@@ -47,8 +47,12 @@ void *memcpy(void *to,const void *from,size_t n)
 #define STOCK_IMAGE_OFFSET 0x200000UL
 
 /* Must match tools/mkadt-nord2.py. */
+#ifndef NORD2_XNU_PHYS_BASE
 #define NORD2_XNU_PHYS_BASE 0x142000000UL
+#endif
+#ifndef NORD2_XNU_MEM_SIZE
 #define NORD2_XNU_MEM_SIZE 0x3e000000UL
+#endif
 
 struct payload_seg {
     uint64_t vmaddr, vmsize, file_off, file_size;
