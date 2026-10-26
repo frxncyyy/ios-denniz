@@ -57,7 +57,7 @@ verified RAM rescue image when needed.
 
 ## Source and verification
 
-Android source pin: `frxncyyy/android_kernel_oplus_mt6893`,
+Android source pin: `<github-user>/android_kernel_oplus_mt6893`,
 `04d00c2565764c3922c9b4826b5acff1106e533f`, principally
 `drivers/misc/mediatek/connectivity/wlan/core/gen4m/chips/soc3_0/soc3_0.c`
 and `connectivity/conninfra/platform/mt6893/mt6893_pos.c`.

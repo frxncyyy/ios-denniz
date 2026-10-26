@@ -29,7 +29,7 @@ normal PC USB connection; future fast-charge ownership needs explicit
 coordination. Hardware IRQ/FIFO behavior and iOS's rendering of unavailable
 values still need testing on the next approved image.
 
-Source pin: `frxncyyy/android_kernel_oplus_mt6893` commit
+Source pin: `<github-user>/android_kernel_oplus_mt6893` commit
 `04d00c2565764c3922c9b4826b5acff1106e533f`. Host verification:
 `python3 tools/test-nord2-battery.py`. Actual gauge/charger observations are
 recorded below; they do not establish charging control or full UI validation.

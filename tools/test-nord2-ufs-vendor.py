@@ -13,7 +13,7 @@ import tempfile
 
 root=Path(__file__).resolve().parent.parent
 live=root/'research/nord2/wifi/live-gpt-read'
-assert hashlib.sha256((live/'primary.bin').read_bytes()).hexdigest()=='e01c103f7d3c6399364e72304b41f99bf24b517b1990f1ba8623ad184472bc86'
+assert hashlib.sha256((live/'primary.bin').read_bytes()).hexdigest()=='0000000000000000000000000000000000000000000000000000000000000000'
 assert hashlib.sha256((live/'backup-tail.bin').read_bytes()).hexdigest()=='c42bb521f900f57f3c57cf1c998707f43ad176ac6da3623d8c4f4e8c3c48674f'
 assert (live/'primary.bin').read_bytes()[4096:] == (live/'backup-tail.bin').read_bytes()[:16384]
 assert (live/'primary.bin').read_bytes()[4096:] == (root/'backup/nord2/ufs-baseline/entries.bin').read_bytes()

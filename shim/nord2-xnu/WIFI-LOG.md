@@ -198,7 +198,7 @@ New timing at GUI ownership distinguishes framebuffer processing from elapsed
 time since stage6. The first-GUI marker precedes the first successful present;
 it is not a lockscreen completion measurement. Exact-C20k-line sanitizer tests
 and local compilation pass. No hardware speedup claim yet. Combined
-[CI39482559337](https://github.com/frxncyyy/ios-sweet/actions/runs/39482559337)
+[CI39482559337](https://github.com/<github-user>/ios-sweet/actions/runs/39482559337)
 passed at source67496ae. Kernel17265160bytes SHA-256
 `74e135136ab6421887155f3396c5328a990d411d7c761aa0e8676004c506b10c`
 matches artifact SHA256SUMS; all1096 captured compile-command lines use
@@ -287,7 +287,7 @@ No snapshot hardware test yet. Exact-C ASan/UBSan tests in
 unowned/in-flight transactions,1000us timeout, AP-only MMIO, bootarg/mapping
 gates and cleanup order. Local kernel C compile passes; patch0082 applies
 cleanly and exactly reproduces the source. Full Apple-clang
-[CI39478743302](https://github.com/frxncyyy/ios-sweet/actions/runs/39478743302)
+[CI39478743302](https://github.com/<github-user>/ios-sweet/actions/runs/39478743302)
 passed at source4693483. Kernel17281112bytes, SHA-256
 `0aa1672f5024ddd3411de2e180364d505880594bb5a42587f5cbd7d3462f9963`,
 matching artifact SHA256SUMS; all1094 captured compile-command lines use

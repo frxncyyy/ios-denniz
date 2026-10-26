@@ -16,7 +16,7 @@
 # --rescue uses the authenticated root ADB RAM recovery, without su/getprop
 # or Android's boot-completion property. It never mounts userdata.
 set -euo pipefail
-ADB=${ADB:-/home/frxncy/Android/Sdk/platform-tools/adb}
+ADB=${ADB:-$HOME/Android/Sdk/platform-tools/adb}
 cd "$(dirname "$0")/.."
 rescue=0
 if [ "${1:-}" = --rescue ]; then

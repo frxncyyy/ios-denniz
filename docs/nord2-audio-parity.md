@@ -6,7 +6,7 @@ handling. It does not include microphone, telephony or Android SmartPA DSP.
 
 ## Source selection
 
-- Android kernel: `frxncyyy/android_kernel_oplus_mt6893`, commit
+- Android kernel: `<github-user>/android_kernel_oplus_mt6893`, commit
   `04d00c2565764c3922c9b4826b5acff1106e533f`, branch
   `KSUN-RUI-susfs-v2.2.0-manual-hook`.
 - Selected audio platform: MT6885 AFE; the MT6893 board binds I2S3 to TFA9874

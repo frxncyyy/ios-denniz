@@ -237,7 +237,7 @@ CPU probe are in `backup/nord2/probe-v2-*`.
 ## Building
 
 Build the complete kernel with the repository's `xnu.yml` GitHub Actions
-workflow on macOS (Apple clang). The current fork is `frxncyyy/ios-sweet`,
+workflow on macOS (Apple clang). The current fork is `<github-user>/ios-sweet`,
 branch `codex/nord2-bringup`. Download both `xnu-kernel` and `xnu-buildtree`;
 record the run ID and head commit in `NOTES.md`.
 

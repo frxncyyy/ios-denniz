@@ -120,7 +120,7 @@ def main():
     ap.add_argument("image", type=Path)
     ap.add_argument("output", type=Path, help="new private evidence directory")
     ap.add_argument("--serial", required=True)
-    ap.add_argument("--adb", default="/home/frxncy/Android/Sdk/platform-tools/adb")
+    ap.add_argument("--adb", default="$HOME/Android/Sdk/platform-tools/adb")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--write-userdata", action="store_true")
     mode.add_argument("--verify-only", action="store_true")

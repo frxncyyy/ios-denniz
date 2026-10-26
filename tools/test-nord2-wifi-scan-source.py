@@ -20,7 +20,7 @@ sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
 for rel,expected in EXPECTED_SOURCE.items():
  if not (S/rel).is_file() or sha(S/rel)!=expected:parser.error('selected source identity mismatch: '+rel)
 board=args.board.resolve()
-BOARD_SHA='61ac3300aad6f65364f845894bb982b7c5d077346f788c29df019c93c4f3f89f'
+BOARD_SHA='0000000000000000000000000000000000000000000000000000000000000000'
 if not board.is_file() or board.stat().st_size!=6146 or sha(board)!=BOARD_SHA:parser.error('board identity/extent mismatch')
 if args.report:
  report_path=args.report.resolve()

@@ -11,7 +11,7 @@ parser.add_argument('--log-dir',type=Path,help='Optional directory for synthetic
 parser.add_argument('--report',type=Path,help='Optional JSON source/fixture hashes and summaries, no packet/board bytes')
 args=parser.parse_args();S=R/'shim/nord2-xnu';P=R/'tools/fixtures/nord2-wifi-normal'
 board=args.board.resolve()
-expected='61ac3300aad6f65364f845894bb982b7c5d077346f788c29df019c93c4f3f89f'
+expected='0000000000000000000000000000000000000000000000000000000000000000'
 if not board.is_file() or board.stat().st_size!=6146 or hashlib.sha256(board.read_bytes()).hexdigest()!=expected:parser.error('board identity/extent mismatch')
 names=('wifi_wpa_diag','wifi_station_data_diag','wifi_default_feature','wifi_rx_readback','wifi_normal_backend','wifi_normal_config','wifi_normal_init','wifi_normal_rx','wifi_normal_transport','wifi_regulatory_policy','wifi_scan_bss','wifi_scan_plan','wifi_basic_config','wifi_basic_resources','wifi_basic_metadata','wifi_basic_primitives','wifi_capability','wifi_capability_dispatcher','wifi_main_initializer','wifi_main_dmashdl','wifi_main_init_plan','wifi_main_transport','wifi_main_layout','wifi_dma_preflight','wifi_main_command','dma_pool_contract')
 files=[S/(name+'.c') for name in names]

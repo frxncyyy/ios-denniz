@@ -57,7 +57,7 @@ python3 tools/test-nord2-wifi-persistent.py
 
 Selected Android source is commit
 `04d00c2565764c3922c9b4826b5acff1106e533f` in
-[android_kernel_oplus_mt6893](https://github.com/frxncyyy/android_kernel_oplus_mt6893/tree/04d00c2565764c3922c9b4826b5acff1106e533f).
+[android_kernel_oplus_mt6893](https://github.com/<github-user>/android_kernel_oplus_mt6893/tree/04d00c2565764c3922c9b4826b5acff1106e533f).
 Relevant files are `drivers/misc/mediatek/connectivity/conninfra/platform/`
 `mt6893/mt6893_pos.c`, `mt6893_pmic.c`, `consys_hw.c`, and the conninfra
 `Kbuild`, configuration parser and platform EMI manager.

@@ -4,7 +4,7 @@ from pathlib import Path
 import argparse,hashlib,json,os,subprocess,tempfile
 R=next(p for p in Path(__file__).resolve().parents if(p/'AGENTS.md').exists());T=R/'tools';S=R/'shim/nord2-xnu'
 a=argparse.ArgumentParser(description=__doc__);a.add_argument('--calibration',type=Path,required=True,help='read-only authenticated6146-byte WIFI file; never embedded/printed');a.add_argument('--candidate',type=Path);a.add_argument('--fixture-overlay',type=Path);a.add_argument('--only',choices=('all','pure','client','owner','contracts','station'),default='all');a.add_argument('--log-dir',type=Path,required=True);x=a.parse_args()
-O=x.log_dir.resolve();O.mkdir(parents=True,exist_ok=True);board=x.calibration.resolve();assert board.stat().st_size==6146 and hashlib.sha256(board.read_bytes()).hexdigest()=='61ac3300aad6f65364f845894bb982b7c5d077346f788c29df019c93c4f3f89f','calibration identity/extent'
+O=x.log_dir.resolve();O.mkdir(parents=True,exist_ok=True);board=x.calibration.resolve();assert board.stat().st_size==6146 and hashlib.sha256(board.read_bytes()).hexdigest()=='0000000000000000000000000000000000000000000000000000000000000000','calibration identity/extent'
 F=Path(__file__).resolve().parent/'fixtures/nord2-wifi-five-ghz';sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
 inputs=[p for p in S.iterdir() if p.is_file()]+[p for p in F.iterdir() if p.is_file()]
 if x.candidate:inputs += [p for p in x.candidate.iterdir() if p.is_file()]
