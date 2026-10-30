@@ -1,0 +1,90 @@
+--- a/bsd/dev/nord2_gpu_core.h
++++ b/bsd/dev/nord2_gpu_core.h
+@@ -256,6 +256,7 @@
+         /* tracking: pages NOT cleaned / NOT invalidated per job, invalidations deferred to a CPU acquire,
+          * and pages invalidated by acquire or by a buffer becoming user-visible */
+         uint64_t cache_skip_clean_pages, cache_skip_inval_pages, cache_deferred_pages, cache_acquire_pages;
++        uint64_t cache_skip_wmask_pages;   /* listed GPU_WRITE buffers the job did not declare in write_mask (n2c_set_wmask_inval) */
+ };
+ 
+ struct n2c_core {
+@@ -278,6 +279,7 @@
+          * context for every job, as before per-job scoping. */
+         bool full_cache_maint;
+         uint8_t track_level;      /* N2C_TRACK_*; set before the first buffer exists */
++        bool wmask_inval;         /* 0110: a job with a non-zero write_mask invalidates only the buffers it declares; set before the first buffer exists */
+         /* Private immutable workaround, separate AS0 MMU, never user mapped. */
+         const uint8_t *wa_payload;
+         size_t wa_size;
+@@ -340,6 +342,9 @@
+ enum n2c_error n2c_seq_state(struct n2c_core *c, unsigned ctx, uint64_t seq,
+                              bool reap, struct n2c_seq_result *res);
+ bool n2c_set_track_level(struct n2c_core *c, unsigned level);
++/* Opt-in (boot-arg n2wm): trust write_mask as the list of buffers a job writes.  A job with write_mask == 0 keeps the conservative rule
++ * (every listed GPU_WRITE buffer).  Refused once buffers exist. */
++bool n2c_set_wmask_inval(struct n2c_core *c, bool on);
+ /* A user mapping of the buffer was handed out: from now on it is maintained like any CPU-visible buffer. */
+ enum n2c_error n2c_bo_cpu_visible(struct n2c_core *c, unsigned ctx, uint32_t handle);
+ /* Bracketed CPU access (level 2, visible buffers only): lock/unlock-style protocol replaces per-job maintenance. */
+--- a/bsd/dev/nord2_gpu_core.c
++++ b/bsd/dev/nord2_gpu_core.c
+@@ -468,6 +468,11 @@
+                                 struct n2c_bo *b = j->bos[i];
+                                 if (!(b->flags & N2C_BO_GPU_WRITE))
+                                         continue;
++                                if (c->wmask_inval && j->write_mask && !((j->write_mask >> i) & 1u)) {
++                                        /* The job declared what it writes and this buffer is not in it: no CPU line of it can be stale because of this job. */
++                                        c->stats.cache_skip_wmask_pages += b->nr_pages;
++                                        continue;
++                                }
+                                 b->gpu_written = true;
+                                 if (c->track_level == N2C_TRACK_LEGACY || (b->cpu_visible && !b->explicit_track)) {
+                                         bo_cache_sync(c, b, false);
+@@ -750,6 +755,14 @@
+ /* ------------------------------------------------------------------ */
+ /* CPU cache tracking                                                  */
+ 
++bool n2c_set_wmask_inval(struct n2c_core *c, bool on)
++{
++        if (!c || c->stats.bos_live)
++                return false;
++        c->wmask_inval = on;
++        return true;
++}
++
+ bool n2c_set_track_level(struct n2c_core *c, unsigned level)
+ {
+         if (!c || level > N2C_TRACK_EXPLICIT || c->stats.bos_live)
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -107,7 +107,11 @@
+         got = PE_parse_boot_argn("nord2_gpu_track", &tr, sizeof(tr)); if (!got) got = PE_parse_boot_argn("n2trk", &tr, sizeof(tr));
+         if (tr < 0 || tr > 2) tr = 1;
+         (void)n2c_set_track_level(c, (unsigned)tr);
+-        IOLog("NORD2 GPU: cache maintenance %s, CPU-access tracking level %d\n", c->full_cache_maint ? "whole-context (boot-arg)" : "per-job buffer list", tr);
++        int wm = 0;      /* 0110: nord2_gpu_wmask=1 (alias n2wm) trusts a job's write_mask for the post-job invalidate */
++        got = PE_parse_boot_argn("nord2_gpu_wmask", &wm, sizeof(wm)); if (!got) got = PE_parse_boot_argn("n2wm", &wm, sizeof(wm));
++        (void)n2c_set_wmask_inval(c, wm == 1);
++        IOLog("NORD2 GPU: cache maintenance %s, CPU-access tracking level %d, invalidate scope %s\n", c->full_cache_maint ? "whole-context (boot-arg)" : "per-job buffer list", tr,
++              c->wmask_inval ? "declared writes (write_mask)" : "every listed GPU_WRITE buffer");
+         return true;
+ }
+ static bool battery_temperature(int *centi);
+@@ -705,7 +709,7 @@
+         int hot = (lvtsMode && lvtsState && lvtsState != 3) ? lvtsHottest(lvtsMask) : (int)0x80000000;
+         uint32_t n = t.jobs ? t.jobs : 1, w = waitN ? waitN : 1;
+         IOLog("NORD2 GPU JOBS: n=%u fault=%u full=%u win_ms=%llu q_us=%llu/%u run_us=%llu/%u tot_us=%llu/%u "
+-              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u gpu_khz=%u mux=%u bat_cC=%d bat_ok=%u gpu_cC=%d soc_cC=%d lvts=%u%s irq=%u:%u/%u/%u/%u trk=%u skipC_KiB=%llu skipI_KiB=%llu defI_KiB=%llu acqI_KiB=%llu\n",
++              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u gpu_khz=%u mux=%u bat_cC=%d bat_ok=%u gpu_cC=%d soc_cC=%d lvts=%u%s irq=%u:%u/%u/%u/%u trk=%u skipC_KiB=%llu skipI_KiB=%llu defI_KiB=%llu acqI_KiB=%llu wmI_KiB=%llu\n",
+               t.jobs, t.faulted, t.full_jobs, t.window_start_us / 1000, t.sum_queue_us / n, t.max_queue_us,
+               t.sum_run_us / n, t.max_run_us, t.sum_total_us / n, t.max_total_us, t.sum_clean_us / n, t.max_clean_us,
+               t.sum_inval_us / n, t.max_inval_us, t.sum_clean_pages * 4, t.sum_inval_pages * 4, waitN,
+@@ -715,7 +719,7 @@
+               lvtsState, (lvtsState && lvts.cal.defaulted) ? "~" : "",
+               (unsigned)irqState, irqTops, irqGuard.spurious_total, irqSleeps, irqTimeouts,
+               (unsigned)core->track_level, core->stats.cache_skip_clean_pages * 4, core->stats.cache_skip_inval_pages * 4,
+-              core->stats.cache_deferred_pages * 4, core->stats.cache_acquire_pages * 4);
++              core->stats.cache_deferred_pages * 4, core->stats.cache_acquire_pages * 4, core->stats.cache_skip_wmask_pages * 4);
+         waitN = waitGapMax = waitDurMax = waitRetMax = 0; waitGapSum = waitDurSum = waitRetSum = 0;
+         seqWaits = seqJobs = seqDurMax = 0; seqDurSum = 0;
+ }

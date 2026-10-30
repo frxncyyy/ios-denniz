@@ -1,0 +1,147 @@
+--- a/gpu/src/Nord2GPU.cpp
++++ b/gpu/src/Nord2GPU.cpp
+@@ -154,6 +154,7 @@
+         uint32_t seqWaits = 0, seqJobs = 0, seqDurMax = 0; uint64_t seqDurSum = 0;
+         void emitJobStats();
+         void surfaceHook(void *surface, bool acquire);
++        bool surfaceBusy(void *surface);
+         /* Optional job interrupt (boot-arg nord2_gpu_irq=1; polling stays the fallback). */
+         bool irqWanted = false, irqTried = false, irqArmed = false;
+         uint32_t irqSpi = NORD2_GPU_JOB_SPI_DEFAULT, irqIntid = 0, irqLearnMisses = 0;
+@@ -497,6 +498,27 @@
+         }
+         IOLockUnlock(lock);
+ }
++/* True while a not-yet-finished job declared (write_mask) that it writes an import of this surface.  The framebuffer
++ * keeps showing the previous complete frame meanwhile (WAIT/WAIT_SEQ completion is what clears it). */
++bool Nord2GPU::surfaceBusy(void *surface) {
++        if (!surface || !ready || !core) return false;
++        bool busy = false;
++        IOLockLock(lock);
++        if (!stopping) {
++                for (unsigned i = 0; i < N2C_MAX_JOBS && !busy; i++) {
++                        const struct n2c_job *j = &core->jobs[i];
++                        if (j->state != N2C_JOB_QUEUED && j->state != N2C_JOB_RUNNING && j->state != N2C_JOB_STOPPING) continue;
++                        for (unsigned k = 0; k < j->nr_bos && !busy; k++) {
++                                const struct n2c_bo *b = j->bos[k];
++                                busy = ((j->write_mask >> k) & 1u) && (b->flags & N2C_BO_IMPORTED) && b->cookie &&
++                                       ((BufferOwner *)b->cookie)->surface == (SweetSurface *)surface;
++                        }
++                }
++        }
++        IOLockUnlock(lock);
++        return busy;
++}
++extern "C" bool nord2_gpu_surface_busy(void *surface) { return gSurfaceGpu ? gSurfaceGpu->surfaceBusy(surface) : false; }
+ extern "C" void nord2_gpu_surface_cpu_acquire(void *surface) { if (gSurfaceGpu) gSurfaceGpu->surfaceHook(surface, true); }
+ extern "C" void nord2_gpu_surface_cpu_release(void *surface) { if (gSurfaceGpu) gSurfaceGpu->surfaceHook(surface, false); }
+ static uint32_t gic_rd32(void *c, uint32_t off) { return read_bank(c, off); }
+--- a/shim/nord2-xnu/Nord2GPU.cpp
++++ b/shim/nord2-xnu/Nord2GPU.cpp
+@@ -154,6 +154,7 @@
+         uint32_t seqWaits = 0, seqJobs = 0, seqDurMax = 0; uint64_t seqDurSum = 0;
+         void emitJobStats();
+         void surfaceHook(void *surface, bool acquire);
++        bool surfaceBusy(void *surface);
+         /* Optional job interrupt (boot-arg nord2_gpu_irq=1; polling stays the fallback). */
+         bool irqWanted = false, irqTried = false, irqArmed = false;
+         uint32_t irqSpi = NORD2_GPU_JOB_SPI_DEFAULT, irqIntid = 0, irqLearnMisses = 0;
+@@ -497,6 +498,27 @@
+         }
+         IOLockUnlock(lock);
+ }
++/* True while a not-yet-finished job declared (write_mask) that it writes an import of this surface.  The framebuffer
++ * keeps showing the previous complete frame meanwhile (WAIT/WAIT_SEQ completion is what clears it). */
++bool Nord2GPU::surfaceBusy(void *surface) {
++        if (!surface || !ready || !core) return false;
++        bool busy = false;
++        IOLockLock(lock);
++        if (!stopping) {
++                for (unsigned i = 0; i < N2C_MAX_JOBS && !busy; i++) {
++                        const struct n2c_job *j = &core->jobs[i];
++                        if (j->state != N2C_JOB_QUEUED && j->state != N2C_JOB_RUNNING && j->state != N2C_JOB_STOPPING) continue;
++                        for (unsigned k = 0; k < j->nr_bos && !busy; k++) {
++                                const struct n2c_bo *b = j->bos[k];
++                                busy = ((j->write_mask >> k) & 1u) && (b->flags & N2C_BO_IMPORTED) && b->cookie &&
++                                       ((BufferOwner *)b->cookie)->surface == (SweetSurface *)surface;
++                        }
++                }
++        }
++        IOLockUnlock(lock);
++        return busy;
++}
++extern "C" bool nord2_gpu_surface_busy(void *surface) { return gSurfaceGpu ? gSurfaceGpu->surfaceBusy(surface) : false; }
+ extern "C" void nord2_gpu_surface_cpu_acquire(void *surface) { if (gSurfaceGpu) gSurfaceGpu->surfaceHook(surface, true); }
+ extern "C" void nord2_gpu_surface_cpu_release(void *surface) { if (gSurfaceGpu) gSurfaceGpu->surfaceHook(surface, false); }
+ static uint32_t gic_rd32(void *c, uint32_t off) { return read_bank(c, off); }
+--- a/gpu/tests/sweet_fb_present_test.c
++++ b/gpu/tests/sweet_fb_present_test.c
+@@ -0,0 +1,68 @@
++/* Presentation scheduling (host): absolute vsync schedule, hz mapping, GPU-busy gating, transfer polling, stats. */
++#include "sweet_fb_present.h"
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++
++int main(void)
++{
++	const uint64_t P = 16666667;     /* ns-scale units; any unit works */
++	/* hz mapping */
++	assert(SWEET_FB_DEFAULT_HZ == 30 && sweet_fb_flush_ticks(30) == 2 && sweet_fb_flush_ticks(10) == 6);
++	assert(sweet_fb_flush_ticks(0) == 1 && sweet_fb_flush_ticks(60) == 1 && sweet_fb_flush_ticks(120) == 1 && sweet_fb_flush_ticks(20) == 3);
++	assert(sweet_fb_flush_due(5, 1) && sweet_fb_flush_due(4, 2) && !sweet_fb_flush_due(5, 2) && sweet_fb_flush_due(6, 3));
++
++	/* A handler that takes 25 ms of a 16.7 ms period (the old code re-armed AFTER the work): the deadlines stay on the
++	 * grid t0 + k*P because each is computed from the previous deadline, not from when the work finished. */
++	uint64_t next = 0, now = 1000000, t0;
++	assert(!sweet_fb_next_tick(&next, now, P) && next == now + P); t0 = now;
++	for (unsigned k = 1; k <= 20; k++) {
++		now = next + 200000;                 /* wake 0.2 ms late */
++		bool late = sweet_fb_next_tick(&next, now, P);     /* re-arm BEFORE working */
++		assert(!late && next == t0 + (uint64_t)(k + 1) * P);
++		now += 25000000;                     /* the present itself: 25 ms of work after re-arming */
++		(void)now;
++	}
++	/* The work of a tick may run into the next deadline: it fires immediately, phase kept. */
++	next = 5 * P; now = 6 * P + P / 4 + 10;
++	assert(!sweet_fb_next_tick(&next, now, P) && next == 6 * P && now > next);
++	/* More than half a period past the NEW deadline (e.g. the thread was starved): restart, do not burst. */
++	next = 5 * P; now = 6 * P + P / 2 + 1;
++	assert(sweet_fb_next_tick(&next, now, P) && next == now + P);
++
++	/* GPU-busy gating: skip until the limit, then force; a complete frame resets the counter. */
++	uint32_t bt = 0;
++	assert(sweet_fb_busy_decision(false, &bt, SWEET_FB_BUSY_MAX_TICKS) == SWEET_FB_BUSY_PRESENT && bt == 0);
++	for (unsigned i = 0; i < SWEET_FB_BUSY_MAX_TICKS; i++) assert(sweet_fb_busy_decision(true, &bt, SWEET_FB_BUSY_MAX_TICKS) == SWEET_FB_BUSY_SKIP);
++	assert(sweet_fb_busy_decision(true, &bt, SWEET_FB_BUSY_MAX_TICKS) == SWEET_FB_BUSY_FORCE && bt == 0);
++	assert(sweet_fb_busy_decision(true, &bt, SWEET_FB_BUSY_MAX_TICKS) == SWEET_FB_BUSY_SKIP && bt == 1);
++	assert(sweet_fb_busy_decision(false, &bt, SWEET_FB_BUSY_MAX_TICKS) == SWEET_FB_BUSY_PRESENT && bt == 0);
++
++	/* transfer polling */
++	assert(sweet_fb_xfer_state(false, 0) == SWEET_FB_XFER_WAIT && sweet_fb_xfer_state(true, 99999999) == SWEET_FB_XFER_DONE);
++	assert(sweet_fb_xfer_state(false, SWEET_FB_XFER_TIMEOUT_US - 1) == SWEET_FB_XFER_WAIT && sweet_fb_xfer_state(false, SWEET_FB_XFER_TIMEOUT_US) == SWEET_FB_XFER_TIMEOUT);
++
++	/* stats: windowed, reported only when something presented and the interval passed */
++	struct sweet_fb_present_stats st; sweet_fb_stats_reset(&st, 1000);
++	assert(!sweet_fb_stats_due(&st, 1000 + SWEET_FB_STAT_INTERVAL_US));            /* nothing presented: silent */
++	sweet_fb_stats_note(&st, 8000, 14000, false, false);
++	sweet_fb_stats_note(&st, 12000, 15000, false, false);
++	sweet_fb_stats_note(&st, 9000, 40000, true, true);
++	assert(st.n == 3 && st.max_us == 49000 && st.max_copy_us == 12000 && st.max_xfer_us == 40000 && st.timeouts == 1 && st.legacy == 1);
++	assert(st.sum_us == 22000 + 27000 + 49000 && st.sum_copy_us == 29000 && st.sum_xfer_us == 69000);
++	assert(!sweet_fb_stats_due(&st, 1000 + SWEET_FB_STAT_INTERVAL_US - 1) && sweet_fb_stats_due(&st, 1000 + SWEET_FB_STAT_INTERVAL_US));
++	sweet_fb_stats_reset(&st, 7000000); assert(!st.n && !sweet_fb_stats_due(&st, 99999999));
++
++	/* mailbox model: the tick takes a frame only when the presenter is idle and the swap is due; never queues a second one */
++	enum { IDLE, WORKING } pstate = IDLE; unsigned dirty = 1, taken = 0; uint64_t tick;
++	for (tick = 1; tick <= 12; tick++) {
++		bool due = sweet_fb_flush_due(tick, 2) && dirty;
++		if (due && pstate == WORKING) { continue; }  /* frame stays pending: newest wins later */
++		if (due) { taken++; dirty = 0; pstate = WORKING; }
++		if (tick % 5 == 0) pstate = IDLE;                                    /* a present takes ~5 ticks */
++		if (tick == 7) dirty = 1;
++	}
++	assert(taken == 2);
++	puts("sweet_fb_present_test: absolute vsync grid unaffected by present time, hz mapping, busy gating, transfer polling, stats pass");
++	return 0;
++}

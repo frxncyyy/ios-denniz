@@ -1,0 +1,680 @@
+--- a/gpu/src/Nord2GPU.cpp
++++ b/gpu/src/Nord2GPU.cpp
+@@ -40,6 +40,11 @@
+         absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+         return ns / 1000000ull;
+ }
++static uint64_t now_us(void *) {
++        uint64_t ns = 0;
++        absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++        return ns / 1000ull;
++}
+ static void sleep_ms(void *, unsigned ms) { IOSleep(ms); }
+ static void delay_us(void *, unsigned us) { IODelay(us); }
+ static void log_msg(void *, const char *s) { IOLog("NORD2 GPU: %s\n", s); }
+@@ -115,6 +120,13 @@
+         bool ready = false, stopping = false;
+         uint64_t privateLimit = NORD2_GPU_PRIVATE_LIMIT, globalLimit = NORD2_GPU_GLOBAL_PRIVATE_LIMIT;
+         uint64_t lastBudgetLog = 0; unsigned budgetSuppressed = 0;
++        /* Compact job-timing line (kernel clocks only, ~one line per 2 s while jobs run).
++         * w_* are measured around WAIT: gap = submit -> WAIT entered, dur = time inside
++         * WAIT, ret = submit -> WAIT returned (what the client sees per job). */
++        bool jobStats = true;
++        uint32_t waitN = 0, waitGapMax = 0, waitDurMax = 0, waitRetMax = 0;
++        uint64_t waitGapSum = 0, waitDurSum = 0, waitRetSum = 0;
++        void emitJobStats();
+         uint64_t privateTotal();
+         void budgetReject(const char *, unsigned, uint64_t, uint64_t);
+         bool start(IOService *) APPLE_KEXT_OVERRIDE;
+@@ -213,7 +225,7 @@
+         n2clk_ops co = { clockRead, clockWrite, delay_us, log_msg };
+         n2hw_ops ho = { read_bank, write_bank, delay_us, log_msg };
+         nord2_scpsys_ops so = { spmRead, spmWrite, infraRead, infraWrite, delay_us, log_msg };
+-        n2c_ops mo = { allocTable, freeTable, flushTable, alloc_host, free_host, sync_page, free_owner, now_ms, log_msg };
++        n2c_ops mo = { allocTable, freeTable, flushTable, alloc_host, free_host, sync_page, free_owner, now_ms, log_msg, now_us };
+         core = (n2c_core *)IOMallocZero(sizeof(*core));
+         return core && n2pmif_init(&pm15, N2PMIF_SPMI, &po, &spmi) &&
+                n2pmif_init(&pm59, N2PMIF_PWRAP, &po, &pwrap) &&
+@@ -294,6 +306,7 @@
+         }
+         if (d->ready) {
+                 n2c_poll(d->core);
++                d->emitJobStats();
+                 if (d->core->state == N2C_CORE_BROKEN) {
+                         d->ready = false; d->setProperty("Nord2GPUState", "fault-memory-pinned");
+                 }
+@@ -305,6 +318,7 @@
+         if (!IOAcceleratorES::start(provider)) return false;
+         lock = IOLockAlloc(); if (!lock) return false;
+         int opt = 0; PE_parse_boot_argn("nord2_gpu", &opt, sizeof(opt)); enabled = opt == 1;
++        int stats = 1; PE_parse_boot_argn("nord2_gpu_stats", &stats, sizeof(stats)); jobStats = stats != 0;
+         int mib = 0; PE_parse_boot_argn("nord2_gpu_priv_mb", &mib, sizeof(mib));
+         privateLimit = nord2_gpu_budget_mib(mib > 0 ? (uint64_t)mib : 0, 16, NORD2_GPU_PRIVATE_MAX >> 20, NORD2_GPU_PRIVATE_LIMIT);
+         mib = 0; PE_parse_boot_argn("nord2_gpu_glob_mb", &mib, sizeof(mib));
+@@ -382,6 +396,19 @@
+         return total;
+ }
+ /* Rate-limited (1/s) diagnostic for budget rejections; counts what it skipped. */
++void Nord2GPU::emitJobStats() {
++        if (!jobStats || !core) return;
++        n2c_timing t;
++        if (!n2c_timing_take(core, &t, 2000000ull)) return;
++        uint32_t n = t.jobs ? t.jobs : 1, w = waitN ? waitN : 1;
++        IOLog("NORD2 GPU JOBS: n=%u fault=%u full=%u win_ms=%llu q_us=%llu/%u run_us=%llu/%u tot_us=%llu/%u "
++              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u\n",
++              t.jobs, t.faulted, t.full_jobs, t.window_start_us / 1000, t.sum_queue_us / n, t.max_queue_us,
++              t.sum_run_us / n, t.max_run_us, t.sum_total_us / n, t.max_total_us, t.sum_clean_us / n, t.max_clean_us,
++              t.sum_inval_us / n, t.max_inval_us, t.sum_clean_pages * 4, t.sum_inval_pages * 4, waitN,
++              waitGapSum / w, waitGapMax, waitDurSum / w, waitDurMax, waitRetSum / w, waitRetMax);
++        waitN = waitGapMax = waitDurMax = waitRetMax = 0; waitGapSum = waitDurSum = waitRetSum = 0;
++}
+ void Nord2GPU::budgetReject(const char *what, unsigned c, uint64_t request, uint64_t limit) {
+         uint64_t t = now_ms(NULL);
+         if (lastBudgetLog && t - lastBudgetLog < 1000) { budgetSuppressed++; return; }
+@@ -647,7 +674,7 @@
+         }
+         case NORD2_GPU_SEL_WAIT: {
+                 if(a->scalarInput[1]>5000){result=kIOReturnBadArgument;break;}
+-                uint32_t state=0,status=0;uint64_t start=now_ms(NULL),id=a->scalarInput[0];
++                uint32_t state=0,status=0;uint64_t start=now_ms(NULL),id=a->scalarInput[0],enter_us=now_us(NULL);
+                 for(;;){
+                         n2c_poll(gpu->core);result=io_error(n2c_job_state(gpu->core,context,id,false,&state,&status));
+                         if(result!=kIOReturnSuccess || state>=N2C_JOB_DONE || gpu->core->state==N2C_CORE_BROKEN || now_ms(NULL)-start>=a->scalarInput[1])break;
+@@ -658,7 +685,15 @@
+                         if(a->structureOutputSize){nord2_gpu_fault_info f={};f.job_id_lo=(uint32_t)id;f.job_id_hi=(uint32_t)(id>>32);
+                                 f.state=state;f.status=status;f.fault_status=gpu->core->ctxs[context].fault_status;f.fault_address=gpu->core->ctxs[context].fault_address;
+                                 memcpy(a->structureOutput,&f,sizeof(f));a->structureOutputSize=sizeof(f);}
+-                        if(state>=N2C_JOB_DONE)(void)n2c_job_state(gpu->core,context,id,true,NULL,NULL);
++                        if(state>=N2C_JOB_DONE){
++                                n2c_job_times jt;uint64_t ret_us=now_us(NULL);
++                                if(n2c_job_get_times(gpu->core,context,id,&jt)==N2C_OK && state==N2C_JOB_DONE){
++                                        uint64_t gap=enter_us>jt.submit_us?enter_us-jt.submit_us:0,dur=ret_us-enter_us,ret=ret_us>jt.submit_us?ret_us-jt.submit_us:0;
++                                        gpu->waitN++;gpu->waitGapSum+=gap;gpu->waitDurSum+=dur;gpu->waitRetSum+=ret;
++                                        if(gap>gpu->waitGapMax)gpu->waitGapMax=(uint32_t)gap;if(dur>gpu->waitDurMax)gpu->waitDurMax=(uint32_t)dur;if(ret>gpu->waitRetMax)gpu->waitRetMax=(uint32_t)ret;
++                                }
++                                (void)n2c_job_state(gpu->core,context,id,true,NULL,NULL);gpu->emitJobStats();
++                        }
+                 }break;
+         }
+         case NORD2_GPU_SEL_FAULT: {
+--- a/shim/nord2-xnu/Nord2GPU.cpp
++++ b/shim/nord2-xnu/Nord2GPU.cpp
+@@ -40,6 +40,11 @@
+         absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+         return ns / 1000000ull;
+ }
++static uint64_t now_us(void *) {
++        uint64_t ns = 0;
++        absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++        return ns / 1000ull;
++}
+ static void sleep_ms(void *, unsigned ms) { IOSleep(ms); }
+ static void delay_us(void *, unsigned us) { IODelay(us); }
+ static void log_msg(void *, const char *s) { IOLog("NORD2 GPU: %s\n", s); }
+@@ -115,6 +120,13 @@
+         bool ready = false, stopping = false;
+         uint64_t privateLimit = NORD2_GPU_PRIVATE_LIMIT, globalLimit = NORD2_GPU_GLOBAL_PRIVATE_LIMIT;
+         uint64_t lastBudgetLog = 0; unsigned budgetSuppressed = 0;
++        /* Compact job-timing line (kernel clocks only, ~one line per 2 s while jobs run).
++         * w_* are measured around WAIT: gap = submit -> WAIT entered, dur = time inside
++         * WAIT, ret = submit -> WAIT returned (what the client sees per job). */
++        bool jobStats = true;
++        uint32_t waitN = 0, waitGapMax = 0, waitDurMax = 0, waitRetMax = 0;
++        uint64_t waitGapSum = 0, waitDurSum = 0, waitRetSum = 0;
++        void emitJobStats();
+         uint64_t privateTotal();
+         void budgetReject(const char *, unsigned, uint64_t, uint64_t);
+         bool start(IOService *) APPLE_KEXT_OVERRIDE;
+@@ -213,7 +225,7 @@
+         n2clk_ops co = { clockRead, clockWrite, delay_us, log_msg };
+         n2hw_ops ho = { read_bank, write_bank, delay_us, log_msg };
+         nord2_scpsys_ops so = { spmRead, spmWrite, infraRead, infraWrite, delay_us, log_msg };
+-        n2c_ops mo = { allocTable, freeTable, flushTable, alloc_host, free_host, sync_page, free_owner, now_ms, log_msg };
++        n2c_ops mo = { allocTable, freeTable, flushTable, alloc_host, free_host, sync_page, free_owner, now_ms, log_msg, now_us };
+         core = (n2c_core *)IOMallocZero(sizeof(*core));
+         return core && n2pmif_init(&pm15, N2PMIF_SPMI, &po, &spmi) &&
+                n2pmif_init(&pm59, N2PMIF_PWRAP, &po, &pwrap) &&
+@@ -294,6 +306,7 @@
+         }
+         if (d->ready) {
+                 n2c_poll(d->core);
++                d->emitJobStats();
+                 if (d->core->state == N2C_CORE_BROKEN) {
+                         d->ready = false; d->setProperty("Nord2GPUState", "fault-memory-pinned");
+                 }
+@@ -305,6 +318,7 @@
+         if (!IOAcceleratorES::start(provider)) return false;
+         lock = IOLockAlloc(); if (!lock) return false;
+         int opt = 0; PE_parse_boot_argn("nord2_gpu", &opt, sizeof(opt)); enabled = opt == 1;
++        int stats = 1; PE_parse_boot_argn("nord2_gpu_stats", &stats, sizeof(stats)); jobStats = stats != 0;
+         int mib = 0; PE_parse_boot_argn("nord2_gpu_priv_mb", &mib, sizeof(mib));
+         privateLimit = nord2_gpu_budget_mib(mib > 0 ? (uint64_t)mib : 0, 16, NORD2_GPU_PRIVATE_MAX >> 20, NORD2_GPU_PRIVATE_LIMIT);
+         mib = 0; PE_parse_boot_argn("nord2_gpu_glob_mb", &mib, sizeof(mib));
+@@ -382,6 +396,19 @@
+         return total;
+ }
+ /* Rate-limited (1/s) diagnostic for budget rejections; counts what it skipped. */
++void Nord2GPU::emitJobStats() {
++        if (!jobStats || !core) return;
++        n2c_timing t;
++        if (!n2c_timing_take(core, &t, 2000000ull)) return;
++        uint32_t n = t.jobs ? t.jobs : 1, w = waitN ? waitN : 1;
++        IOLog("NORD2 GPU JOBS: n=%u fault=%u full=%u win_ms=%llu q_us=%llu/%u run_us=%llu/%u tot_us=%llu/%u "
++              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u\n",
++              t.jobs, t.faulted, t.full_jobs, t.window_start_us / 1000, t.sum_queue_us / n, t.max_queue_us,
++              t.sum_run_us / n, t.max_run_us, t.sum_total_us / n, t.max_total_us, t.sum_clean_us / n, t.max_clean_us,
++              t.sum_inval_us / n, t.max_inval_us, t.sum_clean_pages * 4, t.sum_inval_pages * 4, waitN,
++              waitGapSum / w, waitGapMax, waitDurSum / w, waitDurMax, waitRetSum / w, waitRetMax);
++        waitN = waitGapMax = waitDurMax = waitRetMax = 0; waitGapSum = waitDurSum = waitRetSum = 0;
++}
+ void Nord2GPU::budgetReject(const char *what, unsigned c, uint64_t request, uint64_t limit) {
+         uint64_t t = now_ms(NULL);
+         if (lastBudgetLog && t - lastBudgetLog < 1000) { budgetSuppressed++; return; }
+@@ -647,7 +674,7 @@
+         }
+         case NORD2_GPU_SEL_WAIT: {
+                 if(a->scalarInput[1]>5000){result=kIOReturnBadArgument;break;}
+-                uint32_t state=0,status=0;uint64_t start=now_ms(NULL),id=a->scalarInput[0];
++                uint32_t state=0,status=0;uint64_t start=now_ms(NULL),id=a->scalarInput[0],enter_us=now_us(NULL);
+                 for(;;){
+                         n2c_poll(gpu->core);result=io_error(n2c_job_state(gpu->core,context,id,false,&state,&status));
+                         if(result!=kIOReturnSuccess || state>=N2C_JOB_DONE || gpu->core->state==N2C_CORE_BROKEN || now_ms(NULL)-start>=a->scalarInput[1])break;
+@@ -658,7 +685,15 @@
+                         if(a->structureOutputSize){nord2_gpu_fault_info f={};f.job_id_lo=(uint32_t)id;f.job_id_hi=(uint32_t)(id>>32);
+                                 f.state=state;f.status=status;f.fault_status=gpu->core->ctxs[context].fault_status;f.fault_address=gpu->core->ctxs[context].fault_address;
+                                 memcpy(a->structureOutput,&f,sizeof(f));a->structureOutputSize=sizeof(f);}
+-                        if(state>=N2C_JOB_DONE)(void)n2c_job_state(gpu->core,context,id,true,NULL,NULL);
++                        if(state>=N2C_JOB_DONE){
++                                n2c_job_times jt;uint64_t ret_us=now_us(NULL);
++                                if(n2c_job_get_times(gpu->core,context,id,&jt)==N2C_OK && state==N2C_JOB_DONE){
++                                        uint64_t gap=enter_us>jt.submit_us?enter_us-jt.submit_us:0,dur=ret_us-enter_us,ret=ret_us>jt.submit_us?ret_us-jt.submit_us:0;
++                                        gpu->waitN++;gpu->waitGapSum+=gap;gpu->waitDurSum+=dur;gpu->waitRetSum+=ret;
++                                        if(gap>gpu->waitGapMax)gpu->waitGapMax=(uint32_t)gap;if(dur>gpu->waitDurMax)gpu->waitDurMax=(uint32_t)dur;if(ret>gpu->waitRetMax)gpu->waitRetMax=(uint32_t)ret;
++                                }
++                                (void)n2c_job_state(gpu->core,context,id,true,NULL,NULL);gpu->emitJobStats();
++                        }
+                 }break;
+         }
+         case NORD2_GPU_SEL_FAULT: {
+--- a/gpu/include/nord2_gpu_core.h
++++ b/gpu/include/nord2_gpu_core.h
+@@ -123,6 +123,8 @@
+         void (*free_owner)(void *ctx, void *cookie);
+         uint64_t (*now_ms)(void *ctx);
+         void (*log)(void *ctx, const char *msg);
++        /* Optional microsecond clock for job timing; now_ms()*1000 if NULL. */
++        uint64_t (*now_us)(void *ctx);
+ };
+ 
+ struct n2c_page {
+@@ -175,6 +177,10 @@
+         unsigned nr_bos;
+         uint32_t write_mask;
+         bool full_maint;          /* cache maintenance covers the whole context */
++        /* Timing (us, n2c ops.now_us), set by submit / try_start / job_finish. */
++        uint64_t t_submit_us, t_start_us, t_end_us;
++        uint32_t clean_us, inval_us, clean_pages, inval_pages;
++        bool t_started;
+         uint64_t started_ms, stop_ms;
+         uint32_t status;          /* JS_STATUS of the failing phase */
+         uint64_t head_at_fault;
+@@ -197,6 +203,24 @@
+  * because a producer that ran out of slots cannot list everything. */
+ #define N2C_SUBMIT_FULL_MAINT (1u << 0)
+ 
++/* Job timing aggregated over a window; read and reset with n2c_timing_take().
++ * queue = submit -> first phase start (includes the pre-job clean),
++ * run = first phase start -> completion noticed by the poller (the GPU's own
++ * execution plus up to one polling interval), total = submit -> completion. */
++struct n2c_timing {
++        uint32_t jobs, faulted, full_jobs;
++        uint64_t sum_queue_us, sum_run_us, sum_total_us, sum_clean_us, sum_inval_us;
++        uint64_t sum_clean_pages, sum_inval_pages;
++        uint32_t max_queue_us, max_run_us, max_total_us, max_clean_us, max_inval_us;
++        uint64_t window_start_us;
++};
++
++/* Per-job times of a not yet reaped job (for wait-return lag accounting). */
++struct n2c_job_times {
++        uint64_t submit_us, start_us, end_us;
++        uint32_t clean_us, inval_us;
++};
++
+ struct n2c_stats {
+         uint64_t submitted, completed, faulted, cancelled, timeouts;
+         uint64_t resets, reset_failures, flush_failures;
+@@ -223,6 +247,7 @@
+         unsigned nr_quarantine;
+         uint32_t next_handle;
+         struct n2c_stats stats;
++        struct n2c_timing timing;
+         /* Rollback valve (boot-arg nord2_gpu_cache=1): maintain the whole
+          * context for every job, as before per-job scoping. */
+         bool full_cache_maint;
+@@ -274,6 +299,13 @@
+ /* Process hardware events and deadlines; never sleeps. */
+ void n2c_poll(struct n2c_core *c);
+ /* Query a job; a terminal job is consumed (record freed) when reap. */
++uint64_t n2c_now_us(struct n2c_core *c);
++/* Returns false (and leaves *out untouched) while the window holds no finished job or is
++ * younger than min_window_us; otherwise copies and resets the window. */
++bool n2c_timing_take(struct n2c_core *c, struct n2c_timing *out,
++                     uint64_t min_window_us);
++enum n2c_error n2c_job_get_times(struct n2c_core *c, unsigned ctx, uint64_t id,
++                             struct n2c_job_times *out);
+ enum n2c_error n2c_job_state(struct n2c_core *c, unsigned ctx, uint64_t id,
+                              bool reap, uint32_t *state, uint32_t *status);
+ /* Verified GPU reset and recovery (all contexts' AS reprogrammed). */
+--- a/shim/nord2-xnu/nord2_gpu_core.h
++++ b/shim/nord2-xnu/nord2_gpu_core.h
+@@ -123,6 +123,8 @@
+         void (*free_owner)(void *ctx, void *cookie);
+         uint64_t (*now_ms)(void *ctx);
+         void (*log)(void *ctx, const char *msg);
++        /* Optional microsecond clock for job timing; now_ms()*1000 if NULL. */
++        uint64_t (*now_us)(void *ctx);
+ };
+ 
+ struct n2c_page {
+@@ -175,6 +177,10 @@
+         unsigned nr_bos;
+         uint32_t write_mask;
+         bool full_maint;          /* cache maintenance covers the whole context */
++        /* Timing (us, n2c ops.now_us), set by submit / try_start / job_finish. */
++        uint64_t t_submit_us, t_start_us, t_end_us;
++        uint32_t clean_us, inval_us, clean_pages, inval_pages;
++        bool t_started;
+         uint64_t started_ms, stop_ms;
+         uint32_t status;          /* JS_STATUS of the failing phase */
+         uint64_t head_at_fault;
+@@ -197,6 +203,24 @@
+  * because a producer that ran out of slots cannot list everything. */
+ #define N2C_SUBMIT_FULL_MAINT (1u << 0)
+ 
++/* Job timing aggregated over a window; read and reset with n2c_timing_take().
++ * queue = submit -> first phase start (includes the pre-job clean),
++ * run = first phase start -> completion noticed by the poller (the GPU's own
++ * execution plus up to one polling interval), total = submit -> completion. */
++struct n2c_timing {
++        uint32_t jobs, faulted, full_jobs;
++        uint64_t sum_queue_us, sum_run_us, sum_total_us, sum_clean_us, sum_inval_us;
++        uint64_t sum_clean_pages, sum_inval_pages;
++        uint32_t max_queue_us, max_run_us, max_total_us, max_clean_us, max_inval_us;
++        uint64_t window_start_us;
++};
++
++/* Per-job times of a not yet reaped job (for wait-return lag accounting). */
++struct n2c_job_times {
++        uint64_t submit_us, start_us, end_us;
++        uint32_t clean_us, inval_us;
++};
++
+ struct n2c_stats {
+         uint64_t submitted, completed, faulted, cancelled, timeouts;
+         uint64_t resets, reset_failures, flush_failures;
+@@ -223,6 +247,7 @@
+         unsigned nr_quarantine;
+         uint32_t next_handle;
+         struct n2c_stats stats;
++        struct n2c_timing timing;
+         /* Rollback valve (boot-arg nord2_gpu_cache=1): maintain the whole
+          * context for every job, as before per-job scoping. */
+         bool full_cache_maint;
+@@ -274,6 +299,13 @@
+ /* Process hardware events and deadlines; never sleeps. */
+ void n2c_poll(struct n2c_core *c);
+ /* Query a job; a terminal job is consumed (record freed) when reap. */
++uint64_t n2c_now_us(struct n2c_core *c);
++/* Returns false (and leaves *out untouched) while the window holds no finished job or is
++ * younger than min_window_us; otherwise copies and resets the window. */
++bool n2c_timing_take(struct n2c_core *c, struct n2c_timing *out,
++                     uint64_t min_window_us);
++enum n2c_error n2c_job_get_times(struct n2c_core *c, unsigned ctx, uint64_t id,
++                             struct n2c_job_times *out);
+ enum n2c_error n2c_job_state(struct n2c_core *c, unsigned ctx, uint64_t id,
+                              bool reap, uint32_t *state, uint32_t *status);
+ /* Verified GPU reset and recovery (all contexts' AS reprogrammed). */
+--- a/gpu/src/nord2_gpu_core.c
++++ b/gpu/src/nord2_gpu_core.c
+@@ -24,6 +24,70 @@
+         return c->ops.now_ms(c->ctx);
+ }
+ 
++uint64_t n2c_now_us(struct n2c_core *c)
++{
++        return c->ops.now_us ? c->ops.now_us(c->ctx) : c->ops.now_ms(c->ctx) * 1000ull;
++}
++
++static void timing_note(struct n2c_core *c, const struct n2c_job *j, bool done)
++{
++        struct n2c_timing *t = &c->timing;
++        if (!t->jobs && !t->faulted)
++                t->window_start_us = j->t_submit_us;
++        if (!done) {
++                t->faulted++;
++                return;
++        }
++        uint64_t q = j->t_start_us >= j->t_submit_us ? j->t_start_us - j->t_submit_us : 0;
++        uint64_t r = j->t_end_us >= j->t_start_us ? j->t_end_us - j->t_start_us : 0;
++        uint64_t all = j->t_end_us >= j->t_submit_us ? j->t_end_us - j->t_submit_us : 0;
++#define N2C_ACC(sum, max, v) do { t->sum += (v); if ((v) > t->max) t->max = (uint32_t)((v) > 0xffffffffull ? 0xffffffffull : (v)); } while (0)
++        N2C_ACC(sum_queue_us, max_queue_us, q);
++        N2C_ACC(sum_run_us, max_run_us, r);
++        N2C_ACC(sum_total_us, max_total_us, all);
++        N2C_ACC(sum_clean_us, max_clean_us, (uint64_t)j->clean_us);
++        N2C_ACC(sum_inval_us, max_inval_us, (uint64_t)j->inval_us);
++#undef N2C_ACC
++        t->sum_clean_pages += j->clean_pages;
++        t->sum_inval_pages += j->inval_pages;
++        if (j->full_maint)
++                t->full_jobs++;
++        t->jobs++;
++}
++
++bool n2c_timing_take(struct n2c_core *c, struct n2c_timing *out,
++                     uint64_t min_window_us)
++{
++        if (!c || !out || (!c->timing.jobs && !c->timing.faulted))
++                return false;
++        uint64_t t = n2c_now_us(c);
++        if (t - c->timing.window_start_us < min_window_us)
++                return false;
++        *out = c->timing;
++        memset(&c->timing, 0, sizeof(c->timing));
++        out->window_start_us = t - out->window_start_us; /* window length */
++        return true;
++}
++
++enum n2c_error n2c_job_get_times(struct n2c_core *c, unsigned idx, uint64_t id,
++                             struct n2c_job_times *out)
++{
++        if (!c || !out || idx >= N2C_MAX_CTX || !id)
++                return N2C_E_ARGS;
++        for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
++                const struct n2c_job *j = &c->jobs[i];
++                if (j->state != N2C_JOB_FREE && j->id == id && j->ctx == idx) {
++                        out->submit_us = j->t_submit_us;
++                        out->start_us = j->t_start_us;
++                        out->end_us = j->t_end_us;
++                        out->clean_us = j->clean_us;
++                        out->inval_us = j->inval_us;
++                        return N2C_OK;
++                }
++        }
++        return N2C_E_NO_JOB;
++}
++
+ static struct n2c_ctx *ctx_at(struct n2c_core *c, unsigned idx)
+ {
+         if (idx >= N2C_MAX_CTX)
+@@ -387,6 +451,8 @@
+                  * its buffers only reaches those; any other job (legacy
+                  * ABI, a full list, the rollback valve) invalidates every
+                  * GPU-writable buffer of the context. */
++                j->t_end_us = n2c_now_us(c);
++                uint64_t before = c->stats.cache_inval_pages;
+                 if (j->full_maint) {
+                         for (unsigned i = 0; i < N2C_MAX_BOS; i++) {
+                                 struct n2c_bo *b = c->ctxs[j->ctx].bos[i];
+@@ -398,8 +464,12 @@
+                                 if (j->bos[i]->flags & N2C_BO_GPU_WRITE)
+                                         bo_cache_sync(c, j->bos[i], false);
+                 }
++                j->inval_pages = (uint32_t)(c->stats.cache_inval_pages - before);
++                j->inval_us = (uint32_t)(n2c_now_us(c) - j->t_end_us);
++                timing_note(c, j, true);
+                 c->stats.completed++;
+         } else if (state == N2C_JOB_FAULTED) {
++                timing_note(c, j, false);
+                 c->stats.faulted++;
+         } else if (state == N2C_JOB_CANCELLED) {
+                 c->stats.cancelled++;
+@@ -732,6 +802,7 @@
+         j->phase = need0 ? 0 : 1;
+         j->nr_bos = r->nr_handles;
+         j->write_mask = r->write_mask;
++        j->t_submit_us = n2c_now_us(c);
+         j->full_maint = c->full_cache_maint ||
+                         (r->flags & N2C_SUBMIT_FULL_MAINT) ||
+                         r->nr_handles >= N2C_JOB_BOS;
+@@ -796,6 +867,8 @@
+                  * chain reads); a raw chain that may reach unlisted buffers
+                  * (legacy ABI, full list, rollback valve) covers the entire
+                  * context. */
++                uint64_t t_clean = n2c_now_us(c);
++                uint64_t clean_before = c->stats.cache_clean_pages;
+                 if (pick->phase == 0 || pick->kind == N2C_JOB_FRAGMENT) {
+                         if (pick->full_maint) {
+                                 c->stats.cache_full_jobs++;
+@@ -810,6 +883,8 @@
+                                                 bo_cache_sync(c, pick->bos[i], true);
+                         }
+                 }
++                pick->clean_pages += (uint32_t)(c->stats.cache_clean_pages - clean_before);
++                pick->clean_us += (uint32_t)(n2c_now_us(c) - t_clean);
+                 enum n2hw_error e = n2hw_js_start(c->hw, slot,
+                         c->ctxs[pick->ctx].as, pick->heads[pick->phase],
+                         c->hw->shaders_on);
+@@ -821,6 +896,10 @@
+                         continue;
+                 }
+                 pick->slot = slot;
++                if (!pick->t_started) {
++                        pick->t_started = true;
++                        pick->t_start_us = n2c_now_us(c);
++                }
+                 pick->state = N2C_JOB_RUNNING;
+                 pick->started_ms = now(c);
+                 c->running[slot] = pick->id;
+--- a/shim/nord2-xnu/nord2_gpu_core.c
++++ b/shim/nord2-xnu/nord2_gpu_core.c
+@@ -24,6 +24,70 @@
+         return c->ops.now_ms(c->ctx);
+ }
+ 
++uint64_t n2c_now_us(struct n2c_core *c)
++{
++        return c->ops.now_us ? c->ops.now_us(c->ctx) : c->ops.now_ms(c->ctx) * 1000ull;
++}
++
++static void timing_note(struct n2c_core *c, const struct n2c_job *j, bool done)
++{
++        struct n2c_timing *t = &c->timing;
++        if (!t->jobs && !t->faulted)
++                t->window_start_us = j->t_submit_us;
++        if (!done) {
++                t->faulted++;
++                return;
++        }
++        uint64_t q = j->t_start_us >= j->t_submit_us ? j->t_start_us - j->t_submit_us : 0;
++        uint64_t r = j->t_end_us >= j->t_start_us ? j->t_end_us - j->t_start_us : 0;
++        uint64_t all = j->t_end_us >= j->t_submit_us ? j->t_end_us - j->t_submit_us : 0;
++#define N2C_ACC(sum, max, v) do { t->sum += (v); if ((v) > t->max) t->max = (uint32_t)((v) > 0xffffffffull ? 0xffffffffull : (v)); } while (0)
++        N2C_ACC(sum_queue_us, max_queue_us, q);
++        N2C_ACC(sum_run_us, max_run_us, r);
++        N2C_ACC(sum_total_us, max_total_us, all);
++        N2C_ACC(sum_clean_us, max_clean_us, (uint64_t)j->clean_us);
++        N2C_ACC(sum_inval_us, max_inval_us, (uint64_t)j->inval_us);
++#undef N2C_ACC
++        t->sum_clean_pages += j->clean_pages;
++        t->sum_inval_pages += j->inval_pages;
++        if (j->full_maint)
++                t->full_jobs++;
++        t->jobs++;
++}
++
++bool n2c_timing_take(struct n2c_core *c, struct n2c_timing *out,
++                     uint64_t min_window_us)
++{
++        if (!c || !out || (!c->timing.jobs && !c->timing.faulted))
++                return false;
++        uint64_t t = n2c_now_us(c);
++        if (t - c->timing.window_start_us < min_window_us)
++                return false;
++        *out = c->timing;
++        memset(&c->timing, 0, sizeof(c->timing));
++        out->window_start_us = t - out->window_start_us; /* window length */
++        return true;
++}
++
++enum n2c_error n2c_job_get_times(struct n2c_core *c, unsigned idx, uint64_t id,
++                             struct n2c_job_times *out)
++{
++        if (!c || !out || idx >= N2C_MAX_CTX || !id)
++                return N2C_E_ARGS;
++        for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
++                const struct n2c_job *j = &c->jobs[i];
++                if (j->state != N2C_JOB_FREE && j->id == id && j->ctx == idx) {
++                        out->submit_us = j->t_submit_us;
++                        out->start_us = j->t_start_us;
++                        out->end_us = j->t_end_us;
++                        out->clean_us = j->clean_us;
++                        out->inval_us = j->inval_us;
++                        return N2C_OK;
++                }
++        }
++        return N2C_E_NO_JOB;
++}
++
+ static struct n2c_ctx *ctx_at(struct n2c_core *c, unsigned idx)
+ {
+         if (idx >= N2C_MAX_CTX)
+@@ -387,6 +451,8 @@
+                  * its buffers only reaches those; any other job (legacy
+                  * ABI, a full list, the rollback valve) invalidates every
+                  * GPU-writable buffer of the context. */
++                j->t_end_us = n2c_now_us(c);
++                uint64_t before = c->stats.cache_inval_pages;
+                 if (j->full_maint) {
+                         for (unsigned i = 0; i < N2C_MAX_BOS; i++) {
+                                 struct n2c_bo *b = c->ctxs[j->ctx].bos[i];
+@@ -398,8 +464,12 @@
+                                 if (j->bos[i]->flags & N2C_BO_GPU_WRITE)
+                                         bo_cache_sync(c, j->bos[i], false);
+                 }
++                j->inval_pages = (uint32_t)(c->stats.cache_inval_pages - before);
++                j->inval_us = (uint32_t)(n2c_now_us(c) - j->t_end_us);
++                timing_note(c, j, true);
+                 c->stats.completed++;
+         } else if (state == N2C_JOB_FAULTED) {
++                timing_note(c, j, false);
+                 c->stats.faulted++;
+         } else if (state == N2C_JOB_CANCELLED) {
+                 c->stats.cancelled++;
+@@ -732,6 +802,7 @@
+         j->phase = need0 ? 0 : 1;
+         j->nr_bos = r->nr_handles;
+         j->write_mask = r->write_mask;
++        j->t_submit_us = n2c_now_us(c);
+         j->full_maint = c->full_cache_maint ||
+                         (r->flags & N2C_SUBMIT_FULL_MAINT) ||
+                         r->nr_handles >= N2C_JOB_BOS;
+@@ -796,6 +867,8 @@
+                  * chain reads); a raw chain that may reach unlisted buffers
+                  * (legacy ABI, full list, rollback valve) covers the entire
+                  * context. */
++                uint64_t t_clean = n2c_now_us(c);
++                uint64_t clean_before = c->stats.cache_clean_pages;
+                 if (pick->phase == 0 || pick->kind == N2C_JOB_FRAGMENT) {
+                         if (pick->full_maint) {
+                                 c->stats.cache_full_jobs++;
+@@ -810,6 +883,8 @@
+                                                 bo_cache_sync(c, pick->bos[i], true);
+                         }
+                 }
++                pick->clean_pages += (uint32_t)(c->stats.cache_clean_pages - clean_before);
++                pick->clean_us += (uint32_t)(n2c_now_us(c) - t_clean);
+                 enum n2hw_error e = n2hw_js_start(c->hw, slot,
+                         c->ctxs[pick->ctx].as, pick->heads[pick->phase],
+                         c->hw->shaders_on);
+@@ -821,6 +896,10 @@
+                         continue;
+                 }
+                 pick->slot = slot;
++                if (!pick->t_started) {
++                        pick->t_started = true;
++                        pick->t_start_us = n2c_now_us(c);
++                }
+                 pick->state = N2C_JOB_RUNNING;
+                 pick->started_ms = now(c);
+                 c->running[slot] = pick->id;
+--- a/gpu/tests/nord2_core_test.c
++++ b/gpu/tests/nord2_core_test.c
+@@ -8,7 +8,7 @@
+ struct model {
+  uint64_t time; unsigned owners, table_live, table_allocs, table_limit;
+  unsigned flushes, disables, resets, starts, stops, sync_in, sync_out;
+- unsigned sync_n; const void *sync_cpu[4096]; bool sync_to[4096];
++ unsigned sync_n; const void *sync_cpu[4096]; bool sync_to[4096]; uint64_t us_extra;
+  bool fail_flush, fail_disable, fail_config, fail_reset, fault_ready;
+  struct n2hw_mmu_fault fault;
+  struct n2hw_job_event event; bool event_ready;
+@@ -32,9 +32,11 @@
+ static bool alloc_host(void*c,size_t n,void**p){(void)c;*p=calloc(1,n);return *p!=NULL;}
+ static void free_host(void*c,void*p,size_t n){(void)c;(void)n;free(p);}
+ static void sync_page(void*c,uint64_t pa,void*p,size_t n,bool to){(void)c;(void)pa;CHECK(p && n==4096);if(to)m.sync_in++;else m.sync_out++;
+- if(m.sync_n<4096){m.sync_cpu[m.sync_n]=p;m.sync_to[m.sync_n]=to;m.sync_n++;}}
++ if(m.sync_n<4096){m.sync_cpu[m.sync_n]=p;m.sync_to[m.sync_n]=to;m.sync_n++;}
++ m.us_extra+=10;}
+ static void free_owner(void*c,void*p){(void)c;free(p);m.owners++;}
+ static uint64_t now(void*c){(void)c;return m.time;}
++static uint64_t now_us(void*c){(void)c;return m.time*1000+m.us_extra;}
+ enum n2hw_error n2hw_as_configure(struct n2hw*h,unsigned as,uint64_t root){(void)h;(void)as;CHECK(root);return m.fail_config?N2HW_E_AS_TIMEOUT:N2HW_OK;}
+ enum n2hw_error n2hw_as_flush(struct n2hw*h,unsigned as,uint64_t va,uint64_t n,bool mem){(void)h;(void)as;(void)va;(void)mem;CHECK(n);m.flushes++;return m.fail_flush?N2HW_E_AS_TIMEOUT:N2HW_OK;}
+ enum n2hw_error n2hw_as_disable(struct n2hw*h,unsigned as){(void)h;(void)as;m.disables++;return m.fail_disable?N2HW_E_AS_TIMEOUT:N2HW_OK;}
+@@ -50,7 +52,7 @@
+ static void init(void) {
+  memset(&m,0,sizeof(m));memset(&hw,0,sizeof(hw));hw.identified=hw.slots_valid=hw.l2_on=true;
+  hw.id.as_present=255;hw.id.shader_present=hw.shaders_on=1;hw.slot_fragment=0;hw.slot_compute=hw.slot_vertex_tiler=1;
+- struct n2c_ops ops={alloc_table,free_table,flush_table,alloc_host,free_host,sync_page,free_owner,now,NULL};
++ struct n2c_ops ops={alloc_table,free_table,flush_table,alloc_host,free_host,sync_page,free_owner,now,NULL,now_us};
+  CHECK(n2c_init(&core,&ops,&m,&hw));CHECK(n2c_start(&core)==N2C_OK);
+ }
+ static unsigned context(void){unsigned c;CHECK(n2c_ctx_open(&core,123,64ull<<20,false,&c)==N2C_OK);return c;}
+@@ -302,12 +304,44 @@
+  CHECK(n2c_bo_release(&core,ctx,hi)==N2C_OK && n2c_bo_release(&core,ctx,hp)==N2C_OK);CHECK(core.ctxs[ctx].wired==0 && core.ctxs[ctx].imported==0);
+  CHECK(n2c_ctx_close(&core,ctx)==N2C_OK);
+ }
++static void test_job_timing(void) {
++ /* 0089: per-job queue/run/total, clean/invalidate time and pages, job times, window take. */
++ init();unsigned c=context();uint32_t a;uint64_t va;
++ map_flags(c,2,N2C_BO_GPU_READ|N2C_BO_GPU_WRITE|N2C_BO_GPU_EXEC,&a,&va);
++ m.us_extra=100;
++ uint64_t id=submit_list(c,N2C_JOB_COMPUTE,1,&a,&va,1,0);   /* submit 100, clean 2 pages = 20 us, start 120 */
++ struct n2c_job_times jt;CHECK(n2c_job_get_times(&core,c,id,&jt)==N2C_OK);
++ CHECK(jt.submit_us==100 && jt.start_us==120 && jt.clean_us==20 && !jt.end_us);
++ m.us_extra+=400;complete(1);                                /* GPU ends at 520, invalidate 2 pages = 20 us */
++ CHECK(n2c_job_get_times(&core,c,id,&jt)==N2C_OK && jt.end_us==520 && jt.inval_us==20);
++ struct n2c_timing t;
++ CHECK(!n2c_timing_take(&core,&t,1000000));                 /* window too young: not consumed */
++ CHECK(n2c_timing_take(&core,&t,0));
++ CHECK(t.jobs==1 && t.faulted==0 && t.full_jobs==0);
++ CHECK(t.sum_queue_us==20 && t.max_queue_us==20 && t.sum_run_us==400 && t.max_run_us==400 && t.sum_total_us==420 && t.max_total_us==420);
++ CHECK(t.sum_clean_us==20 && t.sum_inval_us==20 && t.sum_clean_pages==2 && t.sum_inval_pages==2);
++ CHECK(t.window_start_us>=420);                              /* window length since the first submit */
++ CHECK(!n2c_timing_take(&core,&t,0));                       /* reset */
++ done(c,id);CHECK(n2c_job_get_times(&core,c,id,&jt)==N2C_E_NO_JOB);
++ /* faulted jobs are counted, never averaged into the run/queue sums */
++ m.us_extra=0;id=submit_list(c,N2C_JOB_COMPUTE,1,&a,&va,1,0);
++ m.event=(struct n2hw_job_event){.slot=1,.failed=true,.status=0x40};m.event_ready=true;n2c_poll(&core);
++ CHECK(n2c_timing_take(&core,&t,0) && t.jobs==0 && t.faulted==1 && t.sum_run_us==0);
++ {uint32_t st,ss;CHECK(n2c_job_state(&core,c,id,true,&st,&ss)==N2C_OK && st==N2C_JOB_FAULTED);}
++ /* full-maintenance jobs are tagged */
++ id=submit_list(c,N2C_JOB_COMPUTE,1,&a,&va,1,N2C_SUBMIT_FULL_MAINT);complete(1);done(c,id);
++ CHECK(n2c_timing_take(&core,&t,0) && t.jobs==1 && t.full_jobs==1);
++ /* no microsecond clock: milliseconds are scaled */
++ core.ops.now_us=NULL;m.time=7;CHECK(n2c_now_us(&core)==7000);
++ CHECK(n2c_job_get_times(&core,c,12345,&jt)==N2C_E_NO_JOB && n2c_job_get_times(&core,99,1,&jt)==N2C_E_ARGS);
++ CHECK(n2c_ctx_close(&core,c)==N2C_OK);
++}
+ int main(int argc,char**argv) {
+  if(argc>1 && !strcmp(argv[1],"quarantine")){test_quarantine_close();return 0;}
+  if(argc>1 && !strcmp(argv[1],"partial")){test_partial_map_failure();return 0;}
+  test_reuse();test_render_order();test_quarantine_close();test_partial_map_failure();test_close_running();test_open_failure();
+  test_allocation_failure_matrix();test_full_map_flush_failure();test_quarantine_overflow();test_wide_reclaim();
+  test_unlisted_buffer();test_failed_open_pins();test_stop_ack();test_fault_failed_reset_pins();test_imported_accounting();
+- test_scoped_cache_maintenance();test_full_list_is_not_trusted();test_context_limit_384();
+- puts("core: 18 lifetime/ordering/failure scenarios incl. 1024 reuse cycles PASS (hardware model)");return 0;
++ test_scoped_cache_maintenance();test_full_list_is_not_trusted();test_context_limit_384();test_job_timing();
++ puts("core: 19 lifetime/ordering/failure scenarios incl. 1024 reuse cycles PASS (hardware model)");return 0;
+ }

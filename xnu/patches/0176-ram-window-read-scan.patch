@@ -1,0 +1,38 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -86,6 +86,26 @@
+ #define N2BC_SLOTS 256u
+ static volatile uint32_t *n2bc;
+ static uint32_t n2bc_idx;
++extern "C" void nord2_bc(unsigned tag, unsigned a, unsigned bval);
++static uint64_t now_ms_abs() { uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns / 1000000ull; }
++/* 0176: read test of the whole RAM window.  The crashes (p69-p76) are hard resets with no panic text, always after minutes of heavy use when the allocator has reached most of the window;
++ * if a physical range inside the window is not readable (memory protection, wrong size), the first touch kills the SoC.  45 s after boot one 8-byte read per 16 KiB page of
++ * [gPhysBase, gPhysBase + gPhysSize) through the physmap, progress in the breadcrumbs (tag 0x30: pa low, pa high) and in the log every 256 MiB.  Boot-arg n2memscan=0 disables it. */
++extern "C" vm_offset_t phystokv(uint64_t pa);
++static void n2_memscan(void *, wait_result_t) {
++        IOSleep(45000);
++        uint64_t base = gPhysBase, size = gPhysSize, step = 16384, nextlog = base + (256ull << 20), t0 = now_ms_abs();
++        IOLog("NORD2 MEMSCAN: start pa %#llx + %llu MiB\n", base, size >> 20);
++        for (uint64_t pa = base; pa + step <= base + size; pa += step) {
++                if (!(pa & ((64ull << 20) - 1)) || pa == base) nord2_bc(0x30, (unsigned)pa, (unsigned)(pa >> 32));
++                volatile uint64_t *v = (volatile uint64_t *)phystokv(pa);
++                (void)*v;
++                if (pa >= nextlog) { IOLog("NORD2 MEMSCAN: read ok up to %#llx\n", pa); nextlog += 256ull << 20; IOSleep(1); }
++        }
++        IOLog("NORD2 MEMSCAN: whole window read ok in %llu ms\n", now_ms_abs() - t0);
++        nord2_bc(0x31, 0, 0);
++        thread_terminate(current_thread());
++}
+ /* 0169: persistent last-log ring.  The USB capture and the 4 MiB live stream die with the phone; a crash (p69) left no trace.  Two alternating 256 KiB rings in the unused Android
+  * pstore area (0x48090000, 0x480D0000; the pmsg ring at 0x48160000 is separate) get a copy of the live stream every 100 ms.  The next boot prints the tail of the newest ring as
+  * "NORD2 PREV:" lines, so whatever the previous boot said last is in the capture.  Header: magic, boot_seq, wpos (total bytes written, wraps in the data area), cap (data bytes). */
+@@ -172,6 +192,8 @@
+         n2lr_wr(n2lr_cur, 0, N2LR_MAGIC);
+         uint32_t info[2] = {0, 0}; nord2_log_stream_info(info);
+         n2lr_off = info[1] > 16384 ? info[1] - 16384 : 0;   /* a little context of this boot, then everything new */
++        {   int ms = 1; PE_parse_boot_argn("n2memscan", &ms, sizeof(ms)); thread_t th;
++                if (ms == 1 && kernel_thread_start((thread_continue_t)n2_memscan, NULL, &th) == KERN_SUCCESS) thread_deallocate(th); }
+         n2lr_loop = IOWorkLoop::workLoop();
+         n2lr_timer = IOTimerEventSource::timerEventSource(owner, n2lr_tick);
+         if (n2lr_loop && n2lr_timer && n2lr_loop->addEventSource(n2lr_timer) == kIOReturnSuccess) {

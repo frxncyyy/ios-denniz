@@ -1,0 +1,456 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -66,6 +66,9 @@
+ #define SWEET_FB_DSI_INTSTA        0x0cu
+ #define SWEET_FB_DSI_FRAME_DONE    (1u << 4)
+ #define SWEET_FB_DSI_BUSY          (1u << 31)
++#define SWEET_FB_DSI_TE_RDY        (1u << 2)
++#define SWEET_FB_DSI_CMD_DONE      (1u << 1)
++#define SWEET_FB_PANEL_HZ_DEFAULT  90u
+ #define SWEET_FB_MUTEX_EN0         0x20u
+ /* OVL 2L layer 0 of both pipes (osfmk/arm64/sweet_early.c nord2_display_overlay_init verified the same registers). */
+ #define SWEET_FB_OVL0_2L           0x14001000UL
+@@ -171,7 +174,7 @@
+ 	IOTimerEventSource *fPresentTimer;
+ 	uint8_t            *fWorkRec;            /* the swap being presented */
+ 	sweet_fb_pending_surfaces fWorkSurfaces;
+-	uint8_t             fPState;             /* 0 idle, 1 copy pending, 2 panel transfer in flight, 3 scan probe transfer, 4 scan probe hold */
++	uint8_t             fPState;             /* 0 idle, 1 copy pending, 2 panel transfer in flight, 3 scan probe transfer, 4 scan probe hold, 5 waiting for the GPU, 6 waiting for the panel TE */
+ 	uint32_t            fBusyTicks;
+ 	void               *fBusyLastObj;        /* 0148: newest-swap surface at the previous skip, skips in the current run, diagnostic log count */
+ 	uint32_t            fBusyRun, fBusyLogN;
+@@ -182,6 +185,9 @@
+ 	/* 0154: panel link rate. The bootloader leaves MIPI TX0 at 600 Mbps/lane (PCW 92.31, POSDIV 2); the transfer (~11 ms) is link bound
+ 	 * (ansuz: 6.9 ms at 934 Mbps on the same DSI IP).  Raised to 900 Mbps (= the Android 90 Hz mode's 1.5x) once, with the D-PHY timing counts scaled. */
+ 	volatile uint32_t  *fTx;
++	uint32_t            fPanelHz, fVsyncUs;       /* 0155: 90 (default) or 60 */
++	uint64_t            fWaitStartUs, fTeStartUs, fTeOffUntilUs;
++	uint8_t             fModeState;               /* 0 panel still at its boot mode, 1 switched to 90 Hz, 2 refused / failed */
+ 	uint8_t             fRetuneState;        /* 0 not yet, 1 raised, 2 done / refused / reverted */
+ 	uint32_t            fRetunePresents, fSaveCon0, fSaveTim[4];
+ 	uint64_t            fNextTick, fPeriodAbs;
+@@ -199,6 +205,9 @@
+ 	void        presentDone(bool shown, bool timeout, bool legacy);
+ 	void        dumpDisplayRegs(void);
+ 	void        linkRetune(bool up);
++	void        handOver(uint64_t count);
++	bool        dsiDcs(const uint8_t *p, unsigned n);
++	bool        panelRefresh(bool hz90);
+ 	bool        xferStart(void);
+ 	bool        xferDone(void);
+ 	/* SwapWait / swap retirement (boot-arg n2swait, sweet_fb_swapwait.h).  fRetire, fLateSurfaces: fLock. */
+@@ -321,7 +330,14 @@
+ 	/* sweetfb_hz=<n> (0/60+ = every vsync); short alias n2fbhz for the full UI command line (600/607 characters). */
+ 	if (!PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz))) { (void)PE_parse_boot_argn("n2fbhz", &hz, sizeof(hz)); }
+ 	fFlushTicks = sweet_fb_flush_ticks(hz);
+-	nanoseconds_to_absolutetime(SWEET_FB_VSYNC_US * 1000ULL, &fPeriodAbs);
++	fPanelHz = SWEET_FB_PANEL_HZ_DEFAULT;
++	{
++		uint32_t phz = 0;
++		if (PE_parse_boot_argn("n2panelhz", &phz, sizeof(phz)) && (phz == 60 || phz == 90)) { fPanelHz = phz; }
++		if (fFlushTicks > 1) { fPanelHz = 60; }      /* a reduced present rate keeps the 60 Hz tick grid */
++	}
++	fVsyncUs = fPanelHz == 90 ? 11111 : SWEET_FB_VSYNC_US;
++	nanoseconds_to_absolutetime(fVsyncUs * 1000ULL, &fPeriodAbs);
+ 	/* n2swait=<0|1|2>: SwapWait semantics (0 = as before: always success, calls logged). */
+ 	{
+ 		uint32_t level = 0;
+@@ -334,7 +350,7 @@
+ 	/* CoreAnimation follows a timer, not our vsync notifications: tell it the rate the panel really shows (reference 0123).
+ 	 * Published before registerService() so backboardd finds it when it opens the display. */
+ 	{
+-		uint32_t interval = sweet_fb_refresh_interval(fFlushTicks);
++		uint32_t interval = fPanelHz == 90 ? (uint32_t)(((1ULL << 32) + 45) / 90) : sweet_fb_refresh_interval(fFlushTicks);
+ 		if (interval != 0) {
+ 			OSDictionary *refresh = OSDictionary::withCapacity(1);
+ 			OSNumber *num = OSNumber::withNumber((unsigned long long)interval, 32);
+@@ -342,7 +358,7 @@
+ 				refresh->setObject("displayMinRefreshInterval", num);
+ 				setProperty("IOMFBDisplayRefresh", refresh);
+ 				IOLog("NORD2 FB: IOMFBDisplayRefresh.displayMinRefreshInterval %u (1/%u s): CoreAnimation follows the %u Hz panel rate\n",
+-				    interval, 60 / fFlushTicks, 60 / fFlushTicks);
++				    interval, fPanelHz == 90 ? 90 : 60 / fFlushTicks, fPanelHz == 90 ? 90 : 60 / fFlushTicks);
+ 			}
+ 			OSSafeReleaseNULL(num);
+ 			OSSafeReleaseNULL(refresh);
+@@ -378,7 +394,7 @@
+ 	}
+ #endif
+ 	sweet_fb_stats_reset(&fStats, 0);
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	fVsync->setTimeoutUS(fVsyncUs);
+ 	IOLog("SWEET FB: panel present rate %u Hz (every %u vsyncs), present thread, %s transfer, SwapWait level %u\n", hz, fFlushTicks,
+ 	    (fDsi != NULL && fMutex != NULL) ? "polled" : "blocking", fSwapWaitLevel);
+ 
+@@ -443,25 +459,6 @@
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+-#if defined(NORD2)
+-	/* 0150: with 0149 a frame starts its panel copy a few ms after the tick and finishes right around the next one; a presenter that is only
+-	 * just finishing would make this tick skip the new swap for a whole period (30 fps).  Clients have their vsync already: give it a few ms. */
+-	{
+-		uint8_t st = __atomic_load_n(&fb->fPState, __ATOMIC_ACQUIRE);
+-		if (fb->fDirty && (st == 1 || st == 2)) {
+-			IOLockUnlock(fb->fLock);
+-			uint64_t w0 = mach_absolute_time(), waited = 0;
+-			while ((st == 1 || st == 2) && waited < SWEET_FB_PRES_WAIT_US) {
+-				IOSleep(1);
+-				st = __atomic_load_n(&fb->fPState, __ATOMIC_ACQUIRE);
+-				waited = sweet_fb_abs_to_us(mach_absolute_time() - w0);
+-			}
+-			IOLockLock(fb->fLock);
+-			fb->fStats.pres_waits++;
+-			if (st == 0) { fb->fStats.pres_wait_ok++; }
+-		}
+-	}
+-#endif
+ 	if (fb->fPowerOff) {
+ 		if (fb->fDiag.enabled) { __atomic_fetch_add(&fb->fDiag.off, 1, __ATOMIC_RELAXED); }
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+@@ -484,109 +481,47 @@
+ 		if (diag_report) { fb->reportDiagnostics("timer-off"); }
+ 		return;
+ 	}
+-	/* A new frame is handed over only when the presenter is idle (newest swap wins; nothing queues behind a copy). */
+-	bool flush = fb->fDirty && fb->fPState == 0 && sweet_fb_flush_due(count, fb->fFlushTicks);
+-	uint8_t *rec = NULL;
+-	sweet_fb_pending_surfaces surfaces;
+-	sweet_fb_pending_surfaces_init(&surfaces);
+-	if (flush) {
+-		if (fb->fDiag.enabled) { __atomic_fetch_add(&fb->fDiag.flushes, 1, __ATOMIC_RELAXED); }
+-		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+-		if (rec != NULL) {
+-			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+-			/* Take the references captured at SwapEnd for this record. */
+-			if (sweet_fb_swap_lifecycle_take(&fb->fSwapLifecycle, &surfaces)) {
+-				fb->fDirty = false;
+-				sweet_fb_retire_take(&fb->fRetire);
+-			} else {
+-				IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+-				rec = NULL;
+-			}
+-		} else if (fb->fDiag.enabled) {
+-			__atomic_fetch_add(&fb->fDiag.alloc_failed, 1, __ATOMIC_RELAXED);
+-		}
+-	}
+ 	IOLockUnlock(fb->fLock);
+-	if (rec != NULL) {
+-		/* Present only GPU-complete surfaces: while the GPU still writes one, the previous complete frame stays on
+-		 * the panel (this swap goes back to the queue), but never longer than SWEET_FB_BUSY_MAX_TICKS. */
+-		bool busy = false;
+-		void *busyObj = NULL;
+-		for (uint32_t layer = 0; layer < SWEET_FB_LAYERS && !busy; layer++) {
+-			if (surfaces.object[layer] != NULL && nord2_gpu_surface_busy(surfaces.object[layer])) { busy = true; busyObj = surfaces.object[layer]; }
+-		}
+-#if defined(NORD2)
+-		/* 0149: CA submits a frame right after the vsync notification and the swap arrives with its jobs a few ms from done, so at this tick the newest
+-		 * swap is practically always still in flight; skipping it to the next tick lets the following frame replace it (newest swap wins) and the panel
+-		 * starves (one forced present per SWEET_FB_BUSY_MAX_TICKS+1 ticks).  The clock was re-armed on its grid above, so waiting here is free: give the
+-		 * GPU a few ms to finish this very swap, then decide as before. */
+-		if (busy) {
+-			uint64_t w0 = mach_absolute_time(), waited = 0;
+-			while (busy && waited < SWEET_FB_BUSY_WAIT_US) {
+-				IOSleep(1);
+-				busy = false; busyObj = NULL;
+-				for (uint32_t layer = 0; layer < SWEET_FB_LAYERS && !busy; layer++) {
+-					if (surfaces.object[layer] != NULL && nord2_gpu_surface_busy(surfaces.object[layer])) { busy = true; busyObj = surfaces.object[layer]; }
+-				}
+-				waited = sweet_fb_abs_to_us(mach_absolute_time() - w0);
+-			}
+-			fb->fStats.busy_waits++; fb->fStats.busy_wait_us += waited;
+-			if (!busy) { fb->fStats.busy_wait_ok++; }
+-		}
+-#endif
+-		int decision = sweet_fb_busy_decision(busy, &fb->fBusyTicks, SWEET_FB_BUSY_MAX_TICKS);
+-#if defined(NORD2)
+-		/* 0148 (diagnostic): is it the same surface that stays busy, or a new swap with a new busy surface at every tick; and what holds it. */
+-		if (decision == SWEET_FB_BUSY_PRESENT) {
+-			fb->fBusyRun = 0; fb->fBusyLastObj = NULL;
+-		} else {
+-			if (busyObj == fb->fBusyLastObj) { fb->fStats.busy_same++; } else { fb->fStats.busy_diff++; }
+-			fb->fBusyLastObj = busyObj;
+-			fb->fBusyRun++;
+-			if (fb->fBusyRun > fb->fStats.busy_maxrun) { fb->fStats.busy_maxrun = fb->fBusyRun; }
+-			if ((fb->fBusyRun == 1 || decision == SWEET_FB_BUSY_FORCE) && (fb->fBusyLogN < 120 || (fb->fBusyLogN & 15) == 0)) {
+-				uint32_t match, inflight, queued, resv, state; uint64_t age, jid;
+-				nord2_gpu_surface_busy_why(busyObj, &match, &age, &jid, &state, &inflight, &queued, &resv);
+-				IOLog("NORD2 FB BUSYWHY: %s surf=%u run=%u jobs_on_surface=%u oldest_job=%llu state=%u age_ms=%llu inflight=%u queued=%u resv=%u\n",
+-				    decision == SWEET_FB_BUSY_FORCE ? "force" : "start", busyObj ? ((SweetSurface *)busyObj)->id : 0, fb->fBusyRun, match, jid, state,
+-				    age / 1000, inflight, queued, resv);
+-			}
+-			if (fb->fBusyRun == 1 || decision == SWEET_FB_BUSY_FORCE) { fb->fBusyLogN++; }
+-			if (decision == SWEET_FB_BUSY_FORCE) { fb->fBusyRun = 0; }
+-		}
+-#endif
+-		if (decision == SWEET_FB_BUSY_SKIP) {
+-			__atomic_fetch_add(&fb->fStats.busy_skips, 1, __ATOMIC_RELAXED);
+-			IOLockLock(fb->fLock);
+-			bool requeued = sweet_fb_swap_lifecycle_requeue(&fb->fSwapLifecycle, fb->fDirty, &surfaces);
+-			if (requeued) {
+-				fb->fDirty = true;
+-			}
+-			sweet_fb_retire_requeue(&fb->fRetire, requeued);
+-			IOLockUnlock(fb->fLock);
+-			IOLockWakeup(fb->fLock, &fb->fRetireEvent, false);
+-			IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+-			rec = NULL;
+-		} else if (decision == SWEET_FB_BUSY_FORCE) {
+-			__atomic_fetch_add(&fb->fStats.busy_forced, 1, __ATOMIC_RELAXED);
+-		}
+-	}
+-	if (rec != NULL) {
+-		IOLockLock(fb->fLock);
+-		fb->fWorkRec = rec;
+-		fb->fWorkSurfaces = surfaces;
+-		sweet_fb_pending_surfaces_init(&surfaces);      /* ownership moved to the present thread */
+-		fb->fPState = 1;
+-		IOLockUnlock(fb->fLock);
+-		IOLockWakeup(fb->fLock, &fb->fRetireEvent, false);        /* mode 1/2 waiters: the swap is no longer waiting */
+-		fb->fPresentTimer->setTimeoutUS(1);
+-	}
++	/* 0155: the tick is only the fallback; swaps and a finished present hand over at once (handOver() also takes the GPU wait and the TE wait off this thread). */
++	if (sweet_fb_flush_due(count, fb->fFlushTicks)) { fb->handOver(count); }
+ 	fb->reapLate();
+-	/* Whatever the requeue did not take is released here (empty after a hand-over). */
+-	sweet_fb_pending_surfaces_release(&surfaces, sweet_fb_release_surface);
+ 	if (diag_report) { fb->reportDiagnostics("timer-on"); }
+ }
+ 
++/* Takes the newest swap if the presenter is idle and starts it on the present thread (state 5: wait for the GPU, then copy, TE wait, transfer). */
++void
++AppleCLCD::handOver(uint64_t count)
++{
++	(void)count;
++	if (fPresentTimer == NULL) { return; }
++	IOLockLock(fLock);
++	if (fPowerOff || fPState != 0 || !fDirty) { IOLockUnlock(fLock); return; }
++	if (fDiag.enabled) { __atomic_fetch_add(&fDiag.flushes, 1, __ATOMIC_RELAXED); }
++	uint8_t *rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++	if (rec == NULL) {
++		if (fDiag.enabled) { __atomic_fetch_add(&fDiag.alloc_failed, 1, __ATOMIC_RELAXED); }
++		IOLockUnlock(fLock);
++		return;
++	}
++	memcpy(rec, fPending, SWEET_FB_SWAP_REC_SIZE);
++	sweet_fb_pending_surfaces surfaces;
++	sweet_fb_pending_surfaces_init(&surfaces);
++	if (!sweet_fb_swap_lifecycle_take(&fSwapLifecycle, &surfaces)) {
++		IOLockUnlock(fLock);
++		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++		return;
++	}
++	fDirty = false;
++	sweet_fb_retire_take(&fRetire);
++	fWorkRec = rec;
++	fWorkSurfaces = surfaces;
++	fWaitStartUs = sweet_fb_abs_to_us(mach_absolute_time());
++	fPState = 5;
++	IOLockUnlock(fLock);
++	IOLockWakeup(fLock, &fRetireEvent, false);        /* mode 1/2 waiters: the swap is no longer waiting */
++	fPresentTimer->setTimeoutUS(1);
++}
++
+ /* Panel transfer without spinning: start it here, poll for frame-done on the next present-thread wakeup.
+  * Same register sequence as nord2_display_refresh() (osfmk/arm64/sweet_early.c), which has already run once
+  * (overlay removal, display ownership) before this path is used. */
+@@ -628,13 +563,25 @@
+ 	if (fb->fPState == 0) { return; }
+ 	if (__atomic_load_n(&fb->fSwapLifecycle.stopped, __ATOMIC_ACQUIRE)) {
+ #if defined(NORD2)
+-		if (fb->fPState >= 3) { fb->scanStep(SWEET_FB_SCAN_EV_STOP); }
++		if (fb->fPState == 3 || fb->fPState == 4) { fb->scanStep(SWEET_FB_SCAN_EV_STOP); }
+ #endif
+ 		fb->presentDone(false, false, false);
+ 		return;
+ 	}
+ #if defined(NORD2)
+-	if (fb->fPState >= 3) { fb->scanPoll(sender); return; }
++	if (fb->fPState == 5) {
++		/* 0155: the swap is presented when the GPU is done with it (polled here, not on the vsync thread); after SWEET_FB_BUSY_WAIT_US anyway */
++		bool busy = false;
++		for (uint32_t layer = 0; layer < SWEET_FB_LAYERS && !busy; layer++) {
++			if (fb->fWorkSurfaces.object[layer] != NULL && nord2_gpu_surface_busy(fb->fWorkSurfaces.object[layer])) { busy = true; }
++		}
++		uint64_t waited = sweet_fb_abs_to_us(mach_absolute_time()) - fb->fWaitStartUs;
++		if (busy && waited < SWEET_FB_BUSY_WAIT_US) { sender->setTimeoutUS(250); return; }
++		fb->fStats.busy_waits++; fb->fStats.busy_wait_us += waited;
++		if (!busy) { fb->fStats.busy_wait_ok++; } else { __atomic_fetch_add(&fb->fStats.busy_forced, 1, __ATOMIC_RELAXED); }
++		fb->fPState = 1;
++	}
++	if (fb->fPState == 3 || fb->fPState == 4) { fb->scanPoll(sender); return; }
+ 	if (fb->fPState == 1 && sweet_fb_scan_due(fb->fScanState, fb->fNbReady, fb->fPresents,
+ 	    sweet_fb_abs_to_us(mach_absolute_time()) / 1000, fb->fFirstPresentMs)) {
+ 		if (fb->scanBegin(sender)) { return; }      /* probe frame in flight; otherwise present normally below */
+@@ -670,6 +617,14 @@
+ 			}
+ 			fb->fHashLast = h; fb->fHashHave = true;
+ 		}
++		if (fb->fNbReady && fb->fDsi != NULL && sweet_fb_abs_to_us(t1) >= fb->fTeOffUntilUs && !(fb->fDsi[SWEET_FB_DSI_INTSTA / 4] & SWEET_FB_DSI_BUSY)) {
++			/* 0155: the transfer starts at the panel's next TE (the scan then stays behind the write: no tear lines) */
++			fb->fDsi[SWEET_FB_DSI_INTSTA / 4] = ~SWEET_FB_DSI_TE_RDY;
++			fb->fTeStartUs = sweet_fb_abs_to_us(mach_absolute_time());
++			fb->fPState = 6;
++			sender->setTimeoutUS(200);
++			return;
++		}
+ 		if (fb->fNbReady && fb->xferStart()) {
+ 			fb->fXferStart = t1;
+ 			fb->fPState = 2;
+@@ -688,6 +643,27 @@
+ #endif
+ 		return;
+ 	}
++#if defined(NORD2)
++	if (fb->fPState == 6) {
++		uint64_t nowUs = sweet_fb_abs_to_us(mach_absolute_time());
++		uint64_t waited = nowUs - fb->fTeStartUs;
++		bool te = (fb->fDsi[SWEET_FB_DSI_INTSTA / 4] & SWEET_FB_DSI_TE_RDY) != 0;
++		if (!te && waited < SWEET_FB_TE_WAIT_US) { sender->setTimeoutUS(200); return; }
++		if (!te) { fb->fStats.te_miss++; fb->fTeOffUntilUs = nowUs + 1000000; }
++		fb->fStats.te_waits++; fb->fStats.te_wait_us += waited;
++		if (waited > fb->fStats.te_wait_max) { fb->fStats.te_wait_max = (uint32_t)waited; }
++		if (fb->xferStart()) {
++			fb->fXferStart = mach_absolute_time();
++			fb->fPState = 2;
++			sender->setTimeoutUS(SWEET_FB_XFER_POLL_US);
++			return;
++		}
++		int done = nord2_display_refresh();      /* engine busy at the TE: the blocking path */
++		fb->fXferStart = mach_absolute_time();
++		fb->presentDone(true, !done, true);
++		return;
++	}
++#endif
+ 	uint64_t elapsed = sweet_fb_abs_to_us(mach_absolute_time() - fb->fXferStart);
+ 	int st = sweet_fb_xfer_state(fb->xferDone(), elapsed);
+ 	if (st == SWEET_FB_XFER_WAIT) {
+@@ -786,6 +762,62 @@
+ #endif
+ }
+ 
++/* 0155: one DCS packet over the DSI command queue, in LP, between two frames (engine idle).  CMDQ0 normally holds the write_memory_start
++ * header the frame trigger sends (0x002c3909, size 1): saved and put back. */
++bool
++AppleCLCD::dsiDcs(const uint8_t *p, unsigned n)
++{
++#if defined(NORD2)
++	if (fDsi == NULL || n == 0 || n > 8) { return false; }
++	if (fDsi[SWEET_FB_DSI_INTSTA / 4] & SWEET_FB_DSI_BUSY) { return false; }
++	uint32_t saved0 = fDsi[0x200 / 4], savedSize = fDsi[0x60 / 4];
++	uint32_t size;
++	if (n <= 2) {
++		fDsi[0x200 / 4] = ((uint32_t)p[0] << 16) | ((n == 1 ? 0x05u : 0x15u) << 8) | (n == 2 ? ((uint32_t)p[1] << 24) : 0u);
++		size = 1;
++	} else {
++		fDsi[0x200 / 4] = ((uint32_t)n << 16) | (0x39u << 8) | 2u;
++		for (unsigned i = 0; i < n; i += 4) {
++			uint32_t w = 0;
++			for (unsigned k = 0; k < 4 && i + k < n; k++) { w |= (uint32_t)p[i + k] << (8 * k); }
++			fDsi[(0x204 + i) / 4] = w;
++		}
++		size = 1 + (n + 3) / 4;
++	}
++	fDsi[0x60 / 4] = size;
++	fDsi[SWEET_FB_DSI_INTSTA / 4] = ~SWEET_FB_DSI_CMD_DONE;
++	__asm__ volatile("dsb sy" ::: "memory");
++	fDsi[SWEET_FB_DSI_START / 4] = 0;
++	__asm__ volatile("dsb sy" ::: "memory");
++	fDsi[SWEET_FB_DSI_START / 4] = 1;
++	bool ok = false;
++	for (unsigned i = 0; i < 100; i++) {          /* up to 10 ms */
++		if ((fDsi[SWEET_FB_DSI_INTSTA / 4] & SWEET_FB_DSI_CMD_DONE) && !(fDsi[SWEET_FB_DSI_INTSTA / 4] & SWEET_FB_DSI_BUSY)) { ok = true; break; }
++		IODelay(100);
++	}
++	fDsi[0x200 / 4] = saved0;
++	fDsi[0x60 / 4] = savedSize;
++	fDsi[SWEET_FB_DSI_INTSTA / 4] = ~SWEET_FB_DSI_CMD_DONE;
++	__asm__ volatile("dsb sy" ::: "memory");
++	return ok;
++#else
++	(void)p; (void)n;
++	return false;
++#endif
++}
++
++/* The panel's own refresh switch (AMS643YE05, from the Android panel table): F0 5A 5A, 60 08 00 (90 Hz) / 60 00 00 (60 Hz), F7 0F, F0 A5 A5. */
++bool
++AppleCLCD::panelRefresh(bool hz90)
++{
++	static const uint8_t unlock[] = { 0xF0, 0x5A, 0x5A }, lock[] = { 0xF0, 0xA5, 0xA5 }, apply[] = { 0xF7, 0x0F };
++	const uint8_t rate[] = { 0x60, (uint8_t)(hz90 ? 0x08 : 0x00), 0x00 };
++	bool ok = dsiDcs(unlock, 3) && dsiDcs(rate, 3) && dsiDcs(apply, 2);
++	bool locked = dsiDcs(lock, 3);
++	IOLog("NORD2 FB PANEL: refresh switch to %u Hz %s (lock %s)\n", hz90 ? 90 : 60, ok ? "sent" : "FAILED", locked ? "ok" : "FAILED");
++	return ok && locked;
++}
++
+ void
+ AppleCLCD::presentDone(bool shown, bool timeout, bool legacy)
+ {
+@@ -793,9 +825,15 @@
+ #if defined(NORD2)
+ 	/* 0154: the presenter still owns the engine here (fPState != 0), the link is idle */
+ 	if (shown && !legacy) {
+-		if (fRetuneState == 0 && fPresents > 400 && !timeout) { linkRetune(true); }
++		if (fRetuneState == 0 && fPresents > 30 && !timeout) {
++			linkRetune(true);
++			if (fRetuneState == 1 && fPanelHz == 90 && fModeState == 0) { fModeState = panelRefresh(true) ? 1 : 2; }
++		}
+ 		else if (fRetuneState == 1 && fPresents - fRetunePresents < 40 && fDsi != NULL &&
+-		    (timeout || xfer > 30000 || (fDsi[SWEET_FB_DSI_INTSTA / 4] & (1u << 12)))) { linkRetune(false); }
++		    (timeout || xfer > 30000 || (fDsi[SWEET_FB_DSI_INTSTA / 4] & (1u << 12)))) {
++			if (fModeState == 1) { (void)panelRefresh(false); fModeState = 2; }
++			linkRetune(false);
++		}
+ 	}
+ #endif
+ 	IOLockLock(fLock);
+@@ -820,6 +858,7 @@
+ 	/* Safe to release only after the layer copy and the panel transfer are done. */
+ 	sweet_fb_pending_surfaces_release(&surfaces, sweet_fb_release_surface);
+ 	if (!shown) { return; }
++	if (fFlushTicks <= 1) { handOver(0); }       /* 0155: the next swap, if one is waiting, starts now instead of at the next tick */
+ 	if (fPresents++ == 0) { fFirstPresentMs = sweet_fb_abs_to_us(mach_absolute_time()) / 1000; }
+ 	static unsigned logged;
+ 	if (logged < 8) {
+@@ -839,8 +878,9 @@
+ 		    fArrBin[0], fArrBin[1], fArrBin[2], fArrBin[3], fArrBin[4], fLatBin[0], fLatBin[1], fLatBin[2], fLatBin[3], fLatBin[4]);
+ 		for (unsigned i = 0; i < 5; i++) { fArrBin[i] = 0; fLatBin[i] = 0; }
+ 		if (!fRegsDumped && fPresents > 200) { fRegsDumped = true; dumpDisplayRegs(); }
+-		IOLog("NORD2 FB WAITS: busy_waits=%u ok=%u avg_us=%llu presenter_waits=%u ok=%u\n", fStats.busy_waits, fStats.busy_wait_ok,
+-		    fStats.busy_waits ? fStats.busy_wait_us / fStats.busy_waits : 0ULL, fStats.pres_waits, fStats.pres_wait_ok);
++		IOLog("NORD2 FB WAITS: gpu_waits=%u ok=%u avg_us=%llu te_waits=%u te_miss=%u te_avg_us=%llu te_max_us=%u panel_hz=%u mode=%u link=%u\n", fStats.busy_waits, fStats.busy_wait_ok,
++		    fStats.busy_waits ? fStats.busy_wait_us / fStats.busy_waits : 0ULL, fStats.te_waits, fStats.te_miss,
++		    fStats.te_waits ? fStats.te_wait_us / fStats.te_waits : 0ULL, fStats.te_wait_max, fPanelHz, fModeState, fRetuneState);
+ 		IOLog("NORD2 FB SEEN: presents=%u different=%u same=%u gaps_ms<=20/34/67/100/more=%u/%u/%u/%u/%u max_gap_ms=%llu\n", fStats.n, fDistinct, fSame,
+ 		    fGapBin[0], fGapBin[1], fGapBin[2], fGapBin[3], fGapBin[4], fDistinctGapMaxUs / 1000);
+ 		fDistinct = fSame = 0; fDistinctGapMaxUs = 0; for (unsigned i = 0; i < 5; i++) { fGapBin[i] = 0; }
+@@ -1148,6 +1188,7 @@
+ 	IOLockWakeup(fLock, &fRetireEvent, false);
+ 	/* Superseded (or post-stop) references are released outside fLock. */
+ 	sweet_fb_pending_surfaces_release(&replaced, sweet_fb_release_surface);
++	if (fFlushTicks <= 1) { handOver(0); }       /* 0155 */
+ 	reapLate();
+ 	if (fDiag.enabled) {
+ 		uint64_t accepted = __atomic_add_fetch(&fDiag.swaps, 1, __ATOMIC_RELAXED);
+--- a/iokit/Kernel/arm/sweet_fb_present.h
++++ b/iokit/Kernel/arm/sweet_fb_present.h
+@@ -16,6 +16,7 @@
+ 
+ #define SWEET_FB_DEFAULT_HZ 30u          /* panel present rate; one panel transfer plus the copy is ~20-25 ms */
+ #define SWEET_FB_BUSY_MAX_TICKS 6u       /* 100 ms at 60 Hz: then present anyway */
++#define SWEET_FB_TE_WAIT_US 25000u       /* 0155: panel TE not seen: push anyway, and stop waiting for TE for a second */
+ #define SWEET_FB_PRES_WAIT_US 8000u      /* 0150/0151: a presenter still finishing the previous frame is waited for this long at the tick (4 ms still lost a whole period in ~10-20% of the frames: 3.3 ms GPU wait + 2.2 copy + 11 transfer ~ 16.5 ms) */
+ #define SWEET_FB_BUSY_WAIT_US 10000u     /* 0149: a swap whose GPU work is still in flight at the tick is waited for, this long at most, before it is skipped */
+ #define SWEET_FB_XFER_TIMEOUT_US 40000u  /* frame-done not seen: give up on this transfer */
+@@ -85,7 +86,8 @@
+ /* Present timing, windowed; reported at most every SWEET_FB_STAT_INTERVAL_US and only if something presented. */
+ struct sweet_fb_present_stats {
+ 	uint32_t n, timeouts, busy_skips, busy_forced, late_ticks, legacy;
+-	uint32_t busy_same, busy_diff, busy_maxrun, busy_waits, busy_wait_ok, pres_waits, pres_wait_ok;
++	uint32_t busy_same, busy_diff, busy_maxrun, busy_waits, busy_wait_ok, pres_waits, pres_wait_ok, te_waits, te_miss, te_wait_max;
++	uint64_t te_wait_us;
+ 	uint64_t busy_wait_us;   /* 0148: skips with the same / a different newest surface than the previous skip; longest run of skips */
+ 	uint64_t sum_us, sum_copy_us, sum_xfer_us;
+ 	uint32_t max_us, max_copy_us, max_xfer_us;

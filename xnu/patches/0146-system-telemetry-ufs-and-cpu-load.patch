@@ -1,0 +1,60 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -19,6 +19,10 @@
+ #include <kern/clock.h>
+ #include <kern/sched_prim.h>
+ #include <kern/thread.h>
++#include <kern/processor.h>
++#include <mach/processor_info.h>
++#include <mach/host_info.h>
++#include <mach/vm_statistics.h>
+ #include <kern/cpu_data.h>
+ #include <sys/proc.h>
+ #include "SweetSurface.h"
+@@ -39,6 +43,38 @@
+ #include "../../../bsd/dev/nord2_gpu_lvts.h"
+ }
+ 
++/* 0146: system telemetry every 2 s -- per-CPU busy time and the VM paging load (page-ins are file reads from storage; zero-fill and
++ * copy-on-write faults are memory the apps touch for the first time) -- to tell storage or CPU stalls from GPU ones. */
++extern "C" kern_return_t host_statistics64(host_t, host_flavor_t, host_info64_t, mach_msg_type_number_t *);
++extern "C" char n2_realhost[] __asm__("_realhost");   /* the host data the in-kernel callers pass */
++extern "C" void n2_processor_cpu_load(processor_t, natural_t ticks[CPU_STATE_MAX]) __asm__("_processor_cpu_load_info");   /* the struct of the same name hides the function in C++ */
++static void n2_sys_telemetry(uint64_t nowUs) {
++        static uint64_t lastUs = 0;
++        static natural_t cpuPrev[16][CPU_STATE_MAX] = {};
++        static uint64_t vmPrev[6] = {};
++        if (lastUs && nowUs - lastUs < 2000000ull) return;
++        uint64_t winUs = lastUs ? nowUs - lastUs : 0; lastUs = nowUs;
++        unsigned ncpu = (unsigned)ml_get_max_cpu_number() + 1; if (ncpu > 16) ncpu = 16;
++        char busy[96]; unsigned o = 0; unsigned sum = 0, big = 0;
++        for (unsigned i = 0; i < ncpu; i++) {
++                natural_t t[CPU_STATE_MAX] = {};
++                processor_t p = cpu_to_processor((int)i); if (!p) continue;
++                n2_processor_cpu_load(p, t);
++                uint64_t du = (uint64_t)(t[CPU_STATE_USER] - cpuPrev[i][CPU_STATE_USER]) + (t[CPU_STATE_SYSTEM] - cpuPrev[i][CPU_STATE_SYSTEM]);
++                uint64_t di = (uint64_t)(t[CPU_STATE_IDLE] - cpuPrev[i][CPU_STATE_IDLE]);
++                for (unsigned k = 0; k < CPU_STATE_MAX; k++) cpuPrev[i][k] = t[k];
++                unsigned pct = du + di ? (unsigned)(100 * du / (du + di)) : 0;
++                if (i >= 4) big += pct; sum += pct;
++                if (o + 8 < sizeof(busy)) o += (unsigned)snprintf(busy + o, sizeof(busy) - o, "%s%u", i ? "/" : "", pct);
++        }
++        vm_statistics64_data_t v = {}; mach_msg_type_number_t vc = HOST_VM_INFO64_COUNT; (void)host_statistics64((host_t)n2_realhost, HOST_VM_INFO64, (host_info64_t)&v, &vc);
++        uint64_t cur[6] = { v.pageins, v.pageouts, v.faults, v.zero_fill_count, v.cow_faults, v.decompressions };
++        uint64_t d[6]; for (unsigned k = 0; k < 6; k++) { d[k] = cur[k] - vmPrev[k]; vmPrev[k] = cur[k]; }
++        if (winUs)
++                IOLog("NORD2 SYS: win_ms=%llu cpu_busy%%=%s (avg %u, big %u) | vm pageins=%llu pageouts=%llu faults=%llu zerofill=%llu cow=%llu decomp=%llu\n",
++                      winUs / 1000, busy, ncpu ? sum / ncpu : 0, ncpu > 4 ? big / (ncpu - 4) : 0, d[0], d[1], d[2], d[3], d[4], d[5]);
++}
++
+ static struct n2owner gpu_owner_queue;
+ /* Sole caller is ni_thread, between existing PWRAP transactions. */
+ extern "C" void nord2_gpu_owner_poll(void) { n2owner_poll(&gpu_owner_queue); }
+@@ -413,6 +449,7 @@
+                 IOLog("NORD2 GPU: ready=%u stage=%u error=%u id=%08x\n", d->ready,
+                       d->board.report.stage, d->board.report.error, d->hw.id.gpu_id);
+         }
++        n2_sys_telemetry(now_us(NULL));
+         if (d->ready) {
+                 n2c_poll(d->core);
+                 d->emitJobStats();

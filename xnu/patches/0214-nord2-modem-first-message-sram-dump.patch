@@ -1,0 +1,210 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -591,6 +591,195 @@
+ 	}
+ }
+ 
++
++/*
++ * 0206: start MD1 from XNU and watch CCIF (stage 3).  Linux order (modem_sys1.c md_cd_start, md_sys1_platform.c md_cd_power_on and
++ * md_cd_let_md_go): CCIF SRAM reset, MD SRCCLKENA, SPM sleep regs, flight mode off, MTCMOS (already on), SMC MD_KERNEL_BOOT_UP.
++ * Nothing answers the modem yet, so it is expected to stall at the CCIF handshake; the goal is to log what it sends first.
++ * Runs once, 20 s after policy registration, from a thread call; polling is bounded to 25 s.
++ */
++static thread_call_t sweet_modem_start_call;
++
++
++/*
++ * 0213: MD1 MTCMOS power cycle as in Linux clk-mt6885-pg.c spm_mtcmos_ctrl_md1().  In Linux the domain is OFF when ccci starts the
++ * modem (the kernel switches it off at boot) and clk_prepare_enable(scp-sys-md1-main) powers it on fresh; LK leaves it ON on iOS.
++ * Every wait is bounded; on a timeout the function returns -1 and the caller stops.
++ */
++static int
++sweet_modem_wait(volatile uint32_t *reg, uint32_t mask, uint32_t want, const char *what)
++{
++	unsigned n;
++	for (n = 0; n < 20000; n++) {
++		if ((*reg & mask) == want) {
++			return 0;
++		}
++		delay_for_interval(10, NSEC_PER_USEC);
++	}
++	printf("NORD2 MODEM: md1 power: timeout waiting for %s (reg=%08x)\n", what, *reg);
++	return -1;
++}
++
++static int
++sweet_modem_md1_power(volatile uint32_t *spm, volatile uint32_t *ic, int on)
++{
++	const uint32_t m20 = (1U << 10) | (1U << 21) | (1U << 29), m21 = (1U << 6) | (1U << 7);
++
++	spm[0] = (0xB16U << 16) | 1U;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (!on) {
++		ic[0x2A0 / 4] = 1U << 7;                                   /* PROTECTEN_SET step1 */
++		if (sweet_modem_wait(&ic[0x228 / 4], 1U << 7, 1U << 7, "step1 ack")) { return -1; }
++		ic[0xB84 / 4] = m20;                                       /* INFRA_VDNR_SET step2_0 */
++		if (sweet_modem_wait(&ic[0xB90 / 4], m20, m20, "step2_0 ack")) { return -1; }
++		ic[0xBB8 / 4] = m21;                                       /* SUB_INFRA_VDNR_SET step2_1 */
++		if (sweet_modem_wait(&ic[0xBC4 / 4], m21, m21, "step2_1 ack")) { return -1; }
++		spm[0x300 / 4] &= ~0x4U;                                   /* PWR_ON = 0 */
++		if (sweet_modem_wait(&spm[0x16C / 4], 1U, 0, "PWR_STATUS off")) { return -1; }
++		spm[0x398 / 4] |= 0x3U;                                    /* MD_EXT_BUCK_ISO */
++		spm[0x300 / 4] &= ~0x1U;                                   /* PWR_RST_B = 0 */
++		__asm__ volatile ("dsb sy" ::: "memory");
++		return 0;
++	}
++	spm[0x398 / 4] &= ~0x3U;
++	spm[0x300 / 4] |= 0x1U;                                            /* PWR_RST_B = 1 */
++	spm[0x300 / 4] |= 0x4U;                                            /* PWR_ON = 1 */
++	if (sweet_modem_wait(&spm[0x16C / 4], 1U, 1U, "PWR_STATUS on")) { return -1; }
++	ic[0xB88 / 4] = m20;                                               /* INFRA_VDNR_CLR */
++	ic[0xBBC / 4] = m21;                                               /* SUB_INFRA_VDNR_CLR */
++	ic[0x2A4 / 4] = 1U << 7;                                           /* PROTECTEN_CLR */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return 0;
++}
++
++static void
++sweet_modem_start(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	volatile uint32_t *infra = (volatile uint32_t *)ml_io_map(0x10001000UL, 0x1000);
++	volatile uint32_t *spm = (volatile uint32_t *)ml_io_map(0x10006000UL, 0x1000);
++	volatile uint32_t *ccif = (volatile uint32_t *)ml_io_map(0x10209000UL, 0x1000);
++	uint64_t r[4];
++	uint32_t last_rch = 0xdeadbeef, last_busy = 0xdeadbeef, last_start = 0xdeadbeef, last_sram[8] = { 0 };
++	uint32_t v;
++	unsigned i, k;
++	int dumped = 0;
++
++	if (infra == NULL || spm == NULL || ccif == NULL) {
++		printf("NORD2 MODEM: start: mapping failed\n");
++		return;
++	}
++	printf("NORD2 MODEM: start: begin (infracfg_ao+0xF0C=%08x)\n", infra[0xF0C / 4]);
++	printf("NORD2 MODEM: start: MD1 PWR_STATUS before cycle = %08x\n", spm[0x16C / 4]);
++	if (sweet_modem_md1_power(spm, infra, 0)) {
++		return;
++	}
++	printf("NORD2 MODEM: start: MD1 domain off, PWR_STATUS=%08x\n", spm[0x16C / 4]);
++	/*
++	 * ccci_md_clear_smem(first_boot) as Linux does it: only the listed regions, never the unused rest of the bank
++	 * (0x8e4c0000 reads hang, 0x8e000000-0x8e0fffff is not a region).  NCLR_FIRST regions are skipped.
++	 */
++	{
++		static const struct { uintptr_t pa; uint32_t len; const char *name; } clr[] = {
++			{ 0x8e100000UL, 0x10000,   "MD_WIFI_PROXY" },
++			{ 0x8e110000UL, 0x18000,   "DBG..SCP" },
++			{ 0x8e129000UL, 0x3000,    "NETD+USB" },
++			/* skipped in 0212 (hang while clearing, being located): { 0x8e139000UL, 0xd2800,   "CCISM_MCU+EXP" }, */
++			/* skipped in 0212 (hang while clearing, being located): { 0x8ad80000UL, 0x700000,  "MD_NVRAM_CACHE" }, */
++			/* skipped in 0212 (hang while clearing, being located): { 0x8b500000UL, 0x200000,  "CCB" }, */
++			/* skipped in 0212 (hang while clearing, being located): { 0x8b700000UL, 0x1e00000, "RAW_DHL/MDM" }, */
++		};
++		for (unsigned r = 0; r < sizeof(clr) / sizeof(clr[0]); r++) {
++			uint32_t off;
++			printf("NORD2 MODEM: start: clear %s pa %#lx len %#x\n", clr[r].name, (unsigned long)clr[r].pa, clr[r].len);
++			delay_for_interval(100, NSEC_PER_MSEC);
++			for (off = 0; off < clr[r].len; off += 0x10000) {
++				uint32_t n = clr[r].len - off < 0x10000 ? clr[r].len - off : 0x10000;
++				volatile uint64_t *sm = (volatile uint64_t *)ml_io_map(clr[r].pa + off, (n + 0xfff) & ~0xfffU);
++				uint32_t j;
++				if (sm == NULL) {
++					printf("NORD2 MODEM: start: map failed pa %#lx\n", (unsigned long)(clr[r].pa + off));
++					return;
++				}
++				for (j = 0; j < n / 8; j++) {
++					sm[j] = 0;
++				}
++				__asm__ volatile ("dsb sy" ::: "memory");
++				if ((off & 0xfffff) == 0xf0000 || off + 0x10000 >= clr[r].len) {
++					printf("NORD2 MODEM: start: %s cleared through %#lx\n", clr[r].name, (unsigned long)(clr[r].pa + off + n));
++					delay_for_interval(20, NSEC_PER_MSEC);
++				}
++			}
++		}
++	}
++	printf("NORD2 MODEM: start: smem regions cleared\n");
++	for (i = 0; i < 0x200 / 4; i++) {
++		ccif[0x100 / 4 + i] = 0;                    /* md_ccif_sram_reset */
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	/* md_start_platform: BROM check */
++	sweet_modem_smc(6, 3 /* MD_CHECK_DONE */, r);
++	printf("NORD2 MODEM: start: CHECK_DONE -> %llx\n", r[0]);
++	sweet_modem_smc(6, 2 /* MD_CHECK_FLAG */, r);
++	printf("NORD2 MODEM: start: CHECK_FLAG -> %llx %llx %llx %llx\n", r[0], r[1], r[2], r[3]);
++	sweet_modem_smc(6, 4 /* MD_BOOT_STATUS */, r);
++	printf("NORD2 MODEM: start: AP BOOT_STATUS -> %llx %llx %llx\n", r[0], r[1], r[2]);
++	/* md_cd_power_on */
++	v = infra[0xF0C / 4];
++	infra[0xF0C / 4] = (v & ~0xFFU) | 0x21U;                 /* INFRA_AO_MD_SRCCLKENA */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("NORD2 MODEM: start: SRCCLKENA %08x -> %08x\n", v, infra[0xF0C / 4]);
++	spm[0] = 0x0B160001U;                                /* spm_sleep_base */
++	v = spm[8 / 4];
++	spm[8 / 4] = v | (1U << 21);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("NORD2 MODEM: start: spm+8 %08x -> %08x\n", v, spm[8 / 4]);
++	sweet_modem_smc(7 /* MD_FLIGHT_MODE_SET */, 0, r);
++	printf("NORD2 MODEM: start: flight mode off -> %llx %llx\n", r[0], r[1]);
++	if (sweet_modem_md1_power(spm, infra, 1)) {
++		return;
++	}
++	printf("NORD2 MODEM: start: MD1 domain on, PWR_STATUS=%08x\n", spm[0x16C / 4]);
++	/* md_cd_let_md_go */
++	sweet_modem_smc(6, 0 /* MD_KERNEL_BOOT_UP */, r);
++	printf("NORD2 MODEM: start: KERNEL_BOOT_UP -> %llx %llx %llx\n", r[0], r[1], r[2]);
++
++	for (k = 0; k < 500; k++) {                              /* 25 s at 50 ms */
++		uint32_t rch = ccif[0x10 / 4], busy = ccif[0x04 / 4], start = ccif[0x08 / 4];
++		int changed = (rch != last_rch) || (busy != last_busy) || (start != last_start);
++		for (i = 0; i < 8; i++) {
++			uint32_t w = ccif[0x100 / 4 + i];
++			if (w != last_sram[i]) {
++				changed = 1;
++			}
++		}
++		if (rch != 0 && !dumped) {                              /* 0214: full SRAM dump on the first MD message */
++			unsigned q;
++			dumped = 1;
++			printf("NORD2 MODEM: start t=%u ms FIRST MESSAGE rch=%08x con=%08x irqmask?=%08x/%08x\n", k * 50, rch,
++			    ccif[0], ccif[0x20 / 4], ccif[0x24 / 4]);
++			for (q = 0; q < 128; q += 8) {
++				printf("NORD2 MODEM: sram[%03x]: %08x %08x %08x %08x %08x %08x %08x %08x\n", q * 4,
++				    ccif[0x100 / 4 + q], ccif[0x100 / 4 + q + 1], ccif[0x100 / 4 + q + 2], ccif[0x100 / 4 + q + 3],
++				    ccif[0x100 / 4 + q + 4], ccif[0x100 / 4 + q + 5], ccif[0x100 / 4 + q + 6], ccif[0x100 / 4 + q + 7]);
++				delay_for_interval(20, NSEC_PER_MSEC);
++			}
++		}
++		if (changed || k % 100 == 0) {
++			printf("NORD2 MODEM: start t=%u ms rch=%08x busy=%08x start=%08x sram:", k * 50, rch, busy, start);
++			for (i = 0; i < 8; i++) {
++				last_sram[i] = ccif[0x100 / 4 + i];
++				printf(" %08x", last_sram[i]);
++			}
++			printf("\n");
++			last_rch = rch; last_busy = busy; last_start = start;
++		}
++		delay_for_interval(50, NSEC_PER_MSEC);
++	}
++	sweet_modem_smc(6, 4, r);
++	printf("NORD2 MODEM: start: end, BOOT_STATUS -> %llx %llx %llx\n", r[0], r[1], r[2]);
++	sweet_modem_dump("start ccif0 sram-tail", 0x1020a000UL, 8);
++}
++
+ /* Called from bsd_init once MAC policies can register, before any exec. */
+ void sweet_amfi_policy_register(void);
+ 
+@@ -606,5 +795,11 @@
+ 	sweet_modem_probe();
+ 	sweet_modem_power();
+ 	sweet_modem_late_start();
++	sweet_modem_start_call = thread_call_allocate(sweet_modem_start, NULL);
++	if (sweet_modem_start_call != NULL) {
++		uint64_t dl;
++		clock_interval_to_deadline(20000, NSEC_PER_MSEC, &dl);
++		thread_call_enter_delayed(sweet_modem_start_call, dl);
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

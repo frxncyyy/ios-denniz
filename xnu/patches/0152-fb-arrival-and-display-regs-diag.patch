@@ -1,0 +1,83 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -175,6 +175,10 @@
+ 	uint32_t            fBusyTicks;
+ 	void               *fBusyLastObj;        /* 0148: newest-swap surface at the previous skip, skips in the current run, diagnostic log count */
+ 	uint32_t            fBusyRun, fBusyLogN;
++	/* 0152 (diagnostic): swap arrival gaps (CA's delivery rate), arrival -> start of the panel copy latency, one-shot register dump */
++	uint64_t            fSwapLastUs, fSwapArrUs;
++	uint32_t            fArrBin[5], fLatBin[5];
++	bool                fRegsDumped;
+ 	uint64_t            fNextTick, fPeriodAbs;
+ 	uint64_t            fCopyUs, fXferStart;
+ 	/* 0133: how many of the presented frames actually differ from the previous one, and the gaps between the different ones (the panel is refreshed at 60 Hz
+@@ -188,6 +192,7 @@
+ 	static void presentFired(OSObject *owner, IOTimerEventSource *sender);
+ 	bool        presentCopy(const uint8_t *rec, SweetSurface *const surfaces[SWEET_FB_LAYERS]);
+ 	void        presentDone(bool shown, bool timeout, bool legacy);
++	void        dumpDisplayRegs(void);
+ 	bool        xferStart(void);
+ 	bool        xferDone(void);
+ 	/* SwapWait / swap retirement (boot-arg n2swait, sweet_fb_swapwait.h).  fRetire, fLateSurfaces: fLock. */
+@@ -631,6 +636,11 @@
+ #endif
+ 	if (fb->fPState == 1) {
+ 		uint64_t t0 = mach_absolute_time();
++		{
++			uint64_t t0us = sweet_fb_abs_to_us(t0);
++			uint64_t lat = t0us > fb->fSwapArrUs ? t0us - fb->fSwapArrUs : 0;
++			fb->fLatBin[lat <= 8000 ? 0 : lat <= 16000 ? 1 : lat <= 25000 ? 2 : lat <= 33000 ? 3 : 4]++;
++		}
+ 		bool shown = fb->presentCopy(fb->fWorkRec, (SweetSurface *const *)fb->fWorkSurfaces.object);
+ 		uint64_t t1 = mach_absolute_time();
+ 		fb->fCopyUs = sweet_fb_abs_to_us(t1 - t0);
+@@ -681,6 +691,26 @@
+ 	fb->presentDone(true, st == SWEET_FB_XFER_TIMEOUT, false);
+ }
+ 
++/* 0152: read-only dump of the panel link configuration (DSI0, MIPI TX0 PLL/lanes), once, to size a 90 Hz mode (link rate, timings). */
++void
++AppleCLCD::dumpDisplayRegs(void)
++{
++#if defined(NORD2)
++	if (fDsi != NULL) {
++		for (uint32_t o = 0; o < 0x200; o += 0x10) {
++			const volatile uint32_t *r = fDsi + o / 4;
++			IOLog("NORD2 DISPREG DSI0+%03x: %08x %08x %08x %08x\n", o, r[0], r[1], r[2], r[3]);
++		}
++	}
++	volatile uint32_t *tx = (volatile uint32_t *)ml_io_map(0x11e50000UL, 0x1000);
++	if (tx != NULL) {
++		for (uint32_t o = 0; o < 0x80; o += 0x10) {
++			IOLog("NORD2 DISPREG MIPITX0+%03x: %08x %08x %08x %08x\n", o, tx[o / 4], tx[o / 4 + 1], tx[o / 4 + 2], tx[o / 4 + 3]);
++		}
++	}
++#endif
++}
++
+ void
+ AppleCLCD::presentDone(bool shown, bool timeout, bool legacy)
+ {
+@@ -722,6 +752,10 @@
+ 		    fStats.sum_xfer_us / n, fStats.max_xfer_us, fStats.legacy, fStats.timeouts, fStats.busy_skips,
+ 		    fStats.busy_forced, fStats.late_ticks, 60 / fFlushTicks, nord2_gpu_resv_expired(),
+ 		    fStats.busy_same, fStats.busy_diff, fStats.busy_maxrun);
++		IOLog("NORD2 FB ARRIVAL: swap_gaps_ms<=8/20/34/67/more=%u/%u/%u/%u/%u arrival_to_copy_ms<=8/16/25/33/more=%u/%u/%u/%u/%u\n",
++		    fArrBin[0], fArrBin[1], fArrBin[2], fArrBin[3], fArrBin[4], fLatBin[0], fLatBin[1], fLatBin[2], fLatBin[3], fLatBin[4]);
++		for (unsigned i = 0; i < 5; i++) { fArrBin[i] = 0; fLatBin[i] = 0; }
++		if (!fRegsDumped && fPresents > 200) { fRegsDumped = true; dumpDisplayRegs(); }
+ 		IOLog("NORD2 FB WAITS: busy_waits=%u ok=%u avg_us=%llu presenter_waits=%u ok=%u\n", fStats.busy_waits, fStats.busy_wait_ok,
+ 		    fStats.busy_waits ? fStats.busy_wait_us / fStats.busy_waits : 0ULL, fStats.pres_waits, fStats.pres_wait_ok);
+ 		IOLog("NORD2 FB SEEN: presents=%u different=%u same=%u gaps_ms<=20/34/67/100/more=%u/%u/%u/%u/%u max_gap_ms=%llu\n", fStats.n, fDistinct, fSame,
+@@ -1010,6 +1044,11 @@
+ 	    sweet_fb_retain_surface);
+ 	sweet_fb_pending_surfaces_init(&replaced);
+ 	IOLockLock(fLock);
++	{
++		uint64_t nu = sweet_fb_abs_to_us(mach_absolute_time());
++		if (fSwapLastUs) { uint64_t g = nu - fSwapLastUs; fArrBin[g <= 8000 ? 0 : g <= 20000 ? 1 : g <= 34000 ? 2 : g <= 67000 ? 3 : 4]++; }
++		fSwapLastUs = nu; fSwapArrUs = nu;
++	}
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	if (sweet_fb_swap_lifecycle_queue(&fSwapLifecycle, &incoming, &replaced)) {
+ 		fDirty = true;

@@ -1,0 +1,84 @@
+--- a/gpu/src/Nord2GPU.cpp
++++ b/gpu/src/Nord2GPU.cpp
+@@ -530,18 +530,37 @@
+         }
+         IOLockUnlock(lock); if (step) IODelay(step); else IOSleep(1); IOLockLock(lock);
+ }
++/* Battery fuel-gauge temperature (centi-C) from the SweetBattery power source, if it is a real
++ * measurement; the SoC/GPU thermal sensors (LVTS) are not driven by this port. */
++static bool battery_temperature(int *centi) {
++        OSDictionary *m = IOService::serviceMatching("SweetBattery");
++        if (!m) return false;
++        OSPtr<IOService> b = IOService::copyMatchingService(m); m->release();
++        if (!b) return false;
++        OSNumber *t = OSDynamicCast(OSNumber, b->getProperty("Temperature"));
++        OSBoolean *v = OSDynamicCast(OSBoolean, b->getProperty("Nord2BatteryTemperatureValid"));
++        if (!t || !v || v != kOSBooleanTrue) return false;
++        *centi = (int)(int32_t)t->unsigned32BitValue(); return true;
++}
+ void Nord2GPU::emitJobStats() {
+         if (!jobStats || !core) return;
+         n2c_timing t;
+         if (!n2c_timing_take(core, &t, 2000000ull)) return;
++        /* Context for the numbers below: PLL frequency actually programmed (APMIXED, read-only),
++         * the GPU mux parent (1 = MFGPLL) and the battery temperature. */
++        uint32_t pll_khz = n2rail_mfgpll_khz(read_bank(&clocks[N2CLK_APMIXED], N2CLK_MFGPLL_CON1));
++        uint32_t mux = (read_bank(&clocks[N2CLK_TOPCK], N2CLK_CFG_5) >> N2CLK_MFG_MUX_SHIFT) & N2CLK_MFG_MUX_MASK;
++        int bat = 0; bool bat_ok = battery_temperature(&bat);
+         uint32_t n = t.jobs ? t.jobs : 1, w = waitN ? waitN : 1;
+         IOLog("NORD2 GPU JOBS: n=%u fault=%u full=%u win_ms=%llu q_us=%llu/%u run_us=%llu/%u tot_us=%llu/%u "
+-              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u\n",
++              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u gpu_khz=%u mux=%u bat_cC=%d bat_ok=%u irq=%u:%u/%u/%u/%u\n",
+               t.jobs, t.faulted, t.full_jobs, t.window_start_us / 1000, t.sum_queue_us / n, t.max_queue_us,
+               t.sum_run_us / n, t.max_run_us, t.sum_total_us / n, t.max_total_us, t.sum_clean_us / n, t.max_clean_us,
+               t.sum_inval_us / n, t.max_inval_us, t.sum_clean_pages * 4, t.sum_inval_pages * 4, waitN,
+               waitGapSum / w, waitGapMax, waitDurSum / w, waitDurMax, waitRetSum / w, waitRetMax,
+-              seqWaits, seqJobs, seqWaits ? seqDurSum / seqWaits : 0ull, seqDurMax);
++              seqWaits, seqJobs, seqWaits ? seqDurSum / seqWaits : 0ull, seqDurMax, pll_khz, mux,
++              bat_ok ? bat : 0, (unsigned)bat_ok,
++              (unsigned)irqState, irqTops, irqGuard.spurious_total, irqSleeps, irqTimeouts);
+         waitN = waitGapMax = waitDurMax = waitRetMax = 0; waitGapSum = waitDurSum = waitRetSum = 0;
+         seqWaits = seqJobs = seqDurMax = 0; seqDurSum = 0;
+ }
+--- a/shim/nord2-xnu/Nord2GPU.cpp
++++ b/shim/nord2-xnu/Nord2GPU.cpp
+@@ -530,18 +530,37 @@
+         }
+         IOLockUnlock(lock); if (step) IODelay(step); else IOSleep(1); IOLockLock(lock);
+ }
++/* Battery fuel-gauge temperature (centi-C) from the SweetBattery power source, if it is a real
++ * measurement; the SoC/GPU thermal sensors (LVTS) are not driven by this port. */
++static bool battery_temperature(int *centi) {
++        OSDictionary *m = IOService::serviceMatching("SweetBattery");
++        if (!m) return false;
++        OSPtr<IOService> b = IOService::copyMatchingService(m); m->release();
++        if (!b) return false;
++        OSNumber *t = OSDynamicCast(OSNumber, b->getProperty("Temperature"));
++        OSBoolean *v = OSDynamicCast(OSBoolean, b->getProperty("Nord2BatteryTemperatureValid"));
++        if (!t || !v || v != kOSBooleanTrue) return false;
++        *centi = (int)(int32_t)t->unsigned32BitValue(); return true;
++}
+ void Nord2GPU::emitJobStats() {
+         if (!jobStats || !core) return;
+         n2c_timing t;
+         if (!n2c_timing_take(core, &t, 2000000ull)) return;
++        /* Context for the numbers below: PLL frequency actually programmed (APMIXED, read-only),
++         * the GPU mux parent (1 = MFGPLL) and the battery temperature. */
++        uint32_t pll_khz = n2rail_mfgpll_khz(read_bank(&clocks[N2CLK_APMIXED], N2CLK_MFGPLL_CON1));
++        uint32_t mux = (read_bank(&clocks[N2CLK_TOPCK], N2CLK_CFG_5) >> N2CLK_MFG_MUX_SHIFT) & N2CLK_MFG_MUX_MASK;
++        int bat = 0; bool bat_ok = battery_temperature(&bat);
+         uint32_t n = t.jobs ? t.jobs : 1, w = waitN ? waitN : 1;
+         IOLog("NORD2 GPU JOBS: n=%u fault=%u full=%u win_ms=%llu q_us=%llu/%u run_us=%llu/%u tot_us=%llu/%u "
+-              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u\n",
++              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u gpu_khz=%u mux=%u bat_cC=%d bat_ok=%u irq=%u:%u/%u/%u/%u\n",
+               t.jobs, t.faulted, t.full_jobs, t.window_start_us / 1000, t.sum_queue_us / n, t.max_queue_us,
+               t.sum_run_us / n, t.max_run_us, t.sum_total_us / n, t.max_total_us, t.sum_clean_us / n, t.max_clean_us,
+               t.sum_inval_us / n, t.max_inval_us, t.sum_clean_pages * 4, t.sum_inval_pages * 4, waitN,
+               waitGapSum / w, waitGapMax, waitDurSum / w, waitDurMax, waitRetSum / w, waitRetMax,
+-              seqWaits, seqJobs, seqWaits ? seqDurSum / seqWaits : 0ull, seqDurMax);
++              seqWaits, seqJobs, seqWaits ? seqDurSum / seqWaits : 0ull, seqDurMax, pll_khz, mux,
++              bat_ok ? bat : 0, (unsigned)bat_ok,
++              (unsigned)irqState, irqTops, irqGuard.spurious_total, irqSleeps, irqTimeouts);
+         waitN = waitGapMax = waitDurMax = waitRetMax = 0; waitGapSum = waitDurSum = waitRetSum = 0;
+         seqWaits = seqJobs = seqDurMax = 0; seqDurSum = 0;
+ }

@@ -1,0 +1,98 @@
+--- a/bsd/kern/sweet_amfi.c	2026-11-04 10:21:46.150751266 +0100
++++ b/bsd/kern/sweet_amfi.c	2026-11-04 10:21:46.156885931 +0100
+@@ -25,6 +25,10 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <kern/debug.h>
+ #include <kern/startup.h>
++#include <kern/clock.h>
++#include <kern/thread_call.h>
++#include <sys/signal.h>
++extern void psignal(struct proc *p, int sig);
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
+ #include <sys/codesign.h>
+@@ -408,6 +412,77 @@
+ 
+ static mac_policy_handle_t sweet_amfi_mac_handle;
+ 
++/*
++ * 0201 diagnostic: an app that sits black at launch because a daemon never answers (Subway Surfers blocked in a synchronous
++ * NSXPC call to locationd). Every 2 s look for SubwaySurf; once it has been alive for 25 s send SIGABRT to locationd, once
++ * per boot, so ReportCrash writes a report with the stacks of all its threads. launchd restarts locationd (KeepAlive).
++ */
++#define SWEET_DIAG_TRIGGER      "SubwaySurf"
++#define SWEET_DIAG_VICTIM       "locationd"
++#define SWEET_DIAG_AFTER_NS     25000000000ULL
++#define SWEET_DIAG_PID_MAX      12000
++
++static thread_call_t sweet_diag_call;
++static uint64_t sweet_diag_first_seen_ns;
++static bool sweet_diag_done;
++
++static int
++sweet_diag_find(const char *want)
++{
++	char name[MAXCOMLEN + 1];
++	for (int pid = 2; pid < SWEET_DIAG_PID_MAX; pid++) {
++		name[0] = 0;
++		proc_name(pid, name, sizeof(name));
++		if (name[0] != 0 && strncmp(name, want, MAXCOMLEN) == 0) {
++			return pid;
++		}
++	}
++	return 0;
++}
++
++static void
++sweet_diag_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	uint64_t now_abs, now_ns;
++	clock_get_uptime(&now_abs);
++	absolutetime_to_nanoseconds(now_abs, &now_ns);
++	if (!sweet_diag_done) {
++		if (sweet_diag_find(SWEET_DIAG_TRIGGER) != 0) {
++			if (sweet_diag_first_seen_ns == 0) {
++				sweet_diag_first_seen_ns = now_ns;
++				printf("SWEET DIAG: %s is running; SIGABRT to %s in 25 s\n", SWEET_DIAG_TRIGGER, SWEET_DIAG_VICTIM);
++			} else if (now_ns - sweet_diag_first_seen_ns > SWEET_DIAG_AFTER_NS) {
++				int vpid = sweet_diag_find(SWEET_DIAG_VICTIM);
++				proc_t vp = vpid ? proc_find(vpid) : ((proc_t)NULL);
++				if (vp != ((proc_t)NULL)) {
++					printf("SWEET DIAG: SIGABRT to %s (pid %d)\n", SWEET_DIAG_VICTIM, vpid);
++					psignal(vp, SIGABRT);
++					proc_rele(vp);
++				} else {
++					printf("SWEET DIAG: no %s process\n", SWEET_DIAG_VICTIM);
++				}
++				sweet_diag_done = true;
++			}
++		} else {
++			sweet_diag_first_seen_ns = 0;
++		}
++	}
++	uint64_t dl;
++	clock_interval_to_deadline(2000, NSEC_PER_MSEC, &dl);
++	thread_call_enter_delayed(sweet_diag_call, dl);
++}
++
++static void
++sweet_diag_start(void)
++{
++	sweet_diag_call = thread_call_allocate(sweet_diag_tick, NULL);
++	if (sweet_diag_call != NULL) {
++		uint64_t dl;
++		clock_interval_to_deadline(10000, NSEC_PER_MSEC, &dl);
++		thread_call_enter_delayed(sweet_diag_call, dl);
++	}
++}
++
+ /* Called from bsd_init once MAC policies can register, before any exec. */
+ void sweet_amfi_policy_register(void);
+ 
+@@ -420,5 +495,6 @@
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++	sweet_diag_start();
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

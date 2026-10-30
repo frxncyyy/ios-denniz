@@ -1,0 +1,98 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -205,6 +205,11 @@
+ 	uint32_t            fTeGapMin, fTeGapMax, fPhaseAll[8], fPhaseOk[8], fPhaseMiss[8];
+ 	uint64_t            fNextArrUs, fWorkArrUs;
+ 	uint32_t            fArrFine[14];
++	/* 0163: frame pacing -- the moment a frame becomes eligible for its TE slot is shifted by fPaceD so that the slack (ready -> slot) of the usual frame sits in the
++	 * middle of the period, away from the slot boundary where a little jitter of CoreAnimation turns into a lost TE. */
++	bool                fPaceOn;
++	uint64_t            fReadyUs, fNextReadyUs, fPaceSeenUs;
++	uint32_t            fPaceD, fPaceHist[16], fPaceN, fPaceRecenter, fPaceEstUs;
+ 	uint64_t            fLastXferStartUs, fTrackAtUs;
+ 	uint32_t            fDsiOr, fOvlOr[2], fFramesN, fOverlapFrames, fOvlErrFrames, fOvlErrOverlap, fDsiUnderrun, fEdgeStarts;
+ 	uint64_t            fPrepStartUs, fPrepEndUs;
+@@ -372,6 +377,8 @@
+ 	fVsyncUs = fPanelHz == 90 ? SWEET_FB_PANEL90_US : SWEET_FB_VSYNC_US;
+ 	fTePeriodUs = SWEET_FB_VSYNC_US;      /* the panel boots at 60 Hz; set to 11111 when the 90 Hz switch is accepted */
+ 	fTeLeadUs = SWEET_FB_TE_LEAD_US_DEFAULT;
++	fPaceOn = true;
++	{ uint32_t pace = 1; if (PE_parse_boot_argn("n2pace", &pace, sizeof(pace)) && pace == 0) { fPaceOn = false; } }
+ 	{ uint32_t lead = 0; if (PE_parse_boot_argn("n2telead", &lead, sizeof(lead)) && lead <= 4000) { fTeLeadUs = lead; } }
+ 	nanoseconds_to_absolutetime(fVsyncUs * 1000ULL, &fPeriodAbs);
+ 	/* n2swait=<0|1|2>: SwapWait semantics (0 = as before: always success, calls logged). */
+@@ -742,6 +749,7 @@
+ 		bool shown = presentCopy(fNextRec, (SweetSurface *const *)fNextSurfaces.object);
+ 		fPrepCopyUs = sweet_fb_abs_to_us(mach_absolute_time() - t0);
+ 		fPrepEndUs = sweet_fb_abs_to_us(mach_absolute_time());
++		fNextReadyUs = fPrepEndUs;
+ 		fCopyDst = 0;
+ 		if (!shown) { fPrepCopying = false; dropNext(); return; }
+ 		noteDistinct(dst);
+@@ -782,7 +790,7 @@
+ 		fWorkRec = fNextRec; fWorkSurfaces = fNextSurfaces; fWorkArrUs = fNextArrUs;
+ 		fNextRec = NULL; sweet_fb_pending_surfaces_init(&fNextSurfaces);
+ 		sweet_fb_retire_take(&fRetire);
+-		fPrepared = true; fPState = 1; fStats.dbl_hits++;
++		fPrepared = true; fReadyUs = fNextReadyUs; fPState = 1; fStats.dbl_hits++;
+ 		fNextState = 0;
+ 		IOLockUnlock(fLock);
+ 		IOLockWakeup(fLock, &fRetireEvent, false);
+@@ -898,6 +906,7 @@
+ 			shown = fb->presentCopy(fb->fWorkRec, (SweetSurface *const *)fb->fWorkSurfaces.object);
+ 		}
+ 		uint64_t t1 = mach_absolute_time();
++		if (!wasPrepared) { fb->fReadyUs = sweet_fb_abs_to_us(t1); }
+ 		fb->fCopyUs = wasPrepared ? fb->fPrepCopyUs : sweet_fb_abs_to_us(t1 - t0);
+ 		if (!shown) { fb->presentDone(false, false, false); return; }
+ 		if (!wasPrepared) { fb->noteDistinct(fb->fCopyDst ? fb->fCopyDst : fb->fPixels); }
+@@ -941,9 +950,38 @@
+ 		bool leadUsed = false;
+ 		if (fb->fTeLastUs != 0 && fb->fTeLeadUs != 0 && fb->fRefGood && nowUs - fb->fTeLastUs < 500000) {
+ 			/* 0156: start fTeLeadUs before the TE after the last one seen (periodic), so the write is ahead of the scan from the first row */
+-			uint64_t P = fb->fTePeriodUs;
+-			uint64_t k = (nowUs - fb->fTeLastUs + fb->fTeLeadUs) / P + 1;
+-			uint64_t fire = fb->fTeLastUs + k * P - fb->fTeLeadUs;
++			int64_t P = (int64_t)fb->fTePeriodUs, last = (int64_t)fb->fTeLastUs, lead = (int64_t)fb->fTeLeadUs;
++			uint64_t base = nowUs;
++			if (fb->fPaceOn && fb->fReadyUs != 0 && fb->fReadyUs < nowUs + 100000) {
++				if (fb->fPaceSeenUs != fb->fReadyUs) {
++					/* once per frame: where does it sit between its ready time and its slot? */
++					fb->fPaceSeenUs = fb->fReadyUs;
++					int64_t m0 = ((((int64_t)fb->fReadyUs - last + lead) % P) + P) % P;
++					int64_t s0 = P - m0;                                           /* slack with no extra delay */
++					int64_t s1 = ((s0 - (int64_t)(fb->fPaceD % (uint32_t)P)) % P + P) % P;     /* slack with the current delay */
++					fb->fPaceHist[(uint64_t)s1 * 16 / (uint64_t)P]++;
++					if (++fb->fPaceN >= 48) {
++						unsigned best = 0; uint32_t bv = 0;
++						for (unsigned i = 0; i < 16; i++) {
++							uint32_t v = fb->fPaceHist[(i + 15) % 16] + 2 * fb->fPaceHist[i] + fb->fPaceHist[(i + 1) % 16];
++							if (v > bv) { bv = v; best = i; }
++						}
++						int64_t est = ((int64_t)best * P + P / 2) / 16;
++						fb->fPaceEstUs = (uint32_t)est;
++						if (est < P / 4 || est > P - P / 4) {           /* too close to the slot boundary: recentre */
++							int64_t s_nod = (est + (int64_t)(fb->fPaceD % (uint32_t)P)) % P;
++							fb->fPaceD = (uint32_t)((((s_nod - P / 2) % P) + P) % P);
++							fb->fPaceRecenter++;
++						}
++						for (unsigned i = 0; i < 16; i++) { fb->fPaceHist[i] = 0; }
++						fb->fPaceN = 0;
++					}
++				}
++				base = fb->fReadyUs + fb->fPaceD;
++				if (base < nowUs) { base = nowUs; }
++			}
++			int64_t mb = ((((int64_t)base - last + lead) % P) + P) % P;
++			uint64_t fire = base + (uint64_t)(P - mb);
+ 			if (fire > nowUs + 300) { sender->setTimeoutUS((uint32_t)(fire - nowUs - 200)); return; }
+ 			while (sweet_fb_abs_to_us(mach_absolute_time()) < fire) { IODelay(20); }
+ 			fb->fStats.te_lead_starts++;
+@@ -1258,6 +1296,7 @@
+ 		    fDbl ? 1u : 0u, fStats.dbl_preps, fStats.dbl_hits, fStats.te_lead_starts, fTePeriodUs, fTeN ? fTeSpanUs / fTeN : 0ULL,
+ 		    fPhaseBin[0], fPhaseBin[1], fPhaseBin[2], fPhaseBin[3], fPhaseBin[4]);
+ 		for (unsigned i = 0; i < 5; i++) { fPhaseBin[i] = 0; }
++		IOLog("NORD2 FB PACE: on=%u extra_delay_us=%u est_slack_us=%u recenters=%u\n", fPaceOn ? 1u : 0u, fPaceD, fPaceEstUs, fPaceRecenter);
+ 		IOLog("NORD2 FB TEGAP: consecutive_te_gaps_us<10800/11100/11400/11700/12500/more=%u/%u/%u/%u/%u/%u min=%u max=%u spin_miss=%u\n", fTeGapBin[0], fTeGapBin[1], fTeGapBin[2], fTeGapBin[3], fTeGapBin[4], fTeGapBin[5], fTeGapMin, fTeGapMax, fSpinMiss);
+ 		for (unsigned i = 0; i < 6; i++) { fTeGapBin[i] = 0; }
+ 		fTeGapMin = fTeGapMax = fSpinMiss = 0;

@@ -1,0 +1,260 @@
+--- a/bsd/dev/nord2_cpufreq.h
++++ b/bsd/dev/nord2_cpufreq.h
+@@ -78,6 +78,9 @@
+ 	N2CF_L_DONE,        /* a = cluster, b = start row, c = final row, d = final MHz measured */
+ 	N2CF_L_REFUSED,     /* a = reason: 1 gauge hot, 2 no verified domain, 3 target not faster; b = cluster */
+ 	N2CF_L_GUARD,       /* a = cluster, b = new row, c = gauge cC, d = 0 slower / 1 faster */
++	N2CF_L_DOMAIN,      /* a = base, b = ENABLE, c = PERF_STATE, d = HW_STATE of a canonical cpufreq-hw domain (0106) */
++	N2CF_L_SRAM,        /* a = state (enum n2cf_sram), b = ones permille, c = zero+ones words, d = equal-neighbour pairs */
++	N2CF_L_PLACE,       /* a = placement mode written, b = big MHz, c = little MHz */
+ };
+ 
+ struct n2cf_ops {
+@@ -251,6 +254,143 @@
+ 	return mask;
+ }
+ 
++
++/* ---- 0106: what the device data showed, and the fixed bases of the family ---- */
++
++/* cpufreq-hw domain blocks of this SoC family (public mediatek-cpufreq-hw bindings: 0x11bc10, +0x120 per domain; three domains on a 1+3+4 part)
++ * = CSRAM offsets 0x10, 0x130, 0x250.  Discovery scans every offset anyway; these are logged first, raw, so one boot shows what sits there. */
++static const uint32_t n2cf_canonical_bases[N2CF_CLUSTERS] = { 0x10, 0x130, 0x250 };
++
++static inline void
++n2cf_probe_canonical(const struct n2cf_ops *o, void *ctx)
++{
++	for (unsigned i = 0; i < N2CF_CLUSTERS; i++) {
++		uint32_t b = n2cf_canonical_bases[i];
++		o->log(ctx, N2CF_L_DOMAIN, b, o->rd(ctx, b + N2CF_R_ENABLE), o->rd(ctx, b + N2CF_R_PERF), o->rd(ctx, b + N2CF_R_HWSTATE));
++	}
++}
++
++/* Is the CSRAM written by anything?  The P9 device dump (3 boots, 10 words compared) showed the signature of SRAM power-up state: 49.7 % ones,
++ * 1280 distinct words, no zero or all-ones words, and the same words on every boot except ~3 of 32 bits (a firmware or driver that initialised
++ * it would give a table, zeros or counters).  Then no DVFS engine runs and no domain can ever verify. */
++enum n2cf_sram { N2CF_SRAM_EMPTY = 0, N2CF_SRAM_NOISE, N2CF_SRAM_STRUCTURED };
++
++static inline int
++n2cf_csram_diagnose(const struct n2cf_ops *o, void *ctx, bool log)
++{
++	unsigned words = N2CF_CSRAM_SIZE / 4, zero = 0, ones = 0, eq = 0;
++	unsigned long bits = 0;
++	uint32_t prev = 0;
++	for (unsigned i = 0; i < words; i++) {
++		uint32_t v = o->rd(ctx, 4 * i);
++		zero += v == 0 || v == 0xffffffffu;
++		for (uint32_t x = v; x; x &= x - 1) {
++			bits++;
++		}
++		eq += i > 0 && v == prev;
++		prev = v;
++	}
++	ones = (unsigned)(bits * 1000ul / (32ul * words));
++	int st = N2CF_SRAM_STRUCTURED;
++	if (zero * 100 >= words * 97) {
++		st = N2CF_SRAM_EMPTY;
++	} else if (ones >= 460 && ones <= 540 && zero * 100 <= words && eq * 100 <= words) {
++		st = N2CF_SRAM_NOISE;
++	}
++	if (log) {
++		o->log(ctx, N2CF_L_SRAM, (unsigned)st, ones, zero, eq);
++	}
++	return st;
++}
++
++/* ---- 0106: utilisation governor with a UI boost floor (decision logic of the reference's patch 0420) ----
++ * Per cluster, from the busiest CPU of the cluster: target 75 % utilisation; up at once, down only after the load stayed low for the hold time;
++ * while the UI is active (a render/display thread became runnable within the boost window) the clock never drops below the floor row (A78 2.0 GHz).
++ * INPUTS THAT DO NOT EXIST YET: per-CPU busy time and the UI kick need the scheduler hooks (0099 level b exports neither); util < 0 means
++ * unknown, and the governor then only enforces the floor/cap rows.  Not exercised on the device: no domain has ever verified. */
++#define N2CF_GOV_TARGET_PERMILLE 750
++#define N2CF_GOV_DOWN_HOLD_MS    100
++#define N2CF_GOV_BOOST_MS        100
++#define N2CF_GOV_FLOOR_MHZ       2000u
++
++struct n2cf_gov {
++	uint64_t below_since_ms;        /* 0 = load is not low */
++	uint64_t boost_until_ms;
++};
++
++static inline void
++n2cf_gov_kick(struct n2cf_gov *g, uint64_t now_ms)
++{
++	g->boost_until_ms = now_ms + N2CF_GOV_BOOST_MS;
++}
++
++/* Row to run next.  cur = current row, fastest_row = row of the cap, slowest_row = the bootloader's row (never slower), util_permille of the
++ * busiest CPU at the current clock (<0 unknown). */
++static inline unsigned
++n2cf_gov_row(struct n2cf_gov *g, const struct n2cf_lut *l, unsigned cur, unsigned fastest_row, unsigned slowest_row, int util_permille,
++    uint64_t now_ms)
++{
++	unsigned floor_row = n2cf_target_row(l, N2CF_GOV_FLOOR_MHZ);
++	unsigned want = cur;
++	if (floor_row < fastest_row) {
++		floor_row = fastest_row;
++	}
++	if (util_permille >= 0) {
++		/* frequency the load needs so that it would sit at the target: mhz * util / target, rounded up to a row */
++		uint64_t need = ((uint64_t)l->mhz[cur] * (unsigned)util_permille + N2CF_GOV_TARGET_PERMILLE - 1) / N2CF_GOV_TARGET_PERMILLE;
++		unsigned row = fastest_row;             /* the slowest row (largest index) that still offers `need`; nothing does: the fastest */
++		for (unsigned i = slowest_row + 1; i-- > fastest_row;) {
++			if (l->mhz[i] >= need) {
++				row = i;
++				break;
++			}
++		}
++		if (row < cur) {                /* faster: at once */
++			want = row;
++			g->below_since_ms = 0;
++		} else if (row > cur) {         /* slower: only after the hold */
++			if (g->below_since_ms == 0) {
++				g->below_since_ms = now_ms ? now_ms : 1;
++			}
++			if (now_ms - g->below_since_ms >= N2CF_GOV_DOWN_HOLD_MS) {
++				want = cur + 1;         /* one row per tick */
++				g->below_since_ms = now_ms;
++			}
++		} else {
++			g->below_since_ms = 0;
++		}
++	}
++	if (now_ms < g->boost_until_ms && want > floor_row) {
++		want = floor_row;
++	}
++	if (want < fastest_row) {
++		want = fastest_row;
++	}
++	if (want > slowest_row) {
++		want = slowest_row;
++	}
++	return want;
++}
++
++/* ---- 0106: scheduler placement follows the measured advantage ----
++ * Core-aware placement (0099, mode 0xf) puts the render threads on the big cores.  It only helps when they are really faster: a 730 MHz A78 is
++ * about an A55 at 1.5 GHz, so with the big cores at their boot clock it would trade nothing for migrations.  Enable above 1.3x the little clock,
++ * disable again below 1.15x (hysteresis); never touch a mode the user set by boot-arg. */
++static inline int
++n2cf_place_decide(unsigned big_mhz, unsigned little_mhz, int cur_mode)
++{
++	if (big_mhz == 0 || little_mhz == 0) {
++		return cur_mode;
++	}
++	if (cur_mode == 0 && (uint64_t)big_mhz * 100u >= (uint64_t)little_mhz * 130u) {
++		return 0xf;
++	}
++	if (cur_mode != 0 && (uint64_t)big_mhz * 100u < (uint64_t)little_mhz * 115u) {
++		return 0;
++	}
++	return cur_mode;
++}
++
+ /* ---- ramp ---- */
+ 
+ static inline bool
+@@ -300,6 +440,21 @@
+ 	return true;
+ }
+ 
++/* Move a verified domain to `row` (either direction), one row at a time, each row confirmed by measurement (a miss reverts and freezes). */
++static inline bool
++n2cf_goto_row(const struct n2cf_ops *o, void *ctx, unsigned cluster, struct n2cf_domain *d, unsigned row)
++{
++	if (!d->verified || d->frozen || !n2cf_clusters[cluster].writable || row >= d->lut.n) {
++		return false;
++	}
++	while (d->cur != row) {
++		if (!n2cf_set_row(o, ctx, cluster, d, d->cur > row ? d->cur - 1 : d->cur + 1)) {
++			return false;
++		}
++	}
++	return true;
++}
++
+ /* One guard tick for a ramped cluster (the bootloader's row is d->perf0). */
+ static inline void
+ n2cf_guard_tick(const struct n2cf_ops *o, void *ctx, unsigned cluster, struct n2cf_domain *d, unsigned target_row)
+--- a/bsd/dev/nord2_cpufreq.c
++++ b/bsd/dev/nord2_cpufreq.c
+@@ -31,6 +31,7 @@
+ TUNABLE(int, nord2_cpufreq_arg, "n2cpu", 0);
+ 
+ extern unsigned nord2_cpu_mhz(int cpu);                                                /* nord2_sched.c (0099) */
++extern int nord2_sched_mode;                                                            /* nord2_sched.c (0099): placement mode bits */
+ extern bool nord2_battery_temperature_cC(int *centi);                                  /* Nord2GPU.cpp */
+ 
+ #define N2CF_FIRST_S    60u     /* let the boot settle and the 0099 thread print its baseline first */
+@@ -109,6 +110,17 @@
+ 			printf("NORD2 CPUFREQ cluster %s: already at or beyond the requested row (cur %u, target %u)\n", n2cf_clusters[b].name, c, d);
+ 		}
+ 		break;
++	case N2CF_L_DOMAIN:
++		printf("NORD2 CPUFREQ canonical domain +0x%04x: ENABLE %08x PERF_STATE %08x HW_STATE %08x\n", a, b, c, d);
++		break;
++	case N2CF_L_SRAM: {
++		static const char *const st[] = { "empty (zeros/ones)", "power-up noise: nothing ever wrote it, so no DVFS engine runs", "structured" };
++		printf("NORD2 CPUFREQ csram is %s (ones %u.%u%%, %u zero/ones words, %u equal neighbours)\n", a < 3 ? st[a] : "?", b / 10, b % 10, c, d);
++		break;
++	}
++	case N2CF_L_PLACE:
++		printf("NORD2 CPUFREQ placement mode %#x (big cores measure %u MHz, little %u MHz)\n", a, b, c);
++		break;
+ 	case N2CF_L_GUARD:
+ 		printf("NORD2 CPUFREQ guard cluster %s: battery %d.%02d C, row %u (%s)\n", n2cf_clusters[a].name, (int)c / 100, (int)c % 100, b,
+ 		    d ? "faster" : "slower");
+@@ -118,6 +130,18 @@
+ 
+ static const struct n2cf_ops n2cf_ops = { n2cf_rd, n2cf_wr, n2cf_mhz, n2cf_gauge, n2cf_sleep_ms, n2cf_log };
+ 
++/* Enable core-aware placement (0099 mode 0xf) when the big cluster measures well above the little one, back off when it no longer does. */
++static void
++n2cf_place(bool force_log)
++{
++	unsigned big = nord2_cpu_mhz(n2cf_clusters[1].first_cpu), little = nord2_cpu_mhz(n2cf_clusters[0].first_cpu);
++	int next = n2cf_place_decide(big, little, nord2_sched_mode);
++	if (next != nord2_sched_mode || force_log) {
++		nord2_sched_mode = next;
++		n2cf_log(NULL, N2CF_L_PLACE, (unsigned)next, big, little, 0);
++	}
++}
++
+ __attribute__((noreturn)) static void
+ nord2_cpufreq_exit(void)
+ {
+@@ -144,13 +168,22 @@
+ 		printf("NORD2 CPUFREQ: CSRAM unmapped\n");
+ 		nord2_cpufreq_exit();
+ 	}
++	n2cf_probe_canonical(&n2cf_ops, NULL);
++	(void)n2cf_csram_diagnose(&n2cf_ops, NULL, true);
+ 	unsigned mask = n2cf_discover(&n2cf_ops, NULL, dom, true);
+ 	printf("NORD2 CPUFREQ discovery done: verified clusters 0x%x (bit0 ll, bit1 l, bit2 b)%s\n", mask,
+ 	    mask == 0 ? ": no cpufreq-hw domain verified, nothing will be written" : "");
+ 	if (cap != 0 && mask != 0) {
+ 		ramped = n2cf_start(&n2cf_ops, NULL, dom, cap);
+ 	}
+-	while (ramped != 0) {
++	/* Placement follows the measured advantage of the big cores, unless n2sch= was given on the command line. */
++	int user_sched = 0;
++	bool manage_placement = cap != 0 && !PE_parse_boot_argn("n2sch", &user_sched, sizeof(user_sched));
++	unsigned place_ticks = 0;
++	if (manage_placement) {
++		n2cf_place(false);
++	}
++	while (ramped != 0 || manage_placement) {
+ 		assert_wait_timeout((event_t)&nord2_cpufreq_thread, THREAD_UNINT, N2CF_TICK_S, NSEC_PER_SEC);
+ 		thread_block(THREAD_CONTINUE_NULL);
+ 		for (unsigned c = 0; c < N2CF_CLUSTERS; c++) {
+@@ -158,6 +191,10 @@
+ 				n2cf_guard_tick(&n2cf_ops, NULL, c, &dom[c], n2cf_target_row(&dom[c].lut, n2cf_cap_for(cap, c)));
+ 			}
+ 		}
++		if (manage_placement && ++place_ticks >= 5) {                    /* every 10 s */
++			place_ticks = 0;
++			n2cf_place(false);
++		}
+ 	}
+ 	nord2_cpufreq_exit();
+ }

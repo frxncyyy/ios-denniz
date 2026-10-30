@@ -1,0 +1,126 @@
+--- a/bsd/dev/nord2_gpu_board.h
++++ b/bsd/dev/nord2_gpu_board.h
+@@ -99,6 +99,10 @@
+         struct nord2_gpu_board_report report;
+         bool mtcmos_by_us[NORD2_GPU_MTCMOS_COUNT];
+         bool rails_by_us, mux_by_us, cg_by_us;
++        /* Cold-start operating point (kHz), an exact vendor OPP; 0 = 350 MHz.  Only used
++         * when the inherited MFGPLL is unusable and every MFG domain is off (normalize);
++         * a valid inherited PLL is never retuned. */
++        uint32_t target_khz;
+         bool preflight_ok;         /* last preflight passed, nothing since */
+         bool powered;              /* everything up to READY verified */
+         bool uncertain;            /* rollback incomplete: do not retry */
+--- a/bsd/dev/nord2_gpu_clk.h
++++ b/bsd/dev/nord2_gpu_clk.h
+@@ -99,6 +99,9 @@
+ struct n2clk {
+         struct n2clk_ops ops;
+         void *ctx;
++        /* Cold-start target (normalize only). 0 = N2CLK_BOOT_KHZ / N2CLK_BOOT_POSDIV;
++         * otherwise an exact vendor OPP and its posdiv, validated by the board. */
++        uint32_t target_khz, target_posdiv;
+         struct n2clk_snapshot before;
+         bool mux_on;
+         bool mux_ungated_by_us;
+--- a/bsd/dev/nord2_gpu_rail.h
++++ b/bsd/dev/nord2_gpu_rail.h
+@@ -118,6 +118,8 @@
+ uint32_t n2rail_mfgpll_khz(uint32_t con1);
+ /* Conservative requirement for a running frequency, or false. */
+ bool n2rail_point_for_khz(uint32_t khz, struct n2rail_point *point);
++/* Exact vendor OPP entry for khz (index into n2rail_opp_table), or false. */
++bool n2rail_opp_index_exact(uint32_t khz, unsigned *index);
+ bool n2rail_vgpu_uv(uint8_t sel, uint32_t *uv);
+ bool n2rail_vsram_uv(uint8_t sel, uint32_t *uv);
+ uint8_t n2rail_vgpu_sel_for_uv(uint32_t uv);   /* rounds up */
+--- a/bsd/dev/nord2_gpu_board.c
++++ b/bsd/dev/nord2_gpu_board.c
+@@ -107,8 +107,20 @@
+                 r->normalize_pll = true;
+         }
+         struct n2rail_point pt;
+-        if (!n2rail_point_for_khz(r->normalize_pll ? N2CLK_BOOT_KHZ :
+-                                r->clk_before.khz, &pt)) {
++        uint32_t want = N2CLK_BOOT_KHZ;
++        b->clk->target_khz = b->clk->target_posdiv = 0;
++        if (r->normalize_pll && b->target_khz && b->target_khz != N2CLK_BOOT_KHZ) {
++                unsigned idx;
++                if (!n2rail_opp_index_exact(b->target_khz, &idx)) {
++                        r->error = N2RAIL_E_FREQ;
++                        note(b, "Nord2 GPU board: requested OPP is not a vendor table entry");
++                        return false;
++                }
++                want = b->target_khz;
++                b->clk->target_khz = want;
++                b->clk->target_posdiv = n2rail_opp_table[idx].posdiv_power;
++        }
++        if (!n2rail_point_for_khz(r->normalize_pll ? want : r->clk_before.khz, &pt)) {
+                 r->error = N2RAIL_E_FREQ;
+                 return false;
+         }
+--- a/bsd/dev/nord2_gpu_clk.c
++++ b/bsd/dev/nord2_gpu_clk.c
+@@ -152,11 +152,12 @@
+                         goto done;
+                 c->ops.udelay(c->ctx, 20);
+                 /* Unmodified Android __mt_gpufreq_calculate_dds arithmetic. */
+-                uint32_t dds = (((N2CLK_BOOT_KHZ / 100u *
+-                                   (1u << N2CLK_BOOT_POSDIV)) << 14) / 26u + 5u) / 10u;
+-                uint32_t con1 = (N2CLK_BOOT_POSDIV << 24) | dds;
++                uint32_t khz = c->target_khz ? c->target_khz : N2CLK_BOOT_KHZ;
++                uint32_t posdiv = c->target_khz ? c->target_posdiv : N2CLK_BOOT_POSDIV;
++                uint32_t dds = (((khz / 100u * (1u << posdiv)) << 14) / 26u + 5u) / 10u;
++                uint32_t con1 = (posdiv << 24) | dds;
+                 if (!pll_rate(c, con1) ||
+-                    n2rail_mfgpll_khz(rd(c, N2CLK_APMIXED, N2CLK_MFGPLL_CON1)) != N2CLK_BOOT_KHZ)
++                    n2rail_mfgpll_khz(rd(c, N2CLK_APMIXED, N2CLK_MFGPLL_CON1)) != khz)
+                         goto done;
+         }
+         if (!set_parent(c, N2CLK_MFG_PARENT_MFGPLL) || !set_gate(c, false)) {
+--- a/bsd/dev/nord2_gpu_rail.c
++++ b/bsd/dev/nord2_gpu_rail.c
+@@ -43,6 +43,17 @@
+                           100u);
+ }
+ 
++bool n2rail_opp_index_exact(uint32_t khz, unsigned *index)
++{
++        for (unsigned i = 0; i < N2RAIL_OPP_COUNT; i++)
++                if (n2rail_opp_table[i].khz == khz) {
++                        if (index)
++                                *index = i;
++                        return true;
++                }
++        return false;
++}
++
+ bool n2rail_point_for_khz(uint32_t khz, struct n2rail_point *pt)
+ {
+         if (!pt || !khz || khz > n2rail_opp_table[0].khz)
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -99,6 +99,15 @@
+         IOLog("NORD2 GPU: cache maintenance %s\n", c->full_cache_maint ? "whole-context (boot-arg)" : "per-job buffer list");
+         return true;
+ }
++/* Cold-start GPU clock: boot-arg nord2_gpu_khz=<kHz> selects an exact vendor OPP
++ * (350000..886000, see n2rail_opp_table).  Default (absent) keeps the 350 MHz minimum.
++ * Honoured only when the boot chain left MFGPLL unusable and every MFG domain off. */
++static bool opp_target(struct nord2_gpu_board *b) {
++        int khz = 0; PE_parse_boot_argn("nord2_gpu_khz", &khz, sizeof(khz));
++        b->target_khz = khz > 0 ? (uint32_t)khz : 0;
++        if (b->target_khz) IOLog("NORD2 GPU: cold-start OPP requested: %u kHz (exact vendor entry or refused)\n", b->target_khz);
++        return true;
++}
+ static IOReturn io_error(enum n2c_error e) {
+         switch (e) {
+         case N2C_OK: return kIOReturnSuccess;
+@@ -234,6 +243,7 @@
+                n2rail_init(&rail, &ro, this) && n2clk_init(&clk, &co, this) &&
+                n2hw_init(&hw, &ho, &gpu) && nord2_scpsys_init(&scpsys, &so, this, 200000) &&
+                nord2_gpu_board_init(&board, &rail, &clk, &scpsys, &hw, log_msg, this) &&
++               opp_target(&board) &&
+                n2c_init(core, &mo, this, &hw) &&
+                cache_scope(core) &&
+                n2c_set_wa_payload(core, valhall_wa_payload, sizeof(valhall_wa_payload));

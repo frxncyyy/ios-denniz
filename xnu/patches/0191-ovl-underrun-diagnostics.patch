@@ -1,0 +1,54 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-03 23:18:27.615411438 +0100
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-03 23:18:27.616101706 +0100
+@@ -74,6 +74,7 @@
+ /* OVL 2L layer 0 of both pipes (osfmk/arm64/sweet_early.c nord2_display_overlay_init verified the same registers). */
+ #define SWEET_FB_OVL0_2L           0x14001000UL
+ #define SWEET_FB_OVL1_2L           0x14101000UL
++#define SWEET_FB_OVL_INTSTA        0x08u
+ #define SWEET_FB_OVL_SIZE          0x38u
+ #define SWEET_FB_OVL_PITCH         0x44u
+ #define SWEET_FB_OVL_ADDR          0xf40u
+@@ -201,6 +202,7 @@
+ 	int64_t             fTickCorrUs;              /* phase correction for the next vsync tick, consumed by vsyncFired */
+ 	int64_t             fTickCorrSumUs;
+ 	uint32_t            fDzWaits, fSafeStarts, fPhBin[3];
++	uint32_t            fOvlBits[SWEET_FB_SCAN_PIPES][32], fOvlFrames, fDsiUnd;      /* 0191: OVL INTSTA bits seen after each transfer */
+ 	uint64_t            fHbPeriodUs;              /* the heartbeat period: a slow filter of the TE period */
+ 	SweetSurface       *fSurfaceB;
+ 	uintptr_t           fPixelsB, fCopyDst;
+@@ -914,6 +916,18 @@
+ 	}
+ #endif
+ 	int st = sweet_fb_xfer_state(fb->xferDone(), elapsed);
++#if defined(NORD2)
++	if (st != SWEET_FB_XFER_WAIT && fb->fOvl[0] != NULL && fb->fOvl[1] != NULL) {
++		/* 0191: sticky overlay status of the frame just sent (underrun/abnormal bits), then clear it */
++		fb->fOvlFrames++;
++		for (uint32_t i = 0; i < SWEET_FB_SCAN_PIPES; i++) {
++			uint32_t v = fb->fOvl[i][SWEET_FB_OVL_INTSTA / 4];
++			for (uint32_t b = 0; b < 32; b++) { if (v & (1u << b)) { fb->fOvlBits[i][b]++; } }
++			fb->fOvl[i][SWEET_FB_OVL_INTSTA / 4] = 0;
++		}
++		if (fb->fDsi != NULL && (fb->fDsi[SWEET_FB_DSI_INTSTA / 4] & (1u << 12))) { fb->fDsiUnd++; fb->fDsi[SWEET_FB_DSI_INTSTA / 4] = ~(1u << 12); }
++	}
++#endif
+ 	if (st == SWEET_FB_XFER_WAIT) {
+ #if defined(NORD2)
+ 		if (fb->fPState == 2) { fb->prepNext(); }
+@@ -1227,6 +1241,16 @@
+ 		    fDbl ? 1u : 0u, fStats.dbl_preps, fStats.dbl_hits, fStats.te_lead_starts, fTePeriodUs);
+ 		IOLog("NORD2 FB LOCK: te_period_us=%llu tw_min_us=%llu safe_starts=%u deferred=%u ready_phase_early/in/late=%u/%u/%u ctl_err_ema_us=%lld tick_shift_us=%lld period_abs_us=%llu\n", fTePeriodUs, fTwMinUs, fSafeStarts, fDzWaits,
+ 		    fPhBin[0], fPhBin[1], fPhBin[2], (long long)fCtlEmaUs, (long long)fTickCorrSumUs, sweet_fb_abs_to_us(fPeriodAbs));
++		{
++			char ob[2][200]; 
++			for (uint32_t i = 0; i < SWEET_FB_SCAN_PIPES; i++) {
++				size_t n = 0; ob[i][0] = 0;
++				for (uint32_t b = 0; b < 32 && n < 160; b++) { if (fOvlBits[i][b]) { n += snprintf(ob[i] + n, sizeof(ob[i]) - n, "b%u=%u ", b, fOvlBits[i][b]); } }
++				if (n == 0) { snprintf(ob[i], sizeof(ob[i]), "none"); }
++			}
++			IOLog("NORD2 FB OVL: frames=%u dsi_underrun=%u ovl0[%s] ovl1[%s]\n", fOvlFrames, fDsiUnd, ob[0], ob[1]);
++			fOvlFrames = 0; fDsiUnd = 0; memset(fOvlBits, 0, sizeof(fOvlBits));
++		}
+ 		fSafeStarts = 0; fDzWaits = 0; fTickCorrSumUs = 0; fPhBin[0] = fPhBin[1] = fPhBin[2] = 0;
+ 		for (unsigned i = 0; i < 5; i++) { fCad[i] = 0; }
+ 		fDistinct = fSame = 0; fDistinctGapMaxUs = 0; for (unsigned i = 0; i < 5; i++) { fGapBin[i] = 0; }

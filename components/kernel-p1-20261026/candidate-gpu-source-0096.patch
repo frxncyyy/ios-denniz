@@ -1,0 +1,877 @@
+--- a/gpu/src/Nord2GPU.cpp
++++ b/gpu/src/Nord2GPU.cpp
+@@ -101,7 +101,13 @@
+ static bool cache_scope(struct n2c_core *c) {
+         int v = 0; PE_parse_boot_argn("nord2_gpu_cache", &v, sizeof(v));
+         c->full_cache_maint = v == 1;
+-        IOLog("NORD2 GPU: cache maintenance %s\n", c->full_cache_maint ? "whole-context (boot-arg)" : "per-job buffer list");
++        /* Tracking level (0087 scoping is level 0): 1 = buffers the CPU can never touch are maintained once;
++         * 2 = plus IOSurface lock/unlock-bracketed CPU access.  nord2_gpu_track=<n>, short alias n2trk. */
++        int tr = 1, got = 0;
++        got = PE_parse_boot_argn("nord2_gpu_track", &tr, sizeof(tr)); if (!got) got = PE_parse_boot_argn("n2trk", &tr, sizeof(tr));
++        if (tr < 0 || tr > 2) tr = 1;
++        (void)n2c_set_track_level(c, (unsigned)tr);
++        IOLog("NORD2 GPU: cache maintenance %s, CPU-access tracking level %d\n", c->full_cache_maint ? "whole-context (boot-arg)" : "per-job buffer list", tr);
+         return true;
+ }
+ /* Cold-start GPU clock: boot-arg nord2_gpu_khz=<kHz> selects an exact vendor OPP
+@@ -126,6 +132,8 @@
+         default: return kIOReturnIOError;
+         }
+ }
++class Nord2GPU;
++static Nord2GPU *gSurfaceGpu;   /* the ready driver instance, for the IOSurface CPU-access hooks */
+ class IOAcceleratorES : public IOService { OSDeclareDefaultStructors(IOAcceleratorES); };
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ class Nord2GPU : public IOAcceleratorES {
+@@ -145,6 +153,7 @@
+         /* WAIT_SEQ: waits, jobs covered, time inside the wait */
+         uint32_t seqWaits = 0, seqJobs = 0, seqDurMax = 0; uint64_t seqDurSum = 0;
+         void emitJobStats();
++        void surfaceHook(void *surface, bool acquire);
+         /* Optional job interrupt (boot-arg nord2_gpu_irq=1; polling stays the fallback). */
+         bool irqWanted = false, irqTried = false, irqArmed = false;
+         uint32_t irqSpi = NORD2_GPU_JOB_SPI_DEFAULT, irqIntid = 0, irqLearnMisses = 0;
+@@ -346,7 +355,7 @@
+                 d->attempted = true;
+                 n2owner_wait wait = { now_ms, sleep_ms, NULL }; int result = -1;
+                 if (n2owner_call(&gpu_owner_queue, powerOn, d, &wait, 1000, &result) && !result &&
+-                    n2c_start(d->core) == N2C_OK) d->ready = true;
++                    n2c_start(d->core) == N2C_OK) { d->ready = true; gSurfaceGpu = d; }
+                 IOLog("NORD2 GPU CORE: state=%u wa_required=%u wa_done=%u runs=%u "
+                       "hw_error=%u offset=%04x value=%08x\n", d->core->state,
+                       d->hw.has_issue_ttrx_3485, d->hw.wa_complete, d->hw.wa_runs,
+@@ -408,7 +417,7 @@
+         registerService(); return true;
+ }
+ void Nord2GPU::stop(IOService *provider) {
+-        if (lock) { IOLockLock(lock); stopping = true; ready = false; IOLockUnlock(lock); }
++        if (lock) { IOLockLock(lock); stopping = true; ready = false; if (gSurfaceGpu == this) gSurfaceGpu = NULL; IOLockUnlock(lock); }
+         if (timer) { timer->cancelTimeout(); if (loop) loop->removeEventSource(timer); }
+         if (lock) IOLockLock(lock);
+         if (core && core->ops.alloc_table) {
+@@ -468,6 +477,28 @@
+  * (c) enables it and installs irqDispatch on that PE.  Top half: mask the job line at the device,
+  * count, wake the waiter.  Bottom half is the unchanged n2c_poll().  Timeouts keep polling alive. */
+ Nord2GPU *Nord2GPU::irqOwner = NULL;
++/* IOSurface CPU-access protocol (level 2).  acquire: the CPU is about to read the surface (IOSurfaceLock, or the
++ * framebuffer copy): invalidate its lines if the GPU wrote it since.  release: the CPU wrote it (IOSurfaceUnlock
++ * without read-only): clean it before the GPU's next read.  Imports of the surface in any context are covered. */
++void Nord2GPU::surfaceHook(void *surface, bool acquire) {
++        if (!surface || !ready || !core || core->track_level < N2C_TRACK_EXPLICIT) return;
++        IOLockLock(lock);
++        if (!stopping) {
++                for (unsigned i = 0; i < N2C_MAX_CTX; i++) {
++                        if (core->ctxs[i].state == N2C_CTX_FREE) continue;
++                        for (unsigned j = 0; j < N2C_MAX_BOS; j++) {
++                                struct n2c_bo *b = core->ctxs[i].bos[j];
++                                if (!b || b->state != N2C_BO_MAPPED || !(b->flags & N2C_BO_IMPORTED) || !b->cookie ||
++                                    ((BufferOwner *)b->cookie)->surface != (SweetSurface *)surface) continue;
++                                if (acquire) (void)n2c_bo_cpu_acquire(core, i, b->handle, NULL);
++                                else (void)n2c_bo_cpu_dirty(core, i, b->handle);
++                        }
++                }
++        }
++        IOLockUnlock(lock);
++}
++extern "C" void nord2_gpu_surface_cpu_acquire(void *surface) { if (gSurfaceGpu) gSurfaceGpu->surfaceHook(surface, true); }
++extern "C" void nord2_gpu_surface_cpu_release(void *surface) { if (gSurfaceGpu) gSurfaceGpu->surfaceHook(surface, false); }
+ static uint32_t gic_rd32(void *c, uint32_t off) { return read_bank(c, off); }
+ static void gic_wr32(void *c, uint32_t off, uint32_t v) { write_bank(c, off, v); }
+ static uint64_t gic_rd64(void *c, uint32_t off) {
+@@ -636,7 +667,7 @@
+         int hot = (lvtsMode && lvtsState && lvtsState != 3) ? lvtsHottest(lvtsMask) : (int)0x80000000;
+         uint32_t n = t.jobs ? t.jobs : 1, w = waitN ? waitN : 1;
+         IOLog("NORD2 GPU JOBS: n=%u fault=%u full=%u win_ms=%llu q_us=%llu/%u run_us=%llu/%u tot_us=%llu/%u "
+-              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u gpu_khz=%u mux=%u bat_cC=%d bat_ok=%u gpu_cC=%d soc_cC=%d lvts=%u%s irq=%u:%u/%u/%u/%u\n",
++              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u gpu_khz=%u mux=%u bat_cC=%d bat_ok=%u gpu_cC=%d soc_cC=%d lvts=%u%s irq=%u:%u/%u/%u/%u trk=%u skipC_KiB=%llu skipI_KiB=%llu defI_KiB=%llu acqI_KiB=%llu\n",
+               t.jobs, t.faulted, t.full_jobs, t.window_start_us / 1000, t.sum_queue_us / n, t.max_queue_us,
+               t.sum_run_us / n, t.max_run_us, t.sum_total_us / n, t.max_total_us, t.sum_clean_us / n, t.max_clean_us,
+               t.sum_inval_us / n, t.max_inval_us, t.sum_clean_pages * 4, t.sum_inval_pages * 4, waitN,
+@@ -644,7 +675,9 @@
+               seqWaits, seqJobs, seqWaits ? seqDurSum / seqWaits : 0ull, seqDurMax, pll_khz, mux,
+               bat_ok ? bat : 0, (unsigned)bat_ok, gpu_ok ? gmC / 10 : -9999, hot != (int)0x80000000 ? hot : -9999,
+               lvtsState, (lvtsState && lvts.cal.defaulted) ? "~" : "",
+-              (unsigned)irqState, irqTops, irqGuard.spurious_total, irqSleeps, irqTimeouts);
++              (unsigned)irqState, irqTops, irqGuard.spurious_total, irqSleeps, irqTimeouts,
++              (unsigned)core->track_level, core->stats.cache_skip_clean_pages * 4, core->stats.cache_skip_inval_pages * 4,
++              core->stats.cache_deferred_pages * 4, core->stats.cache_acquire_pages * 4);
+         waitN = waitGapMax = waitDurMax = waitRetMax = 0; waitGapSum = waitDurSum = waitRetSum = 0;
+         seqWaits = seqJobs = seqDurMax = 0; seqDurSum = 0;
+ }
+@@ -661,7 +694,7 @@
+                             uint32_t *h, uint64_t *va, uint64_t *actual) {
+         if (!ready || !core || c >= N2C_MAX_CTX) return kIOReturnNotReady;
+         uint64_t requested = bytes;
+-        if ((flags & ~1u)) return kIOReturnBadArgument;
++        if ((flags & ~3u)) return kIOReturnBadArgument;          /* bit0 executable, bit1 GPU-only (never CPU-mapped) */
+         if (!nord2_gpu_allocation_size_limit(bytes, core->ctxs[c].wired - core->ctxs[c].imported, privateLimit, &bytes)) {
+                 budgetReject("private", c, requested, privateLimit); return kIOReturnBadArgument;
+         }
+@@ -683,7 +716,7 @@
+         }
+         owner->md = md; bool adopted = false;
+         enum n2c_error e = valid ? n2c_bo_map(core, c, pages, count, N2C_BO_GPU_READ | N2C_BO_GPU_WRITE |
+-                ((flags & 1) ? N2C_BO_GPU_EXEC : 0), owner, bytes, h, va, &adopted) : N2C_E_ARGS;
++                ((flags & 1) ? N2C_BO_GPU_EXEC : 0) | ((flags & 2) ? N2C_BO_GPU_ONLY : 0), owner, bytes, h, va, &adopted) : N2C_E_ARGS;
+         IOFree(pages, count * sizeof(*pages)); if (!adopted) free_owner(this, owner);
+         if (e == N2C_OK) {
+                 *actual = bytes;
+@@ -723,6 +756,8 @@
+         enum n2c_error e = valid ? n2c_bo_map(core,c,pages,count,N2C_BO_GPU_READ|N2C_BO_GPU_WRITE|N2C_BO_IMPORTED,
+                                              owner,charged,h,va,&adopted) : N2C_E_ARGS;
+         IOFree(pages,count*sizeof(*pages)); if (!adopted) free_owner(this,owner);
++        /* Level 2: the surface's CPU access is bracketed by IOSurfaceLock/Unlock (see surfaceHook). */
++        if (e==N2C_OK && core->track_level>=N2C_TRACK_EXPLICIT) (void)n2c_bo_track(core,c,*h);
+         if (e==N2C_OK) *actual=mapped; return io_error(e);
+ }
+ IOReturn Nord2GPU::compute(unsigned c, const nord2_gpu_compute_request *r, uint64_t *id) {
+@@ -868,6 +903,8 @@
+         if(!options || !memory || !gpu || !lock)return kIOReturnBadArgument;
+         *memory=NULL;*options=kIOMapDefaultCache;IOLockLock(lock);IOLockLock(gpu->lock);
+         const n2c_bo *b=!closed && context<N2C_MAX_CTX?n2c_bo_lookup(gpu->core,context,type):NULL;
++        if(b && (b->flags & N2C_BO_GPU_ONLY))b=NULL;               /* GPU-only buffers have no CPU mapping, by promise */
++        if(b)(void)n2c_bo_cpu_visible(gpu->core,context,type);     /* from now on the CPU may touch it: normal maintenance */
+         BufferOwner *o=b?(BufferOwner *)b->cookie:NULL;
+         if(o && o->md){*memory=o->md;(*memory)->retain();}
+         IOLockUnlock(gpu->lock);IOLockUnlock(lock);return *memory?kIOReturnSuccess:kIOReturnNotFound;
+--- a/shim/nord2-xnu/Nord2GPU.cpp
++++ b/shim/nord2-xnu/Nord2GPU.cpp
+@@ -101,7 +101,13 @@
+ static bool cache_scope(struct n2c_core *c) {
+         int v = 0; PE_parse_boot_argn("nord2_gpu_cache", &v, sizeof(v));
+         c->full_cache_maint = v == 1;
+-        IOLog("NORD2 GPU: cache maintenance %s\n", c->full_cache_maint ? "whole-context (boot-arg)" : "per-job buffer list");
++        /* Tracking level (0087 scoping is level 0): 1 = buffers the CPU can never touch are maintained once;
++         * 2 = plus IOSurface lock/unlock-bracketed CPU access.  nord2_gpu_track=<n>, short alias n2trk. */
++        int tr = 1, got = 0;
++        got = PE_parse_boot_argn("nord2_gpu_track", &tr, sizeof(tr)); if (!got) got = PE_parse_boot_argn("n2trk", &tr, sizeof(tr));
++        if (tr < 0 || tr > 2) tr = 1;
++        (void)n2c_set_track_level(c, (unsigned)tr);
++        IOLog("NORD2 GPU: cache maintenance %s, CPU-access tracking level %d\n", c->full_cache_maint ? "whole-context (boot-arg)" : "per-job buffer list", tr);
+         return true;
+ }
+ /* Cold-start GPU clock: boot-arg nord2_gpu_khz=<kHz> selects an exact vendor OPP
+@@ -126,6 +132,8 @@
+         default: return kIOReturnIOError;
+         }
+ }
++class Nord2GPU;
++static Nord2GPU *gSurfaceGpu;   /* the ready driver instance, for the IOSurface CPU-access hooks */
+ class IOAcceleratorES : public IOService { OSDeclareDefaultStructors(IOAcceleratorES); };
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ class Nord2GPU : public IOAcceleratorES {
+@@ -145,6 +153,7 @@
+         /* WAIT_SEQ: waits, jobs covered, time inside the wait */
+         uint32_t seqWaits = 0, seqJobs = 0, seqDurMax = 0; uint64_t seqDurSum = 0;
+         void emitJobStats();
++        void surfaceHook(void *surface, bool acquire);
+         /* Optional job interrupt (boot-arg nord2_gpu_irq=1; polling stays the fallback). */
+         bool irqWanted = false, irqTried = false, irqArmed = false;
+         uint32_t irqSpi = NORD2_GPU_JOB_SPI_DEFAULT, irqIntid = 0, irqLearnMisses = 0;
+@@ -346,7 +355,7 @@
+                 d->attempted = true;
+                 n2owner_wait wait = { now_ms, sleep_ms, NULL }; int result = -1;
+                 if (n2owner_call(&gpu_owner_queue, powerOn, d, &wait, 1000, &result) && !result &&
+-                    n2c_start(d->core) == N2C_OK) d->ready = true;
++                    n2c_start(d->core) == N2C_OK) { d->ready = true; gSurfaceGpu = d; }
+                 IOLog("NORD2 GPU CORE: state=%u wa_required=%u wa_done=%u runs=%u "
+                       "hw_error=%u offset=%04x value=%08x\n", d->core->state,
+                       d->hw.has_issue_ttrx_3485, d->hw.wa_complete, d->hw.wa_runs,
+@@ -408,7 +417,7 @@
+         registerService(); return true;
+ }
+ void Nord2GPU::stop(IOService *provider) {
+-        if (lock) { IOLockLock(lock); stopping = true; ready = false; IOLockUnlock(lock); }
++        if (lock) { IOLockLock(lock); stopping = true; ready = false; if (gSurfaceGpu == this) gSurfaceGpu = NULL; IOLockUnlock(lock); }
+         if (timer) { timer->cancelTimeout(); if (loop) loop->removeEventSource(timer); }
+         if (lock) IOLockLock(lock);
+         if (core && core->ops.alloc_table) {
+@@ -468,6 +477,28 @@
+  * (c) enables it and installs irqDispatch on that PE.  Top half: mask the job line at the device,
+  * count, wake the waiter.  Bottom half is the unchanged n2c_poll().  Timeouts keep polling alive. */
+ Nord2GPU *Nord2GPU::irqOwner = NULL;
++/* IOSurface CPU-access protocol (level 2).  acquire: the CPU is about to read the surface (IOSurfaceLock, or the
++ * framebuffer copy): invalidate its lines if the GPU wrote it since.  release: the CPU wrote it (IOSurfaceUnlock
++ * without read-only): clean it before the GPU's next read.  Imports of the surface in any context are covered. */
++void Nord2GPU::surfaceHook(void *surface, bool acquire) {
++        if (!surface || !ready || !core || core->track_level < N2C_TRACK_EXPLICIT) return;
++        IOLockLock(lock);
++        if (!stopping) {
++                for (unsigned i = 0; i < N2C_MAX_CTX; i++) {
++                        if (core->ctxs[i].state == N2C_CTX_FREE) continue;
++                        for (unsigned j = 0; j < N2C_MAX_BOS; j++) {
++                                struct n2c_bo *b = core->ctxs[i].bos[j];
++                                if (!b || b->state != N2C_BO_MAPPED || !(b->flags & N2C_BO_IMPORTED) || !b->cookie ||
++                                    ((BufferOwner *)b->cookie)->surface != (SweetSurface *)surface) continue;
++                                if (acquire) (void)n2c_bo_cpu_acquire(core, i, b->handle, NULL);
++                                else (void)n2c_bo_cpu_dirty(core, i, b->handle);
++                        }
++                }
++        }
++        IOLockUnlock(lock);
++}
++extern "C" void nord2_gpu_surface_cpu_acquire(void *surface) { if (gSurfaceGpu) gSurfaceGpu->surfaceHook(surface, true); }
++extern "C" void nord2_gpu_surface_cpu_release(void *surface) { if (gSurfaceGpu) gSurfaceGpu->surfaceHook(surface, false); }
+ static uint32_t gic_rd32(void *c, uint32_t off) { return read_bank(c, off); }
+ static void gic_wr32(void *c, uint32_t off, uint32_t v) { write_bank(c, off, v); }
+ static uint64_t gic_rd64(void *c, uint32_t off) {
+@@ -636,7 +667,7 @@
+         int hot = (lvtsMode && lvtsState && lvtsState != 3) ? lvtsHottest(lvtsMask) : (int)0x80000000;
+         uint32_t n = t.jobs ? t.jobs : 1, w = waitN ? waitN : 1;
+         IOLog("NORD2 GPU JOBS: n=%u fault=%u full=%u win_ms=%llu q_us=%llu/%u run_us=%llu/%u tot_us=%llu/%u "
+-              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u gpu_khz=%u mux=%u bat_cC=%d bat_ok=%u gpu_cC=%d soc_cC=%d lvts=%u%s irq=%u:%u/%u/%u/%u\n",
++              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u gpu_khz=%u mux=%u bat_cC=%d bat_ok=%u gpu_cC=%d soc_cC=%d lvts=%u%s irq=%u:%u/%u/%u/%u trk=%u skipC_KiB=%llu skipI_KiB=%llu defI_KiB=%llu acqI_KiB=%llu\n",
+               t.jobs, t.faulted, t.full_jobs, t.window_start_us / 1000, t.sum_queue_us / n, t.max_queue_us,
+               t.sum_run_us / n, t.max_run_us, t.sum_total_us / n, t.max_total_us, t.sum_clean_us / n, t.max_clean_us,
+               t.sum_inval_us / n, t.max_inval_us, t.sum_clean_pages * 4, t.sum_inval_pages * 4, waitN,
+@@ -644,7 +675,9 @@
+               seqWaits, seqJobs, seqWaits ? seqDurSum / seqWaits : 0ull, seqDurMax, pll_khz, mux,
+               bat_ok ? bat : 0, (unsigned)bat_ok, gpu_ok ? gmC / 10 : -9999, hot != (int)0x80000000 ? hot : -9999,
+               lvtsState, (lvtsState && lvts.cal.defaulted) ? "~" : "",
+-              (unsigned)irqState, irqTops, irqGuard.spurious_total, irqSleeps, irqTimeouts);
++              (unsigned)irqState, irqTops, irqGuard.spurious_total, irqSleeps, irqTimeouts,
++              (unsigned)core->track_level, core->stats.cache_skip_clean_pages * 4, core->stats.cache_skip_inval_pages * 4,
++              core->stats.cache_deferred_pages * 4, core->stats.cache_acquire_pages * 4);
+         waitN = waitGapMax = waitDurMax = waitRetMax = 0; waitGapSum = waitDurSum = waitRetSum = 0;
+         seqWaits = seqJobs = seqDurMax = 0; seqDurSum = 0;
+ }
+@@ -661,7 +694,7 @@
+                             uint32_t *h, uint64_t *va, uint64_t *actual) {
+         if (!ready || !core || c >= N2C_MAX_CTX) return kIOReturnNotReady;
+         uint64_t requested = bytes;
+-        if ((flags & ~1u)) return kIOReturnBadArgument;
++        if ((flags & ~3u)) return kIOReturnBadArgument;          /* bit0 executable, bit1 GPU-only (never CPU-mapped) */
+         if (!nord2_gpu_allocation_size_limit(bytes, core->ctxs[c].wired - core->ctxs[c].imported, privateLimit, &bytes)) {
+                 budgetReject("private", c, requested, privateLimit); return kIOReturnBadArgument;
+         }
+@@ -683,7 +716,7 @@
+         }
+         owner->md = md; bool adopted = false;
+         enum n2c_error e = valid ? n2c_bo_map(core, c, pages, count, N2C_BO_GPU_READ | N2C_BO_GPU_WRITE |
+-                ((flags & 1) ? N2C_BO_GPU_EXEC : 0), owner, bytes, h, va, &adopted) : N2C_E_ARGS;
++                ((flags & 1) ? N2C_BO_GPU_EXEC : 0) | ((flags & 2) ? N2C_BO_GPU_ONLY : 0), owner, bytes, h, va, &adopted) : N2C_E_ARGS;
+         IOFree(pages, count * sizeof(*pages)); if (!adopted) free_owner(this, owner);
+         if (e == N2C_OK) {
+                 *actual = bytes;
+@@ -723,6 +756,8 @@
+         enum n2c_error e = valid ? n2c_bo_map(core,c,pages,count,N2C_BO_GPU_READ|N2C_BO_GPU_WRITE|N2C_BO_IMPORTED,
+                                              owner,charged,h,va,&adopted) : N2C_E_ARGS;
+         IOFree(pages,count*sizeof(*pages)); if (!adopted) free_owner(this,owner);
++        /* Level 2: the surface's CPU access is bracketed by IOSurfaceLock/Unlock (see surfaceHook). */
++        if (e==N2C_OK && core->track_level>=N2C_TRACK_EXPLICIT) (void)n2c_bo_track(core,c,*h);
+         if (e==N2C_OK) *actual=mapped; return io_error(e);
+ }
+ IOReturn Nord2GPU::compute(unsigned c, const nord2_gpu_compute_request *r, uint64_t *id) {
+@@ -868,6 +903,8 @@
+         if(!options || !memory || !gpu || !lock)return kIOReturnBadArgument;
+         *memory=NULL;*options=kIOMapDefaultCache;IOLockLock(lock);IOLockLock(gpu->lock);
+         const n2c_bo *b=!closed && context<N2C_MAX_CTX?n2c_bo_lookup(gpu->core,context,type):NULL;
++        if(b && (b->flags & N2C_BO_GPU_ONLY))b=NULL;               /* GPU-only buffers have no CPU mapping, by promise */
++        if(b)(void)n2c_bo_cpu_visible(gpu->core,context,type);     /* from now on the CPU may touch it: normal maintenance */
+         BufferOwner *o=b?(BufferOwner *)b->cookie:NULL;
+         if(o && o->md){*memory=o->md;(*memory)->retain();}
+         IOLockUnlock(gpu->lock);IOLockUnlock(lock);return *memory?kIOReturnSuccess:kIOReturnNotFound;
+--- a/gpu/include/nord2_gpu_core.h
++++ b/gpu/include/nord2_gpu_core.h
+@@ -54,6 +54,7 @@
+         N2C_BO_GPU_EXEC = 1u << 2,
+         N2C_BO_CPU_UNCACHED = 1u << 3,  /* CPU mapping WC/NC: no CPU sync */
+         N2C_BO_IMPORTED = 1u << 4,      /* pages owned by e.g. IOSurface */
++        N2C_BO_GPU_ONLY = 1u << 5,      /* promise: never mapped for the CPU (the kernel refuses the mapping) */
+ };
+ 
+ enum n2c_bo_state {
+@@ -148,7 +149,22 @@
+         void *cookie;
+         uint64_t tables[8];       /* detached tables awaiting reset */
+         unsigned nr_tables;
+-};
++        /* CPU cache tracking (track_level >= 1).  A buffer the CPU can never touch needs
++         * one clean (the kernel's zero fill) and no maintenance after that. */
++        bool cpu_dirty;           /* CPU lines may be dirty: clean before the GPU reads */
++        bool cpu_visible;         /* the CPU can read/write it: user mapping handed out, or an imported surface */
++        bool explicit_track;      /* visible, but CPU access is bracketed by acquire/dirty calls (level 2) */
++        bool gpu_dirty;           /* tracked: GPU wrote it since the last acquire */
++        bool gpu_written;         /* the GPU has written it at least once */
++};
++
++/* Cache tracking levels: 0 = every listed buffer is cleaned before and invalidated after every job (0087);
++ * 1 = buffers the CPU cannot reach are maintained once, user-visible ones as at level 0;
++ * 2 = level 1 plus explicitly tracked visible buffers (IOSurface lock/unlock): clean only after a CPU write,
++ *     invalidate only on CPU acquire. */
++#define N2C_TRACK_LEGACY 0u
++#define N2C_TRACK_PRIVATE 1u
++#define N2C_TRACK_EXPLICIT 2u
+ 
+ struct n2c_ctx {
+         uint8_t state;
+@@ -231,6 +247,9 @@
+          * invalidate after completion) and jobs that needed whole-context
+          * maintenance. */
+         uint64_t cache_clean_pages, cache_inval_pages, cache_full_jobs;
++        /* tracking: pages NOT cleaned / NOT invalidated per job, invalidations deferred to a CPU acquire,
++         * and pages invalidated by acquire or by a buffer becoming user-visible */
++        uint64_t cache_skip_clean_pages, cache_skip_inval_pages, cache_deferred_pages, cache_acquire_pages;
+ };
+ 
+ struct n2c_core {
+@@ -252,6 +271,7 @@
+         /* Rollback valve (boot-arg nord2_gpu_cache=1): maintain the whole
+          * context for every job, as before per-job scoping. */
+         bool full_cache_maint;
++        uint8_t track_level;      /* N2C_TRACK_*; set before the first buffer exists */
+         /* Private immutable workaround, separate AS0 MMU, never user mapped. */
+         const uint8_t *wa_payload;
+         size_t wa_size;
+@@ -313,6 +333,14 @@
+  * nothing is pending, every terminal job <= seq of the context is released. */
+ enum n2c_error n2c_seq_state(struct n2c_core *c, unsigned ctx, uint64_t seq,
+                              bool reap, struct n2c_seq_result *res);
++bool n2c_set_track_level(struct n2c_core *c, unsigned level);
++/* A user mapping of the buffer was handed out: from now on it is maintained like any CPU-visible buffer. */
++enum n2c_error n2c_bo_cpu_visible(struct n2c_core *c, unsigned ctx, uint32_t handle);
++/* Bracketed CPU access (level 2, visible buffers only): lock/unlock-style protocol replaces per-job maintenance. */
++enum n2c_error n2c_bo_track(struct n2c_core *c, unsigned ctx, uint32_t handle);
++enum n2c_error n2c_bo_cpu_dirty(struct n2c_core *c, unsigned ctx, uint32_t handle);     /* CPU wrote (unlock) */
++enum n2c_error n2c_bo_cpu_acquire(struct n2c_core *c, unsigned ctx, uint32_t handle,   /* CPU is about to read */
++                                  uint32_t *invalidated_pages);
+ uint64_t n2c_now_us(struct n2c_core *c);
+ /* Returns false (and leaves *out untouched) while the window holds no finished job or is
+  * younger than min_window_us; otherwise copies and resets the window. */
+--- a/shim/nord2-xnu/nord2_gpu_core.h
++++ b/shim/nord2-xnu/nord2_gpu_core.h
+@@ -54,6 +54,7 @@
+         N2C_BO_GPU_EXEC = 1u << 2,
+         N2C_BO_CPU_UNCACHED = 1u << 3,  /* CPU mapping WC/NC: no CPU sync */
+         N2C_BO_IMPORTED = 1u << 4,      /* pages owned by e.g. IOSurface */
++        N2C_BO_GPU_ONLY = 1u << 5,      /* promise: never mapped for the CPU (the kernel refuses the mapping) */
+ };
+ 
+ enum n2c_bo_state {
+@@ -148,7 +149,22 @@
+         void *cookie;
+         uint64_t tables[8];       /* detached tables awaiting reset */
+         unsigned nr_tables;
+-};
++        /* CPU cache tracking (track_level >= 1).  A buffer the CPU can never touch needs
++         * one clean (the kernel's zero fill) and no maintenance after that. */
++        bool cpu_dirty;           /* CPU lines may be dirty: clean before the GPU reads */
++        bool cpu_visible;         /* the CPU can read/write it: user mapping handed out, or an imported surface */
++        bool explicit_track;      /* visible, but CPU access is bracketed by acquire/dirty calls (level 2) */
++        bool gpu_dirty;           /* tracked: GPU wrote it since the last acquire */
++        bool gpu_written;         /* the GPU has written it at least once */
++};
++
++/* Cache tracking levels: 0 = every listed buffer is cleaned before and invalidated after every job (0087);
++ * 1 = buffers the CPU cannot reach are maintained once, user-visible ones as at level 0;
++ * 2 = level 1 plus explicitly tracked visible buffers (IOSurface lock/unlock): clean only after a CPU write,
++ *     invalidate only on CPU acquire. */
++#define N2C_TRACK_LEGACY 0u
++#define N2C_TRACK_PRIVATE 1u
++#define N2C_TRACK_EXPLICIT 2u
+ 
+ struct n2c_ctx {
+         uint8_t state;
+@@ -231,6 +247,9 @@
+          * invalidate after completion) and jobs that needed whole-context
+          * maintenance. */
+         uint64_t cache_clean_pages, cache_inval_pages, cache_full_jobs;
++        /* tracking: pages NOT cleaned / NOT invalidated per job, invalidations deferred to a CPU acquire,
++         * and pages invalidated by acquire or by a buffer becoming user-visible */
++        uint64_t cache_skip_clean_pages, cache_skip_inval_pages, cache_deferred_pages, cache_acquire_pages;
+ };
+ 
+ struct n2c_core {
+@@ -252,6 +271,7 @@
+         /* Rollback valve (boot-arg nord2_gpu_cache=1): maintain the whole
+          * context for every job, as before per-job scoping. */
+         bool full_cache_maint;
++        uint8_t track_level;      /* N2C_TRACK_*; set before the first buffer exists */
+         /* Private immutable workaround, separate AS0 MMU, never user mapped. */
+         const uint8_t *wa_payload;
+         size_t wa_size;
+@@ -313,6 +333,14 @@
+  * nothing is pending, every terminal job <= seq of the context is released. */
+ enum n2c_error n2c_seq_state(struct n2c_core *c, unsigned ctx, uint64_t seq,
+                              bool reap, struct n2c_seq_result *res);
++bool n2c_set_track_level(struct n2c_core *c, unsigned level);
++/* A user mapping of the buffer was handed out: from now on it is maintained like any CPU-visible buffer. */
++enum n2c_error n2c_bo_cpu_visible(struct n2c_core *c, unsigned ctx, uint32_t handle);
++/* Bracketed CPU access (level 2, visible buffers only): lock/unlock-style protocol replaces per-job maintenance. */
++enum n2c_error n2c_bo_track(struct n2c_core *c, unsigned ctx, uint32_t handle);
++enum n2c_error n2c_bo_cpu_dirty(struct n2c_core *c, unsigned ctx, uint32_t handle);     /* CPU wrote (unlock) */
++enum n2c_error n2c_bo_cpu_acquire(struct n2c_core *c, unsigned ctx, uint32_t handle,   /* CPU is about to read */
++                                  uint32_t *invalidated_pages);
+ uint64_t n2c_now_us(struct n2c_core *c);
+ /* Returns false (and leaves *out untouched) while the window holds no finished job or is
+  * younger than min_window_us; otherwise copies and resets the window. */
+--- a/gpu/include/nord2_gpu_transport.h
++++ b/gpu/include/nord2_gpu_transport.h
+@@ -6,7 +6,8 @@
+ #include <stddef.h>
+ #include <stdbool.h>
+ #define NORD2_GPU_SEL_STATUS 0
+-#define NORD2_GPU_SEL_ALLOC 1
++#define NORD2_GPU_SEL_ALLOC 1   /* scalars {bytes, flags}: flags bit0 = executable, bit1 = GPU-only (kernel refuses any CPU mapping;
++                                 * such a buffer needs no cache maintenance after its first use: heap, TLS, GPU-private targets) */
+ #define NORD2_GPU_SEL_RELEASE 2
+ #define NORD2_GPU_SEL_SUBMIT_COMPUTE 3
+ /* A WAIT reporting DONE consumes that job ID; running/fault results do not. */
+--- a/shim/nord2-xnu/nord2_gpu_transport.h
++++ b/shim/nord2-xnu/nord2_gpu_transport.h
+@@ -6,7 +6,8 @@
+ #include <stddef.h>
+ #include <stdbool.h>
+ #define NORD2_GPU_SEL_STATUS 0
+-#define NORD2_GPU_SEL_ALLOC 1
++#define NORD2_GPU_SEL_ALLOC 1   /* scalars {bytes, flags}: flags bit0 = executable, bit1 = GPU-only (kernel refuses any CPU mapping;
++                                 * such a buffer needs no cache maintenance after its first use: heap, TLS, GPU-private targets) */
+ #define NORD2_GPU_SEL_RELEASE 2
+ #define NORD2_GPU_SEL_SUBMIT_COMPUTE 3
+ /* A WAIT reporting DONE consumes that job ID; running/fault results do not. */
+--- a/gpu/src/nord2_gpu_core.c
++++ b/gpu/src/nord2_gpu_core.c
+@@ -456,13 +456,29 @@
+                 if (j->full_maint) {
+                         for (unsigned i = 0; i < N2C_MAX_BOS; i++) {
+                                 struct n2c_bo *b = c->ctxs[j->ctx].bos[i];
+-                                if (b && (b->flags & N2C_BO_GPU_WRITE))
++                                if (b && (b->flags & N2C_BO_GPU_WRITE)) {
+                                         bo_cache_sync(c, b, false);
++                                        b->gpu_written = true;
++                                        b->gpu_dirty = false;
++                                }
+                         }
+                 } else {
+-                        for (unsigned i = 0; i < j->nr_bos; i++)
+-                                if (j->bos[i]->flags & N2C_BO_GPU_WRITE)
+-                                        bo_cache_sync(c, j->bos[i], false);
++                        for (unsigned i = 0; i < j->nr_bos; i++) {
++                                struct n2c_bo *b = j->bos[i];
++                                if (!(b->flags & N2C_BO_GPU_WRITE))
++                                        continue;
++                                b->gpu_written = true;
++                                if (c->track_level == N2C_TRACK_LEGACY || (b->cpu_visible && !b->explicit_track)) {
++                                        bo_cache_sync(c, b, false);
++                                } else if (!b->cpu_visible) {
++                                        /* No CPU alias exists, so no CPU line can be stale. */
++                                        if (!(b->flags & N2C_BO_CPU_UNCACHED))
++                                                c->stats.cache_skip_inval_pages += b->nr_pages;
++                                } else {
++                                        b->gpu_dirty = true;       /* invalidated by the CPU's acquire */
++                                        c->stats.cache_deferred_pages += b->nr_pages;
++                                }
++                        }
+                 }
+                 j->inval_pages = (uint32_t)(c->stats.cache_inval_pages - before);
+                 j->inval_us = (uint32_t)(n2c_now_us(c) - j->t_end_us);
+@@ -587,7 +603,7 @@
+             c->reset_pending)
+                 return N2C_E_STATE;
+         if (!pages || !nr_pages || nr_pages > MAX_BO_PAGES || !handle_out ||
+-            !va_out || (flags & ~0x1fu) ||
++            !va_out || (flags & ~0x3fu) || ((flags & N2C_BO_GPU_ONLY) && (flags & (N2C_BO_IMPORTED | N2C_BO_CPU_UNCACHED))) ||
+             !(flags & (N2C_BO_GPU_READ | N2C_BO_GPU_WRITE)))
+                 return N2C_E_ARGS;
+         for (unsigned i = 0; i < nr_pages; i++) {
+@@ -662,6 +678,8 @@
+                 x->imported += charged;
+         b->refs = 1;
+         b->handle_live = true;
++        b->cpu_dirty = true;                        /* the kernel zero fill / initial CPU writes */
++        b->cpu_visible = (flags & N2C_BO_IMPORTED) != 0;
+         b->state = N2C_BO_MAPPED;
+         b->mapped_size = (uint64_t)mapped * NORD2_GPU_PAGE_SIZE;
+         if (mapped != nr_pages) {
+@@ -729,6 +747,96 @@
+ }
+ 
+ /* ------------------------------------------------------------------ */
++/* CPU cache tracking                                                  */
++
++bool n2c_set_track_level(struct n2c_core *c, unsigned level)
++{
++        if (!c || level > N2C_TRACK_EXPLICIT || c->stats.bos_live)
++                return false;
++        c->track_level = (uint8_t)level;
++        return true;
++}
++
++static struct n2c_bo *tracked_bo(struct n2c_core *c, unsigned idx, uint32_t handle,
++                                 enum n2c_error *e)
++{
++        struct n2c_ctx *x = c ? ctx_at(c, idx) : NULL;
++        if (!x) {
++                *e = N2C_E_NO_CTX;
++                return NULL;
++        }
++        struct n2c_bo *b = bo_at(x, handle);
++        if (!b || b->state != N2C_BO_MAPPED) {
++                *e = N2C_E_NO_HANDLE;
++                return NULL;
++        }
++        *e = N2C_OK;
++        return b;
++}
++
++enum n2c_error n2c_bo_cpu_visible(struct n2c_core *c, unsigned idx, uint32_t handle)
++{
++        enum n2c_error e;
++        struct n2c_bo *b = tracked_bo(c, idx, handle, &e);
++        if (!b)
++                return e;
++        if (b->flags & N2C_BO_GPU_ONLY)
++                return N2C_E_STATE;                 /* promised never to be CPU-visible */
++        if (b->cpu_visible)
++                return N2C_OK;
++        b->cpu_visible = true;
++        b->cpu_dirty = true;                        /* the CPU may write at any time from now on */
++        if (b->gpu_written && !(b->flags & N2C_BO_CPU_UNCACHED)) {
++                /* A speculative fill of the kernel alias could have cached pre-GPU contents while the
++                 * buffer was invisible; drop it once before the CPU can look. */
++                bo_cache_sync(c, b, false);
++        }
++        return N2C_OK;
++}
++
++enum n2c_error n2c_bo_track(struct n2c_core *c, unsigned idx, uint32_t handle)
++{
++        enum n2c_error e;
++        struct n2c_bo *b = tracked_bo(c, idx, handle, &e);
++        if (!b)
++                return e;
++        if (c->track_level < N2C_TRACK_EXPLICIT || !b->cpu_visible)
++                return N2C_E_STATE;
++        b->explicit_track = true;
++        return N2C_OK;
++}
++
++enum n2c_error n2c_bo_cpu_dirty(struct n2c_core *c, unsigned idx, uint32_t handle)
++{
++        enum n2c_error e;
++        struct n2c_bo *b = tracked_bo(c, idx, handle, &e);
++        if (!b)
++                return e;
++        b->cpu_dirty = true;
++        return N2C_OK;
++}
++
++enum n2c_error n2c_bo_cpu_acquire(struct n2c_core *c, unsigned idx, uint32_t handle,
++                                  uint32_t *invalidated_pages)
++{
++        enum n2c_error e;
++        struct n2c_bo *b = tracked_bo(c, idx, handle, &e);
++        if (invalidated_pages)
++                *invalidated_pages = 0;
++        if (!b)
++                return e;
++        if (b->gpu_dirty && !(b->flags & N2C_BO_CPU_UNCACHED)) {
++                uint64_t before = c->stats.cache_inval_pages;
++                bo_cache_sync(c, b, false);
++                c->stats.cache_acquire_pages += c->stats.cache_inval_pages - before;
++                if (invalidated_pages)
++                        *invalidated_pages = (uint32_t)(c->stats.cache_inval_pages - before);
++        }
++        b->gpu_dirty = false;
++        return N2C_OK;
++}
++
++/* ------------------------------------------------------------------ */
+ /* Jobs                                                                */
+ 
+ static bool head_inside(const struct n2c_submit *r, struct n2c_bo *const *bos,
+@@ -877,13 +985,23 @@
+                                 c->stats.cache_full_jobs++;
+                                 for (unsigned i = 0; i < N2C_MAX_BOS; i++) {
+                                         struct n2c_bo *b = c->ctxs[pick->ctx].bos[i];
+-                                        if (b && b->state == N2C_BO_MAPPED)
++                                        if (b && b->state == N2C_BO_MAPPED) {
+                                                 bo_cache_sync(c, b, true);
++                                                b->cpu_dirty = b->cpu_visible && !b->explicit_track;
++                                        }
+                                 }
+                         } else {
+-                                for (unsigned i = 0; i < pick->nr_bos; i++)
+-                                        if (pick->bos[i]->state == N2C_BO_MAPPED)
+-                                                bo_cache_sync(c, pick->bos[i], true);
++                                for (unsigned i = 0; i < pick->nr_bos; i++) {
++                                        struct n2c_bo *b = pick->bos[i];
++                                        if (b->state != N2C_BO_MAPPED)
++                                                continue;
++                                        if (c->track_level == N2C_TRACK_LEGACY || b->cpu_dirty) {
++                                                bo_cache_sync(c, b, true);
++                                                b->cpu_dirty = b->cpu_visible && !b->explicit_track;
++                                        } else if (!(b->flags & N2C_BO_CPU_UNCACHED)) {
++                                                c->stats.cache_skip_clean_pages += b->nr_pages;
++                                        }
++                                }
+                         }
+                 }
+                 pick->clean_pages += (uint32_t)(c->stats.cache_clean_pages - clean_before);
+--- a/shim/nord2-xnu/nord2_gpu_core.c
++++ b/shim/nord2-xnu/nord2_gpu_core.c
+@@ -456,13 +456,29 @@
+                 if (j->full_maint) {
+                         for (unsigned i = 0; i < N2C_MAX_BOS; i++) {
+                                 struct n2c_bo *b = c->ctxs[j->ctx].bos[i];
+-                                if (b && (b->flags & N2C_BO_GPU_WRITE))
++                                if (b && (b->flags & N2C_BO_GPU_WRITE)) {
+                                         bo_cache_sync(c, b, false);
++                                        b->gpu_written = true;
++                                        b->gpu_dirty = false;
++                                }
+                         }
+                 } else {
+-                        for (unsigned i = 0; i < j->nr_bos; i++)
+-                                if (j->bos[i]->flags & N2C_BO_GPU_WRITE)
+-                                        bo_cache_sync(c, j->bos[i], false);
++                        for (unsigned i = 0; i < j->nr_bos; i++) {
++                                struct n2c_bo *b = j->bos[i];
++                                if (!(b->flags & N2C_BO_GPU_WRITE))
++                                        continue;
++                                b->gpu_written = true;
++                                if (c->track_level == N2C_TRACK_LEGACY || (b->cpu_visible && !b->explicit_track)) {
++                                        bo_cache_sync(c, b, false);
++                                } else if (!b->cpu_visible) {
++                                        /* No CPU alias exists, so no CPU line can be stale. */
++                                        if (!(b->flags & N2C_BO_CPU_UNCACHED))
++                                                c->stats.cache_skip_inval_pages += b->nr_pages;
++                                } else {
++                                        b->gpu_dirty = true;       /* invalidated by the CPU's acquire */
++                                        c->stats.cache_deferred_pages += b->nr_pages;
++                                }
++                        }
+                 }
+                 j->inval_pages = (uint32_t)(c->stats.cache_inval_pages - before);
+                 j->inval_us = (uint32_t)(n2c_now_us(c) - j->t_end_us);
+@@ -587,7 +603,7 @@
+             c->reset_pending)
+                 return N2C_E_STATE;
+         if (!pages || !nr_pages || nr_pages > MAX_BO_PAGES || !handle_out ||
+-            !va_out || (flags & ~0x1fu) ||
++            !va_out || (flags & ~0x3fu) || ((flags & N2C_BO_GPU_ONLY) && (flags & (N2C_BO_IMPORTED | N2C_BO_CPU_UNCACHED))) ||
+             !(flags & (N2C_BO_GPU_READ | N2C_BO_GPU_WRITE)))
+                 return N2C_E_ARGS;
+         for (unsigned i = 0; i < nr_pages; i++) {
+@@ -662,6 +678,8 @@
+                 x->imported += charged;
+         b->refs = 1;
+         b->handle_live = true;
++        b->cpu_dirty = true;                        /* the kernel zero fill / initial CPU writes */
++        b->cpu_visible = (flags & N2C_BO_IMPORTED) != 0;
+         b->state = N2C_BO_MAPPED;
+         b->mapped_size = (uint64_t)mapped * NORD2_GPU_PAGE_SIZE;
+         if (mapped != nr_pages) {
+@@ -729,6 +747,96 @@
+ }
+ 
+ /* ------------------------------------------------------------------ */
++/* CPU cache tracking                                                  */
++
++bool n2c_set_track_level(struct n2c_core *c, unsigned level)
++{
++        if (!c || level > N2C_TRACK_EXPLICIT || c->stats.bos_live)
++                return false;
++        c->track_level = (uint8_t)level;
++        return true;
++}
++
++static struct n2c_bo *tracked_bo(struct n2c_core *c, unsigned idx, uint32_t handle,
++                                 enum n2c_error *e)
++{
++        struct n2c_ctx *x = c ? ctx_at(c, idx) : NULL;
++        if (!x) {
++                *e = N2C_E_NO_CTX;
++                return NULL;
++        }
++        struct n2c_bo *b = bo_at(x, handle);
++        if (!b || b->state != N2C_BO_MAPPED) {
++                *e = N2C_E_NO_HANDLE;
++                return NULL;
++        }
++        *e = N2C_OK;
++        return b;
++}
++
++enum n2c_error n2c_bo_cpu_visible(struct n2c_core *c, unsigned idx, uint32_t handle)
++{
++        enum n2c_error e;
++        struct n2c_bo *b = tracked_bo(c, idx, handle, &e);
++        if (!b)
++                return e;
++        if (b->flags & N2C_BO_GPU_ONLY)
++                return N2C_E_STATE;                 /* promised never to be CPU-visible */
++        if (b->cpu_visible)
++                return N2C_OK;
++        b->cpu_visible = true;
++        b->cpu_dirty = true;                        /* the CPU may write at any time from now on */
++        if (b->gpu_written && !(b->flags & N2C_BO_CPU_UNCACHED)) {
++                /* A speculative fill of the kernel alias could have cached pre-GPU contents while the
++                 * buffer was invisible; drop it once before the CPU can look. */
++                bo_cache_sync(c, b, false);
++        }
++        return N2C_OK;
++}
++
++enum n2c_error n2c_bo_track(struct n2c_core *c, unsigned idx, uint32_t handle)
++{
++        enum n2c_error e;
++        struct n2c_bo *b = tracked_bo(c, idx, handle, &e);
++        if (!b)
++                return e;
++        if (c->track_level < N2C_TRACK_EXPLICIT || !b->cpu_visible)
++                return N2C_E_STATE;
++        b->explicit_track = true;
++        return N2C_OK;
++}
++
++enum n2c_error n2c_bo_cpu_dirty(struct n2c_core *c, unsigned idx, uint32_t handle)
++{
++        enum n2c_error e;
++        struct n2c_bo *b = tracked_bo(c, idx, handle, &e);
++        if (!b)
++                return e;
++        b->cpu_dirty = true;
++        return N2C_OK;
++}
++
++enum n2c_error n2c_bo_cpu_acquire(struct n2c_core *c, unsigned idx, uint32_t handle,
++                                  uint32_t *invalidated_pages)
++{
++        enum n2c_error e;
++        struct n2c_bo *b = tracked_bo(c, idx, handle, &e);
++        if (invalidated_pages)
++                *invalidated_pages = 0;
++        if (!b)
++                return e;
++        if (b->gpu_dirty && !(b->flags & N2C_BO_CPU_UNCACHED)) {
++                uint64_t before = c->stats.cache_inval_pages;
++                bo_cache_sync(c, b, false);
++                c->stats.cache_acquire_pages += c->stats.cache_inval_pages - before;
++                if (invalidated_pages)
++                        *invalidated_pages = (uint32_t)(c->stats.cache_inval_pages - before);
++        }
++        b->gpu_dirty = false;
++        return N2C_OK;
++}
++
++/* ------------------------------------------------------------------ */
+ /* Jobs                                                                */
+ 
+ static bool head_inside(const struct n2c_submit *r, struct n2c_bo *const *bos,
+@@ -877,13 +985,23 @@
+                                 c->stats.cache_full_jobs++;
+                                 for (unsigned i = 0; i < N2C_MAX_BOS; i++) {
+                                         struct n2c_bo *b = c->ctxs[pick->ctx].bos[i];
+-                                        if (b && b->state == N2C_BO_MAPPED)
++                                        if (b && b->state == N2C_BO_MAPPED) {
+                                                 bo_cache_sync(c, b, true);
++                                                b->cpu_dirty = b->cpu_visible && !b->explicit_track;
++                                        }
+                                 }
+                         } else {
+-                                for (unsigned i = 0; i < pick->nr_bos; i++)
+-                                        if (pick->bos[i]->state == N2C_BO_MAPPED)
+-                                                bo_cache_sync(c, pick->bos[i], true);
++                                for (unsigned i = 0; i < pick->nr_bos; i++) {
++                                        struct n2c_bo *b = pick->bos[i];
++                                        if (b->state != N2C_BO_MAPPED)
++                                                continue;
++                                        if (c->track_level == N2C_TRACK_LEGACY || b->cpu_dirty) {
++                                                bo_cache_sync(c, b, true);
++                                                b->cpu_dirty = b->cpu_visible && !b->explicit_track;
++                                        } else if (!(b->flags & N2C_BO_CPU_UNCACHED)) {
++                                                c->stats.cache_skip_clean_pages += b->nr_pages;
++                                        }
++                                }
+                         }
+                 }
+                 pick->clean_pages += (uint32_t)(c->stats.cache_clean_pages - clean_before);
+--- a/gpu/tests/nord2_core_test.c
++++ b/gpu/tests/nord2_core_test.c
+@@ -374,12 +374,82 @@
+  {uint32_t st,ss;(void)n2c_job_state(&core,o,last-1,true,&st,&ss);}
+  CHECK(n2c_ctx_close(&core,c)==N2C_OK);(void)n2c_ctx_close(&core,o);
+ }
++static void run_one(unsigned c,unsigned n,const uint32_t*hs,const uint64_t*vs,uint32_t w,uint32_t flags) {
++ m.sync_n=0;m.sync_in=m.sync_out=0;uint64_t id=submit_list(c,N2C_JOB_COMPUTE,n,hs,vs,w,flags);complete(1);done(c,id);
++}
++static void test_cache_tracking(void) {
++ const uint32_t RW=N2C_BO_GPU_READ|N2C_BO_GPU_WRITE|N2C_BO_GPU_EXEC,IMP=N2C_BO_GPU_READ|N2C_BO_GPU_WRITE|N2C_BO_IMPORTED;
++ /* level 0 = legacy: the whole list every job, private or not */
++ init();CHECK(n2c_set_track_level(&core,N2C_TRACK_LEGACY));unsigned c=context();uint32_t a,b,s;uint64_t va[3];
++ map_flags(c,2,RW,&a,&va[0]);
++ uint32_t hs[2]={a,0};uint64_t vs[2]={va[0],0};
++ run_one(c,1,hs,vs,1,0);CHECK(m.sync_in==2 && m.sync_out==2);
++ run_one(c,1,hs,vs,1,0);CHECK(m.sync_in==2 && m.sync_out==2);
++ CHECK(n2c_ctx_close(&core,c)==N2C_OK);
++ /* level 1: invisible buffer cleaned once, never invalidated; visible buffers as before */
++ init();CHECK(n2c_set_track_level(&core,N2C_TRACK_PRIVATE));c=context();
++ map_flags(c,2,RW,&a,&va[0]);map_flags(c,3,RW,&b,&va[1]);       /* a: GPU-only, b: handed to the CPU */
++ const char*A=base_of(c,a),*B=base_of(c,b);
++ CHECK(n2c_bo_cpu_visible(&core,c,b)==N2C_OK && n2c_bo_cpu_visible(&core,c,b)==N2C_OK && n2c_bo_cpu_visible(&core,c,999)==N2C_E_NO_HANDLE);
++ hs[0]=a;hs[1]=b;vs[0]=va[0];vs[1]=va[1];
++ run_one(c,2,hs,vs,3,0);
++ CHECK(syncs_in(A,2,true)==2 && syncs_in(B,3,true)==3 && syncs_in(A,2,false)==0 && syncs_in(B,3,false)==3);   /* first use: both cleaned */
++ CHECK(!m.sync_cpu[0] || 1);
++ run_one(c,2,hs,vs,3,0);
++ CHECK(syncs_in(A,2,true)==0 && syncs_in(A,2,false)==0);                                                   /* GPU-only: nothing */
++ CHECK(syncs_in(B,3,true)==3 && syncs_in(B,3,false)==3);                                                   /* visible: every job */
++ CHECK(core.stats.cache_skip_clean_pages==2 && core.stats.cache_skip_inval_pages==4);
++ /* a buffer that becomes visible after the GPU wrote it is invalidated once at that moment */
++ m.sync_n=0;CHECK(n2c_bo_cpu_visible(&core,c,a)==N2C_OK && syncs_in(A,2,false)==2 && syncs_in(A,2,true)==0);
++ run_one(c,2,hs,vs,3,0);CHECK(syncs_in(A,2,true)==2 && syncs_in(A,2,false)==2);                           /* now conservative */
++ /* level 1 cannot track an imported surface */
++ map_flags(c,4,IMP,&s,&va[2]);CHECK(n2c_bo_track(&core,c,s)==N2C_E_STATE);
++ const char*S=base_of(c,s);hs[0]=s;vs[0]=va[2];run_one(c,1,hs,vs,1,0);run_one(c,1,hs,vs,1,0);
++ CHECK(syncs_in(S,4,true)==4 && syncs_in(S,4,false)==4);
++ CHECK(n2c_ctx_close(&core,c)==N2C_OK);
++ /* GPU-only promise: accepted, never visible, rejected combinations */
++ {init();CHECK(n2c_set_track_level(&core,N2C_TRACK_PRIVATE));c=context();uint32_t g;uint64_t vg;
++  map_flags(c,2,RW|N2C_BO_GPU_ONLY,&g,&vg);
++  CHECK(n2c_bo_cpu_visible(&core,c,g)==N2C_E_STATE);
++  hs[0]=g;vs[0]=vg;run_one(c,1,hs,vs,1,0);CHECK(syncs_in(base_of(c,g),2,true)==2);
++  run_one(c,1,hs,vs,1,0);CHECK(m.sync_in==0 && m.sync_out==0);
++  struct n2c_page pg={.pa=0x90000000ull,.cpu=(void*)&m};uint32_t h2;uint64_t v2;bool ad=false;
++  CHECK(n2c_bo_map(&core,c,&pg,1,N2C_BO_GPU_READ|N2C_BO_GPU_WRITE|N2C_BO_GPU_ONLY|N2C_BO_IMPORTED,NULL,4096,&h2,&v2,&ad)==N2C_E_ARGS && !ad);
++  CHECK(n2c_bo_map(&core,c,&pg,1,N2C_BO_GPU_READ|N2C_BO_GPU_WRITE|(1u<<6),NULL,4096,&h2,&v2,&ad)==N2C_E_ARGS);
++  CHECK(n2c_ctx_close(&core,c)==N2C_OK);}
++ /* level 2: lock/unlock protocol for a visible imported surface */
++ init();CHECK(n2c_set_track_level(&core,N2C_TRACK_EXPLICIT));c=context();
++ map_flags(c,4,IMP,&s,&va[2]);S=base_of(c,s);map_flags(c,2,RW,&a,&va[0]);
++ CHECK(n2c_bo_track(&core,c,s)==N2C_OK && n2c_bo_track(&core,c,a)==N2C_E_STATE && n2c_bo_track(&core,c,999)==N2C_E_NO_HANDLE);
++ hs[0]=s;vs[0]=va[2];
++ run_one(c,1,hs,vs,1,0);                                  /* first use: initial CPU state is dirty -> clean; GPU write deferred */
++ CHECK(syncs_in(S,4,true)==4 && syncs_in(S,4,false)==0 && core.stats.cache_deferred_pages==4);
++ run_one(c,1,hs,vs,1,0);run_one(c,1,hs,vs,1,0);           /* repeated GPU-only use: no maintenance at all */
++ CHECK(m.sync_in==0 && m.sync_out==0 && core.stats.cache_deferred_pages==12);
++ uint32_t inv=77;m.sync_n=0;
++ CHECK(n2c_bo_cpu_acquire(&core,c,s,&inv)==N2C_OK && inv==4 && syncs_in(S,4,false)==4);   /* CPU read: invalidate once */
++ CHECK(n2c_bo_cpu_acquire(&core,c,s,&inv)==N2C_OK && inv==0 && syncs_in(S,4,false)==4);   /* nothing new from the GPU */
++ CHECK(n2c_bo_cpu_acquire(&core,c,999,&inv)==N2C_E_NO_HANDLE && inv==0);
++ run_one(c,1,hs,vs,1,0);CHECK(m.sync_in==0);                                              /* CPU only read: still clean */
++ CHECK(n2c_bo_cpu_dirty(&core,c,s)==N2C_OK);               /* CPU wrote (unlock) */
++ run_one(c,1,hs,vs,1,0);CHECK(syncs_in(S,4,true)==4);     /* cleaned once, then clean again */
++ run_one(c,1,hs,vs,1,0);CHECK(m.sync_in==0);
++ /* full-maintenance jobs ignore tracking and reset the state */
++ run_one(c,1,hs,vs,0,N2C_SUBMIT_FULL_MAINT);CHECK(syncs_in(S,4,true)==4 && syncs_in(S,4,false)==4 && core.stats.cache_full_jobs==1);
++ m.sync_n=0;CHECK(n2c_bo_cpu_acquire(&core,c,s,&inv)==N2C_OK && inv==0);                  /* the full job already invalidated */
++ /* mixed list: tracked surface + conservative visible buffer + invisible buffer */
++ CHECK(n2c_bo_cpu_visible(&core,c,a)==N2C_OK);hs[0]=s;hs[1]=a;vs[0]=va[2];vs[1]=va[0];
++ run_one(c,2,hs,vs,3,0);CHECK(syncs_in(base_of(c,a),2,true)==2 && syncs_in(base_of(c,a),2,false)==2 && syncs_in(S,4,true)==0);
++ CHECK(n2c_set_track_level(&core,1)==false && core.track_level==N2C_TRACK_EXPLICIT);       /* fixed once buffers exist */
++ CHECK(n2c_ctx_close(&core,c)==N2C_OK);
++ init();CHECK(!n2c_set_track_level(&core,3) && n2c_set_track_level(&core,2));
++}
+ int main(int argc,char**argv) {
+  if(argc>1 && !strcmp(argv[1],"quarantine")){test_quarantine_close();return 0;}
+  if(argc>1 && !strcmp(argv[1],"partial")){test_partial_map_failure();return 0;}
+  test_reuse();test_render_order();test_quarantine_close();test_partial_map_failure();test_close_running();test_open_failure();
+  test_allocation_failure_matrix();test_full_map_flush_failure();test_quarantine_overflow();test_wide_reclaim();
+  test_unlisted_buffer();test_failed_open_pins();test_stop_ack();test_fault_failed_reset_pins();test_imported_accounting();
+- test_scoped_cache_maintenance();test_full_list_is_not_trusted();test_context_limit_384();test_job_timing();test_async_chain();
+- puts("core: 20 lifetime/ordering/failure scenarios incl. 1024 reuse cycles PASS (hardware model)");return 0;
++ test_scoped_cache_maintenance();test_full_list_is_not_trusted();test_context_limit_384();test_job_timing();test_async_chain();test_cache_tracking();
++ puts("core: 21 lifetime/ordering/failure scenarios incl. 1024 reuse cycles PASS (hardware model)");return 0;
+ }

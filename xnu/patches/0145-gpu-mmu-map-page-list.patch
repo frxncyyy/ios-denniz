@@ -1,0 +1,245 @@
+--- a/bsd/dev/nord2_gpu_mmu.c
++++ b/bsd/dev/nord2_gpu_mmu.c
+@@ -156,20 +156,28 @@
+ }
+ 
+ static bool map_preflight(const struct nord2_gpu_mmu *mmu, uint64_t va,
+-                          uint64_t pa, size_t size, uint64_t flags)
++                          uint64_t pa, const uint64_t *pas, size_t size,
++                          uint64_t flags)
+ {
++        const struct nord2_gpu_mmu_table *t = NULL;
++        uint64_t t_base = ~0ull;
+         for (uint64_t off = 0; off < size; off += NORD2_GPU_PAGE_SIZE) {
+-                bool corrupt = false;
+-                const struct nord2_gpu_mmu_table *t =
+-                        walk_l3(mmu, va + off, &corrupt);
+-                if (corrupt)
+-                        return false;
++                uint64_t cur = va + off;
++                uint64_t base = cur & ~(level_span(LAST_LEVEL - 1) - 1);
++                if (base != t_base) {          /* one walk per level-3 table, not per page */
++                        bool corrupt = false;
++                        t = walk_l3(mmu, cur, &corrupt);
++                        if (corrupt)
++                                return false;
++                        t_base = base;
++                }
+                 if (!t)
+                         continue;
+                 uint64_t entry = ((const uint64_t *)t->cpu)
+-                        [index_at(LAST_LEVEL, va + off)];
++                        [index_at(LAST_LEVEL, cur)];
++                uint64_t want = pas ? pas[off / NORD2_GPU_PAGE_SIZE] : pa + off;
+                 if (entry_valid(entry, LAST_LEVEL) &&
+-                    entry != ((pa + off) | flags | ATE_VALID_L3))
++                    entry != (want | flags | ATE_VALID_L3))
+                         return false;
+         }
+         return true;
+@@ -183,12 +191,17 @@
+                                         NORD2_GPU_SHARE_NONE, writable, executable);
+ }
+ 
+-bool nord2_gpu_mmu_map_shared(struct nord2_gpu_mmu *mmu, uint64_t va, uint64_t pa,
+-                              size_t size, enum nord2_gpu_memattr memattr,
+-                              enum nord2_gpu_shareability shareability,
+-                              bool writable, bool executable)
++/* Map `size` bytes at va: from the contiguous range at pa, or (pas != NULL) page by page from the list.  *done_out gets the number of
++ * pages that are mapped when it fails part-way (they are the first ones). */
++static bool map_impl(struct nord2_gpu_mmu *mmu, uint64_t va, uint64_t pa,
++                     const uint64_t *pas, size_t size,
++                     enum nord2_gpu_memattr memattr,
++                     enum nord2_gpu_shareability shareability,
++                     bool writable, bool executable, uint64_t *done_out)
+ {
+-        if (!mmu || !mmu->valid || !is_aligned(va) || !is_aligned(pa) ||
++        if (done_out)
++                *done_out = 0;
++        if (!mmu || !mmu->valid || !is_aligned(va) || (!pas && !is_aligned(pa)) ||
+             (unsigned)memattr > NORD2_GPU_MEMATTR_NON_CACHEABLE ||
+             (shareability != NORD2_GPU_SHARE_NONE &&
+              shareability != NORD2_GPU_SHARE_INNER) ||
+@@ -196,20 +209,26 @@
+              shareability != NORD2_GPU_SHARE_NONE) ||
+             !size || (size & (NORD2_GPU_PAGE_SIZE - 1u)) ||
+             va >= (1ULL << NORD2_GPU_VA_BITS) ||
+-            pa >= (1ULL << NORD2_GPU_PA_BITS) ||
+             size > (1ULL << NORD2_GPU_VA_BITS) - va ||
+-            size > (1ULL << NORD2_GPU_PA_BITS) - pa)
++            (!pas && (pa >= (1ULL << NORD2_GPU_PA_BITS) ||
++                      size > (1ULL << NORD2_GPU_PA_BITS) - pa)))
+                 return false;
++        if (pas) {
++                for (uint64_t i = 0; i < size / NORD2_GPU_PAGE_SIZE; i++)
++                        if (!is_aligned(pas[i]) || pas[i] >= (1ULL << NORD2_GPU_PA_BITS))
++                                return false;
++        }
+         uint64_t flags = ((uint64_t)memattr << 2) |
+                          ((uint64_t)shareability << 8);
+         flags |= writable ? ATE_ACCESS_RW : ATE_ACCESS_RO;
+         flags |= ATE_ACCESS_BIT;
+         if (!executable)
+                 flags |= ATE_NX;
+-        if (!map_preflight(mmu, va, pa, size, flags))
++        if (!map_preflight(mmu, va, pa, pas, size, flags))
+                 return false;
+ 
+         bool ok = true;
++        uint64_t done_pages = 0;
+         struct nord2_gpu_mmu_table *l3 = NULL;
+         uint64_t l3_base = ~0ull;
+         for (uint64_t off = 0; off < size && ok; off += NORD2_GPU_PAGE_SIZE) {
+@@ -265,21 +284,47 @@
+                 }
+                 uint64_t *table = (uint64_t *)l3->cpu;
+                 unsigned idx = index_at(LAST_LEVEL, cur_va);
+-                uint64_t want_pa = pa + off;
++                uint64_t want_pa = pas ? pas[off / NORD2_GPU_PAGE_SIZE] : pa + off;
+                 if (entry_valid(table[idx], LAST_LEVEL)) {
+                         if (entry_pa(table[idx]) != want_pa)
+                                 ok = false; /* excluded by preflight */
++                        else
++                                done_pages++;
+                         continue;           /* identical: idempotent */
+                 }
+                 table[idx] = want_pa | flags | ATE_VALID_L3;
+                 l3->dirty = true;
+                 mmu->mapped_pages++;
+                 mmu->mapped_bytes += NORD2_GPU_PAGE_SIZE;
++                done_pages++;
+         }
+         flush_dirty(mmu);
++        if (done_out)
++                *done_out = ok ? size / NORD2_GPU_PAGE_SIZE : done_pages;
+         return ok;
+ }
+ 
++bool nord2_gpu_mmu_map_shared(struct nord2_gpu_mmu *mmu, uint64_t va, uint64_t pa,
++                              size_t size, enum nord2_gpu_memattr memattr,
++                              enum nord2_gpu_shareability shareability,
++                              bool writable, bool executable)
++{
++        return map_impl(mmu, va, pa, NULL, size, memattr, shareability,
++                        writable, executable, NULL);
++}
++
++bool nord2_gpu_mmu_map_pages(struct nord2_gpu_mmu *mmu, uint64_t va,
++                             const uint64_t *pas, size_t count,
++                             enum nord2_gpu_memattr memattr,
++                             enum nord2_gpu_shareability shareability,
++                             bool writable, bool executable, uint64_t *mapped)
++{
++        if (!pas || !count)
++                return false;
++        return map_impl(mmu, va, 0, pas, count * NORD2_GPU_PAGE_SIZE, memattr,
++                        shareability, writable, executable, mapped);
++}
++
+ bool nord2_gpu_mmu_walk(const struct nord2_gpu_mmu *mmu, uint64_t va,
+                         uint64_t *pa, uint64_t *entry_out)
+ {
+@@ -305,16 +350,31 @@
+             va >= (1ULL << NORD2_GPU_VA_BITS) ||
+             size > (1ULL << NORD2_GPU_VA_BITS) - va)
+                 return false;
+-        /* Atomic: refuse unless every page is mapped. */
++        /* Atomic: refuse unless every page is mapped.  One walk per level-3 table, not per page. */
++        struct nord2_gpu_mmu_table *t = NULL;
++        uint64_t t_base = ~0ull;
+         for (uint64_t off = 0; off < size; off += NORD2_GPU_PAGE_SIZE) {
+-                if (!nord2_gpu_mmu_walk(mmu, va + off, NULL, NULL))
++                uint64_t cur = va + off;
++                uint64_t base = cur & ~(level_span(LAST_LEVEL - 1) - 1);
++                if (base != t_base) {
++                        t = walk_l3(mmu, cur, NULL);
++                        t_base = base;
++                }
++                if (!t || !entry_valid(((const uint64_t *)t->cpu)[index_at(LAST_LEVEL, cur)], LAST_LEVEL))
+                         return false;
+         }
+         unsigned count = 0;
++        t = NULL;
++        t_base = ~0ull;
+         for (uint64_t off = 0; off < size; off += NORD2_GPU_PAGE_SIZE) {
+-                struct nord2_gpu_mmu_table *t = walk_l3(mmu, va + off, NULL);
++                uint64_t cur = va + off;
++                uint64_t base = cur & ~(level_span(LAST_LEVEL - 1) - 1);
++                if (base != t_base) {
++                        t = walk_l3(mmu, cur, NULL);
++                        t_base = base;
++                }
+                 uint64_t *table = (uint64_t *)t->cpu;
+-                table[index_at(LAST_LEVEL, va + off)] = ATE_INVALID;
++                table[index_at(LAST_LEVEL, cur)] = ATE_INVALID;
+                 t->dirty = true;
+                 count++;
+         }
+--- a/bsd/dev/nord2_gpu_mmu.h
++++ b/bsd/dev/nord2_gpu_mmu.h
+@@ -101,6 +101,13 @@
+                               size_t size, enum nord2_gpu_memattr memattr,
+                               enum nord2_gpu_shareability shareability,
+                               bool writable, bool executable);
++/* The pages of a buffer that are not contiguous: pas[0..count) in order, one walk per level-3 table and one flush.  *mapped (optional) is
++ * the number of leading pages mapped when it fails part-way. */
++bool nord2_gpu_mmu_map_pages(struct nord2_gpu_mmu *mmu, uint64_t va,
++                             const uint64_t *pas, size_t count,
++                             enum nord2_gpu_memattr memattr,
++                             enum nord2_gpu_shareability shareability,
++                             bool writable, bool executable, uint64_t *mapped);
+ bool nord2_gpu_mmu_unmap(struct nord2_gpu_mmu *mmu, uint64_t va, size_t size);
+ 
+ /* Walk returns the leaf physical address and the raw entry, or false. */
+--- a/bsd/dev/nord2_gpu_core.c
++++ b/bsd/dev/nord2_gpu_core.c
+@@ -821,18 +821,37 @@
+         bool exec = (flags & N2C_BO_GPU_EXEC) != 0;
+         bool write = (flags & N2C_BO_GPU_WRITE) != 0;
+         unsigned mapped = 0;
+-        for (; mapped < nr_pages; mapped++) {
+-                /* Android r32p1 JIT/tiler allocations request COHERENT_LOCAL:
+-                 * default cached attribute + SHARE_INNER. CPU coherency NONE
+-                 * does not disable GPU-internal sharing between shader/tiler
+-                 * units. Apply the same policy to all ordinary user BOs; CPU
+-                 * cache maintenance and permissions remain necessary. */
+-                if (!nord2_gpu_mmu_map_shared(&x->mmu, va + (uint64_t)mapped * 4096u,
+-                                       pages[mapped].pa, 4096,
+-                                       NORD2_GPU_MEMATTR_IMPL_DEF,
+-                                       NORD2_GPU_SHARE_INNER, write,
+-                                       exec))
+-                        break;
++        /* Android r32p1 JIT/tiler allocations request COHERENT_LOCAL:
++         * default cached attribute + SHARE_INNER. CPU coherency NONE
++         * does not disable GPU-internal sharing between shader/tiler
++         * units. Apply the same policy to all ordinary user BOs; CPU
++         * cache maintenance and permissions remain necessary.
++         * The pages go down in one call (one walk per level-3 table and one flush): a page per call scanned the table
++         * registry several times for every 4 KiB. */
++        {
++                uint64_t *pas = NULL;
++                if (nr_pages > 1 &&
++                    c->ops.alloc_host(c->ctx, nr_pages * sizeof(*pas), (void **)&pas) && pas) {
++                        uint64_t done = 0;
++                        for (unsigned i = 0; i < nr_pages; i++)
++                                pas[i] = pages[i].pa;
++                        (void)nord2_gpu_mmu_map_pages(&x->mmu, va, pas, nr_pages,
++                                                      NORD2_GPU_MEMATTR_IMPL_DEF,
++                                                      NORD2_GPU_SHARE_INNER, write, exec, &done);
++                        mapped = (unsigned)done;
++                        c->ops.free_host(c->ctx, pas, nr_pages * sizeof(*pas));
++                } else {
++                        if (pas)
++                                c->ops.free_host(c->ctx, pas, nr_pages * sizeof(*pas));
++                        for (; mapped < nr_pages; mapped++) {
++                                if (!nord2_gpu_mmu_map_shared(&x->mmu, va + (uint64_t)mapped * 4096u,
++                                                       pages[mapped].pa, 4096,
++                                                       NORD2_GPU_MEMATTR_IMPL_DEF,
++                                                       NORD2_GPU_SHARE_INNER, write,
++                                                       exec))
++                                        break;
++                        }
++                }
+         }
+         x->bos[slot] = b;
+         c->stats.bos_live++;

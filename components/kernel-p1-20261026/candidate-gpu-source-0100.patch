@@ -1,0 +1,182 @@
+--- a/gpu/src/Nord2GPU.cpp
++++ b/gpu/src/Nord2GPU.cpp
+@@ -903,7 +903,7 @@
+ }
+ void Nord2GPUUserClient::closeContext() {
+         if(!lock)return;
+-        IOLockLock(lock);closed=true;
++        IOLockLock(lock);__atomic_store_n(&closed,true,__ATOMIC_RELEASE);
+         if(gpu && context<N2C_MAX_CTX) {
+                 enum n2c_error e;
+                 do {
+@@ -936,7 +936,7 @@
+         if(!nord2_gpu_call_valid(sel,a->scalarInputCount,a->scalarOutputCount,a->structureInputSize,a->structureOutputSize,
+                                  a->scalarInput,a->scalarOutput,a->structureInput,a->structureOutput) ||
+            a->structureInputDescriptor || a->structureOutputDescriptor || a->asyncWakePort!=MACH_PORT_NULL)return kIOReturnBadArgument;
+-        IOLockLock(lock);IOLockLock(gpu->lock);IOReturn result=kIOReturnUnsupported;
++        IOLockLock(lock);IOLockLock(gpu->lock);IOReturn result=kIOReturnUnsupported;bool clientHeld=true;
+         if(closed || gpu->stopping){result=kIOReturnNotOpen;goto out;}
+         if(sel==NORD2_GPU_SEL_STATUS){gpu->status((nord2_gpu_status *)a->structureOutput);a->structureOutputSize=sizeof(nord2_gpu_status);result=kIOReturnSuccess;goto out;}
+         if(sel==NORD2_GPU_SEL_LOG){
+@@ -972,10 +972,16 @@
+         }
+         case NORD2_GPU_SEL_WAIT: {
+                 if(a->scalarInput[1]>5000){result=kIOReturnBadArgument;break;}
++                /* Wait WITHOUT the per-connection lock: the frontend submits from one thread while a finish thread waits on the same
++                 * connection (n2mb_wait_seq), and holding the client lock for the whole wait made every other call of the connection
++                 * queue behind it (GPU idle between jobs).  ctx stays valid because closeContext() needs gpu->lock for n2c_ctx_close and
++                 * every iteration re-checks 'closed' under gpu->lock before touching the context. */
++                const unsigned ctx=context;IOLockUnlock(lock);clientHeld=false;
+                 uint32_t state=0,status=0;uint64_t id=a->scalarInput[0],enter_us=now_us(NULL),limit_us=a->scalarInput[1]*1000ull;
+                 for(;;){
++                        if(__atomic_load_n(&closed,__ATOMIC_ACQUIRE) || gpu->stopping){result=kIOReturnNotOpen;break;}
+                         gpu->irqLearnCheck();
+-                        n2c_poll(gpu->core);result=io_error(n2c_job_state(gpu->core,context,id,false,&state,&status));
++                        n2c_poll(gpu->core);result=io_error(n2c_job_state(gpu->core,ctx,id,false,&state,&status));
+                         uint64_t elapsed=now_us(NULL)-enter_us;
+                         if(result!=kIOReturnSuccess || state>=N2C_JOB_DONE || gpu->core->state==N2C_CORE_BROKEN || elapsed>=limit_us)break;
+                         gpu->waitStep(elapsed);
+@@ -983,25 +989,27 @@
+                 if(result==kIOReturnSuccess){
+                         a->scalarOutput[0]=state;a->scalarOutputCount=1;
+                         if(a->structureOutputSize){nord2_gpu_fault_info f={};f.job_id_lo=(uint32_t)id;f.job_id_hi=(uint32_t)(id>>32);
+-                                f.state=state;f.status=status;f.fault_status=gpu->core->ctxs[context].fault_status;f.fault_address=gpu->core->ctxs[context].fault_address;
++                                f.state=state;f.status=status;f.fault_status=gpu->core->ctxs[ctx].fault_status;f.fault_address=gpu->core->ctxs[ctx].fault_address;
+                                 memcpy(a->structureOutput,&f,sizeof(f));a->structureOutputSize=sizeof(f);}
+                         if(state>=N2C_JOB_DONE){
+                                 n2c_job_times jt;uint64_t ret_us=now_us(NULL);
+-                                if(n2c_job_get_times(gpu->core,context,id,&jt)==N2C_OK && state==N2C_JOB_DONE){
++                                if(n2c_job_get_times(gpu->core,ctx,id,&jt)==N2C_OK && state==N2C_JOB_DONE){
+                                         uint64_t gap=enter_us>jt.submit_us?enter_us-jt.submit_us:0,dur=ret_us-enter_us,ret=ret_us>jt.submit_us?ret_us-jt.submit_us:0;
+                                         gpu->waitN++;gpu->waitGapSum+=gap;gpu->waitDurSum+=dur;gpu->waitRetSum+=ret;
+                                         if(gap>gpu->waitGapMax)gpu->waitGapMax=(uint32_t)gap;if(dur>gpu->waitDurMax)gpu->waitDurMax=(uint32_t)dur;if(ret>gpu->waitRetMax)gpu->waitRetMax=(uint32_t)ret;
+                                 }
+-                                (void)n2c_job_state(gpu->core,context,id,true,NULL,NULL);gpu->emitJobStats();
++                                (void)n2c_job_state(gpu->core,ctx,id,true,NULL,NULL);gpu->emitJobStats();
+                         }
+                 }break;
+         }
+         case NORD2_GPU_SEL_WAIT_SEQ: {
+                 if(a->scalarInput[1]>5000){result=kIOReturnBadArgument;break;}
++                const unsigned ctx=context;IOLockUnlock(lock);clientHeld=false;     /* see SEL_WAIT: no connection lock while waiting */
+                 uint64_t seq=a->scalarInput[0],enter_us=now_us(NULL),limit_us=a->scalarInput[1]*1000ull;n2c_seq_result r={};
+                 for(;;){
++                        if(__atomic_load_n(&closed,__ATOMIC_ACQUIRE) || gpu->stopping){result=kIOReturnNotOpen;break;}
+                         gpu->irqLearnCheck();
+-                        n2c_poll(gpu->core);result=io_error(n2c_seq_state(gpu->core,context,seq,false,&r));
++                        n2c_poll(gpu->core);result=io_error(n2c_seq_state(gpu->core,ctx,seq,false,&r));
+                         uint64_t elapsed=now_us(NULL)-enter_us;
+                         if(result!=kIOReturnSuccess || !r.pending || gpu->core->state==N2C_CORE_BROKEN || elapsed>=limit_us)break;
+                         gpu->waitStep(elapsed);
+@@ -1010,11 +1018,11 @@
+                         uint32_t state=r.pending?N2C_JOB_RUNNING:(r.failed?r.first_failed_state:N2C_JOB_DONE);
+                         a->scalarOutput[0]=state;a->scalarOutput[1]=r.done+r.failed;a->scalarOutput[2]=r.first_failed_id;a->scalarOutputCount=3;
+                         if(a->structureOutputSize){nord2_gpu_fault_info f={};f.job_id_lo=(uint32_t)r.first_failed_id;f.job_id_hi=(uint32_t)(r.first_failed_id>>32);
+-                                f.state=r.first_failed_state;f.status=r.first_failed_status;f.fault_status=gpu->core->ctxs[context].fault_status;f.fault_address=gpu->core->ctxs[context].fault_address;
++                                f.state=r.first_failed_state;f.status=r.first_failed_status;f.fault_status=gpu->core->ctxs[ctx].fault_status;f.fault_address=gpu->core->ctxs[ctx].fault_address;
+                                 memcpy(a->structureOutput,&f,sizeof(f));a->structureOutputSize=sizeof(f);}
+                         if(!r.pending){
+                                 gpu->seqWaits++;gpu->seqJobs+=r.done+r.failed;uint64_t dur=now_us(NULL)-enter_us;gpu->seqDurSum+=dur;if(dur>gpu->seqDurMax)gpu->seqDurMax=(uint32_t)dur;
+-                                (void)n2c_seq_state(gpu->core,context,seq,true,&r);gpu->emitJobStats();
++                                (void)n2c_seq_state(gpu->core,ctx,seq,true,&r);gpu->emitJobStats();
+                         }
+                 }break;
+         }
+@@ -1036,5 +1044,5 @@
+         default: break;
+         }
+  out:
+-        IOLockUnlock(gpu->lock);IOLockUnlock(lock);return result;
++        IOLockUnlock(gpu->lock);if(clientHeld)IOLockUnlock(lock);return result;
+ }
+--- a/shim/nord2-xnu/Nord2GPU.cpp
++++ b/shim/nord2-xnu/Nord2GPU.cpp
+@@ -903,7 +903,7 @@
+ }
+ void Nord2GPUUserClient::closeContext() {
+         if(!lock)return;
+-        IOLockLock(lock);closed=true;
++        IOLockLock(lock);__atomic_store_n(&closed,true,__ATOMIC_RELEASE);
+         if(gpu && context<N2C_MAX_CTX) {
+                 enum n2c_error e;
+                 do {
+@@ -936,7 +936,7 @@
+         if(!nord2_gpu_call_valid(sel,a->scalarInputCount,a->scalarOutputCount,a->structureInputSize,a->structureOutputSize,
+                                  a->scalarInput,a->scalarOutput,a->structureInput,a->structureOutput) ||
+            a->structureInputDescriptor || a->structureOutputDescriptor || a->asyncWakePort!=MACH_PORT_NULL)return kIOReturnBadArgument;
+-        IOLockLock(lock);IOLockLock(gpu->lock);IOReturn result=kIOReturnUnsupported;
++        IOLockLock(lock);IOLockLock(gpu->lock);IOReturn result=kIOReturnUnsupported;bool clientHeld=true;
+         if(closed || gpu->stopping){result=kIOReturnNotOpen;goto out;}
+         if(sel==NORD2_GPU_SEL_STATUS){gpu->status((nord2_gpu_status *)a->structureOutput);a->structureOutputSize=sizeof(nord2_gpu_status);result=kIOReturnSuccess;goto out;}
+         if(sel==NORD2_GPU_SEL_LOG){
+@@ -972,10 +972,16 @@
+         }
+         case NORD2_GPU_SEL_WAIT: {
+                 if(a->scalarInput[1]>5000){result=kIOReturnBadArgument;break;}
++                /* Wait WITHOUT the per-connection lock: the frontend submits from one thread while a finish thread waits on the same
++                 * connection (n2mb_wait_seq), and holding the client lock for the whole wait made every other call of the connection
++                 * queue behind it (GPU idle between jobs).  ctx stays valid because closeContext() needs gpu->lock for n2c_ctx_close and
++                 * every iteration re-checks 'closed' under gpu->lock before touching the context. */
++                const unsigned ctx=context;IOLockUnlock(lock);clientHeld=false;
+                 uint32_t state=0,status=0;uint64_t id=a->scalarInput[0],enter_us=now_us(NULL),limit_us=a->scalarInput[1]*1000ull;
+                 for(;;){
++                        if(__atomic_load_n(&closed,__ATOMIC_ACQUIRE) || gpu->stopping){result=kIOReturnNotOpen;break;}
+                         gpu->irqLearnCheck();
+-                        n2c_poll(gpu->core);result=io_error(n2c_job_state(gpu->core,context,id,false,&state,&status));
++                        n2c_poll(gpu->core);result=io_error(n2c_job_state(gpu->core,ctx,id,false,&state,&status));
+                         uint64_t elapsed=now_us(NULL)-enter_us;
+                         if(result!=kIOReturnSuccess || state>=N2C_JOB_DONE || gpu->core->state==N2C_CORE_BROKEN || elapsed>=limit_us)break;
+                         gpu->waitStep(elapsed);
+@@ -983,25 +989,27 @@
+                 if(result==kIOReturnSuccess){
+                         a->scalarOutput[0]=state;a->scalarOutputCount=1;
+                         if(a->structureOutputSize){nord2_gpu_fault_info f={};f.job_id_lo=(uint32_t)id;f.job_id_hi=(uint32_t)(id>>32);
+-                                f.state=state;f.status=status;f.fault_status=gpu->core->ctxs[context].fault_status;f.fault_address=gpu->core->ctxs[context].fault_address;
++                                f.state=state;f.status=status;f.fault_status=gpu->core->ctxs[ctx].fault_status;f.fault_address=gpu->core->ctxs[ctx].fault_address;
+                                 memcpy(a->structureOutput,&f,sizeof(f));a->structureOutputSize=sizeof(f);}
+                         if(state>=N2C_JOB_DONE){
+                                 n2c_job_times jt;uint64_t ret_us=now_us(NULL);
+-                                if(n2c_job_get_times(gpu->core,context,id,&jt)==N2C_OK && state==N2C_JOB_DONE){
++                                if(n2c_job_get_times(gpu->core,ctx,id,&jt)==N2C_OK && state==N2C_JOB_DONE){
+                                         uint64_t gap=enter_us>jt.submit_us?enter_us-jt.submit_us:0,dur=ret_us-enter_us,ret=ret_us>jt.submit_us?ret_us-jt.submit_us:0;
+                                         gpu->waitN++;gpu->waitGapSum+=gap;gpu->waitDurSum+=dur;gpu->waitRetSum+=ret;
+                                         if(gap>gpu->waitGapMax)gpu->waitGapMax=(uint32_t)gap;if(dur>gpu->waitDurMax)gpu->waitDurMax=(uint32_t)dur;if(ret>gpu->waitRetMax)gpu->waitRetMax=(uint32_t)ret;
+                                 }
+-                                (void)n2c_job_state(gpu->core,context,id,true,NULL,NULL);gpu->emitJobStats();
++                                (void)n2c_job_state(gpu->core,ctx,id,true,NULL,NULL);gpu->emitJobStats();
+                         }
+                 }break;
+         }
+         case NORD2_GPU_SEL_WAIT_SEQ: {
+                 if(a->scalarInput[1]>5000){result=kIOReturnBadArgument;break;}
++                const unsigned ctx=context;IOLockUnlock(lock);clientHeld=false;     /* see SEL_WAIT: no connection lock while waiting */
+                 uint64_t seq=a->scalarInput[0],enter_us=now_us(NULL),limit_us=a->scalarInput[1]*1000ull;n2c_seq_result r={};
+                 for(;;){
++                        if(__atomic_load_n(&closed,__ATOMIC_ACQUIRE) || gpu->stopping){result=kIOReturnNotOpen;break;}
+                         gpu->irqLearnCheck();
+-                        n2c_poll(gpu->core);result=io_error(n2c_seq_state(gpu->core,context,seq,false,&r));
++                        n2c_poll(gpu->core);result=io_error(n2c_seq_state(gpu->core,ctx,seq,false,&r));
+                         uint64_t elapsed=now_us(NULL)-enter_us;
+                         if(result!=kIOReturnSuccess || !r.pending || gpu->core->state==N2C_CORE_BROKEN || elapsed>=limit_us)break;
+                         gpu->waitStep(elapsed);
+@@ -1010,11 +1018,11 @@
+                         uint32_t state=r.pending?N2C_JOB_RUNNING:(r.failed?r.first_failed_state:N2C_JOB_DONE);
+                         a->scalarOutput[0]=state;a->scalarOutput[1]=r.done+r.failed;a->scalarOutput[2]=r.first_failed_id;a->scalarOutputCount=3;
+                         if(a->structureOutputSize){nord2_gpu_fault_info f={};f.job_id_lo=(uint32_t)r.first_failed_id;f.job_id_hi=(uint32_t)(r.first_failed_id>>32);
+-                                f.state=r.first_failed_state;f.status=r.first_failed_status;f.fault_status=gpu->core->ctxs[context].fault_status;f.fault_address=gpu->core->ctxs[context].fault_address;
++                                f.state=r.first_failed_state;f.status=r.first_failed_status;f.fault_status=gpu->core->ctxs[ctx].fault_status;f.fault_address=gpu->core->ctxs[ctx].fault_address;
+                                 memcpy(a->structureOutput,&f,sizeof(f));a->structureOutputSize=sizeof(f);}
+                         if(!r.pending){
+                                 gpu->seqWaits++;gpu->seqJobs+=r.done+r.failed;uint64_t dur=now_us(NULL)-enter_us;gpu->seqDurSum+=dur;if(dur>gpu->seqDurMax)gpu->seqDurMax=(uint32_t)dur;
+-                                (void)n2c_seq_state(gpu->core,context,seq,true,&r);gpu->emitJobStats();
++                                (void)n2c_seq_state(gpu->core,ctx,seq,true,&r);gpu->emitJobStats();
+                         }
+                 }break;
+         }
+@@ -1036,5 +1044,5 @@
+         default: break;
+         }
+  out:
+-        IOLockUnlock(gpu->lock);IOLockUnlock(lock);return result;
++        IOLockUnlock(gpu->lock);if(clientHeld)IOLockUnlock(lock);return result;
+ }

@@ -1,0 +1,188 @@
+--- a/bsd/dev/nord2_gpu_core.c
++++ b/bsd/dev/nord2_gpu_core.c
+@@ -361,21 +361,42 @@
+         reap_idle_buffers(c, x);
+ }
+ 
++/* CPU cache maintenance of one buffer, page by page.  Uncached CPU mappings
++ * need none.  to_device: clean before the GPU reads; otherwise invalidate
++ * after the GPU wrote. */
++static void bo_cache_sync(struct n2c_core *c, struct n2c_bo *b, bool to_device)
++{
++        if (!b || (b->flags & N2C_BO_CPU_UNCACHED))
++                return;
++        for (unsigned p = 0; p < b->nr_pages; p++)
++                c->ops.sync(c->ctx, b->pages[p].pa, b->pages[p].cpu,
++                            NORD2_GPU_PAGE_SIZE, to_device);
++        if (to_device)
++                c->stats.cache_clean_pages += b->nr_pages;
++        else
++                c->stats.cache_inval_pages += b->nr_pages;
++}
++
+ static void job_finish(struct n2c_core *c, struct n2c_job *j, uint8_t state)
+ {
+         j->state = state;
+         if (state == N2C_JOB_DONE) {
+                 /* GPU writes reached memory at the END_FLUSH_CLEAN; drop
+-                 * stale CPU lines before the client reads. */
+-                for (unsigned i = 0; i < N2C_MAX_BOS; i++) {
+-                        struct n2c_bo *b = c->ctxs[j->ctx].bos[i];
+-                        if (!b || !(b->flags & N2C_BO_GPU_WRITE) ||
+-                            (b->flags & N2C_BO_CPU_UNCACHED))
+-                                continue;
+-                        for (unsigned p = 0; p < b->nr_pages; p++)
+-                                c->ops.sync(c->ctx, b->pages[p].pa,
+-                                            b->pages[p].cpu,
+-                                            NORD2_GPU_PAGE_SIZE, false);
++                 * stale CPU lines before the client reads.  A GPU write can
++                 * only land in a buffer mapped GPU_WRITE.  A job that listed
++                 * its buffers only reaches those; any other job (legacy
++                 * ABI, a full list, the rollback valve) invalidates every
++                 * GPU-writable buffer of the context. */
++                if (j->full_maint) {
++                        for (unsigned i = 0; i < N2C_MAX_BOS; i++) {
++                                struct n2c_bo *b = c->ctxs[j->ctx].bos[i];
++                                if (b && (b->flags & N2C_BO_GPU_WRITE))
++                                        bo_cache_sync(c, b, false);
++                        }
++                } else {
++                        for (unsigned i = 0; i < j->nr_bos; i++)
++                                if (j->bos[i]->flags & N2C_BO_GPU_WRITE)
++                                        bo_cache_sync(c, j->bos[i], false);
+                 }
+                 c->stats.completed++;
+         } else if (state == N2C_JOB_FAULTED) {
+@@ -667,6 +688,7 @@
+             !x->as_live || c->reset_pending)
+                 return N2C_E_STATE;
+         if (!r || !id_out || !r->nr_handles || r->nr_handles > N2C_JOB_BOS ||
++            (r->flags & ~N2C_SUBMIT_FULL_MAINT) ||
+             (r->nr_handles < 32 && (r->write_mask >> r->nr_handles)))
+                 return N2C_E_ARGS;
+         bool need0 = r->kind == N2C_JOB_COMPUTE || r->kind == N2C_JOB_RENDER;
+@@ -710,6 +732,9 @@
+         j->phase = need0 ? 0 : 1;
+         j->nr_bos = r->nr_handles;
+         j->write_mask = r->write_mask;
++        j->full_maint = c->full_cache_maint ||
++                        (r->flags & N2C_SUBMIT_FULL_MAINT) ||
++                        r->nr_handles >= N2C_JOB_BOS;
+         for (unsigned i = 0; i < r->nr_handles; i++) {
+                 struct n2c_bo *b = bos[i];
+                 j->bos[i] = b;
+@@ -766,18 +791,23 @@
+                         return;
+                 unsigned slot = phase_slot(c, pick);
+                 /* Serialize CPU maintenance after the older job completed,
+-                 * before its successor starts. A raw chain may read buffers
+-                 * omitted from the hint list; cover the entire context. */
++                 * before its successor starts.  A job that listed its
++                 * buffers cleans those (the producer lists everything the
++                 * chain reads); a raw chain that may reach unlisted buffers
++                 * (legacy ABI, full list, rollback valve) covers the entire
++                 * context. */
+                 if (pick->phase == 0 || pick->kind == N2C_JOB_FRAGMENT) {
+-                        for (unsigned i = 0; i < N2C_MAX_BOS; i++) {
+-                                struct n2c_bo *b = c->ctxs[pick->ctx].bos[i];
+-                                if (!b || b->state != N2C_BO_MAPPED ||
+-                                    (b->flags & N2C_BO_CPU_UNCACHED))
+-                                        continue;
+-                                for (unsigned p = 0; p < b->nr_pages; p++)
+-                                        c->ops.sync(c->ctx, b->pages[p].pa,
+-                                                    b->pages[p].cpu,
+-                                                    NORD2_GPU_PAGE_SIZE, true);
++                        if (pick->full_maint) {
++                                c->stats.cache_full_jobs++;
++                                for (unsigned i = 0; i < N2C_MAX_BOS; i++) {
++                                        struct n2c_bo *b = c->ctxs[pick->ctx].bos[i];
++                                        if (b && b->state == N2C_BO_MAPPED)
++                                                bo_cache_sync(c, b, true);
++                                }
++                        } else {
++                                for (unsigned i = 0; i < pick->nr_bos; i++)
++                                        if (pick->bos[i]->state == N2C_BO_MAPPED)
++                                                bo_cache_sync(c, pick->bos[i], true);
+                         }
+                 }
+                 enum n2hw_error e = n2hw_js_start(c->hw, slot,
+--- a/bsd/dev/nord2_gpu_core.h
++++ b/bsd/dev/nord2_gpu_core.h
+@@ -174,6 +174,7 @@
+         struct n2c_bo *bos[N2C_JOB_BOS];
+         unsigned nr_bos;
+         uint32_t write_mask;
++        bool full_maint;          /* cache maintenance covers the whole context */
+         uint64_t started_ms, stop_ms;
+         uint32_t status;          /* JS_STATUS of the failing phase */
+         uint64_t head_at_fault;
+@@ -186,13 +187,25 @@
+         uint64_t heads[2];
+         uint32_t handles[N2C_JOB_BOS];
+         uint32_t write_mask;      /* bit i: GPU may write handles[i] */
++        uint32_t flags;           /* N2C_SUBMIT_* */
+ };
+ 
++/* The handle list is only a hint: the chain may reach buffers that are not
++ * listed (legacy compute ABI following pointers inside FAU/resource tables).
++ * CPU cache maintenance then covers every buffer of the context instead of
++ * the listed ones.  A list that fills N2C_JOB_BOS is treated the same way,
++ * because a producer that ran out of slots cannot list everything. */
++#define N2C_SUBMIT_FULL_MAINT (1u << 0)
++
+ struct n2c_stats {
+         uint64_t submitted, completed, faulted, cancelled, timeouts;
+         uint64_t resets, reset_failures, flush_failures;
+         uint64_t mmu_faults, quarantined, drained;
+         uint64_t bos_live, bytes_live, tables_live;
++        /* CPU cache maintenance, in 4 KiB pages (clean before a job phase,
++         * invalidate after completion) and jobs that needed whole-context
++         * maintenance. */
++        uint64_t cache_clean_pages, cache_inval_pages, cache_full_jobs;
+ };
+ 
+ struct n2c_core {
+@@ -210,6 +223,9 @@
+         unsigned nr_quarantine;
+         uint32_t next_handle;
+         struct n2c_stats stats;
++        /* Rollback valve (boot-arg nord2_gpu_cache=1): maintain the whole
++         * context for every job, as before per-job scoping. */
++        bool full_cache_maint;
+         /* Private immutable workaround, separate AS0 MMU, never user mapped. */
+         const uint8_t *wa_payload;
+         size_t wa_size;
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -84,6 +84,14 @@
+         /* CIVAC: also discards stale CPU lines following GPU END_FLUSH. */
+         FlushPoC_DcacheRegion((vm_offset_t)cpu, bytes);
+ }
++/* Cache maintenance is scoped to each job's submitted buffer list.  Boot-arg
++ * nord2_gpu_cache=1 restores whole-context maintenance for every job. */
++static bool cache_scope(struct n2c_core *c) {
++        int v = 0; PE_parse_boot_argn("nord2_gpu_cache", &v, sizeof(v));
++        c->full_cache_maint = v == 1;
++        IOLog("NORD2 GPU: cache maintenance %s\n", c->full_cache_maint ? "whole-context (boot-arg)" : "per-job buffer list");
++        return true;
++}
+ static IOReturn io_error(enum n2c_error e) {
+         switch (e) {
+         case N2C_OK: return kIOReturnSuccess;
+@@ -207,6 +215,7 @@
+                n2hw_init(&hw, &ho, &gpu) && nord2_scpsys_init(&scpsys, &so, this, 200000) &&
+                nord2_gpu_board_init(&board, &rail, &clk, &scpsys, &hw, log_msg, this) &&
+                n2c_init(core, &mo, this, &hw) &&
++               cache_scope(core) &&
+                n2c_set_wa_payload(core, valhall_wa_payload, sizeof(valhall_wa_payload));
+ }
+ int Nord2GPU::powerOn(void *p) {
+@@ -437,6 +446,8 @@
+         if (!nord2_gpu_jm_build_compute_program((uint8_t *)((BufferOwner *)cmd->cookie)->md->getBytesNoCopy(),(size_t)size,&chain)) result=kIOReturnBadArgument;
+         else {
+                 struct n2c_submit sub={};sub.kind=N2C_JOB_COMPUTE;sub.heads[0]=va;
++                /* ABI v1: shader/FAU/resource tables hold raw pointers to buffers that are not listed. */
++                sub.flags=N2C_SUBMIT_FULL_MAINT;
+                 sub.handles[sub.nr_handles++]=h;sub.handles[sub.nr_handles++]=shader->handle;
+                 const n2c_bo *extra[2]={res,fau};
+                 for(unsigned i=0;i<2;i++)if(extra[i]){

@@ -1,0 +1,401 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -187,6 +187,15 @@
+ 	volatile uint32_t  *fTx;
+ 	uint32_t            fPanelHz, fVsyncUs;       /* 0155: 90 (default) or 60 */
+ 	uint64_t            fWaitStartUs, fTeStartUs, fTeOffUntilUs;
++	/* 0156: double-buffered panel memory (the copy of the next frame overlaps the transfer of the current one), TE prediction, cadence */
++	uint64_t            fPhysB, fNextWaitUs, fPrepCopyUs, fTeLastUs, fTePeriodUs, fTeObsUs, fTeLeadUs;
++	SweetSurface       *fSurfaceB;
++	uintptr_t           fPixelsB, fCopyDst;
++	uint8_t            *fNextRec;
++	sweet_fb_pending_surfaces fNextSurfaces;
++	bool                fDbl, fPrepared, fTeObsSet;
++	uint8_t             fFront, fNextState;      /* fFront: panel buffer the overlay reads (0 = fPixels, 1 = fPixelsB); fNextState 0 none, 1 taken / waiting for the GPU, 2 copied */
++	uint32_t            fCad[5];
+ 	uint8_t             fModeState;               /* 0 panel still at its boot mode, 1 switched to 90 Hz, 2 refused / failed */
+ 	uint8_t             fRetuneState;        /* 0 not yet, 1 raised, 2 done / refused / reverted */
+ 	uint32_t            fRetunePresents, fSaveCon0, fSaveTim[4];
+@@ -208,6 +217,11 @@
+ 	void        handOver(uint64_t count);
+ 	bool        dsiDcs(const uint8_t *p, unsigned n);
+ 	bool        panelRefresh(bool hz90);
++	bool        dblEnable(void);
++	bool        ovlSelect(uint8_t idx);
++	void        prepNext(void);
++	void        dropNext(void);
++	void        noteDistinct(uintptr_t dst);
+ 	bool        xferStart(void);
+ 	bool        xferDone(void);
+ 	/* SwapWait / swap retirement (boot-arg n2swait, sweet_fb_swapwait.h).  fRetire, fLateSurfaces: fLock. */
+@@ -337,6 +351,9 @@
+ 		if (fFlushTicks > 1) { fPanelHz = 60; }      /* a reduced present rate keeps the 60 Hz tick grid */
+ 	}
+ 	fVsyncUs = fPanelHz == 90 ? 11111 : SWEET_FB_VSYNC_US;
++	fTePeriodUs = SWEET_FB_VSYNC_US;      /* the panel boots at 60 Hz; set to 11111 when the 90 Hz switch is accepted */
++	fTeLeadUs = SWEET_FB_TE_LEAD_US_DEFAULT;
++	{ uint32_t lead = 0; if (PE_parse_boot_argn("n2telead", &lead, sizeof(lead)) && lead <= 4000) { fTeLeadUs = lead; } }
+ 	nanoseconds_to_absolutetime(fVsyncUs * 1000ULL, &fPeriodAbs);
+ 	/* n2swait=<0|1|2>: SwapWait semantics (0 = as before: always success, calls logged). */
+ 	{
+@@ -467,6 +484,10 @@
+ 			fb->fFadeStep = step + 1;
+ 		}
+ 		IOLockUnlock(fb->fLock);
++#if defined(NORD2)
++		if (fb->fDbl && fb->fFront != 0 && fb->fPState == 0) { (void)fb->ovlSelect(0); fb->fFront = 0; }      /* the fade draws into buffer 0 */
++		fb->dropNext();
++#endif
+ 		if (step <= 6) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+@@ -488,6 +509,149 @@
+ 	if (diag_report) { fb->reportDiagnostics("timer-on"); }
+ }
+ 
++/* 0156: FNV hash of the panel memory just filled -> "distinct frames" and their cadence. */
++void
++AppleCLCD::noteDistinct(uintptr_t dst)
++{
++	uint64_t h = 1469598103934665603ULL;
++	for (uint32_t y = 0; y < fHeight; y += 8) {
++		const volatile uint64_t *row = (const volatile uint64_t *)(dst + (uint64_t)y * fRowBytes);
++		uint32_t words = fWidth / 2;
++		for (uint32_t k = 0; k < 16; k++) { h = (h ^ row[(words / 16) * k]) * 1099511628211ULL; }
++	}
++	uint64_t nowUs = sweet_fb_abs_to_us(mach_absolute_time());
++	if (fHashHave && h == fHashLast) { fSame++; }
++	else {
++		if (fHashHave && fDistinctLastUs) {
++			uint64_t gap = nowUs - fDistinctLastUs;
++			if (gap > fDistinctGapMaxUs) { fDistinctGapMaxUs = gap; }
++			fGapBin[gap <= 20000 ? 0 : gap <= 34000 ? 1 : gap <= 67000 ? 2 : gap <= 100000 ? 3 : 4]++;
++			fCad[gap <= 12500 ? 0 : gap <= 15000 ? 1 : gap <= 19000 ? 2 : gap <= 28000 ? 3 : 4]++;
++		}
++		fDistinct++; fDistinctLastUs = nowUs;
++	}
++	fHashLast = h; fHashHave = true;
++}
++
++/* 0156: drop a taken-but-unpresented frame (power off, stop). */
++void
++AppleCLCD::dropNext(void)
++{
++	IOLockLock(fLock);
++	uint8_t *rec = fNextRec;
++	sweet_fb_pending_surfaces s = fNextSurfaces;
++	fNextRec = NULL; sweet_fb_pending_surfaces_init(&fNextSurfaces);
++	bool had = fNextState != 0;
++	fNextState = 0;
++	bool requeued = false;
++	if (had && rec != NULL) { requeued = sweet_fb_swap_lifecycle_requeue(&fSwapLifecycle, fDirty, &s); if (requeued) { fDirty = true; } }
++	IOLockUnlock(fLock);
++	if (rec != NULL) { IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE); }
++	sweet_fb_pending_surfaces_release(&s, sweet_fb_release_surface);
++}
++
++/* 0156: the overlay reads panel buffer idx (both pipes), read back to prove the registers took it. Only between frames. */
++bool
++AppleCLCD::ovlSelect(uint8_t idx)
++{
++#if defined(NORD2)
++	if (fOvl[0] == NULL || fOvl[1] == NULL) { return false; }
++	uint64_t base = idx ? fPhysB : fPhys;
++	for (uint32_t i = 0; i < SWEET_FB_SCAN_PIPES; i++) { fOvl[i][SWEET_FB_OVL_ADDR / 4] = sweet_fb_scan_base_addr(base, fWidth, i); }
++	__asm__ volatile("dsb sy" ::: "memory");
++	for (uint32_t i = 0; i < SWEET_FB_SCAN_PIPES; i++) { if (fOvl[i][SWEET_FB_OVL_ADDR / 4] != sweet_fb_scan_base_addr(base, fWidth, i)) { return false; } }
++	return true;
++#else
++	(void)idx;
++	return false;
++#endif
++}
++
++/* 0156: second panel buffer right behind the first one in the framebuffer carve-out; refuses unless the overlay is exactly as the bootloader left it. */
++bool
++AppleCLCD::dblEnable(void)
++{
++#if defined(NORD2)
++	const char *why = NULL;
++	if (fDsi == NULL) { why = "no DSI"; }
++	if (why == NULL && fOvl[0] == NULL) { fOvl[0] = (volatile uint32_t *)ml_io_map(SWEET_FB_OVL0_2L, 0x1000); }
++	if (why == NULL && fOvl[1] == NULL) { fOvl[1] = (volatile uint32_t *)ml_io_map(SWEET_FB_OVL1_2L, 0x1000); }
++	if (why == NULL && (fOvl[0] == NULL || fOvl[1] == NULL)) { why = "overlay not mappable"; }
++	uint32_t want_size = (fHeight << 16) | (fWidth / SWEET_FB_SCAN_PIPES);
++	for (uint32_t i = 0; why == NULL && i < SWEET_FB_SCAN_PIPES; i++) {
++		volatile uint32_t *o = fOvl[i];
++		if (o[SWEET_FB_OVL_ADDR / 4] != sweet_fb_scan_base_addr(fPhys, fWidth, i)) { why = "ADDR not the panel buffer"; }
++		else if ((o[SWEET_FB_OVL_PITCH / 4] & 0xffffu) != fRowBytes) { why = "PITCH not the panel pitch"; }
++		else if (o[SWEET_FB_OVL_SIZE / 4] != want_size) { why = "SIZE not the half panel"; }
++	}
++	if (why == NULL) {
++		fPhysB = fPhys + (uint64_t)fRowBytes * fHeight;
++		if (fPhysB + (uint64_t)fRowBytes * fHeight > SWEET_FB_SCAN_CARVE_END) { why = "no room in the carve-out"; }
++	}
++	if (why == NULL) {
++		fSurfaceB = sweet_surface_create_physical(fPhysB, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
++		fPixelsB = fSurfaceB != NULL ? fSurfaceB->kernelAddress() : 0;
++		if (fPixelsB == 0) { why = "second buffer not mappable"; }
++	}
++	if (why != NULL) {
++		IOLog("NORD2 FB DBL: double buffering refused: %s (addr %08x/%08x pitch %08x/%08x size %08x/%08x)\n", why,
++		    fOvl[0] ? fOvl[0][SWEET_FB_OVL_ADDR / 4] : 0, fOvl[1] ? fOvl[1][SWEET_FB_OVL_ADDR / 4] : 0,
++		    fOvl[0] ? fOvl[0][SWEET_FB_OVL_PITCH / 4] : 0, fOvl[1] ? fOvl[1][SWEET_FB_OVL_PITCH / 4] : 0,
++		    fOvl[0] ? fOvl[0][SWEET_FB_OVL_SIZE / 4] : 0, fOvl[1] ? fOvl[1][SWEET_FB_OVL_SIZE / 4] : 0);
++		return false;
++	}
++	memcpy((void *)fPixelsB, (const void *)fPixels, (size_t)fRowBytes * fHeight);
++	__asm__ volatile("dsb sy" ::: "memory");
++	fFront = 0; fDbl = true;
++	IOLog("NORD2 FB DBL: double buffering on, second buffer at 0x%llx\n", fPhysB);
++	return true;
++#else
++	return false;
++#endif
++}
++
++/* 0156: while a frame is being transferred, take the next swap (if any), wait for the GPU without blocking, and copy it into the idle buffer. */
++void
++AppleCLCD::prepNext(void)
++{
++#if defined(NORD2)
++	if (!fDbl) { return; }
++	if (fNextState == 0) {
++		IOLockLock(fLock);
++		if (fPowerOff || !fDirty || fNextState != 0) { IOLockUnlock(fLock); return; }
++		uint8_t *rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++		if (rec == NULL) { IOLockUnlock(fLock); return; }
++		memcpy(rec, fPending, SWEET_FB_SWAP_REC_SIZE);
++		sweet_fb_pending_surfaces s;
++		sweet_fb_pending_surfaces_init(&s);
++		if (!sweet_fb_swap_lifecycle_take(&fSwapLifecycle, &s)) { IOLockUnlock(fLock); IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE); return; }
++		fDirty = false;
++		fNextRec = rec; fNextSurfaces = s; fNextState = 1;
++		fNextWaitUs = sweet_fb_abs_to_us(mach_absolute_time());
++		IOLockUnlock(fLock);
++	}
++	if (fNextState == 1) {
++		bool busy = false;
++		for (uint32_t layer = 0; layer < SWEET_FB_LAYERS && !busy; layer++) {
++			if (fNextSurfaces.object[layer] != NULL && nord2_gpu_surface_busy(fNextSurfaces.object[layer])) { busy = true; }
++		}
++		uint64_t waited = sweet_fb_abs_to_us(mach_absolute_time()) - fNextWaitUs;
++		if (busy && waited < SWEET_FB_BUSY_WAIT_US) { return; }
++		fStats.busy_waits++; fStats.busy_wait_us += waited;
++		if (!busy) { fStats.busy_wait_ok++; } else { __atomic_fetch_add(&fStats.busy_forced, 1, __ATOMIC_RELAXED); }
++		fCopyDst = fFront ? fPixels : fPixelsB;       /* the buffer the overlay is not reading */
++		uint64_t t0 = mach_absolute_time();
++		bool shown = presentCopy(fNextRec, (SweetSurface *const *)fNextSurfaces.object);
++		fPrepCopyUs = sweet_fb_abs_to_us(mach_absolute_time() - t0);
++		fCopyDst = 0;
++		if (!shown) { dropNext(); return; }
++		noteDistinct(fFront ? fPixels : fPixelsB);
++		fStats.dbl_preps++;
++		fNextState = 2;
++	}
++#endif
++}
++
+ /* Takes the newest swap if the presenter is idle and starts it on the present thread (state 5: wait for the GPU, then copy, TE wait, transfer). */
+ void
+ AppleCLCD::handOver(uint64_t count)
+@@ -495,6 +659,19 @@
+ 	(void)count;
+ 	if (fPresentTimer == NULL) { return; }
+ 	IOLockLock(fLock);
++	if (!fPowerOff && fPState == 0 && fNextState != 0) {
++		/* 0156: the frame prepared during the last transfer goes first */
++		fWorkRec = fNextRec; fWorkSurfaces = fNextSurfaces;
++		fNextRec = NULL; sweet_fb_pending_surfaces_init(&fNextSurfaces);
++		sweet_fb_retire_take(&fRetire);
++		if (fNextState == 2) { fPrepared = true; fPState = 1; fStats.dbl_hits++; }
++		else { fWaitStartUs = fNextWaitUs; fPState = 5; }
++		fNextState = 0;
++		IOLockUnlock(fLock);
++		IOLockWakeup(fLock, &fRetireEvent, false);
++		fPresentTimer->setTimeoutUS(1);
++		return;
++	}
+ 	if (fPowerOff || fPState != 0 || !fDirty) { IOLockUnlock(fLock); return; }
+ 	if (fDiag.enabled) { __atomic_fetch_add(&fDiag.flushes, 1, __ATOMIC_RELAXED); }
+ 	uint8_t *rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+@@ -564,6 +741,7 @@
+ 	if (__atomic_load_n(&fb->fSwapLifecycle.stopped, __ATOMIC_ACQUIRE)) {
+ #if defined(NORD2)
+ 		if (fb->fPState == 3 || fb->fPState == 4) { fb->scanStep(SWEET_FB_SCAN_EV_STOP); }
++		fb->dropNext();
+ #endif
+ 		fb->presentDone(false, false, false);
+ 		return;
+@@ -576,7 +754,7 @@
+ 			if (fb->fWorkSurfaces.object[layer] != NULL && nord2_gpu_surface_busy(fb->fWorkSurfaces.object[layer])) { busy = true; }
+ 		}
+ 		uint64_t waited = sweet_fb_abs_to_us(mach_absolute_time()) - fb->fWaitStartUs;
+-		if (busy && waited < SWEET_FB_BUSY_WAIT_US) { sender->setTimeoutUS(250); return; }
++		if (busy && waited < SWEET_FB_BUSY_WAIT_US) { sender->setTimeoutUS(100); return; }
+ 		fb->fStats.busy_waits++; fb->fStats.busy_wait_us += waited;
+ 		if (!busy) { fb->fStats.busy_wait_ok++; } else { __atomic_fetch_add(&fb->fStats.busy_forced, 1, __ATOMIC_RELAXED); }
+ 		fb->fPState = 1;
+@@ -594,31 +772,25 @@
+ 			uint64_t lat = t0us > fb->fSwapArrUs ? t0us - fb->fSwapArrUs : 0;
+ 			fb->fLatBin[lat <= 8000 ? 0 : lat <= 16000 ? 1 : lat <= 25000 ? 2 : lat <= 33000 ? 3 : 4]++;
+ 		}
+-		bool shown = fb->presentCopy(fb->fWorkRec, (SweetSurface *const *)fb->fWorkSurfaces.object);
++		bool wasPrepared = fb->fPrepared;
++		bool shown = true;
++		if (wasPrepared) { fb->fPrepared = false; }
++		else {
++			fb->fCopyDst = fb->fDbl ? (fb->fFront ? fb->fPixels : fb->fPixelsB) : fb->fPixels;
++			shown = fb->presentCopy(fb->fWorkRec, (SweetSurface *const *)fb->fWorkSurfaces.object);
++		}
+ 		uint64_t t1 = mach_absolute_time();
+-		fb->fCopyUs = sweet_fb_abs_to_us(t1 - t0);
++		fb->fCopyUs = wasPrepared ? fb->fPrepCopyUs : sweet_fb_abs_to_us(t1 - t0);
+ 		if (!shown) { fb->presentDone(false, false, false); return; }
+-		{	/* 0133: FNV-1a over 16 words in every 8th row of the panel memory the copy just filled */
+-			uint64_t h = 1469598103934665603ULL;
+-			for (uint32_t y = 0; y < fb->fHeight; y += 8) {
+-				const volatile uint64_t *row = (const volatile uint64_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+-				uint32_t words = fb->fWidth / 2;
+-				for (uint32_t k = 0; k < 16; k++) { h = (h ^ row[(words / 16) * k]) * 1099511628211ULL; }
+-			}
+-			uint64_t nowUs = sweet_fb_abs_to_us(t1);
+-			if (fb->fHashHave && h == fb->fHashLast) { fb->fSame++; }
+-			else {
+-				if (fb->fHashHave && fb->fDistinctLastUs) {
+-					uint64_t gap = nowUs - fb->fDistinctLastUs;
+-					if (gap > fb->fDistinctGapMaxUs) { fb->fDistinctGapMaxUs = gap; }
+-					fb->fGapBin[gap <= 20000 ? 0 : gap <= 34000 ? 1 : gap <= 67000 ? 2 : gap <= 100000 ? 3 : 4]++;
+-				}
+-				fb->fDistinct++; fb->fDistinctLastUs = nowUs;
+-			}
+-			fb->fHashLast = h; fb->fHashHave = true;
+-		}
++		if (!wasPrepared) { fb->noteDistinct(fb->fCopyDst ? fb->fCopyDst : fb->fPixels); }
++		fb->fCopyDst = 0;
+ 		if (fb->fNbReady && fb->fDsi != NULL && sweet_fb_abs_to_us(t1) >= fb->fTeOffUntilUs && !(fb->fDsi[SWEET_FB_DSI_INTSTA / 4] & SWEET_FB_DSI_BUSY)) {
+ 			/* 0155: the transfer starts at the panel's next TE (the scan then stays behind the write: no tear lines) */
++			if (fb->fDbl) {      /* 0156: the overlay reads the buffer that was just filled */
++				uint8_t back = fb->fFront ? 0 : 1;
++				if (fb->ovlSelect(back)) { fb->fFront = back; }
++				else { IOLog("NORD2 FB DBL: overlay flip refused, back to one buffer\n"); fb->fDbl = false; (void)fb->ovlSelect(0); fb->fFront = 0; fb->dropNext(); }
++			}
+ 			fb->fDsi[SWEET_FB_DSI_INTSTA / 4] = ~SWEET_FB_DSI_TE_RDY;
+ 			fb->fTeStartUs = sweet_fb_abs_to_us(mach_absolute_time());
+ 			fb->fPState = 6;
+@@ -648,6 +820,21 @@
+ 		uint64_t nowUs = sweet_fb_abs_to_us(mach_absolute_time());
+ 		uint64_t waited = nowUs - fb->fTeStartUs;
+ 		bool te = (fb->fDsi[SWEET_FB_DSI_INTSTA / 4] & SWEET_FB_DSI_TE_RDY) != 0;
++		if (fb->fTeLastUs != 0 && fb->fTeLeadUs != 0 && nowUs - fb->fTeLastUs < 200000) {
++			/* 0156: start fTeLeadUs before the TE after the last one seen (periodic), so the write is ahead of the scan from the first row */
++			uint64_t P = fb->fTePeriodUs;
++			uint64_t k = (nowUs - fb->fTeLastUs + fb->fTeLeadUs) / P + 1;
++			uint64_t fire = fb->fTeLastUs + k * P - fb->fTeLeadUs;
++			if (fire > nowUs + 300) { sender->setTimeoutUS((uint32_t)(fire - nowUs - 200)); return; }
++			while (sweet_fb_abs_to_us(mach_absolute_time()) < fire) { IODelay(20); }
++			fb->fStats.te_lead_starts++;
++			nowUs = sweet_fb_abs_to_us(mach_absolute_time());
++			te = true;
++			fb->fDsi[SWEET_FB_DSI_INTSTA / 4] = ~SWEET_FB_DSI_TE_RDY;      /* the next TE seen is the one this push is ahead of */
++		} else if (te) {
++			fb->fTeLastUs = nowUs;      /* edge mode: the TE was just seen */
++			fb->fDsi[SWEET_FB_DSI_INTSTA / 4] = ~SWEET_FB_DSI_TE_RDY;
++		}
+ 		if (!te && waited < SWEET_FB_TE_WAIT_US) { sender->setTimeoutUS(200); return; }
+ 		if (!te) { fb->fStats.te_miss++; fb->fTeOffUntilUs = nowUs + 1000000; }
+ 		fb->fStats.te_waits++; fb->fStats.te_wait_us += waited;
+@@ -665,8 +852,17 @@
+ 	}
+ #endif
+ 	uint64_t elapsed = sweet_fb_abs_to_us(mach_absolute_time() - fb->fXferStart);
++#if defined(NORD2)
++	if (fb->fPState == 2 && !fb->fTeObsSet && fb->fDsi != NULL && (fb->fDsi[SWEET_FB_DSI_INTSTA / 4] & SWEET_FB_DSI_TE_RDY)) {
++		fb->fTeObsUs = sweet_fb_abs_to_us(mach_absolute_time()) - SWEET_FB_XFER_POLL_US / 2;      /* first TE since the push started */
++		fb->fTeObsSet = true;
++	}
++#endif
+ 	int st = sweet_fb_xfer_state(fb->xferDone(), elapsed);
+ 	if (st == SWEET_FB_XFER_WAIT) {
++#if defined(NORD2)
++		if (fb->fPState == 2) { fb->prepNext(); }
++#endif
+ 		sender->setTimeoutUS(SWEET_FB_XFER_POLL_US);
+ 		return;
+ 	}
+@@ -825,13 +1021,29 @@
+ #if defined(NORD2)
+ 	/* 0154: the presenter still owns the engine here (fPState != 0), the link is idle */
+ 	if (shown && !legacy) {
++		if (fTeObsSet) {
++			fTeObsSet = false;
++			if (fTeLastUs != 0 && fTeObsUs > fTeLastUs && fTeObsUs - fTeLastUs < 200000) {
++				uint64_t d = fTeObsUs - fTeLastUs, P = fTePeriodUs, n = (d + P / 2) / P;
++				int64_t err = n ? (int64_t)d - (int64_t)(n * P) : 0;
++				if (n >= 1 && err > -(int64_t)(P / 4) && err < (int64_t)(P / 4)) {
++					fTePeriodUs = (uint64_t)((int64_t)P + err / (int64_t)(8 * n));
++					if (fTePeriodUs < 8000) { fTePeriodUs = 8000; } else if (fTePeriodUs > 20000) { fTePeriodUs = 20000; }
++				}
++			}
++			fTeLastUs = fTeObsUs;
++		}
+ 		if (fRetuneState == 0 && fPresents > 30 && !timeout) {
+ 			linkRetune(true);
+-			if (fRetuneState == 1 && fPanelHz == 90 && fModeState == 0) { fModeState = panelRefresh(true) ? 1 : 2; }
++			if (fRetuneState == 1 && fPanelHz == 90 && fModeState == 0) {
++				fModeState = panelRefresh(true) ? 1 : 2;
++				if (fModeState == 1) { fTePeriodUs = 11111; fTeLastUs = 0; }      /* re-acquire the TE at the new rate */
++			}
++			if (!fDbl && fRetuneState == 1) { (void)dblEnable(); }
+ 		}
+ 		else if (fRetuneState == 1 && fPresents - fRetunePresents < 40 && fDsi != NULL &&
+ 		    (timeout || xfer > 30000 || (fDsi[SWEET_FB_DSI_INTSTA / 4] & (1u << 12)))) {
+-			if (fModeState == 1) { (void)panelRefresh(false); fModeState = 2; }
++			if (fModeState == 1) { (void)panelRefresh(false); fModeState = 2; fTePeriodUs = SWEET_FB_VSYNC_US; fTeLastUs = 0; }
+ 			linkRetune(false);
+ 		}
+ 	}
+@@ -883,6 +1095,9 @@
+ 		    fStats.te_waits ? fStats.te_wait_us / fStats.te_waits : 0ULL, fStats.te_wait_max, fPanelHz, fModeState, fRetuneState);
+ 		IOLog("NORD2 FB SEEN: presents=%u different=%u same=%u gaps_ms<=20/34/67/100/more=%u/%u/%u/%u/%u max_gap_ms=%llu\n", fStats.n, fDistinct, fSame,
+ 		    fGapBin[0], fGapBin[1], fGapBin[2], fGapBin[3], fGapBin[4], fDistinctGapMaxUs / 1000);
++		IOLog("NORD2 FB CADENCE: distinct_gaps_ms<=12.5/15/19/28/more=%u/%u/%u/%u/%u dbl=%u preps=%u hits=%u te_lead_starts=%u te_period_us=%llu\n", fCad[0], fCad[1], fCad[2], fCad[3], fCad[4],
++		    fDbl ? 1u : 0u, fStats.dbl_preps, fStats.dbl_hits, fStats.te_lead_starts, fTePeriodUs);
++		for (unsigned i = 0; i < 5; i++) { fCad[i] = 0; }
+ 		fDistinct = fSame = 0; fDistinctGapMaxUs = 0; for (unsigned i = 0; i < 5; i++) { fGapBin[i] = 0; }
+ 		sweet_fb_stats_reset(&fStats, now_us);
+ 		IOLockLock(fLock);
+@@ -1323,7 +1538,7 @@
+ 		if (src != 0 && bpe == 4) {
+ 			if (fDiag.enabled) { __atomic_fetch_add(&fDiag.copied_layers, 1, __ATOMIC_RELAXED); }
+ 			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++				memcpy((void *)((fCopyDst ? fCopyDst : fPixels) + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
+--- a/iokit/Kernel/arm/sweet_fb_present.h
++++ b/iokit/Kernel/arm/sweet_fb_present.h
+@@ -16,11 +16,12 @@
+ 
+ #define SWEET_FB_DEFAULT_HZ 30u          /* panel present rate; one panel transfer plus the copy is ~20-25 ms */
+ #define SWEET_FB_BUSY_MAX_TICKS 6u       /* 100 ms at 60 Hz: then present anyway */
++#define SWEET_FB_TE_LEAD_US_DEFAULT 1000u   /* 0156: the push starts this long before the predicted TE (the write must be ahead of the panel scan) */
+ #define SWEET_FB_TE_WAIT_US 25000u       /* 0155: panel TE not seen: push anyway, and stop waiting for TE for a second */
+ #define SWEET_FB_PRES_WAIT_US 8000u      /* 0150/0151: a presenter still finishing the previous frame is waited for this long at the tick (4 ms still lost a whole period in ~10-20% of the frames: 3.3 ms GPU wait + 2.2 copy + 11 transfer ~ 16.5 ms) */
+ #define SWEET_FB_BUSY_WAIT_US 10000u     /* 0149: a swap whose GPU work is still in flight at the tick is waited for, this long at most, before it is skipped */
+ #define SWEET_FB_XFER_TIMEOUT_US 40000u  /* frame-done not seen: give up on this transfer */
+-#define SWEET_FB_XFER_POLL_US 500u
++#define SWEET_FB_XFER_POLL_US 250u
+ #define SWEET_FB_STAT_INTERVAL_US 5000000u
+ 
+ /* hz == 0 or >= 60: every tick; otherwise every 60/hz-th tick. */
+@@ -86,7 +87,7 @@
+ /* Present timing, windowed; reported at most every SWEET_FB_STAT_INTERVAL_US and only if something presented. */
+ struct sweet_fb_present_stats {
+ 	uint32_t n, timeouts, busy_skips, busy_forced, late_ticks, legacy;
+-	uint32_t busy_same, busy_diff, busy_maxrun, busy_waits, busy_wait_ok, pres_waits, pres_wait_ok, te_waits, te_miss, te_wait_max;
++	uint32_t busy_same, busy_diff, busy_maxrun, busy_waits, busy_wait_ok, pres_waits, pres_wait_ok, te_waits, te_miss, te_wait_max, dbl_preps, dbl_hits, te_lead_starts;
+ 	uint64_t te_wait_us;
+ 	uint64_t busy_wait_us;   /* 0148: skips with the same / a different newest surface than the previous skip; longest run of skips */
+ 	uint64_t sum_us, sum_copy_us, sum_xfer_us;

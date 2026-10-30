@@ -1,0 +1,38 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -64,6 +64,15 @@
+         const char *nm = proc_best_name(p); unsigned i = 0; if (nm) for (; i < sizeof(e->name) - 1 && nm[i]; i++) e->name[i] = nm[i]; e->name[i] = 0;
+         return 0;
+ }
++/* 0168: why a call was refused with something that is neither "out of memory" nor "bad argument" (the shim retries those for 10 s): core and context state */
++static void n2_refusal_log(struct n2c_core *core, bool ready, bool stopping, unsigned ctx, uint32_t sel, IOReturn result, const char *where) {
++        static unsigned logged; if (logged >= 120) return; logged++;
++        unsigned fr = 0, op = 0, zo = 0, other = 0;
++        if (core) for (unsigned i = 1; i < N2C_MAX_CTX; i++) { switch (core->ctxs[i].state) { case N2C_CTX_FREE: fr++; break; case N2C_CTX_OPEN: op++; break; case N2C_CTX_ZOMBIE: zo++; break; default: other++; } }
++        IOLog("NORD2 GPU REFUSED: %s sel=%u result=0x%x ready=%d stopping=%d core_state=%d reset_pending=%d powered=%d ctx=%u ctx_state=%d ctxs(free/open/zombie/other)=%u/%u/%u/%u\n",
++              where, (unsigned)sel, (unsigned)result, (int)ready, (int)stopping, core ? (int)core->state : -1, core ? (int)core->reset_pending : -1, core ? (int)core->gpu_powered : -1,
++              ctx, (core && ctx < N2C_MAX_CTX) ? (int)core->ctxs[ctx].state : -1, fr, op, zo, other);
++}
+ static void n2_proc_top(uint64_t winUs) {
+         n2_pcur_n = 0; (void)proc_iterate(1 /* PROC_ALLPROCLIST */, n2_proc_cb, NULL, NULL, NULL);
+         struct { int idx; uint64_t d; } top[4] = {};
+@@ -1363,7 +1372,7 @@
+                 IOLog("NORD2 GPU USER: %.*s",(int)a->structureInputSize,(const char *)a->structureInput);
+                 result=kIOReturnSuccess;goto out;
+         }
+-        result=ensureContext();if(result!=kIOReturnSuccess)goto out;
++        result=ensureContext();if(result!=kIOReturnSuccess){n2_refusal_log(gpu->core,gpu->ready,gpu->stopping,context,sel,result,"ensureContext");goto out;}
+         result=kIOReturnUnsupported;
+         switch(sel){
+         case NORD2_GPU_SEL_ALLOC: {
+@@ -1371,7 +1380,9 @@
+                 /* 0144: like WAIT, no connection lock during the slow part: submits and maps of this connection run meanwhile (closeContext() takes gpu->lock) */
+                 const unsigned actx=context;IOLockUnlock(lock);clientHeld=false;
+                 uint32_t h;uint64_t va,size;result=gpu->mapBuffer(actx,a->scalarInput[0],(uint32_t)a->scalarInput[1],&h,&va,&size,true,&closed);
+-                if(result==kIOReturnSuccess){a->scalarOutput[0]=h;a->scalarOutput[1]=va;a->scalarOutput[2]=size;a->scalarOutputCount=3;}break;
++                if(result==kIOReturnSuccess){a->scalarOutput[0]=h;a->scalarOutput[1]=va;a->scalarOutput[2]=size;a->scalarOutputCount=3;}
++                else if(result!=kIOReturnNoMemory && result!=kIOReturnBadArgument){IOLockLock(gpu->lock);n2_refusal_log(gpu->core,gpu->ready,gpu->stopping,actx,sel,result,"ALLOC");IOLockUnlock(gpu->lock);}
++                break;
+         }
+         case NORD2_GPU_SEL_RELEASE:
+                 if(a->scalarInput[0]>UINT32_MAX){result=kIOReturnBadArgument;break;}

@@ -1,0 +1,129 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -225,6 +225,7 @@
+         void emitJobStats();
+         void surfaceHook(void *surface, bool acquire);
+         bool surfaceBusy(void *surface);
++        void surfaceBusyWhy(void *surface, uint32_t *match, uint64_t *oldestAgeUs, uint64_t *oldestId, uint32_t *oldestState, uint32_t *inflight, uint32_t *queued, uint32_t *resv);
+         static int pmicRead(void *);   /* 0116: one PMIC register read on the PWRAP owner thread (CPU DVFS init voltages) */
+         /* Optional job interrupt (boot-arg nord2_gpu_irq=1; polling stays the fallback). */
+         bool irqWanted = false, irqTried = false, irqArmed = false;
+@@ -615,6 +616,38 @@
+         return busy;
+ }
+ extern "C" bool nord2_gpu_surface_busy(void *surface) { return gSurfaceGpu ? gSurfaceGpu->surfaceBusy(surface) : false; }
++/* 0148: the same predicate as surfaceBusy, but reporting what holds the surface (called only from the present thread when a swap is skipped or forced). */
++void Nord2GPU::surfaceBusyWhy(void *surface, uint32_t *match, uint64_t *oldestAgeUs, uint64_t *oldestId, uint32_t *oldestState, uint32_t *inflight, uint32_t *queued, uint32_t *resv) {
++        *match = 0; *oldestAgeUs = 0; *oldestId = 0; *oldestState = 0; *inflight = 0; *queued = 0; *resv = 0;
++        if (!surface || !ready || !core) return;
++        IOLockLock(lock);
++        if (!stopping) {
++                uint64_t t = now_us(NULL);
++                for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
++                        const struct n2c_job *j = &core->jobs[i];
++                        if (j->state != N2C_JOB_QUEUED && j->state != N2C_JOB_RUNNING && j->state != N2C_JOB_STOPPING) continue;
++                        (*inflight)++;
++                        if (j->state == N2C_JOB_QUEUED) (*queued)++;
++                        bool m = false;
++                        for (unsigned k = 0; k < j->nr_bos && !m; k++) {
++                                const struct n2c_bo *b = j->bos[k];
++                                m = ((j->write_mask >> k) & 1u) && (b->flags & N2C_BO_IMPORTED) && b->cookie &&
++                                    ((BufferOwner *)b->cookie)->surface == (SweetSurface *)surface;
++                        }
++                        if (!m) continue;
++                        (*match)++;
++                        uint64_t age = t > j->t_submit_us ? t - j->t_submit_us : 0;
++                        if (age >= *oldestAgeUs) { *oldestAgeUs = age; *oldestId = j->id; *oldestState = j->state; }
++                }
++                *resv = n2c_resv_busy(core, surface) ? 1 : 0;
++        }
++        IOLockUnlock(lock);
++}
++extern "C" void nord2_gpu_surface_busy_why(void *surface, uint32_t *match, uint64_t *oldest_age_us, uint64_t *oldest_id, uint32_t *oldest_state,
++    uint32_t *inflight, uint32_t *queued, uint32_t *resv) {
++        if (gSurfaceGpu) { gSurfaceGpu->surfaceBusyWhy(surface, match, oldest_age_us, oldest_id, oldest_state, inflight, queued, resv); }
++        else { *match = 0; *oldest_age_us = 0; *oldest_id = 0; *oldest_state = 0; *inflight = 0; *queued = 0; *resv = 0; }
++}
+ extern "C" uint64_t nord2_gpu_resv_expired(void) { return gSurfaceGpu && gSurfaceGpu->core ? gSurfaceGpu->core->stats.resv_expired : 0; }
+ extern "C" void nord2_gpu_surface_cpu_acquire(void *surface) { if (gSurfaceGpu) gSurfaceGpu->surfaceHook(surface, true); }
+ extern "C" void nord2_gpu_surface_cpu_release(void *surface) { if (gSurfaceGpu) gSurfaceGpu->surfaceHook(surface, false); }
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -173,6 +173,8 @@
+ 	sweet_fb_pending_surfaces fWorkSurfaces;
+ 	uint8_t             fPState;             /* 0 idle, 1 copy pending, 2 panel transfer in flight, 3 scan probe transfer, 4 scan probe hold */
+ 	uint32_t            fBusyTicks;
++	void               *fBusyLastObj;        /* 0148: newest-swap surface at the previous skip, skips in the current run, diagnostic log count */
++	uint32_t            fBusyRun, fBusyLogN;
+ 	uint64_t            fNextTick, fPeriodAbs;
+ 	uint64_t            fCopyUs, fXferStart;
+ 	/* 0133: how many of the presented frames actually differ from the previous one, and the gaps between the different ones (the panel is refreshed at 60 Hz
+@@ -479,10 +481,31 @@
+ 		/* Present only GPU-complete surfaces: while the GPU still writes one, the previous complete frame stays on
+ 		 * the panel (this swap goes back to the queue), but never longer than SWEET_FB_BUSY_MAX_TICKS. */
+ 		bool busy = false;
++		void *busyObj = NULL;
+ 		for (uint32_t layer = 0; layer < SWEET_FB_LAYERS && !busy; layer++) {
+-			if (surfaces.object[layer] != NULL && nord2_gpu_surface_busy(surfaces.object[layer])) { busy = true; }
++			if (surfaces.object[layer] != NULL && nord2_gpu_surface_busy(surfaces.object[layer])) { busy = true; busyObj = surfaces.object[layer]; }
+ 		}
+ 		int decision = sweet_fb_busy_decision(busy, &fb->fBusyTicks, SWEET_FB_BUSY_MAX_TICKS);
++#if defined(NORD2)
++		/* 0148 (diagnostic): is it the same surface that stays busy, or a new swap with a new busy surface at every tick; and what holds it. */
++		if (decision == SWEET_FB_BUSY_PRESENT) {
++			fb->fBusyRun = 0; fb->fBusyLastObj = NULL;
++		} else {
++			if (busyObj == fb->fBusyLastObj) { fb->fStats.busy_same++; } else { fb->fStats.busy_diff++; }
++			fb->fBusyLastObj = busyObj;
++			fb->fBusyRun++;
++			if (fb->fBusyRun > fb->fStats.busy_maxrun) { fb->fStats.busy_maxrun = fb->fBusyRun; }
++			if ((fb->fBusyRun == 1 || decision == SWEET_FB_BUSY_FORCE) && (fb->fBusyLogN < 120 || (fb->fBusyLogN & 15) == 0)) {
++				uint32_t match, inflight, queued, resv, state; uint64_t age, jid;
++				nord2_gpu_surface_busy_why(busyObj, &match, &age, &jid, &state, &inflight, &queued, &resv);
++				IOLog("NORD2 FB BUSYWHY: %s surf=%u run=%u jobs_on_surface=%u oldest_job=%llu state=%u age_ms=%llu inflight=%u queued=%u resv=%u\n",
++				    decision == SWEET_FB_BUSY_FORCE ? "force" : "start", busyObj ? ((SweetSurface *)busyObj)->id : 0, fb->fBusyRun, match, jid, state,
++				    age / 1000, inflight, queued, resv);
++			}
++			if (fb->fBusyRun == 1 || decision == SWEET_FB_BUSY_FORCE) { fb->fBusyLogN++; }
++			if (decision == SWEET_FB_BUSY_FORCE) { fb->fBusyRun = 0; }
++		}
++#endif
+ 		if (decision == SWEET_FB_BUSY_SKIP) {
+ 			__atomic_fetch_add(&fb->fStats.busy_skips, 1, __ATOMIC_RELAXED);
+ 			IOLockLock(fb->fLock);
+@@ -656,10 +679,11 @@
+ 	uint64_t now_us = sweet_fb_abs_to_us(mach_absolute_time());
+ 	if (sweet_fb_stats_due(&fStats, now_us)) {
+ 		uint32_t n = fStats.n ? fStats.n : 1;
+-		IOLog("NORD2 FB PRESENT: n=%u avg_us=%llu max_us=%u copy_us=%llu/%u xfer_us=%llu/%u legacy=%u timeouts=%u busy_skips=%u busy_forced=%u late_ticks=%u rate_hz=%u resv_expired=%llu\n",
++		IOLog("NORD2 FB PRESENT: n=%u avg_us=%llu max_us=%u copy_us=%llu/%u xfer_us=%llu/%u legacy=%u timeouts=%u busy_skips=%u busy_forced=%u late_ticks=%u rate_hz=%u resv_expired=%llu busy_same=%u busy_diff=%u busy_maxrun=%u\n",
+ 		    fStats.n, fStats.sum_us / n, fStats.max_us, fStats.sum_copy_us / n, fStats.max_copy_us,
+ 		    fStats.sum_xfer_us / n, fStats.max_xfer_us, fStats.legacy, fStats.timeouts, fStats.busy_skips,
+-		    fStats.busy_forced, fStats.late_ticks, 60 / fFlushTicks, nord2_gpu_resv_expired());
++		    fStats.busy_forced, fStats.late_ticks, 60 / fFlushTicks, nord2_gpu_resv_expired(),
++		    fStats.busy_same, fStats.busy_diff, fStats.busy_maxrun);
+ 		IOLog("NORD2 FB SEEN: presents=%u different=%u same=%u gaps_ms<=20/34/67/100/more=%u/%u/%u/%u/%u max_gap_ms=%llu\n", fStats.n, fDistinct, fSame,
+ 		    fGapBin[0], fGapBin[1], fGapBin[2], fGapBin[3], fGapBin[4], fDistinctGapMaxUs / 1000);
+ 		fDistinct = fSame = 0; fDistinctGapMaxUs = 0; for (unsigned i = 0; i < 5; i++) { fGapBin[i] = 0; }
+--- a/iokit/Kernel/arm/sweet_fb_present.h
++++ b/iokit/Kernel/arm/sweet_fb_present.h
+@@ -83,6 +83,7 @@
+ /* Present timing, windowed; reported at most every SWEET_FB_STAT_INTERVAL_US and only if something presented. */
+ struct sweet_fb_present_stats {
+ 	uint32_t n, timeouts, busy_skips, busy_forced, late_ticks, legacy;
++	uint32_t busy_same, busy_diff, busy_maxrun;   /* 0148: skips with the same / a different newest surface than the previous skip; longest run of skips */
+ 	uint64_t sum_us, sum_copy_us, sum_xfer_us;
+ 	uint32_t max_us, max_copy_us, max_xfer_us;
+ 	uint64_t last_report_us;
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -60,6 +60,9 @@
+ extern "C" void nord2_gpu_surface_cpu_release(void *surface);
+ /* True while a GPU job that declared it writes this surface has not finished (the framebuffer then keeps the previous frame). */
+ extern "C" bool nord2_gpu_surface_busy(void *surface);
++/* 0148 (diagnostic): why a surface is busy: jobs in flight that list it (count, oldest age in us, its id and state), all jobs in flight / queued. */
++extern "C" void nord2_gpu_surface_busy_why(void *surface, uint32_t *match, uint64_t *oldest_age_us, uint64_t *oldest_id, uint32_t *oldest_state,
++    uint32_t *inflight, uint32_t *queued, uint32_t *resv);
+ /* 0112: reservations that expired unretired since boot (a frame that never got submitted, or a client that forgot to retire). */
+ extern "C" uint64_t nord2_gpu_resv_expired(void);
+ 

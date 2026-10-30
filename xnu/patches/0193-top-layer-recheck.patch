@@ -1,0 +1,68 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-03 23:43:28.532271109 +0100
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-03 23:43:28.532988302 +0100
+@@ -1250,7 +1250,7 @@
+ 				if (n == 0) { snprintf(ob[i], sizeof(ob[i]), "none"); }
+ 			}
+ 			IOLog("NORD2 FB OVL: frames=%u dsi_underrun=%u ovl0[%s] ovl1[%s]\n", fOvlFrames, fDsiUnd, ob[0], ob[1]);
+-			IOLog("NORD2 FB CHK: layers=%u rows=%u left_diff_upper=%u left_diff_lower=%u control_diff=%u right_diff=%u\n", fChk[5], fChk[0], fChk[1], fChk[2], fChk[3], fChk[4]);
++			IOLog("NORD2 FB CHK: top_layers=%u rows=%u src_changed_left_upper/lower=%u/%u centre=%u right=%u dst_ne_src_left=%u dst_ne_src_other=%u\n", fChk[5], fChk[0], fChk[1], fChk[2], fChk[3], fChk[4], fChk[6], fChk[7]);
+ 			memset(fChk, 0, sizeof(fChk));
+ 			fOvlFrames = 0; fDsiUnd = 0; memset(fOvlBits, 0, sizeof(fOvlBits));
+ 		}
+@@ -1615,6 +1615,8 @@
+ 		}
+ 	}
+ 
++	bool ck_have = false; uintptr_t ck_src = 0, ck_dst = 0; uint32_t ck_spitch = 0; int32_t ck_w = 0, ck_h = 0; SweetSurface *ck_s = NULL;
++	uint8_t ck_pre[32][3][64];
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -1702,23 +1704,34 @@
+ 				    (size_t)w * 4);
+ 			}
+ 		}
+-		if (src != 0 && bpe == 4 && dx == 0 && w >= 600 && h >= 64) {
+-			/* 0192: look again at the source after the copy. A difference means the source changed (GPU still writing / stale CPU cache). */
+-			nord2_gpu_surface_cpu_acquire(s);
+-			uintptr_t dbase = (fCopyDst ? fCopyDst : fPixels);
+-			fChk[5]++;
+-			for (int32_t k = 0; k < 64; k++) {
+-				int32_t y = (int32_t)((int64_t)(h - 1) * k / 63);
+-				const uint8_t *sp = (const uint8_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4);
+-				const uint8_t *dp = (const uint8_t *)(dbase + (uint64_t)(dy + y) * fRowBytes);
+-				fChk[0]++;
+-				if (memcmp(sp, dp, 64) != 0) { fChk[y < h / 2 ? 1 : 2]++; }
+-				if (memcmp(sp + 2048, dp + 2048, 64) != 0) { fChk[3]++; }
+-				if (memcmp(sp + (size_t)(w - 16) * 4, dp + (size_t)(w - 16) * 4, 64) != 0) { fChk[4]++; }
++		if (src != 0 && bpe == 4 && dx == 0 && w >= 600 && h >= 64 && !ownRef) {
++			/* 0193: remember the newest full-width layer; it is checked once after the loop (lower layers are legitimately overwritten) */
++			ck_have = true; ck_src = src + s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4; ck_spitch = s->bytesPerRow;
++			ck_dst = (fCopyDst ? fCopyDst : fPixels) + (uint64_t)dy * fRowBytes; ck_w = w; ck_h = h; ck_s = s;
++			for (int32_t k = 0; k < 32; k++) {
++				int32_t y = (int32_t)((int64_t)(h - 1) * k / 31);
++				const uint8_t *sp = (const uint8_t *)(ck_src + (uint64_t)y * ck_spitch);
++				memcpy(ck_pre[k][0], sp, 64); memcpy(ck_pre[k][1], sp + 2048, 64); memcpy(ck_pre[k][2], sp + (size_t)(w - 16) * 4, 64);
+ 			}
+ 		}
+ 		if (ownRef) s->release();
+ 	}
++	if (ck_have) {
++		/* 0193: top layer only: chk[0]=rows, chk[1..4]=source changed during copy (left upper/lower, centre, right), chk[6]=dst!=source left upper/lower, chk[7]=dst!=source centre/right */
++		nord2_gpu_surface_cpu_acquire(ck_s);
++		fChk[5]++;
++		for (int32_t k = 0; k < 32; k++) {
++			int32_t y = (int32_t)((int64_t)(ck_h - 1) * k / 31);
++			const uint8_t *sp = (const uint8_t *)(ck_src + (uint64_t)y * ck_spitch);
++			const uint8_t *dp = (const uint8_t *)(ck_dst + (uint64_t)y * fRowBytes);
++			fChk[0]++;
++			if (memcmp(sp, ck_pre[k][0], 64) != 0) { fChk[y < ck_h / 2 ? 1 : 2]++; }
++			if (memcmp(sp + 2048, ck_pre[k][1], 64) != 0) { fChk[3]++; }
++			if (memcmp(sp + (size_t)(ck_w - 16) * 4, ck_pre[k][2], 64) != 0) { fChk[4]++; }
++			if (memcmp(sp, dp, 64) != 0) { fChk[6]++; }
++			if (memcmp(sp + 2048, dp + 2048, 64) != 0 || memcmp(sp + (size_t)(ck_w - 16) * 4, dp + (size_t)(ck_w - 16) * 4, 64) != 0) { fChk[7]++; }
++		}
++	}
+ 	if (diag_present && diag_present == __atomic_load_n(&fDiag.begin_failed, __ATOMIC_RELAXED) + 1) {
+ 		reportDiagnostics("first-present");
+ 	}

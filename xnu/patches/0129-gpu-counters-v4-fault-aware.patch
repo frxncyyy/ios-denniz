@@ -1,0 +1,75 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp	2026-10-29 22:45:39.838784896 +0100
++++ b/iokit/Kernel/arm/Nord2GPU.cpp	2026-10-29 22:58:26.314307134 +0100
+@@ -167,7 +167,7 @@
+         int pfMode = 0;
+         bool pfFailed = false;
+         struct nord2_gpu_mmu pfmmu = {};
+-        IOBufferMemoryDescriptor *pfMd = NULL;
++        IOBufferMemoryDescriptor *pfMd = NULL, *pfXmd[3] = {};      /* 0129: 4 x 16 KiB of dump space, the GPU may write more than the 14.8 KiB seen so far */
+         uint64_t pfPa = 0;
+         uint8_t *pfCpu = NULL;
+         unsigned pfBytes = 0;
+@@ -832,9 +832,20 @@
+                 bool ok = nord2_gpu_mmu_init(&pfmmu, &mo, this, 4);
+                 for (unsigned i = 0; ok && i < pfBytes / 4096; i++)
+                         ok = nord2_gpu_mmu_map(&pfmmu, N2PF_VA + i * 4096ull, pfPa + i * 4096ull, 4096, NORD2_GPU_MEMATTR_NON_CACHEABLE, true, false);
++                for (unsigned k = 0; ok && k < 3; k++) {
++                        pfXmd[k] = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut, 16384, 16384);
++                        IOByteCount xl = 0;
++                        uint64_t xpa = pfXmd[k] ? pfXmd[k]->getPhysicalSegment(0, &xl, kIOMemoryMapperNone) : 0;
++                        if (!pfXmd[k] || !valid_ram(xpa) || xl < 16384) { ok = false; break; }
++                        bzero(pfXmd[k]->getBytesNoCopy(), 16384);
++                        sync_page(NULL, xpa, pfXmd[k]->getBytesNoCopy(), 16384, true);
++                        for (unsigned i = 0; ok && i < 4; i++)
++                                ok = nord2_gpu_mmu_map(&pfmmu, N2PF_VA + (k + 1) * 16384ull + i * 4096ull, xpa + i * 4096ull, 4096, NORD2_GPU_MEMATTR_NON_CACHEABLE, true, false);
++                }
+                 if (!ok) { IOLog("NORD2 PRFCNT: mapping failed\n"); pfFailed = true; return; }
+         }
+         if (!pfArmed || read_bank(&gpu, 0x68) != 1u) {      /* first use, after a power cycle or after a failed sample: program AS0 and the counters, the window is only armed */
++                write_bank(&gpu, N2HW_MMU_IRQ_CLEAR, 0x00010001u);         /* a stale AS0 fault would keep the address space blocked */
+                 if (n2hw_as_configure(&hw, 0, pfmmu.root_pa) != N2HW_OK) { IOLog("NORD2 PRFCNT: AS0 configure failed\n"); pfFailed = true; return; }
+                 write_bank(&gpu, 0x60, (uint32_t)N2PF_VA); write_bank(&gpu, 0x64, (uint32_t)(N2PF_VA >> 32));
+                 write_bank(&gpu, 0x6c, 0xffffffffu); write_bank(&gpu, 0x70, 0xffffffffu);
+@@ -846,6 +857,7 @@
+                                        read_bank(&gpu, N2HW_SHADER_PRESENT_HI), read_bank(&gpu, N2HW_SHADER_PRESENT_LO));
+                 return;
+         }
++        if (read_bank(&gpu, N2HW_MMU_IRQ_RAWSTAT) & 1u) { IOLog("NORD2 PRFCNT: stale AS0 fault before the sample: status %08x address %08x%08x extra %08x\n", read_bank(&gpu, 0x241c), read_bank(&gpu, 0x2424), read_bank(&gpu, 0x2420), read_bank(&gpu, 0x2438)); write_bank(&gpu, N2HW_MMU_IRQ_CLEAR, 0x00010001u); pfArmed = false; return; }
+         bzero(pfCpu, pfBytes);
+         sync_page(NULL, pfPa, pfCpu, pfBytes, true);
+         write_bank(&gpu, 0x24, 1u << 16);
+@@ -857,11 +869,12 @@
+         uint64_t t1 = now_us(NULL);
+         if (!(read_bank(&gpu, 0x20) & (1u << 16))) {
+                 pfFails++;
+-                IOLog("NORD2 PRFCNT: sample incomplete after %llu us (busy slots mask %u, now %u), job_irq_raw=%08x js_state=%08x js0_status=%08x js1_status=%08x gpu_irq_raw=%08x mmu_irq_raw=%08x gpu_faultstatus=%08x as0_status=%08x; counters off (failure %u)\n",
+-                      t1 - t0, busy, (n2hw_js_idle(&hw, 0) ? 0u : 1u) | (n2hw_js_idle(&hw, 1) ? 0u : 2u), read_bank(&gpu, N2HW_JOB_IRQ_RAWSTAT), read_bank(&gpu, 0x1010),
+-                      read_bank(&gpu, 0x1824), read_bank(&gpu, 0x18a4), read_bank(&gpu, 0x20), read_bank(&gpu, N2HW_MMU_IRQ_RAWSTAT), read_bank(&gpu, N2HW_GPU_FAULTSTATUS),
+-                      read_bank(&gpu, 0x2428), pfFails);
++                IOLog("NORD2 PRFCNT: incomplete after %llu us busy=%u/%u fail=%u\n", t1 - t0, busy, (n2hw_js_idle(&hw, 0) ? 0u : 1u) | (n2hw_js_idle(&hw, 1) ? 0u : 2u), pfFails);
++                IOLog("NORD2 PRFCNT: job_irq=%08x js_state=%08x js0=%08x js1=%08x gpu_irq=%08x mmu_irq=%08x gpu_fault=%08x\n", read_bank(&gpu, N2HW_JOB_IRQ_RAWSTAT), read_bank(&gpu, 0x1010),
++                      read_bank(&gpu, 0x1824), read_bank(&gpu, 0x18a4), read_bank(&gpu, 0x20), read_bank(&gpu, N2HW_MMU_IRQ_RAWSTAT), read_bank(&gpu, N2HW_GPU_FAULTSTATUS));
++                IOLog("NORD2 PRFCNT: AS0 fault status %08x address %08x%08x extra %08x\n", read_bank(&gpu, 0x241c), read_bank(&gpu, 0x2424), read_bank(&gpu, 0x2420), read_bank(&gpu, 0x2438));
+                 write_bank(&gpu, 0x68, 0u);                         /* releases the job manager */
++                write_bank(&gpu, N2HW_MMU_IRQ_CLEAR, 0x00010001u);
+                 pfArmed = false;
+                 if (pfFails >= 8) pfFailed = true;
+                 return;
+@@ -879,11 +892,12 @@
+                 cores++;
+                 for (unsigned i = 0; i < 64; i++) sh[i] += w[(N2PF_SHADER_BASE + c) * 64 + i];
+         }
+-        IOLog("NORD2 PRFCNT: win_us=%llu took_us=%llu busy=%u cores=%u | JM gpu=%llu js0=%llu js1=%llu | TIL act=%llu | L2 look=%llu rlook=%llu wlook=%llu rbeat=%llu wbeat=%llu arstall=%llu wstall=%llu "
+-              "lat0_127=%llu lat128_191=%llu lat192_255=%llu lat256_319=%llu lat320_383=%llu | SC frag=%llu exec=%llu fpk=%llu quads=%llu warps=%llu ptiles=%llu fma=%llu "
+-              "texflit=%llu texdfch=%llu texstall=%llu texstarve=%llu rdtex=%llu wrtib=%llu rdftc=%llu\n",
+-              winUs, t1 - t0, busy, cores, jm[6], jm[10], jm[18], ti[4], ms[25], ms[26], ms[27], ms[32], ms[47], ms[33], ms[48], ms[37], ms[38], ms[39], ms[40], ms[41],
+-              sh[4], sh[26], sh[7], sh[11], sh[9], sh[18], sh[27], sh[35], sh[36], sh[37], sh[38], sh[58], sh[62], sh[54]);
++        /* Short lines only: the console cuts long lines and interleaves them with other output. */
++        IOLog("NORD2 PRFCNT A win_us=%llu took_us=%llu busy=%u cores=%u gpu=%llu js0=%llu js1=%llu til=%llu\n", winUs, t1 - t0, busy, cores, jm[6], jm[10], jm[18], ti[4]);
++        IOLog("NORD2 PRFCNT B l2look=%llu rlook=%llu wlook=%llu rbeat=%llu wbeat=%llu arstall=%llu wstall=%llu\n", ms[25], ms[26], ms[27], ms[32], ms[47], ms[33], ms[48]);
++        IOLog("NORD2 PRFCNT C lat0_127=%llu lat128_191=%llu lat192_255=%llu lat256_319=%llu lat320_383=%llu\n", ms[37], ms[38], ms[39], ms[40], ms[41]);
++        IOLog("NORD2 PRFCNT D frag=%llu exec=%llu fpk=%llu quads=%llu warps=%llu ptiles=%llu fma=%llu\n", sh[4], sh[26], sh[7], sh[11], sh[9], sh[18], sh[27]);
++        IOLog("NORD2 PRFCNT E texflit=%llu texdfch=%llu texstall=%llu texstarve=%llu rdtex=%llu wrtib=%llu rdftc=%llu\n", sh[35], sh[36], sh[37], sh[38], sh[58], sh[62], sh[54]);
+ }
+ void Nord2GPU::budgetReject(const char *what, unsigned c, uint64_t request, uint64_t limit) {
+         uint64_t t = now_ms(NULL);

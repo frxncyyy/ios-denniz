@@ -1,0 +1,170 @@
+--- a/bsd/dev/nord2_gpu_transport.h
++++ b/bsd/dev/nord2_gpu_transport.h
+@@ -92,20 +92,30 @@
+ #endif
+ 
+ 
+-/* Private (driver-allocated) backing is capped per client at 64 MiB.  Pages
+- * imported from an IOSurface are owned and already wired by IOSurface; they
+- * are charged to a separate import budget, never to the private cap.  Both
+- * budgets are subsets of the context's hard wired_limit (256 MiB), which
+- * must stay >= NORD2_GPU_PRIVATE_LIMIT + NORD2_GPU_IMPORT_LIMIT. */
+-#define NORD2_GPU_PRIVATE_LIMIT (64ull << 20)
+-#define NORD2_GPU_IMPORT_LIMIT  (128ull << 20)
++/* Private (driver-allocated) backing is capped per client.  Pages imported
++ * from an IOSurface are owned and already wired by IOSurface; they are charged
++ * to a separate import budget, never to the private cap.  Per-client hard
++ * context limit = private ceiling + import limit.
++ *
++ * The kernel only manages ~992 MiB of RAM on the Nord 2 window, so the default
++ * private cap (160 MiB) is deliberately below the boot-arg ceiling (256 MiB),
++ * and a device-wide private budget bounds the sum over all clients.  Both
++ * defaults can be changed without a rebuild: boot-args nord2_gpu_priv_mb
++ * (per client, 16..256) and nord2_gpu_glob_mb (all clients, 16..512). */
++#define NORD2_GPU_PRIVATE_LIMIT  (160ull << 20)   /* default, per client */
++#define NORD2_GPU_PRIVATE_MAX    (256ull << 20)   /* boot-arg ceiling */
++#define NORD2_GPU_GLOBAL_PRIVATE_LIMIT (256ull << 20) /* default, all clients */
++#define NORD2_GPU_GLOBAL_PRIVATE_MAX   (512ull << 20)
++#define NORD2_GPU_IMPORT_LIMIT   (128ull << 20)
++#define NORD2_GPU_CONTEXT_LIMIT  (NORD2_GPU_PRIVATE_MAX + NORD2_GPU_IMPORT_LIMIT) /* 384 MiB */
+ 
+ /* All backing is accounted in XNU's 16 KiB allocation units.  `wired` is the
+  * context's PRIVATE usage only (total wired minus imported). */
+-static inline bool nord2_gpu_allocation_size(uint64_t requested,
+-                                             uint64_t wired, uint64_t *size)
++static inline bool nord2_gpu_allocation_size_limit(uint64_t requested,
++                                                   uint64_t wired,
++                                                   uint64_t limit,
++                                                   uint64_t *size)
+ {
+-        const uint64_t limit = NORD2_GPU_PRIVATE_LIMIT;
+         if (!requested || requested > limit || wired > limit || !size)
+                 return false;
+         uint64_t rounded = (requested + 16383u) & ~16383ull;
+@@ -115,6 +125,35 @@
+         return true;
+ }
+ 
++static inline bool nord2_gpu_allocation_size(uint64_t requested,
++                                             uint64_t wired, uint64_t *size)
++{
++        return nord2_gpu_allocation_size_limit(requested, wired,
++                        NORD2_GPU_PRIVATE_LIMIT, size);
++}
++
++/* Clamp a boot-arg value given in MiB; 0/absent keeps the default. */
++static inline uint64_t nord2_gpu_budget_mib(uint64_t mib, uint64_t lo_mib,
++                                            uint64_t hi_mib, uint64_t dflt)
++{
++        if (!mib)
++                return dflt;
++        if (mib < lo_mib)
++                mib = lo_mib;
++        if (mib > hi_mib)
++                mib = hi_mib;
++        return mib << 20;
++}
++
++/* Device-wide check: the request (already rounded) plus every client's private
++ * bytes must stay within the global private budget. */
++static inline bool nord2_gpu_global_private_ok(uint64_t total_private,
++                                               uint64_t rounded,
++                                               uint64_t limit)
++{
++        return total_private <= limit && rounded <= limit - total_private;
++}
++
+ /* Imported surface pages: 4 KiB granularity (surface offset/length are page
+  * aligned), bounded by NORD2_GPU_IMPORT_LIMIT of already-imported bytes. */
+ static inline bool nord2_gpu_import_size(uint64_t mapped, uint64_t imported,
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -21,6 +21,8 @@
+ extern "C" {
+ extern unsigned long gPhysBase, gPhysSize;
+ extern int PE_parse_boot_argn(const char *, void *, int);
++extern int proc_selfpid(void);
++extern void proc_selfname(char *, int);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ #include "../../../bsd/dev/nord2_gpu_board.h"
+ #include "../../../bsd/dev/nord2_gpu_core.h"
+@@ -111,6 +113,10 @@
+         IOLock *lock = NULL;
+         struct n2c_core *core = NULL;
+         bool ready = false, stopping = false;
++        uint64_t privateLimit = NORD2_GPU_PRIVATE_LIMIT, globalLimit = NORD2_GPU_GLOBAL_PRIVATE_LIMIT;
++        uint64_t lastBudgetLog = 0; unsigned budgetSuppressed = 0;
++        uint64_t privateTotal();
++        void budgetReject(const char *, unsigned, uint64_t, uint64_t);
+         bool start(IOService *) APPLE_KEXT_OVERRIDE;
+         void stop(IOService *) APPLE_KEXT_OVERRIDE;
+         void free() APPLE_KEXT_OVERRIDE;
+@@ -299,6 +305,12 @@
+         if (!IOAcceleratorES::start(provider)) return false;
+         lock = IOLockAlloc(); if (!lock) return false;
+         int opt = 0; PE_parse_boot_argn("nord2_gpu", &opt, sizeof(opt)); enabled = opt == 1;
++        int mib = 0; PE_parse_boot_argn("nord2_gpu_priv_mb", &mib, sizeof(mib));
++        privateLimit = nord2_gpu_budget_mib(mib > 0 ? (uint64_t)mib : 0, 16, NORD2_GPU_PRIVATE_MAX >> 20, NORD2_GPU_PRIVATE_LIMIT);
++        mib = 0; PE_parse_boot_argn("nord2_gpu_glob_mb", &mib, sizeof(mib));
++        globalLimit = nord2_gpu_budget_mib(mib > 0 ? (uint64_t)mib : 0, 16, NORD2_GPU_GLOBAL_PRIVATE_MAX >> 20, NORD2_GPU_GLOBAL_PRIVATE_LIMIT);
++        IOLog("NORD2 GPU: budgets private=%llu MiB/client global-private=%llu MiB import=%llu MiB/client ctx-limit=%llu MiB ram=%lu MiB\n",
++              privateLimit >> 20, globalLimit >> 20, (uint64_t)NORD2_GPU_IMPORT_LIMIT >> 20, (uint64_t)NORD2_GPU_CONTEXT_LIMIT >> 20, gPhysSize >> 20);
+         setProperty(kIOUserClientClassKey, "Nord2GPUUserClient");
+         setProperty("Nord2TransportVersion", (uint64_t)NORD2_GPU_TRANSPORT_VERSION, 32);
+         setProperty("Nord2GPUState", "disabled");
+@@ -362,10 +374,34 @@
+         }
+         if (spm.p) { s->mfg_pwr_status = read_bank(&spm, 0x16c); s->mfg_pwr_status_2nd = read_bank(&spm, 0x170); }
+ }
++/* Private bytes of every live context (device-wide private budget). */
++uint64_t Nord2GPU::privateTotal() {
++        uint64_t total = 0;
++        for (unsigned i = 0; i < N2C_MAX_CTX; i++)
++                if (core->ctxs[i].state != N2C_CTX_FREE) total += core->ctxs[i].wired - core->ctxs[i].imported;
++        return total;
++}
++/* Rate-limited (1/s) diagnostic for budget rejections; counts what it skipped. */
++void Nord2GPU::budgetReject(const char *what, unsigned c, uint64_t request, uint64_t limit) {
++        uint64_t t = now_ms(NULL);
++        if (lastBudgetLog && t - lastBudgetLog < 1000) { budgetSuppressed++; return; }
++        char name[17] = {}; proc_selfname(name, sizeof(name));
++        IOLog("NORD2 GPU BUDGET: %s rejected pid=%d(%s) ctx=%u request=%llu KiB private=%llu KiB imported=%llu KiB all-private=%llu KiB limit=%llu KiB bos=%llu suppressed=%u\n",
++              what, proc_selfpid(), name, c, request >> 10, (core->ctxs[c].wired - core->ctxs[c].imported) >> 10,
++              core->ctxs[c].imported >> 10, privateTotal() >> 10, limit >> 10, core->stats.bos_live, budgetSuppressed);
++        lastBudgetLog = t; budgetSuppressed = 0;
++}
+ IOReturn Nord2GPU::mapBuffer(unsigned c, uint64_t bytes, uint32_t flags,
+                             uint32_t *h, uint64_t *va, uint64_t *actual) {
+         if (!ready || !core || c >= N2C_MAX_CTX) return kIOReturnNotReady;
+-        if ((flags & ~1u) || !nord2_gpu_allocation_size(bytes, core->ctxs[c].wired - core->ctxs[c].imported, &bytes)) return kIOReturnBadArgument;
++        uint64_t requested = bytes;
++        if ((flags & ~1u)) return kIOReturnBadArgument;
++        if (!nord2_gpu_allocation_size_limit(bytes, core->ctxs[c].wired - core->ctxs[c].imported, privateLimit, &bytes)) {
++                budgetReject("private", c, requested, privateLimit); return kIOReturnBadArgument;
++        }
++        if (!nord2_gpu_global_private_ok(privateTotal(), bytes, globalLimit)) {
++                budgetReject("global-private", c, requested, globalLimit); return kIOReturnNoMemory;
++        }
+         auto md = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared, (vm_size_t)bytes, 16384);
+         if (!md) return kIOReturnNoMemory;
+         BufferOwner *owner = (BufferOwner *)IOMallocZero(sizeof(*owner));
+@@ -399,7 +435,9 @@
+         if (!ready || !core || c >= N2C_MAX_CTX || !bytes || (offset & 4095)) return kIOReturnBadArgument;
+         uint64_t mapped = ((uint64_t)bytes + 4095) & ~4095ull, charged;
+         /* IOSurface owns these pages: charge the import budget, not the private cap. */
+-        if (!nord2_gpu_import_size(mapped, core->ctxs[c].imported, &charged)) return kIOReturnNoMemory;
++        if (!nord2_gpu_import_size(mapped, core->ctxs[c].imported, &charged)) {
++                budgetReject("import", c, mapped, NORD2_GPU_IMPORT_LIMIT); return kIOReturnNoMemory;
++        }
+         SweetSurface *s = sweet_surface_copy(id); if (!s) return kIOReturnNotFound;
+         uint64_t base = (uint64_t)s->offset + offset;
+         if (!s->memory || (base & 4095) || base > s->allocSize || mapped > s->allocSize - base ||
+@@ -538,7 +576,7 @@
+ IOReturn Nord2GPUUserClient::ensureContext() {
+         if(!gpu->ready || gpu->stopping)return kIOReturnNotReady;
+         if(context<N2C_MAX_CTX)return kIOReturnSuccess;
+-        return io_error(n2c_ctx_open(gpu->core,(uint64_t)(uintptr_t)task,256ull<<20,false,&context));
++        return io_error(n2c_ctx_open(gpu->core,(uint64_t)(uintptr_t)task,NORD2_GPU_CONTEXT_LIMIT,false,&context));
+ }
+ void Nord2GPUUserClient::closeContext() {
+         if(!lock)return;

@@ -1,0 +1,298 @@
+--- a/gpu/src/Nord2GPU.cpp
++++ b/gpu/src/Nord2GPU.cpp
+@@ -356,7 +356,7 @@
+ IOReturn Nord2GPU::mapBuffer(unsigned c, uint64_t bytes, uint32_t flags,
+                             uint32_t *h, uint64_t *va, uint64_t *actual) {
+         if (!ready || !core || c >= N2C_MAX_CTX) return kIOReturnNotReady;
+-        if ((flags & ~1u) || !nord2_gpu_allocation_size(bytes, core->ctxs[c].wired, &bytes)) return kIOReturnBadArgument;
++        if ((flags & ~1u) || !nord2_gpu_allocation_size(bytes, core->ctxs[c].wired - core->ctxs[c].imported, &bytes)) return kIOReturnBadArgument;
+         auto md = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared, (vm_size_t)bytes, 16384);
+         if (!md) return kIOReturnNoMemory;
+         BufferOwner *owner = (BufferOwner *)IOMallocZero(sizeof(*owner));
+@@ -387,9 +387,10 @@
+ }
+ IOReturn Nord2GPU::importSurface(unsigned c, uint32_t id, uint32_t offset, uint32_t bytes,
+                                 uint32_t *h, uint64_t *va, uint64_t *actual) {
+-        if (!ready || !bytes || (offset & 4095)) return kIOReturnBadArgument;
++        if (!ready || !core || c >= N2C_MAX_CTX || !bytes || (offset & 4095)) return kIOReturnBadArgument;
+         uint64_t mapped = ((uint64_t)bytes + 4095) & ~4095ull, charged;
+-        if (!nord2_gpu_allocation_size(mapped, core->ctxs[c].wired, &charged)) return kIOReturnNoMemory;
++        /* IOSurface owns these pages: charge the import budget, not the private cap. */
++        if (!nord2_gpu_import_size(mapped, core->ctxs[c].imported, &charged)) return kIOReturnNoMemory;
+         SweetSurface *s = sweet_surface_copy(id); if (!s) return kIOReturnNotFound;
+         uint64_t base = (uint64_t)s->offset + offset;
+         if (!s->memory || (base & 4095) || base > s->allocSize || mapped > s->allocSize - base ||
+--- a/shim/nord2-xnu/Nord2GPU.cpp
++++ b/shim/nord2-xnu/Nord2GPU.cpp
+@@ -356,7 +356,7 @@
+ IOReturn Nord2GPU::mapBuffer(unsigned c, uint64_t bytes, uint32_t flags,
+                             uint32_t *h, uint64_t *va, uint64_t *actual) {
+         if (!ready || !core || c >= N2C_MAX_CTX) return kIOReturnNotReady;
+-        if ((flags & ~1u) || !nord2_gpu_allocation_size(bytes, core->ctxs[c].wired, &bytes)) return kIOReturnBadArgument;
++        if ((flags & ~1u) || !nord2_gpu_allocation_size(bytes, core->ctxs[c].wired - core->ctxs[c].imported, &bytes)) return kIOReturnBadArgument;
+         auto md = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared, (vm_size_t)bytes, 16384);
+         if (!md) return kIOReturnNoMemory;
+         BufferOwner *owner = (BufferOwner *)IOMallocZero(sizeof(*owner));
+@@ -387,9 +387,10 @@
+ }
+ IOReturn Nord2GPU::importSurface(unsigned c, uint32_t id, uint32_t offset, uint32_t bytes,
+                                 uint32_t *h, uint64_t *va, uint64_t *actual) {
+-        if (!ready || !bytes || (offset & 4095)) return kIOReturnBadArgument;
++        if (!ready || !core || c >= N2C_MAX_CTX || !bytes || (offset & 4095)) return kIOReturnBadArgument;
+         uint64_t mapped = ((uint64_t)bytes + 4095) & ~4095ull, charged;
+-        if (!nord2_gpu_allocation_size(mapped, core->ctxs[c].wired, &charged)) return kIOReturnNoMemory;
++        /* IOSurface owns these pages: charge the import budget, not the private cap. */
++        if (!nord2_gpu_import_size(mapped, core->ctxs[c].imported, &charged)) return kIOReturnNoMemory;
+         SweetSurface *s = sweet_surface_copy(id); if (!s) return kIOReturnNotFound;
+         uint64_t base = (uint64_t)s->offset + offset;
+         if (!s->memory || (base & 4095) || base > s->allocSize || mapped > s->allocSize - base ||
+--- a/gpu/include/nord2_gpu_core.h
++++ b/gpu/include/nord2_gpu_core.h
+@@ -157,6 +157,7 @@
+         struct n2va va;
+         struct n2c_bo *bos[N2C_MAX_BOS];
+         uint64_t wired, wired_limit;
++        uint64_t imported;        /* subset of wired charged to N2C_BO_IMPORTED pages */
+         uint32_t jobs;            /* jobs not yet terminal */
+         uint32_t fault_status;
+         uint64_t fault_address;
+--- a/shim/nord2-xnu/nord2_gpu_core.h
++++ b/shim/nord2-xnu/nord2_gpu_core.h
+@@ -157,6 +157,7 @@
+         struct n2va va;
+         struct n2c_bo *bos[N2C_MAX_BOS];
+         uint64_t wired, wired_limit;
++        uint64_t imported;        /* subset of wired charged to N2C_BO_IMPORTED pages */
+         uint32_t jobs;            /* jobs not yet terminal */
+         uint32_t fault_status;
+         uint64_t fault_address;
+--- a/gpu/include/nord2_gpu_transport.h
++++ b/gpu/include/nord2_gpu_transport.h
+@@ -92,11 +92,20 @@
+ #endif
+ 
+ 
+-/* All backing is accounted in XNU's 16 KiB allocation units. */
++/* Private (driver-allocated) backing is capped per client at 64 MiB.  Pages
++ * imported from an IOSurface are owned and already wired by IOSurface; they
++ * are charged to a separate import budget, never to the private cap.  Both
++ * budgets are subsets of the context's hard wired_limit (256 MiB), which
++ * must stay >= NORD2_GPU_PRIVATE_LIMIT + NORD2_GPU_IMPORT_LIMIT. */
++#define NORD2_GPU_PRIVATE_LIMIT (64ull << 20)
++#define NORD2_GPU_IMPORT_LIMIT  (128ull << 20)
++
++/* All backing is accounted in XNU's 16 KiB allocation units.  `wired` is the
++ * context's PRIVATE usage only (total wired minus imported). */
+ static inline bool nord2_gpu_allocation_size(uint64_t requested,
+                                              uint64_t wired, uint64_t *size)
+ {
+-        const uint64_t limit = 64ull << 20;
++        const uint64_t limit = NORD2_GPU_PRIVATE_LIMIT;
+         if (!requested || requested > limit || wired > limit || !size)
+                 return false;
+         uint64_t rounded = (requested + 16383u) & ~16383ull;
+@@ -106,6 +115,19 @@
+         return true;
+ }
+ 
++/* Imported surface pages: 4 KiB granularity (surface offset/length are page
++ * aligned), bounded by NORD2_GPU_IMPORT_LIMIT of already-imported bytes. */
++static inline bool nord2_gpu_import_size(uint64_t mapped, uint64_t imported,
++                                         uint64_t *charged)
++{
++        const uint64_t limit = NORD2_GPU_IMPORT_LIMIT;
++        if (!mapped || (mapped & 4095u) || mapped > limit || imported > limit ||
++            !charged || mapped > limit - imported)
++                return false;
++        *charged = mapped;
++        return true;
++}
++
+ /* Validate counts AND pointers before the IOKit adapter touches any buffer.
+  * Descriptor-backed/in-band async requests are not part of ABI v1. */
+ static inline bool nord2_gpu_call_valid(uint32_t selector,
+--- a/shim/nord2-xnu/nord2_gpu_transport.h
++++ b/shim/nord2-xnu/nord2_gpu_transport.h
+@@ -92,11 +92,20 @@
+ #endif
+ 
+ 
+-/* All backing is accounted in XNU's 16 KiB allocation units. */
++/* Private (driver-allocated) backing is capped per client at 64 MiB.  Pages
++ * imported from an IOSurface are owned and already wired by IOSurface; they
++ * are charged to a separate import budget, never to the private cap.  Both
++ * budgets are subsets of the context's hard wired_limit (256 MiB), which
++ * must stay >= NORD2_GPU_PRIVATE_LIMIT + NORD2_GPU_IMPORT_LIMIT. */
++#define NORD2_GPU_PRIVATE_LIMIT (64ull << 20)
++#define NORD2_GPU_IMPORT_LIMIT  (128ull << 20)
++
++/* All backing is accounted in XNU's 16 KiB allocation units.  `wired` is the
++ * context's PRIVATE usage only (total wired minus imported). */
+ static inline bool nord2_gpu_allocation_size(uint64_t requested,
+                                              uint64_t wired, uint64_t *size)
+ {
+-        const uint64_t limit = 64ull << 20;
++        const uint64_t limit = NORD2_GPU_PRIVATE_LIMIT;
+         if (!requested || requested > limit || wired > limit || !size)
+                 return false;
+         uint64_t rounded = (requested + 16383u) & ~16383ull;
+@@ -106,6 +115,19 @@
+         return true;
+ }
+ 
++/* Imported surface pages: 4 KiB granularity (surface offset/length are page
++ * aligned), bounded by NORD2_GPU_IMPORT_LIMIT of already-imported bytes. */
++static inline bool nord2_gpu_import_size(uint64_t mapped, uint64_t imported,
++                                         uint64_t *charged)
++{
++        const uint64_t limit = NORD2_GPU_IMPORT_LIMIT;
++        if (!mapped || (mapped & 4095u) || mapped > limit || imported > limit ||
++            !charged || mapped > limit - imported)
++                return false;
++        *charged = mapped;
++        return true;
++}
++
+ /* Validate counts AND pointers before the IOKit adapter touches any buffer.
+  * Descriptor-backed/in-band async requests are not part of ABI v1. */
+ static inline bool nord2_gpu_call_valid(uint32_t selector,
+--- a/gpu/src/nord2_gpu_core.c
++++ b/gpu/src/nord2_gpu_core.c
+@@ -65,6 +65,8 @@
+         if (b->cookie && c->ops.free_owner)
+                 c->ops.free_owner(c->ctx, b->cookie);
+         x->wired = x->wired >= b->charged ? x->wired - b->charged : 0;
++        if (b->flags & N2C_BO_IMPORTED)
++                x->imported = x->imported >= b->charged ? x->imported - b->charged : 0;
+         c->stats.bos_live--;
+         c->stats.bytes_live -= b->size;
+         if (b->pages)
+@@ -565,6 +567,8 @@
+         c->stats.bos_live++;
+         c->stats.bytes_live += size;
+         x->wired += charged;
++        if (flags & N2C_BO_IMPORTED)
++                x->imported += charged;
+         b->refs = 1;
+         b->handle_live = true;
+         b->state = N2C_BO_MAPPED;
+--- a/shim/nord2-xnu/nord2_gpu_core.c
++++ b/shim/nord2-xnu/nord2_gpu_core.c
+@@ -65,6 +65,8 @@
+         if (b->cookie && c->ops.free_owner)
+                 c->ops.free_owner(c->ctx, b->cookie);
+         x->wired = x->wired >= b->charged ? x->wired - b->charged : 0;
++        if (b->flags & N2C_BO_IMPORTED)
++                x->imported = x->imported >= b->charged ? x->imported - b->charged : 0;
+         c->stats.bos_live--;
+         c->stats.bytes_live -= b->size;
+         if (b->pages)
+@@ -565,6 +567,8 @@
+         c->stats.bos_live++;
+         c->stats.bytes_live += size;
+         x->wired += charged;
++        if (flags & N2C_BO_IMPORTED)
++                x->imported += charged;
+         b->refs = 1;
+         b->handle_live = true;
+         b->state = N2C_BO_MAPPED;
+--- a/gpu/tests/nord2_core_test.c
++++ b/gpu/tests/nord2_core_test.c
+@@ -194,11 +194,24 @@
+  CHECK(n2c_ctx_close(&core,c)==N2C_E_BROKEN);CHECK(!m.owners);
+  CHECK(n2c_stop(&core)!=N2C_OK);model_destroy_after_power_cut();
+ }
++static void test_imported_accounting(void) {
++ init();unsigned ctx;CHECK(n2c_ctx_open(&core,124,256ull<<20,false,&ctx)==N2C_OK);
++ unsigned n=2744;struct n2c_page*p=calloc(n,sizeof(*p));void*owner=calloc(n,4096);CHECK(p&&owner);
++ for(unsigned i=0;i<n;i++){p[i].pa=0x90000000ull+4096ull*i;p[i].cpu=(char*)owner+4096ull*i;}
++ bool adopted=false;uint32_t h=0;uint64_t va=0;
++ CHECK(n2c_bo_map(&core,ctx,p,n,N2C_BO_GPU_READ|N2C_BO_GPU_WRITE|N2C_BO_IMPORTED,owner,n*4096ull,&h,&va,&adopted)==N2C_OK);
++ CHECK(adopted && core.ctxs[ctx].wired==n*4096ull && core.ctxs[ctx].imported==n*4096ull);
++ uint32_t h2;uint64_t va2;CHECK(map_pages(ctx,4,&h2,&va2)==N2C_OK); /* private pages: wired only */
++ CHECK(core.ctxs[ctx].imported==n*4096ull && core.ctxs[ctx].wired==n*4096ull+4*4096ull);
++ CHECK(n2c_bo_release(&core,ctx,h)==N2C_OK);CHECK(core.ctxs[ctx].imported==0 && core.ctxs[ctx].wired==4*4096ull);
++ CHECK(n2c_bo_release(&core,ctx,h2)==N2C_OK);CHECK(core.ctxs[ctx].wired==0);
++ free(p);CHECK(n2c_ctx_close(&core,ctx)==N2C_OK);
++}
+ int main(int argc,char**argv) {
+  if(argc>1 && !strcmp(argv[1],"quarantine")){test_quarantine_close();return 0;}
+  if(argc>1 && !strcmp(argv[1],"partial")){test_partial_map_failure();return 0;}
+  test_reuse();test_render_order();test_quarantine_close();test_partial_map_failure();test_close_running();test_open_failure();
+  test_allocation_failure_matrix();test_full_map_flush_failure();test_quarantine_overflow();test_wide_reclaim();
+- test_unlisted_buffer();test_failed_open_pins();test_stop_ack();test_fault_failed_reset_pins();
+- puts("core: 14 lifetime/ordering/failure scenarios incl. 1024 reuse cycles PASS (hardware model)");return 0;
++ test_unlisted_buffer();test_failed_open_pins();test_stop_ack();test_fault_failed_reset_pins();test_imported_accounting();
++ puts("core: 15 lifetime/ordering/failure scenarios incl. 1024 reuse cycles PASS (hardware model)");return 0;
+ }
+--- a/gpu/tests/nord2_transport_test.c
++++ b/gpu/tests/nord2_transport_test.c
+@@ -20,6 +20,18 @@
+         assert(!nord2_gpu_allocation_size(UINT64_MAX, 0, &size));
+         assert(!nord2_gpu_allocation_size(128, (64ull<<20)-4096, &size));
+         assert(nord2_gpu_allocation_size(128, (64ull<<20)-16384, &size));
++        /* Imported IOSurface pages use their own budget; three BackBoard display
++         * surfaces (11239424 B, 2744 pages) plus textures fit with margin. */
++        assert(nord2_gpu_import_size(11239424ull+1024, 0, &size) == false); /* unaligned */
++        assert(nord2_gpu_import_size(2744ull*4096, 0, &size) && size == 11239424ull);
++        assert(nord2_gpu_import_size(2744ull*4096, 9ull*2744*4096, &size));
++        assert(!nord2_gpu_import_size(2744ull*4096, 11ull*2744*4096, &size)); /* hard bound */
++        assert(!nord2_gpu_import_size(0, 0, &size));
++        assert(!nord2_gpu_import_size(NORD2_GPU_IMPORT_LIMIT + 4096, 0, &size));
++        assert(nord2_gpu_import_size(NORD2_GPU_IMPORT_LIMIT, 0, &size));
++        assert(!nord2_gpu_import_size(4096, NORD2_GPU_IMPORT_LIMIT, &size));
++        assert(!nord2_gpu_import_size(4096, UINT64_MAX, &size));
++        assert(NORD2_GPU_PRIVATE_LIMIT + NORD2_GPU_IMPORT_LIMIT <= (256ull<<20));
+         assert(nord2_gpu_call_valid(0,0,0,0,sizeof(status),0,0,0,&status));
+         assert(!nord2_gpu_call_valid(0,0,0,0,sizeof(status),0,0,0,0));
+         assert(!nord2_gpu_call_valid(0,0,0,0,sizeof(status)-1,0,0,0,&status));
+--- /dev/null
++++ b/gpu/tests/sweet_fb_pending_surfaces_test.c
+@@ -0,0 +1,47 @@
++/* Host test for the SwapEnd surface-retention bookkeeping (SweetFramebuffer). */
++#include "sweet_fb_pending_surfaces.h"
++#include <assert.h>
++#include <stdio.h>
++static int live[16], next_fail_id;
++static void *retain(uint32_t id) { if (id == (uint32_t)next_fail_id) return 0; live[id]++; return (void *)(uintptr_t)id; }
++static void release(void *o) { live[(uintptr_t)o]--; assert(live[(uintptr_t)o] >= 0); }
++static int total(void) { int t = 0; for (int i = 0; i < 16; i++) t += live[i]; return t; }
++int main(void) {
++	sweet_fb_swap_lifecycle l; sweet_fb_pending_surfaces in, old, taken;
++	uint32_t ids[4] = {1, 2, 3, 4};
++	sweet_fb_swap_lifecycle_init(&l);
++	/* mask limits what is retained; id 0 never retained */
++	sweet_fb_pending_surfaces_capture(&in, ids, 0x5, retain);
++	assert(live[1] == 1 && live[2] == 0 && live[3] == 1 && live[4] == 0);
++	assert(sweet_fb_swap_lifecycle_queue(&l, &in, &old) && !sweet_fb_pending_surfaces_any(&in));
++	assert(!sweet_fb_pending_surfaces_any(&old));
++	/* newer swap supersedes: old refs come back for release outside the lock */
++	uint32_t ids2[4] = {5, 0, 3, 0};
++	sweet_fb_pending_surfaces_capture(&in, ids2, 0xf, retain);
++	assert(sweet_fb_swap_lifecycle_queue(&l, &in, &old));
++	sweet_fb_pending_surfaces_release(&old, release);
++	assert(live[1] == 0 && live[3] == 1 && live[5] == 1 && total() == 2 + 0 + 0 - 0 + 0 && total() == 2);
++	/* retain failure (surface already gone) leaves NULL, no leak */
++	next_fail_id = 7; uint32_t ids3[4] = {7, 0, 0, 0};
++	sweet_fb_pending_surfaces_capture(&in, ids3, 1, retain);
++	assert(!sweet_fb_pending_surfaces_any(&in)); next_fail_id = -1;
++	/* present takes ownership; failed present requeues when nothing newer */
++	assert(sweet_fb_swap_lifecycle_take(&l, &taken) && !sweet_fb_pending_surfaces_any(&l.pending));
++	assert(sweet_fb_swap_lifecycle_requeue(&l, false, &taken) && !sweet_fb_pending_surfaces_any(&taken));
++	assert(total() == 2);
++	/* ...but a newer pending record wins; stale refs stay with the caller */
++	assert(sweet_fb_swap_lifecycle_take(&l, &taken));
++	assert(!sweet_fb_swap_lifecycle_requeue(&l, true, &taken) && sweet_fb_pending_surfaces_any(&taken));
++	sweet_fb_pending_surfaces_release(&taken, release); assert(total() == 0);
++	/* stop releases queued refs; later swaps are refused without leaking */
++	sweet_fb_pending_surfaces_capture(&in, ids, 0xf, retain);
++	assert(sweet_fb_swap_lifecycle_queue(&l, &in, &old)); assert(total() == 4);
++	sweet_fb_swap_lifecycle_stop(&l, &taken); sweet_fb_pending_surfaces_release(&taken, release);
++	assert(total() == 0);
++	sweet_fb_pending_surfaces_capture(&in, ids, 0xf, retain);
++	assert(!sweet_fb_swap_lifecycle_queue(&l, &in, &old)); sweet_fb_pending_surfaces_release(&old, release);
++	assert(total() == 0 && !sweet_fb_swap_lifecycle_take(&l, &taken));
++	assert(!sweet_fb_swap_lifecycle_requeue(&l, false, &taken));
++	puts("sweet_fb_pending_surfaces: lifecycle PASS");
++	return 0;
++}

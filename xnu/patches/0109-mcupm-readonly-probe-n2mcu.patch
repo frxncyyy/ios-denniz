@@ -1,0 +1,83 @@
+--- a/bsd/dev/nord2_cpufreq.c
++++ b/bsd/dev/nord2_cpufreq.c
+@@ -29,6 +29,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+ TUNABLE(int, nord2_cpufreq_arg, "n2cpu", 0);
++TUNABLE(int, nord2_mcu_arg, "n2mcu", 0);
+ 
+ extern unsigned nord2_cpu_mhz(int cpu);                                                /* nord2_sched.c (0099) */
+ extern int nord2_sched_mode;                                                            /* nord2_sched.c (0099): placement mode bits */
+@@ -142,6 +143,43 @@
+ 	}
+ }
+ 
++/*
++ * n2mcu=1: READ-ONLY look at the MCUPM (MCU power manager, the co-processor that owns CPU DVFS on this SoC; README-0107-design.md).
++ * Addresses are the live DT's `mediatek,mcupm` node (reg-names): control registers (shared by all five mailboxes) 0x10300074 clr, 0x10300078 recv,
++ * 0x10300150 send, 0x10300154 set; mailbox slot memory mbox0..4 = 0x1031fce0 + 0xa0*n; firmware SRAM base 0x10301000.  Only 32-bit loads, no
++ * store of any kind, nothing is sent.  Printed raw; interpretation is in the design note.  Risk: a block whose clock or power is off may stall
++ * the bus (no abort recovery in this kernel), which is why this has its own boot-arg and needs its own approval to run.
++ */
++static void
++n2mcu_probe(void)
++{
++	static const struct { uint64_t pa; uint32_t words; const char *what; } r[] = {
++		{ 0x10300074, 1, "mbox clr" }, { 0x10300078, 1, "mbox recv" }, { 0x10300150, 1, "mbox send" }, { 0x10300154, 1, "mbox set" },
++	};
++	volatile uint32_t *ctl = (volatile uint32_t *)ml_io_map(0x10300000, 0x1000);
++	volatile uint32_t *box = (volatile uint32_t *)ml_io_map(0x1031f000, 0x1000);
++	volatile uint32_t *sram = (volatile uint32_t *)ml_io_map(0x10301000, 0x1000);
++	if (ctl == NULL || box == NULL || sram == NULL) {
++		printf("NORD2 MCUPM probe: mapping failed\n");
++		return;
++	}
++	printf("NORD2 MCUPM probe begin (read-only)\n");
++	for (unsigned i = 0; i < sizeof(r) / sizeof(r[0]); i++) {
++		printf("NORD2 MCUPM reg %#llx %s = %08x\n", r[i].pa, r[i].what, ctl[(r[i].pa & 0xfff) / 4]);
++	}
++	for (unsigned n = 0; n < 5; n++) {
++		uint32_t base = 0xce0 + 0xa0 * n;                 /* offset in the page 0x1031f000: 0x1031fce0 + 0xa0*n */
++		for (unsigned w = 0; w < 0xa0 / 4; w += 4) {
++			printf("NORD2 MCUPM mbox%u +0x%02x: %08x %08x %08x %08x\n", n, w * 4, box[base / 4 + w], box[base / 4 + w + 1],
++			    box[base / 4 + w + 2], box[base / 4 + w + 3]);
++		}
++	}
++	for (unsigned w = 0; w < 64; w += 4) {                    /* first 256 bytes of the firmware SRAM */
++		printf("NORD2 MCUPM sram +0x%03x: %08x %08x %08x %08x\n", w * 4, sram[w], sram[w + 1], sram[w + 2], sram[w + 3]);
++	}
++	printf("NORD2 MCUPM probe end\n");
++}
++
+ __attribute__((noreturn)) static void
+ nord2_cpufreq_exit(void)
+ {
+@@ -163,6 +201,12 @@
+ 	assert_wait_timeout((event_t)&nord2_cpufreq_thread, THREAD_UNINT, N2CF_FIRST_S, NSEC_PER_SEC);
+ 	thread_block(THREAD_CONTINUE_NULL);
+ 
++	if (nord2_mcu_arg > 0) {
++		n2mcu_probe();
++	}
++	if (nord2_cpufreq_arg <= 0) {
++		nord2_cpufreq_exit();
++	}
+ 	n2cf_csram = (volatile uint32_t *)ml_io_map(N2CF_CSRAM_PA, N2CF_CSRAM_SIZE);
+ 	if (n2cf_csram == NULL) {
+ 		printf("NORD2 CPUFREQ: CSRAM unmapped\n");
+@@ -202,10 +246,13 @@
+ static void
+ nord2_cpufreq_init(void)
+ {
+-	if (nord2_cpufreq_arg <= 0) {
++	if (nord2_cpufreq_arg <= 0 && nord2_mcu_arg <= 0) {
+ 		return;
+ 	}
+-	printf("NORD2 CPUFREQ: n2cpu=%d (%s)\n", nord2_cpufreq_arg,
++	if (nord2_mcu_arg > 0) {
++		printf("NORD2 MCUPM: n2mcu=%d (read-only probe at boot+%us)\n", nord2_mcu_arg, N2CF_FIRST_S);
++	}
++	if (nord2_cpufreq_arg > 0) printf("NORD2 CPUFREQ: n2cpu=%d (%s)\n", nord2_cpufreq_arg,
+ 	    nord2_cpufreq_arg >= 500 ? "discover, then ramp verified big clusters" : "discovery only, nothing is written");
+ 	thread_t thread;
+ 	if (kernel_thread_start(nord2_cpufreq_thread, NULL, &thread) == KERN_SUCCESS) {

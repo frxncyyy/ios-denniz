@@ -1,0 +1,131 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -199,6 +199,10 @@
+ 	bool                fPrepArmed, fPrepCopying, fFireValid;
+ 	uint64_t            fFireTeUs, fTeSpanUs;
+ 	uint32_t            fTeN, fPhaseBin[5];
++	/* 0158 (diagnostic + safer TE start): underrun accounting per window, copy-overlap correlation, alternating concurrent-prepare mode, precise TE reference */
++	bool                fConcOn, fRefGood, fOvlNoClear;
++	uint32_t            fDsiOr, fOvlOr[2], fFramesN, fOverlapFrames, fOvlErrFrames, fOvlErrOverlap, fDsiUnderrun, fEdgeStarts;
++	uint64_t            fPrepStartUs, fPrepEndUs;
+ 	bool                fDbl, fPrepared, fTeObsSet;
+ 	uint8_t             fFront, fNextState;      /* fFront: panel buffer the overlay reads (0 = fPixels, 1 = fPixelsB); fNextState 0 none, 1 taken / waiting for the GPU, 2 copied */
+ 	uint32_t            fCad[5];
+@@ -403,6 +407,9 @@
+ #if defined(NORD2)
+ 	fDsi = (volatile uint32_t *)ml_io_map(SWEET_FB_DSI0, 0x1000);
+ 	fMutex = (volatile uint32_t *)ml_io_map(SWEET_FB_DISP_MUTEX, 0x1000);
++	fOvl[0] = (volatile uint32_t *)ml_io_map(SWEET_FB_OVL0_2L, 0x1000);
++	fOvl[1] = (volatile uint32_t *)ml_io_map(SWEET_FB_OVL1_2L, 0x1000);
++	fConcOn = true;
+ #endif
+ #if defined(NORD2)
+ 	{
+@@ -658,8 +665,10 @@
+ 		uintptr_t dst = fFront ? fPixels : fPixelsB;       /* the buffer the overlay is not reading */
+ 		fCopyDst = dst;
+ 		uint64_t t0 = mach_absolute_time();
++		fPrepStartUs = sweet_fb_abs_to_us(t0);
+ 		bool shown = presentCopy(fNextRec, (SweetSurface *const *)fNextSurfaces.object);
+ 		fPrepCopyUs = sweet_fb_abs_to_us(mach_absolute_time() - t0);
++		fPrepEndUs = sweet_fb_abs_to_us(mach_absolute_time());
+ 		fCopyDst = 0;
+ 		if (!shown) { fPrepCopying = false; dropNext(); return; }
+ 		noteDistinct(dst);
+@@ -855,7 +864,8 @@
+ 		uint64_t nowUs = sweet_fb_abs_to_us(mach_absolute_time());
+ 		uint64_t waited = nowUs - fb->fTeStartUs;
+ 		bool te = (fb->fDsi[SWEET_FB_DSI_INTSTA / 4] & SWEET_FB_DSI_TE_RDY) != 0;
+-		if (fb->fTeLastUs != 0 && fb->fTeLeadUs != 0 && nowUs - fb->fTeLastUs < 200000) {
++		bool leadUsed = false;
++		if (fb->fTeLastUs != 0 && fb->fTeLeadUs != 0 && fb->fRefGood && nowUs - fb->fTeLastUs < 3 * fb->fTePeriodUs) {
+ 			/* 0156: start fTeLeadUs before the TE after the last one seen (periodic), so the write is ahead of the scan from the first row */
+ 			uint64_t P = fb->fTePeriodUs;
+ 			uint64_t k = (nowUs - fb->fTeLastUs + fb->fTeLeadUs) / P + 1;
+@@ -863,21 +873,33 @@
+ 			if (fire > nowUs + 300) { sender->setTimeoutUS((uint32_t)(fire - nowUs - 200)); return; }
+ 			while (sweet_fb_abs_to_us(mach_absolute_time()) < fire) { IODelay(20); }
+ 			fb->fStats.te_lead_starts++;
+-			fb->fFireTeUs = fire + fb->fTeLeadUs; fb->fFireValid = true;
++			fb->fFireTeUs = fire + fb->fTeLeadUs; fb->fFireValid = true; leadUsed = true;
+ 			nowUs = sweet_fb_abs_to_us(mach_absolute_time());
+ 			te = true;
+ 			fb->fDsi[SWEET_FB_DSI_INTSTA / 4] = ~SWEET_FB_DSI_TE_RDY;      /* the next TE seen is the one this push is ahead of */
+ 		} else if (te) {
+ 			fb->fTeLastUs = nowUs;      /* edge mode: the TE was just seen */
++			fb->fRefGood = true;
++			fb->fEdgeStarts++;
+ 			fb->fDsi[SWEET_FB_DSI_INTSTA / 4] = ~SWEET_FB_DSI_TE_RDY;
+ 		}
+-		if (!te && waited < SWEET_FB_TE_WAIT_US) { sender->setTimeoutUS(200); return; }
++		if (!te && waited < SWEET_FB_TE_WAIT_US) { sender->setTimeoutUS(100); return; }
+ 		if (!te) { fb->fStats.te_miss++; fb->fTeOffUntilUs = nowUs + 1000000; }
+ 		fb->fStats.te_waits++; fb->fStats.te_wait_us += waited;
+ 		if (waited > fb->fStats.te_wait_max) { fb->fStats.te_wait_max = (uint32_t)waited; }
+ 		if (fb->xferStart()) {
+ 			fb->fXferStart = mach_absolute_time();
+ 			fb->fPState = 2;
++			if (leadUsed) {
++				/* 0158: the push is ahead of the TE: watch for it tightly (a few us) so the next prediction rests on a precise reference */
++				uint64_t s0 = sweet_fb_abs_to_us(mach_absolute_time()), tn = s0;
++				fb->fRefGood = false;
++				while (tn - s0 < fb->fTeLeadUs + 1500) {
++					if (fb->fDsi[SWEET_FB_DSI_INTSTA / 4] & SWEET_FB_DSI_TE_RDY) { fb->fTeObsUs = tn; fb->fTeObsSet = true; fb->fRefGood = true; break; }
++					IODelay(5);
++					tn = sweet_fb_abs_to_us(mach_absolute_time());
++				}
++			}
+ 			sender->setTimeoutUS(SWEET_FB_XFER_POLL_US);
+ 			return;
+ 		}
+@@ -892,12 +914,13 @@
+ 	if (fb->fPState == 2 && !fb->fTeObsSet && fb->fDsi != NULL && (fb->fDsi[SWEET_FB_DSI_INTSTA / 4] & SWEET_FB_DSI_TE_RDY)) {
+ 		fb->fTeObsUs = sweet_fb_abs_to_us(mach_absolute_time()) - SWEET_FB_XFER_POLL_US / 2;      /* first TE since the push started */
+ 		fb->fTeObsSet = true;
++		fb->fRefGood = false;      /* polled late: not a precise reference, the next push waits for the edge */
+ 	}
+ #endif
+ 	int st = sweet_fb_xfer_state(fb->xferDone(), elapsed);
+ 	if (st == SWEET_FB_XFER_WAIT) {
+ #if defined(NORD2)
+-		if (fb->fPState == 2 && fb->fDbl && fb->fPrepTimer != NULL && fb->fNextState == 0 && fb->fDirty && !fb->fPrepArmed) {
++		if (fb->fPState == 2 && fb->fDbl && fb->fPrepTimer != NULL && fb->fConcOn && fb->fNextState == 0 && fb->fDirty && !fb->fPrepArmed) {
+ 			fb->fPrepArmed = true;
+ 			fb->fPrepTimer->setTimeoutUS(1);
+ 		}
+@@ -1059,6 +1082,24 @@
+ 	uint64_t xfer = shown ? sweet_fb_abs_to_us(mach_absolute_time() - fXferStart) : 0;
+ #if defined(NORD2)
+ 	/* 0154: the presenter still owns the engine here (fPState != 0), the link is idle */
++	if (shown && !legacy && fDsi != NULL) {
++		/* 0158: did the link or the overlay report an underrun for this frame, and did the copy of the next one overlap it? */
++		uint32_t d = fDsi[SWEET_FB_DSI_INTSTA / 4];
++		fDsiOr |= d;
++		if (d & (1u << 12)) { fDsiUnderrun++; }
++		bool err = false;
++		for (unsigned i = 0; i < 2; i++) {
++			if (fOvl[i] == NULL || fOvlNoClear) { continue; }
++			uint32_t sta = fOvl[i][0x08 / 4];
++			fOvlOr[i] |= sta;
++			if (sta & ~3u) { err = true; fOvl[i][0x08 / 4] = ~sta; if (fOvl[i][0x08 / 4] & ~3u) { fOvlNoClear = true; } }
++		}
++		uint64_t xs = sweet_fb_abs_to_us(fXferStart), nu = sweet_fb_abs_to_us(mach_absolute_time());
++		bool ov = fPrepEndUs > xs && fPrepStartUs < nu;
++		fFramesN++;
++		if (ov) { fOverlapFrames++; }
++		if (err) { fOvlErrFrames++; if (ov) { fOvlErrOverlap++; } }
++	}
+ 	if (shown && !legacy) {
+ 		if (fTeObsSet) {
+ 			fTeObsSet = false;
+@@ -1145,6 +1186,10 @@
+ 		    fDbl ? 1u : 0u, fStats.dbl_preps, fStats.dbl_hits, fStats.te_lead_starts, fTePeriodUs, fTeN ? fTeSpanUs / fTeN : 0ULL,
+ 		    fPhaseBin[0], fPhaseBin[1], fPhaseBin[2], fPhaseBin[3], fPhaseBin[4]);
+ 		for (unsigned i = 0; i < 5; i++) { fPhaseBin[i] = 0; }
++		IOLog("NORD2 FB ERR: conc=%u frames=%u overlap_frames=%u dsi_or=%08x ovl0_or=%08x ovl1_or=%08x ovl_err_frames=%u ovl_err_with_overlap=%u dsi_underrun=%u edge_starts=%u noclear=%u\n", fConcOn ? 1u : 0u,
++		    fFramesN, fOverlapFrames, fDsiOr, fOvlOr[0], fOvlOr[1], fOvlErrFrames, fOvlErrOverlap, fDsiUnderrun, fEdgeStarts, fOvlNoClear ? 1u : 0u);
++		fFramesN = fOverlapFrames = fOvlErrFrames = fOvlErrOverlap = fDsiUnderrun = fEdgeStarts = 0; fDsiOr = 0; fOvlOr[0] = fOvlOr[1] = 0;
++		if (fDbl) { fConcOn = !fConcOn; }      /* the diagnostic build alternates the concurrent prepare every window */
+ 		for (unsigned i = 0; i < 5; i++) { fCad[i] = 0; }
+ 		fDistinct = fSame = 0; fDistinctGapMaxUs = 0; for (unsigned i = 0; i < 5; i++) { fGapBin[i] = 0; }
+ 		sweet_fb_stats_reset(&fStats, now_us);

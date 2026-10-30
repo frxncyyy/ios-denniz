@@ -1,0 +1,209 @@
+--- a/gpu/include/nord2_gpu_core.h
++++ b/gpu/include/nord2_gpu_core.h
+@@ -37,7 +37,13 @@
+ #endif
+ 
+ #define N2C_MAX_CTX 8u          /* AS0 kernel + AS1..AS7 clients */
+-#define N2C_MAX_BOS 256u        /* handles per context */
++/* Handles per context.  A handle is (serial << N2C_SLOT_BITS) | slot, 32 bits in the ABI (u32 handles[]), so the slot field takes
++ * N2C_SLOT_BITS of the serial: 0105 raised the context limit from 256 to 1024 slots (backboardd held all 256 and dropped commands) and
++ * the core-wide serial, which never repeats so a stale handle cannot alias, shrank from 24 to 22 bits (4194303 buffers per boot). */
++#define N2C_SLOT_BITS 10u
++#define N2C_MAX_BOS (1u << N2C_SLOT_BITS)
++#define N2C_SLOT_MASK (N2C_MAX_BOS - 1u)
++#define N2C_HANDLE_SERIAL_MAX (0xffffffffu >> N2C_SLOT_BITS)
+ #define N2C_MAX_JOBS 128u       /* records across the device */
+ #define N2C_CTX_JOBS 96u        /* in-flight (not yet reaped) jobs per context */
+ #define N2C_JOB_BOS 32u
+--- a/gpu/include/nord2_gpu_va.h
++++ b/gpu/include/nord2_gpu_va.h
+@@ -17,7 +17,10 @@
+ extern "C" {
+ #endif
+ 
+-#define N2VA_MAX_EXTENTS 256u
++/* Free extents.  Every live buffer can leave one free gap behind it (small buffers are 64 KiB aligned and the gap is not reusable for
++ * another 64 KiB-aligned buffer), so the list must hold more extents than a context has handles: 256 extents made the 257th small
++ * buffer fail with N2C_E_VA long before any other limit (0105; nord2_gpu_core.c asserts N2VA_MAX_EXTENTS > N2C_MAX_BOS). */
++#define N2VA_MAX_EXTENTS 1032u
+ #define N2VA_GRANULE 0x1000ull
+ 
+ struct n2va_extent {
+--- a/gpu/src/nord2_gpu_core.c
++++ b/gpu/src/nord2_gpu_core.c
+@@ -10,6 +10,7 @@
+ #define JOB_HEADER_BYTES 128u
+ #define SPAN_512G (1ull << 39)
+ #define MAX_BO_PAGES 65536u     /* 256 MiB in 4 KiB pages */
++_Static_assert(N2VA_MAX_EXTENTS > N2C_MAX_BOS, "a free gap can sit behind every buffer");
+ #define BO_GUARD 0x1000ull      /* unmapped page after every buffer */
+ #define JS_STATUS_BUS_FAULT 0x48u
+ 
+@@ -98,7 +99,7 @@
+ 
+ static struct n2c_bo *bo_at(struct n2c_ctx *x, uint32_t handle)
+ {
+-        unsigned slot = handle & 0xffu;
++        unsigned slot = handle & N2C_SLOT_MASK;
+         struct n2c_bo *b = x->bos[slot];
+         return (b && b->handle == handle && b->handle_live) ? b : NULL;
+ }
+@@ -136,7 +137,7 @@
+         if (b->pages)
+                 c->ops.free_host(c->ctx, b->pages,
+                                  b->nr_pages * sizeof(*b->pages));
+-        unsigned slot = b->handle & 0xffu;
++        unsigned slot = b->handle & N2C_SLOT_MASK;
+         if (x->bos[slot] == b)
+                 x->bos[slot] = NULL;
+         c->ops.free_host(c->ctx, b, sizeof(*b));
+@@ -614,7 +615,7 @@
+         }
+         if (charged < (uint64_t)nr_pages * NORD2_GPU_PAGE_SIZE)
+                 return N2C_E_ARGS;
+-        if (c->next_handle > 0xffffffu)
++        if (c->next_handle > N2C_HANDLE_SERIAL_MAX)
+                 return N2C_E_NO_HANDLE; /* never alias a stale handle */
+         if (charged > x->wired_limit || x->wired > x->wired_limit - charged)
+                 return N2C_E_QUOTA;
+@@ -653,7 +654,7 @@
+         b->charged = charged;
+         b->cookie = cookie;
+         *adopted_out = true;
+-        b->handle = (c->next_handle++ << 8) | slot;
++        b->handle = (c->next_handle++ << N2C_SLOT_BITS) | slot;
+         bool exec = (flags & N2C_BO_GPU_EXEC) != 0;
+         bool write = (flags & N2C_BO_GPU_WRITE) != 0;
+         unsigned mapped = 0;
+--- a/shim/nord2-xnu/nord2_gpu_core.h
++++ b/shim/nord2-xnu/nord2_gpu_core.h
+@@ -37,7 +37,13 @@
+ #endif
+ 
+ #define N2C_MAX_CTX 8u          /* AS0 kernel + AS1..AS7 clients */
+-#define N2C_MAX_BOS 256u        /* handles per context */
++/* Handles per context.  A handle is (serial << N2C_SLOT_BITS) | slot, 32 bits in the ABI (u32 handles[]), so the slot field takes
++ * N2C_SLOT_BITS of the serial: 0105 raised the context limit from 256 to 1024 slots (backboardd held all 256 and dropped commands) and
++ * the core-wide serial, which never repeats so a stale handle cannot alias, shrank from 24 to 22 bits (4194303 buffers per boot). */
++#define N2C_SLOT_BITS 10u
++#define N2C_MAX_BOS (1u << N2C_SLOT_BITS)
++#define N2C_SLOT_MASK (N2C_MAX_BOS - 1u)
++#define N2C_HANDLE_SERIAL_MAX (0xffffffffu >> N2C_SLOT_BITS)
+ #define N2C_MAX_JOBS 128u       /* records across the device */
+ #define N2C_CTX_JOBS 96u        /* in-flight (not yet reaped) jobs per context */
+ #define N2C_JOB_BOS 32u
+--- a/shim/nord2-xnu/nord2_gpu_va.h
++++ b/shim/nord2-xnu/nord2_gpu_va.h
+@@ -17,7 +17,10 @@
+ extern "C" {
+ #endif
+ 
+-#define N2VA_MAX_EXTENTS 256u
++/* Free extents.  Every live buffer can leave one free gap behind it (small buffers are 64 KiB aligned and the gap is not reusable for
++ * another 64 KiB-aligned buffer), so the list must hold more extents than a context has handles: 256 extents made the 257th small
++ * buffer fail with N2C_E_VA long before any other limit (0105; nord2_gpu_core.c asserts N2VA_MAX_EXTENTS > N2C_MAX_BOS). */
++#define N2VA_MAX_EXTENTS 1032u
+ #define N2VA_GRANULE 0x1000ull
+ 
+ struct n2va_extent {
+--- a/shim/nord2-xnu/nord2_gpu_core.c
++++ b/shim/nord2-xnu/nord2_gpu_core.c
+@@ -10,6 +10,7 @@
+ #define JOB_HEADER_BYTES 128u
+ #define SPAN_512G (1ull << 39)
+ #define MAX_BO_PAGES 65536u     /* 256 MiB in 4 KiB pages */
++_Static_assert(N2VA_MAX_EXTENTS > N2C_MAX_BOS, "a free gap can sit behind every buffer");
+ #define BO_GUARD 0x1000ull      /* unmapped page after every buffer */
+ #define JS_STATUS_BUS_FAULT 0x48u
+ 
+@@ -98,7 +99,7 @@
+ 
+ static struct n2c_bo *bo_at(struct n2c_ctx *x, uint32_t handle)
+ {
+-        unsigned slot = handle & 0xffu;
++        unsigned slot = handle & N2C_SLOT_MASK;
+         struct n2c_bo *b = x->bos[slot];
+         return (b && b->handle == handle && b->handle_live) ? b : NULL;
+ }
+@@ -136,7 +137,7 @@
+         if (b->pages)
+                 c->ops.free_host(c->ctx, b->pages,
+                                  b->nr_pages * sizeof(*b->pages));
+-        unsigned slot = b->handle & 0xffu;
++        unsigned slot = b->handle & N2C_SLOT_MASK;
+         if (x->bos[slot] == b)
+                 x->bos[slot] = NULL;
+         c->ops.free_host(c->ctx, b, sizeof(*b));
+@@ -614,7 +615,7 @@
+         }
+         if (charged < (uint64_t)nr_pages * NORD2_GPU_PAGE_SIZE)
+                 return N2C_E_ARGS;
+-        if (c->next_handle > 0xffffffu)
++        if (c->next_handle > N2C_HANDLE_SERIAL_MAX)
+                 return N2C_E_NO_HANDLE; /* never alias a stale handle */
+         if (charged > x->wired_limit || x->wired > x->wired_limit - charged)
+                 return N2C_E_QUOTA;
+@@ -653,7 +654,7 @@
+         b->charged = charged;
+         b->cookie = cookie;
+         *adopted_out = true;
+-        b->handle = (c->next_handle++ << 8) | slot;
++        b->handle = (c->next_handle++ << N2C_SLOT_BITS) | slot;
+         bool exec = (flags & N2C_BO_GPU_EXEC) != 0;
+         bool write = (flags & N2C_BO_GPU_WRITE) != 0;
+         unsigned mapped = 0;
+--- a/gpu/tests/nord2_core_test.c
++++ b/gpu/tests/nord2_core_test.c
+@@ -444,12 +444,50 @@
+  CHECK(n2c_ctx_close(&core,c)==N2C_OK);
+  init();CHECK(!n2c_set_track_level(&core,3) && n2c_set_track_level(&core,2));
+ }
++static void test_handle_limit_1024(void) {
++ /* 0105: backboardd held all 256 handles of its context and a new code BO failed, dropping the command.  The limit is 1024 now; the slot field
++  * of a handle is 10 bits and the core-wide serial 22 bits, a stale handle never aliases a live one. */
++ CHECK(N2C_MAX_BOS==1024 && N2C_SLOT_BITS==10 && N2C_SLOT_MASK==1023 && N2C_HANDLE_SERIAL_MAX==(1u<<22)-1);
++ CHECK(sizeof(((struct n2c_ctx*)0)->bos)/sizeof(void*)==1024);
++ init();unsigned a=context(),b=context();
++ static uint32_t h[N2C_MAX_BOS],hb[N2C_MAX_BOS];static uint64_t va[N2C_MAX_BOS],vb[N2C_MAX_BOS];
++ unsigned seen[N2C_MAX_BOS];memset(seen,0,sizeof(seen));
++ for(unsigned i=0;i<N2C_MAX_BOS;i++){CHECK(map_pages(a,1,&h[i],&va[i])==N2C_OK);seen[h[i]&N2C_SLOT_MASK]++;CHECK(n2c_bo_lookup(&core,a,h[i])!=NULL);}
++ for(unsigned i=0;i<N2C_MAX_BOS;i++){CHECK(seen[i]==1);if(i)CHECK(va[i]!=va[i-1]);}      /* every slot used exactly once, distinct VAs */
++ uint32_t hx;uint64_t vx;
++ CHECK(map_pages(a,1,&hx,&vx)==N2C_E_NO_HANDLE);                                          /* the 1025th: no handle (not a quota error) */
++ CHECK(core.stats.bos_live==N2C_MAX_BOS);
++ /* another context is independent and has its own 1024 */
++ for(unsigned i=0;i<N2C_MAX_BOS;i++)CHECK(map_pages(b,1,&hb[i],&vb[i])==N2C_OK);
++ CHECK(map_pages(b,1,&hx,&vx)==N2C_E_NO_HANDLE && core.stats.bos_live==2u*N2C_MAX_BOS);
++ CHECK(n2c_bo_lookup(&core,b,h[7])==NULL || h[7]==hb[7]);                                    /* a handle of one context is not a handle of the other */
++ CHECK(n2c_bo_lookup(&core,a,h[5]^(1u<<N2C_SLOT_BITS))==NULL);                                /* same slot, other serial: no alias */
++ CHECK(n2c_bo_lookup(&core,a,(h[5]&~N2C_SLOT_MASK)|((h[5]+1)&N2C_SLOT_MASK))==NULL);          /* other slot, same serial: no alias */
++ /* the high slots work for jobs: a full 32-handle list spread over the table */
++ uint32_t hs[32];uint64_t vs[32];for(unsigned i=0;i<32;i++){hs[i]=h[31*i+3];vs[i]=va[31*i+3];}
++ run_one(a,32,hs,vs,0xffffffffu,0);
++ /* free one in the middle: the slot is reused, the old handle stays dead */
++ uint32_t old=h[500];
++ CHECK(n2c_bo_release(&core,a,old)==N2C_OK && n2c_bo_lookup(&core,a,old)==NULL);
++ CHECK(map_pages(a,1,&hx,&vx)==N2C_OK && (hx&N2C_SLOT_MASK)==500 && hx!=old && n2c_bo_lookup(&core,a,old)==NULL && n2c_bo_lookup(&core,a,hx)!=NULL);
++ CHECK(map_pages(a,1,&hx,&vx)==N2C_E_NO_HANDLE);
++ /* the highest slot is addressable and releasable */
++ CHECK((h[N2C_MAX_BOS-1]&N2C_SLOT_MASK)==N2C_MAX_BOS-1 && n2c_bo_release(&core,a,h[N2C_MAX_BOS-1])==N2C_OK);
++ /* closing a full context frees everything it held */
++ CHECK(n2c_ctx_close(&core,a)==N2C_OK && core.stats.bos_live==N2C_MAX_BOS);
++ CHECK(n2c_ctx_close(&core,b)==N2C_OK && core.stats.bos_live==0);
++ /* the serial runs out cleanly, never wraps into a stale handle */
++ init();unsigned c=context();core.next_handle=N2C_HANDLE_SERIAL_MAX;
++ CHECK(map_pages(c,1,&hx,&vx)==N2C_OK && (hx>>N2C_SLOT_BITS)==N2C_HANDLE_SERIAL_MAX && hx>(hx&N2C_SLOT_MASK));
++ CHECK(map_pages(c,1,&hx,&vx)==N2C_E_NO_HANDLE);
++ CHECK(n2c_ctx_close(&core,c)==N2C_OK);
++}
+ int main(int argc,char**argv) {
+  if(argc>1 && !strcmp(argv[1],"quarantine")){test_quarantine_close();return 0;}
+  if(argc>1 && !strcmp(argv[1],"partial")){test_partial_map_failure();return 0;}
+  test_reuse();test_render_order();test_quarantine_close();test_partial_map_failure();test_close_running();test_open_failure();
+  test_allocation_failure_matrix();test_full_map_flush_failure();test_quarantine_overflow();test_wide_reclaim();
+  test_unlisted_buffer();test_failed_open_pins();test_stop_ack();test_fault_failed_reset_pins();test_imported_accounting();
+- test_scoped_cache_maintenance();test_full_list_is_not_trusted();test_context_limit_384();test_job_timing();test_async_chain();test_cache_tracking();
+- puts("core: 21 lifetime/ordering/failure scenarios incl. 1024 reuse cycles PASS (hardware model)");return 0;
++ test_scoped_cache_maintenance();test_full_list_is_not_trusted();test_context_limit_384();test_job_timing();test_async_chain();test_cache_tracking();test_handle_limit_1024();
++ puts("core: 22 lifetime/ordering/failure scenarios incl. 1024 reuse cycles PASS (hardware model)");return 0;
+ }

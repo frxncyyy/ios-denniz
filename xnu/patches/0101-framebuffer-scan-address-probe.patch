@@ -1,0 +1,414 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,7 @@
+ #include "SweetSurface.h"
+ #include "sweet_fb_pending_surfaces.h"
+ #include "sweet_fb_present.h"
++#include "sweet_fb_scan.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ 
+@@ -65,6 +66,12 @@
+ #define SWEET_FB_DSI_FRAME_DONE    (1u << 4)
+ #define SWEET_FB_DSI_BUSY          (1u << 31)
+ #define SWEET_FB_MUTEX_EN0         0x20u
++/* OVL 2L layer 0 of both pipes (osfmk/arm64/sweet_early.c nord2_display_overlay_init verified the same registers). */
++#define SWEET_FB_OVL0_2L           0x14001000UL
++#define SWEET_FB_OVL1_2L           0x14101000UL
++#define SWEET_FB_OVL_SIZE          0x38u
++#define SWEET_FB_OVL_PITCH         0x44u
++#define SWEET_FB_OVL_ADDR          0xf40u
+ #endif
+ 
+ enum {
+@@ -163,7 +170,7 @@
+ 	IOTimerEventSource *fPresentTimer;
+ 	uint8_t            *fWorkRec;            /* the swap being presented */
+ 	sweet_fb_pending_surfaces fWorkSurfaces;
+-	uint8_t             fPState;             /* 0 idle, 1 copy pending, 2 panel transfer in flight */
++	uint8_t             fPState;             /* 0 idle, 1 copy pending, 2 panel transfer in flight, 3 scan probe transfer, 4 scan probe hold */
+ 	uint32_t            fBusyTicks;
+ 	uint64_t            fNextTick, fPeriodAbs;
+ 	uint64_t            fCopyUs, fXferStart;
+@@ -175,6 +182,19 @@
+ 	void        presentDone(bool shown, bool timeout, bool legacy);
+ 	bool        xferStart(void);
+ 	bool        xferDone(void);
++	/* NORD2 scan-address probe (boot-arg n2scan, off by default; sweet_fb_scan.h).  Present thread only. */
++	int                 fScanState;          /* enum sweet_fb_scan_state */
++	uint32_t            fScanHoldMs, fPresents;
++	uint64_t            fFirstPresentMs, fScanXferUs;
++	volatile uint32_t  *fOvl[SWEET_FB_SCAN_PIPES];
++	uint32_t            fOvlPitchOld[SWEET_FB_SCAN_PIPES];
++	struct sweet_fb_scan_plan fScanPlan;
++	IOMemoryDescriptor *fScanMem;
++	IOMemoryMap        *fScanMap;
++	bool        scanBegin(IOTimerEventSource *sender);
++	void        scanPoll(IOTimerEventSource *sender);
++	void        scanStep(int event);
++	void        scanRestoreRegs(void);
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
+@@ -285,6 +305,24 @@
+ 	fDsi = (volatile uint32_t *)ml_io_map(SWEET_FB_DSI0, 0x1000);
+ 	fMutex = (volatile uint32_t *)ml_io_map(SWEET_FB_DISP_MUTEX, 0x1000);
+ #endif
++#if defined(NORD2)
++	{
++		uint32_t scan = 0;
++		if (PE_parse_boot_argn("n2scan", &scan, sizeof(scan)) && sweet_fb_scan_hold_ms(scan) != 0) {
++			fScanHoldMs = sweet_fb_scan_hold_ms(scan);
++			fOvl[0] = (volatile uint32_t *)ml_io_map(SWEET_FB_OVL0_2L, 0x1000);
++			fOvl[1] = (volatile uint32_t *)ml_io_map(SWEET_FB_OVL1_2L, 0x1000);
++			if (fOvl[0] != NULL && fOvl[1] != NULL &&
++			    sweet_fb_scan_plan_make(&fScanPlan, fPhys, fRowBytes, fWidth, fHeight, SWEET_FB_SCAN_PROBE_PITCH)) {
++				fScanState = SWEET_FB_SCAN_ARMED;
++				IOLog("NORD2 FB SCAN: probe armed, slot 0x%llx pitch %u hold %u ms (shows a test pattern once, then restores)\n",
++				    fScanPlan.slot_pa, fScanPlan.pitch, fScanHoldMs);
++			} else {
++				IOLog("NORD2 FB SCAN: probe refused (overlay mapping or slot outside the carve-out)\n");
++			}
++		}
++	}
++#endif
+ 	sweet_fb_stats_reset(&fStats, 0);
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 	IOLog("SWEET FB: panel present rate %u Hz (every %u vsyncs), present thread, %s transfer\n", hz, fFlushTicks,
+@@ -469,7 +507,20 @@
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	if (fb->fPState == 0) { return; }
+-	if (__atomic_load_n(&fb->fSwapLifecycle.stopped, __ATOMIC_ACQUIRE)) { fb->presentDone(false, false, false); return; }
++	if (__atomic_load_n(&fb->fSwapLifecycle.stopped, __ATOMIC_ACQUIRE)) {
++#if defined(NORD2)
++		if (fb->fPState >= 3) { fb->scanStep(SWEET_FB_SCAN_EV_STOP); }
++#endif
++		fb->presentDone(false, false, false);
++		return;
++	}
++#if defined(NORD2)
++	if (fb->fPState >= 3) { fb->scanPoll(sender); return; }
++	if (fb->fPState == 1 && sweet_fb_scan_due(fb->fScanState, fb->fNbReady, fb->fPresents,
++	    sweet_fb_abs_to_us(mach_absolute_time()) / 1000, fb->fFirstPresentMs)) {
++		if (fb->scanBegin(sender)) { return; }      /* probe frame in flight; otherwise present normally below */
++	}
++#endif
+ 	if (fb->fPState == 1) {
+ 		uint64_t t0 = mach_absolute_time();
+ 		bool shown = fb->presentCopy(fb->fWorkRec, (SweetSurface *const *)fb->fWorkSurfaces.object);
+@@ -525,6 +576,7 @@
+ 	/* Safe to release only after the layer copy and the panel transfer are done. */
+ 	sweet_fb_pending_surfaces_release(&surfaces, sweet_fb_release_surface);
+ 	if (!shown) { return; }
++	if (fPresents++ == 0) { fFirstPresentMs = sweet_fb_abs_to_us(mach_absolute_time()) / 1000; }
+ 	static unsigned logged;
+ 	if (logged < 8) {
+ 		logged++;
+@@ -542,6 +594,126 @@
+ 	}
+ }
+ 
++#if defined(NORD2)
++/* ---- scan-address probe (present thread; see sweet_fb_scan.h for why and for the safety model) ---- */
++void
++AppleCLCD::scanRestoreRegs(void)
++{
++	for (uint32_t i = 0; i < SWEET_FB_SCAN_PIPES; i++) {
++		if (fOvl[i] == NULL) { continue; }
++		fOvl[i][SWEET_FB_OVL_ADDR / 4] = sweet_fb_scan_base_addr(fPhys, fWidth, i);
++		fOvl[i][SWEET_FB_OVL_PITCH / 4] = sweet_fb_scan_pitch_reg(fOvl[i][SWEET_FB_OVL_PITCH / 4], fRowBytes);
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	IOLog("NORD2 FB SCAN: restored addr %08x/%08x pitch %08x/%08x (base %08x/%08x)\n",
++	    fOvl[0] ? fOvl[0][SWEET_FB_OVL_ADDR / 4] : 0, fOvl[1] ? fOvl[1][SWEET_FB_OVL_ADDR / 4] : 0,
++	    fOvl[0] ? fOvl[0][SWEET_FB_OVL_PITCH / 4] : 0, fOvl[1] ? fOvl[1][SWEET_FB_OVL_PITCH / 4] : 0,
++	    sweet_fb_scan_base_addr(fPhys, fWidth, 0), sweet_fb_scan_base_addr(fPhys, fWidth, 1));
++}
++
++void
++AppleCLCD::scanStep(int event)
++{
++	bool restore = false;
++	int next = sweet_fb_scan_next(fScanState, event, &restore);
++	if (restore) { scanRestoreRegs(); }
++	if (next != fScanState && !sweet_fb_scan_owns_panel(next)) {
++		OSSafeReleaseNULL(fScanMap);
++		OSSafeReleaseNULL(fScanMem);
++	}
++	fScanState = next;
++}
++
++bool
++AppleCLCD::scanBegin(IOTimerEventSource *sender)
++{
++	const char *why = NULL;
++	uint32_t want_size = (fHeight << 16) | (fWidth / SWEET_FB_SCAN_PIPES);
++	for (uint32_t i = 0; i < SWEET_FB_SCAN_PIPES && why == NULL; i++) {
++		volatile uint32_t *o = fOvl[i];
++		if (o[SWEET_FB_OVL_ADDR / 4] != sweet_fb_scan_base_addr(fPhys, fWidth, i)) { why = "ADDR not the panel buffer"; }
++		else if ((o[SWEET_FB_OVL_PITCH / 4] & 0xffffu) != fRowBytes) { why = "PITCH not the panel pitch"; }
++		else if (o[SWEET_FB_OVL_SIZE / 4] != want_size) { why = "SIZE not the half panel"; }
++		fOvlPitchOld[i] = o[SWEET_FB_OVL_PITCH / 4];
++	}
++	if (why == NULL && (fDsi[SWEET_FB_DSI_INTSTA / 4] & SWEET_FB_DSI_BUSY)) { why = "link busy"; }
++	if (why == NULL) {
++		fScanMem = IOMemoryDescriptor::withPhysicalAddress(fScanPlan.slot_pa, fScanPlan.bytes, kIODirectionInOut);
++		fScanMap = fScanMem != NULL ? fScanMem->map(kIOMapWriteCombineCache) : NULL;
++		if (fScanMap == NULL) { why = "slot not mappable"; }
++	}
++	if (why != NULL) {
++		IOLog("NORD2 FB SCAN: probe refused, %s (addr %08x/%08x pitch %08x/%08x size %08x/%08x)\n", why,
++		    fOvl[0][SWEET_FB_OVL_ADDR / 4], fOvl[1][SWEET_FB_OVL_ADDR / 4], fOvl[0][SWEET_FB_OVL_PITCH / 4],
++		    fOvl[1][SWEET_FB_OVL_PITCH / 4], fOvl[0][SWEET_FB_OVL_SIZE / 4], fOvl[1][SWEET_FB_OVL_SIZE / 4]);
++		/* Nothing was written to the overlay: no restore needed. */
++		fScanState = SWEET_FB_SCAN_FAILED;
++		OSSafeReleaseNULL(fScanMap);
++		OSSafeReleaseNULL(fScanMem);
++		return false;
++	}
++	uintptr_t base = (uintptr_t)fScanMap->getVirtualAddress();
++	for (uint32_t y = 0; y < fHeight; y++) {
++		volatile uint32_t *row = (volatile uint32_t *)(base + (uint64_t)y * fScanPlan.pitch);
++		for (uint32_t x = 0; x < fWidth; x++) { row[x] = sweet_fb_scan_pixel(x, y, fWidth, fHeight); }
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	bool ok = true;
++	for (uint32_t i = 0; i < SWEET_FB_SCAN_PIPES; i++) {
++		fOvl[i][SWEET_FB_OVL_ADDR / 4] = (uint32_t)fScanPlan.addr[i];
++		fOvl[i][SWEET_FB_OVL_PITCH / 4] = sweet_fb_scan_pitch_reg(fOvlPitchOld[i], fScanPlan.pitch);
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	uint32_t ra[2] = { fOvl[0][SWEET_FB_OVL_ADDR / 4], fOvl[1][SWEET_FB_OVL_ADDR / 4] };
++	uint32_t rp[2] = { fOvl[0][SWEET_FB_OVL_PITCH / 4], fOvl[1][SWEET_FB_OVL_PITCH / 4] };
++	for (uint32_t i = 0; i < SWEET_FB_SCAN_PIPES; i++) {
++		if (ra[i] != (uint32_t)fScanPlan.addr[i] || (rp[i] & 0xffffu) != fScanPlan.pitch) { ok = false; }
++	}
++	IOLog("NORD2 FB SCAN: wrote addr %08x/%08x pitch %u, readback addr %08x/%08x pitch %08x/%08x -> %s\n",
++	    (uint32_t)fScanPlan.addr[0], (uint32_t)fScanPlan.addr[1], fScanPlan.pitch, ra[0], ra[1], rp[0], rp[1],
++	    ok ? "registers took the values" : "READBACK MISMATCH");
++	if (ok && !xferStart()) { ok = false; IOLog("NORD2 FB SCAN: panel link busy, probe frame not sent\n"); }
++	if (!ok) {
++		scanStep(SWEET_FB_SCAN_EV_BEGIN_FAIL);      /* restores the base registers */
++		return false;
++	}
++	scanStep(SWEET_FB_SCAN_EV_BEGIN_OK);
++	fXferStart = mach_absolute_time();
++	fPState = 3;
++	sender->setTimeoutUS(SWEET_FB_XFER_POLL_US);
++	return true;
++}
++
++void
++AppleCLCD::scanPoll(IOTimerEventSource *sender)
++{
++	if (fPState == 3) {
++		uint64_t elapsed = sweet_fb_abs_to_us(mach_absolute_time() - fXferStart);
++		int st = sweet_fb_xfer_state(xferDone(), elapsed);
++		if (st == SWEET_FB_XFER_WAIT) { sender->setTimeoutUS(SWEET_FB_XFER_POLL_US); return; }
++		if (st == SWEET_FB_XFER_TIMEOUT) {
++			IOLog("NORD2 FB SCAN: probe transfer timed out after %llu us, restoring\n", elapsed);
++			scanStep(SWEET_FB_SCAN_EV_XFER_TIMEOUT);
++			fPState = 1;
++			sender->setTimeoutUS(1);
++			return;
++		}
++		fScanXferUs = elapsed;
++		scanStep(SWEET_FB_SCAN_EV_XFER_DONE);
++		fPState = 4;
++		IOLog("NORD2 FB SCAN: probe frame transferred in %llu us; pattern stays %u ms (white/yellow/cyan/green/magenta/red/blue/black bars, grey ramp, striped frame)\n",
++		    elapsed, fScanHoldMs);
++		sender->setTimeoutUS(fScanHoldMs * 1000u);
++		return;
++	}
++	/* fPState == 4: hold over.  Restore the panel buffer and present the pending frame the normal way. */
++	scanStep(SWEET_FB_SCAN_EV_HOLD_EXPIRED);
++	IOLog("NORD2 FB SCAN: probe finished (flip %s)\n", fScanState == SWEET_FB_SCAN_DONE ? "completed, judge the screen photo/video" : "aborted");
++	fPState = 1;
++	sender->setTimeoutUS(1);
++}
++#endif
++
+ void
+ AppleCLCD::addClient(IOMobileFramebufferUserClient *client)
+ {
+@@ -793,6 +965,9 @@
+ 		fPresentTimer->cancelTimeout();
+ 		fPresentTimer->disable();
+ 	}
++#if defined(NORD2)
++	if (sweet_fb_scan_owns_panel(fScanState)) { scanStep(SWEET_FB_SCAN_EV_STOP); }
++#endif
+ 	sweet_fb_pending_surfaces_release(&pending, sweet_fb_release_surface);
+ 	IOService::stop(provider);
+ }
+--- a/iokit/Kernel/arm/sweet_fb_scan.h
++++ b/iokit/Kernel/arm/sweet_fb_scan.h
+@@ -0,0 +1,167 @@
++#ifndef SWEET_FB_SCAN_H
++#define SWEET_FB_SCAN_H
++/*
++ * NORD2 scan-address probe, pure and host-testable (never touches IOKit or registers).
++ *
++ * Why: the panel is DSI command mode.  The overlay engines (OVL 2L layer 0 of both pipes) read the picture from DRAM only while
++ * a transfer runs (MUTEX_EN + DSI_START ... FRAME_DONE); between transfers nothing scans memory.  If the layer ADDR (and PITCH)
++ * registers can simply be re-pointed before a transfer, then
++ *   - a frame that is already in physically contiguous memory below 4 GiB (a GPU-rendered CoreAnimation surface) can be sent to the
++ *     panel with NO CPU copy (the copy is ~2.6 ms of CPU and 10 MB of write-combined traffic per present), and
++ *   - ownership of that surface ends at FRAME_DONE (no flip-completion tracking like a video-mode pipeline needs).
++ * Nothing proves today that the ADDR/PITCH writes take effect (the only OVL writes ever made are CON/SRC/RDMA of the removed
++ * warning layer).  The probe settles it on the device and costs nothing when the boot-arg is absent:
++ *   n2scan=<ms>  (1 = default 1500 ms hold, clamped 200..5000) once, after the UI is up, show a test pattern from a second buffer
++ *                in the framebuffer carve-out through ADDR+PITCH, then restore and continue normally.
++ *
++ * Layout facts (NOTES.md 2026-10-19 phase-1 dump; the driver re-checks them at run time before writing anything):
++ *   panel buffer  0x76e10000, pitch 4352, 1080x2400 BGRA; pipe 0 reads x 0..539, pipe 1 x 540..1079 at +2160 bytes
++ *   OVL0_2L 0x14001000 / OVL1_2L 0x14101000: CON +0x30 SIZE +0x38 PITCH +0x44 ADDR +0xf40 (layer 0)
++ *   LK's warning layer lived at 0x77806000 and is disabled before the polled transfer path starts
++ *   carve-out end 0x78c00000
++ */
++#include <stdbool.h>
++#include <stdint.h>
++
++#define SWEET_FB_SCAN_CARVE_END     0x78c00000ull
++#define SWEET_FB_SCAN_ALIGN         0x1000ull
++#define SWEET_FB_SCAN_PROBE_PITCH   4608u        /* != the LK pitch 4352: ADDR and PITCH are both exercised */
++#define SWEET_FB_SCAN_PIPES         2u
++#define SWEET_FB_SCAN_DEFAULT_HOLD_MS 1500u
++#define SWEET_FB_SCAN_MIN_PRESENTS  20u          /* UI is animating */
++#define SWEET_FB_SCAN_MIN_DELAY_MS  8000u        /* and has been for a while */
++
++/* ---- address plan ---- */
++struct sweet_fb_scan_plan {
++	uint64_t slot_pa;                        /* second buffer */
++	uint64_t bytes;                          /* probe_pitch * height */
++	uint32_t pitch;
++	uint64_t addr[SWEET_FB_SCAN_PIPES];      /* what each pipe's ADDR register must hold while the probe frame is scanned */
++};
++
++/* Slot directly behind the panel buffer (page aligned), inside the carve-out.  width must be even (two pipes read halves). */
++static inline bool
++sweet_fb_scan_plan_make(struct sweet_fb_scan_plan *p, uint64_t base_pa, uint32_t base_pitch, uint32_t width, uint32_t height,
++    uint32_t probe_pitch)
++{
++	if (!p || !base_pa || !base_pitch || !width || (width & 1u) || !height || (base_pa & (SWEET_FB_SCAN_ALIGN - 1)) ||
++	    probe_pitch < width * 4u || (probe_pitch & 63u) || base_pitch < width * 4u) {
++		return false;
++	}
++	uint64_t base_end = base_pa + (uint64_t)base_pitch * height;
++	uint64_t slot = (base_end + SWEET_FB_SCAN_ALIGN - 1) & ~(SWEET_FB_SCAN_ALIGN - 1);
++	uint64_t bytes = (uint64_t)probe_pitch * height;
++	if (slot < base_end || slot + bytes < slot || slot + bytes > SWEET_FB_SCAN_CARVE_END || slot + bytes > 0x100000000ull) {
++		return false;
++	}
++	p->slot_pa = slot;
++	p->bytes = bytes;
++	p->pitch = probe_pitch;
++	for (uint32_t i = 0; i < SWEET_FB_SCAN_PIPES; i++) {
++		p->addr[i] = slot + (uint64_t)i * (width / SWEET_FB_SCAN_PIPES) * 4u;
++	}
++	return true;
++}
++
++/* What pipe i must show before the probe touches it (the layout the early console verified) and after restore. */
++static inline uint32_t
++sweet_fb_scan_base_addr(uint64_t base_pa, uint32_t width, uint32_t pipe)
++{
++	return (uint32_t)(base_pa + (uint64_t)pipe * (width / SWEET_FB_SCAN_PIPES) * 4u);
++}
++
++/* PITCH register: only the low 16 bits are the pitch, the rest is preserved. */
++static inline uint32_t
++sweet_fb_scan_pitch_reg(uint32_t old, uint32_t pitch)
++{
++	return (old & ~0xffffu) | (pitch & 0xffffu);
++}
++
++/* ---- test pattern (BGRA words 0xAARRGGBB as stored little endian) ---- */
++#define SWEET_FB_SCAN_BORDER 8u
++static inline uint32_t
++sweet_fb_scan_pixel(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
++{
++	static const uint32_t bars[8] = { 0xffffffffu, 0xffffff00u, 0xff00ffffu, 0xff00ff00u, 0xffff00ffu, 0xffff0000u, 0xff0000ffu, 0xff000000u };
++	if (x >= w || y >= h) {
++		return 0;
++	}
++	if (x < SWEET_FB_SCAN_BORDER || y < SWEET_FB_SCAN_BORDER || x >= w - SWEET_FB_SCAN_BORDER || y >= h - SWEET_FB_SCAN_BORDER) {
++		return ((x + y) & 16u) ? 0xffffffffu : 0xffff8000u;           /* striped frame: shows cropping, shifts and pitch skew */
++	}
++	if (y >= h - h / 8u) {
++		uint32_t v = (uint32_t)(((uint64_t)x * 255u) / (w - 1u));   /* grey ramp left to right */
++		return 0xff000000u | (v << 16) | (v << 8) | v;
++	}
++	return bars[(uint32_t)(((uint64_t)x * 8u) / w)];
++}
++
++/* ---- probe state machine ---- */
++enum sweet_fb_scan_state {
++	SWEET_FB_SCAN_OFF = 0,
++	SWEET_FB_SCAN_ARMED,      /* waiting for the UI */
++	SWEET_FB_SCAN_FLIPPED,    /* registers written, probe frame transferring */
++	SWEET_FB_SCAN_HOLD,       /* probe frame on the panel */
++	SWEET_FB_SCAN_DONE,       /* restored, probe finished */
++	SWEET_FB_SCAN_FAILED,     /* refused or failed, restored; never retried */
++};
++enum sweet_fb_scan_event {
++	SWEET_FB_SCAN_EV_BEGIN_OK,
++	SWEET_FB_SCAN_EV_BEGIN_FAIL,   /* layout mismatch, readback mismatch, link busy */
++	SWEET_FB_SCAN_EV_XFER_DONE,
++	SWEET_FB_SCAN_EV_XFER_TIMEOUT,
++	SWEET_FB_SCAN_EV_HOLD_EXPIRED,
++	SWEET_FB_SCAN_EV_STOP,
++};
++
++static inline uint32_t
++sweet_fb_scan_hold_ms(uint32_t arg)
++{
++	if (arg == 0) {
++		return 0;
++	}
++	if (arg == 1) {
++		return SWEET_FB_SCAN_DEFAULT_HOLD_MS;
++	}
++	return arg < 200 ? 200 : (arg > 5000 ? 5000 : arg);
++}
++
++static inline bool
++sweet_fb_scan_due(int state, bool link_ready, uint32_t presents, uint64_t now_ms, uint64_t first_present_ms)
++{
++	return state == SWEET_FB_SCAN_ARMED && link_ready && presents >= SWEET_FB_SCAN_MIN_PRESENTS &&
++	    first_present_ms != 0 && now_ms >= first_present_ms && now_ms - first_present_ms >= SWEET_FB_SCAN_MIN_DELAY_MS;
++}
++
++/* Next state.  *restore is set when the base ADDR/PITCH must be written back (from FLIPPED or HOLD on any exit). */
++static inline int
++sweet_fb_scan_next(int state, int event, bool *restore)
++{
++	*restore = false;
++	switch (state) {
++	case SWEET_FB_SCAN_ARMED:
++		if (event == SWEET_FB_SCAN_EV_BEGIN_OK) { return SWEET_FB_SCAN_FLIPPED; }
++		if (event == SWEET_FB_SCAN_EV_BEGIN_FAIL) { *restore = true; return SWEET_FB_SCAN_FAILED; }   /* partial writes undone */
++		if (event == SWEET_FB_SCAN_EV_STOP) { return SWEET_FB_SCAN_FAILED; }
++		return state;
++	case SWEET_FB_SCAN_FLIPPED:
++		if (event == SWEET_FB_SCAN_EV_XFER_DONE) { return SWEET_FB_SCAN_HOLD; }
++		if (event == SWEET_FB_SCAN_EV_XFER_TIMEOUT || event == SWEET_FB_SCAN_EV_STOP) { *restore = true; return SWEET_FB_SCAN_FAILED; }
++		return state;
++	case SWEET_FB_SCAN_HOLD:
++		if (event == SWEET_FB_SCAN_EV_HOLD_EXPIRED) { *restore = true; return SWEET_FB_SCAN_DONE; }
++		if (event == SWEET_FB_SCAN_EV_STOP) { *restore = true; return SWEET_FB_SCAN_FAILED; }
++		return state;
++	default:
++		return state;       /* OFF, DONE, FAILED are terminal */
++	}
++}
++
++/* While the probe owns the panel (FLIPPED/HOLD) the vsync handler must not hand over a frame. */
++static inline bool
++sweet_fb_scan_owns_panel(int state)
++{
++	return state == SWEET_FB_SCAN_FLIPPED || state == SWEET_FB_SCAN_HOLD;
++}
++
++#endif

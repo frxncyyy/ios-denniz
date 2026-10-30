@@ -1,0 +1,53 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -208,6 +208,7 @@
+ 	/* 0163: frame pacing -- the moment a frame becomes eligible for its TE slot is shifted by fPaceD so that the slack (ready -> slot) of the usual frame sits in the
+ 	 * middle of the period, away from the slot boundary where a little jitter of CoreAnimation turns into a lost TE. */
+ 	bool                fPaceOn;
++	uint64_t            fTeMinLeadUs, fLeadActUs;       /* 0164: flexible lead: the push starts once the frame is ready, no earlier than fTeLeadUs and no later than fTeMinLeadUs before the TE */
+ 	uint64_t            fReadyUs, fNextReadyUs, fPaceSeenUs;
+ 	uint32_t            fPaceD, fPaceHist[16], fPaceN, fPaceRecenter, fPaceEstUs;
+ 	uint64_t            fLastXferStartUs, fTrackAtUs;
+@@ -377,8 +378,10 @@
+ 	fVsyncUs = fPanelHz == 90 ? SWEET_FB_PANEL90_US : SWEET_FB_VSYNC_US;
+ 	fTePeriodUs = SWEET_FB_VSYNC_US;      /* the panel boots at 60 Hz; set to 11111 when the 90 Hz switch is accepted */
+ 	fTeLeadUs = SWEET_FB_TE_LEAD_US_DEFAULT;
+-	fPaceOn = true;
+-	{ uint32_t pace = 1; if (PE_parse_boot_argn("n2pace", &pace, sizeof(pace)) && pace == 0) { fPaceOn = false; } }
++	fPaceOn = false;      /* 0164: the slot-centering pace of 0163 made the cadence worse on hardware (every second TE); off unless n2pace=1 */
++	{ uint32_t pace = 0; if (PE_parse_boot_argn("n2pace", &pace, sizeof(pace)) && pace == 1) { fPaceOn = true; } }
++	fTeMinLeadUs = 1000;
++	{ uint32_t ml = 0; if (PE_parse_boot_argn("n2teminlead", &ml, sizeof(ml)) && ml >= 600 && ml <= 3000) { fTeMinLeadUs = ml; } }
+ 	{ uint32_t lead = 0; if (PE_parse_boot_argn("n2telead", &lead, sizeof(lead)) && lead <= 4000) { fTeLeadUs = lead; } }
+ 	nanoseconds_to_absolutetime(fVsyncUs * 1000ULL, &fPeriodAbs);
+ 	/* n2swait=<0|1|2>: SwapWait semantics (0 = as before: always success, calls logged). */
+@@ -980,12 +983,17 @@
+ 				base = fb->fReadyUs + fb->fPaceD;
+ 				if (base < nowUs) { base = nowUs; }
+ 			}
+-			int64_t mb = ((((int64_t)base - last + lead) % P) + P) % P;
+-			uint64_t fire = base + (uint64_t)(P - mb);
++			/* 0164: the first TE we can still be ahead of by at least fTeMinLeadUs; start as early as the full lead before it, or at once if the frame is later */
++			int64_t jn = (int64_t)base + (int64_t)fb->fTeMinLeadUs - last + P - 1;
++			int64_t j = jn > 0 ? jn / P : 0;
++			uint64_t teNext = (uint64_t)(last + j * P);
++			uint64_t fire = teNext > (uint64_t)lead ? teNext - (uint64_t)lead : 0;
++			if (fire < base) { fire = base; }
++			fb->fLeadActUs = teNext > fire ? teNext - fire : 0;
+ 			if (fire > nowUs + 300) { sender->setTimeoutUS((uint32_t)(fire - nowUs - 200)); return; }
+ 			while (sweet_fb_abs_to_us(mach_absolute_time()) < fire) { IODelay(20); }
+ 			fb->fStats.te_lead_starts++;
+-			fb->fFireTeUs = fire + fb->fTeLeadUs; fb->fFireValid = true; leadUsed = true;
++			fb->fFireTeUs = fire + fb->fLeadActUs; fb->fFireValid = true; leadUsed = true;
+ 			nowUs = sweet_fb_abs_to_us(mach_absolute_time());
+ 			te = true;
+ 			fb->fDsi[SWEET_FB_DSI_INTSTA / 4] = ~SWEET_FB_DSI_TE_RDY;      /* the next TE seen is the one this push is ahead of */
+@@ -1020,7 +1028,7 @@
+ 				/* 0158: the push is ahead of the TE: watch for it tightly (a few us) so the next prediction rests on a precise reference */
+ 				uint64_t s0 = sweet_fb_abs_to_us(mach_absolute_time()), tn = s0;
+ 				fb->fRefGood = false;
+-				while (tn - s0 < fb->fTeLeadUs + 3000) {
++				while (tn - s0 < fb->fLeadActUs + 3000) {
+ 					if (fb->fDsi[SWEET_FB_DSI_INTSTA / 4] & SWEET_FB_DSI_TE_RDY) { fb->fTeObsUs = tn; fb->fTeObsSet = true; fb->fRefGood = true; break; }
+ 					IODelay(5);
+ 					tn = sweet_fb_abs_to_us(mach_absolute_time());

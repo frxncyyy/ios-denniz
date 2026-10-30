@@ -1,0 +1,379 @@
+--- a/bsd/dev/nord2_dvfs.h
++++ b/bsd/dev/nord2_dvfs.h
+@@ -25,9 +25,9 @@
+ #define N2D_MBOX_ALIVE     0u                /* channel 0: platform */
+ #define N2D_MBOX_DVFS      1u                /* channel 1: CPU DVFS */
+ #define N2D_IPI_TIMEOUT_MS 2000u
+-#define N2D_START_MAX_CC   4000              /* no ramp step at or above 40.0 C */
+-#define N2D_THROTTLE_CC    4300              /* one row slower per tick at or above 43.0 C */
+-#define N2D_RECOVER_CC     3800              /* one row faster per tick again below 38.0 C */
++#define N2D_START_MAX_CC   4500              /* no ramp step at or above 45.0 C (0171: was 40.0 C) */
++#define N2D_THROTTLE_CC    4600              /* one row slower per tick at or above 46.0 C (0171: was 43.0 C) */
++#define N2D_RECOVER_CC     4400              /* one row faster per tick again below 44.0 C (0171: was 38.0 C, so a throttled phone stayed at the slowest row until it was nearly cold) */
+ #define N2D_CLOCK_PCT      8u
+ #define N2D_SETTLE_MS      50u
+ #define N2D_SETTLE_TRIES   6u
+@@ -48,6 +48,8 @@
+ 	N2D_L_RESULT,       /* a = enum n2d_result */
+ 	N2D_L_ACCESS,       /* a = enum n2d_access, b/c = detail: logged BEFORE the access, followed by ops->flush */
+ 	N2D_L_STAGE,        /* a = the stage limit that stopped the sequence (cfg->max_step) */
++	N2D_L_GOV,          /* 0172, every 2 s: a = rowL | rowB << 8, b = utilL | utilB << 16 (permille, 0xffff unknown), c = row changes in the window, d = boost permille of the ticks */
++	N2D_L_GOVCLK,       /* 0172, every 2 s: a = cluster, b = row MHz the governor asked for, c = measured MHz */
+ };
+ 
+ enum n2d_access {
+@@ -90,6 +92,10 @@
+ 	void (*set_place)(void *ctx, int mode);                                  /* write nord2_sched_mode */
+ 	void (*log)(void *ctx, int code, unsigned a, unsigned b, unsigned c, unsigned d);
+ 	void (*flush)(void *ctx);                                                 /* wait until the host has pulled the log lines written so far (bounded) */
++	/* 0172: load-based scaling (all optional; the governor does nothing without them) */
++	int (*util)(void *ctx, int cpu);                                          /* busy permille of the CPU over the last ~100 ms, < 0 unknown; called once per CPU per governor tick */
++	uint64_t (*now_ms)(void *ctx);
++	uint64_t (*ui_kick_ms)(void *ctx);                                        /* time of the last UI activity (a CoreAnimation swap), 0 = none */
+ };
+ 
+ struct n2d_cfg {
+@@ -539,4 +545,183 @@
+ 		}
+ 	}
+ }
++
++/* ---- 0172: load-based frequency scaling ----
++ * The clusters used to sit at the cap (L 2.6 / B 3.0 GHz) whatever the load.  Every N2D_GOV_TICK_MS the busiest CPU of L (cpu4-6) and of B (cpu7) is measured; the row that would put
++ * it at N2D_GOV_TARGET_PERMILLE is chosen: faster at once, slower only after N2D_GOV_DOWN_HOLD_MS below it.  While the UI is active (a CoreAnimation swap within N2D_GOV_BOOST_MS) the
++ * clusters never run below the floor MHz.  The thermal guard no longer steps the clock itself: it moves the fastest row the governor may pick (limit), one row per 2 s.
++ * Rows are written like n2d_goto_row does (CCI order included) but without the 50 ms settle wait and the measurement; the clock is measured and logged every 2 s instead. */
++#define N2D_GOV_TICK_MS         50u
++#define N2D_GOV_TARGET_PERMILLE 600u
++#define N2D_GOV_DOWN_HOLD_MS    150u
++#define N2D_GOV_BOOST_MS        150u
++#define N2D_GOV_FLOOR_L_MHZ     1740u        /* while the UI is active */
++#define N2D_GOV_FLOOR_B_MHZ     1998u
++#define N2D_GOV_IDLE_L_MHZ      1046u        /* slowest the governor goes (the bootloader rows 700/659 MHz are only for the fallback) */
++#define N2D_GOV_IDLE_B_MHZ      1108u
++#define N2D_GOV_SLOW_TICK_MS    2000u
++#define N2D_GOV_STEP_MS         2u
++
++struct n2d_gov {
++	uint8_t limit[3];            /* fastest row the thermal guard allows (>= st->target) */
++	uint8_t slowest[3];          /* slowest row the governor uses (<= st->orig) */
++	uint64_t below_since[3];
++	uint64_t last_slow_ms;
++	unsigned ticks, boost_ticks, changes;
++	int util[3];
++};
++
++/* last row whose clock is at least mhz (slowest row that still offers it), clamped to [fastest, slowest] */
++static inline unsigned
++n2d_row_at_least(unsigned cluster, unsigned mhz, unsigned fastest, unsigned slowest)
++{
++	for (unsigned i = slowest + 1; i-- > fastest;) {
++		if (n2d_row_mhz(cluster, i) >= mhz) {
++			return i;
++		}
++	}
++	return fastest;
++}
++
++static inline void
++n2d_set_row_fast(const struct n2d_ops *o, void *ctx, struct n2d_state *st, unsigned c, unsigned row)
++{
++	/* One row at a time (the transition the firmware was verified with), N2D_GOV_STEP_MS apart; a jump over 12 rows costs ~25 ms.  A multi-row jump in one store crashed the phone (p73). */
++	while (st->cur[c] != row) {
++		unsigned step = st->cur[c] > row ? (unsigned)st->cur[c] - 1u : (unsigned)st->cur[c] + 1u;
++		uint8_t next[3] = { st->cur[0], st->cur[1], st->cur[2] };
++		next[c] = (uint8_t)step;
++		uint32_t cci = n2dv_cci_row(next[N2DV_LL], next[N2DV_B]);
++		if (step < st->cur[c]) {
++			o->w32(ctx, N2DV_OFF_REQ + 4 * N2DV_CCI, cci);
++		}
++		o->w32(ctx, N2DV_OFF_PPM_LIMIT + 4 * c, (uint32_t)step << 16 | step);
++		o->w32(ctx, N2DV_OFF_REQ + 4 * c, step);
++		if (step >= st->cur[c]) {
++			o->w32(ctx, N2DV_OFF_REQ + 4 * N2DV_CCI, cci);
++		}
++		st->cur[c] = (uint8_t)step;
++		if (st->cur[c] != row) {
++			o->sleep_ms(ctx, N2D_GOV_STEP_MS);
++		}
++	}
++}
++
++static inline void
++n2d_gov_init(const struct n2d_ops *o, void *ctx, const struct n2d_state *st, struct n2d_gov *g)
++{
++	int cC = 0;
++	bool valid = o->gauge(ctx, &cC);
++	for (unsigned c = 0; c < 3; c++) {
++		g->limit[c] = st->target[c];
++		g->slowest[c] = st->orig[c];
++		g->below_since[c] = 0;
++		g->util[c] = -1;
++	}
++	for (unsigned c = N2DV_L; c <= N2DV_B; c++) {
++		unsigned idle = n2d_row_at_least(c, c == N2DV_L ? N2D_GOV_IDLE_L_MHZ : N2D_GOV_IDLE_B_MHZ, st->target[c], st->orig[c]);
++		g->slowest[c] = (uint8_t)idle;
++		if (!valid || cC >= N2D_START_MAX_CC) {
++			g->limit[c] = (uint8_t)idle;           /* hot or unknown at start: nothing above the idle row until the guard says it is cool */
++		}
++	}
++	g->last_slow_ms = 0;
++	g->ticks = g->boost_ticks = g->changes = 0;
++}
++
++static inline void
++n2d_gov_tick(const struct n2d_ops *o, void *ctx, const struct n2d_cfg *cfg, struct n2d_state *st, struct n2d_gov *g)
++{
++	if (st->stopped || !st->inited || !o->util || !o->now_ms) {
++		return;
++	}
++	uint64_t now = o->now_ms(ctx);
++	uint64_t kick = o->ui_kick_ms ? o->ui_kick_ms(ctx) : 0;
++	bool boost = kick != 0 && now >= kick && now - kick < N2D_GOV_BOOST_MS;
++	g->ticks++;
++	if (boost) {
++		g->boost_ticks++;
++	}
++	for (unsigned c = N2DV_L; c <= N2DV_B; c++) {
++		int u = -1;
++		unsigned ncpu = c == N2DV_L ? 3u : 1u;
++		for (unsigned k = 0; k < ncpu; k++) {
++			int x = o->util(ctx, n2d_first_cpu[c] + (int)k);
++			if (x > u) {
++				u = x;
++			}
++		}
++		g->util[c] = u;
++		unsigned fastest = g->limit[c], slowest = g->slowest[c], cur = st->cur[c];
++		if (fastest > slowest) {
++			slowest = fastest;
++		}
++		unsigned want = cur;
++		if (u >= 0) {
++			uint64_t need = ((uint64_t)n2d_row_mhz(c, cur) * (unsigned)u + N2D_GOV_TARGET_PERMILLE - 1) / N2D_GOV_TARGET_PERMILLE;
++			unsigned row = n2d_row_at_least(c, (unsigned)need, fastest, slowest);
++			if (row < cur) {
++				want = row;                                       /* faster: at once */
++				g->below_since[c] = 0;
++			} else if (row > cur) {                               /* slower: after the hold */
++				if (g->below_since[c] == 0) {
++					g->below_since[c] = now ? now : 1;
++				}
++				if (now - g->below_since[c] >= N2D_GOV_DOWN_HOLD_MS) {
++					want = row;
++				}
++			} else {
++				g->below_since[c] = 0;
++			}
++		}
++		if (boost) {
++			unsigned floor_row = n2d_row_at_least(c, c == N2DV_L ? N2D_GOV_FLOOR_L_MHZ : N2D_GOV_FLOOR_B_MHZ, fastest, slowest);
++			if (want > floor_row) {
++				want = floor_row;
++			}
++		}
++		if (want < fastest) {
++			want = fastest;
++		}
++		if (want > slowest) {
++			want = slowest;
++		}
++		if (want != cur) {
++			n2d_set_row_fast(o, ctx, st, c, want);
++			g->changes++;
++		}
++	}
++	if (g->last_slow_ms == 0 || now - g->last_slow_ms >= N2D_GOV_SLOW_TICK_MS) {
++		bool first = g->last_slow_ms == 0;
++		g->last_slow_ms = now ? now : 1;
++		int cC = 0;
++		if (o->gauge(ctx, &cC)) {                                 /* thermal guard: move the fastest allowed row, one row per slow tick */
++			for (unsigned c = N2DV_L; c <= N2DV_B; c++) {
++				if (cC >= N2D_THROTTLE_CC && g->limit[c] < g->slowest[c]) {
++					g->limit[c]++;
++					o->log(ctx, N2D_L_THERMAL, 4, (unsigned)cC, c, g->limit[c]);
++				} else if (cC < N2D_RECOVER_CC && g->limit[c] > st->target[c]) {
++					g->limit[c]--;
++					o->log(ctx, N2D_L_THERMAL, 5, (unsigned)cC, c, g->limit[c]);
++				}
++			}
++		}
++		if (!first) {
++			for (unsigned c = N2DV_L; c <= N2DV_B; c++) {
++				o->log(ctx, N2D_L_GOVCLK, c, n2d_row_mhz(c, st->cur[c]), o->mhz(ctx, n2d_first_cpu[c]), 0);
++			}
++			unsigned ul = g->util[N2DV_L] < 0 ? 0xffffu : (unsigned)g->util[N2DV_L], ub = g->util[N2DV_B] < 0 ? 0xffffu : (unsigned)g->util[N2DV_B];
++			o->log(ctx, N2D_L_GOV, st->cur[N2DV_L] | (unsigned)st->cur[N2DV_B] << 8, ul | ub << 16, g->changes, g->ticks ? g->boost_ticks * 1000u / g->ticks : 0u);
++		}
++		g->ticks = g->boost_ticks = g->changes = 0;
++		if (!st->stopped && cfg->place) {                          /* placement follows the cap, not the momentary clock */
++			int next = n2d_place_decide(n2d_row_mhz(N2DV_L, st->target[N2DV_L]), n2d_row_mhz(N2DV_LL, st->cur[N2DV_LL]), st->place_mode);
++			if (next != st->place_mode) {
++				st->place_mode = next;
++				o->set_place(ctx, next);
++				o->log(ctx, N2D_L_PLACE, (unsigned)next, n2d_row_mhz(N2DV_L, st->target[N2DV_L]), n2d_row_mhz(N2DV_LL, st->cur[N2DV_LL]), 0);
++			}
++		}
++	}
++}
+ #endif
+--- a/bsd/dev/nord2_cpufreq.h
++++ b/bsd/dev/nord2_cpufreq.h
+@@ -38,9 +38,9 @@
+ #define N2CF_R_LATENCY      0x114u
+ #define N2CF_HW_RUNNING     1u
+ #define N2CF_ORACLE_PCT     8u       /* measured clock vs LUT[PERF_STATE] */
+-#define N2CF_START_MAX_CC   4000     /* 40.0 C: no ramp at or above */
+-#define N2CF_THROTTLE_CC    4300     /* 43.0 C: one row slower per tick */
+-#define N2CF_RECOVER_CC     3800     /* 38.0 C: one row faster per tick again */
++#define N2CF_START_MAX_CC   4500     /* 45.0 C: no ramp at or above (0171) */
++#define N2CF_THROTTLE_CC    4600     /* 46.0 C: one row slower per tick (0171) */
++#define N2CF_RECOVER_CC     4400     /* 44.0 C: one row faster per tick again (0171) */
+ #define N2CF_DEFAULT_CAP_MHZ 2000u
+ #define N2CF_CLUSTERS       3u
+ 
+--- a/bsd/dev/nord2_cpufreq.c
++++ b/bsd/dev/nord2_cpufreq.c
+@@ -36,11 +36,13 @@
+ TUNABLE(int, nord2_dvfs_arg, "n2dvfs", 0);
+ TUNABLE(int, nord2_membw_arg, "n2membw", 0);   /* patch 0120: CPU memory bandwidth measurement (read/write/copy of 64 MiB); touches only DRAM */
+ TUNABLE(int, nord2_dram_arg, "n2dram", 0);   /* patch 0121: read-only dump of the DVFSRC page (1), plus the DRAMC ch0 AO page (2); nothing is written */
+-TUNABLE(int, nord2_dvfs_stage_arg, "n2dvst", 3);   /* 0 preflight only, 1 + share buffer, 2 + platform init, 3 = everything (default) */
++TUNABLE(int, nord2_dvfs_stage_arg, "n2dvst", 3);
++TUNABLE(int, nord2_gov_arg, "n2gov", 1);          /* 0172: 1 = load-based scaling (default), 0 = fixed cap with the old 2 s guard */   /* 0 preflight only, 1 + share buffer, 2 + platform init, 3 = everything (default) */
+ 
+ extern unsigned nord2_cpu_mhz(int cpu);                                                /* nord2_sched.c (0099) */
+ extern int nord2_sched_mode;                                                            /* nord2_sched.c (0099): placement mode bits */
+ extern bool nord2_battery_temperature_cC(int *centi);                                  /* Nord2GPU.cpp */
++extern int nord2_cpu_util_permille(int cpu);                                            /* Nord2GPU.cpp (0172): busy permille over the last ~100 ms */
+ extern int nord2_gpu_pmic_ready(void);  /* Nord2GPU.cpp (0142): the GPU driver is ready and its PMIC owner thread answers */
+ extern int nord2_pmic_read(unsigned bus, unsigned sid, unsigned reg, unsigned *val);  /* Nord2GPU.cpp (0116): read-only PMIC access on the owner thread */
+ 
+@@ -632,8 +634,8 @@
+ 		printf("NORD2 DVFS step 3 cluster %s done: row %u -> %u, CPU measures %u MHz\n", cl[a], b, c, d);
+ 		break;
+ 	case N2D_L_THERMAL: {
+-		static const char *const why[] = { "?", "no ramp: battery at or above 40.0 C", "no ramp: battery gauge unreadable", "ramp stopped: battery at or above 40.0 C", "battery at or above 43.0 C: one row slower",
+-			                           "battery below 38.0 C: one row faster" };
++		static const char *const why[] = { "?", "no ramp: battery at or above 45.0 C", "no ramp: battery gauge unreadable", "ramp stopped: battery at or above 45.0 C", "battery at or above 46.0 C: fastest allowed row one slower",
++			                           "battery below 44.0 C: fastest allowed row one faster" };
+ 		printf("NORD2 DVFS thermal: %s (battery %d.%02d C, cluster %s, row %u)\n", a < 6 ? why[a] : "?", (int)b / 100, (int)b % 100, c < 4 ? cl[c] : "-", d);
+ 		break;
+ 	}
+@@ -655,6 +657,14 @@
+ 		}
+ 		break;
+ 	}
++	case N2D_L_GOV:
++		printf("NORD2 DVFS gov: L row %u (%u MHz) util %d permille, B row %u (%u MHz) util %d permille, %u row changes, boost %u permille of the ticks\n", a & 0xff,
++		    n2d_row_mhz(N2DV_L, a & 0xff), (b & 0xffff) == 0xffff ? -1 : (int)(b & 0xffff), (a >> 8) & 0xff, n2d_row_mhz(N2DV_B, (a >> 8) & 0xff),
++		    (b >> 16) == 0xffff ? -1 : (int)(b >> 16), c, d);
++		break;
++	case N2D_L_GOVCLK:
++		printf("NORD2 DVFS gov clock: cluster %s asked %u MHz, measures %u MHz\n", cl[a & 3], b, c);
++		break;
+ 	case N2D_L_STAGE:
+ 		printf("NORD2 DVFS stage limit %u reached: stopping on purpose before the next stage (0 preflight, 1 share buffer, 2 platform init, 3 hand-over)\n", a);
+ 		break;
+@@ -668,7 +678,38 @@
+ 	}
+ }
+ 
+-static const struct n2d_ops n2dv_ops = { n2cf_wr, n2cf_rd, n2dv_mbox, n2dv_share_init, n2dv_rail, n2cf_mhz, n2cf_gauge, n2cf_sleep_ms, n2dv_set_place, n2dv_log, n2dv_flush };
++static volatile uint64_t n2dv_ui_kick;
++
++static uint64_t
++n2dv_now_ms(__unused void *ctx)
++{
++	uint64_t abs = 0, ns = 0;
++	clock_get_uptime(&abs);
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000000ull;
++}
++
++/* 0172: called by the framebuffer driver for every CoreAnimation swap: the UI is active, the governor keeps the boost floor for N2D_GOV_BOOST_MS */
++void
++nord2_dvfs_ui_kick(void)
++{
++	n2dv_ui_kick = n2dv_now_ms(NULL);
++}
++
++static int
++n2dv_util(__unused void *ctx, int cpu)
++{
++	return nord2_cpu_util_permille(cpu);
++}
++
++static uint64_t
++n2dv_ui_kick_ms(__unused void *ctx)
++{
++	return n2dv_ui_kick;
++}
++
++static const struct n2d_ops n2dv_ops = { n2cf_wr, n2cf_rd, n2dv_mbox, n2dv_share_init, n2dv_rail, n2cf_mhz, n2cf_gauge, n2cf_sleep_ms, n2dv_set_place, n2dv_log, n2dv_flush,
++	n2dv_util, n2dv_now_ms, n2dv_ui_kick_ms };
+ 
+ /* ---- patch 0120: CPU memory bandwidth ------------------------------------------------------------------------------------------
+  * The GPU renders ~1 Gpixel/s whatever its clock, shader length or job count.  If the DRAM clock was left at a low bootloader value
+@@ -811,6 +852,17 @@
+ 	if (nord2_membw_arg)
+ 		n2membw_run("after DVFS");
+ 	n2dram_run("after DVFS");
++	if (nord2_gov_arg != 0 && !st.stopped && st.inited && cfg.cap_mhz != 0) {
++		struct n2d_gov gov;
++		n2d_gov_init(&n2dv_ops, NULL, &st, &gov);
++		printf("NORD2 DVFS gov: load-based scaling on (target %u permille, down hold %u ms, boost %u ms, UI floor L %u / B %u MHz, idle L %u / B %u MHz, limit rows L %u B %u)\n",
++		    N2D_GOV_TARGET_PERMILLE, N2D_GOV_DOWN_HOLD_MS, N2D_GOV_BOOST_MS, N2D_GOV_FLOOR_L_MHZ, N2D_GOV_FLOOR_B_MHZ, N2D_GOV_IDLE_L_MHZ, N2D_GOV_IDLE_B_MHZ,
++		    gov.limit[N2DV_L], gov.limit[N2DV_B]);
++		while (!st.stopped && st.inited) {
++			n2cf_sleep_ms(NULL, N2D_GOV_TICK_MS);
++			n2d_gov_tick(&n2dv_ops, NULL, &cfg, &st, &gov);
++		}
++	}
+ 	while (!st.stopped && st.inited && cfg.cap_mhz != 0) {
+ 		n2cf_sleep_ms(NULL, 1000u * N2CF_TICK_S);
+ 		n2d_tick(&n2dv_ops, NULL, &cfg, &st);
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -48,6 +48,23 @@
+ extern "C" kern_return_t host_statistics64(host_t, host_flavor_t, host_info64_t, mach_msg_type_number_t *);
+ extern "C" char n2_realhost[] __asm__("_realhost");   /* the host data the in-kernel callers pass */
+ extern "C" void n2_processor_cpu_load(processor_t, natural_t ticks[CPU_STATE_MAX]) __asm__("_processor_cpu_load_info");   /* the struct of the same name hides the function in C++ */
++/* 0183: busy permille of one CPU over the last ~100 ms for the DVFS governor.  Called every 50 ms per CPU by the governor thread only; keeps the last three samples of the
++ * cumulative user+system / total ticks (10 ms ticks), so the window is two calls and the result is good to about +-10 points. */
++extern "C" int nord2_cpu_util_permille(int cpu) {
++        static struct { uint32_t busy[3], tot[3]; unsigned n; int last; } h[16];
++        if (cpu < 0 || cpu >= 16) return -1;
++        processor_t p = cpu_to_processor(cpu); if (!p) return -1;
++        natural_t t[CPU_STATE_MAX] = {};
++        n2_processor_cpu_load(p, t);
++        uint32_t busy = t[CPU_STATE_USER] + t[CPU_STATE_SYSTEM], tot = busy + t[CPU_STATE_IDLE];
++        unsigned k = h[cpu].n % 3; h[cpu].busy[k] = busy; h[cpu].tot[k] = tot; h[cpu].n++;
++        if (h[cpu].n < 3) { h[cpu].last = -1; return -1; }
++        unsigned old = h[cpu].n % 3;
++        uint32_t dt = tot - h[cpu].tot[old], db = busy - h[cpu].busy[old];
++        if (dt < 5) return h[cpu].last;
++        int u = (int)(1000ull * db / dt); if (u > 1000) u = 1000;
++        h[cpu].last = u; return u;
++}
+ static void n2_sys_telemetry(uint64_t nowUs) {
+         static uint64_t lastUs = 0;
+         static natural_t cpuPrev[16][CPU_STATE_MAX] = {};
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -41,6 +41,7 @@
+ #include "sweet_fb_swapwait.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" void nord2_dvfs_ui_kick(void);   /* bsd/dev/nord2_cpufreq.c (0184): the UI is active, the CPU governor keeps its boost floor */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -1415,6 +1416,7 @@
+ 		/* Finite ABI evidence, outside fLock; never alter record interpretation. */
+ 		if (accepted <= 2) { sweet_fb_diag_record(rec, accepted); }
+ 	}
++	nord2_dvfs_ui_kick();
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}

@@ -1,0 +1,1084 @@
+From: ansuz-port (Nord2 Metal port ledger)
+Subject: [PATCH 0099] nord2: core-aware placement on the big cores, per-CPU clock report (opt-in)
+
+Ported from rotten-apple (ansuz-metal) xnu 0212/0236 (core-aware placement for
+the SMP clutch scheduler) and 0095/0140 (CPU clock by dependent-add chain).
+Default behaviour unchanged (n2sch=0); per-switch accounting + NORD2 SCHED /
+NORD2 CPUCLK log lines on. Boot-args: n2sch n2schpri n2big n2schst n2schab
+n2clk n2csram (see osfmk/kern/nord2_sched.c). Applies after 0084.
+Link levels: (a) measurement only = add nord2_sched.o + nord2_sched_sysctl.o;
+(b) placement = also replace archive members sched_clutch.o + sched_prim.o.
+---
+diff --git a/osfmk/conf/files b/osfmk/conf/files
+--- a/osfmk/conf/files
++++ b/osfmk/conf/files
+@@ -162,6 +162,7 @@
+ osfmk/kern/sched_dualq.c	optional config_sched_multiq
+ osfmk/kern/sched_clutch.c	optional config_clutch
+ osfmk/kern/sched_prim.c		standard
++osfmk/kern/nord2_sched.c	standard
+ osfmk/kern/sched_proto.c	optional config_sched_proto
+ osfmk/kern/sched_traditional.c	optional config_sched_traditional
+ osfmk/kern/sched_grrr.c	optional config_sched_grrr_core
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/nord2_sched_sysctl.c		standard
+ bsd/dev/wifi_basic_config.c			standard
+ bsd/dev/wifi_basic_resources.c			standard
+ bsd/dev/wifi_basic_metadata.c			standard
+diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
+--- a/osfmk/kern/sched_clutch.c
++++ b/osfmk/kern/sched_clutch.c
+@@ -2778,7 +2778,11 @@
+ 	.steal_thread                                   = sched_clutch_steal_thread,
+ 	.compute_timeshare_priority                     = sched_compute_timeshare_priority,
+ 	.choose_node                                    = sched_choose_node,
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	.choose_processor                               = nord2_sched_choose_processor,
++#else
+ 	.choose_processor                               = choose_processor,
++#endif
+ 	.processor_enqueue                              = sched_clutch_processor_enqueue,
+ 	.processor_queue_shutdown                       = sched_clutch_processor_queue_shutdown,
+ 	.processor_queue_remove                         = sched_clutch_processor_queue_remove,
+@@ -2800,7 +2804,11 @@
+ 	.sched_groups_enabled                           = FALSE,
+ 	.avoid_processor_enabled                        = TRUE,
+ 	.thread_avoid_processor                         = sched_clutch_thread_avoid_processor,
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	.processor_balance                              = nord2_sched_balance,
++#else
+ 	.processor_balance                              = sched_SMT_balance,
++#endif
+ 
+ 	.rt_runq                                        = sched_rtlocal_runq,
+ 	.rt_init                                        = sched_rtlocal_init,
+@@ -3214,6 +3222,11 @@
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (nord2_sched_avoid_processor(processor, thread)) {
++		return true;
++	}
++#endif
+ 	return false;
+ }
+ 
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -3393,6 +3393,9 @@
+ 		 * - We do not want to callout if "thread" is NULL.
+ 		 */
+ 		thread_csw_callout(thread, self, processor->last_dispatch);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		nord2_sched_switch(processor, thread, self, processor->last_dispatch);
++#endif
+ 
+ #if KASAN
+ 		if (thread->continuation != NULL) {
+diff --git a/osfmk/kern/sched_prim.h b/osfmk/kern/sched_prim.h
+--- a/osfmk/kern/sched_prim.h
++++ b/osfmk/kern/sched_prim.h
+@@ -312,6 +312,32 @@
+ 	processor_t processor,
+ 	processor_set_t pset);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* Nord2 core-aware placement on the clutch scheduler (osfmk/kern/nord2_sched.c, patch 0099) */
++extern processor_t nord2_sched_choose_processor(
++	processor_set_t pset,
++	processor_t     processor,
++	thread_t        thread);
++extern bool nord2_sched_avoid_processor(
++	processor_t     processor,
++	thread_t        thread);
++extern void nord2_sched_balance(
++	processor_t     processor,
++	processor_set_t pset);
++extern void nord2_sched_switch(
++	processor_t     processor,
++	thread_t        old,
++	thread_t        new,
++	uint64_t        now);
++/* readout for bsd/dev/nord2_sched_sysctl.c */
++extern void nord2_sched_watch_resolve(void);
++extern void nord2_sched_watch_set(uint64_t tid, const char *name);
++extern void nord2_sched_reset(void);
++extern size_t nord2_sched_text(char *buf, size_t size);
++extern size_t nord2_cpuclk_text(char *buf, size_t size);
++extern unsigned nord2_cpu_mhz(int cpu);
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ extern void thread_quantum_init(
+ 	thread_t thread,
+ 	uint64_t now);
+diff --git a/osfmk/kern/nord2_sched.c b/osfmk/kern/nord2_sched.c
+new file mode 100644
+--- /dev/null
++++ b/osfmk/kern/nord2_sched.c
+@@ -0,0 +1,617 @@
++/*
++ * Nord2: core-aware placement for the SMP clutch scheduler, per-CPU clock
++ * measurement and the "NORD2 SCHED" / "NORD2 CPUCLK" log lines.
++ *
++ * Ported from rotten-apple (ansuz-metal, private reference) xnu patches 0212
++ * (rottenapple_sched.c, core-aware placement), 0236 (TOP sched fixes) and the
++ * clock measurement of 0095/0140 (top_mhz_here / rottenapple_cpu_mhz).
++ *
++ * Nord2 (MT6893) runs its 8 CPUs as one SMP processor set (ADT cluster-id 0,
++ * cluster-type 0): cpu0-3 Cortex-A55, cpu4-6 Cortex-A78 (2.6 GHz), cpu7
++ * Cortex-A78 (3.0 GHz). choose_processor() takes the lowest-numbered idle
++ * CPU, so UI threads (CoreAnimation's render thread, the Metal frontend's
++ * queue and pipeline compiles running on it) land on the A55s first.
++ *
++ * Everything is opt-in; with the defaults the scheduler behaves as before
++ * and only the per-switch accounting runs (n2schst=0 turns that off too).
++ *
++ * Boot-args (short: the Nord2 command line is close to its limit) and sysctls:
++ *   n2sch=<mode>     kern.nord2_sched_mode  0 (default) | bits of N2S_* (0xf recommended)
++ *   n2schpri=<pri>   kern.nord2_sched_pri   lowest eligible priority (default 47, BASEPRI_FOREGROUND)
++ *   n2big=<mask>     kern.nord2_sched_fast  big-CPU mask (default: from ADT compatible "cortex-a78")
++ *   n2schst=<0|1>    kern.nord2_sched_stats per-CPU accounting (default 1)
++ *   n2schab=<sec>    in-boot A/B: alternate mode 0 and n2sch every <sec> s (0 = off, 30..3600)
++ *   n2clk=<sec>      NORD2 CPUCLK line interval (default 300, first at 45 s; 0 = never)
++ *   n2csram=1        also read MT6893 CPU DVFS CSRAM state (0x0011bc00, read-only; default off)
++ *   kern.nord2_sched (text totals), kern.nord2_sched_reset, kern.nord2_sched_watch,
++ *   kern.nord2_cpuclk (measure now, text)  -- bsd/dev/nord2_sched_sysctl.c
++ *
++ * Log lines (every 60 s, or every n2schab s if shorter, while stats are on):
++ *   NORD2 SCHED mode 0x.. pri>=N ab=K: big busy B% elig E%, little busy B% elig E%
++ *   NORD2 SCHED watch <name> <ms/s> on big P% <runs>/s; elig-on-little-while-big-idle N/s;
++ *       placed big-idle N/s big-preempt N/s spill N/s kept-little N/s pull N/s (ipi N/s)
++ *   NORD2 CPUCLK 0:MHz 1:MHz ... 7:MHz [csram cur LL/L/B=idx vproc=.. tbl0=..]
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <mach/mach_types.h>
++#include <kern/kern_types.h>
++#include <kern/bits.h>
++#include <kern/clock.h>
++#include <kern/misc_protos.h>
++#include <kern/processor.h>
++#include <kern/sched.h>
++#include <kern/sched_prim.h>
++#include <kern/startup.h>
++#include <kern/task.h>
++#include <kern/thread.h>
++#include <machine/atomic.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/section_keywords.h>
++
++#include "nord2_sched_policy.h"
++
++#define N2S_WATCH_NAME          64      /* MAXTHREADNAMESIZE */
++#define N2S_REPORT_S            60
++#define N2S_FIRST_S             45
++
++TUNABLE_WRITEABLE(int, nord2_sched_mode, "n2sch", 0);
++TUNABLE_WRITEABLE(int, nord2_sched_pri, "n2schpri", BASEPRI_FOREGROUND);
++TUNABLE_WRITEABLE(int, nord2_sched_fast, "n2big", 0);
++TUNABLE_WRITEABLE(int, nord2_sched_stats, "n2schst", 1);
++TUNABLE_WRITEABLE(int, nord2_sched_ab_s, "n2schab", 0);
++TUNABLE(int, nord2_cpuclk_s, "n2clk", 300);
++TUNABLE(int, nord2_csram, "n2csram", 0);
++
++char nord2_sched_watch_name[N2S_WATCH_NAME] = "coreanimation.display.primary";
++uint64_t nord2_sched_watch_tid;
++static bool n2s_watch_by_tid;
++static int n2s_ab_mode;                 /* the n2sch mode the A/B alternates with */
++static unsigned n2s_ab_phase;           /* 0: mode 0, 1: n2s_ab_mode */
++
++struct n2s_cpu {
++	uint64_t since, busy, elig, watch, watch_runs, slow_missed;
++} __attribute__((aligned(64)));
++
++static struct n2s_cpu n2s_cpu[N2S_MAX_CPUS];
++
++static struct {
++	uint64_t fast_idle, fast_preempt, spill, kept_slow, pull_ipi, pulled;
++} n2s_count;
++
++static inline uint32_t
++n2s_fast_map(void)
++{
++	return (uint32_t)os_atomic_load(&nord2_sched_fast, relaxed);
++}
++
++static inline bool
++n2s_thread_eligible(thread_t thread, int mode)
++{
++	return n2s_eligible(mode, thread->sched_pri, thread->base_pri, nord2_sched_pri, BASEPRI_RTQUEUES,
++	           get_threadtask(thread) == kernel_task);
++}
++
++static void
++n2s_view_fill(processor_set_t pset, uint32_t fast, struct n2s_view *v)
++{
++	cpumap_t avail = pset->cpu_available_map & pset->recommended_bitmask & pset->primary_map;
++	cpumap_t run = (pset->cpu_state_map[PROCESSOR_RUNNING] | pset->cpu_state_map[PROCESSOR_DISPATCHING]) &
++	    ~pset->pending_AST_URGENT_cpu_mask & ~pset->pending_AST_PREEMPT_cpu_mask;
++
++	v->avail = (uint32_t)avail;
++	v->idle = (uint32_t)pset->cpu_state_map[PROCESSOR_IDLE];
++	v->running = (uint32_t)run;
++	/* only the CPUs the policy may inspect (fast for PREEMPT, slow for PULL) */
++	for (int cpuid = lsb_first(run); cpuid >= 0 && cpuid < N2S_MAX_CPUS; cpuid = lsb_next(run, cpuid)) {
++		processor_t p = processor_array[cpuid];
++		v->cur_pri[cpuid] = (int16_t)p->current_pri;
++		v->bound[cpuid] = p->current_is_bound ? 1 : 0;
++	}
++	(void)fast;
++}
++
++/*
++ * SCHED(choose_processor) for the clutch scheduler on Nord2. Same contract as
++ * choose_processor(): pset locked on entry, the returned processor's pset
++ * locked on return (all CPUs are in this one pset).
++ */
++processor_t
++nord2_sched_choose_processor(processor_set_t pset, processor_t hint, thread_t thread)
++{
++	int mode = os_atomic_load(&nord2_sched_mode, relaxed);
++	uint32_t fast = n2s_fast_map();
++
++	if (mode == 0 || fast == 0 || thread->sched_pri >= BASEPRI_RTQUEUES ||
++	    thread->affinity_set != AFFINITY_SET_NULL || pset->online_processor_count == 0) {
++		return choose_processor(pset, hint, thread);
++	}
++	if (hint != PROCESSOR_NULL && hint->processor_set != pset) {
++		hint = PROCESSOR_NULL;
++	}
++
++	struct n2s_view v;
++	int reason;
++	n2s_view_fill(pset, fast, &v);
++	bool eligible = n2s_thread_eligible(thread, mode);
++	bool decayed = thread->sched_mode == TH_MODE_TIMESHARE && thread->sched_pri < thread->base_pri;
++	int cpu = n2s_choose(mode, fast, &v, hint != PROCESSOR_NULL ? hint->cpu_id : -1, eligible, decayed,
++	    thread->sched_pri, nord2_sched_pri, &reason);
++
++	switch (reason) {
++	case N2S_R_FAST_IDLE:
++		os_atomic_inc(&n2s_count.fast_idle, relaxed);
++		break;
++	case N2S_R_FAST_PREEMPT:
++		os_atomic_inc(&n2s_count.fast_preempt, relaxed);
++		break;
++	case N2S_R_KEPT_SLOW:
++		if (hint != PROCESSOR_NULL && bit_test(v.idle & v.avail & fast, hint->cpu_id)) {
++			os_atomic_inc(&n2s_count.kept_slow, relaxed);
++		}
++		break;
++	default:
++		break;
++	}
++	if (cpu >= 0) {
++		return processor_array[cpu];
++	}
++	processor_t p = choose_processor(pset, hint, thread);
++	if (reason == N2S_R_SPILL && p != PROCESSOR_NULL && !bit_test(fast, p->cpu_id)) {
++		os_atomic_inc(&n2s_count.spill, relaxed);
++	}
++	return p;
++}
++
++/* From SCHED(thread_avoid_processor), pset locked. */
++bool
++nord2_sched_avoid_processor(processor_t processor, thread_t thread)
++{
++	int mode = os_atomic_load(&nord2_sched_mode, relaxed);
++	uint32_t fast = n2s_fast_map();
++
++	if ((mode & (N2S_PLACE | N2S_PULL)) != (N2S_PLACE | N2S_PULL) || fast == 0 ||
++	    thread == processor->idle_thread || thread->affinity_set != AFFINITY_SET_NULL) {
++		return false;
++	}
++	processor_set_t pset = processor->processor_set;
++	uint32_t idle_avail = (uint32_t)(pset->cpu_state_map[PROCESSOR_IDLE] & pset->cpu_available_map &
++	    pset->recommended_bitmask);
++	if (n2s_avoid(mode, fast, processor->cpu_id, idle_avail, n2s_thread_eligible(thread, mode),
++	    thread->bound_processor != PROCESSOR_NULL)) {
++		os_atomic_inc(&n2s_count.pulled, relaxed);
++		return true;
++	}
++	return false;
++}
++
++/* SCHED(processor_balance): pset locked on entry, unlocked on return. */
++void
++nord2_sched_balance(processor_t cprocessor, processor_set_t cpset)
++{
++	int mode = os_atomic_load(&nord2_sched_mode, relaxed);
++	uint32_t fast = n2s_fast_map();
++	processor_t target = PROCESSOR_NULL;
++	sched_ipi_type_t ipi = SCHED_IPI_NONE;
++
++	if ((mode & (N2S_PLACE | N2S_PULL)) == (N2S_PLACE | N2S_PULL) && fast != 0 &&
++	    bit_test(fast, cprocessor->cpu_id) && cprocessor->is_recommended) {
++		struct n2s_view v;
++		n2s_view_fill(cpset, fast, &v);
++		int t = n2s_pull_target(mode, fast, cprocessor->cpu_id, &v, nord2_sched_pri, BASEPRI_RTQUEUES,
++		    MINPRI_KERNEL);
++		if (t >= 0) {
++			target = processor_array[t];
++			ipi = sched_ipi_action(target, NULL, SCHED_IPI_EVENT_REBALANCE);
++			if (ipi == SCHED_IPI_NONE) {
++				target = PROCESSOR_NULL;
++			} else {
++				os_atomic_inc(&n2s_count.pull_ipi, relaxed);
++			}
++		}
++	}
++
++	sched_SMT_balance(cprocessor, cpset);   /* unlocks cpset */
++
++	if (target != PROCESSOR_NULL) {
++		sched_ipi_perform(target, ipi);
++	}
++}
++
++/* thread_dispatch(): `old` switched off `processor` at `now`, `new` runs. Lock-free, per CPU. */
++void
++nord2_sched_switch(processor_t processor, thread_t old, thread_t new, uint64_t now)
++{
++	if (!nord2_sched_stats) {
++		return;
++	}
++	int cpu = processor->cpu_id;
++	if (cpu < 0 || cpu >= N2S_MAX_CPUS) {
++		return;
++	}
++	struct n2s_cpu *c = &n2s_cpu[cpu];
++	int mode = nord2_sched_mode;
++	uint64_t since = c->since;
++
++	c->since = now;
++	if (since != 0 && now > since && old != processor->idle_thread) {
++		uint64_t d = now - since;
++		c->busy += d;
++		if (n2s_thread_eligible(old, mode)) {
++			c->elig += d;
++		}
++		uint64_t w = nord2_sched_watch_tid;
++		if (w != 0 && old->thread_id == w) {
++			c->watch += d;
++			c->watch_runs++;
++		}
++	}
++	uint32_t fast = n2s_fast_map();
++	if (fast != 0 && new != processor->idle_thread && !bit_test(fast, cpu) && n2s_thread_eligible(new, mode)) {
++		processor_set_t pset = processor->processor_set;
++		if (os_atomic_load(&pset->cpu_state_map[PROCESSOR_IDLE], relaxed) & pset->recommended_bitmask & fast) {
++			c->slow_missed++;
++		}
++	}
++}
++
++void
++nord2_sched_watch_resolve(void)
++{
++	char pat[N2S_WATCH_NAME], name[N2S_WATCH_NAME];
++	thread_t thread;
++	uint64_t tid = 0;
++
++	if (n2s_watch_by_tid) {
++		return;
++	}
++	strlcpy(pat, nord2_sched_watch_name, sizeof(pat));
++	if (pat[0] == '\0') {
++		nord2_sched_watch_tid = 0;
++		return;
++	}
++	lck_mtx_lock(&tasks_threads_lock);
++	queue_iterate(&threads, thread, thread_t, threads) {
++		name[0] = '\0';
++		thread_get_thread_name(thread, name);
++		name[sizeof(name) - 1] = '\0';
++		if (name[0] != '\0' && strnstr(name, pat, sizeof(name)) != NULL) {
++			tid = thread->thread_id;
++			break;
++		}
++	}
++	lck_mtx_unlock(&tasks_threads_lock);
++	nord2_sched_watch_tid = tid;
++}
++
++void
++nord2_sched_watch_set(uint64_t tid, const char *name)
++{
++	if (tid != 0) {
++		n2s_watch_by_tid = true;
++		nord2_sched_watch_tid = tid;
++		return;
++	}
++	if (name != NULL) {
++		strlcpy(nord2_sched_watch_name, name, sizeof(nord2_sched_watch_name));
++	}
++	n2s_watch_by_tid = false;
++	nord2_sched_watch_resolve();
++}
++
++void
++nord2_sched_reset(void)
++{
++	for (int i = 0; i < N2S_MAX_CPUS; i++) {
++		uint64_t since = n2s_cpu[i].since;
++		bzero(&n2s_cpu[i], sizeof(n2s_cpu[i]));
++		n2s_cpu[i].since = since;
++	}
++	bzero(&n2s_count, sizeof(n2s_count));
++}
++
++static uint64_t
++n2s_ns(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns;
++}
++
++size_t
++nord2_sched_text(char *buf, size_t size)
++{
++	uint32_t fast = n2s_fast_map();
++	uint64_t cl[2][4] = {{0}};
++	size_t n;
++
++	nord2_sched_watch_resolve();
++	n = (size_t)snprintf(buf, size, "mode 0x%x pri %d big 0x%x stats %d ab %d/%u watch \"%s\"%s tid %llu\n",
++	    (unsigned)nord2_sched_mode, nord2_sched_pri, (unsigned)fast, nord2_sched_stats, nord2_sched_ab_s, n2s_ab_phase,
++	    nord2_sched_watch_name, n2s_watch_by_tid ? " (by id)" : "", nord2_sched_watch_tid);
++	for (int cpu = 0; cpu < (int)processor_count && cpu < N2S_MAX_CPUS && n < size; cpu++) {
++		struct n2s_cpu c = n2s_cpu[cpu];
++		int f = (fast >> cpu) & 1;
++		cl[f][0] += c.busy;
++		cl[f][1] += c.elig;
++		cl[f][2] += c.watch;
++		cl[f][3] += c.watch_runs;
++		n += (size_t)snprintf(buf + n, size - n, "cpu %d %c busy %llu elig %llu watch %llu watch_runs %llu slow_missed %llu\n",
++		    cpu, f ? 'B' : 'L', n2s_ns(c.busy), n2s_ns(c.elig), n2s_ns(c.watch), c.watch_runs, c.slow_missed);
++	}
++	for (int f = 1; f >= 0 && n < size; f--) {
++		n += (size_t)snprintf(buf + n, size - n, "cluster %c busy %llu elig %llu watch %llu watch_runs %llu\n",
++		    f ? 'B' : 'L', n2s_ns(cl[f][0]), n2s_ns(cl[f][1]), n2s_ns(cl[f][2]), cl[f][3]);
++	}
++	if (n < size) {
++		n += (size_t)snprintf(buf + n, size - n, "placed big_idle %llu big_preempt %llu spill %llu kept_little %llu pull_ipi %llu pulled %llu\n",
++		    n2s_count.fast_idle, n2s_count.fast_preempt, n2s_count.spill, n2s_count.kept_slow,
++		    n2s_count.pull_ipi, n2s_count.pulled);
++	}
++	return n < size ? n : size - 1;
++}
++
++static inline uint64_t
++n2s_delta(uint64_t now, uint64_t prev)
++{
++	return now >= prev ? now - prev : now;  /* a reset counts from 0 (0236) */
++}
++
++/* Two "NORD2 SCHED" lines over the interval since the previous call (each < 240 characters). */
++static void
++nord2_sched_report(uint64_t interval_abs)
++{
++	static uint64_t prev_cpu[N2S_MAX_CPUS][5];
++	static uint64_t prev_count[6];
++	static bool have_prev;
++	uint32_t fast = n2s_fast_map();
++	uint64_t busy[2] = {0}, elig[2] = {0}, watch[2] = {0}, runs = 0, missed = 0;
++	int ncpu[2] = {0};
++	uint64_t ms = n2s_ns(interval_abs) / 1000000;
++
++	if (!nord2_sched_stats) {
++		return;
++	}
++	nord2_sched_watch_resolve();
++	ms = ms ? ms : 1;
++	for (int cpu = 0; cpu < (int)processor_count && cpu < N2S_MAX_CPUS; cpu++) {
++		struct n2s_cpu c = n2s_cpu[cpu];
++		uint64_t now[5] = { c.busy, c.elig, c.watch, c.watch_runs, c.slow_missed };
++		int f = (fast >> cpu) & 1;
++		ncpu[f]++;
++		if (have_prev) {
++			busy[f] += n2s_delta(now[0], prev_cpu[cpu][0]);
++			elig[f] += n2s_delta(now[1], prev_cpu[cpu][1]);
++			watch[f] += n2s_delta(now[2], prev_cpu[cpu][2]);
++			runs += n2s_delta(now[3], prev_cpu[cpu][3]);
++			missed += n2s_delta(now[4], prev_cpu[cpu][4]);
++		}
++		memcpy(prev_cpu[cpu], now, sizeof(now));
++	}
++	uint64_t cnt[6] = { n2s_count.fast_idle, n2s_count.fast_preempt, n2s_count.spill,
++		            n2s_count.kept_slow, n2s_count.pulled, n2s_count.pull_ipi };
++	uint64_t d[6];
++	for (int i = 0; i < 6; i++) {
++		d[i] = have_prev ? n2s_delta(cnt[i], prev_count[i]) * 1000 / ms : 0;
++		prev_count[i] = cnt[i];
++	}
++	if (!have_prev) {
++		have_prev = true;
++		return;
++	}
++	uint64_t span = interval_abs ? interval_abs : 1;
++	uint64_t wsum = watch[0] + watch[1];
++	printf("NORD2 SCHED mode 0x%x pri>=%d ab=%u: big busy %llu%% elig %llu%%, little busy %llu%% elig %llu%%\n",
++	    (unsigned)nord2_sched_mode, nord2_sched_pri, n2s_ab_phase,
++	    busy[1] * 100 / (span * (uint64_t)MAX(ncpu[1], 1)), elig[1] * 100 / (span * (uint64_t)MAX(ncpu[1], 1)),
++	    busy[0] * 100 / (span * (uint64_t)MAX(ncpu[0], 1)), elig[0] * 100 / (span * (uint64_t)MAX(ncpu[0], 1)));
++	printf("NORD2 SCHED watch %s %llu ms/s on big %llu%% %llu runs/s; elig-on-little-while-big-idle %llu/s; "
++	    "placed big-idle %llu/s big-preempt %llu/s spill %llu/s kept-little %llu/s pull %llu/s (ipi %llu/s)\n",
++	    nord2_sched_watch_tid ? "ca" : "-", n2s_ns(wsum) / 1000 / ms,
++	    wsum ? watch[1] * 100 / wsum : 0, runs * 1000 / ms, missed * 1000 / ms,
++	    d[0], d[1], d[2], d[3], d[4], d[5]);
++}
++
++/* ---- per-CPU clock measurement (0095/0140) ---- */
++
++#define N2S_SPIN_LOOPS  32768u  /* x 8 dependent adds = 262144 cycles: ~90 us at 3 GHz, ~0.5 ms at 500 MHz */
++
++static uint64_t __attribute__((noinline))
++n2s_spin(void)
++{
++	uint64_t x = 0, n = N2S_SPIN_LOOPS;
++	__asm__ volatile (
++                "1:\n"
++                "add %0, %0, #1\n" "add %0, %0, #1\n" "add %0, %0, #1\n" "add %0, %0, #1\n"
++                "add %0, %0, #1\n" "add %0, %0, #1\n" "add %0, %0, #1\n" "add %0, %0, #1\n"
++                "subs %1, %1, #1\n"
++                "b.ne 1b\n"
++                : "+r" (x), "+r" (n) : : "cc");
++	return x;
++}
++
++static unsigned
++n2s_mhz_here(void)
++{
++	uint64_t best = UINT64_MAX;
++	for (int i = 0; i < 8; i++) {   /* fastest of 8 skips interrupted runs */
++		uint64_t t0 = mach_absolute_time();
++		(void)n2s_spin();
++		uint64_t t = mach_absolute_time() - t0;
++		best = t < best ? t : best;
++	}
++	return n2s_mhz((uint64_t)N2S_SPIN_LOOPS * 8, n2s_ns(best));
++}
++
++/* Measured clock of XNU CPU `cpu` in MHz; 0 if it is not running. May block: no spinlocks held. */
++unsigned
++nord2_cpu_mhz(int cpu)
++{
++	if (cpu < 0 || cpu >= (int)processor_count) {
++		return 0;
++	}
++	processor_t p = cpu_to_processor(cpu);
++	if (p == PROCESSOR_NULL || p->state == PROCESSOR_OFF_LINE || p->state == PROCESSOR_SHUTDOWN ||
++	    p->state == PROCESSOR_START) {
++		return 0;       /* binding to a CPU that never runs would park this thread for good */
++	}
++	thread_bind(p);
++	thread_block(THREAD_CONTINUE_NULL);
++	unsigned mhz = current_processor() == p ? n2s_mhz_here() : 0;
++	thread_bind(PROCESSOR_NULL);
++	thread_block(THREAD_CONTINUE_NULL);
++	return mhz;
++}
++
++/*
++ * MT6893 CPU DVFS state in the cpuhvfs CSRAM (Android kernel
++ * drivers/misc/mediatek/base/power/cpufreq_v1: CSRAM_BASE 0x0011bc00 size
++ * 0x1400; OFFS_TBL_S 0x10, OFFS_CUR_VPROC_S 0x32c, OFFS_CUR_FREQ_S 0x354
++ * (per cluster LL, L, B: current OPP index), OFFS_SCHED_S 0x3a4 (request:
++ * counter << 4 | index)). Read-only, opt-in (n2csram=1).
++ */
++#define N2S_CSRAM_PA            0x0011bc00ull
++#define N2S_CSRAM_SIZE          0x1400u
++static volatile uint32_t *n2s_csram;
++
++static size_t
++n2s_csram_text(char *buf, size_t size)
++{
++	if (!nord2_csram) {
++		return 0;
++	}
++	if (n2s_csram == NULL) {
++		n2s_csram = (volatile uint32_t *)ml_io_map(N2S_CSRAM_PA, N2S_CSRAM_SIZE);
++		if (n2s_csram == NULL) {
++			return (size_t)snprintf(buf, size, " csram unmapped");
++		}
++	}
++	volatile uint32_t *r = n2s_csram;
++	int n = snprintf(buf, size, " csram cur %u/%u/%u vproc %u/%u sched 0x%x/0x%x/0x%x tbl0 0x%x 0x%x",
++	    r[0x354 / 4], r[0x358 / 4], r[0x35c / 4], r[0x32c / 4], r[0x330 / 4],
++	    r[0x3a4 / 4], r[0x3a8 / 4], r[0x3ac / 4], r[0x10 / 4], r[0x14 / 4]);
++	return n > 0 ? (size_t)n : 0;
++}
++
++/* "NORD2 CPUCLK 0:1999 1:2000 ... MHz"; also the text of kern.nord2_cpuclk. */
++size_t
++nord2_cpuclk_text(char *buf, size_t size)
++{
++	size_t n = (size_t)snprintf(buf, size, "NORD2 CPUCLK");
++	for (int cpu = 0; cpu < (int)processor_count && cpu < N2S_MAX_CPUS && n < size; cpu++) {
++		n += (size_t)snprintf(buf + n, size - n, " %d:%u", cpu, nord2_cpu_mhz(cpu));
++	}
++	if (n < size) {
++		n += (size_t)snprintf(buf + n, size - n, " MHz big 0x%x", (unsigned)n2s_fast_map());
++	}
++	if (n < size) {
++		n += n2s_csram_text(buf + n, size - n);
++	}
++	return n < size ? n : size - 1;
++}
++
++static void
++n2s_sleep_s(unsigned s)
++{
++	assert_wait_timeout((event_t)&n2s_sleep_s, THREAD_UNINT, s, NSEC_PER_SEC);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++n2s_ab_switch(void)
++{
++	n2s_ab_phase ^= 1u;
++	os_atomic_store(&nord2_sched_mode, n2s_ab_phase ? n2s_ab_mode : 0, relaxed);
++	uint64_t ns = n2s_ns(mach_absolute_time());
++	printf("NORD2 SCHED AB phase=%u mode=0x%x t_ms=%llu\n", n2s_ab_phase, (unsigned)nord2_sched_mode, ns / 1000000);
++}
++
++__attribute__((noreturn)) static void
++nord2_sched_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	char line[256];
++	unsigned t = 0, last_clk = 0, last_ab = 0;
++	uint64_t prev = mach_absolute_time();
++
++	n2s_sleep_s(N2S_FIRST_S);
++	t = N2S_FIRST_S;
++	if (nord2_cpuclk_s > 0) {
++		nord2_cpuclk_text(line, sizeof(line));
++		printf("%s\n", line);
++		last_clk = t;
++	}
++	nord2_sched_report(mach_absolute_time() - prev);        /* baseline */
++	prev = mach_absolute_time();
++	last_ab = t;
++	for (;;) {
++		unsigned step = N2S_REPORT_S;
++		if (nord2_sched_ab_s > 0 && (unsigned)nord2_sched_ab_s < step) {
++			step = (unsigned)nord2_sched_ab_s;
++		}
++		n2s_sleep_s(step);
++		t += step;
++		uint64_t now = mach_absolute_time();
++		bool ab_due = nord2_sched_ab_s > 0 && t - last_ab >= (unsigned)nord2_sched_ab_s;
++		nord2_sched_report(now - prev);  /* every step; closes the window of an A/B phase that ends */
++		prev = now;
++		if (ab_due) {
++			n2s_ab_switch();
++			last_ab = t;
++		}
++		if (nord2_cpuclk_s > 0 && t - last_clk >= (unsigned)nord2_cpuclk_s) {
++			nord2_cpuclk_text(line, sizeof(line));
++			printf("%s\n", line);
++			last_clk = t;
++		}
++	}
++}
++
++/* Big CPUs from the ADT (compatible "cortex-a78" etc.) unless n2big gave a mask; start the report thread. */
++static void
++nord2_sched_init(void)
++{
++	DTEntry cpus, child;
++	OpaqueDTEntryIterator iter;
++	uint32_t map = 0;
++	int idx = 0;
++
++	if (nord2_sched_fast == 0 &&
++	    SecureDTLookupEntry(NULL, "/cpus", &cpus) == kSuccess &&
++	    SecureDTInitEntryIterator(cpus, &iter) == kSuccess) {
++		/* XNU numbers CPUs in ADT order (cpus=N takes a prefix) */
++		while (SecureDTIterateEntries(&iter, &child) == kSuccess && idx < N2S_MAX_CPUS) {
++			void const *prop;
++			unsigned int size;
++			if (SecureDTGetProperty(child, "compatible", &prop, &size) == kSuccess &&
++			    n2s_compatible_is_big((const char *)prop, size)) {
++				map |= 1u << idx;
++			}
++			idx++;
++		}
++		nord2_sched_fast = (int)map;
++	}
++	if (nord2_sched_ab_s != 0 && (nord2_sched_ab_s < 30 || nord2_sched_ab_s > 3600)) {
++		nord2_sched_ab_s = 0;
++	}
++	n2s_ab_mode = nord2_sched_mode & N2S_MODE_MASK;
++	if (nord2_sched_ab_s > 0) {
++		if (n2s_ab_mode == 0) {
++			n2s_ab_mode = N2S_PLACE | N2S_PREEMPT | N2S_KEEPFREE | N2S_PULL;
++		}
++		nord2_sched_mode = 0;   /* phase 0 first */
++	}
++	printf("NORD2 SCHED init: big CPUs 0x%x (%s), mode 0x%x, eligible pri >= %d, stats %d, ab %d s (mode 0x%x), clk %d s, csram %d\n",
++	    (unsigned)nord2_sched_fast, map ? "ADT" : "n2big/none", (unsigned)nord2_sched_mode, nord2_sched_pri,
++	    nord2_sched_stats, nord2_sched_ab_s, (unsigned)n2s_ab_mode, nord2_cpuclk_s, nord2_csram);
++
++	thread_t thread;
++	if (kernel_thread_start(nord2_sched_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "nord2_sched");
++		thread_deallocate(thread);
++	}
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, nord2_sched_init);
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/osfmk/kern/nord2_sched_policy.h b/osfmk/kern/nord2_sched_policy.h
+new file mode 100644
+--- /dev/null
++++ b/osfmk/kern/nord2_sched_policy.h
+@@ -0,0 +1,193 @@
++/*
++ * Nord2 core-aware placement: pure decision logic (no XNU types), shared by
++ * osfmk/kern/nord2_sched.c and the host test tests/nord2_sched_policy_test.c.
++ *
++ * Ported from rotten-apple (ansuz-metal) xnu patch 0212 rottenapple_sched.c
++ * (docs/SCHED.md there), same policy shape as XNU's sched_amp_common.c:
++ * prefer big cores for UI-priority threads, spill to little cores under
++ * load, keep big cores free of background work, pull back when a big core
++ * idles. Nord2 (MT6893): cpu0-3 Cortex-A55, cpu4-6 Cortex-A78 2.6 GHz,
++ * cpu7 Cortex-A78 3.0 GHz, all in ADT cluster 0 (SMP), so stock
++ * choose_processor() fills the lowest idle CPU number (the A55s) first.
++ */
++#ifndef NORD2_SCHED_POLICY_H
++#define NORD2_SCHED_POLICY_H
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#define N2S_PLACE       0x01    /* eligible thread -> an idle big CPU */
++#define N2S_PREEMPT     0x02    /* no big CPU idle: preempt a big CPU running a non-eligible lower-priority thread */
++#define N2S_KEEPFREE    0x04    /* non-eligible thread -> an idle little CPU before an idle big one */
++#define N2S_PULL        0x08    /* (with PLACE) a big CPU going idle pulls an eligible thread off a little CPU */
++#define N2S_KERNEL      0x10    /* kernel_task threads may be eligible */
++#define N2S_MODE_MASK   0x1f
++
++#define N2S_MAX_CPUS    32
++
++enum n2s_reason {
++	N2S_R_FALLBACK = 0,     /* stock choose_processor() */
++	N2S_R_FAST_IDLE,        /* PLACE */
++	N2S_R_FAST_PREEMPT,     /* PREEMPT */
++	N2S_R_SPILL,            /* eligible, stock choice (counted as spill if it lands on a little CPU) */
++	N2S_R_KEPT_SLOW,        /* KEEPFREE */
++};
++
++/* What the policy sees of a processor set (bit i = XNU CPU i). */
++struct n2s_view {
++	uint32_t avail;         /* available & recommended & primary */
++	uint32_t idle;          /* PROCESSOR_IDLE */
++	uint32_t running;       /* RUNNING|DISPATCHING without a pending urgent/preempt AST */
++	int16_t  cur_pri[N2S_MAX_CPUS];
++	uint8_t  bound[N2S_MAX_CPUS];   /* current thread bound to that CPU */
++};
++
++static inline int
++n2s_lsb(uint32_t m)
++{
++	return m ? __builtin_ctz(m) : -1;
++}
++
++static inline int
++n2s_pick(uint32_t map, int hint)
++{
++	if (hint >= 0 && hint < N2S_MAX_CPUS && (map >> hint) & 1u) {
++		return hint;
++	}
++	return n2s_lsb(map);
++}
++
++/* thread eligibility: max(sched_pri, base_pri) >= threshold, not realtime, kernel only with N2S_KERNEL */
++static inline bool
++n2s_eligible(int mode, int sched_pri, int base_pri, int threshold, int rt_floor, bool kernel_thread)
++{
++	int pri = sched_pri > base_pri ? sched_pri : base_pri;
++	if (pri < threshold || sched_pri >= rt_floor) {
++		return false;
++	}
++	return !kernel_thread || (mode & N2S_KERNEL);
++}
++
++/*
++ * Returns the CPU to dispatch on, or -1 for the stock choice; *reason says why.
++ * decayed: a timeshare thread whose sched_pri fell below its base_pri (it
++ * would not preempt; let the stock choice place it).
++ */
++static inline int
++n2s_choose(int mode, uint32_t fast, const struct n2s_view *v, int hint, bool eligible,
++    bool decayed, int thread_pri, int threshold, int *reason)
++{
++	uint32_t avail = v->avail, slow = avail & ~fast, idle = v->idle & avail;
++
++	*reason = N2S_R_FALLBACK;
++	fast &= avail;
++	if (!(mode & N2S_MODE_MASK) || fast == 0 || slow == 0) {
++		return -1;
++	}
++	if (eligible) {
++		if ((mode & N2S_PLACE) && (idle & fast)) {
++			*reason = N2S_R_FAST_IDLE;
++			return n2s_pick(idle & fast, hint);
++		}
++		if ((mode & N2S_PREEMPT) && !decayed) {
++			uint32_t run = v->running & fast;
++			int victim = -1;
++			for (int c = n2s_lsb(run); c >= 0; run &= run - 1, c = n2s_lsb(run)) {
++				if (!v->bound[c] && (victim < 0 || v->cur_pri[c] < v->cur_pri[victim])) {
++					victim = c;
++				}
++			}
++			if (victim >= 0 && v->cur_pri[victim] < threshold && v->cur_pri[victim] < thread_pri) {
++				*reason = N2S_R_FAST_PREEMPT;
++				return victim;
++			}
++		}
++		*reason = N2S_R_SPILL;
++		return -1;
++	}
++	if ((mode & N2S_KEEPFREE) && (idle & slow)) {
++		*reason = N2S_R_KEPT_SLOW;
++		return n2s_pick(idle & slow, hint);
++	}
++	return -1;
++}
++
++/* PULL: should an eligible thread on little CPU `cpu` leave it (a big CPU idles)? */
++static inline bool
++n2s_avoid(int mode, uint32_t fast, int cpu, uint32_t idle_avail, bool eligible, bool bound)
++{
++	if ((mode & (N2S_PLACE | N2S_PULL)) != (N2S_PLACE | N2S_PULL) || fast == 0 ||
++	    cpu < 0 || cpu >= N2S_MAX_CPUS || ((fast >> cpu) & 1u) || bound || !eligible) {
++		return false;
++	}
++	return (idle_avail & fast) != 0;
++}
++
++/* PULL: big CPU `cpu` goes idle: the little CPU running the highest eligible priority, or -1. */
++static inline int
++n2s_pull_target(int mode, uint32_t fast, int cpu, const struct n2s_view *v, int threshold,
++    int rt_floor, int kernel_floor)
++{
++	if ((mode & (N2S_PLACE | N2S_PULL)) != (N2S_PLACE | N2S_PULL) || cpu < 0 ||
++	    cpu >= N2S_MAX_CPUS || !((fast >> cpu) & 1u)) {
++		return -1;
++	}
++	uint32_t cand = v->running & ~fast;
++	int best = -1, target = -1;
++	for (int c = n2s_lsb(cand); c >= 0; cand &= cand - 1, c = n2s_lsb(cand)) {
++		int pri = v->cur_pri[c];
++		if (pri < threshold || pri >= rt_floor || v->bound[c]) {
++			continue;
++		}
++		if (!(mode & N2S_KERNEL) && pri >= kernel_floor) {
++			continue;       /* almost surely a kernel thread: avoid a useless IPI */
++		}
++		if (pri > best) {
++			best = pri;
++			target = c;
++		}
++	}
++	return target;
++}
++
++/* Big-core detection from an ADT "compatible" string list (NUL separated). */
++static inline bool
++n2s_compatible_is_big(const char *list, unsigned size)
++{
++	static const char *const big[] = { "cortex-a78", "cortex-a77", "cortex-a76", "cortex-x1" };
++	unsigned i = 0;
++	while (i < size) {
++		const char *s = list + i;
++		unsigned n = 0;
++		while (i + n < size && s[n] != '\0') {
++			n++;
++		}
++		for (unsigned b = 0; b < sizeof(big) / sizeof(big[0]); b++) {
++			const char *p = big[b];
++			unsigned plen = 0;
++			while (p[plen]) {
++				plen++;
++			}
++			for (unsigned k = 0; k + plen <= n; k++) {
++				unsigned j = 0;
++				while (j < plen && s[k + j] == p[j]) {
++					j++;
++				}
++				if (j == plen) {
++					return true;
++				}
++			}
++		}
++		i += n + 1;
++	}
++	return false;
++}
++
++/* MHz from a dependent-add chain of `cycles` single-cycle adds that took `ns`. */
++static inline unsigned
++n2s_mhz(uint64_t cycles, uint64_t ns)
++{
++	return ns ? (unsigned)((cycles * 1000ull + ns / 2) / ns) : 0;
++}
++
++#endif /* NORD2_SCHED_POLICY_H */
+diff --git a/bsd/dev/nord2_sched_sysctl.c b/bsd/dev/nord2_sched_sysctl.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/nord2_sched_sysctl.c
+@@ -0,0 +1,138 @@
++/*
++ * Nord2 patch 0099: sysctls of the core-aware placement and the CPU clock
++ * readout (osfmk/kern/nord2_sched.c). Ported from the sysctl block of
++ * rotten-apple (ansuz-metal) 0212 bsd/dev/rottenapple_top.c.
++ *
++ *   kern.nord2_sched_mode   rw int  placement mode bits (0 = stock)
++ *   kern.nord2_sched_pri    rw int  lowest eligible priority
++ *   kern.nord2_sched_fast   rw int  big-CPU mask
++ *   kern.nord2_sched_stats  rw int  per-switch accounting on/off
++ *   kern.nord2_sched        ro text totals since boot or reset
++ *   kern.nord2_sched_reset  wo int  1 zeroes the totals
++ *   kern.nord2_sched_watch  rw text watched thread name substring, or a thread id
++ *   kern.nord2_cpuclk       ro text measures every CPU now ("NORD2 CPUCLK ...")
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <kern/kalloc.h>
++
++extern int nord2_sched_mode, nord2_sched_pri, nord2_sched_fast, nord2_sched_stats;
++extern char nord2_sched_watch_name[64];
++extern void nord2_sched_watch_set(uint64_t tid, const char *name);
++extern void nord2_sched_reset(void);
++extern size_t nord2_sched_text(char *buf, size_t size);
++extern size_t nord2_cpuclk_text(char *buf, size_t size);
++
++SYSCTL_INT(_kern, OID_AUTO, nord2_sched_mode, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_sched_mode, 0,
++    "core-aware placement: 1 place, 2 preempt, 4 keep big free, 8 pull, 16 kernel threads (nord2 0099)");
++SYSCTL_INT(_kern, OID_AUTO, nord2_sched_pri, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_sched_pri, 0,
++    "core-aware placement: lowest eligible priority (nord2 0099)");
++SYSCTL_INT(_kern, OID_AUTO, nord2_sched_fast, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_sched_fast, 0,
++    "core-aware placement: big CPU mask (nord2 0099)");
++SYSCTL_INT(_kern, OID_AUTO, nord2_sched_stats, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_sched_stats, 0,
++    "core-aware placement: per-CPU accounting (nord2 0099)");
++
++static int
++n2_text_out(struct sysctl_req *req, size_t (*fill)(char *, size_t))
++{
++	const size_t size = 2048;
++	int err;
++
++	if (req->newptr != USER_ADDR_NULL) {
++		return EPERM;
++	}
++	if (req->oldptr == USER_ADDR_NULL) {
++		req->oldidx = size;     /* size query: the text may grow before the read */
++		return 0;
++	}
++	char *buf = kalloc_data(size, Z_WAITOK | Z_ZERO);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	size_t n = fill(buf, size);
++	buf[n] = '\0';
++	err = SYSCTL_OUT(req, buf, n + 1);
++	kfree_data(buf, size);
++	return err;
++}
++
++static int
++sysctl_nord2_sched SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	return n2_text_out(req, nord2_sched_text);
++}
++SYSCTL_PROC(_kern, OID_AUTO, nord2_sched, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_nord2_sched, "A", "core-aware placement totals (nord2 0099)");
++
++static int
++sysctl_nord2_cpuclk SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	return n2_text_out(req, nord2_cpuclk_text);
++}
++SYSCTL_PROC(_kern, OID_AUTO, nord2_cpuclk, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_nord2_cpuclk, "A", "measured clock of every CPU in MHz (nord2 0099)");
++
++static int
++sysctl_nord2_sched_watch SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	char name[64];
++	int err;
++
++	strlcpy(name, nord2_sched_watch_name, sizeof(name));
++	if (req->newptr == USER_ADDR_NULL) {
++		return SYSCTL_OUT(req, name, strlen(name) + 1);
++	}
++	size_t len = req->newlen;
++	if (len == 0 || len >= sizeof(name)) {
++		return EINVAL;
++	}
++	bzero(name, sizeof(name));
++	err = SYSCTL_IN(req, name, len);
++	if (err != 0) {
++		return err;
++	}
++	/* printable NUL-terminated text = name substring; a 4/8-byte non-text value = thread id (0: back to the name) */
++	bool text = name[len - 1] == '\0';
++	for (size_t i = 0; text && i + 1 < len; i++) {
++		text = name[i] >= 0x20 && name[i] < 0x7f;
++	}
++	if (!text && (len == sizeof(uint32_t) || len == sizeof(uint64_t))) {
++		uint64_t tid = 0;
++		memcpy(&tid, name, len);
++		nord2_sched_watch_set(tid, NULL);
++		return 0;
++	}
++	if (!text) {
++		return EINVAL;
++	}
++	nord2_sched_watch_set(0, name);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, nord2_sched_watch, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_nord2_sched_watch, "A", "core-aware placement: watched thread name or id (nord2 0099)");
++
++static int
++sysctl_nord2_sched_reset SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = 0, err;
++
++	err = sysctl_handle_int(oidp, &v, 0, req);
++	if (err != 0 || req->newptr == USER_ADDR_NULL) {
++		return err;
++	}
++	if (v != 0) {
++		nord2_sched_reset();
++	}
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, nord2_sched_reset, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_nord2_sched_reset, "I", "core-aware placement: write 1 to zero the totals (nord2 0099)");
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */

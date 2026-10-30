@@ -1,0 +1,80 @@
+--- a/gpu/src/Nord2GPU.cpp
++++ b/gpu/src/Nord2GPU.cpp
+@@ -170,6 +170,7 @@
+         void emitJobStats();
+         void surfaceHook(void *surface, bool acquire);
+         bool surfaceBusy(void *surface);
++        static int pmicRead(void *);   /* 0116: one PMIC register read on the PWRAP owner thread (CPU DVFS init voltages) */
+         /* Optional job interrupt (boot-arg nord2_gpu_irq=1; polling stays the fallback). */
+         bool irqWanted = false, irqTried = false, irqArmed = false;
+         uint32_t irqSpi = NORD2_GPU_JOB_SPI_DEFAULT, irqIntid = 0, irqLearnMisses = 0;
+@@ -701,6 +702,29 @@
+         if (!t || !v || v != kOSBooleanTrue) return false;
+         *centi = (int)(int32_t)t->unsigned32BitValue(); return true;
+ }
++/* 0116, used by bsd/dev/nord2_cpufreq.c (CPU DVFS init): read-only access to the PMIC registers the stock regulators read for the init voltages.  bus 0 = MT6315 on SPMI
++ * (8-bit register of slave `sid`), bus 1 = MT6359P on PWRAP (16-bit register).  Runs on the owner thread like every other rail transaction; returns 0 and the value, or
++ * -1 when the GPU driver is not ready, the owner thread is not polling, or the read failed.  Never writes. */
++struct PmicReq { Nord2GPU *d; unsigned bus, sid, reg, val; int rc; };
++int Nord2GPU::pmicRead(void *p) {
++        PmicReq *q = (PmicReq *)p;
++        if (q->bus == 0) { uint8_t v = 0; q->rc = n2pmif_spmi_read(&q->d->pm15, (uint8_t)q->sid, (uint16_t)q->reg, &v); q->val = v; }
++        else { uint16_t v = 0; q->rc = n2pmif_pwrap_read(&q->d->pm59, (uint16_t)q->reg, &v); q->val = v; }
++        return q->rc;
++}
++extern "C" int nord2_pmic_read(unsigned bus, unsigned sid, unsigned reg, unsigned *val) {
++        Nord2GPU *d = gSurfaceGpu;
++        if (!d || !d->ready || d->stopping || !val || bus > 1 || !n2owner_ready(&gpu_owner_queue)) return -1;
++        PmicReq q = { d, bus, sid, reg, 0, -1 };
++        int result = -1;
++        IOLockLock(d->lock);
++        n2owner_wait wait = { now_ms, sleep_ms, NULL };
++        bool ok = !d->stopping && n2owner_call(&gpu_owner_queue, Nord2GPU::pmicRead, &q, &wait, 1000, &result);
++        IOLockUnlock(d->lock);
++        if (!ok || result || q.rc) return -1;
++        *val = q.val;
++        return 0;
++}
+ /* Used by bsd/dev/nord2_cpufreq.c (patch 0104): the battery gauge is the only temperature the CPU DVFS guard has. */
+ extern "C" bool nord2_battery_temperature_cC(int *centi) { return battery_temperature(centi); }
+ void Nord2GPU::emitJobStats() {
+--- a/shim/nord2-xnu/Nord2GPU.cpp
++++ b/shim/nord2-xnu/Nord2GPU.cpp
+@@ -170,6 +170,7 @@
+         void emitJobStats();
+         void surfaceHook(void *surface, bool acquire);
+         bool surfaceBusy(void *surface);
++        static int pmicRead(void *);   /* 0116: one PMIC register read on the PWRAP owner thread (CPU DVFS init voltages) */
+         /* Optional job interrupt (boot-arg nord2_gpu_irq=1; polling stays the fallback). */
+         bool irqWanted = false, irqTried = false, irqArmed = false;
+         uint32_t irqSpi = NORD2_GPU_JOB_SPI_DEFAULT, irqIntid = 0, irqLearnMisses = 0;
+@@ -701,6 +702,29 @@
+         if (!t || !v || v != kOSBooleanTrue) return false;
+         *centi = (int)(int32_t)t->unsigned32BitValue(); return true;
+ }
++/* 0116, used by bsd/dev/nord2_cpufreq.c (CPU DVFS init): read-only access to the PMIC registers the stock regulators read for the init voltages.  bus 0 = MT6315 on SPMI
++ * (8-bit register of slave `sid`), bus 1 = MT6359P on PWRAP (16-bit register).  Runs on the owner thread like every other rail transaction; returns 0 and the value, or
++ * -1 when the GPU driver is not ready, the owner thread is not polling, or the read failed.  Never writes. */
++struct PmicReq { Nord2GPU *d; unsigned bus, sid, reg, val; int rc; };
++int Nord2GPU::pmicRead(void *p) {
++        PmicReq *q = (PmicReq *)p;
++        if (q->bus == 0) { uint8_t v = 0; q->rc = n2pmif_spmi_read(&q->d->pm15, (uint8_t)q->sid, (uint16_t)q->reg, &v); q->val = v; }
++        else { uint16_t v = 0; q->rc = n2pmif_pwrap_read(&q->d->pm59, (uint16_t)q->reg, &v); q->val = v; }
++        return q->rc;
++}
++extern "C" int nord2_pmic_read(unsigned bus, unsigned sid, unsigned reg, unsigned *val) {
++        Nord2GPU *d = gSurfaceGpu;
++        if (!d || !d->ready || d->stopping || !val || bus > 1 || !n2owner_ready(&gpu_owner_queue)) return -1;
++        PmicReq q = { d, bus, sid, reg, 0, -1 };
++        int result = -1;
++        IOLockLock(d->lock);
++        n2owner_wait wait = { now_ms, sleep_ms, NULL };
++        bool ok = !d->stopping && n2owner_call(&gpu_owner_queue, Nord2GPU::pmicRead, &q, &wait, 1000, &result);
++        IOLockUnlock(d->lock);
++        if (!ok || result || q.rc) return -1;
++        *val = q.val;
++        return 0;
++}
+ /* Used by bsd/dev/nord2_cpufreq.c (patch 0104): the battery gauge is the only temperature the CPU DVFS guard has. */
+ extern "C" bool nord2_battery_temperature_cC(int *centi) { return battery_temperature(centi); }
+ void Nord2GPU::emitJobStats() {

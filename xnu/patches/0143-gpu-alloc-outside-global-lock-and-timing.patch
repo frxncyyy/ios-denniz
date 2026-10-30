@@ -1,0 +1,90 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -219,7 +219,7 @@
+         bool start(IOService *) APPLE_KEXT_OVERRIDE;
+         void stop(IOService *) APPLE_KEXT_OVERRIDE;
+         void free() APPLE_KEXT_OVERRIDE;
+-        IOReturn mapBuffer(unsigned, uint64_t, uint32_t, uint32_t *, uint64_t *, uint64_t *);
++        IOReturn mapBuffer(unsigned, uint64_t, uint32_t, uint32_t *, uint64_t *, uint64_t *, bool dropLock = false);
+         IOReturn importSurface(unsigned, uint32_t, uint32_t, uint32_t, uint32_t *, uint64_t *, uint64_t *);
+         IOReturn compute(unsigned, const nord2_gpu_compute_request *, uint64_t *);
+         void status(nord2_gpu_status *);
+@@ -936,7 +936,7 @@
+         lastBudgetLog = t; budgetSuppressed = 0;
+ }
+ IOReturn Nord2GPU::mapBuffer(unsigned c, uint64_t bytes, uint32_t flags,
+-                            uint32_t *h, uint64_t *va, uint64_t *actual) {
++                            uint32_t *h, uint64_t *va, uint64_t *actual, bool dropLock) {
+         if (!ready || !core || c >= N2C_MAX_CTX) return kIOReturnNotReady;
+         uint64_t requested = bytes;
+         if ((flags & ~7u) || ((flags & 2u) && (flags & 4u))) return kIOReturnBadArgument;   /* bit0 executable, bit1 GPU-only (never CPU-mapped), bit2 CPU write-combine (no CPU cache maintenance) */
+@@ -946,6 +946,10 @@
+         if (!nord2_gpu_global_private_ok(privateTotal(), bytes, globalLimit)) {
+                 budgetReject("global-private", c, requested, globalLimit); return kIOReturnNoMemory;
+         }
++        /* 0143: building the memory (allocation, wiring, zero fill, page walk) is the expensive part, a few ms and up to 100 ms for a big buffer: it
++         * does not touch the core, so the global lock (job dispatch, completions) is released meanwhile when the caller is a client's ALLOC. */
++        uint64_t t0 = now_us(NULL), t1 = t0, t2 = t0, t3 = t0, t4 = t0;
++        if (dropLock) IOLockUnlock(lock);
+         static unsigned extLogs; bool ext = (flags & 6u) != 0; bool lg = ext && extLogs < 4; if (lg) extLogs++;
+         bool pageableWc = (flags & 4u) && (gAllocExt & 4u);
+         if (lg) { IOLog("NORD2 GPU EXT: flags=%u bytes=%llu pageable=%d stage=md-create\n", flags, bytes, (int)pageableWc); }
+@@ -957,14 +961,16 @@
+                 md = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared | ((flags & 4u) ? kIOMapWriteCombineCache : 0), (vm_size_t)bytes, 16384);
+         }
+         if (lg) { IOLog("NORD2 GPU EXT: flags=%u md=%p stage=md-created\n", flags, (void *)md); }
+-        if (!md) return kIOReturnNoMemory;
++        t1 = now_us(NULL);
++        if (!md) { if (dropLock) IOLockLock(lock); return kIOReturnNoMemory; }
+         BufferOwner *owner = (BufferOwner *)IOMallocZero(sizeof(*owner));
+         unsigned count = (unsigned)(bytes / 4096);
+         n2c_page *pages = (n2c_page *)IOMallocZero(count * sizeof(*pages));
+-        if (!owner || !pages) { if (owner) IOFree(owner, sizeof(*owner)); if (pages) IOFree(pages, count*sizeof(*pages)); md->release(); return kIOReturnNoMemory; }
++        if (!owner || !pages) { if (owner) IOFree(owner, sizeof(*owner)); if (pages) IOFree(pages, count*sizeof(*pages)); md->release(); if (dropLock) IOLockLock(lock); return kIOReturnNoMemory; }
+         if (pageableWc) {
+-                if (md->prepare(kIODirectionInOut) != kIOReturnSuccess) { IOFree(owner, sizeof(*owner)); IOFree(pages, count*sizeof(*pages)); md->release(); return kIOReturnNoMemory; }
++                if (md->prepare(kIODirectionInOut) != kIOReturnSuccess) { IOFree(owner, sizeof(*owner)); IOFree(pages, count*sizeof(*pages)); md->release(); if (dropLock) IOLockLock(lock); return kIOReturnNoMemory; }
+                 owner->prepared = true;
++                t2 = now_us(NULL);
+                 if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=prepared\n", flags); }
+                 static uint8_t zeros[65536];   /* 0141: 64 KiB per call, not 4 KiB */
+                 for (uint64_t off = 0; off < bytes; off += sizeof(zeros)) { uint64_t n = bytes - off < sizeof(zeros) ? bytes - off : sizeof(zeros); md->writeBytes(off, zeros, (IOByteCount)n); }
+@@ -972,6 +978,7 @@
+                 if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=bzero\n", flags); }
+                 bzero(md->getBytesNoCopy(), (size_t)bytes);
+         }
++        t3 = now_us(NULL);
+         if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=zeroed\n", flags); }
+         bool valid = true;
+         for (unsigned i = 0; i < count; i++) {
+@@ -979,12 +986,21 @@
+                 pages[i].cpu = pageableWc ? NULL : (uint8_t *)md->getBytesNoCopy() + (uint64_t)i * 4096;
+                 if (!valid_ram(pages[i].pa) || length < 4096) valid = false;
+         }
++        t4 = now_us(NULL);
+         if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=segments valid=%d\n", flags, (int)valid); }
++        if (dropLock) {
++                IOLockLock(lock);
++                if (!ready || stopping || !core) { IOFree(pages, count * sizeof(*pages)); owner->md = md; free_owner(this, owner); return kIOReturnNotReady; }
++        }
+         owner->md = md; bool adopted = false;
+         enum n2c_error e = valid ? n2c_bo_map(core, c, pages, count, N2C_BO_GPU_READ | N2C_BO_GPU_WRITE |
+                 ((flags & 1) ? N2C_BO_GPU_EXEC : 0) | ((flags & 2) ? N2C_BO_GPU_ONLY : 0) | ((flags & 4u) ? N2C_BO_CPU_UNCACHED : 0), owner, bytes, h, va, &adopted) : N2C_E_ARGS;
+         IOFree(pages, count * sizeof(*pages)); if (!adopted) free_owner(this, owner);
+         if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=mapped e=%d\n", flags, (int)e); }
++        { static unsigned slowLogs; uint64_t t5 = now_us(NULL);
++          if (t5 - t0 >= 2000 && slowLogs < 60) { slowLogs++;
++                IOLog("NORD2 GPU ALLOC SLOW: bytes=%llu flags=%u md=%llu prepare=%llu zero=%llu segments=%llu map=%llu total=%llu us (lock %s)\n", bytes, flags,
++                      t1 - t0, t2 > t1 ? t2 - t1 : 0, t3 > t2 ? t3 - t2 : 0, t4 - t3, t5 - t4, t5 - t0, dropLock ? "dropped" : "held"); } }
+         if (e == N2C_OK) {
+                 *actual = bytes;
+                 if ((*h >> 8) <= 8 || bytes >= (8ull << 20)) {
+@@ -1240,7 +1256,7 @@
+         switch(sel){
+         case NORD2_GPU_SEL_ALLOC: {
+                 if((a->scalarInput[1] & ~1ull) && (a->scalarInput[1]>7 || (((a->scalarInput[1]>>1)&1u) && !(gAllocExt&1u)) || (((a->scalarInput[1]>>2)&1u) && !(gAllocExt&6u)))){result=kIOReturnBadArgument;break;}   /* 0135/0136: bit0 exec, bit1 GPU-only (n2ext&1), bit2 CPU write-combine (n2ext&2) */
+-                uint32_t h;uint64_t va,size;result=gpu->mapBuffer(context,a->scalarInput[0],(uint32_t)a->scalarInput[1],&h,&va,&size);
++                uint32_t h;uint64_t va,size;result=gpu->mapBuffer(context,a->scalarInput[0],(uint32_t)a->scalarInput[1],&h,&va,&size,true);
+                 if(result==kIOReturnSuccess){a->scalarOutput[0]=h;a->scalarOutput[1]=va;a->scalarOutput[2]=size;a->scalarOutputCount=3;}break;
+         }
+         case NORD2_GPU_SEL_RELEASE:

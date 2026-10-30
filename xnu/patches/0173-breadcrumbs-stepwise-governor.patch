@@ -1,0 +1,158 @@
+--- a/bsd/dev/nord2_dvfs.h
++++ b/bsd/dev/nord2_dvfs.h
+@@ -560,6 +560,7 @@
+ #define N2D_GOV_IDLE_L_MHZ      1046u        /* slowest the governor goes (the bootloader rows 700/659 MHz are only for the fallback) */
+ #define N2D_GOV_IDLE_B_MHZ      1108u
+ #define N2D_GOV_SLOW_TICK_MS    2000u
++#define N2D_GOV_STEP_MS         2u
+ 
+ struct n2d_gov {
+ 	uint8_t limit[3];            /* fastest row the thermal guard allows (>= st->target) */
+@@ -585,18 +586,25 @@
+ static inline void
+ n2d_set_row_fast(const struct n2d_ops *o, void *ctx, struct n2d_state *st, unsigned c, unsigned row)
+ {
+-	uint8_t next[3] = { st->cur[0], st->cur[1], st->cur[2] };
+-	next[c] = (uint8_t)row;
+-	uint32_t cci = n2dv_cci_row(next[N2DV_LL], next[N2DV_B]);
+-	if (row < st->cur[c]) {
+-		o->w32(ctx, N2DV_OFF_REQ + 4 * N2DV_CCI, cci);
+-	}
+-	o->w32(ctx, N2DV_OFF_PPM_LIMIT + 4 * c, (uint32_t)row << 16 | row);
+-	o->w32(ctx, N2DV_OFF_REQ + 4 * c, row);
+-	if (row >= st->cur[c]) {
+-		o->w32(ctx, N2DV_OFF_REQ + 4 * N2DV_CCI, cci);
++	/* One row at a time (the transition the firmware was verified with), N2D_GOV_STEP_MS apart; a jump over 12 rows costs ~25 ms.  A multi-row jump in one store crashed the phone (p73). */
++	while (st->cur[c] != row) {
++		unsigned step = st->cur[c] > row ? (unsigned)st->cur[c] - 1u : (unsigned)st->cur[c] + 1u;
++		uint8_t next[3] = { st->cur[0], st->cur[1], st->cur[2] };
++		next[c] = (uint8_t)step;
++		uint32_t cci = n2dv_cci_row(next[N2DV_LL], next[N2DV_B]);
++		if (step < st->cur[c]) {
++			o->w32(ctx, N2DV_OFF_REQ + 4 * N2DV_CCI, cci);
++		}
++		o->w32(ctx, N2DV_OFF_PPM_LIMIT + 4 * c, (uint32_t)step << 16 | step);
++		o->w32(ctx, N2DV_OFF_REQ + 4 * c, step);
++		if (step >= st->cur[c]) {
++			o->w32(ctx, N2DV_OFF_REQ + 4 * N2DV_CCI, cci);
++		}
++		st->cur[c] = (uint8_t)step;
++		if (st->cur[c] != row) {
++			o->sleep_ms(ctx, N2D_GOV_STEP_MS);
++		}
+ 	}
+-	st->cur[c] = (uint8_t)row;
+ }
+ 
+ static inline void
+--- a/bsd/dev/nord2_cpufreq.c
++++ b/bsd/dev/nord2_cpufreq.c
+@@ -42,6 +42,7 @@
+ extern unsigned nord2_cpu_mhz(int cpu);                                                /* nord2_sched.c (0099) */
+ extern int nord2_sched_mode;                                                            /* nord2_sched.c (0099): placement mode bits */
+ extern bool nord2_battery_temperature_cC(int *centi);                                  /* Nord2GPU.cpp */
++extern void nord2_bc(unsigned tag, unsigned a, unsigned b);                                  /* Nord2GPU.cpp (0173): breadcrumb in the persistent area */
+ extern int nord2_cpu_util_permille(int cpu);                                            /* Nord2GPU.cpp (0172): busy permille over the last ~100 ms */
+ extern int nord2_gpu_pmic_ready(void);  /* Nord2GPU.cpp (0142): the GPU driver is ready and its PMIC owner thread answers */
+ extern int nord2_pmic_read(unsigned bus, unsigned sid, unsigned reg, unsigned *val);  /* Nord2GPU.cpp (0116): read-only PMIC access on the owner thread */
+@@ -60,6 +61,7 @@
+ static void
+ n2cf_wr(__unused void *ctx, uint32_t off, uint32_t v)
+ {
++	nord2_bc(0x40, off, v);
+ 	n2cf_csram[off / 4] = v;
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -82,6 +82,10 @@
+         return 0;
+ }
+ 
++#define N2BC_PA 0x48110000ull
++#define N2BC_SLOTS 256u
++static volatile uint32_t *n2bc;
++static uint32_t n2bc_idx;
+ /* 0169: persistent last-log ring.  The USB capture and the 4 MiB live stream die with the phone; a crash (p69) left no trace.  Two alternating 256 KiB rings in the unused Android
+  * pstore area (0x48090000, 0x480D0000; the pmsg ring at 0x48160000 is separate) get a copy of the live stream every 100 ms.  The next boot prints the tail of the newest ring as
+  * "NORD2 PREV:" lines, so whatever the previous boot said last is in the capture.  Header: magic, boot_seq, wpos (total bytes written, wraps in the data area), cap (data bytes). */
+@@ -119,6 +123,21 @@
+                 if (rgu) IOLog("NORD2 RST: rgu mode=%08x length=%08x sta=%08x [10]=%08x [14]=%08x [18]=%08x [1c]=%08x nonrst20=%08x nonrst24=%08x [28]=%08x [2c]=%08x\n",
+                                rgu[0], rgu[1], rgu[3], rgu[4], rgu[5], rgu[6], rgu[7], rgu[8], rgu[9], rgu[10], rgu[11]);
+         }
++        {   /* 0173: previous boot's breadcrumbs (oldest first, last 40), then restart the buffer */
++                n2bc = (volatile uint32_t *)ml_io_map(N2BC_PA, N2BC_SLOTS * 16 + 16);
++                if (n2bc) {
++                        uint32_t n = n2bc[1], magic = n2bc[0];
++                        if (magic == 0x4e324243u && n) {
++                                uint32_t cnt = n < 40 ? n : 40;
++                                IOLog("NORD2 BC: previous boot: %u accesses recorded, last %u (tag: 0x1x bank read, 0x2x bank write, x = bank index in map order, a = offset, b = value; 0x40 CSRAM store, 0x5x stats tick)\n", n, cnt);
++                                for (uint32_t k = 0; k < cnt; k++) {
++                                        volatile uint32_t *e = n2bc + 4 + ((n - cnt + k) % N2BC_SLOTS) * 4;
++                                        IOLog("NORD2 BC: t=%08x cpu%u tag=%02x a=%08x b=%08x\n", e[0], e[1] >> 24, e[1] & 0xff, e[2], e[3]);
++                                }
++                        } else IOLog("NORD2 BC: no previous breadcrumbs\n");
++                        n2bc[1] = 0; n2bc_idx = 0; n2bc[0] = 0x4e324243u;
++                }
++        }
+         n2lr_map[0] = (volatile uint8_t *)ml_io_map(N2LR_BASE0, N2LR_SIZE);
+         n2lr_map[1] = (volatile uint8_t *)ml_io_map(N2LR_BASE1, N2LR_SIZE);
+         if (!n2lr_map[0] || !n2lr_map[1]) { IOLog("NORD2 PREV: cannot map the log rings\n"); return; }
+@@ -234,15 +253,33 @@
+ static void delay_us(void *, unsigned us) { IODelay(us); }
+ static void log_msg(void *, const char *s) { IOLog("NORD2 GPU: %s\n", s); }
+ struct Bank { volatile uint32_t *p; unsigned bytes; };
++/* 0173: breadcrumbs.  The last hardware accesses before a crash, written straight into the persistent area (not through the 20 ms log mirror): 256 slots of 16 bytes at 0x48110000
++ * {CNTVCT low, tag | cpu << 24, a, b}.  Tag 0x10 | bank read, 0x20 | bank write (a = offset, b = value), 0x40 DVFS CSRAM store, 0x50 stats tick, 0x60 governor.  The next boot prints the last 40. */
++extern "C" void nord2_bc(unsigned tag, unsigned a, unsigned bval) {
++        if (!n2bc) return;
++        uint32_t i = __atomic_fetch_add(&n2bc_idx, 1u, __ATOMIC_RELAXED);
++        volatile uint32_t *e = n2bc + 4 + (i % N2BC_SLOTS) * 4;
++        uint32_t cpu = (uint32_t)((__builtin_arm_rsr64("MPIDR_EL1") >> 8) & 0xff);
++        e[0] = (uint32_t)__builtin_arm_rsr64("CNTVCT_EL0"); e[1] = tag | cpu << 24; e[2] = a; e[3] = bval;
++        n2bc[1] = i + 1;
++}
++static volatile uint32_t *n2bc_banks[24]; static unsigned n2bc_nb;
++static inline unsigned n2bc_bank(void *ctx) {      /* index of the bank in the order the banks were mapped (0 = first) */
++        volatile uint32_t *p = ((Bank *)ctx)->p;
++        for (unsigned i = 0; i < n2bc_nb; i++) if (n2bc_banks[i] == p) return i;
++        return 15;
++}
+ static uint32_t read_bank(void *ctx, uint32_t off) {
+         Bank *b = (Bank *)ctx;
+         if (!b->p || (off & 3) || off >= b->bytes) return 0;
++        nord2_bc(0x10 | n2bc_bank(ctx), off, 0);
+         uint32_t v = b->p[off / 4];
+         __asm__ volatile("dmb oshld" ::: "memory");
+         return v;
+ }
+ static void write_bank(void *ctx, uint32_t off, uint32_t v) {
+         Bank *b = (Bank *)ctx;
++        if (b->p && !(off & 3) && off < b->bytes) nord2_bc(0x20 | n2bc_bank(ctx), off, v);
+         if (!b->p || (off & 3) || off >= b->bytes) return;
+         __asm__ volatile("dmb oshst" ::: "memory");
+         b->p[off / 4] = v;
+@@ -251,6 +288,7 @@
+ static bool map_bank(Bank *b, uint64_t pa, unsigned bytes) {
+         b->bytes = bytes;
+         b->p = (volatile uint32_t *)ml_io_map(pa, bytes);
++        if (b->p && n2bc_nb < 24) n2bc_banks[n2bc_nb++] = b->p;
+         return b->p != NULL;
+ }
+ static bool valid_ram(uint64_t pa) {
+@@ -592,6 +630,7 @@
+                 IOLog("NORD2 GPU: ready=%u stage=%u error=%u id=%08x\n", d->ready,
+                       d->board.report.stage, d->board.report.error, d->hw.id.gpu_id);
+         }
++        nord2_bc(0x50, 0, 0);
+         n2_sys_telemetry(now_us(NULL));
+         if (d->ready) {
+                 n2c_poll(d->core);
+@@ -607,6 +646,7 @@
+         /* 0131: with unfinished jobs the poll that notices a completion and starts the next job runs every 150 us (was 1 ms): a job takes ~0.7 ms of GPU time but used to cost ~2.5 ms of turnaround. */
+         if (d->ready && unfinished && d->irqState == NORD2_IRQ_ACTIVE) d->irqArm();   /* 0140: completion interrupts for asynchronous clients */
+         if (d->ready && unfinished) sender->setTimeout(150, kMicrosecondScale); else sender->setTimeoutMS(d->ready ? 5 : 1000);
++        nord2_bc(0x51, 0, 0);
+         IOLockUnlock(d->lock);
+ }
+ bool Nord2GPU::start(IOService *provider) {

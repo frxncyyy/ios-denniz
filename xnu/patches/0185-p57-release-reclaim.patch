@@ -1,0 +1,79 @@
+--- a/bsd/dev/nord2_gpu_core.c
++++ b/bsd/dev/nord2_gpu_core.c
+@@ -197,13 +197,28 @@
+ /* Raw JM chains may address any buffer in their own AS, including one
+  * omitted from the submit list. Retain all released buffers until that
+  * context is idle; AS isolation is still enforced between clients. */
++/* 0185: a released buffer used to stay mapped until the context had NO job in flight.  backboardd renders continuously, so its buffers piled up (1024 handle
++ * slots, hundreds of MiB wired) until the slots ran out: ALLOC then failed with N2C_E_NO_HANDLE (EIO in the shim, which retries for 10 s = the 10 s UI freeze),
++ * and the freeze left the table fuller, so the next one came sooner.  A raw chain can address any buffer of its own AS, but only a job SUBMITTED BEFORE the release
++ * can still be using it: the buffer is reclaimed as soon as every older job of the context has dropped its references. */
++static uint64_t ctx_oldest_pending(const struct n2c_core *c, const struct n2c_ctx *x)
++{
++        uint64_t oldest = UINT64_MAX;
++        unsigned idx = (unsigned)(x - c->ctxs);
++        for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
++                const struct n2c_job *j = &c->jobs[i];
++                if (j->state != N2C_JOB_FREE && j->ctx == idx && !j->released && j->id < oldest)
++                        oldest = j->id;
++        }
++        return oldest;
++}
++
+ static void reap_idle_buffers(struct n2c_core *c, struct n2c_ctx *x)
+ {
+-        if (x->jobs)
+-                return;
++        uint64_t oldest = x->jobs ? ctx_oldest_pending(c, x) : UINT64_MAX;
+         for (unsigned i = 0; i < N2C_MAX_BOS; i++) {
+                 struct n2c_bo *b = x->bos[i];
+-                if (b && !b->refs && b->state == N2C_BO_MAPPED)
++                if (b && !b->refs && b->state == N2C_BO_MAPPED && (!x->jobs || (b->rel_id && oldest >= b->rel_id)))
+                         teardown(c, x, b);
+         }
+ }
+@@ -212,7 +227,8 @@
+ {
+         if (!b->refs)
+                 return;
+-        if (--b->refs == 0 && !x->jobs && b->state == N2C_BO_MAPPED)
++        if (--b->refs == 0 && b->state == N2C_BO_MAPPED &&
++            (!x->jobs || (b->rel_id && ctx_oldest_pending(c, x) >= b->rel_id)))
+                 teardown(c, x, b);
+ }
+ 
+@@ -895,7 +911,9 @@
+         if (!b)
+                 return N2C_E_NO_HANDLE;
+         b->handle_live = false;
+-        bool deferred = b->refs > 1 || x->jobs;
++        if (!b->rel_id)
++                b->rel_id = c->next_job_id;
++        bool deferred = b->refs > 1 || (x->jobs && ctx_oldest_pending(c, x) < b->rel_id);
+         bo_put(c, x, b);
+         return deferred ? N2C_E_BUSY : N2C_OK;
+ }
+--- a/bsd/dev/nord2_gpu_core.h
++++ b/bsd/dev/nord2_gpu_core.h
+@@ -165,6 +165,7 @@
+         bool explicit_track;      /* visible, but CPU access is bracketed by acquire/dirty calls (level 2) */
+         bool gpu_dirty;           /* tracked: GPU wrote it since the last acquire */
+         bool gpu_written;         /* the GPU has written it at least once */
++        uint64_t rel_id;          /* 0185: c->next_job_id when the client released the handle (0 = still live): only jobs older than this can still address it */
+ };
+ 
+ /* Cache tracking levels: 0 = every listed buffer is cleaned before and invalidated after every job (0087);
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -923,6 +923,11 @@
+         IOLog("NORD2 MEM: free=%u wired=%u active=%u inactive=%u spec=%u throttled=%u pageable_int=%u pageable_ext=%u avail=%u compressed=%u free_target=%u (16K pages)\n",
+               vm_page_free_count, vm_page_wire_count, vm_page_active_count, vm_page_inactive_count, vm_page_speculative_count, vm_page_throttled_count,
+               vm_page_pageable_internal_count, vm_page_pageable_external_count, memorystatus_available_pages, c_segment_pages_compressed, vm_page_free_target);
++        if (core) {   /* 0185: released-but-still-mapped buffers (held for older jobs), live buffers, handle table fill of the fullest context */
++                unsigned held = 0, fullest = 0;
++                for (unsigned i = 1; i < N2C_MAX_CTX; i++) { unsigned used = 0; for (unsigned k = 0; k < N2C_MAX_BOS; k++) { struct n2c_bo *b = core->ctxs[i].bos[k]; if (b) { used++; if (!b->refs && b->state == N2C_BO_MAPPED) held++; } } if (used > fullest) fullest = used; }
++                IOLog("NORD2 MEM GPU: bos_live=%llu released_held=%u fullest_handle_table=%u/%u private=%llu MiB\n", (unsigned long long)core->stats.bos_live, held, fullest, (unsigned)N2C_MAX_BOS, (unsigned long long)(privateTotal() >> 20));
++        }
+         clockCheck();
+         if (pfMode == 2 || pfFailed || !core) return;                       /* n2pf=2: memory statistics and clock only, the GPU counters stay off */
+         /* patch 0128 (n2pf=1): v3.  v2 issued PRFCNT_SAMPLE and looked at the completion bit one stats window (2 s) later; when the sample did not complete the job manager

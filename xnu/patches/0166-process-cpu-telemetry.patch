@@ -1,0 +1,49 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -49,6 +49,38 @@
+ extern "C" char n2_realhost[] __asm__("_realhost");   /* the host data the in-kernel callers pass */
+ extern "C" void n2_processor_cpu_load(processor_t, natural_t ticks[CPU_STATE_MAX]) __asm__("_processor_cpu_load_info");   /* the struct of the same name hides the function in C++ */
+ extern "C" unsigned nord2_cpu_mhz(int cpu);
++/* 0166: which processes use the CPU -- the busiest ones every 2 s (task user+system time, includes finished threads) */
++extern "C" int proc_iterate(unsigned int flags, int (*callout)(proc_t, void *), void *arg, int (*filterfn)(proc_t, void *), void *filterarg);
++extern "C" kern_return_t task_info(task_t task, task_flavor_t flavor, task_info_t info, mach_msg_type_number_t *count);
++struct n2_pacc { int pid; char name[20]; uint64_t total; };
++static n2_pacc n2_pcur[128], n2_pprev[128];
++static unsigned n2_pcur_n, n2_pprev_n;
++static int n2_proc_cb(proc_t p, void *) {
++        if (n2_pcur_n >= 128) return 0;
++        task_t tk = proc_task(p); if (!tk) return 0;
++        task_absolutetime_info_data_t ti = {}; mach_msg_type_number_t cnt = TASK_ABSOLUTETIME_INFO_COUNT;
++        if (task_info(tk, TASK_ABSOLUTETIME_INFO, (task_info_t)&ti, &cnt) != KERN_SUCCESS) return 0;
++        n2_pacc *e = &n2_pcur[n2_pcur_n++]; e->pid = proc_pid(p); e->total = ti.total_user + ti.total_system;
++        const char *nm = proc_best_name(p); unsigned i = 0; if (nm) for (; i < sizeof(e->name) - 1 && nm[i]; i++) e->name[i] = nm[i]; e->name[i] = 0;
++        return 0;
++}
++static void n2_proc_top(uint64_t winUs) {
++        n2_pcur_n = 0; (void)proc_iterate(1 /* PROC_ALLPROCLIST */, n2_proc_cb, NULL, NULL, NULL);
++        struct { int idx; uint64_t d; } top[4] = {};
++        for (unsigned i = 0; i < n2_pcur_n; i++) {
++                uint64_t prev = 0; for (unsigned k = 0; k < n2_pprev_n; k++) if (n2_pprev[k].pid == n2_pcur[i].pid) { prev = n2_pprev[k].total; break; }
++                if (!prev || n2_pcur[i].total < prev) continue;
++                uint64_t d = n2_pcur[i].total - prev, ns = 0; absolutetime_to_nanoseconds(d, &ns);
++                for (unsigned t = 0; t < 4; t++) if (ns > top[t].d) { for (unsigned u = 3; u > t; u--) top[u] = top[u - 1]; top[t].idx = (int)i; top[t].d = ns; break; }
++        }
++        if (winUs && top[0].d) {
++                char b[160]; unsigned o = 0;
++                for (unsigned t = 0; t < 4 && top[t].d; t++) o += (unsigned)snprintf(b + o, sizeof(b) - o, "%s%s=%llums", t ? " " : "", n2_pcur[top[t].idx].name, top[t].d / 1000000ull);
++                IOLog("NORD2 PROC: cpu ms in %llu ms: %s\n", winUs / 1000, b);
++        }
++        for (unsigned i = 0; i < n2_pcur_n; i++) n2_pprev[i] = n2_pcur[i];
++        n2_pprev_n = n2_pcur_n;
++}
+ static void n2_sys_telemetry(uint64_t nowUs) {
+         static uint64_t lastUs = 0;
+         static natural_t cpuPrev[16][CPU_STATE_MAX] = {};
+@@ -71,6 +103,7 @@
+         vm_statistics64_data_t v = {}; mach_msg_type_number_t vc = HOST_VM_INFO64_COUNT; (void)host_statistics64((host_t)n2_realhost, HOST_VM_INFO64, (host_info64_t)&v, &vc);
+         uint64_t cur[6] = { v.pageins, v.pageouts, v.faults, v.zero_fill_count, v.cow_faults, v.decompressions };
+         uint64_t d[6]; for (unsigned k = 0; k < 6; k++) { d[k] = cur[k] - vmPrev[k]; vmPrev[k] = cur[k]; }
++        n2_proc_top(winUs);
+         if (winUs)
+                 IOLog("NORD2 CPUCLK: little(cpu0) %u MHz big(cpu4) %u MHz big(cpu7) %u MHz\n", nord2_cpu_mhz(0), nord2_cpu_mhz(4), nord2_cpu_mhz(7));
+         if (winUs)

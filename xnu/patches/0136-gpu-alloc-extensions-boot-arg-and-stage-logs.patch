@@ -1,0 +1,54 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -25,6 +25,7 @@
+ extern "C" {
+ extern unsigned long gPhysBase, gPhysSize;
+ extern int PE_parse_boot_argn(const char *, void *, int);
++static uint32_t gAllocExt = 0;   /* 0136: boot-arg n2ext, which ALLOC flags beyond 'executable' are accepted: 1 GPU-only, 2 write-combine */
+ extern int proc_selfpid(void);
+ extern void proc_selfname(char *, int);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -103,6 +104,7 @@
+  * nord2_gpu_cache=1 restores whole-context maintenance for every job. */
+ static bool cache_scope(struct n2c_core *c) {
+         int v = 0; PE_parse_boot_argn("nord2_gpu_cache", &v, sizeof(v));
++        { int x = 0; if (PE_parse_boot_argn("n2ext", &x, sizeof(x))) gAllocExt = (uint32_t)x & 3u; IOLog("NORD2 GPU: alloc extensions n2ext=%u (1 GPU-only, 2 write-combine)\n", gAllocExt); }
+         c->full_cache_maint = v == 1;
+         /* Tracking level (0087 scoping is level 0): 1 = buffers the CPU can never touch are maintained once;
+          * 2 = plus IOSurface lock/unlock-bracketed CPU access.  nord2_gpu_track=<n>, short alias n2trk. */
+@@ -936,13 +938,18 @@
+         if (!nord2_gpu_global_private_ok(privateTotal(), bytes, globalLimit)) {
+                 budgetReject("global-private", c, requested, globalLimit); return kIOReturnNoMemory;
+         }
++        static unsigned extLogs; bool ext = (flags & 6u) != 0; bool lg = ext && extLogs < 12; if (lg) extLogs++;
++        if (lg) IOLog("NORD2 GPU EXT: flags=%u bytes=%llu stage=md-create\n", flags, bytes);
+         auto md = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared | ((flags & 4u) ? kIOMapWriteCombineCache : 0), (vm_size_t)bytes, 16384);
++        if (lg) IOLog("NORD2 GPU EXT: flags=%u md=%p stage=md-created\n", flags, (void *)md);
+         if (!md) return kIOReturnNoMemory;
+         BufferOwner *owner = (BufferOwner *)IOMallocZero(sizeof(*owner));
+         unsigned count = (unsigned)(bytes / 4096);
+         n2c_page *pages = (n2c_page *)IOMallocZero(count * sizeof(*pages));
+         if (!owner || !pages) { if (owner) IOFree(owner, sizeof(*owner)); if (pages) IOFree(pages, count*sizeof(*pages)); md->release(); return kIOReturnNoMemory; }
++        if (lg) IOLog("NORD2 GPU EXT: flags=%u stage=bzero\n", flags);
+         bzero(md->getBytesNoCopy(), (size_t)bytes);
++        if (lg) IOLog("NORD2 GPU EXT: flags=%u stage=bzero-done\n", flags);
+         bool valid = true;
+         for (unsigned i = 0; i < count; i++) {
+                 IOByteCount length; pages[i].pa = md->getPhysicalSegment((uint64_t)i * 4096, &length, kIOMemoryMapperNone);
+@@ -953,6 +960,7 @@
+         enum n2c_error e = valid ? n2c_bo_map(core, c, pages, count, N2C_BO_GPU_READ | N2C_BO_GPU_WRITE |
+                 ((flags & 1) ? N2C_BO_GPU_EXEC : 0) | ((flags & 2) ? N2C_BO_GPU_ONLY : 0) | ((flags & 4u) ? N2C_BO_CPU_UNCACHED : 0), owner, bytes, h, va, &adopted) : N2C_E_ARGS;
+         IOFree(pages, count * sizeof(*pages)); if (!adopted) free_owner(this, owner);
++        if (lg) IOLog("NORD2 GPU EXT: flags=%u stage=mapped e=%d\n", flags, (int)e);
+         if (e == N2C_OK) {
+                 *actual = bytes;
+                 if ((*h >> 8) <= 8 || bytes >= (8ull << 20)) {
+@@ -1206,7 +1214,7 @@
+         result=kIOReturnUnsupported;
+         switch(sel){
+         case NORD2_GPU_SEL_ALLOC: {
+-                if(a->scalarInput[1]>7){result=kIOReturnBadArgument;break;}   /* 0135: bit0 exec, bit1 GPU-only, bit2 CPU write-combine */
++                if((a->scalarInput[1] & ~1ull) && (a->scalarInput[1]>7 || (((a->scalarInput[1]>>1)&1u) && !(gAllocExt&1u)) || (((a->scalarInput[1]>>2)&1u) && !(gAllocExt&2u)))){result=kIOReturnBadArgument;break;}   /* 0135/0136: bit0 exec, bit1 GPU-only (n2ext&1), bit2 CPU write-combine (n2ext&2) */
+                 uint32_t h;uint64_t va,size;result=gpu->mapBuffer(context,a->scalarInput[0],(uint32_t)a->scalarInput[1],&h,&va,&size);
+                 if(result==kIOReturnSuccess){a->scalarOutput[0]=h;a->scalarOutput[1]=va;a->scalarOutput[2]=size;a->scalarOutputCount=3;}break;
+         }

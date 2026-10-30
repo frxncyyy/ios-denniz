@@ -1,0 +1,33 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp	2026-10-29 22:58:26.314307134 +0100
++++ b/iokit/Kernel/arm/Nord2GPU.cpp	2026-10-29 23:07:50.403356935 +0100
+@@ -176,7 +176,7 @@
+         uint64_t ckCycles = 0, ckStamp = 0, ckUs = 0;      /* 0127: GPU cycle counter / timestamp at the previous stats window */
+         bool ckRunning = false;
+         void clockCheck();
+-        unsigned pfWaits = 0, pfArms = 0, pfFails = 0;
++        unsigned pfWaits = 0, pfArms = 0, pfFails = 0, pfSinceArm = 0;
+         void prfcntSample();
+         uint32_t waitN = 0, waitGapMax = 0, waitDurMax = 0, waitRetMax = 0;
+         uint64_t waitGapSum = 0, waitDurSum = 0, waitRetSum = 0;
+@@ -852,14 +852,20 @@
+                 write_bank(&gpu, 0x74, 0xffffffffu); write_bank(&gpu, 0x7c, 0xffffffffu);
+                 write_bank(&gpu, 0x68, 1u);
+                 write_bank(&gpu, 0x30, 3u);
+-                pfArmed = true; pfLastUs = now_us(NULL); pfArms++;
++                pfArmed = true; pfSinceArm = 0; pfLastUs = now_us(NULL); pfArms++;
+                 if (pfArms <= 3) IOLog("NORD2 PRFCNT: armed (AS0, VA %llx), l2_features=%08x shader_present=%08x%08x\n", N2PF_VA, read_bank(&gpu, N2HW_L2_FEATURES),
+                                        read_bank(&gpu, N2HW_SHADER_PRESENT_HI), read_bank(&gpu, N2HW_SHADER_PRESENT_LO));
+                 return;
+         }
+         if (read_bank(&gpu, N2HW_MMU_IRQ_RAWSTAT) & 1u) { IOLog("NORD2 PRFCNT: stale AS0 fault before the sample: status %08x address %08x%08x extra %08x\n", read_bank(&gpu, 0x241c), read_bank(&gpu, 0x2424), read_bank(&gpu, 0x2420), read_bank(&gpu, 0x2438)); write_bank(&gpu, N2HW_MMU_IRQ_CLEAR, 0x00010001u); pfArmed = false; return; }
++        /* 0130: the hardware advances its dump pointer by one dump (about 7.4 KiB) per PRFCNT_SAMPLE and only restarts at PRFCNT_BASE; v4 read offset 0 every time, so one sample in
++         * eight carried data and the ninth wrote past the 64 KiB mapping (AS0 translation fault 0x240003c3 at VA+0x10000).  Rewrite BASE before every sample, clear all four dump areas
++         * and re-arm after six samples anyway. */
++        if (++pfSinceArm > 6) { pfArmed = false; pfSinceArm = 0; return; }
++        write_bank(&gpu, 0x60, (uint32_t)N2PF_VA); write_bank(&gpu, 0x64, (uint32_t)(N2PF_VA >> 32));
+         bzero(pfCpu, pfBytes);
+         sync_page(NULL, pfPa, pfCpu, pfBytes, true);
++        for (unsigned k = 0; k < 3; k++) if (pfXmd[k]) { bzero(pfXmd[k]->getBytesNoCopy(), 16384); sync_page(NULL, 0, pfXmd[k]->getBytesNoCopy(), 16384, true); }
+         write_bank(&gpu, 0x24, 1u << 16);
+         unsigned busy = (n2hw_js_idle(&hw, 0) ? 0u : 1u) | (n2hw_js_idle(&hw, 1) ? 0u : 2u);
+         uint64_t t0 = now_us(NULL);

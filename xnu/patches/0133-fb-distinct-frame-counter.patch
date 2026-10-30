@@ -1,0 +1,50 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-28 13:52:09.398117732 +0100
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-30 00:50:00.717745347 +0100
+@@ -175,6 +175,11 @@
+ 	uint32_t            fBusyTicks;
+ 	uint64_t            fNextTick, fPeriodAbs;
+ 	uint64_t            fCopyUs, fXferStart;
++	/* 0133: how many of the presented frames actually differ from the previous one, and the gaps between the different ones (the panel is refreshed at 60 Hz
++	 * whatever the renderer delivers: this is the frame rate the user sees). */
++	uint64_t            fHashLast, fDistinctLastUs, fDistinctGapMaxUs;
++	uint32_t            fDistinct, fSame, fGapBin[5];
++	bool                fHashHave;
+ 	volatile uint32_t  *fDsi, *fMutex;       /* panel transfer registers (NORD2) */
+ 	bool                fNbReady;            /* the blocking path has run once: overlay removed, ownership taken */
+ 	struct sweet_fb_present_stats fStats;
+@@ -569,6 +574,25 @@
+ 		uint64_t t1 = mach_absolute_time();
+ 		fb->fCopyUs = sweet_fb_abs_to_us(t1 - t0);
+ 		if (!shown) { fb->presentDone(false, false, false); return; }
++		{	/* 0133: FNV-1a over 16 words in every 8th row of the panel memory the copy just filled */
++			uint64_t h = 1469598103934665603ULL;
++			for (uint32_t y = 0; y < fb->fHeight; y += 8) {
++				const volatile uint64_t *row = (const volatile uint64_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++				uint32_t words = fb->fWidth / 2;
++				for (uint32_t k = 0; k < 16; k++) { h = (h ^ row[(words / 16) * k]) * 1099511628211ULL; }
++			}
++			uint64_t nowUs = sweet_fb_abs_to_us(t1);
++			if (fb->fHashHave && h == fb->fHashLast) { fb->fSame++; }
++			else {
++				if (fb->fHashHave && fb->fDistinctLastUs) {
++					uint64_t gap = nowUs - fb->fDistinctLastUs;
++					if (gap > fb->fDistinctGapMaxUs) { fb->fDistinctGapMaxUs = gap; }
++					fb->fGapBin[gap <= 20000 ? 0 : gap <= 34000 ? 1 : gap <= 67000 ? 2 : gap <= 100000 ? 3 : 4]++;
++				}
++				fb->fDistinct++; fb->fDistinctLastUs = nowUs;
++			}
++			fb->fHashLast = h; fb->fHashHave = true;
++		}
+ 		if (fb->fNbReady && fb->xferStart()) {
+ 			fb->fXferStart = t1;
+ 			fb->fPState = 2;
+@@ -636,6 +660,9 @@
+ 		    fStats.n, fStats.sum_us / n, fStats.max_us, fStats.sum_copy_us / n, fStats.max_copy_us,
+ 		    fStats.sum_xfer_us / n, fStats.max_xfer_us, fStats.legacy, fStats.timeouts, fStats.busy_skips,
+ 		    fStats.busy_forced, fStats.late_ticks, 60 / fFlushTicks, nord2_gpu_resv_expired());
++		IOLog("NORD2 FB SEEN: presents=%u different=%u same=%u gaps_ms<=20/34/67/100/more=%u/%u/%u/%u/%u max_gap_ms=%llu\n", fStats.n, fDistinct, fSame,
++		    fGapBin[0], fGapBin[1], fGapBin[2], fGapBin[3], fGapBin[4], fDistinctGapMaxUs / 1000);
++		fDistinct = fSame = 0; fDistinctGapMaxUs = 0; for (unsigned i = 0; i < 5; i++) { fGapBin[i] = 0; }
+ 		sweet_fb_stats_reset(&fStats, now_us);
+ 		IOLockLock(fLock);
+ 		struct sweet_fb_retire rs = fRetire;

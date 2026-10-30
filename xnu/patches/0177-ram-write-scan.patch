@@ -1,0 +1,40 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -104,6 +104,37 @@
+         }
+         IOLog("NORD2 MEMSCAN: whole window read ok in %llu ms\n", now_ms_abs() - t0);
+         nord2_bc(0x31, 0, 0);
++        /* 0177: write test.  Chunks of 32 MiB from the system allocator (so the pages are free and nobody else uses them), every page written with a pattern
++         * derived from its physical address and read back, then released.  Breadcrumb 0x32 with the chunk's first and last page address before each chunk. */
++        {
++                int wt = 1; PE_parse_boot_argn("n2memwrite", &wt, sizeof(wt));
++                IODMACommand *dummy = NULL; (void)dummy;
++                uint64_t bad = 0, pages = 0, chunks = 0, lo = ~0ull, hi = 0;
++                IOBufferMemoryDescriptor *held[96]; unsigned nheld = 0;
++                for (unsigned c = 0; wt == 1 && c < 96; c++) {
++                        IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared, 32ull << 20, 16384);
++                        if (!md) break;
++                        volatile uint64_t *va = (volatile uint64_t *)md->getBytesNoCopy();
++                        for (uint64_t off = 0; off < (32ull << 20); off += 16384) {
++                                IOByteCount len = 0; uint64_t pa = md->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
++                                if (!pa) continue;
++                                if (!(off & ((4ull << 20) - 1))) nord2_bc(0x32, (unsigned)pa, (unsigned)(pa >> 32));
++                                if (pa < lo) lo = pa; if (pa > hi) hi = pa;
++                                uint64_t pat = 0x4e32574c00000000ull ^ pa;
++                                volatile uint64_t *w = va + off / 8;
++                                w[0] = pat; w[1] = ~pat; w[2047] = pat ^ 0x55aa55aaull;
++                                __asm__ volatile("dsb sy" ::: "memory");
++                                FlushPoC_DcacheRegion((vm_offset_t)w, 16384);
++                                if (w[0] != pat || w[1] != ~pat || w[2047] != (pat ^ 0x55aa55aaull)) bad++;
++                                pages++;
++                        }
++                        held[nheld++] = md; chunks++;
++                        if ((chunks & 7) == 0) { IOLog("NORD2 MEMSCAN: write test %llu chunks, %llu pages, pa %#llx..%#llx, mismatches %llu\n", chunks, pages, lo, hi, bad); IOSleep(1); }
++                }
++                for (unsigned i = 0; i < nheld; i++) held[i]->release();
++                IOLog("NORD2 MEMSCAN: write test done: %llu chunks, %llu pages written and read back, pa %#llx..%#llx, mismatches %llu\n", chunks, pages, lo, hi, bad);
++                nord2_bc(0x33, 0, 0);
++        }
+         thread_terminate(current_thread());
+ }
+ /* 0169: persistent last-log ring.  The USB capture and the 4 MiB live stream die with the phone; a crash (p69) left no trace.  Two alternating 256 KiB rings in the unused Android

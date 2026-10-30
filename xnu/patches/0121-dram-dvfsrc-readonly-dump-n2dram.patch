@@ -1,0 +1,72 @@
+--- a/bsd/dev/nord2_cpufreq.c	2026-10-29 19:31:08.114688905 +0100
++++ b/bsd/dev/nord2_cpufreq.c	2026-10-29 20:03:23.301838697 +0100
+@@ -35,6 +35,7 @@
+ TUNABLE(int, nord2_mcuping_arg, "n2mcuping", 0);
+ TUNABLE(int, nord2_dvfs_arg, "n2dvfs", 0);
+ TUNABLE(int, nord2_membw_arg, "n2membw", 0);   /* patch 0120: CPU memory bandwidth measurement (read/write/copy of 64 MiB); touches only DRAM */
++TUNABLE(int, nord2_dram_arg, "n2dram", 0);   /* patch 0121: read-only dump of the DVFSRC page (1), plus the DRAMC ch0 AO page (2); nothing is written */
+ TUNABLE(int, nord2_dvfs_stage_arg, "n2dvst", 3);   /* 0 preflight only, 1 + share buffer, 2 + platform init, 3 = everything (default) */
+ 
+ extern unsigned nord2_cpu_mhz(int cpu);                                                /* nord2_sched.c (0099) */
+@@ -739,6 +740,46 @@
+ 		kmem_free(kernel_map, b, N2MB_BYTES);
+ }
+ 
++/* ---- patch 0121: DRAM clock state, read-only ------------------------------------------------------------------------------------
++ * The stock kernel runs DVFSRC (DRAM 800..4266 MHz, 24 OPPs, 2400 MHz idle in the rescue).  Ours never touches it, so the DRAM may sit at
++ * the bootloader level.  Only 32-bit reads of the DVFSRC page (0x10012000, a platform device of the stock kernel) are done; level 2 then
++ * reads the DRAMC ch0 AO page (0x10230000) after the DVFSRC lines have been flushed.  All-zero lines are folded. */
++static void
++n2dram_page(const char *tag, uint32_t pa)
++{
++	volatile uint32_t *m = (volatile uint32_t *)ml_io_map(pa, 0x1000);
++	unsigned zero = 0;
++
++	if (m == NULL) {
++		printf("NORD2 DRAM %s %08x: mapping failed\n", tag, pa);
++		return;
++	}
++	for (unsigned o = 0; o < 0x400; o += 8) {
++		uint32_t w[8];
++		unsigned any = 0;
++		for (unsigned i = 0; i < 8; i++) {
++			w[i] = m[o + i];
++			any |= w[i];
++		}
++		if (!any) {
++			zero++;
++			continue;
++		}
++		printf("NORD2 DRAM %s %08x+%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", tag, pa, o * 4, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++	}
++	printf("NORD2 DRAM %s %08x: done, %u all-zero lines folded\n", tag, pa, zero);
++}
++
++static void
++n2dram_run(const char *tag)
++{
++	if (nord2_dram_arg <= 0)
++		return;
++	n2dram_page(tag, 0x10012000);
++	if (nord2_dram_arg >= 2)
++		n2dram_page(tag, 0x10230000);
++}
++
+ static void
+ n2dvfs_main(void)
+ {
+@@ -761,12 +802,14 @@
+ 	}
+ 	printf("NORD2 DVFS begin: n2dvfs=%d n2dvst=%u (%s), placement %s\n", nord2_dvfs_arg, cfg.max_step, cfg.cap_mhz ? "hand-over then ramp of L and B to the cap" : "hand-over only, no frequency change",
+ 	    cfg.place ? "managed" : "not managed");
++	n2dram_run("before DVFS");
+ 	if (nord2_membw_arg)
+ 		n2membw_run("before DVFS");
+ 	enum n2d_result r = n2d_bringup(&n2dv_ops, NULL, &cfg, &st);
+ 	printf("NORD2 DVFS bring-up finished with result %u\n", (unsigned)r);
+ 	if (nord2_membw_arg)
+ 		n2membw_run("after DVFS");
++	n2dram_run("after DVFS");
+ 	while (!st.stopped && st.inited && cfg.cap_mhz != 0) {
+ 		n2cf_sleep_ms(NULL, 1000u * N2CF_TICK_S);
+ 		n2d_tick(&n2dv_ops, NULL, &cfg, &st);

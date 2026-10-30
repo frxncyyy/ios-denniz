@@ -1,0 +1,45 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp	2026-10-29 23:07:50.403356935 +0100
++++ b/iokit/Kernel/arm/Nord2GPU.cpp	2026-10-29 23:21:11.330571413 +0100
+@@ -419,7 +419,8 @@
+          * while any exist so an async chain keeps the GPU fed between WAIT calls. */
+         unsigned unfinished = 0;
+         if (d->ready) for (unsigned i = 0; i < N2C_MAX_CTX; i++) if (d->core->ctxs[i].state != N2C_CTX_FREE) unfinished += d->core->ctxs[i].jobs;
+-        sender->setTimeoutMS(d->ready ? (unfinished ? 1 : 5) : 1000);
++        /* 0131: with unfinished jobs the poll that notices a completion and starts the next job runs every 150 us (was 1 ms): a job takes ~0.7 ms of GPU time but used to cost ~2.5 ms of turnaround. */
++        if (d->ready && unfinished) sender->setTimeout(150, kMicrosecondScale); else sender->setTimeoutMS(d->ready ? 5 : 1000);
+         IOLockUnlock(d->lock);
+ }
+ bool Nord2GPU::start(IOService *provider) {
+@@ -654,7 +655,7 @@
+                 IOLockLock(lock);
+                 return;
+         }
+-        IOLockUnlock(lock); if (step) IODelay(step); else IOSleep(1); IOLockLock(lock);
++        IOLockUnlock(lock); if (step) IODelay(step); else if (elapsed_us < 40000) IODelay(250); else IOSleep(1); IOLockLock(lock);   /* 0131: was IOSleep(1) for every wait longer than 6 ms */
+ }
+ /* ---- LVTS thermal sensing (opt-in; see nord2_gpu_lvts.h for the safety model) ---- */
+ uint32_t Nord2GPU::lvtsRd(void *p, enum n2lvts_block b, uint32_t off) {
+@@ -759,16 +760,18 @@
+         int32_t gmC = 0; bool gpu_ok = lvtsGpu(&gmC);
+         int hot = (lvtsMode && lvtsState && lvtsState != 3) ? lvtsHottest(lvtsMask) : (int)0x80000000;
+         uint32_t n = t.jobs ? t.jobs : 1, w = waitN ? waitN : 1;
+-        IOLog("NORD2 GPU JOBS: n=%u fault=%u full=%u win_ms=%llu q_us=%llu/%u run_us=%llu/%u tot_us=%llu/%u "
+-              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u gpu_khz=%u mux=%u bat_cC=%d bat_ok=%u gpu_cC=%d soc_cC=%d lvts=%u%s irq=%u:%u/%u/%u/%u trk=%u skipC_KiB=%llu skipI_KiB=%llu defI_KiB=%llu acqI_KiB=%llu wmI_KiB=%llu resv=%llu/%llu/%llu/%llu\n",
++        /* 0131: three short lines instead of one of ~900 characters, which the console cut after about 500 (the cache tracking and reservation fields were lost). */
++        IOLog("NORD2 GPU JOBS: n=%u fault=%u full=%u win_ms=%llu q_us=%llu/%u run_us=%llu/%u tot_us=%llu/%u clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu\n",
+               t.jobs, t.faulted, t.full_jobs, t.window_start_us / 1000, t.sum_queue_us / n, t.max_queue_us,
+               t.sum_run_us / n, t.max_run_us, t.sum_total_us / n, t.max_total_us, t.sum_clean_us / n, t.max_clean_us,
+-              t.sum_inval_us / n, t.max_inval_us, t.sum_clean_pages * 4, t.sum_inval_pages * 4, waitN,
+-              waitGapSum / w, waitGapMax, waitDurSum / w, waitDurMax, waitRetSum / w, waitRetMax,
++              t.sum_inval_us / n, t.max_inval_us, t.sum_clean_pages * 4, t.sum_inval_pages * 4);
++        IOLog("NORD2 GPU JOBS2: waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u gpu_khz=%u mux=%u irq=%u:%u/%u/%u/%u\n",
++              waitN, waitGapSum / w, waitGapMax, waitDurSum / w, waitDurMax, waitRetSum / w, waitRetMax,
+               seqWaits, seqJobs, seqWaits ? seqDurSum / seqWaits : 0ull, seqDurMax, pll_khz, mux,
++              (unsigned)irqState, irqTops, irqGuard.spurious_total, irqSleeps, irqTimeouts);
++        IOLog("NORD2 GPU JOBS3: bat_cC=%d bat_ok=%u gpu_cC=%d soc_cC=%d lvts=%u%s trk=%u skipC_KiB=%llu skipI_KiB=%llu defI_KiB=%llu acqI_KiB=%llu wmI_KiB=%llu resv=%llu/%llu/%llu/%llu\n",
+               bat_ok ? bat : 0, (unsigned)bat_ok, gpu_ok ? gmC / 10 : -9999, hot != (int)0x80000000 ? hot : -9999,
+               lvtsState, (lvtsState && lvts.cal.defaulted) ? "~" : "",
+-              (unsigned)irqState, irqTops, irqGuard.spurious_total, irqSleeps, irqTimeouts,
+               (unsigned)core->track_level, core->stats.cache_skip_clean_pages * 4, core->stats.cache_skip_inval_pages * 4,
+               core->stats.cache_deferred_pages * 4, core->stats.cache_acquire_pages * 4, core->stats.cache_skip_wmask_pages * 4,
+               core->stats.resv_reserves, core->stats.resv_retires, core->stats.resv_cancels, core->stats.resv_expired);

@@ -1,0 +1,77 @@
+--- a/bsd/dev/nord2_gpu_core.h
++++ b/bsd/dev/nord2_gpu_core.h
+@@ -37,7 +37,13 @@
+ #endif
+ 
+ #define N2C_MAX_CTX 8u          /* AS0 kernel + AS1..AS7 clients */
+-#define N2C_MAX_BOS 256u        /* handles per context */
++/* Handles per context.  A handle is (serial << N2C_SLOT_BITS) | slot, 32 bits in the ABI (u32 handles[]), so the slot field takes
++ * N2C_SLOT_BITS of the serial: 0105 raised the context limit from 256 to 1024 slots (backboardd held all 256 and dropped commands) and
++ * the core-wide serial, which never repeats so a stale handle cannot alias, shrank from 24 to 22 bits (4194303 buffers per boot). */
++#define N2C_SLOT_BITS 10u
++#define N2C_MAX_BOS (1u << N2C_SLOT_BITS)
++#define N2C_SLOT_MASK (N2C_MAX_BOS - 1u)
++#define N2C_HANDLE_SERIAL_MAX (0xffffffffu >> N2C_SLOT_BITS)
+ #define N2C_MAX_JOBS 128u       /* records across the device */
+ #define N2C_CTX_JOBS 96u        /* in-flight (not yet reaped) jobs per context */
+ #define N2C_JOB_BOS 32u
+--- a/bsd/dev/nord2_gpu_core.c
++++ b/bsd/dev/nord2_gpu_core.c
+@@ -10,6 +10,7 @@
+ #define JOB_HEADER_BYTES 128u
+ #define SPAN_512G (1ull << 39)
+ #define MAX_BO_PAGES 65536u     /* 256 MiB in 4 KiB pages */
++_Static_assert(N2VA_MAX_EXTENTS > N2C_MAX_BOS, "a free gap can sit behind every buffer");
+ #define BO_GUARD 0x1000ull      /* unmapped page after every buffer */
+ #define JS_STATUS_BUS_FAULT 0x48u
+ 
+@@ -98,7 +99,7 @@
+ 
+ static struct n2c_bo *bo_at(struct n2c_ctx *x, uint32_t handle)
+ {
+-        unsigned slot = handle & 0xffu;
++        unsigned slot = handle & N2C_SLOT_MASK;
+         struct n2c_bo *b = x->bos[slot];
+         return (b && b->handle == handle && b->handle_live) ? b : NULL;
+ }
+@@ -136,7 +137,7 @@
+         if (b->pages)
+                 c->ops.free_host(c->ctx, b->pages,
+                                  b->nr_pages * sizeof(*b->pages));
+-        unsigned slot = b->handle & 0xffu;
++        unsigned slot = b->handle & N2C_SLOT_MASK;
+         if (x->bos[slot] == b)
+                 x->bos[slot] = NULL;
+         c->ops.free_host(c->ctx, b, sizeof(*b));
+@@ -614,7 +615,7 @@
+         }
+         if (charged < (uint64_t)nr_pages * NORD2_GPU_PAGE_SIZE)
+                 return N2C_E_ARGS;
+-        if (c->next_handle > 0xffffffu)
++        if (c->next_handle > N2C_HANDLE_SERIAL_MAX)
+                 return N2C_E_NO_HANDLE; /* never alias a stale handle */
+         if (charged > x->wired_limit || x->wired > x->wired_limit - charged)
+                 return N2C_E_QUOTA;
+@@ -653,7 +654,7 @@
+         b->charged = charged;
+         b->cookie = cookie;
+         *adopted_out = true;
+-        b->handle = (c->next_handle++ << 8) | slot;
++        b->handle = (c->next_handle++ << N2C_SLOT_BITS) | slot;
+         bool exec = (flags & N2C_BO_GPU_EXEC) != 0;
+         bool write = (flags & N2C_BO_GPU_WRITE) != 0;
+         unsigned mapped = 0;
+--- a/bsd/dev/nord2_gpu_va.h
++++ b/bsd/dev/nord2_gpu_va.h
+@@ -17,7 +17,10 @@
+ extern "C" {
+ #endif
+ 
+-#define N2VA_MAX_EXTENTS 256u
++/* Free extents.  Every live buffer can leave one free gap behind it (small buffers are 64 KiB aligned and the gap is not reusable for
++ * another 64 KiB-aligned buffer), so the list must hold more extents than a context has handles: 256 extents made the 257th small
++ * buffer fail with N2C_E_VA long before any other limit (0105; nord2_gpu_core.c asserts N2VA_MAX_EXTENTS > N2C_MAX_BOS). */
++#define N2VA_MAX_EXTENTS 1032u
+ #define N2VA_GRANULE 0x1000ull
+ 
+ struct n2va_extent {

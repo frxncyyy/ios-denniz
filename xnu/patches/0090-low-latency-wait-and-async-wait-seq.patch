@@ -1,0 +1,255 @@
+--- a/bsd/dev/nord2_gpu_core.c
++++ b/bsd/dev/nord2_gpu_core.c
+@@ -782,6 +782,8 @@
+         if ((need0 && !head_inside(r, bos, r->heads[0])) ||
+             (need1 && !head_inside(r, bos, r->heads[1])))
+                 return N2C_E_RANGE;
++        if (x->jobs >= N2C_CTX_JOBS)
++                return N2C_E_BUSY; /* per-context in-flight window */
+         struct n2c_job *j = NULL;
+         for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
+                 if (c->jobs[i].state == N2C_JOB_FREE) {
+@@ -836,19 +838,20 @@
+                 /* Oldest queued job whose context has nothing older still
+                  * pending (per-context submission order across slots). */
+                 struct n2c_job *pick = NULL;
++                uint64_t oldest[N2C_MAX_CTX] = { 0 };
++                for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
++                        const struct n2c_job *o = &c->jobs[i];
++                        if ((o->state == N2C_JOB_QUEUED || o->state == N2C_JOB_RUNNING ||
++                             o->state == N2C_JOB_STOPPING) &&
++                            (!oldest[o->ctx] || o->id < oldest[o->ctx]))
++                                oldest[o->ctx] = o->id;
++                }
+                 for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
+                         struct n2c_job *j = &c->jobs[i];
+                         if (j->state != N2C_JOB_QUEUED)
+                                 continue;
+-                        bool blocked = false;
+-                        for (unsigned k = 0; k < N2C_MAX_JOBS; k++) {
+-                                const struct n2c_job *o = &c->jobs[k];
+-                                if (o != j && o->ctx == j->ctx && o->id < j->id &&
+-                                    (o->state == N2C_JOB_QUEUED ||
+-                                     o->state == N2C_JOB_RUNNING ||
+-                                     o->state == N2C_JOB_STOPPING))
+-                                        blocked = true;
+-                        }
++                        /* Blocked unless it is the oldest unfinished job of its context. */
++                        bool blocked = oldest[j->ctx] != j->id;
+                         if (c->ctxs[j->ctx].state != N2C_CTX_OPEN ||
+                             !c->ctxs[j->ctx].as_live)
+                                 blocked = true;
+@@ -1014,6 +1017,42 @@
+         try_start(c);
+ }
+ 
++enum n2c_error n2c_seq_state(struct n2c_core *c, unsigned idx, uint64_t seq,
++                             bool reap, struct n2c_seq_result *res)
++{
++        if (!c || !res || idx >= N2C_MAX_CTX)
++                return N2C_E_ARGS;
++        n2c_poll(c);
++        if (!seq || seq >= c->next_job_id || !c->next_job_id)
++                return N2C_E_NO_JOB;
++        memset(res, 0, sizeof(*res));
++        for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
++                const struct n2c_job *j = &c->jobs[i];
++                if (j->state == N2C_JOB_FREE || j->ctx != idx || j->id > seq)
++                        continue;
++                if (!terminal(j->state)) {
++                        res->pending++;
++                } else if (j->state == N2C_JOB_DONE) {
++                        res->done++;
++                } else {
++                        res->failed++;
++                        if (!res->first_failed_id || j->id < res->first_failed_id) {
++                                res->first_failed_id = j->id;
++                                res->first_failed_state = j->state;
++                                res->first_failed_status = j->status;
++                        }
++                }
++        }
++        if (reap && !res->pending)
++                for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
++                        struct n2c_job *j = &c->jobs[i];
++                        if (j->state != N2C_JOB_FREE && j->ctx == idx && j->id <= seq &&
++                            terminal(j->state))
++                                memset(j, 0, sizeof(*j));
++                }
++        return N2C_OK;
++}
++
+ enum n2c_error n2c_job_state(struct n2c_core *c, unsigned idx, uint64_t id,
+                              bool reap, uint32_t *state, uint32_t *status)
+ {
+--- a/bsd/dev/nord2_gpu_core.h
++++ b/bsd/dev/nord2_gpu_core.h
+@@ -38,7 +38,8 @@
+ 
+ #define N2C_MAX_CTX 8u          /* AS0 kernel + AS1..AS7 clients */
+ #define N2C_MAX_BOS 256u        /* handles per context */
+-#define N2C_MAX_JOBS 32u        /* records across the device */
++#define N2C_MAX_JOBS 128u       /* records across the device */
++#define N2C_CTX_JOBS 96u        /* in-flight (not yet reaped) jobs per context */
+ #define N2C_JOB_BOS 32u
+ #define N2C_MAX_TABLES 1024u    /* page tables per context (2 GiB of L3) */
+ #define N2C_QUARANTINE 64u
+@@ -299,6 +300,19 @@
+ /* Process hardware events and deadlines; never sleeps. */
+ void n2c_poll(struct n2c_core *c);
+ /* Query a job; a terminal job is consumed (record freed) when reap. */
++/* Aggregate view of every job of one context with id <= seq (jobs run in
++ * submission order per context, so seq = the last submitted id covers the
++ * whole chain).  pending counts QUEUED/RUNNING/STOPPING jobs; done/failed count
++ * terminal ones; first_failed_* describe the lowest failing id. */
++struct n2c_seq_result {
++        uint32_t pending, done, failed;
++        uint64_t first_failed_id;
++        uint32_t first_failed_state, first_failed_status;
++};
++/* seq must have been issued (N2C_E_NO_JOB otherwise).  With reap, and only when
++ * nothing is pending, every terminal job <= seq of the context is released. */
++enum n2c_error n2c_seq_state(struct n2c_core *c, unsigned ctx, uint64_t seq,
++                             bool reap, struct n2c_seq_result *res);
+ uint64_t n2c_now_us(struct n2c_core *c);
+ /* Returns false (and leaves *out untouched) while the window holds no finished job or is
+  * younger than min_window_us; otherwise copies and resets the window. */
+--- a/bsd/dev/nord2_gpu_transport.h
++++ b/bsd/dev/nord2_gpu_transport.h
+@@ -18,6 +18,18 @@
+ #define NORD2_GPU_SEL_SUBMIT_JM 9
+ #define NORD2_GPU_SEL_SYNC 10
+ #define NORD2_GPU_SEL_LOG 11 /* bounded diagnostic text; no GPU work */
++/* Asynchronous chains: SUBMIT_JM returns the job id (a per-device monotonic
++ * sequence number) without waiting; jobs of one context run strictly in
++ * submission order.  WAIT_SEQ(seq, timeout_ms) waits until every job of the
++ * calling context with id <= seq is terminal, then reaps them all:
++ *   scalarOutput[0] = 4 (all DONE) | 5 FAULTED | 6 CANCELLED | 7 RESET (state of the lowest failing job)
++ *                     | 2 RUNNING (timeout, nothing reaped)
++ *   scalarOutput[1] = number of terminal jobs <= seq   scalarOutput[2] = lowest failing id (0 none)
++ * and, if requested, a nord2_gpu_fault_info for that failing job.  At most
++ * NORD2_GPU_MAX_INFLIGHT unfinished jobs per client; SUBMIT_JM returns kIOReturnBusy
++ * beyond that (wait, then resubmit). */
++#define NORD2_GPU_SEL_WAIT_SEQ 12
++#define NORD2_GPU_MAX_INFLIGHT 96u
+ #define NORD2_GPU_TRANSPORT_VERSION 2u
+ 
+ /* ABI v2: raw arch9 Job Manager chains in the calling client's address
+@@ -132,6 +144,19 @@
+                         NORD2_GPU_PRIVATE_LIMIT, size);
+ }
+ 
++/* Completion polling (no GPU interrupt is wired up): busy-poll with short delays
++ * while a job is young, then fall back to millisecond sleeps.  Returns the delay
++ * in microseconds, or 0 for "sleep 1 ms".  A 1 ms IOSleep costs 1-2.5 ms of
++ * completion latency per job on this kernel, which dominated small jobs. */
++static inline unsigned nord2_gpu_wait_step_us(uint64_t elapsed_us)
++{
++        if (elapsed_us < 1500u)
++                return 20u;
++        if (elapsed_us < 6000u)
++                return 100u;
++        return 0u;
++}
++
+ /* Clamp a boot-arg value given in MiB; 0/absent keeps the default. */
+ static inline uint64_t nord2_gpu_budget_mib(uint64_t mib, uint64_t lo_mib,
+                                             uint64_t hi_mib, uint64_t dflt)
+@@ -197,6 +222,10 @@
+                 expected_si = sizeof(struct nord2_gpu_submit_request);
+                 expected_no = 1; break;
+         case NORD2_GPU_SEL_SYNC: expected_ni = 2; break;
++        case NORD2_GPU_SEL_WAIT_SEQ:
++                expected_ni = 2; expected_no = 3;
++                if (so) minimum_so = sizeof(struct nord2_gpu_fault_info);
++                break;
+         default: return false;
+         }
+         return ni == expected_ni && no >= expected_no && si == expected_si &&
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -126,6 +126,8 @@
+         bool jobStats = true;
+         uint32_t waitN = 0, waitGapMax = 0, waitDurMax = 0, waitRetMax = 0;
+         uint64_t waitGapSum = 0, waitDurSum = 0, waitRetSum = 0;
++        /* WAIT_SEQ: waits, jobs covered, time inside the wait */
++        uint32_t seqWaits = 0, seqJobs = 0, seqDurMax = 0; uint64_t seqDurSum = 0;
+         void emitJobStats();
+         uint64_t privateTotal();
+         void budgetReject(const char *, unsigned, uint64_t, uint64_t);
+@@ -311,7 +313,11 @@
+                         d->ready = false; d->setProperty("Nord2GPUState", "fault-memory-pinned");
+                 }
+         }
+-        sender->setTimeoutMS(d->ready ? 5 : 1000);
++        /* Queued/running jobs are started and completed by polling: tick at 1 ms
++         * while any exist so an async chain keeps the GPU fed between WAIT calls. */
++        unsigned unfinished = 0;
++        if (d->ready) for (unsigned i = 0; i < N2C_MAX_CTX; i++) if (d->core->ctxs[i].state != N2C_CTX_FREE) unfinished += d->core->ctxs[i].jobs;
++        sender->setTimeoutMS(d->ready ? (unfinished ? 1 : 5) : 1000);
+         IOLockUnlock(d->lock);
+ }
+ bool Nord2GPU::start(IOService *provider) {
+@@ -402,12 +408,14 @@
+         if (!n2c_timing_take(core, &t, 2000000ull)) return;
+         uint32_t n = t.jobs ? t.jobs : 1, w = waitN ? waitN : 1;
+         IOLog("NORD2 GPU JOBS: n=%u fault=%u full=%u win_ms=%llu q_us=%llu/%u run_us=%llu/%u tot_us=%llu/%u "
+-              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u\n",
++              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u\n",
+               t.jobs, t.faulted, t.full_jobs, t.window_start_us / 1000, t.sum_queue_us / n, t.max_queue_us,
+               t.sum_run_us / n, t.max_run_us, t.sum_total_us / n, t.max_total_us, t.sum_clean_us / n, t.max_clean_us,
+               t.sum_inval_us / n, t.max_inval_us, t.sum_clean_pages * 4, t.sum_inval_pages * 4, waitN,
+-              waitGapSum / w, waitGapMax, waitDurSum / w, waitDurMax, waitRetSum / w, waitRetMax);
++              waitGapSum / w, waitGapMax, waitDurSum / w, waitDurMax, waitRetSum / w, waitRetMax,
++              seqWaits, seqJobs, seqWaits ? seqDurSum / seqWaits : 0ull, seqDurMax);
+         waitN = waitGapMax = waitDurMax = waitRetMax = 0; waitGapSum = waitDurSum = waitRetSum = 0;
++        seqWaits = seqJobs = seqDurMax = 0; seqDurSum = 0;
+ }
+ void Nord2GPU::budgetReject(const char *what, unsigned c, uint64_t request, uint64_t limit) {
+         uint64_t t = now_ms(NULL);
+@@ -674,11 +682,13 @@
+         }
+         case NORD2_GPU_SEL_WAIT: {
+                 if(a->scalarInput[1]>5000){result=kIOReturnBadArgument;break;}
+-                uint32_t state=0,status=0;uint64_t start=now_ms(NULL),id=a->scalarInput[0],enter_us=now_us(NULL);
++                uint32_t state=0,status=0;uint64_t id=a->scalarInput[0],enter_us=now_us(NULL),limit_us=a->scalarInput[1]*1000ull;
+                 for(;;){
+                         n2c_poll(gpu->core);result=io_error(n2c_job_state(gpu->core,context,id,false,&state,&status));
+-                        if(result!=kIOReturnSuccess || state>=N2C_JOB_DONE || gpu->core->state==N2C_CORE_BROKEN || now_ms(NULL)-start>=a->scalarInput[1])break;
+-                        IOLockUnlock(gpu->lock);IOSleep(1);IOLockLock(gpu->lock);
++                        uint64_t elapsed=now_us(NULL)-enter_us;
++                        if(result!=kIOReturnSuccess || state>=N2C_JOB_DONE || gpu->core->state==N2C_CORE_BROKEN || elapsed>=limit_us)break;
++                        unsigned step=nord2_gpu_wait_step_us(elapsed);
++                        IOLockUnlock(gpu->lock);if(step)IODelay(step);else IOSleep(1);IOLockLock(gpu->lock);
+                 }
+                 if(result==kIOReturnSuccess){
+                         a->scalarOutput[0]=state;a->scalarOutputCount=1;
+@@ -696,6 +706,28 @@
+                         }
+                 }break;
+         }
++        case NORD2_GPU_SEL_WAIT_SEQ: {
++                if(a->scalarInput[1]>5000){result=kIOReturnBadArgument;break;}
++                uint64_t seq=a->scalarInput[0],enter_us=now_us(NULL),limit_us=a->scalarInput[1]*1000ull;n2c_seq_result r={};
++                for(;;){
++                        n2c_poll(gpu->core);result=io_error(n2c_seq_state(gpu->core,context,seq,false,&r));
++                        uint64_t elapsed=now_us(NULL)-enter_us;
++                        if(result!=kIOReturnSuccess || !r.pending || gpu->core->state==N2C_CORE_BROKEN || elapsed>=limit_us)break;
++                        unsigned step=nord2_gpu_wait_step_us(elapsed);
++                        IOLockUnlock(gpu->lock);if(step)IODelay(step);else IOSleep(1);IOLockLock(gpu->lock);
++                }
++                if(result==kIOReturnSuccess){
++                        uint32_t state=r.pending?N2C_JOB_RUNNING:(r.failed?r.first_failed_state:N2C_JOB_DONE);
++                        a->scalarOutput[0]=state;a->scalarOutput[1]=r.done+r.failed;a->scalarOutput[2]=r.first_failed_id;a->scalarOutputCount=3;
++                        if(a->structureOutputSize){nord2_gpu_fault_info f={};f.job_id_lo=(uint32_t)r.first_failed_id;f.job_id_hi=(uint32_t)(r.first_failed_id>>32);
++                                f.state=r.first_failed_state;f.status=r.first_failed_status;f.fault_status=gpu->core->ctxs[context].fault_status;f.fault_address=gpu->core->ctxs[context].fault_address;
++                                memcpy(a->structureOutput,&f,sizeof(f));a->structureOutputSize=sizeof(f);}
++                        if(!r.pending){
++                                gpu->seqWaits++;gpu->seqJobs+=r.done+r.failed;uint64_t dur=now_us(NULL)-enter_us;gpu->seqDurSum+=dur;if(dur>gpu->seqDurMax)gpu->seqDurMax=(uint32_t)dur;
++                                (void)n2c_seq_state(gpu->core,context,seq,true,&r);gpu->emitJobStats();
++                        }
++                }break;
++        }
+         case NORD2_GPU_SEL_FAULT: {
+                 nord2_gpu_fault_info f={};f.fault_status=gpu->core->ctxs[context].fault_status;f.fault_address=gpu->core->ctxs[context].fault_address;
+                 memcpy(a->structureOutput,&f,sizeof(f));a->structureOutputSize=sizeof(f);result=kIOReturnSuccess;break;

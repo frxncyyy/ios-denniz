@@ -1,0 +1,63 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -485,6 +485,25 @@
+ 		for (uint32_t layer = 0; layer < SWEET_FB_LAYERS && !busy; layer++) {
+ 			if (surfaces.object[layer] != NULL && nord2_gpu_surface_busy(surfaces.object[layer])) { busy = true; busyObj = surfaces.object[layer]; }
+ 		}
++#if defined(NORD2)
++		/* 0149: CA submits a frame right after the vsync notification and the swap arrives with its jobs a few ms from done, so at this tick the newest
++		 * swap is practically always still in flight; skipping it to the next tick lets the following frame replace it (newest swap wins) and the panel
++		 * starves (one forced present per SWEET_FB_BUSY_MAX_TICKS+1 ticks).  The clock was re-armed on its grid above, so waiting here is free: give the
++		 * GPU a few ms to finish this very swap, then decide as before. */
++		if (busy) {
++			uint64_t w0 = mach_absolute_time(), waited = 0;
++			while (busy && waited < SWEET_FB_BUSY_WAIT_US) {
++				IOSleep(1);
++				busy = false; busyObj = NULL;
++				for (uint32_t layer = 0; layer < SWEET_FB_LAYERS && !busy; layer++) {
++					if (surfaces.object[layer] != NULL && nord2_gpu_surface_busy(surfaces.object[layer])) { busy = true; busyObj = surfaces.object[layer]; }
++				}
++				waited = sweet_fb_abs_to_us(mach_absolute_time() - w0);
++			}
++			fb->fStats.busy_waits++; fb->fStats.busy_wait_us += waited;
++			if (!busy) { fb->fStats.busy_wait_ok++; }
++		}
++#endif
+ 		int decision = sweet_fb_busy_decision(busy, &fb->fBusyTicks, SWEET_FB_BUSY_MAX_TICKS);
+ #if defined(NORD2)
+ 		/* 0148 (diagnostic): is it the same surface that stays busy, or a new swap with a new busy surface at every tick; and what holds it. */
+@@ -679,11 +698,12 @@
+ 	uint64_t now_us = sweet_fb_abs_to_us(mach_absolute_time());
+ 	if (sweet_fb_stats_due(&fStats, now_us)) {
+ 		uint32_t n = fStats.n ? fStats.n : 1;
+-		IOLog("NORD2 FB PRESENT: n=%u avg_us=%llu max_us=%u copy_us=%llu/%u xfer_us=%llu/%u legacy=%u timeouts=%u busy_skips=%u busy_forced=%u late_ticks=%u rate_hz=%u resv_expired=%llu busy_same=%u busy_diff=%u busy_maxrun=%u\n",
++		IOLog("NORD2 FB PRESENT: n=%u avg_us=%llu max_us=%u copy_us=%llu/%u xfer_us=%llu/%u legacy=%u timeouts=%u busy_skips=%u busy_forced=%u late_ticks=%u rate_hz=%u resv_expired=%llu busy_same=%u busy_diff=%u busy_maxrun=%u busy_waits=%u busy_wait_ok=%u busy_wait_avg_us=%llu\n",
+ 		    fStats.n, fStats.sum_us / n, fStats.max_us, fStats.sum_copy_us / n, fStats.max_copy_us,
+ 		    fStats.sum_xfer_us / n, fStats.max_xfer_us, fStats.legacy, fStats.timeouts, fStats.busy_skips,
+ 		    fStats.busy_forced, fStats.late_ticks, 60 / fFlushTicks, nord2_gpu_resv_expired(),
+-		    fStats.busy_same, fStats.busy_diff, fStats.busy_maxrun);
++		    fStats.busy_same, fStats.busy_diff, fStats.busy_maxrun, fStats.busy_waits, fStats.busy_wait_ok,
++		    fStats.busy_waits ? fStats.busy_wait_us / fStats.busy_waits : 0ULL);
+ 		IOLog("NORD2 FB SEEN: presents=%u different=%u same=%u gaps_ms<=20/34/67/100/more=%u/%u/%u/%u/%u max_gap_ms=%llu\n", fStats.n, fDistinct, fSame,
+ 		    fGapBin[0], fGapBin[1], fGapBin[2], fGapBin[3], fGapBin[4], fDistinctGapMaxUs / 1000);
+ 		fDistinct = fSame = 0; fDistinctGapMaxUs = 0; for (unsigned i = 0; i < 5; i++) { fGapBin[i] = 0; }
+--- a/iokit/Kernel/arm/sweet_fb_present.h
++++ b/iokit/Kernel/arm/sweet_fb_present.h
+@@ -16,6 +16,7 @@
+ 
+ #define SWEET_FB_DEFAULT_HZ 30u          /* panel present rate; one panel transfer plus the copy is ~20-25 ms */
+ #define SWEET_FB_BUSY_MAX_TICKS 6u       /* 100 ms at 60 Hz: then present anyway */
++#define SWEET_FB_BUSY_WAIT_US 10000u     /* 0149: a swap whose GPU work is still in flight at the tick is waited for, this long at most, before it is skipped */
+ #define SWEET_FB_XFER_TIMEOUT_US 40000u  /* frame-done not seen: give up on this transfer */
+ #define SWEET_FB_XFER_POLL_US 500u
+ #define SWEET_FB_STAT_INTERVAL_US 5000000u
+@@ -83,7 +84,8 @@
+ /* Present timing, windowed; reported at most every SWEET_FB_STAT_INTERVAL_US and only if something presented. */
+ struct sweet_fb_present_stats {
+ 	uint32_t n, timeouts, busy_skips, busy_forced, late_ticks, legacy;
+-	uint32_t busy_same, busy_diff, busy_maxrun;   /* 0148: skips with the same / a different newest surface than the previous skip; longest run of skips */
++	uint32_t busy_same, busy_diff, busy_maxrun, busy_waits, busy_wait_ok;
++	uint64_t busy_wait_us;   /* 0148: skips with the same / a different newest surface than the previous skip; longest run of skips */
+ 	uint64_t sum_us, sum_copy_us, sum_xfer_us;
+ 	uint32_t max_us, max_copy_us, max_xfer_us;
+ 	uint64_t last_report_us;

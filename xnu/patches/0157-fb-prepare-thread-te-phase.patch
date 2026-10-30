@@ -1,0 +1,156 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -193,6 +193,12 @@
+ 	uintptr_t           fPixelsB, fCopyDst;
+ 	uint8_t            *fNextRec;
+ 	sweet_fb_pending_surfaces fNextSurfaces;
++	/* 0157: the next frame is prepared on its own thread so the present thread keeps timing the panel TE accurately */
++	IOWorkLoop         *fPrepLoop;
++	IOTimerEventSource *fPrepTimer;
++	bool                fPrepArmed, fPrepCopying, fFireValid;
++	uint64_t            fFireTeUs, fTeSpanUs;
++	uint32_t            fTeN, fPhaseBin[5];
+ 	bool                fDbl, fPrepared, fTeObsSet;
+ 	uint8_t             fFront, fNextState;      /* fFront: panel buffer the overlay reads (0 = fPixels, 1 = fPixelsB); fNextState 0 none, 1 taken / waiting for the GPU, 2 copied */
+ 	uint32_t            fCad[5];
+@@ -210,6 +216,7 @@
+ 	bool                fNbReady;            /* the blocking path has run once: overlay removed, ownership taken */
+ 	struct sweet_fb_present_stats fStats;
+ 	static void presentFired(OSObject *owner, IOTimerEventSource *sender);
++	static void prepFired(OSObject *owner, IOTimerEventSource *sender);
+ 	bool        presentCopy(const uint8_t *rec, SweetSurface *const surfaces[SWEET_FB_LAYERS]);
+ 	void        presentDone(bool shown, bool timeout, bool legacy);
+ 	void        dumpDisplayRegs(void);
+@@ -388,6 +395,11 @@
+ 		IOLog("SWEET FB: no present thread\n");
+ 		return false;
+ 	}
++	fPrepLoop = IOWorkLoop::workLoop();
++	fPrepTimer = fPrepLoop != NULL ? IOTimerEventSource::timerEventSource(this, &AppleCLCD::prepFired) : NULL;
++	if (fPrepTimer == NULL || fPrepLoop->addEventSource(fPrepTimer) != kIOReturnSuccess) {
++		OSSafeReleaseNULL(fPrepTimer);      /* no double buffering without the prepare thread */
++	}
+ #if defined(NORD2)
+ 	fDsi = (volatile uint32_t *)ml_io_map(SWEET_FB_DSI0, 0x1000);
+ 	fMutex = (volatile uint32_t *)ml_io_map(SWEET_FB_DISP_MUTEX, 0x1000);
+@@ -574,6 +586,7 @@
+ #if defined(NORD2)
+ 	const char *why = NULL;
+ 	if (fDsi == NULL) { why = "no DSI"; }
++	if (why == NULL && fPrepTimer == NULL) { why = "no prepare thread"; }
+ 	if (why == NULL && fOvl[0] == NULL) { fOvl[0] = (volatile uint32_t *)ml_io_map(SWEET_FB_OVL0_2L, 0x1000); }
+ 	if (why == NULL && fOvl[1] == NULL) { fOvl[1] = (volatile uint32_t *)ml_io_map(SWEET_FB_OVL1_2L, 0x1000); }
+ 	if (why == NULL && (fOvl[0] == NULL || fOvl[1] == NULL)) { why = "overlay not mappable"; }
+@@ -639,19 +652,41 @@
+ 		if (busy && waited < SWEET_FB_BUSY_WAIT_US) { return; }
+ 		fStats.busy_waits++; fStats.busy_wait_us += waited;
+ 		if (!busy) { fStats.busy_wait_ok++; } else { __atomic_fetch_add(&fStats.busy_forced, 1, __ATOMIC_RELAXED); }
+-		fCopyDst = fFront ? fPixels : fPixelsB;       /* the buffer the overlay is not reading */
++		IOLockLock(fLock);
++		fPrepCopying = true;
++		IOLockUnlock(fLock);
++		uintptr_t dst = fFront ? fPixels : fPixelsB;       /* the buffer the overlay is not reading */
++		fCopyDst = dst;
+ 		uint64_t t0 = mach_absolute_time();
+ 		bool shown = presentCopy(fNextRec, (SweetSurface *const *)fNextSurfaces.object);
+ 		fPrepCopyUs = sweet_fb_abs_to_us(mach_absolute_time() - t0);
+ 		fCopyDst = 0;
+-		if (!shown) { dropNext(); return; }
+-		noteDistinct(fFront ? fPixels : fPixelsB);
++		if (!shown) { fPrepCopying = false; dropNext(); return; }
++		noteDistinct(dst);
+ 		fStats.dbl_preps++;
++		IOLockLock(fLock);
+ 		fNextState = 2;
++		fPrepCopying = false;
++		IOLockUnlock(fLock);
+ 	}
+ #endif
+ }
+ 
++void
++AppleCLCD::prepFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	AppleCLCD *fb = (AppleCLCD *)owner;
++#if defined(NORD2)
++	if (!fb->fDbl || __atomic_load_n(&fb->fSwapLifecycle.stopped, __ATOMIC_ACQUIRE)) { fb->fPrepArmed = false; return; }
++	fb->prepNext();
++	if (fb->fNextState == 1) { sender->setTimeoutUS(100); return; }       /* still waiting for the GPU */
++	fb->fPrepArmed = false;
++	if (fb->fNextState == 2 && fb->fPState == 0) { fb->handOver(0); }        /* the transfer ended while the copy ran: start it now */
++#else
++	(void)fb; (void)sender;
++#endif
++}
++
+ /* Takes the newest swap if the presenter is idle and starts it on the present thread (state 5: wait for the GPU, then copy, TE wait, transfer). */
+ void
+ AppleCLCD::handOver(uint64_t count)
+@@ -659,13 +694,13 @@
+ 	(void)count;
+ 	if (fPresentTimer == NULL) { return; }
+ 	IOLockLock(fLock);
+-	if (!fPowerOff && fPState == 0 && fNextState != 0) {
++	if (!fPowerOff && fPState == 0 && fNextState == 1) { IOLockUnlock(fLock); return; }      /* 0157: the prepare thread is on it and calls back */
++	if (!fPowerOff && fPState == 0 && fNextState == 2) {
+ 		/* 0156: the frame prepared during the last transfer goes first */
+ 		fWorkRec = fNextRec; fWorkSurfaces = fNextSurfaces;
+ 		fNextRec = NULL; sweet_fb_pending_surfaces_init(&fNextSurfaces);
+ 		sweet_fb_retire_take(&fRetire);
+-		if (fNextState == 2) { fPrepared = true; fPState = 1; fStats.dbl_hits++; }
+-		else { fWaitStartUs = fNextWaitUs; fPState = 5; }
++		fPrepared = true; fPState = 1; fStats.dbl_hits++;
+ 		fNextState = 0;
+ 		IOLockUnlock(fLock);
+ 		IOLockWakeup(fLock, &fRetireEvent, false);
+@@ -828,6 +863,7 @@
+ 			if (fire > nowUs + 300) { sender->setTimeoutUS((uint32_t)(fire - nowUs - 200)); return; }
+ 			while (sweet_fb_abs_to_us(mach_absolute_time()) < fire) { IODelay(20); }
+ 			fb->fStats.te_lead_starts++;
++			fb->fFireTeUs = fire + fb->fTeLeadUs; fb->fFireValid = true;
+ 			nowUs = sweet_fb_abs_to_us(mach_absolute_time());
+ 			te = true;
+ 			fb->fDsi[SWEET_FB_DSI_INTSTA / 4] = ~SWEET_FB_DSI_TE_RDY;      /* the next TE seen is the one this push is ahead of */
+@@ -861,7 +897,10 @@
+ 	int st = sweet_fb_xfer_state(fb->xferDone(), elapsed);
+ 	if (st == SWEET_FB_XFER_WAIT) {
+ #if defined(NORD2)
+-		if (fb->fPState == 2) { fb->prepNext(); }
++		if (fb->fPState == 2 && fb->fDbl && fb->fPrepTimer != NULL && fb->fNextState == 0 && fb->fDirty && !fb->fPrepArmed) {
++			fb->fPrepArmed = true;
++			fb->fPrepTimer->setTimeoutUS(1);
++		}
+ #endif
+ 		sender->setTimeoutUS(SWEET_FB_XFER_POLL_US);
+ 		return;
+@@ -1023,10 +1062,17 @@
+ 	if (shown && !legacy) {
+ 		if (fTeObsSet) {
+ 			fTeObsSet = false;
++			if (fFireValid) {
++				fFireValid = false;
++				int64_t pe = (int64_t)fTeObsUs - (int64_t)fFireTeUs;
++				uint64_t ap = pe < 0 ? (uint64_t)(-pe) : (uint64_t)pe;
++				fPhaseBin[ap <= 300 ? 0 : ap <= 600 ? 1 : ap <= 1000 ? 2 : ap <= 2000 ? 3 : 4]++;
++			}
+ 			if (fTeLastUs != 0 && fTeObsUs > fTeLastUs && fTeObsUs - fTeLastUs < 200000) {
+ 				uint64_t d = fTeObsUs - fTeLastUs, P = fTePeriodUs, n = (d + P / 2) / P;
+ 				int64_t err = n ? (int64_t)d - (int64_t)(n * P) : 0;
+ 				if (n >= 1 && err > -(int64_t)(P / 4) && err < (int64_t)(P / 4)) {
++					fTeSpanUs += d; fTeN += (uint32_t)n;
+ 					fTePeriodUs = (uint64_t)((int64_t)P + err / (int64_t)(8 * n));
+ 					if (fTePeriodUs < 8000) { fTePeriodUs = 8000; } else if (fTePeriodUs > 20000) { fTePeriodUs = 20000; }
+ 				}
+@@ -1095,8 +1141,10 @@
+ 		    fStats.te_waits ? fStats.te_wait_us / fStats.te_waits : 0ULL, fStats.te_wait_max, fPanelHz, fModeState, fRetuneState);
+ 		IOLog("NORD2 FB SEEN: presents=%u different=%u same=%u gaps_ms<=20/34/67/100/more=%u/%u/%u/%u/%u max_gap_ms=%llu\n", fStats.n, fDistinct, fSame,
+ 		    fGapBin[0], fGapBin[1], fGapBin[2], fGapBin[3], fGapBin[4], fDistinctGapMaxUs / 1000);
+-		IOLog("NORD2 FB CADENCE: distinct_gaps_ms<=12.5/15/19/28/more=%u/%u/%u/%u/%u dbl=%u preps=%u hits=%u te_lead_starts=%u te_period_us=%llu\n", fCad[0], fCad[1], fCad[2], fCad[3], fCad[4],
+-		    fDbl ? 1u : 0u, fStats.dbl_preps, fStats.dbl_hits, fStats.te_lead_starts, fTePeriodUs);
++		IOLog("NORD2 FB CADENCE: distinct_gaps_ms<=12.5/15/19/28/more=%u/%u/%u/%u/%u dbl=%u preps=%u hits=%u te_lead_starts=%u te_period_us=%llu te_long_us=%llu phase_err_us<=300/600/1000/2000/more=%u/%u/%u/%u/%u\n", fCad[0], fCad[1], fCad[2], fCad[3], fCad[4],
++		    fDbl ? 1u : 0u, fStats.dbl_preps, fStats.dbl_hits, fStats.te_lead_starts, fTePeriodUs, fTeN ? fTeSpanUs / fTeN : 0ULL,
++		    fPhaseBin[0], fPhaseBin[1], fPhaseBin[2], fPhaseBin[3], fPhaseBin[4]);
++		for (unsigned i = 0; i < 5; i++) { fPhaseBin[i] = 0; }
+ 		for (unsigned i = 0; i < 5; i++) { fCad[i] = 0; }
+ 		fDistinct = fSame = 0; fDistinctGapMaxUs = 0; for (unsigned i = 0; i < 5; i++) { fGapBin[i] = 0; }
+ 		sweet_fb_stats_reset(&fStats, now_us);

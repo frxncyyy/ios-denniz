@@ -1,0 +1,896 @@
+--- a/gpu/include/nord2_gpu_core.h
++++ b/gpu/include/nord2_gpu_core.h
+@@ -133,6 +133,9 @@
+         void (*log)(void *ctx, const char *msg);
+         /* Optional microsecond clock for job timing; now_ms()*1000 if NULL. */
+         uint64_t (*now_us)(void *ctx);
++        /* 0112: identity of the display surface behind an imported buffer's owner cookie (what the framebuffer compares); NULL = not a surface.
++         * Optional: the cookie itself if NULL.  Resolved at reservation time only; the result is never dereferenced by the core. */
++        const void *(*resv_token)(void *ctx, void *cookie);
+ };
+ 
+ struct n2c_page {
+@@ -257,6 +260,23 @@
+          * and pages invalidated by acquire or by a buffer becoming user-visible */
+         uint64_t cache_skip_clean_pages, cache_skip_inval_pages, cache_deferred_pages, cache_acquire_pages;
+         uint64_t cache_skip_wmask_pages;   /* listed GPU_WRITE buffers the job did not declare in write_mask (n2c_set_wmask_inval) */
++        /* 0112 surface reservations: reserved, retired with a completion seq, cancelled (seq 0 or client gone), expired unretired */
++        uint64_t resv_reserves, resv_retires, resv_cancels, resv_expired;
++};
++
++/* 0112: a reservation tells the framebuffer that jobs NOT YET SUBMITTED will write these surfaces.  Fail-safe by construction: at most 4 per context,
++ * an unretired one stops counting after N2C_RESV_EXPIRE_MS, a retired one ends when every job of the context up to its seq is terminal (any terminal
++ * state), and closing the context drops them. */
++#define N2C_RESV_MAX 8u
++#define N2C_RESV_PER_CTX 4u
++#define N2C_RESV_SLOTS (N2C_MAX_CTX * N2C_RESV_PER_CTX)
++#define N2C_RESV_EXPIRE_MS 200u
++struct n2c_resv {
++        uint32_t id;              /* 0 = free; per-context monotonic otherwise */
++        uint8_t ctx, n;
++        uint64_t seq;             /* 0 = not retired yet */
++        uint64_t t_ms;            /* reservation time */
++        const void *tok[N2C_RESV_MAX];
+ };
+ 
+ struct n2c_core {
+@@ -280,6 +300,9 @@
+         bool full_cache_maint;
+         uint8_t track_level;      /* N2C_TRACK_*; set before the first buffer exists */
+         bool wmask_inval;         /* 0110: a job with a non-zero write_mask invalidates only the buffers it declares; set before the first buffer exists */
++        bool resv_off;            /* 0112 kill switch (boot-arg n2resv=0): the selectors answer kIOReturnUnsupported */
++        uint32_t resv_next[N2C_MAX_CTX];
++        struct n2c_resv resv[N2C_RESV_SLOTS];
+         /* Private immutable workaround, separate AS0 MMU, never user mapped. */
+         const uint8_t *wa_payload;
+         size_t wa_size;
+@@ -345,6 +368,14 @@
+ /* Opt-in (boot-arg n2wm): trust write_mask as the list of buffers a job writes.  A job with write_mask == 0 keeps the conservative rule
+  * (every listed GPU_WRITE buffer).  Refused once buffers exist. */
+ bool n2c_set_wmask_inval(struct n2c_core *c, bool on);
++
++/* 0112 surface reservations.  RESERVE: handles are this context's imported-surface buffers; n == 0 answers id 0 (availability probe); > 8 or an unknown or
++ * non-imported handle: N2C_E_ARGS; more than 4 live reservations in the context: N2C_E_BUSY.  RETIRE: id 0 is a no-op; unknown id: N2C_E_NO_JOB; seq 0 cancels
++ * at once; seq must name an issued job (N2C_E_ARGS otherwise).  BUSY: a live reservation names the surface token.  Never blocks. */
++enum n2c_error n2c_resv_create(struct n2c_core *c, unsigned idx, const uint32_t *handles, unsigned n, uint32_t *id);
++enum n2c_error n2c_resv_retire(struct n2c_core *c, unsigned idx, uint32_t id, uint64_t seq);
++bool n2c_resv_busy(struct n2c_core *c, const void *token);
++void n2c_set_resv_enabled(struct n2c_core *c, bool on);
+ /* A user mapping of the buffer was handed out: from now on it is maintained like any CPU-visible buffer. */
+ enum n2c_error n2c_bo_cpu_visible(struct n2c_core *c, unsigned ctx, uint32_t handle);
+ /* Bracketed CPU access (level 2, visible buffers only): lock/unlock-style protocol replaces per-job maintenance. */
+--- a/gpu/src/nord2_gpu_core.c
++++ b/gpu/src/nord2_gpu_core.c
+@@ -529,6 +529,153 @@
+         nord2_gpu_mmu_fini(&x->mmu);
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* Surface reservations (0112)                                         */
++
++static bool ctx_jobs_pending_upto(struct n2c_core *c, unsigned idx, uint64_t seq)
++{
++        for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
++                const struct n2c_job *j = &c->jobs[i];
++                if (j->state != N2C_JOB_FREE && j->ctx == idx && j->id <= seq && !terminal(j->state))
++                        return true;
++        }
++        return false;
++}
++
++/* Drop what no longer counts: unretired reservations older than the expiry, retired ones whose jobs are all terminal. */
++static void resv_sweep(struct n2c_core *c)
++{
++        uint64_t t = now(c);
++        for (unsigned i = 0; i < N2C_RESV_SLOTS; i++) {
++                struct n2c_resv *r = &c->resv[i];
++                if (!r->id)
++                        continue;
++                if (!r->seq) {
++                        if (t >= r->t_ms && t - r->t_ms >= N2C_RESV_EXPIRE_MS) {
++                                c->stats.resv_expired++;
++                                memset(r, 0, sizeof(*r));
++                        }
++                } else if (!ctx_jobs_pending_upto(c, r->ctx, r->seq)) {
++                        memset(r, 0, sizeof(*r));
++                }
++        }
++}
++
++static void resv_drop_ctx(struct n2c_core *c, unsigned idx)
++{
++        for (unsigned i = 0; i < N2C_RESV_SLOTS; i++) {
++                struct n2c_resv *r = &c->resv[i];
++                if (r->id && r->ctx == idx) {
++                        c->stats.resv_cancels++;
++                        memset(r, 0, sizeof(*r));
++                }
++        }
++}
++
++void n2c_set_resv_enabled(struct n2c_core *c, bool on)
++{
++        if (c)
++                c->resv_off = !on;
++}
++
++enum n2c_error n2c_resv_create(struct n2c_core *c, unsigned idx, const uint32_t *handles, unsigned n, uint32_t *id)
++{
++        struct n2c_ctx *x = c ? ctx_at(c, idx) : NULL;
++        if (!x)
++                return N2C_E_NO_CTX;
++        if (c->resv_off)
++                return N2C_E_STATE;
++        if (!id || n > N2C_RESV_MAX || (n && !handles))
++                return N2C_E_ARGS;
++        *id = 0;
++        if (!n)
++                return N2C_OK;                  /* the availability probe */
++        resv_sweep(c);
++        unsigned live = 0, free_slot = N2C_RESV_SLOTS;
++        for (unsigned i = 0; i < N2C_RESV_SLOTS; i++) {
++                if (!c->resv[i].id) {
++                        if (free_slot == N2C_RESV_SLOTS)
++                                free_slot = i;
++                } else if (c->resv[i].ctx == idx) {
++                        live++;
++                }
++        }
++        const void *tok[N2C_RESV_MAX];
++        for (unsigned i = 0; i < n; i++) {
++                struct n2c_bo *b = bo_at(x, handles[i]);
++                if (!b || b->state != N2C_BO_MAPPED || !(b->flags & N2C_BO_IMPORTED))
++                        return N2C_E_ARGS;
++                tok[i] = c->ops.resv_token ? c->ops.resv_token(c->ctx, b->cookie) : b->cookie;
++                if (!tok[i])
++                        return N2C_E_ARGS;
++        }
++        if (live >= N2C_RESV_PER_CTX || free_slot == N2C_RESV_SLOTS)
++                return N2C_E_BUSY;
++        struct n2c_resv *r = &c->resv[free_slot];
++        memset(r, 0, sizeof(*r));
++        uint32_t nid = ++c->resv_next[idx];
++        if (!nid)
++                nid = ++c->resv_next[idx];     /* never 0 */
++        r->id = nid;
++        r->ctx = (uint8_t)idx;
++        r->n = (uint8_t)n;
++        r->t_ms = now(c);
++        for (unsigned i = 0; i < n; i++)
++                r->tok[i] = tok[i];
++        c->stats.resv_reserves++;
++        *id = nid;
++        return N2C_OK;
++}
++
++enum n2c_error n2c_resv_retire(struct n2c_core *c, unsigned idx, uint32_t id, uint64_t seq)
++{
++        struct n2c_ctx *x = c ? ctx_at(c, idx) : NULL;
++        if (!x)
++                return N2C_E_NO_CTX;
++        if (c->resv_off)
++                return N2C_E_STATE;
++        if (!id)
++                return N2C_OK;
++        resv_sweep(c);
++        struct n2c_resv *r = NULL;
++        for (unsigned i = 0; i < N2C_RESV_SLOTS; i++)
++                if (c->resv[i].id == id && c->resv[i].ctx == idx) {
++                        r = &c->resv[i];
++                        break;
++                }
++        if (!r)
++                return N2C_E_NO_JOB;
++        if (!seq) {
++                c->stats.resv_cancels++;
++                memset(r, 0, sizeof(*r));
++                return N2C_OK;
++        }
++        if (seq >= c->next_job_id)
++                return N2C_E_ARGS;              /* must name an issued job: nothing would ever release it early */
++        if (r->seq)
++                return N2C_OK;                  /* retiring twice keeps the first seq */
++        r->seq = seq;
++        c->stats.resv_retires++;
++        resv_sweep(c);
++        return N2C_OK;
++}
++
++bool n2c_resv_busy(struct n2c_core *c, const void *token)
++{
++        if (!c || !token)
++                return false;
++        resv_sweep(c);
++        for (unsigned i = 0; i < N2C_RESV_SLOTS; i++) {
++                const struct n2c_resv *r = &c->resv[i];
++                if (!r->id)
++                        continue;
++                for (unsigned k = 0; k < r->n; k++)
++                        if (r->tok[k] == token)
++                                return true;
++        }
++        return false;
++}
++
+ enum n2c_error n2c_ctx_close(struct n2c_core *c, unsigned idx)
+ {
+         struct n2c_ctx *x = c ? ctx_at(c, idx) : NULL;
+@@ -536,6 +683,7 @@
+                 return N2C_E_NO_CTX;
+         if (x->state == N2C_CTX_ZOMBIE)
+                 return N2C_E_BROKEN;
++        resv_drop_ctx(c, idx);   /* a client that is gone (or closing) reserves nothing */
+         /* 1. Jobs: cancel queued, stop running. */
+         for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
+                 struct n2c_job *j = &c->jobs[i];
+@@ -1258,6 +1406,8 @@
+                         job_finish(c, j, N2C_JOB_RESET);
+         }
+         drain_quarantine(c);
++        for (unsigned i = 0; i < N2C_MAX_CTX; i++)
++                resv_drop_ctx(c, i);          /* a reset ends everything the frames were waiting for */
+         c->reset_pending = false;
+         if (n2hw_apply_quirks(c->hw) != N2HW_OK ||
+             n2hw_power_on_l2(c->hw) != N2HW_OK || wa_start(c) != N2C_OK ||
+--- a/gpu/include/nord2_gpu_transport.h
++++ b/gpu/include/nord2_gpu_transport.h
+@@ -30,6 +30,14 @@
+  * NORD2_GPU_MAX_INFLIGHT unfinished jobs per client; SUBMIT_JM returns kIOReturnBusy
+  * beyond that (wait, then resubmit). */
+ #define NORD2_GPU_SEL_WAIT_SEQ 12
++/* 0112 display-surface reservation.  RESERVE(n, handles[n] as structure input of n uint32 imported-surface buffer handles) -> id (never 0 when n > 0):
++ * until retired, cancelled, expired (200 ms) or its client closes, the framebuffer treats those surfaces as busy although no job writing them has been
++ * submitted yet.  n == 0 answers id 0 and is the availability probe; n > 8: BadArgument; more than 4 live reservations in the context: Busy.
++ * RETIRE(id, seq): seq != 0 keeps it busy until every job of this context with id <= seq is terminal; seq == 0 cancels; id 0 is a no-op;
++ * unknown id: kIOReturnNotFound.  Neither call blocks. */
++#define NORD2_GPU_SEL_SURFACE_RESERVE 13
++#define NORD2_GPU_SEL_SURFACE_RETIRE 14
++#define NORD2_GPU_RESERVE_MAX 8u
+ #define NORD2_GPU_MAX_INFLIGHT 96u
+ #define NORD2_GPU_TRANSPORT_VERSION 2u
+ 
+@@ -252,6 +260,10 @@
+                 expected_si = sizeof(struct nord2_gpu_submit_request);
+                 expected_no = 1; break;
+         case NORD2_GPU_SEL_SYNC: expected_ni = 2; break;
++        case NORD2_GPU_SEL_SURFACE_RESERVE:
++                if (!iv || ((const uint64_t *)iv)[0] > NORD2_GPU_RESERVE_MAX) return false;
++                expected_ni = 1; expected_no = 1; expected_si = (size_t)((const uint64_t *)iv)[0] * 4u; break;
++        case NORD2_GPU_SEL_SURFACE_RETIRE: expected_ni = 2; break;
+         case NORD2_GPU_SEL_WAIT_SEQ:
+                 expected_ni = 2; expected_no = 3;
+                 if (so) minimum_so = sizeof(struct nord2_gpu_fault_info);
+--- a/gpu/src/Nord2GPU.cpp
++++ b/gpu/src/Nord2GPU.cpp
+@@ -82,6 +82,8 @@
+         IOBufferMemoryDescriptor *md;
+         SweetSurface *surface;
+ };
++/* 0112: the display surface behind an imported buffer (NULL for any other buffer); only compared, never dereferenced, by the core. */
++static const void *resv_token(void *, void *cookie) { return cookie ? (const void *)((BufferOwner *)cookie)->surface : NULL; }
+ static void free_owner(void *, void *cookie) {
+         BufferOwner *o = (BufferOwner *)cookie;
+         if (!o) return;
+@@ -111,8 +113,11 @@
+         int wm = 0;      /* 0110: nord2_gpu_wmask=1 (alias n2wm) trusts a job's write_mask for the post-job invalidate */
+         got = PE_parse_boot_argn("nord2_gpu_wmask", &wm, sizeof(wm)); if (!got) got = PE_parse_boot_argn("n2wm", &wm, sizeof(wm));
+         (void)n2c_set_wmask_inval(c, wm == 1);
+-        IOLog("NORD2 GPU: cache maintenance %s, CPU-access tracking level %d, invalidate scope %s\n", c->full_cache_maint ? "whole-context (boot-arg)" : "per-job buffer list", tr,
+-              c->wmask_inval ? "declared writes (write_mask)" : "every listed GPU_WRITE buffer");
++        int rs = 1;      /* 0112: nord2_gpu_resv=0 (alias n2resv) disables the display-surface reservation selectors */
++        got = PE_parse_boot_argn("nord2_gpu_resv", &rs, sizeof(rs)); if (!got) got = PE_parse_boot_argn("n2resv", &rs, sizeof(rs));
++        n2c_set_resv_enabled(c, rs != 0);
++        IOLog("NORD2 GPU: cache maintenance %s, CPU-access tracking level %d, invalidate scope %s, surface reservations %s\n", c->full_cache_maint ? "whole-context (boot-arg)" : "per-job buffer list", tr,
++              c->wmask_inval ? "declared writes (write_mask)" : "every listed GPU_WRITE buffer", rs ? "on" : "off");
+         return true;
+ }
+ static bool battery_temperature(int *centi);
+@@ -287,7 +292,7 @@
+         n2clk_ops co = { clockRead, clockWrite, delay_us, log_msg };
+         n2hw_ops ho = { read_bank, write_bank, delay_us, log_msg };
+         nord2_scpsys_ops so = { spmRead, spmWrite, infraRead, infraWrite, delay_us, log_msg };
+-        n2c_ops mo = { allocTable, freeTable, flushTable, alloc_host, free_host, sync_page, free_owner, now_ms, log_msg, now_us };
++        n2c_ops mo = { allocTable, freeTable, flushTable, alloc_host, free_host, sync_page, free_owner, now_ms, log_msg, now_us, resv_token };
+         core = (n2c_core *)IOMallocZero(sizeof(*core));
+         return core && n2pmif_init(&pm15, N2PMIF_SPMI, &po, &spmi) &&
+                n2pmif_init(&pm59, N2PMIF_PWRAP, &po, &pwrap) &&
+@@ -533,11 +538,13 @@
+                                        ((BufferOwner *)b->cookie)->surface == (SweetSurface *)surface;
+                         }
+                 }
++                if (!busy) busy = n2c_resv_busy(core, surface);   /* 0112: a frame that has not been submitted yet but is promised */
+         }
+         IOLockUnlock(lock);
+         return busy;
+ }
+ extern "C" bool nord2_gpu_surface_busy(void *surface) { return gSurfaceGpu ? gSurfaceGpu->surfaceBusy(surface) : false; }
++extern "C" uint64_t nord2_gpu_resv_expired(void) { return gSurfaceGpu && gSurfaceGpu->core ? gSurfaceGpu->core->stats.resv_expired : 0; }
+ extern "C" void nord2_gpu_surface_cpu_acquire(void *surface) { if (gSurfaceGpu) gSurfaceGpu->surfaceHook(surface, true); }
+ extern "C" void nord2_gpu_surface_cpu_release(void *surface) { if (gSurfaceGpu) gSurfaceGpu->surfaceHook(surface, false); }
+ static uint32_t gic_rd32(void *c, uint32_t off) { return read_bank(c, off); }
+@@ -710,7 +717,7 @@
+         int hot = (lvtsMode && lvtsState && lvtsState != 3) ? lvtsHottest(lvtsMask) : (int)0x80000000;
+         uint32_t n = t.jobs ? t.jobs : 1, w = waitN ? waitN : 1;
+         IOLog("NORD2 GPU JOBS: n=%u fault=%u full=%u win_ms=%llu q_us=%llu/%u run_us=%llu/%u tot_us=%llu/%u "
+-              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u gpu_khz=%u mux=%u bat_cC=%d bat_ok=%u gpu_cC=%d soc_cC=%d lvts=%u%s irq=%u:%u/%u/%u/%u trk=%u skipC_KiB=%llu skipI_KiB=%llu defI_KiB=%llu acqI_KiB=%llu wmI_KiB=%llu\n",
++              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u gpu_khz=%u mux=%u bat_cC=%d bat_ok=%u gpu_cC=%d soc_cC=%d lvts=%u%s irq=%u:%u/%u/%u/%u trk=%u skipC_KiB=%llu skipI_KiB=%llu defI_KiB=%llu acqI_KiB=%llu wmI_KiB=%llu resv=%llu/%llu/%llu/%llu\n",
+               t.jobs, t.faulted, t.full_jobs, t.window_start_us / 1000, t.sum_queue_us / n, t.max_queue_us,
+               t.sum_run_us / n, t.max_run_us, t.sum_total_us / n, t.max_total_us, t.sum_clean_us / n, t.max_clean_us,
+               t.sum_inval_us / n, t.max_inval_us, t.sum_clean_pages * 4, t.sum_inval_pages * 4, waitN,
+@@ -720,7 +727,8 @@
+               lvtsState, (lvtsState && lvts.cal.defaulted) ? "~" : "",
+               (unsigned)irqState, irqTops, irqGuard.spurious_total, irqSleeps, irqTimeouts,
+               (unsigned)core->track_level, core->stats.cache_skip_clean_pages * 4, core->stats.cache_skip_inval_pages * 4,
+-              core->stats.cache_deferred_pages * 4, core->stats.cache_acquire_pages * 4, core->stats.cache_skip_wmask_pages * 4);
++              core->stats.cache_deferred_pages * 4, core->stats.cache_acquire_pages * 4, core->stats.cache_skip_wmask_pages * 4,
++              core->stats.resv_reserves, core->stats.resv_retires, core->stats.resv_cancels, core->stats.resv_expired);
+         waitN = waitGapMax = waitDurMax = waitRetMax = 0; waitGapSum = waitDurSum = waitRetSum = 0;
+         seqWaits = seqJobs = seqDurMax = 0; seqDurSum = 0;
+ }
+@@ -1093,6 +1101,17 @@
+                 uint32_t h;uint64_t va,size;result=gpu->importSurface(context,(uint32_t)a->scalarInput[0],(uint32_t)a->scalarInput[1],(uint32_t)a->scalarInput[2],&h,&va,&size);
+                 if(result==kIOReturnSuccess){a->scalarOutput[0]=h;a->scalarOutput[1]=va;a->scalarOutput[2]=size;a->scalarOutputCount=3;}break;
+         }
++        case NORD2_GPU_SEL_SURFACE_RESERVE: {
++                if(gpu->core->resv_off){result=kIOReturnUnsupported;break;}
++                uint32_t id=0,n=(uint32_t)a->scalarInput[0];   /* the validator bounded n by the structure size it demanded */
++                result=io_error(n2c_resv_create(gpu->core,context,(const uint32_t *)a->structureInput,n,&id));
++                if(result==kIOReturnSuccess){a->scalarOutput[0]=id;a->scalarOutputCount=1;}
++                break;
++        }
++        case NORD2_GPU_SEL_SURFACE_RETIRE:
++                if(gpu->core->resv_off){result=kIOReturnUnsupported;break;}
++                if(a->scalarInput[0]>UINT32_MAX){result=kIOReturnBadArgument;break;}
++                result=io_error(n2c_resv_retire(gpu->core,context,(uint32_t)a->scalarInput[0],a->scalarInput[1]));break;
+         case NORD2_GPU_SEL_PROBE:
+                 result=gpu->probe(context);break;
+         case NORD2_GPU_SEL_SYNC:
+--- a/shim/nord2-xnu/nord2_gpu_core.h
++++ b/shim/nord2-xnu/nord2_gpu_core.h
+@@ -133,6 +133,9 @@
+         void (*log)(void *ctx, const char *msg);
+         /* Optional microsecond clock for job timing; now_ms()*1000 if NULL. */
+         uint64_t (*now_us)(void *ctx);
++        /* 0112: identity of the display surface behind an imported buffer's owner cookie (what the framebuffer compares); NULL = not a surface.
++         * Optional: the cookie itself if NULL.  Resolved at reservation time only; the result is never dereferenced by the core. */
++        const void *(*resv_token)(void *ctx, void *cookie);
+ };
+ 
+ struct n2c_page {
+@@ -257,6 +260,23 @@
+          * and pages invalidated by acquire or by a buffer becoming user-visible */
+         uint64_t cache_skip_clean_pages, cache_skip_inval_pages, cache_deferred_pages, cache_acquire_pages;
+         uint64_t cache_skip_wmask_pages;   /* listed GPU_WRITE buffers the job did not declare in write_mask (n2c_set_wmask_inval) */
++        /* 0112 surface reservations: reserved, retired with a completion seq, cancelled (seq 0 or client gone), expired unretired */
++        uint64_t resv_reserves, resv_retires, resv_cancels, resv_expired;
++};
++
++/* 0112: a reservation tells the framebuffer that jobs NOT YET SUBMITTED will write these surfaces.  Fail-safe by construction: at most 4 per context,
++ * an unretired one stops counting after N2C_RESV_EXPIRE_MS, a retired one ends when every job of the context up to its seq is terminal (any terminal
++ * state), and closing the context drops them. */
++#define N2C_RESV_MAX 8u
++#define N2C_RESV_PER_CTX 4u
++#define N2C_RESV_SLOTS (N2C_MAX_CTX * N2C_RESV_PER_CTX)
++#define N2C_RESV_EXPIRE_MS 200u
++struct n2c_resv {
++        uint32_t id;              /* 0 = free; per-context monotonic otherwise */
++        uint8_t ctx, n;
++        uint64_t seq;             /* 0 = not retired yet */
++        uint64_t t_ms;            /* reservation time */
++        const void *tok[N2C_RESV_MAX];
+ };
+ 
+ struct n2c_core {
+@@ -280,6 +300,9 @@
+         bool full_cache_maint;
+         uint8_t track_level;      /* N2C_TRACK_*; set before the first buffer exists */
+         bool wmask_inval;         /* 0110: a job with a non-zero write_mask invalidates only the buffers it declares; set before the first buffer exists */
++        bool resv_off;            /* 0112 kill switch (boot-arg n2resv=0): the selectors answer kIOReturnUnsupported */
++        uint32_t resv_next[N2C_MAX_CTX];
++        struct n2c_resv resv[N2C_RESV_SLOTS];
+         /* Private immutable workaround, separate AS0 MMU, never user mapped. */
+         const uint8_t *wa_payload;
+         size_t wa_size;
+@@ -345,6 +368,14 @@
+ /* Opt-in (boot-arg n2wm): trust write_mask as the list of buffers a job writes.  A job with write_mask == 0 keeps the conservative rule
+  * (every listed GPU_WRITE buffer).  Refused once buffers exist. */
+ bool n2c_set_wmask_inval(struct n2c_core *c, bool on);
++
++/* 0112 surface reservations.  RESERVE: handles are this context's imported-surface buffers; n == 0 answers id 0 (availability probe); > 8 or an unknown or
++ * non-imported handle: N2C_E_ARGS; more than 4 live reservations in the context: N2C_E_BUSY.  RETIRE: id 0 is a no-op; unknown id: N2C_E_NO_JOB; seq 0 cancels
++ * at once; seq must name an issued job (N2C_E_ARGS otherwise).  BUSY: a live reservation names the surface token.  Never blocks. */
++enum n2c_error n2c_resv_create(struct n2c_core *c, unsigned idx, const uint32_t *handles, unsigned n, uint32_t *id);
++enum n2c_error n2c_resv_retire(struct n2c_core *c, unsigned idx, uint32_t id, uint64_t seq);
++bool n2c_resv_busy(struct n2c_core *c, const void *token);
++void n2c_set_resv_enabled(struct n2c_core *c, bool on);
+ /* A user mapping of the buffer was handed out: from now on it is maintained like any CPU-visible buffer. */
+ enum n2c_error n2c_bo_cpu_visible(struct n2c_core *c, unsigned ctx, uint32_t handle);
+ /* Bracketed CPU access (level 2, visible buffers only): lock/unlock-style protocol replaces per-job maintenance. */
+--- a/shim/nord2-xnu/nord2_gpu_core.c
++++ b/shim/nord2-xnu/nord2_gpu_core.c
+@@ -529,6 +529,153 @@
+         nord2_gpu_mmu_fini(&x->mmu);
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* Surface reservations (0112)                                         */
++
++static bool ctx_jobs_pending_upto(struct n2c_core *c, unsigned idx, uint64_t seq)
++{
++        for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
++                const struct n2c_job *j = &c->jobs[i];
++                if (j->state != N2C_JOB_FREE && j->ctx == idx && j->id <= seq && !terminal(j->state))
++                        return true;
++        }
++        return false;
++}
++
++/* Drop what no longer counts: unretired reservations older than the expiry, retired ones whose jobs are all terminal. */
++static void resv_sweep(struct n2c_core *c)
++{
++        uint64_t t = now(c);
++        for (unsigned i = 0; i < N2C_RESV_SLOTS; i++) {
++                struct n2c_resv *r = &c->resv[i];
++                if (!r->id)
++                        continue;
++                if (!r->seq) {
++                        if (t >= r->t_ms && t - r->t_ms >= N2C_RESV_EXPIRE_MS) {
++                                c->stats.resv_expired++;
++                                memset(r, 0, sizeof(*r));
++                        }
++                } else if (!ctx_jobs_pending_upto(c, r->ctx, r->seq)) {
++                        memset(r, 0, sizeof(*r));
++                }
++        }
++}
++
++static void resv_drop_ctx(struct n2c_core *c, unsigned idx)
++{
++        for (unsigned i = 0; i < N2C_RESV_SLOTS; i++) {
++                struct n2c_resv *r = &c->resv[i];
++                if (r->id && r->ctx == idx) {
++                        c->stats.resv_cancels++;
++                        memset(r, 0, sizeof(*r));
++                }
++        }
++}
++
++void n2c_set_resv_enabled(struct n2c_core *c, bool on)
++{
++        if (c)
++                c->resv_off = !on;
++}
++
++enum n2c_error n2c_resv_create(struct n2c_core *c, unsigned idx, const uint32_t *handles, unsigned n, uint32_t *id)
++{
++        struct n2c_ctx *x = c ? ctx_at(c, idx) : NULL;
++        if (!x)
++                return N2C_E_NO_CTX;
++        if (c->resv_off)
++                return N2C_E_STATE;
++        if (!id || n > N2C_RESV_MAX || (n && !handles))
++                return N2C_E_ARGS;
++        *id = 0;
++        if (!n)
++                return N2C_OK;                  /* the availability probe */
++        resv_sweep(c);
++        unsigned live = 0, free_slot = N2C_RESV_SLOTS;
++        for (unsigned i = 0; i < N2C_RESV_SLOTS; i++) {
++                if (!c->resv[i].id) {
++                        if (free_slot == N2C_RESV_SLOTS)
++                                free_slot = i;
++                } else if (c->resv[i].ctx == idx) {
++                        live++;
++                }
++        }
++        const void *tok[N2C_RESV_MAX];
++        for (unsigned i = 0; i < n; i++) {
++                struct n2c_bo *b = bo_at(x, handles[i]);
++                if (!b || b->state != N2C_BO_MAPPED || !(b->flags & N2C_BO_IMPORTED))
++                        return N2C_E_ARGS;
++                tok[i] = c->ops.resv_token ? c->ops.resv_token(c->ctx, b->cookie) : b->cookie;
++                if (!tok[i])
++                        return N2C_E_ARGS;
++        }
++        if (live >= N2C_RESV_PER_CTX || free_slot == N2C_RESV_SLOTS)
++                return N2C_E_BUSY;
++        struct n2c_resv *r = &c->resv[free_slot];
++        memset(r, 0, sizeof(*r));
++        uint32_t nid = ++c->resv_next[idx];
++        if (!nid)
++                nid = ++c->resv_next[idx];     /* never 0 */
++        r->id = nid;
++        r->ctx = (uint8_t)idx;
++        r->n = (uint8_t)n;
++        r->t_ms = now(c);
++        for (unsigned i = 0; i < n; i++)
++                r->tok[i] = tok[i];
++        c->stats.resv_reserves++;
++        *id = nid;
++        return N2C_OK;
++}
++
++enum n2c_error n2c_resv_retire(struct n2c_core *c, unsigned idx, uint32_t id, uint64_t seq)
++{
++        struct n2c_ctx *x = c ? ctx_at(c, idx) : NULL;
++        if (!x)
++                return N2C_E_NO_CTX;
++        if (c->resv_off)
++                return N2C_E_STATE;
++        if (!id)
++                return N2C_OK;
++        resv_sweep(c);
++        struct n2c_resv *r = NULL;
++        for (unsigned i = 0; i < N2C_RESV_SLOTS; i++)
++                if (c->resv[i].id == id && c->resv[i].ctx == idx) {
++                        r = &c->resv[i];
++                        break;
++                }
++        if (!r)
++                return N2C_E_NO_JOB;
++        if (!seq) {
++                c->stats.resv_cancels++;
++                memset(r, 0, sizeof(*r));
++                return N2C_OK;
++        }
++        if (seq >= c->next_job_id)
++                return N2C_E_ARGS;              /* must name an issued job: nothing would ever release it early */
++        if (r->seq)
++                return N2C_OK;                  /* retiring twice keeps the first seq */
++        r->seq = seq;
++        c->stats.resv_retires++;
++        resv_sweep(c);
++        return N2C_OK;
++}
++
++bool n2c_resv_busy(struct n2c_core *c, const void *token)
++{
++        if (!c || !token)
++                return false;
++        resv_sweep(c);
++        for (unsigned i = 0; i < N2C_RESV_SLOTS; i++) {
++                const struct n2c_resv *r = &c->resv[i];
++                if (!r->id)
++                        continue;
++                for (unsigned k = 0; k < r->n; k++)
++                        if (r->tok[k] == token)
++                                return true;
++        }
++        return false;
++}
++
+ enum n2c_error n2c_ctx_close(struct n2c_core *c, unsigned idx)
+ {
+         struct n2c_ctx *x = c ? ctx_at(c, idx) : NULL;
+@@ -536,6 +683,7 @@
+                 return N2C_E_NO_CTX;
+         if (x->state == N2C_CTX_ZOMBIE)
+                 return N2C_E_BROKEN;
++        resv_drop_ctx(c, idx);   /* a client that is gone (or closing) reserves nothing */
+         /* 1. Jobs: cancel queued, stop running. */
+         for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
+                 struct n2c_job *j = &c->jobs[i];
+@@ -1258,6 +1406,8 @@
+                         job_finish(c, j, N2C_JOB_RESET);
+         }
+         drain_quarantine(c);
++        for (unsigned i = 0; i < N2C_MAX_CTX; i++)
++                resv_drop_ctx(c, i);          /* a reset ends everything the frames were waiting for */
+         c->reset_pending = false;
+         if (n2hw_apply_quirks(c->hw) != N2HW_OK ||
+             n2hw_power_on_l2(c->hw) != N2HW_OK || wa_start(c) != N2C_OK ||
+--- a/shim/nord2-xnu/nord2_gpu_transport.h
++++ b/shim/nord2-xnu/nord2_gpu_transport.h
+@@ -30,6 +30,14 @@
+  * NORD2_GPU_MAX_INFLIGHT unfinished jobs per client; SUBMIT_JM returns kIOReturnBusy
+  * beyond that (wait, then resubmit). */
+ #define NORD2_GPU_SEL_WAIT_SEQ 12
++/* 0112 display-surface reservation.  RESERVE(n, handles[n] as structure input of n uint32 imported-surface buffer handles) -> id (never 0 when n > 0):
++ * until retired, cancelled, expired (200 ms) or its client closes, the framebuffer treats those surfaces as busy although no job writing them has been
++ * submitted yet.  n == 0 answers id 0 and is the availability probe; n > 8: BadArgument; more than 4 live reservations in the context: Busy.
++ * RETIRE(id, seq): seq != 0 keeps it busy until every job of this context with id <= seq is terminal; seq == 0 cancels; id 0 is a no-op;
++ * unknown id: kIOReturnNotFound.  Neither call blocks. */
++#define NORD2_GPU_SEL_SURFACE_RESERVE 13
++#define NORD2_GPU_SEL_SURFACE_RETIRE 14
++#define NORD2_GPU_RESERVE_MAX 8u
+ #define NORD2_GPU_MAX_INFLIGHT 96u
+ #define NORD2_GPU_TRANSPORT_VERSION 2u
+ 
+@@ -252,6 +260,10 @@
+                 expected_si = sizeof(struct nord2_gpu_submit_request);
+                 expected_no = 1; break;
+         case NORD2_GPU_SEL_SYNC: expected_ni = 2; break;
++        case NORD2_GPU_SEL_SURFACE_RESERVE:
++                if (!iv || ((const uint64_t *)iv)[0] > NORD2_GPU_RESERVE_MAX) return false;
++                expected_ni = 1; expected_no = 1; expected_si = (size_t)((const uint64_t *)iv)[0] * 4u; break;
++        case NORD2_GPU_SEL_SURFACE_RETIRE: expected_ni = 2; break;
+         case NORD2_GPU_SEL_WAIT_SEQ:
+                 expected_ni = 2; expected_no = 3;
+                 if (so) minimum_so = sizeof(struct nord2_gpu_fault_info);
+--- a/shim/nord2-xnu/Nord2GPU.cpp
++++ b/shim/nord2-xnu/Nord2GPU.cpp
+@@ -82,6 +82,8 @@
+         IOBufferMemoryDescriptor *md;
+         SweetSurface *surface;
+ };
++/* 0112: the display surface behind an imported buffer (NULL for any other buffer); only compared, never dereferenced, by the core. */
++static const void *resv_token(void *, void *cookie) { return cookie ? (const void *)((BufferOwner *)cookie)->surface : NULL; }
+ static void free_owner(void *, void *cookie) {
+         BufferOwner *o = (BufferOwner *)cookie;
+         if (!o) return;
+@@ -111,8 +113,11 @@
+         int wm = 0;      /* 0110: nord2_gpu_wmask=1 (alias n2wm) trusts a job's write_mask for the post-job invalidate */
+         got = PE_parse_boot_argn("nord2_gpu_wmask", &wm, sizeof(wm)); if (!got) got = PE_parse_boot_argn("n2wm", &wm, sizeof(wm));
+         (void)n2c_set_wmask_inval(c, wm == 1);
+-        IOLog("NORD2 GPU: cache maintenance %s, CPU-access tracking level %d, invalidate scope %s\n", c->full_cache_maint ? "whole-context (boot-arg)" : "per-job buffer list", tr,
+-              c->wmask_inval ? "declared writes (write_mask)" : "every listed GPU_WRITE buffer");
++        int rs = 1;      /* 0112: nord2_gpu_resv=0 (alias n2resv) disables the display-surface reservation selectors */
++        got = PE_parse_boot_argn("nord2_gpu_resv", &rs, sizeof(rs)); if (!got) got = PE_parse_boot_argn("n2resv", &rs, sizeof(rs));
++        n2c_set_resv_enabled(c, rs != 0);
++        IOLog("NORD2 GPU: cache maintenance %s, CPU-access tracking level %d, invalidate scope %s, surface reservations %s\n", c->full_cache_maint ? "whole-context (boot-arg)" : "per-job buffer list", tr,
++              c->wmask_inval ? "declared writes (write_mask)" : "every listed GPU_WRITE buffer", rs ? "on" : "off");
+         return true;
+ }
+ static bool battery_temperature(int *centi);
+@@ -287,7 +292,7 @@
+         n2clk_ops co = { clockRead, clockWrite, delay_us, log_msg };
+         n2hw_ops ho = { read_bank, write_bank, delay_us, log_msg };
+         nord2_scpsys_ops so = { spmRead, spmWrite, infraRead, infraWrite, delay_us, log_msg };
+-        n2c_ops mo = { allocTable, freeTable, flushTable, alloc_host, free_host, sync_page, free_owner, now_ms, log_msg, now_us };
++        n2c_ops mo = { allocTable, freeTable, flushTable, alloc_host, free_host, sync_page, free_owner, now_ms, log_msg, now_us, resv_token };
+         core = (n2c_core *)IOMallocZero(sizeof(*core));
+         return core && n2pmif_init(&pm15, N2PMIF_SPMI, &po, &spmi) &&
+                n2pmif_init(&pm59, N2PMIF_PWRAP, &po, &pwrap) &&
+@@ -533,11 +538,13 @@
+                                        ((BufferOwner *)b->cookie)->surface == (SweetSurface *)surface;
+                         }
+                 }
++                if (!busy) busy = n2c_resv_busy(core, surface);   /* 0112: a frame that has not been submitted yet but is promised */
+         }
+         IOLockUnlock(lock);
+         return busy;
+ }
+ extern "C" bool nord2_gpu_surface_busy(void *surface) { return gSurfaceGpu ? gSurfaceGpu->surfaceBusy(surface) : false; }
++extern "C" uint64_t nord2_gpu_resv_expired(void) { return gSurfaceGpu && gSurfaceGpu->core ? gSurfaceGpu->core->stats.resv_expired : 0; }
+ extern "C" void nord2_gpu_surface_cpu_acquire(void *surface) { if (gSurfaceGpu) gSurfaceGpu->surfaceHook(surface, true); }
+ extern "C" void nord2_gpu_surface_cpu_release(void *surface) { if (gSurfaceGpu) gSurfaceGpu->surfaceHook(surface, false); }
+ static uint32_t gic_rd32(void *c, uint32_t off) { return read_bank(c, off); }
+@@ -710,7 +717,7 @@
+         int hot = (lvtsMode && lvtsState && lvtsState != 3) ? lvtsHottest(lvtsMask) : (int)0x80000000;
+         uint32_t n = t.jobs ? t.jobs : 1, w = waitN ? waitN : 1;
+         IOLog("NORD2 GPU JOBS: n=%u fault=%u full=%u win_ms=%llu q_us=%llu/%u run_us=%llu/%u tot_us=%llu/%u "
+-              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u gpu_khz=%u mux=%u bat_cC=%d bat_ok=%u gpu_cC=%d soc_cC=%d lvts=%u%s irq=%u:%u/%u/%u/%u trk=%u skipC_KiB=%llu skipI_KiB=%llu defI_KiB=%llu acqI_KiB=%llu wmI_KiB=%llu\n",
++              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u gpu_khz=%u mux=%u bat_cC=%d bat_ok=%u gpu_cC=%d soc_cC=%d lvts=%u%s irq=%u:%u/%u/%u/%u trk=%u skipC_KiB=%llu skipI_KiB=%llu defI_KiB=%llu acqI_KiB=%llu wmI_KiB=%llu resv=%llu/%llu/%llu/%llu\n",
+               t.jobs, t.faulted, t.full_jobs, t.window_start_us / 1000, t.sum_queue_us / n, t.max_queue_us,
+               t.sum_run_us / n, t.max_run_us, t.sum_total_us / n, t.max_total_us, t.sum_clean_us / n, t.max_clean_us,
+               t.sum_inval_us / n, t.max_inval_us, t.sum_clean_pages * 4, t.sum_inval_pages * 4, waitN,
+@@ -720,7 +727,8 @@
+               lvtsState, (lvtsState && lvts.cal.defaulted) ? "~" : "",
+               (unsigned)irqState, irqTops, irqGuard.spurious_total, irqSleeps, irqTimeouts,
+               (unsigned)core->track_level, core->stats.cache_skip_clean_pages * 4, core->stats.cache_skip_inval_pages * 4,
+-              core->stats.cache_deferred_pages * 4, core->stats.cache_acquire_pages * 4, core->stats.cache_skip_wmask_pages * 4);
++              core->stats.cache_deferred_pages * 4, core->stats.cache_acquire_pages * 4, core->stats.cache_skip_wmask_pages * 4,
++              core->stats.resv_reserves, core->stats.resv_retires, core->stats.resv_cancels, core->stats.resv_expired);
+         waitN = waitGapMax = waitDurMax = waitRetMax = 0; waitGapSum = waitDurSum = waitRetSum = 0;
+         seqWaits = seqJobs = seqDurMax = 0; seqDurSum = 0;
+ }
+@@ -1093,6 +1101,17 @@
+                 uint32_t h;uint64_t va,size;result=gpu->importSurface(context,(uint32_t)a->scalarInput[0],(uint32_t)a->scalarInput[1],(uint32_t)a->scalarInput[2],&h,&va,&size);
+                 if(result==kIOReturnSuccess){a->scalarOutput[0]=h;a->scalarOutput[1]=va;a->scalarOutput[2]=size;a->scalarOutputCount=3;}break;
+         }
++        case NORD2_GPU_SEL_SURFACE_RESERVE: {
++                if(gpu->core->resv_off){result=kIOReturnUnsupported;break;}
++                uint32_t id=0,n=(uint32_t)a->scalarInput[0];   /* the validator bounded n by the structure size it demanded */
++                result=io_error(n2c_resv_create(gpu->core,context,(const uint32_t *)a->structureInput,n,&id));
++                if(result==kIOReturnSuccess){a->scalarOutput[0]=id;a->scalarOutputCount=1;}
++                break;
++        }
++        case NORD2_GPU_SEL_SURFACE_RETIRE:
++                if(gpu->core->resv_off){result=kIOReturnUnsupported;break;}
++                if(a->scalarInput[0]>UINT32_MAX){result=kIOReturnBadArgument;break;}
++                result=io_error(n2c_resv_retire(gpu->core,context,(uint32_t)a->scalarInput[0],a->scalarInput[1]));break;
+         case NORD2_GPU_SEL_PROBE:
+                 result=gpu->probe(context);break;
+         case NORD2_GPU_SEL_SYNC:
+--- a/gpu/tests/nord2_core_test.c
++++ b/gpu/tests/nord2_core_test.c
+@@ -52,7 +52,7 @@
+ static void init(void) {
+  memset(&m,0,sizeof(m));memset(&hw,0,sizeof(hw));hw.identified=hw.slots_valid=hw.l2_on=true;
+  hw.id.as_present=255;hw.id.shader_present=hw.shaders_on=1;hw.slot_fragment=0;hw.slot_compute=hw.slot_vertex_tiler=1;
+- struct n2c_ops ops={alloc_table,free_table,flush_table,alloc_host,free_host,sync_page,free_owner,now,NULL,now_us};
++ struct n2c_ops ops={alloc_table,free_table,flush_table,alloc_host,free_host,sync_page,free_owner,now,NULL,now_us,NULL};
+  CHECK(n2c_init(&core,&ops,&m,&hw));CHECK(n2c_start(&core)==N2C_OK);
+ }
+ static unsigned context(void){unsigned c;CHECK(n2c_ctx_open(&core,123,64ull<<20,false,&c)==N2C_OK);return c;}
+@@ -537,6 +537,115 @@
+   CHECK(syncs_in(base_of(c,sfc),4,true)==4);                   /* GPU reads what the CPU wrote, although the surface is not declared */
+   CHECK(n2c_ctx_close(&core,c)==N2C_OK);}
+ }
++/* ---- 0112: display-surface reservations ---------------------------------------------------------------------------------------------- */
++#define IMP (N2C_BO_GPU_READ|N2C_BO_GPU_WRITE|N2C_BO_IMPORTED)
++static uint32_t imported(unsigned c,uint64_t*va){uint32_t h;map_flags(c,1,IMP,&h,va);return h;}
++static const void *tok(unsigned c,uint32_t h){const struct n2c_bo*b=n2c_bo_lookup(&core,c,h);CHECK(b&&b->cookie);return b->cookie;}
++static const void *odd_token(void*c,void*cookie){(void)c;return cookie&&*(char*)cookie==0?(const void*)((char*)cookie+1):NULL;}
++static void test_resv_basic(void) {
++ init();unsigned c=context(),o=context();uint32_t h[6],ho,plain;uint64_t va[6],vo,pva;
++ for(unsigned i=0;i<6;i++)h[i]=imported(c,&va[i]);
++ map_flags(c,1,N2C_BO_GPU_READ|N2C_BO_GPU_WRITE,&plain,&pva);   /* a buffer that is not an imported surface */
++ ho=imported(o,&vo);
++ const void *t0=tok(c,h[0]),*t1=tok(c,h[1]),*t2=tok(c,h[2]),*to=tok(o,ho);
++ uint32_t id=77,id2=77;
++ /* availability probe: n == 0 answers id 0 and success, even with a NULL handle list; nothing becomes busy */
++ CHECK(n2c_resv_create(&core,c,NULL,0,&id)==N2C_OK && id==0);CHECK(!n2c_resv_busy(&core,t0) && !core.stats.resv_reserves);
++ /* argument errors leave nothing behind */
++ CHECK(n2c_resv_create(&core,c,h,9,&id)==N2C_E_ARGS);
++ CHECK(n2c_resv_create(&core,c,NULL,1,&id)==N2C_E_ARGS);
++ uint32_t bad[2]={h[0],0x7fffffffu};CHECK(n2c_resv_create(&core,c,bad,2,&id)==N2C_E_ARGS);
++ bad[1]=plain;CHECK(n2c_resv_create(&core,c,bad,2,&id)==N2C_E_ARGS);
++ bad[1]=ho;CHECK(n2c_resv_create(&core,c,bad,2,&id)==N2C_E_ARGS);          /* another context's handle */
++ CHECK(!n2c_resv_busy(&core,t0) && !core.stats.resv_reserves);
++ /* reserve: visible at once, only for the named surfaces, ids per context monotonic */
++ CHECK(n2c_resv_create(&core,c,h,2,&id)==N2C_OK && id==1);
++ CHECK(n2c_resv_busy(&core,t0) && n2c_resv_busy(&core,t1) && !n2c_resv_busy(&core,t2) && !n2c_resv_busy(&core,NULL));
++ CHECK(!n2c_resv_busy(&core,to));
++ CHECK(n2c_resv_create(&core,o,&ho,1,&id2)==N2C_OK && id2==1 && n2c_resv_busy(&core,to));   /* the other context starts at 1 as well */
++ CHECK(n2c_resv_create(&core,c,&h[2],1,&id2)==N2C_OK && id2==2 && n2c_resv_busy(&core,t2));
++ /* retire: id 0 is a no-op, unknown ids and other contexts' ids are NotFound, a seq that was never issued is refused */
++ CHECK(n2c_resv_retire(&core,c,0,0)==N2C_OK && n2c_resv_retire(&core,c,0,99)==N2C_OK);
++ CHECK(n2c_resv_retire(&core,c,99,0)==N2C_E_NO_JOB);
++ CHECK(n2c_resv_retire(&core,o,2,0)==N2C_E_NO_JOB);
++ CHECK(n2c_resv_retire(&core,c,id2,core.next_job_id)==N2C_E_ARGS && n2c_resv_busy(&core,t2));
++ /* cancel is immediate and only once */
++ CHECK(n2c_resv_retire(&core,c,id2,0)==N2C_OK && !n2c_resv_busy(&core,t2) && core.stats.resv_cancels==1);
++ CHECK(n2c_resv_retire(&core,c,id2,0)==N2C_E_NO_JOB);
++ /* the 5th live reservation of one context is Busy (and reports id 0); another context is unaffected; a freed slot is reusable */
++ uint32_t ids[4];
++ CHECK(n2c_resv_create(&core,c,&h[3],1,&ids[0])==N2C_OK && n2c_resv_create(&core,c,&h[4],1,&ids[1])==N2C_OK);   /* 3 live */
++ CHECK(n2c_resv_create(&core,c,&h[5],1,&ids[2])==N2C_OK);                                                         /* 4 live */
++ id2=55;CHECK(n2c_resv_create(&core,c,&h[5],1,&id2)==N2C_E_BUSY && id2==0);
++ CHECK(n2c_resv_create(&core,o,&ho,1,&id2)==N2C_OK && id2==2);
++ CHECK(n2c_resv_retire(&core,c,ids[2],0)==N2C_OK && n2c_resv_create(&core,c,&h[5],1,&ids[3])==N2C_OK && ids[3]>ids[2]);
++ /* the reservation names the surface only: releasing the buffer is not blocked by it and nothing is dereferenced (ASan) */
++ CHECK(n2c_bo_release(&core,c,h[3])==N2C_OK);
++ CHECK(n2c_resv_retire(&core,c,ids[0],0)==N2C_OK);
++ /* closing both contexts drops what is left; every reservation ended as a cancel here */
++ CHECK(n2c_ctx_close(&core,c)==N2C_OK && n2c_ctx_close(&core,o)==N2C_OK);
++ CHECK(!n2c_resv_busy(&core,t1) && !n2c_resv_busy(&core,to));
++ CHECK(core.stats.resv_cancels==core.stats.resv_reserves && !core.stats.resv_retires && !core.stats.resv_expired);
++}
++static void test_resv_time_and_jobs(void) {
++ init();unsigned c=context();uint64_t va;uint32_t h=imported(c,&va);const void *t=tok(c,h);uint32_t id;
++ /* expiry: unretired for 200 ms stops counting, is counted, and frees its slot */
++ m.time=1000;CHECK(n2c_resv_create(&core,c,&h,1,&id)==N2C_OK);
++ m.time=1000+N2C_RESV_EXPIRE_MS-1;CHECK(n2c_resv_busy(&core,t) && core.stats.resv_expired==0);
++ m.time=1000+N2C_RESV_EXPIRE_MS;CHECK(!n2c_resv_busy(&core,t) && core.stats.resv_expired==1);
++ CHECK(n2c_resv_retire(&core,c,id,0)==N2C_E_NO_JOB);                                /* swept: a late retire learns it */
++ for(unsigned i=0;i<4;i++)CHECK(n2c_resv_create(&core,c,&h,1,&id)==N2C_OK);       /* every slot is usable again */
++ CHECK(n2c_resv_create(&core,c,&h,1,&id)==N2C_E_BUSY);
++ m.time+=N2C_RESV_EXPIRE_MS;CHECK(!n2c_resv_busy(&core,t) && core.stats.resv_expired==5);
++ /* retire(seq): busy until the job is terminal, however long that takes; DONE releases */
++ uint64_t j=submit(c,h,va,N2C_JOB_COMPUTE);
++ CHECK(n2c_resv_create(&core,c,&h,1,&id)==N2C_OK && n2c_resv_retire(&core,c,id,j)==N2C_OK && core.stats.resv_retires==1);
++ CHECK(n2c_resv_retire(&core,c,id,j)==N2C_OK && core.stats.resv_retires==1);       /* a second retire keeps the first */
++ m.time+=5000;CHECK(n2c_resv_busy(&core,t) && core.stats.resv_expired==5);          /* a retired reservation does not time out under a running job */
++ complete(1);CHECK(!n2c_resv_busy(&core,t));done(c,j);
++ /* retiring a seq whose jobs are all terminal already releases at once (reaped or not) */
++ CHECK(n2c_resv_create(&core,c,&h,1,&id)==N2C_OK && n2c_resv_retire(&core,c,id,j)==N2C_OK && !n2c_resv_busy(&core,t));
++ /* a later job of the same context does not extend a reservation retired at an earlier seq */
++ uint64_t j1=submit(c,h,va,N2C_JOB_COMPUTE),j2=submit(c,h,va,N2C_JOB_COMPUTE);
++ CHECK(n2c_resv_create(&core,c,&h,1,&id)==N2C_OK && n2c_resv_retire(&core,c,id,j1)==N2C_OK && n2c_resv_busy(&core,t));
++ complete(1);CHECK(!n2c_resv_busy(&core,t));done(c,j1);
++ complete(1);done(c,j2);
++ CHECK(n2c_ctx_close(&core,c)==N2C_OK);
++}
++static void test_resv_failure_paths(void) {
++ uint32_t h,id,id2;uint64_t va;unsigned c;const void *t;uint64_t j;
++ /* a faulted job releases once its stop is verified (reset), not before */
++ init();c=context();h=imported(c,&va);t=tok(c,h);j=submit(c,h,va,N2C_JOB_COMPUTE);
++ CHECK(n2c_resv_create(&core,c,&h,1,&id)==N2C_OK && n2c_resv_retire(&core,c,id,j)==N2C_OK && n2c_resv_busy(&core,t));
++ m.fault=(struct n2hw_mmu_fault){.as=c,.status=0x42,.address=va};m.fault_ready=true;n2c_poll(&core);
++ uint32_t state=0,status=0;CHECK(n2c_job_state(&core,c,j,false,&state,&status)==N2C_OK && state==N2C_JOB_STOPPING);
++ CHECK(n2c_resv_busy(&core,t));                      /* stopping is not terminal: the GPU may still write */
++ m.time+=N2C_STOP_TIMEOUT_MS;n2c_poll(&core);        /* unacknowledged stop -> verified reset */
++ CHECK(n2c_job_state(&core,c,j,false,&state,&status)==N2C_OK && state==N2C_JOB_RESET);
++ CHECK(!n2c_resv_busy(&core,t));CHECK(n2c_ctx_close(&core,c)==N2C_OK);
++ /* RESET releases both kinds: one retired behind a running job, and one never retired */
++ init();c=context();h=imported(c,&va);t=tok(c,h);j=submit(c,h,va,N2C_JOB_COMPUTE);
++ CHECK(n2c_resv_create(&core,c,&h,1,&id)==N2C_OK && n2c_resv_retire(&core,c,id,j)==N2C_OK && n2c_resv_busy(&core,t));
++ CHECK(n2c_resv_create(&core,c,&h,1,&id2)==N2C_OK);
++ CHECK(n2c_reset(&core)==N2C_OK);CHECK(!n2c_resv_busy(&core,t) && core.stats.resv_cancels==2);
++ CHECK(n2c_ctx_close(&core,c)==N2C_OK);
++ /* a context that closes (client death) drops its unretired reservations */
++ init();c=context();h=imported(c,&va);t=tok(c,h);
++ CHECK(n2c_resv_create(&core,c,&h,1,&id)==N2C_OK && n2c_resv_busy(&core,t));
++ CHECK(n2c_ctx_close(&core,c)==N2C_OK && !n2c_resv_busy(&core,t) && core.stats.resv_cancels==1);
++ /* kill switch */
++ init();c=context();h=imported(c,&va);t=tok(c,h);n2c_set_resv_enabled(&core,false);
++ CHECK(n2c_resv_create(&core,c,&h,1,&id)==N2C_E_STATE && n2c_resv_create(&core,c,NULL,0,&id)==N2C_E_STATE && n2c_resv_retire(&core,c,1,0)==N2C_E_STATE);
++ CHECK(!n2c_resv_busy(&core,t));n2c_set_resv_enabled(&core,true);CHECK(n2c_resv_create(&core,c,&h,1,&id)==N2C_OK);
++ CHECK(n2c_ctx_close(&core,c)==N2C_OK);
++ /* the optional token callback decides what the surface identity is; NULL means not a surface */
++ init();c=context();core.ops.resv_token=odd_token;
++ uint64_t v2;uint32_t h2;h=imported(c,&va);h2=imported(c,&v2);*(char*)tok(c,h2)=1;
++ CHECK(n2c_resv_create(&core,c,&h2,1,&id)==N2C_E_ARGS);
++ CHECK(n2c_resv_create(&core,c,&h,1,&id)==N2C_OK && n2c_resv_busy(&core,(const char*)tok(c,h)+1) && !n2c_resv_busy(&core,tok(c,h)));
++ CHECK(n2c_ctx_close(&core,c)==N2C_OK);
++}
++
+ int main(int argc,char**argv) {
+  if(argc>1 && !strcmp(argv[1],"quarantine")){test_quarantine_close();return 0;}
+  if(argc>1 && !strcmp(argv[1],"partial")){test_partial_map_failure();return 0;}
+@@ -544,5 +653,6 @@
+  test_allocation_failure_matrix();test_full_map_flush_failure();test_quarantine_overflow();test_wide_reclaim();
+  test_unlisted_buffer();test_failed_open_pins();test_stop_ack();test_fault_failed_reset_pins();test_imported_accounting();
+  test_scoped_cache_maintenance();test_full_list_is_not_trusted();test_context_limit_384();test_job_timing();test_async_chain();test_cache_tracking();test_handle_limit_1024();test_write_mask_invalidate();
+- puts("core: 23 lifetime/ordering/failure scenarios incl. 1024 reuse cycles PASS (hardware model)");return 0;
++ test_resv_basic();test_resv_time_and_jobs();test_resv_failure_paths();
++ puts("core: 26 lifetime/ordering/failure scenarios incl. 1024 reuse cycles and 3 display-surface reservation scenarios (0112) PASS (hardware model)");return 0;
+ }
+--- a/gpu/tests/nord2_transport_test.c
++++ b/gpu/tests/nord2_transport_test.c
+@@ -54,6 +54,39 @@
+         assert(!nord2_gpu_call_valid(NORD2_GPU_SEL_WAIT_SEQ,2,3,8,0,seqin,seqout,seqin,0));
+         assert(NORD2_GPU_SEL_WAIT_SEQ != NORD2_GPU_SEL_SYNC && NORD2_GPU_SEL_WAIT_SEQ != NORD2_GPU_SEL_LOG);
+         assert(NORD2_GPU_MAX_INFLIGHT == 96u);
++        /* 0112: display-surface reservation selectors (contract with the frontend: 13 RESERVE, 14 RETIRE). */
++        {
++                assert(NORD2_GPU_SEL_SURFACE_RESERVE == 13 && NORD2_GPU_SEL_SURFACE_RETIRE == 14 && NORD2_GPU_RESERVE_MAX == 8u);
++                assert(NORD2_GPU_SEL_SURFACE_RESERVE != NORD2_GPU_SEL_WAIT_SEQ && NORD2_GPU_SEL_SURFACE_RETIRE != NORD2_GPU_SEL_SYNC);
++                uint32_t hs[8] = {1, 2, 3, 4, 5, 6, 7, 8};
++                uint64_t rin[1], rout[1], tin[2] = {5, 9}, tout[1];
++                rin[0] = 0;   /* the availability probe: one scalar in, one out, no structure */
++                assert(nord2_gpu_call_valid(NORD2_GPU_SEL_SURFACE_RESERVE, 1, 1, 0, 0, rin, rout, NULL, NULL));
++                assert(nord2_gpu_call_valid(NORD2_GPU_SEL_SURFACE_RESERVE, 1, 1, 0, 0, rin, rout, hs, NULL));
++                assert(!nord2_gpu_call_valid(NORD2_GPU_SEL_SURFACE_RESERVE, 1, 1, 4, 0, rin, rout, hs, NULL));          /* n=0 carries no handles */
++                for (unsigned n = 1; n <= 8; n++) {
++                        rin[0] = n;
++                        assert(nord2_gpu_call_valid(NORD2_GPU_SEL_SURFACE_RESERVE, 1, 1, n * 4, 0, rin, rout, hs, NULL));
++                        assert(!nord2_gpu_call_valid(NORD2_GPU_SEL_SURFACE_RESERVE, 1, 1, n * 4 - 4, 0, rin, rout, hs, NULL));
++                        assert(!nord2_gpu_call_valid(NORD2_GPU_SEL_SURFACE_RESERVE, 1, 1, n * 4 + 4, 0, rin, rout, hs, NULL));   /* count and size must agree */
++                        assert(!nord2_gpu_call_valid(NORD2_GPU_SEL_SURFACE_RESERVE, 1, 1, n * 4, 0, rin, rout, NULL, NULL));    /* handles required */
++                        assert(!nord2_gpu_call_valid(NORD2_GPU_SEL_SURFACE_RESERVE, 1, 0, n * 4, 0, rin, rout, hs, NULL));      /* the id is returned */
++                        assert(!nord2_gpu_call_valid(NORD2_GPU_SEL_SURFACE_RESERVE, 0, 1, n * 4, 0, rin, rout, hs, NULL));
++                }
++                rin[0] = 9;
++                assert(!nord2_gpu_call_valid(NORD2_GPU_SEL_SURFACE_RESERVE, 1, 1, 36, 0, rin, rout, hs, NULL));         /* n > 8 */
++                rin[0] = UINT64_MAX;
++                assert(!nord2_gpu_call_valid(NORD2_GPU_SEL_SURFACE_RESERVE, 1, 1, 0, 0, rin, rout, hs, NULL));          /* no wrap to a small size */
++                rin[0] = 0x100000000ull;
++                assert(!nord2_gpu_call_valid(NORD2_GPU_SEL_SURFACE_RESERVE, 1, 1, 0, 0, rin, rout, hs, NULL));
++                assert(!nord2_gpu_call_valid(NORD2_GPU_SEL_SURFACE_RESERVE, 1, 1, 0, 0, NULL, rout, hs, NULL));
++                assert(nord2_gpu_call_valid(NORD2_GPU_SEL_SURFACE_RETIRE, 2, 0, 0, 0, tin, NULL, NULL, NULL));
++                assert(nord2_gpu_call_valid(NORD2_GPU_SEL_SURFACE_RETIRE, 2, 1, 0, 0, tin, tout, NULL, NULL));          /* extra scalar out is tolerated like everywhere else */
++                assert(!nord2_gpu_call_valid(NORD2_GPU_SEL_SURFACE_RETIRE, 1, 0, 0, 0, tin, NULL, NULL, NULL));
++                assert(!nord2_gpu_call_valid(NORD2_GPU_SEL_SURFACE_RETIRE, 3, 0, 0, 0, tin, NULL, NULL, NULL));
++                assert(!nord2_gpu_call_valid(NORD2_GPU_SEL_SURFACE_RETIRE, 2, 0, 4, 0, tin, NULL, hs, NULL));
++                assert(!nord2_gpu_call_valid(15, 0, 0, 0, 0, NULL, NULL, NULL, NULL));                                  /* nothing after 14 yet */
++        }
+         assert(nord2_gpu_wait_step_us(0) == 20 && nord2_gpu_wait_step_us(1499) == 20);
+         assert(nord2_gpu_wait_step_us(1500) == 100 && nord2_gpu_wait_step_us(5999) == 100);
+         assert(nord2_gpu_wait_step_us(6000) == 0 && nord2_gpu_wait_step_us(UINT64_MAX) == 0);
+--- a/gpu/tests/nord2_trap_abi_test.c
++++ b/gpu/tests/nord2_trap_abi_test.c
+@@ -72,6 +72,22 @@
+ 	assert(nord2_gpu_trap_call_ok(&c, sizeof(c)) && nord2_gpu_call_valid(c.selector, 2, 3, 0, 0, in, out, NULL, NULL));
+ 	c.struct_out = 0x1000; c.struct_out_size = sizeof(fi);
+ 	assert(nord2_gpu_trap_call_ok(&c, sizeof(c)) && nord2_gpu_call_valid(c.selector, 2, 3, 0, c.struct_out_size, in, out, NULL, &fi));
++	/* 0112: the reservation calls as the frontend issues them (probe n=0; RESERVE n=2 with a handle list; RETIRE id,seq) */
++	{
++		uint32_t hs[2] = { 3, 4 }; uint64_t rin[2] = { 0, 0 };
++		c = good(); c.selector = NORD2_GPU_SEL_SURFACE_RESERVE; c.scalar_in_count = 1; c.scalar_out_count = 1; c.scalar_in[0] = 0;
++		assert(nord2_gpu_trap_call_ok(&c, sizeof(c)) && nord2_gpu_call_valid(c.selector, 1, 1, 0, 0, rin, out, NULL, NULL));
++		c = good(); c.selector = NORD2_GPU_SEL_SURFACE_RESERVE; c.scalar_in_count = 1; c.scalar_out_count = 1; c.scalar_in[0] = rin[0] = 2;
++		c.struct_in = 0x1000; c.struct_in_size = sizeof(hs);
++		assert(nord2_gpu_trap_call_ok(&c, sizeof(c)) && nord2_gpu_call_valid(c.selector, 1, 1, c.struct_in_size, 0, rin, out, hs, NULL));
++		c.struct_in_size = sizeof(hs) - 4;   /* the trap block accepts it; the shared validator does not */
++		assert(nord2_gpu_trap_call_ok(&c, sizeof(c)) && !nord2_gpu_call_valid(c.selector, 1, 1, c.struct_in_size, 0, rin, out, hs, NULL));
++		c = good(); c.selector = NORD2_GPU_SEL_SURFACE_RETIRE; c.scalar_in_count = 2; c.scalar_in[0] = 1; c.scalar_in[1] = 42;
++		assert(nord2_gpu_trap_call_ok(&c, sizeof(c)) && nord2_gpu_call_valid(c.selector, 2, 0, 0, 0, c.scalar_in, NULL, NULL, NULL));
++		/* the reply carries the reservation id */
++		uint64_t idsc[1] = { 5 }; c = good(); c.selector = NORD2_GPU_SEL_SURFACE_RESERVE;
++		assert(nord2_gpu_trap_finish(&c, 0, idsc, 1, 0) == 0 && c.done == NORD2_GPU_TRAP_DONE && c.scalar_out_count == 1 && c.scalar_out[0] == 5);
++	}
+ 	c = good(); c.selector = NORD2_GPU_SEL_LOG; c.struct_in = 0x1000; c.struct_in_size = 16384;
+ 	assert(nord2_gpu_trap_call_ok(&c, sizeof(c)));
+ 	/* a wrong shape that the trap block accepts is still refused by the shared validator (the handler runs the same check) */

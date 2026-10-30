@@ -1,0 +1,318 @@
+--- a/bsd/dev/nord2_cpufreq.c
++++ b/bsd/dev/nord2_cpufreq.c
+@@ -34,6 +34,7 @@
+ TUNABLE(int, nord2_mcu_arg, "n2mcu", 0);
+ TUNABLE(int, nord2_mcuping_arg, "n2mcuping", 0);
+ TUNABLE(int, nord2_dvfs_arg, "n2dvfs", 0);
++TUNABLE(int, nord2_dvfs_stage_arg, "n2dvst", 3);   /* 0 preflight only, 1 + share buffer, 2 + platform init, 3 = everything (default) */
+ 
+ extern unsigned nord2_cpu_mhz(int cpu);                                                /* nord2_sched.c (0099) */
+ extern int nord2_sched_mode;                                                            /* nord2_sched.c (0099): placement mode bits */
+@@ -484,7 +485,7 @@
+ #define N2DV_MBOX_PAGE_PA  0x1031f000ull
+ #define N2DV_MBOX_BASE     0xce0u          /* offset of mailbox 0 in the mailbox page; mailbox n at + 0xa0 * n */
+ 
+-static volatile uint32_t *n2dv_ctl, *n2dv_mbpage, *n2dv_share;
++static volatile uint32_t *n2dv_ctl, *n2dv_mbpage, *n2dv_share, *n2dv_share_end;
+ 
+ static int
+ n2dv_mbox(__unused void *ctx, unsigned ch, const uint32_t *w, unsigned n, uint32_t *reply, unsigned nreply, unsigned timeout_ms)
+@@ -526,30 +527,26 @@
+ 	}
+ }
+ 
+-/* Stock mcupm_plt_init: zero the header, the mark at both ends of the region, then magic, size of the header (3 words) and the region size. */
++/* Stock mcupm_plt_init: the header (magic, sizeof(struct plt_ctrl_s) = 12, region size) at the start and the magic mark in the last word.  Only the first and the last
++ * 16 KiB of the region are mapped (device memory, 32-bit stores): the firmware has no DRAM access in this configuration and the stock driver zeroes only the header. */
+ static bool
+ n2dv_share_init(__unused void *ctx, uint32_t pa, uint32_t size)
+ {
+ 	if (n2dv_share == NULL) {
+-		n2dv_share = (volatile uint32_t *)ml_io_map(pa, size);
++		n2dv_share = (volatile uint32_t *)ml_io_map(pa, 0x4000);
+ 	}
+-	if (n2dv_share == NULL) {
+-		return false;
++	if (n2dv_share_end == NULL) {
++		n2dv_share_end = (volatile uint32_t *)ml_io_map(pa + size - 0x4000, 0x4000);
+ 	}
+-	for (uint32_t i = 0; i < size / 4; i++) {
+-		n2dv_share[i] = 0;
++	if (n2dv_share == NULL || n2dv_share_end == NULL) {
++		return false;
+ 	}
+-	n2dv_share[0] = N2D_PLT_INIT;
+-	n2dv_share[size / 4 - 1] = N2D_PLT_INIT;
+-	n2dv_share[0] = N2D_PLT_INIT;                                       /* plt_ctl->magic */
++	n2dv_share_end[0x4000 / 4 - 1] = N2D_PLT_INIT;
++	n2dv_share[0] = N2D_PLT_INIT;                                       /* the start mark, then plt_ctl->magic */
+ 	n2dv_share[1] = 12;                                                 /* sizeof(struct plt_ctrl_s) */
+ 	n2dv_share[2] = size;                                               /* mem_sz */
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+-	bool ok = n2dv_share[0] == N2D_PLT_INIT && n2dv_share[1] == 12 && n2dv_share[2] == size && n2dv_share[size / 4 - 1] == N2D_PLT_INIT;
+-	for (uint32_t i = 3; ok && i < 4096; i++) {
+-		ok = n2dv_share[i] == 0;
+-	}
+-	return ok;
++	return n2dv_share[0] == N2D_PLT_INIT && n2dv_share[1] == 12 && n2dv_share[2] == size && n2dv_share_end[0x4000 / 4 - 1] == N2D_PLT_INIT;
+ }
+ 
+ static bool
+@@ -565,6 +562,13 @@
+ 	return *vproc != 0 && *vsram != 0;
+ }
+ 
++/* The console log is pulled by the host (control requests about every 250 ms): wait long enough for it to fetch the line that announces the next hardware access. */
++static void
++n2dv_flush(__unused void *ctx)
++{
++	n2cf_sleep_ms(NULL, 400);
++}
++
+ static void
+ n2dv_set_place(__unused void *ctx, int mode)
+ {
+@@ -584,7 +588,7 @@
+ 		}
+ 		break;
+ 	case N2D_L_RAIL:
+-		printf("NORD2 DVFS step 0 rails cluster %s: Vproc %u.%02u mV, Vsram %u.%02u mV: %s\n", cl[a], b / 100, b % 100, c / 100, c % 100,
++		printf("NORD2 DVFS step 0 rails cluster %s%s: Vproc %u.%02u mV, Vsram %u.%02u mV: %s\n", cl[a], a >= 2 ? " (shared rails with LL/L, not read)" : " (read)", b / 100, b % 100, c / 100, c % 100,
+ 		    d ? "ok" : "REFUSED (unreadable, below 500 mV or above 1120 mV, Vsram below Vproc, or Vsram more than 250 mV above Vproc)");
+ 		break;
+ 	case N2D_L_SHARE:
+@@ -634,17 +638,32 @@
+ 	case N2D_L_FALLBACK:
+ 		printf("NORD2 DVFS FALLBACK (%u): limits and requests of LL/L/B pinned back to the bootloader rows %u/%u/%u, nothing more is sent\n", a, b, c, d);
+ 		break;
++	case N2D_L_ACCESS: {
++		static const char *const what[] = { "?", "PMIC read: MT6315 SID 7 VBUCK3 and MT6359P VSRAM_PROC2 (LL rails)", "PMIC read: MT6315 SID 6 VBUCK1 and MT6359P VSRAM_PROC1 (L rails)",
++			"share buffer: map the first and last 16 KiB and store the header", "mailbox 0 doorbell: platform init", "CSRAM stores: pinned plan (guards, zero area, limits, requests, table, CCI map)",
++			"mailbox 1 doorbell: DVFS command", "CSRAM stores: sched-disable and cluster-on", "CSRAM stores: ramp step (limit, request, CCI request)" };
++		printf("NORD2 DVFS access %u: next is %s%s", a, a < sizeof(what) / sizeof(what[0]) ? what[a] : "?", a == N2D_A_IPI || a == N2D_A_RAMP ? " " : "\n");
++		if (a == N2D_A_IPI) {
++			printf("(command %u arg %u)\n", b, c);
++		} else if (a == N2D_A_RAMP) {
++			printf("(cluster %s row %u)\n", cl[b & 3], c);
++		}
++		break;
++	}
++	case N2D_L_STAGE:
++		printf("NORD2 DVFS stage limit %u reached: stopping on purpose before the next stage (0 preflight, 1 share buffer, 2 platform init, 3 hand-over)\n", a);
++		break;
+ 	case N2D_L_RESULT: {
+ 		static const char *const res[] = { "?", "hand-over done, clusters pinned at the bootloader rows", "ramp reached the cap rows", "STOPPED in preflight: clocks (nothing sent)",
+ 			                           "STOPPED in preflight: rails (nothing sent)", "STOPPED in preflight: share buffer (nothing sent)", "STOPPED: platform init refused",
+-			                           "STOPPED: CSRAM readback mismatch", "STOPPED: DVFS command failed", "STOPPED: a clock disagreed", "STOPPED: a ramp row was not reached", "STOPPED: bad arguments" };
++			                           "STOPPED: CSRAM readback mismatch", "STOPPED: DVFS command failed", "STOPPED: a clock disagreed", "STOPPED: a ramp row was not reached", "STOPPED: bad arguments", "stage limit reached (on purpose)" };
+ 		printf("NORD2 DVFS result %u: %s\n", a, a < sizeof(res) / sizeof(res[0]) ? res[a] : "?");
+ 		break;
+ 	}
+ 	}
+ }
+ 
+-static const struct n2d_ops n2dv_ops = { n2cf_wr, n2cf_rd, n2dv_mbox, n2dv_share_init, n2dv_rail, n2cf_mhz, n2cf_gauge, n2cf_sleep_ms, n2dv_set_place, n2dv_log };
++static const struct n2d_ops n2dv_ops = { n2cf_wr, n2cf_rd, n2dv_mbox, n2dv_share_init, n2dv_rail, n2cf_mhz, n2cf_gauge, n2cf_sleep_ms, n2dv_set_place, n2dv_log, n2dv_flush };
+ 
+ static void
+ n2dvfs_main(void)
+@@ -654,6 +673,7 @@
+ 	int user_sched = 0;
+ 	cfg.cap_mhz = nord2_dvfs_arg >= 500 ? (unsigned)nord2_dvfs_arg : 0;
+ 	cfg.place = cfg.cap_mhz != 0 && !PE_parse_boot_argn("n2sch", &user_sched, sizeof(user_sched));
++	cfg.max_step = nord2_dvfs_stage_arg < 0 ? 0u : (nord2_dvfs_stage_arg > 3 ? 3u : (unsigned)nord2_dvfs_stage_arg);
+ 	n2cf_csram = (volatile uint32_t *)ml_io_map(N2CF_CSRAM_PA, N2CF_CSRAM_SIZE);
+ 	n2dv_ctl = (volatile uint32_t *)ml_io_map(N2DV_CTL_PA, 0x1000);
+ 	n2dv_mbpage = (volatile uint32_t *)ml_io_map(N2DV_MBOX_PAGE_PA, 0x1000);
+@@ -661,7 +681,7 @@
+ 		printf("NORD2 DVFS: mapping failed, nothing done\n");
+ 		return;
+ 	}
+-	printf("NORD2 DVFS begin: n2dvfs=%d (%s), placement %s\n", nord2_dvfs_arg, cfg.cap_mhz ? "hand-over then ramp of L and B to the cap" : "hand-over only, no frequency change",
++	printf("NORD2 DVFS begin: n2dvfs=%d n2dvst=%u (%s), placement %s\n", nord2_dvfs_arg, cfg.max_step, cfg.cap_mhz ? "hand-over then ramp of L and B to the cap" : "hand-over only, no frequency change",
+ 	    cfg.place ? "managed" : "not managed");
+ 	enum n2d_result r = n2d_bringup(&n2dv_ops, NULL, &cfg, &st);
+ 	printf("NORD2 DVFS bring-up finished with result %u\n", (unsigned)r);
+--- a/bsd/dev/nord2_dvfs.h
++++ b/bsd/dev/nord2_dvfs.h
+@@ -5,8 +5,11 @@
+  * left, an optional measured row-by-row ramp of the A78 clusters, the battery guard and the 0099 placement switch.  Pure and host-testable: every register,
+  * mailbox, rail, clock and gauge access goes through struct n2d_ops.  Derivation of every number and message: README-0107-design.md sections 11, 12 and
+  * nord2_cpuhvfs_init.h.  Rules (all tested):
+- *   - PREFLIGHT sends and writes nothing: the clocks must match the state every earlier boot showed, all four rails must be readable and inside the platform
+- *     clamps, the share buffer must be a free region.  Any failure stops with nothing touched.
++ *   - PREFLIGHT sends and writes nothing: the clocks must match the state every earlier boot showed, the rails must be readable and inside the limits, the
++ *     share buffer must be a free region.  Only the two rail pairs proven on the device are READ (LL/CCI pair and L/B pair); B and CCI are derived from the
++ *     stock sharing rule.  Any failure stops with nothing touched.
++ *   - Every hardware access is announced by a `NORD2 DVFS access` line followed by a flush wait (the log is pulled by the host about every 250 ms), so a hard
++ *     reset leaves the last access named in the log.  cfg->max_step stops the sequence early (0 preflight, 1 + share buffer, 2 + platform init, 3 = everything).
+  *   - Every step is verified (reply word, CSRAM readback, measured clocks).  Once any init message has gone out, ANY unexpected reply, timeout or
+  *     measurement runs the fallback: limits and requests of LL/L/B back to the bootloader rows, then stop; nothing is sent again.
+  *   - The ramp moves one row at a time, L and B alternately, never above the cap, never while the gauge is unreadable or at or above 40.0 C, and each row
+@@ -43,6 +46,19 @@
+ 	N2D_L_PLACE,        /* a = mode written, b = big MHz, c = little MHz */
+ 	N2D_L_FALLBACK,     /* a = reason (enum n2d_result), b/c/d = bootloader rows of LL/L/B */
+ 	N2D_L_RESULT,       /* a = enum n2d_result */
++	N2D_L_ACCESS,       /* a = enum n2d_access, b/c = detail: logged BEFORE the access, followed by ops->flush */
++	N2D_L_STAGE,        /* a = the stage limit that stopped the sequence (cfg->max_step) */
++};
++
++enum n2d_access {
++	N2D_A_RAIL_LL = 1,  /* MT6315 SID 7 VBUCK3 + MT6359P VSRAM_PROC2 */
++	N2D_A_RAIL_L,       /* MT6315 SID 6 VBUCK1 + MT6359P VSRAM_PROC1 */
++	N2D_A_SHARE,        /* map and write the share buffer header */
++	N2D_A_PLT,          /* doorbell on mailbox 0 */
++	N2D_A_CSRAM,        /* the pinned CSRAM plan (stores) */
++	N2D_A_IPI,          /* doorbell on mailbox 1: b = command */
++	N2D_A_ONOFF,        /* sched-disable and cluster-on stores */
++	N2D_A_RAMP,         /* limit and request stores for one ramp step: b = cluster, c = row */
+ };
+ 
+ enum n2d_result {
+@@ -57,6 +73,7 @@
+ 	N2D_E_CLOCK,             /* a clock disagreed after the hand-over or during the ramp: fallback run */
+ 	N2D_E_RAMP,              /* a ramp row was not reached: fallback run */
+ 	N2D_E_ARGS,
++	N2D_E_STAGE,             /* stopped on purpose at cfg->max_step (nothing wrong) */
+ };
+ 
+ struct n2d_ops {
+@@ -72,11 +89,13 @@
+ 	void (*sleep_ms)(void *ctx, unsigned ms);
+ 	void (*set_place)(void *ctx, int mode);                                  /* write nord2_sched_mode */
+ 	void (*log)(void *ctx, int code, unsigned a, unsigned b, unsigned c, unsigned d);
++	void (*flush)(void *ctx);                                                 /* wait until the host has pulled the log lines written so far (bounded) */
+ };
+ 
+ struct n2d_cfg {
+ 	unsigned cap_mhz;            /* 0 = hand-over only, no ramp; otherwise the cap of L and B (>= 500) */
+ 	bool place;                  /* manage the 0099 placement */
++	unsigned max_step;           /* 0 preflight only, 1 + share buffer, 2 + platform init, >= 3 everything */
+ };
+ 
+ struct n2d_state {
+@@ -193,6 +212,14 @@
+ 	return cur_mode;
+ }
+ 
++/* Announce a hardware access and give the host time to pull the line before it happens. */
++static inline void
++n2d_trace(const struct n2d_ops *o, void *ctx, unsigned what, unsigned b, unsigned c)
++{
++	o->log(ctx, N2D_L_ACCESS, what, b, c, 0);
++	o->flush(ctx);
++}
++
+ static inline void
+ n2d_fallback(const struct n2d_ops *o, void *ctx, struct n2d_state *st, enum n2d_result why)
+ {
+@@ -217,6 +244,7 @@
+ n2d_ipi(const struct n2d_ops *o, void *ctx, const uint32_t m[N2DV_IPI_WORDS], unsigned arg)
+ {
+ 	uint32_t reply[4] = { 0, 0, 0, 0 };
++	n2d_trace(o, ctx, N2D_A_IPI, m[0], arg);
+ 	int rc = o->mbox(ctx, N2D_MBOX_DVFS, m, N2DV_IPI_WORDS, reply, 4, N2D_IPI_TIMEOUT_MS);
+ 	o->log(ctx, N2D_L_IPI, m[0], arg, (unsigned)rc, reply[0]);
+ 	return rc == 0;
+@@ -226,6 +254,7 @@
+ static inline bool
+ n2d_goto_row(const struct n2d_ops *o, void *ctx, struct n2d_state *st, unsigned c, unsigned row)
+ {
++	n2d_trace(o, ctx, N2D_A_RAMP, c, row);
+ 	/* The CCI request follows the vendor CCI map [LL row][B row] (assumption: README 12.7); faster uncore first, slower uncore last. */
+ 	uint8_t next[3] = { st->cur[0], st->cur[1], st->cur[2] };
+ 	next[c] = (uint8_t)row;
+@@ -278,11 +307,20 @@
+ 		st->boot_mhz[c] = m;
+ 		st->orig[c] = st->cur[c] = st->target[c] = (uint8_t)row;
+ 	}
++	/* Only the two rail pairs proven on the device are read (c6t): LL/CCI share Vproc2 + Vsram2, L/B share Vproc1 + Vsram1 (mtk_cpufreq_platform.c).  B and CCI take the
++	 * values of their partners; they are printed as derived.  All four are judged before the verdict. */
++	uint32_t rv[4][2] = { { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 } };
++	bool read_ok[2];
++	for (unsigned c = 0; c < 2; c++) {
++		n2d_trace(o, ctx, c == 0 ? N2D_A_RAIL_LL : N2D_A_RAIL_L, c, 0);
++		read_ok[c] = o->rail(ctx, c, &rv[c][0], &rv[c][1]);
++	}
++	rv[N2DV_B][0] = rv[N2DV_L][0]; rv[N2DV_B][1] = rv[N2DV_L][1];
++	rv[N2DV_CCI][0] = rv[N2DV_LL][0]; rv[N2DV_CCI][1] = rv[N2DV_LL][1];
+ 	bool rails_good = true;
+-	for (unsigned c = 0; c < N2DV_NR_CLUSTERS; c++) {          /* all four are read and printed before the verdict: a refusal shows every rail */
+-		uint32_t vp = 0, vs = 0;
+-		bool ok = o->rail(ctx, c, &vp, &vs) && n2dv_rails_ok(vp, vs);     /* the stock probe's own check (Vsram >= Vproc, difference <= 250 mV) plus garbage floors */
+-		o->log(ctx, N2D_L_RAIL, c, vp, vs, ok);
++	for (unsigned c = 0; c < N2DV_NR_CLUSTERS; c++) {
++		bool ok = read_ok[c < 2 ? c : (c == N2DV_B ? 1 : 0)] && n2dv_rails_ok(rv[c][0], rv[c][1]);     /* the stock probe's own check plus garbage floors */
++		o->log(ctx, N2D_L_RAIL, c, rv[c][0], rv[c][1], ok);
+ 		rails_good = rails_good && ok;
+ 	}
+ 	if (!rails_good) {
+@@ -290,6 +328,12 @@
+ 		o->log(ctx, N2D_L_RESULT, N2D_E_PRE_RAIL, 0, 0, 0);
+ 		return st->result = N2D_E_PRE_RAIL;
+ 	}
++	if (cfg->max_step == 0) {
++		st->stopped = true;
++		o->log(ctx, N2D_L_STAGE, 0, 0, 0, 0);
++		return st->result = N2D_E_STAGE;
++	}
++	n2d_trace(o, ctx, N2D_A_SHARE, N2D_SHARE_PA, N2D_SHARE_SIZE);
+ 	if (!n2d_share_ok(N2D_SHARE_PA, N2D_SHARE_SIZE) || !o->share_init(ctx, N2D_SHARE_PA, N2D_SHARE_SIZE)) {
+ 		o->log(ctx, N2D_L_SHARE, N2D_SHARE_PA, N2D_SHARE_SIZE, 0, 0);
+ 		st->stopped = true;
+@@ -297,11 +341,17 @@
+ 		return st->result = N2D_E_PRE_SHARE;
+ 	}
+ 	o->log(ctx, N2D_L_SHARE, N2D_SHARE_PA, N2D_SHARE_SIZE, 1, 0);
++	if (cfg->max_step == 1) {
++		st->stopped = true;
++		o->log(ctx, N2D_L_STAGE, 1, 0, 0, 0);
++		return st->result = N2D_E_STAGE;
++	}
+ 
+ 	/* ---- step 1: platform init (stock mcupm_plt_init): {0x504C5401, phys, size}, reply word must be exactly 1 ---- */
+ 	{
+ 		uint32_t w[3] = { N2D_PLT_INIT, N2D_SHARE_PA, N2D_SHARE_SIZE }, reply[1] = { 0 };
+ 		o->log(ctx, N2D_L_PLT, 0, w[1], w[2], 0);
++		n2d_trace(o, ctx, N2D_A_PLT, w[1], w[2]);
+ 		int rc = o->mbox(ctx, N2D_MBOX_ALIVE, w, 3, reply, 1, N2D_IPI_TIMEOUT_MS);
+ 		o->log(ctx, N2D_L_PLT, rc == 0 ? 1u : 2u, rc == 0 ? reply[0] : (unsigned)rc, 0, 0);
+ 		if (rc != 0 || reply[0] != 1) {
+@@ -310,11 +360,17 @@
+ 			return st->result = N2D_E_PLT;
+ 		}
+ 	}
++	if (cfg->max_step == 2) {
++		st->stopped = true;
++		o->log(ctx, N2D_L_STAGE, 2, 0, 0, 0);
++		return st->result = N2D_E_STAGE;
++	}
+ 
+ 	/* ---- step 2: DVFS hand-over, every cluster pinned at the bootloader row ---- */
+ 	{
+ 		struct n2dv_plan plan = { .level = N2DV_ONLY_LEVEL, .pin = true, .row = { st->orig[0], st->orig[1], st->orig[2] } };
+ 		struct n2dv_ops wops = { o->w32 };
++		n2d_trace(o, ctx, N2D_A_CSRAM, 0, 0);
+ 		if (n2dv_csram_init(&wops, ctx, &plan) != 0) {
+ 			st->stopped = true;
+ 			o->log(ctx, N2D_L_RESULT, N2D_E_ARGS, 0, 0, 0);
+@@ -348,9 +404,8 @@
+ 		n2d_fallback(o, ctx, st, N2D_E_IPI);
+ 		return st->result;
+ 	}
+-	for (unsigned c = 0; c < N2DV_NR_CLUSTERS; c++) {
+-		uint32_t vp = 0, vs = 0;
+-		if (!o->rail(ctx, c, &vp, &vs) || !n2dv_msg_init_volt(m, c, vp, vs) || !n2d_ipi(o, ctx, m, c)) {
++	for (unsigned c = 0; c < N2DV_NR_CLUSTERS; c++) {        /* the voltages read in the preflight: nothing moved a rail since, and no further PMIC access is made */
++		if (!n2dv_msg_init_volt(m, c, rv[c][0], rv[c][1]) || !n2d_ipi(o, ctx, m, c)) {
+ 			n2d_fallback(o, ctx, st, N2D_E_IPI);
+ 			return st->result;
+ 		}
+@@ -362,6 +417,7 @@
+ 	}
+ 	{
+ 		struct n2dv_ops wops = { o->w32 };
++		n2d_trace(o, ctx, N2D_A_ONOFF, 0, 0);
+ 		n2dv_sched_disable(&wops, ctx);
+ 		for (unsigned c = 0; c < 3; c++) {
+ 			n2dv_cluster_on(&wops, ctx, c);

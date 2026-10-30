@@ -1,0 +1,72 @@
+--- a/bsd/dev/nord2_gpu_core.c
++++ b/bsd/dev/nord2_gpu_core.c
+@@ -116,6 +116,11 @@
+ static void free_bo_memory(struct n2c_core *c, struct n2c_ctx *x,
+                            struct n2c_bo *b)
+ {
++        if (b->retained) {
++                b->retained = false;
++                if (x->retained)
++                        x->retained--;
++        }
+         for (unsigned i = 0; i < c->nr_quarantine;) {
+                 if (c->quarantine[i] == b) {
+                         c->quarantine[i] = c->quarantine[--c->nr_quarantine];
+@@ -215,6 +220,8 @@
+ 
+ static void reap_idle_buffers(struct n2c_core *c, struct n2c_ctx *x)
+ {
++        if (!x->retained)
++                return;                 /* 0187: nothing released is waiting: no scan of the handle table after every job */
+         uint64_t oldest = x->jobs ? ctx_oldest_pending(c, x) : UINT64_MAX;
+         for (unsigned i = 0; i < N2C_MAX_BOS; i++) {
+                 struct n2c_bo *b = x->bos[i];
+@@ -914,6 +921,10 @@
+         if (!b->rel_id)
+                 b->rel_id = c->next_job_id;
+         bool deferred = b->refs > 1 || (x->jobs && ctx_oldest_pending(c, x) < b->rel_id);
++        if (deferred && !b->retained) {
++                b->retained = true;
++                x->retained++;
++        }
+         bo_put(c, x, b);
+         return deferred ? N2C_E_BUSY : N2C_OK;
+ }
+--- a/bsd/dev/nord2_gpu_core.h
++++ b/bsd/dev/nord2_gpu_core.h
+@@ -40,7 +40,7 @@
+ /* Handles per context.  A handle is (serial << N2C_SLOT_BITS) | slot, 32 bits in the ABI (u32 handles[]), so the slot field takes
+  * N2C_SLOT_BITS of the serial: 0105 raised the context limit from 256 to 1024 slots (backboardd held all 256 and dropped commands) and
+  * the core-wide serial, which never repeats so a stale handle cannot alias, shrank from 24 to 22 bits (4194303 buffers per boot). */
+-#define N2C_SLOT_BITS 10u
++#define N2C_SLOT_BITS 13u   /* 0186: 8192 slots (was 1024: backboardd/SpringBoard grew to 1024 LIVE buffers in ~3 minutes, ALLOC then failed with N2C_E_NO_HANDLE = EIO = the 10 s freeze); serial 19 bits = 524287 buffers per boot */
+ #define N2C_MAX_BOS (1u << N2C_SLOT_BITS)
+ #define N2C_SLOT_MASK (N2C_MAX_BOS - 1u)
+ #define N2C_HANDLE_SERIAL_MAX (0xffffffffu >> N2C_SLOT_BITS)
+@@ -165,6 +165,7 @@
+         bool explicit_track;      /* visible, but CPU access is bracketed by acquire/dirty calls (level 2) */
+         bool gpu_dirty;           /* tracked: GPU wrote it since the last acquire */
+         bool gpu_written;         /* the GPU has written it at least once */
++        bool retained;            /* 0187: released, still mapped for older jobs (counted in ctx->retained) */
+         uint64_t rel_id;          /* 0185: c->next_job_id when the client released the handle (0 = still live): only jobs older than this can still address it */
+ };
+ 
+@@ -188,6 +189,7 @@
+         uint64_t wired, wired_limit;
+         uint64_t imported;        /* subset of wired charged to N2C_BO_IMPORTED pages */
+         uint32_t jobs;            /* jobs not yet terminal */
++        uint32_t retained;        /* 0187: released buffers still held for older jobs */
+         uint32_t fault_status;
+         uint64_t fault_address;
+ };
+--- a/bsd/dev/nord2_gpu_va.h
++++ b/bsd/dev/nord2_gpu_va.h
+@@ -20,7 +20,7 @@
+ /* Free extents.  Every live buffer can leave one free gap behind it (small buffers are 64 KiB aligned and the gap is not reusable for
+  * another 64 KiB-aligned buffer), so the list must hold more extents than a context has handles: 256 extents made the 257th small
+  * buffer fail with N2C_E_VA long before any other limit (0105; nord2_gpu_core.c asserts N2VA_MAX_EXTENTS > N2C_MAX_BOS). */
+-#define N2VA_MAX_EXTENTS 1032u
++#define N2VA_MAX_EXTENTS 8200u   /* 0186/0187: must stay above N2C_MAX_BOS (8192) */
+ #define N2VA_GRANULE 0x1000ull
+ 
+ struct n2va_extent {

@@ -1,0 +1,139 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -591,6 +591,124 @@
+ 	}
+ }
+ 
++
++/*
++ * 0206: start MD1 from XNU and watch CCIF (stage 3).  Linux order (modem_sys1.c md_cd_start, md_sys1_platform.c md_cd_power_on and
++ * md_cd_let_md_go): CCIF SRAM reset, MD SRCCLKENA, SPM sleep regs, flight mode off, MTCMOS (already on), SMC MD_KERNEL_BOOT_UP.
++ * Nothing answers the modem yet, so it is expected to stall at the CCIF handshake; the goal is to log what it sends first.
++ * Runs once, 20 s after policy registration, from a thread call; polling is bounded to 25 s.
++ */
++static thread_call_t sweet_modem_start_call;
++
++static void
++sweet_modem_start(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	volatile uint32_t *infra = (volatile uint32_t *)ml_io_map(0x10001000UL, 0x1000);
++	volatile uint32_t *spm = (volatile uint32_t *)ml_io_map(0x10006000UL, 0x1000);
++	volatile uint32_t *ccif = (volatile uint32_t *)ml_io_map(0x10209000UL, 0x1000);
++	uint64_t r[4];
++	uint32_t last_rch = 0xdeadbeef, last_busy = 0xdeadbeef, last_start = 0xdeadbeef, last_sram[8] = { 0 };
++	uint32_t v;
++	unsigned i, k;
++
++	if (infra == NULL || spm == NULL || ccif == NULL) {
++		printf("NORD2 MODEM: start: mapping failed\n");
++		return;
++	}
++	printf("NORD2 MODEM: start: begin (infracfg_ao+0xF0C=%08x)\n", infra[0xF0C / 4]);
++	/* 0210: read-only walk of the shared memory, one word every 64 KiB, a log line before every read.  Does not start the modem. */
++	{
++		uintptr_t pa;
++		for (pa = 0x8e000000UL; pa < 0x8f800000UL; pa += 0x10000UL) {
++			volatile uint32_t *w;
++			printf("NORD2 MODEM: walk pa %#lx map\n", (unsigned long)pa);
++			delay_for_interval(100, NSEC_PER_MSEC);
++			w = (volatile uint32_t *)ml_io_map(pa, 0x1000);
++			if (w == NULL) {
++				printf("NORD2 MODEM: walk pa %#lx map failed\n", (unsigned long)pa);
++				continue;
++			}
++			printf("NORD2 MODEM: walk pa %#lx read\n", (unsigned long)pa);
++			delay_for_interval(100, NSEC_PER_MSEC);
++			printf("NORD2 MODEM: walk pa %#lx = %08x\n", (unsigned long)pa, (unsigned)w[0]);
++		}
++		for (pa = 0x8a000000UL; pa < 0x8d600000UL; pa += 0x400000UL) {
++			volatile uint32_t *w;
++			printf("NORD2 MODEM: walk img pa %#lx read\n", (unsigned long)pa);
++			delay_for_interval(100, NSEC_PER_MSEC);
++			w = (volatile uint32_t *)ml_io_map(pa, 0x1000);
++			if (w != NULL) {
++				printf("NORD2 MODEM: walk img pa %#lx = %08x\n", (unsigned long)pa, (unsigned)w[0]);
++			}
++		}
++		printf("NORD2 MODEM: walk done\n");
++		return;
++	}
++
++	/* ccci_md_clear_smem(first_boot): zero the whole 24 MiB shared-memory bank, 1 MiB mappings at a time */
++	for (k = 0; k < 24; k++) {
++		volatile uint64_t *sm;
++		printf("NORD2 MODEM: start: smem chunk %u (pa %#lx) mapping\n", k, (unsigned long)(0x8e000000UL + (uintptr_t)k * 0x100000UL));
++		delay_for_interval(300, NSEC_PER_MSEC);
++		sm = (volatile uint64_t *)ml_io_map(0x8e000000UL + (uintptr_t)k * 0x100000UL, 0x100000);
++		if (sm == NULL) {
++			printf("NORD2 MODEM: start: smem map %u failed\n", k);
++			return;
++		}
++		printf("NORD2 MODEM: start: smem chunk %u first word %08x, writing\n", k, (unsigned)*(volatile uint32_t *)sm);
++		delay_for_interval(300, NSEC_PER_MSEC);
++		for (i = 0; i < 0x100000 / 8; i++) {
++			sm[i] = 0;
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		printf("NORD2 MODEM: start: smem chunk %u cleared\n", k);
++	}
++	printf("NORD2 MODEM: start: smem cleared (24 MiB)\n");
++	for (i = 0; i < 0x200 / 4; i++) {
++		ccif[0x100 / 4 + i] = 0;                    /* md_ccif_sram_reset */
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	v = infra[0xF0C / 4];
++	infra[0xF0C / 4] = (v & ~0xFFU) | 0x21U;                 /* INFRA_AO_MD_SRCCLKENA */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("NORD2 MODEM: start: SRCCLKENA %08x -> %08x\n", v, infra[0xF0C / 4]);
++	spm[0] = 0x0B160001U;                                /* spm_sleep_base */
++	v = spm[8 / 4];
++	spm[8 / 4] = v | (1U << 21);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("NORD2 MODEM: start: spm+8 %08x -> %08x\n", v, spm[8 / 4]);
++	sweet_modem_smc(7 /* MD_FLIGHT_MODE_SET */, 0, r);
++	printf("NORD2 MODEM: start: flight mode off -> %llx %llx\n", r[0], r[1]);
++	sweet_modem_smc(6, 3 /* MD_CHECK_DONE */, r);
++	printf("NORD2 MODEM: start: BROM check -> %llx\n", r[0]);
++	sweet_modem_smc(6, 0 /* MD_KERNEL_BOOT_UP */, r);
++	printf("NORD2 MODEM: start: KERNEL_BOOT_UP -> %llx %llx %llx\n", r[0], r[1], r[2]);
++
++	for (k = 0; k < 500; k++) {                              /* 25 s at 50 ms */
++		uint32_t rch = ccif[0x10 / 4], busy = ccif[0x04 / 4], start = ccif[0x08 / 4];
++		int changed = (rch != last_rch) || (busy != last_busy) || (start != last_start);
++		for (i = 0; i < 8; i++) {
++			uint32_t w = ccif[0x100 / 4 + i];
++			if (w != last_sram[i]) {
++				changed = 1;
++			}
++		}
++		if (changed || k % 100 == 0) {
++			printf("NORD2 MODEM: start t=%u ms rch=%08x busy=%08x start=%08x sram:", k * 50, rch, busy, start);
++			for (i = 0; i < 8; i++) {
++				last_sram[i] = ccif[0x100 / 4 + i];
++				printf(" %08x", last_sram[i]);
++			}
++			printf("\n");
++			last_rch = rch; last_busy = busy; last_start = start;
++		}
++		delay_for_interval(50, NSEC_PER_MSEC);
++	}
++	sweet_modem_smc(6, 4, r);
++	printf("NORD2 MODEM: start: end, BOOT_STATUS -> %llx %llx %llx\n", r[0], r[1], r[2]);
++	sweet_modem_dump("start ccif0 sram-tail", 0x1020a000UL, 8);
++}
++
+ /* Called from bsd_init once MAC policies can register, before any exec. */
+ void sweet_amfi_policy_register(void);
+ 
+@@ -606,5 +724,11 @@
+ 	sweet_modem_probe();
+ 	sweet_modem_power();
+ 	sweet_modem_late_start();
++	sweet_modem_start_call = thread_call_allocate(sweet_modem_start, NULL);
++	if (sweet_modem_start_call != NULL) {
++		uint64_t dl;
++		clock_interval_to_deadline(20000, NSEC_PER_MSEC, &dl);
++		thread_call_enter_delayed(sweet_modem_start_call, dl);
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

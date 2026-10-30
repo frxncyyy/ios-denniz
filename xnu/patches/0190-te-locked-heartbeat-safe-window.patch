@@ -1,0 +1,275 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -172,6 +172,11 @@
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	/* Panel presents run on their own thread so the vsync clock never waits for a copy or a transfer. */
+ 	IOWorkLoop         *fPresentLoop;
++	IOWorkLoop         *fTrackLoop;
++	IOTimerEventSource *fTrackTimer;
++	uint64_t            fLastPresentUs;
++	bool                fTrackArmed;
++	uint64_t            fTrackDeadlineUs;
+ 	IOTimerEventSource *fPresentTimer;
+ 	uint8_t            *fWorkRec;            /* the swap being presented */
+ 	sweet_fb_pending_surfaces fWorkSurfaces;
+@@ -190,6 +195,13 @@
+ 	uint64_t            fWaitStartUs, fTeStartUs, fTeOffUntilUs;
+ 	/* 0156: double-buffered panel memory (the copy of the next frame overlaps the transfer of the current one), TE prediction, cadence */
+ 	uint64_t            fPhysB, fNextWaitUs, fPrepCopyUs, fTeLastUs, fTePeriodUs, fTeObsUs, fTeLeadUs;
++	/* 0190: the vsync heartbeat follows the panel's real TE period and phase, pushes start in the tear-free window (see presentFired state 6) */
++	uint64_t            fTwMinUs;                 /* shortest panel transfer seen, minus the poll granularity: the safe-window width */
++	int64_t             fCtlEmaUs;                /* smoothed distance of the "ready to push" phase from its target */
++	int64_t             fTickCorrUs;              /* phase correction for the next vsync tick, consumed by vsyncFired */
++	int64_t             fTickCorrSumUs;
++	uint32_t            fDzWaits, fSafeStarts, fPhBin[3];
++	uint64_t            fHbPeriodUs;              /* the heartbeat period: a slow filter of the TE period */
+ 	SweetSurface       *fSurfaceB;
+ 	uintptr_t           fPixelsB, fCopyDst;
+ 	uint8_t            *fNextRec;
+@@ -211,6 +223,8 @@
+ 	bool                fNbReady;            /* the blocking path has run once: overlay removed, ownership taken */
+ 	struct sweet_fb_present_stats fStats;
+ 	static void presentFired(OSObject *owner, IOTimerEventSource *sender);
++	static void trackFired(OSObject *owner, IOTimerEventSource *sender);      /* 0191: keeps the TE reference fresh while nothing is presented */
++	void        teObserve(uint64_t obsUs, bool precise);
+ 	bool        presentCopy(const uint8_t *rec, SweetSurface *const surfaces[SWEET_FB_LAYERS]);
+ 	void        presentDone(bool shown, bool timeout, bool legacy);
+ 	void        dumpDisplayRegs(void);
+@@ -354,6 +368,7 @@
+ 	fVsyncUs = fPanelHz == 90 ? 11111 : SWEET_FB_VSYNC_US;
+ 	fTePeriodUs = SWEET_FB_VSYNC_US;      /* the panel boots at 60 Hz; set to 11111 when the 90 Hz switch is accepted */
+ 	fTeLeadUs = SWEET_FB_TE_LEAD_US_DEFAULT;
++	fTwMinUs = 6800; fCtlEmaUs = 0; fTickCorrUs = 0; fTickCorrSumUs = 0; fDzWaits = 0; fSafeStarts = 0; fPhBin[0] = fPhBin[1] = fPhBin[2] = 0; fHbPeriodUs = 0;
+ 	{ uint32_t lead = 0; if (PE_parse_boot_argn("n2telead", &lead, sizeof(lead)) && lead <= 4000) { fTeLeadUs = lead; } }
+ 	nanoseconds_to_absolutetime(fVsyncUs * 1000ULL, &fPeriodAbs);
+ 	/* n2swait=<0|1|2>: SwapWait semantics (0 = as before: always success, calls logged). */
+@@ -390,6 +405,9 @@
+ 		return false;
+ 	}
+ #if defined(NORD2)
++	fTrackLoop = IOWorkLoop::workLoop();
++	fTrackTimer = fTrackLoop != NULL ? IOTimerEventSource::timerEventSource(this, &AppleCLCD::trackFired) : NULL;
++	if (fTrackTimer != NULL && fTrackLoop->addEventSource(fTrackTimer) != kIOReturnSuccess) { OSSafeReleaseNULL(fTrackTimer); }
+ 	fDsi = (volatile uint32_t *)ml_io_map(SWEET_FB_DSI0, 0x1000);
+ 	fMutex = (volatile uint32_t *)ml_io_map(SWEET_FB_DISP_MUTEX, 0x1000);
+ #endif
+@@ -413,6 +431,7 @@
+ #endif
+ 	sweet_fb_stats_reset(&fStats, 0);
+ 	fVsync->setTimeoutUS(fVsyncUs);
++	if (fTrackTimer != NULL) { fTrackTimer->setTimeoutMS(2000); }
+ 	IOLog("SWEET FB: panel present rate %u Hz (every %u vsyncs), present thread, %s transfer, SwapWait level %u\n", hz, fFlushTicks,
+ 	    (fDsi != NULL && fMutex != NULL) ? "polled" : "blocking", fSwapWaitLevel);
+ 
+@@ -458,6 +477,16 @@
+ 	uint64_t now = mach_absolute_time();
+ 	/* Re-arm first, on the absolute grid: no copy, transfer or notification below can stretch the vsync clock. */
+ 	if (sweet_fb_next_tick(&fb->fNextTick, now, fb->fPeriodAbs)) { __atomic_fetch_add(&fb->fStats.late_ticks, 1, __ATOMIC_RELAXED); }
++	{   /* 0190: phase correction from the presenter (a few tens of us per tick at most): the next tick moves, and so does every later one */
++		int64_t corr = __atomic_exchange_n(&fb->fTickCorrUs, 0, __ATOMIC_RELAXED);
++		if (corr > 120) { corr = 120; } else if (corr < -120) { corr = -120; }
++		if (corr != 0) {
++			uint64_t cabs = 0;
++			nanoseconds_to_absolutetime((uint64_t)(corr < 0 ? -corr : corr) * 1000ULL, &cabs);
++			fb->fNextTick = corr < 0 ? fb->fNextTick - cabs : fb->fNextTick + cabs;
++			fb->fTickCorrSumUs += corr;
++		}
++	}
+ 	if (!__atomic_load_n(&fb->fSwapLifecycle.stopped, __ATOMIC_ACQUIRE)) { sender->wakeAtTime(fb->fNextTick); }
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	bool diag_report = false;
+@@ -794,6 +823,21 @@
+ 			}
+ 			fb->fDsi[SWEET_FB_DSI_INTSTA / 4] = ~SWEET_FB_DSI_TE_RDY;
+ 			fb->fTeStartUs = sweet_fb_abs_to_us(mach_absolute_time());
++			{   /* 0190: where in the panel's refresh does this frame become pushable?  The vsync heartbeat (the clients' frame clock) is nudged so that this phase sits in the middle of the tear-free window */
++				uint64_t nowUs = fb->fTeStartUs;
++				if (fb->fTeLastUs != 0 && fb->fTePeriodUs >= 8000 && nowUs - fb->fTeLastUs < 1500000) {
++					int64_t P = (int64_t)fb->fTePeriodUs, phi = (int64_t)((nowUs - fb->fTeLastUs) % (uint64_t)P);
++					int64_t twc = (int64_t)fb->fTwMinUs; if (twc > P - 1500) { twc = P - 1500; }
++					int64_t wlo = P - twc + 800, whi = P - 2000;
++					fb->fPhBin[phi < wlo ? 0 : (phi > whi ? 2 : 1)]++;
++					int64_t e = phi - ((wlo + whi) / 2);      /* target: the middle of the safe window */
++					if (e > P / 2) { e -= P; } else if (e < -P / 2) { e += P; }
++					fb->fCtlEmaUs += (e - fb->fCtlEmaUs) / 8;
++					int64_t adj = -fb->fCtlEmaUs / 16;
++					if (adj > 30) { adj = 30; } else if (adj < -30) { adj = -30; }
++					__atomic_fetch_add(&fb->fTickCorrUs, adj, __ATOMIC_RELAXED);
++				}
++			}
+ 			fb->fPState = 6;
+ 			sender->setTimeoutUS(200);
+ 			return;
+@@ -821,15 +865,25 @@
+ 		uint64_t nowUs = sweet_fb_abs_to_us(mach_absolute_time());
+ 		uint64_t waited = nowUs - fb->fTeStartUs;
+ 		bool te = (fb->fDsi[SWEET_FB_DSI_INTSTA / 4] & SWEET_FB_DSI_TE_RDY) != 0;
+-		if (fb->fTeLastUs != 0 && fb->fTeLeadUs != 0 && nowUs - fb->fTeLastUs < 200000) {
+-			/* 0156: start fTeLeadUs before the TE after the last one seen (periodic), so the write is ahead of the scan from the first row */
+-			uint64_t P = fb->fTePeriodUs;
+-			uint64_t k = (nowUs - fb->fTeLastUs + fb->fTeLeadUs) / P + 1;
+-			uint64_t fire = fb->fTeLastUs + k * P - fb->fTeLeadUs;
+-			if (fire > nowUs + 300) { sender->setTimeoutUS((uint32_t)(fire - nowUs - 200)); return; }
+-			while (sweet_fb_abs_to_us(mach_absolute_time()) < fire) { IODelay(20); }
++		if (fb->fTeLastUs != 0 && fb->fTePeriodUs >= 8000 && nowUs - fb->fTeLastUs < 1500000) {
++			/* 0190: the panel scan restarts at every TE and the push is faster than the scan (Tw < P).  A push that starts X before a TE, 0 < X < Tw, can never
++			 * overtake the scan of the previous refresh and is ahead of the next one: no tear.  A push that starts in [TE, TE + P - Tw) tears.  So: start at once
++			 * when the phase since the last TE is in [P - Tw + 0.8 ms, P - 2.0 ms], otherwise wait for that window (at most P - ... 4 ms), instead of always waiting for a
++			 * fixed lead before the next TE (which cost a whole refresh whenever the frame was 1 us late). */
++			uint64_t P = fb->fTePeriodUs, tw = fb->fTwMinUs;
++			if (tw > P - 1500) { tw = P - 1500; }
++			uint64_t lo = P - tw + 800, hi = P - 2000;      /* margins: the scan start is only known to ~0.5 ms relative to the TE edge */
++			uint64_t phi = (nowUs - fb->fTeLastUs) % P;
++			if (phi < lo || phi > hi) {
++				uint64_t wait = phi < lo ? lo - phi : (P - phi) + lo;
++				fb->fDzWaits++;
++				if (wait > 500) { sender->setTimeoutUS((uint32_t)(wait - 400)); return; }
++				uint64_t until = nowUs + wait;
++				while (sweet_fb_abs_to_us(mach_absolute_time()) < until) { IODelay(20); }
++				nowUs = sweet_fb_abs_to_us(mach_absolute_time());
++			}
++			fb->fSafeStarts++;
+ 			fb->fStats.te_lead_starts++;
+-			nowUs = sweet_fb_abs_to_us(mach_absolute_time());
+ 			te = true;
+ 			fb->fDsi[SWEET_FB_DSI_INTSTA / 4] = ~SWEET_FB_DSI_TE_RDY;      /* the next TE seen is the one this push is ahead of */
+ 		} else if (te) {
+@@ -870,6 +924,81 @@
+ 	fb->presentDone(true, st == SWEET_FB_XFER_TIMEOUT, false);
+ }
+ 
++/* 0191: one TE sighting.  A sighting made by the present thread's 250 us poll can only be late; one made by trackFired's spin loop is good to ~10 us. */
++void
++AppleCLCD::teObserve(uint64_t obsUs, bool precise)
++{
++#if defined(NORD2)
++	bool obsLocked = false;
++	if (fTeLastUs != 0 && obsUs > fTeLastUs && obsUs - fTeLastUs < 2000000) {
++		uint64_t d = obsUs - fTeLastUs, P = fTePeriodUs, n = (d + P / 2) / P;
++		int64_t err = n ? (int64_t)d - (int64_t)(n * P) : 0;
++		if (n >= 1 && err > -(int64_t)(P / 4) && err < (int64_t)(P / 4)) {
++			int64_t pe = err < -250 ? -250 : (err > 250 ? 250 : err);
++			int64_t np = (int64_t)P + pe / (int64_t)((precise ? 24 : 48) * n);
++			int64_t plo = fModeState == 1 ? 11100 : 8000, phi_ = fModeState == 1 ? 11350 : 20000;
++			fTePeriodUs = (uint64_t)(np < plo ? plo : (np > phi_ ? phi_ : np));
++			int64_t base = (int64_t)fTeLastUs + (int64_t)(n * P);
++			if (precise) { fTeLastUs = (uint64_t)(base + err / 2); }
++			else { fTeLastUs = (uint64_t)(base + (err < 0 ? err / 2 : (err > 400 ? 400 : err) / 16)); }
++			obsLocked = true;
++		}
++	}
++	if (!obsLocked) { fTeLastUs = obsUs; }
++	if (fPanelHz == 90 && fModeState == 1) {
++		int64_t h = fHbPeriodUs ? (int64_t)fHbPeriodUs : 11226;
++		h += ((int64_t)fTePeriodUs - h) / 16;
++		if (h < 11150) { h = 11150; } else if (h > 11300) { h = 11300; }
++		fHbPeriodUs = (uint64_t)h;
++		uint64_t pabs = 0; nanoseconds_to_absolutetime(fHbPeriodUs * 1000ULL, &pabs);
++		fPeriodAbs = pabs;      /* the clients' frame clock runs at the panel's real refresh rate (it ran at 11111 us against a 11226 us panel: a dropped frame every second) */
++	}
++#else
++	(void)obsUs; (void)precise;
++#endif
++}
++
++/* 0191: while nothing is presented the TE reference would age and the first frame of the next interaction would start at the TE edge (a tear band at the top).  Every
++ * 200 ms after activity (1 s when idle) the panel's TE is watched with a 150 us timer poll (no spinning: a spin on this thread delayed the GPU completion thread of the same CPU,
++ * GPU waits went from 2 to 5 ms and 30 % of the presents were forced), and the reference is refreshed. */
++void
++AppleCLCD::trackFired(OSObject *owner, IOTimerEventSource *sender)
++{
++#if defined(NORD2)
++	AppleCLCD *fb = (AppleCLCD *)owner;
++	if (__atomic_load_n(&fb->fSwapLifecycle.stopped, __ATOMIC_ACQUIRE)) { return; }
++	uint64_t nowUs = sweet_fb_abs_to_us(mach_absolute_time());
++	uint32_t nextMs = (nowUs - fb->fLastPresentUs < 4000000) ? 200 : 1000;
++	if (fb->fTrackArmed) {
++		uint64_t P = fb->fTePeriodUs;
++		if (fb->fPState != 0 || fb->fDsi == NULL) { fb->fTrackArmed = false; sender->setTimeoutMS(nextMs); return; }
++		if (fb->fDsi[SWEET_FB_DSI_INTSTA / 4] & SWEET_FB_DSI_TE_RDY) {
++			fb->fTrackArmed = false;
++			fb->teObserve(nowUs - 75, false);
++			sender->setTimeoutMS(nextMs);
++			return;
++		}
++		(void)P;
++		if (nowUs > fb->fTrackDeadlineUs) { fb->fTrackArmed = false; sender->setTimeoutMS(nextMs); return; }      /* the TE did not show up */
++		sender->setTimeoutUS(150);
++		return;
++	}
++	if (fb->fPowerOff || !fb->fNbReady || fb->fDsi == NULL || fb->fModeState != 1 || fb->fRetuneState != 1 || fb->fPState != 0 ||
++	    fb->fTeLastUs == 0 || fb->fTePeriodUs < 11100 || fb->fTePeriodUs > 11350 || nowUs < fb->fTeLastUs) {
++		sender->setTimeoutMS(nextMs);
++		return;
++	}
++	uint64_t P = fb->fTePeriodUs, k = (nowUs - fb->fTeLastUs + 1200) / P + 1, tn = fb->fTeLastUs + k * P;
++	if (tn > nowUs + 1500) { sender->setTimeoutUS((uint32_t)(tn - nowUs - 1000)); return; }
++	fb->fDsi[SWEET_FB_DSI_INTSTA / 4] = ~SWEET_FB_DSI_TE_RDY;
++	fb->fTrackArmed = true;
++	fb->fTrackDeadlineUs = tn + 1800;
++	sender->setTimeoutUS(150);
++#else
++	(void)owner; (void)sender;
++#endif
++}
++
+ /* 0152: read-only dump of the panel link configuration (DSI0, MIPI TX0 PLL/lanes), once, to size a 90 Hz mode (link rate, timings). */
+ void
+ AppleCLCD::dumpDisplayRegs(void)
+@@ -1022,23 +1151,20 @@
+ #if defined(NORD2)
+ 	/* 0154: the presenter still owns the engine here (fPState != 0), the link is idle */
+ 	if (shown && !legacy) {
++		if (xfer > 3000 && xfer < 20000) {
++			uint64_t m = xfer > 300 ? xfer - 300 : xfer;      /* 0190: the safe-window width follows the fastest transfers */
++			if (m < fTwMinUs) { fTwMinUs = m; } else { fTwMinUs += (m - fTwMinUs) / 64; }
++			if (fTwMinUs < 4500) { fTwMinUs = 4500; }
++		}
+ 		if (fTeObsSet) {
+ 			fTeObsSet = false;
+-			if (fTeLastUs != 0 && fTeObsUs > fTeLastUs && fTeObsUs - fTeLastUs < 200000) {
+-				uint64_t d = fTeObsUs - fTeLastUs, P = fTePeriodUs, n = (d + P / 2) / P;
+-				int64_t err = n ? (int64_t)d - (int64_t)(n * P) : 0;
+-				if (n >= 1 && err > -(int64_t)(P / 4) && err < (int64_t)(P / 4)) {
+-					fTePeriodUs = (uint64_t)((int64_t)P + err / (int64_t)(8 * n));
+-					if (fTePeriodUs < 8000) { fTePeriodUs = 8000; } else if (fTePeriodUs > 20000) { fTePeriodUs = 20000; }
+-				}
+-			}
+-			fTeLastUs = fTeObsUs;
++			teObserve(fTeObsUs, false);
+ 		}
+ 		if (fRetuneState == 0 && fPresents > 30 && !timeout) {
+ 			linkRetune(true);
+ 			if (fRetuneState == 1 && fPanelHz == 90 && fModeState == 0) {
+ 				fModeState = panelRefresh(true) ? 1 : 2;
+-				if (fModeState == 1) { fTePeriodUs = 11111; fTeLastUs = 0; }      /* re-acquire the TE at the new rate */
++				if (fModeState == 1) { fTePeriodUs = 11226; fTeLastUs = 0; }      /* re-acquire the TE at the new rate */
+ 			}
+ 			if (!fDbl && fRetuneState == 1) { (void)dblEnable(); }
+ 		}
+@@ -1071,6 +1197,7 @@
+ 	/* Safe to release only after the layer copy and the panel transfer are done. */
+ 	sweet_fb_pending_surfaces_release(&surfaces, sweet_fb_release_surface);
+ 	if (!shown) { return; }
++	fLastPresentUs = sweet_fb_abs_to_us(mach_absolute_time());
+ 	if (fFlushTicks <= 1) { handOver(0); }       /* 0155: the next swap, if one is waiting, starts now instead of at the next tick */
+ 	if (fPresents++ == 0) { fFirstPresentMs = sweet_fb_abs_to_us(mach_absolute_time()) / 1000; }
+ 	static unsigned logged;
+@@ -1098,6 +1225,9 @@
+ 		    fGapBin[0], fGapBin[1], fGapBin[2], fGapBin[3], fGapBin[4], fDistinctGapMaxUs / 1000);
+ 		IOLog("NORD2 FB CADENCE: distinct_gaps_ms<=12.5/15/19/28/more=%u/%u/%u/%u/%u dbl=%u preps=%u hits=%u te_lead_starts=%u te_period_us=%llu\n", fCad[0], fCad[1], fCad[2], fCad[3], fCad[4],
+ 		    fDbl ? 1u : 0u, fStats.dbl_preps, fStats.dbl_hits, fStats.te_lead_starts, fTePeriodUs);
++		IOLog("NORD2 FB LOCK: te_period_us=%llu tw_min_us=%llu safe_starts=%u deferred=%u ready_phase_early/in/late=%u/%u/%u ctl_err_ema_us=%lld tick_shift_us=%lld period_abs_us=%llu\n", fTePeriodUs, fTwMinUs, fSafeStarts, fDzWaits,
++		    fPhBin[0], fPhBin[1], fPhBin[2], (long long)fCtlEmaUs, (long long)fTickCorrSumUs, sweet_fb_abs_to_us(fPeriodAbs));
++		fSafeStarts = 0; fDzWaits = 0; fTickCorrSumUs = 0; fPhBin[0] = fPhBin[1] = fPhBin[2] = 0;
+ 		for (unsigned i = 0; i < 5; i++) { fCad[i] = 0; }
+ 		fDistinct = fSame = 0; fDistinctGapMaxUs = 0; for (unsigned i = 0; i < 5; i++) { fGapBin[i] = 0; }
+ 		sweet_fb_stats_reset(&fStats, now_us);
+@@ -1572,6 +1702,7 @@
+ 		fVsync->cancelTimeout();
+ 		fVsync->disable();
+ 	}
++	if (fTrackTimer != NULL) { fTrackTimer->cancelTimeout(); fTrackTimer->disable(); }
+ 	if (fPresentTimer != NULL) {
+ 		/* Let the present thread notice the stop and drop its frame (copy/transfer in flight finishes first). */
+ 		for (unsigned i = 0; i < 200 && fPState != 0; i++) {

@@ -1,0 +1,99 @@
+--- a/bsd/dev/nord2_gpu_core.c
++++ b/bsd/dev/nord2_gpu_core.c
+@@ -65,6 +65,8 @@
+         if (b->cookie && c->ops.free_owner)
+                 c->ops.free_owner(c->ctx, b->cookie);
+         x->wired = x->wired >= b->charged ? x->wired - b->charged : 0;
++        if (b->flags & N2C_BO_IMPORTED)
++                x->imported = x->imported >= b->charged ? x->imported - b->charged : 0;
+         c->stats.bos_live--;
+         c->stats.bytes_live -= b->size;
+         if (b->pages)
+@@ -565,6 +567,8 @@
+         c->stats.bos_live++;
+         c->stats.bytes_live += size;
+         x->wired += charged;
++        if (flags & N2C_BO_IMPORTED)
++                x->imported += charged;
+         b->refs = 1;
+         b->handle_live = true;
+         b->state = N2C_BO_MAPPED;
+--- a/bsd/dev/nord2_gpu_core.h
++++ b/bsd/dev/nord2_gpu_core.h
+@@ -157,6 +157,7 @@
+         struct n2va va;
+         struct n2c_bo *bos[N2C_MAX_BOS];
+         uint64_t wired, wired_limit;
++        uint64_t imported;        /* subset of wired charged to N2C_BO_IMPORTED pages */
+         uint32_t jobs;            /* jobs not yet terminal */
+         uint32_t fault_status;
+         uint64_t fault_address;
+--- a/bsd/dev/nord2_gpu_transport.h
++++ b/bsd/dev/nord2_gpu_transport.h
+@@ -92,11 +92,20 @@
+ #endif
+ 
+ 
+-/* All backing is accounted in XNU's 16 KiB allocation units. */
++/* Private (driver-allocated) backing is capped per client at 64 MiB.  Pages
++ * imported from an IOSurface are owned and already wired by IOSurface; they
++ * are charged to a separate import budget, never to the private cap.  Both
++ * budgets are subsets of the context's hard wired_limit (256 MiB), which
++ * must stay >= NORD2_GPU_PRIVATE_LIMIT + NORD2_GPU_IMPORT_LIMIT. */
++#define NORD2_GPU_PRIVATE_LIMIT (64ull << 20)
++#define NORD2_GPU_IMPORT_LIMIT  (128ull << 20)
++
++/* All backing is accounted in XNU's 16 KiB allocation units.  `wired` is the
++ * context's PRIVATE usage only (total wired minus imported). */
+ static inline bool nord2_gpu_allocation_size(uint64_t requested,
+                                              uint64_t wired, uint64_t *size)
+ {
+-        const uint64_t limit = 64ull << 20;
++        const uint64_t limit = NORD2_GPU_PRIVATE_LIMIT;
+         if (!requested || requested > limit || wired > limit || !size)
+                 return false;
+         uint64_t rounded = (requested + 16383u) & ~16383ull;
+@@ -106,6 +115,19 @@
+         return true;
+ }
+ 
++/* Imported surface pages: 4 KiB granularity (surface offset/length are page
++ * aligned), bounded by NORD2_GPU_IMPORT_LIMIT of already-imported bytes. */
++static inline bool nord2_gpu_import_size(uint64_t mapped, uint64_t imported,
++                                         uint64_t *charged)
++{
++        const uint64_t limit = NORD2_GPU_IMPORT_LIMIT;
++        if (!mapped || (mapped & 4095u) || mapped > limit || imported > limit ||
++            !charged || mapped > limit - imported)
++                return false;
++        *charged = mapped;
++        return true;
++}
++
+ /* Validate counts AND pointers before the IOKit adapter touches any buffer.
+  * Descriptor-backed/in-band async requests are not part of ABI v1. */
+ static inline bool nord2_gpu_call_valid(uint32_t selector,
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -356,7 +356,7 @@
+ IOReturn Nord2GPU::mapBuffer(unsigned c, uint64_t bytes, uint32_t flags,
+                             uint32_t *h, uint64_t *va, uint64_t *actual) {
+         if (!ready || !core || c >= N2C_MAX_CTX) return kIOReturnNotReady;
+-        if ((flags & ~1u) || !nord2_gpu_allocation_size(bytes, core->ctxs[c].wired, &bytes)) return kIOReturnBadArgument;
++        if ((flags & ~1u) || !nord2_gpu_allocation_size(bytes, core->ctxs[c].wired - core->ctxs[c].imported, &bytes)) return kIOReturnBadArgument;
+         auto md = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared, (vm_size_t)bytes, 16384);
+         if (!md) return kIOReturnNoMemory;
+         BufferOwner *owner = (BufferOwner *)IOMallocZero(sizeof(*owner));
+@@ -387,9 +387,10 @@
+ }
+ IOReturn Nord2GPU::importSurface(unsigned c, uint32_t id, uint32_t offset, uint32_t bytes,
+                                 uint32_t *h, uint64_t *va, uint64_t *actual) {
+-        if (!ready || !bytes || (offset & 4095)) return kIOReturnBadArgument;
++        if (!ready || !core || c >= N2C_MAX_CTX || !bytes || (offset & 4095)) return kIOReturnBadArgument;
+         uint64_t mapped = ((uint64_t)bytes + 4095) & ~4095ull, charged;
+-        if (!nord2_gpu_allocation_size(mapped, core->ctxs[c].wired, &charged)) return kIOReturnNoMemory;
++        /* IOSurface owns these pages: charge the import budget, not the private cap. */
++        if (!nord2_gpu_import_size(mapped, core->ctxs[c].imported, &charged)) return kIOReturnNoMemory;
+         SweetSurface *s = sweet_surface_copy(id); if (!s) return kIOReturnNotFound;
+         uint64_t base = (uint64_t)s->offset + offset;
+         if (!s->memory || (base & 4095) || base > s->allocSize || mapped > s->allocSize - base ||

@@ -1,0 +1,162 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -91,6 +91,88 @@
+ static void sleep_ms(void *, unsigned ms) { IOSleep(ms); }
+ static void delay_us(void *, unsigned us) { IODelay(us); }
+ static void log_msg(void *, const char *s) { IOLog("NORD2 GPU: %s\n", s); }
++/* 0182: persistent last-log ring (passive).  Two alternating 256 KiB rings in the unused Android pstore area (0x48090000, 0x480D0000) get a copy of the live log stream every 20 ms;
++ * the next boot prints the tail of the previous boot's ring as "NORD2 PREV:" lines, so what the phone said last before a freeze/crash is in the capture. */
++extern "C" {
++uint32_t nord2_log_stream_read(uint32_t offset, uint8_t *out, uint32_t max);
++void nord2_log_stream_info(uint32_t info[2]);
++}
++#define N2LR_BASE0 0x48090000ull
++#define N2LR_BASE1 0x480D0000ull
++#define N2LR_SIZE  0x40000u
++#define N2LR_HDR   16u
++#define N2LR_MAGIC 0x4e324c52u   /* "N2LR" */
++static volatile uint8_t *n2lr_map[2];
++static volatile uint8_t *n2lr_cur;
++static uint32_t n2lr_wpos, n2lr_off;
++static IOWorkLoop *n2lr_loop; static IOTimerEventSource *n2lr_timer;
++static inline uint32_t n2lr_rd(volatile uint8_t *r, unsigned w) { return ((volatile uint32_t *)r)[w]; }
++static inline void n2lr_wr(volatile uint8_t *r, unsigned w, uint32_t v) { ((volatile uint32_t *)r)[w] = v; }
++static void n2lr_tick(OSObject *, IOTimerEventSource *sender) {
++        uint8_t buf[2048];
++        uint32_t cap = N2LR_SIZE - N2LR_HDR;
++        for (unsigned round = 0; round < 16; round++) {
++                uint32_t n = nord2_log_stream_read(n2lr_off, buf, sizeof(buf));
++                if (!n) break;
++                for (uint32_t i = 0; i < n; i++) n2lr_cur[N2LR_HDR + ((n2lr_wpos + i) % cap)] = buf[i];
++                __asm__ volatile("dsb sy" ::: "memory");
++                n2lr_wpos += n; n2lr_off += n;
++                n2lr_wr(n2lr_cur, 2, n2lr_wpos);
++        }
++        if (sender) sender->setTimeoutMS(20);
++}
++static void n2lr_start(OSObject *owner) {
++        n2lr_map[0] = (volatile uint8_t *)ml_io_map(N2LR_BASE0, N2LR_SIZE);
++        n2lr_map[1] = (volatile uint8_t *)ml_io_map(N2LR_BASE1, N2LR_SIZE);
++        if (!n2lr_map[0] || !n2lr_map[1]) { IOLog("NORD2 PREV: cannot map the log rings\n"); return; }
++        uint32_t cap = N2LR_SIZE - N2LR_HDR, seq[2] = {0, 0}; bool valid[2];
++        for (unsigned k = 0; k < 2; k++) {
++                valid[k] = n2lr_rd(n2lr_map[k], 0) == N2LR_MAGIC && n2lr_rd(n2lr_map[k], 3) == cap;
++                if (valid[k]) seq[k] = n2lr_rd(n2lr_map[k], 1);
++        }
++        int newest = -1; if (valid[0] && (!valid[1] || seq[0] >= seq[1])) newest = 0; else if (valid[1]) newest = 1;
++        uint32_t mySeq = newest >= 0 ? seq[newest] + 1 : 1;
++        if (newest >= 0) {
++                volatile uint8_t *r = n2lr_map[newest]; uint32_t wpos = n2lr_rd(r, 2);
++                uint32_t have = wpos < cap ? wpos : cap, show = have < 24576 ? have : 24576;
++                IOLog("NORD2 PREV: previous boot seq=%u wrote %u bytes, last %u follow\n", seq[newest], wpos, show);
++                char line[400]; unsigned ll = 0; bool skipFirst = show < have;
++                for (uint32_t i = 0; i < show; i++) {
++                        char ch = (char)r[N2LR_HDR + ((wpos - show + i) % cap)];
++                        if (ch == '\n' || ll >= sizeof(line) - 1) {
++                                line[ll] = 0; if (!skipFirst && ll) IOLog("NORD2 PREV: %s\n", line);
++                                skipFirst = false; ll = 0;
++                                if (ch != '\n' && ch >= 32 && ch < 127) line[ll++] = ch;
++                        } else if (ch >= 32 && ch < 127) line[ll++] = ch;
++                }
++                if (ll) { line[ll] = 0; IOLog("NORD2 PREV: %s (unterminated: the log ends here)\n", line); }
++                IOLog("NORD2 PREV: end of the previous boot's log\n");
++        } else IOLog("NORD2 PREV: no previous log ring\n");
++        int mine = newest == 0 ? 1 : 0;
++        n2lr_cur = n2lr_map[mine];
++        n2lr_wr(n2lr_cur, 0, 0); __asm__ volatile("dsb sy" ::: "memory");
++        n2lr_wr(n2lr_cur, 1, mySeq); n2lr_wr(n2lr_cur, 2, 0); n2lr_wr(n2lr_cur, 3, cap);
++        __asm__ volatile("dsb sy" ::: "memory");
++        n2lr_wr(n2lr_cur, 0, N2LR_MAGIC);
++        uint32_t info[2] = {0, 0}; nord2_log_stream_info(info);
++        n2lr_off = info[1] > 16384 ? info[1] - 16384 : 0;
++        n2lr_loop = IOWorkLoop::workLoop();
++        n2lr_timer = IOTimerEventSource::timerEventSource(owner, n2lr_tick);
++        if (n2lr_loop && n2lr_timer && n2lr_loop->addEventSource(n2lr_timer) == kIOReturnSuccess) {
++                IOLog("NORD2 PREV: this boot is seq %u in ring %d, mirrored every 20 ms\n", mySeq, mine);
++                n2lr_timer->setTimeoutMS(20);
++        } else IOLog("NORD2 PREV: cannot start the mirror\n");
++}
++static void n2lr_stop() { if (n2lr_timer) { n2lr_timer->cancelTimeout(); if (n2lr_loop) n2lr_loop->removeEventSource(n2lr_timer); } }
++/* 0168: why a call was refused with something that is neither "out of memory" nor "bad argument" (the shim retries those for 10 s): core and context state */
++static void n2_refusal_log(struct n2c_core *core, bool ready, bool stopping, unsigned ctx, uint32_t sel, IOReturn result, const char *where) {
++        static unsigned logged; if (logged >= 120) return; logged++;
++        unsigned fr = 0, op = 0, zo = 0, other = 0;
++        if (core) for (unsigned i = 1; i < N2C_MAX_CTX; i++) { switch (core->ctxs[i].state) { case N2C_CTX_FREE: fr++; break; case N2C_CTX_OPEN: op++; break; case N2C_CTX_ZOMBIE: zo++; break; default: other++; } }
++        IOLog("NORD2 GPU REFUSED: %s sel=%u result=0x%x ready=%d stopping=%d core_state=%d reset_pending=%d powered=%d ctx=%u ctx_state=%d ctxs(free/open/zombie/other)=%u/%u/%u/%u\n",
++              where, (unsigned)sel, (unsigned)result, (int)ready, (int)stopping, core ? (int)core->state : -1, core ? (int)core->reset_pending : -1, core ? (int)core->gpu_powered : -1,
++              ctx, (core && ctx < N2C_MAX_CTX) ? (int)core->ctxs[ctx].state : -1, fr, op, zo, other);
++}
+ struct Bank { volatile uint32_t *p; unsigned bytes; };
+ static uint32_t read_bank(void *ctx, uint32_t off) {
+         Bank *b = (Bank *)ctx;
+@@ -470,6 +552,7 @@
+ bool Nord2GPU::start(IOService *provider) {
+         if (!IOAcceleratorES::start(provider)) return false;
+         lock = IOLockAlloc(); if (!lock) return false;
++        n2lr_start(this);
+         int opt = 0; PE_parse_boot_argn("nord2_gpu", &opt, sizeof(opt)); enabled = opt == 1;
+         int stats = 1; PE_parse_boot_argn("nord2_gpu_stats", &stats, sizeof(stats)); jobStats = stats != 0;
+         if (!PE_parse_boot_argn("n2pf", &pfMode, sizeof(pfMode))) pfMode = 0;
+@@ -508,6 +591,7 @@
+ }
+ void Nord2GPU::stop(IOService *provider) {
+         if (lock) { IOLockLock(lock); stopping = true; ready = false; if (gSurfaceGpu == this) gSurfaceGpu = NULL; IOLockUnlock(lock); }
++        n2lr_stop();
+         if (timer) { timer->cancelTimeout(); if (loop) loop->removeEventSource(timer); }
+         if (lock) IOLockLock(lock);
+         if (core && core->ops.alloc_table) {
+@@ -1070,6 +1154,9 @@
+         IOFree(pages, count * sizeof(*pages)); if (!adopted) free_owner(this, owner);
+         if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=mapped e=%d\n", flags, (int)e); }
+         { static unsigned slowLogs; uint64_t t5 = now_us(NULL);
++          static unsigned verySlow; if (t5 - t0 >= 100000 && verySlow < 100) { verySlow++;
++                IOLog("NORD2 GPU ALLOC VERYSLOW: bytes=%llu flags=%u md_create=%llu prepare=%llu zero=%llu segments=%llu map=%llu total=%llu us free=%u wired=%u e=%d\n", bytes, flags,
++                      t1 - t0, t2 > t1 ? t2 - t1 : 0, t3 > t2 ? t3 - t2 : 0, t4 - t3, t5 - t4, t5 - t0, vm_page_free_count, vm_page_wire_count, (int)e); }
+           if (t5 - t0 >= 2000 && slowLogs < 60) { slowLogs++;
+                 IOLog("NORD2 GPU ALLOC SLOW: bytes=%llu flags=%u md=%llu prepare=%llu zero=%llu segments=%llu map=%llu total=%llu us (lock %s)\n", bytes, flags,
+                       t1 - t0, t2 > t1 ? t2 - t1 : 0, t3 > t2 ? t3 - t2 : 0, t4 - t3, t5 - t4, t5 - t0, dropLock ? "dropped" : "held"); } }
+@@ -1308,7 +1395,8 @@
+         if(!nord2_gpu_call_valid(sel,a->scalarInputCount,a->scalarOutputCount,a->structureInputSize,a->structureOutputSize,
+                                  a->scalarInput,a->scalarOutput,a->structureInput,a->structureOutput) ||
+            a->structureInputDescriptor || a->structureOutputDescriptor || a->asyncWakePort!=MACH_PORT_NULL)return kIOReturnBadArgument;
+-        IOLockLock(lock);IOLockLock(gpu->lock);IOReturn result=kIOReturnUnsupported;bool clientHeld=true;
++        uint64_t callT0=now_us(NULL),lockT0=callT0,lockMid=0;
++        IOLockLock(lock);lockMid=now_us(NULL);IOLockLock(gpu->lock);uint64_t callT1=now_us(NULL);IOReturn result=kIOReturnUnsupported;bool clientHeld=true;
+         if(closed || gpu->stopping){result=kIOReturnNotOpen;goto out;}
+         if(sel==NORD2_GPU_SEL_STATUS){gpu->status((nord2_gpu_status *)a->structureOutput);a->structureOutputSize=sizeof(nord2_gpu_status);result=kIOReturnSuccess;goto out;}
+         if(sel==NORD2_GPU_SEL_HWINFO){
+@@ -1323,7 +1411,7 @@
+                 IOLog("NORD2 GPU USER: %.*s",(int)a->structureInputSize,(const char *)a->structureInput);
+                 result=kIOReturnSuccess;goto out;
+         }
+-        result=ensureContext();if(result!=kIOReturnSuccess)goto out;
++        result=ensureContext();if(result!=kIOReturnSuccess){n2_refusal_log(gpu->core,gpu->ready,gpu->stopping,context,sel,result,"ensureContext");goto out;}
+         result=kIOReturnUnsupported;
+         switch(sel){
+         case NORD2_GPU_SEL_ALLOC: {
+@@ -1331,7 +1419,9 @@
+                 /* 0144: like WAIT, no connection lock during the slow part: submits and maps of this connection run meanwhile (closeContext() takes gpu->lock) */
+                 const unsigned actx=context;IOLockUnlock(lock);clientHeld=false;
+                 uint32_t h;uint64_t va,size;result=gpu->mapBuffer(actx,a->scalarInput[0],(uint32_t)a->scalarInput[1],&h,&va,&size,true,&closed);
+-                if(result==kIOReturnSuccess){a->scalarOutput[0]=h;a->scalarOutput[1]=va;a->scalarOutput[2]=size;a->scalarOutputCount=3;}break;
++                if(result==kIOReturnSuccess){a->scalarOutput[0]=h;a->scalarOutput[1]=va;a->scalarOutput[2]=size;a->scalarOutputCount=3;}
++                else if(result!=kIOReturnNoMemory && result!=kIOReturnBadArgument){IOLockLock(gpu->lock);n2_refusal_log(gpu->core,gpu->ready,gpu->stopping,actx,sel,result,"ALLOC");IOLockUnlock(gpu->lock);}
++                break;
+         }
+         case NORD2_GPU_SEL_RELEASE:
+                 if(a->scalarInput[0]>UINT32_MAX){result=kIOReturnBadArgument;break;}
+@@ -1433,5 +1523,13 @@
+         default: break;
+         }
+  out:
+-        IOLockUnlock(gpu->lock);if(clientHeld)IOLockUnlock(lock);return result;
++        IOLockUnlock(gpu->lock);if(clientHeld)IOLockUnlock(lock);
++        {       /* 0167: a call that took long, and where the time went (waiting for this connection's lock, for the global lock, or inside), with the free memory at the end */
++                static unsigned slowCalls; uint64_t callT2=now_us(NULL);
++                if(((callT2-callT0>=250000 && sel!=NORD2_GPU_SEL_WAIT && sel!=NORD2_GPU_SEL_WAIT_SEQ) || callT1-callT0>=150000) && slowCalls<300){slowCalls++;
++                        IOLog("NORD2 GPU SLOWCALL: sel=%u total=%llu ms wait_client_lock=%llu ms wait_global_lock=%llu ms result=0x%x free=%u wired=%u active=%u inactive=%u spec=%u (16K pages)\n",
++                              (unsigned)sel,(callT2-callT0)/1000,(lockMid-lockT0)/1000,(callT1-lockMid)/1000,(unsigned)result,vm_page_free_count,vm_page_wire_count,vm_page_active_count,vm_page_inactive_count,vm_page_speculative_count);
++                }
++        }
++        return result;
+ }

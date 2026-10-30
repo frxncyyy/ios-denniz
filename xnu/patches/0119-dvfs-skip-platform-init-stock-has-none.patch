@@ -1,0 +1,121 @@
+--- a/bsd/dev/nord2_cpufreq.c
++++ b/bsd/dev/nord2_cpufreq.c
+@@ -595,7 +595,9 @@
+ 		printf("NORD2 DVFS step 0 share buffer %#x +%#x: %s\n", a, b, c ? "mapped, zeroed, stock header written and read back" : "REFUSED");
+ 		break;
+ 	case N2D_L_PLT:
+-		if (a == 0) {
++		if (a == 3) {
++			printf("NORD2 DVFS step 1 platform init: skipped on purpose (the stock kernel sends no platform init), no share buffer\n");
++		} else if (a == 0) {
+ 			printf("NORD2 DVFS step 1 platform init: sending {%#x, %#x, %#x} to mailbox 0\n", N2D_PLT_INIT, b, c);
+ 		} else if (a == 1) {
+ 			printf("NORD2 DVFS step 1 platform init: reply %#x (%s)\n", b, b == 1 ? "accepted" : "NOT 1: refused");
+@@ -674,6 +676,10 @@
+ 	cfg.cap_mhz = nord2_dvfs_arg >= 500 ? (unsigned)nord2_dvfs_arg : 0;
+ 	cfg.place = cfg.cap_mhz != 0 && !PE_parse_boot_argn("n2sch", &user_sched, sizeof(user_sched));
+ 	cfg.max_step = nord2_dvfs_stage_arg < 0 ? 0u : (nord2_dvfs_stage_arg > 3 ? 3u : (unsigned)nord2_dvfs_stage_arg);
++	{
++		int plt = 0;
++		cfg.skip_plt = !PE_parse_boot_argn("n2dvplt", &plt, sizeof(plt)) || plt == 0;      /* n2dvplt=1 sends the P20 platform init again (the stock kernel does not) */
++	}
+ 	n2cf_csram = (volatile uint32_t *)ml_io_map(N2CF_CSRAM_PA, N2CF_CSRAM_SIZE);
+ 	n2dv_ctl = (volatile uint32_t *)ml_io_map(N2DV_CTL_PA, 0x1000);
+ 	n2dv_mbpage = (volatile uint32_t *)ml_io_map(N2DV_MBOX_PAGE_PA, 0x1000);
+--- a/bsd/dev/nord2_dvfs.h
++++ b/bsd/dev/nord2_dvfs.h
+@@ -36,7 +36,7 @@
+ 	N2D_L_PREFLIGHT,    /* a = cluster, b = measured MHz, c = bootloader row, d = row MHz */
+ 	N2D_L_RAIL,         /* a = cluster, b = Vproc (10 uV), c = Vsram (10 uV), d = 1 ok / 0 refused */
+ 	N2D_L_SHARE,        /* a = pa, b = size, c = 1 ok / 0 refused */
+-	N2D_L_PLT,          /* a = 0 sent, 1 reply, 2 refused; b = reply word / error */
++	N2D_L_PLT,          /* a = 0 sent, 1 reply, 2 refused, 3 skipped (patch 0119); b = reply word / error */
+ 	N2D_L_CSRAM,        /* a = 0 written, 1 verified ok, 2 mismatching words; b = count */
+ 	N2D_L_IPI,          /* a = command, b = cluster/level, c = status (0 ok, < 0 error), d = first reply word */
+ 	N2D_L_INITOK,       /* a = cluster, b = current row reported by the firmware, c = measured MHz, d = row MHz */
+@@ -96,6 +96,8 @@
+ 	unsigned cap_mhz;            /* 0 = hand-over only, no ramp; otherwise the cap of L and B (>= 500) */
+ 	bool place;                  /* manage the 0099 placement */
+ 	unsigned max_step;           /* 0 preflight only, 1 + share buffer, 2 + platform init, >= 3 everything */
++	bool skip_plt;               /* patch 0119: no share buffer, no platform init.  The stock Image never builds 0x504c5401 (no movz/movk/literal anywhere); P20 sent it and the
++	                              * firmware answered 0, an unknown command.  With the flag max_step 1 and 2 stop before the hand-over (nothing sent). */
+ };
+ 
+ struct n2d_state {
+@@ -333,37 +335,47 @@
+ 		o->log(ctx, N2D_L_STAGE, 0, 0, 0, 0);
+ 		return st->result = N2D_E_STAGE;
+ 	}
+-	n2d_trace(o, ctx, N2D_A_SHARE, N2D_SHARE_PA, N2D_SHARE_SIZE);
+-	if (!n2d_share_ok(N2D_SHARE_PA, N2D_SHARE_SIZE) || !o->share_init(ctx, N2D_SHARE_PA, N2D_SHARE_SIZE)) {
+-		o->log(ctx, N2D_L_SHARE, N2D_SHARE_PA, N2D_SHARE_SIZE, 0, 0);
+-		st->stopped = true;
+-		o->log(ctx, N2D_L_RESULT, N2D_E_PRE_SHARE, 0, 0, 0);
+-		return st->result = N2D_E_PRE_SHARE;
+-	}
+-	o->log(ctx, N2D_L_SHARE, N2D_SHARE_PA, N2D_SHARE_SIZE, 1, 0);
+-	if (cfg->max_step == 1) {
+-		st->stopped = true;
+-		o->log(ctx, N2D_L_STAGE, 1, 0, 0, 0);
+-		return st->result = N2D_E_STAGE;
+-	}
++	if (cfg->skip_plt) {
++		o->log(ctx, N2D_L_PLT, 3, 0, 0, 0);                           /* skipped on purpose: the stock kernel sends no platform init */
++		if (cfg->max_step < 3) {
++			st->stopped = true;
++			o->log(ctx, N2D_L_STAGE, cfg->max_step, 0, 0, 0);
++			return st->result = N2D_E_STAGE;
++		}
++	} else {
++		n2d_trace(o, ctx, N2D_A_SHARE, N2D_SHARE_PA, N2D_SHARE_SIZE);
++		if (!n2d_share_ok(N2D_SHARE_PA, N2D_SHARE_SIZE) || !o->share_init(ctx, N2D_SHARE_PA, N2D_SHARE_SIZE)) {
++			o->log(ctx, N2D_L_SHARE, N2D_SHARE_PA, N2D_SHARE_SIZE, 0, 0);
++			st->stopped = true;
++			o->log(ctx, N2D_L_RESULT, N2D_E_PRE_SHARE, 0, 0, 0);
++			return st->result = N2D_E_PRE_SHARE;
++		}
++		o->log(ctx, N2D_L_SHARE, N2D_SHARE_PA, N2D_SHARE_SIZE, 1, 0);
++		if (cfg->max_step == 1) {
++			st->stopped = true;
++			o->log(ctx, N2D_L_STAGE, 1, 0, 0, 0);
++			return st->result = N2D_E_STAGE;
++		}
+ 
+-	/* ---- step 1: platform init (stock mcupm_plt_init): {0x504C5401, phys, size}, reply word must be exactly 1 ---- */
+-	{
+-		uint32_t w[3] = { N2D_PLT_INIT, N2D_SHARE_PA, N2D_SHARE_SIZE }, reply[1] = { 0 };
+-		o->log(ctx, N2D_L_PLT, 0, w[1], w[2], 0);
+-		n2d_trace(o, ctx, N2D_A_PLT, w[1], w[2]);
+-		int rc = o->mbox(ctx, N2D_MBOX_ALIVE, w, 3, reply, 1, N2D_IPI_TIMEOUT_MS);
+-		o->log(ctx, N2D_L_PLT, rc == 0 ? 1u : 2u, rc == 0 ? reply[0] : (unsigned)rc, 0, 0);
+-		if (rc != 0 || reply[0] != 1) {
+-			st->stopped = true;                                    /* nothing configured yet, so nothing to pin */
+-			o->log(ctx, N2D_L_RESULT, N2D_E_PLT, 0, 0, 0);
+-			return st->result = N2D_E_PLT;
++		/* ---- step 1: platform init (stock mcupm_plt_init): {0x504C5401, phys, size}, reply word must be exactly 1 ---- */
++		{
++			uint32_t w[3] = { N2D_PLT_INIT, N2D_SHARE_PA, N2D_SHARE_SIZE }, reply[1] = { 0 };
++			o->log(ctx, N2D_L_PLT, 0, w[1], w[2], 0);
++			n2d_trace(o, ctx, N2D_A_PLT, w[1], w[2]);
++			int rc = o->mbox(ctx, N2D_MBOX_ALIVE, w, 3, reply, 1, N2D_IPI_TIMEOUT_MS);
++			o->log(ctx, N2D_L_PLT, rc == 0 ? 1u : 2u, rc == 0 ? reply[0] : (unsigned)rc, 0, 0);
++			if (rc != 0 || reply[0] != 1) {
++				st->stopped = true;                                    /* nothing configured yet, so nothing to pin */
++				o->log(ctx, N2D_L_RESULT, N2D_E_PLT, 0, 0, 0);
++				return st->result = N2D_E_PLT;
++			}
+ 		}
+-	}
+-	if (cfg->max_step == 2) {
+-		st->stopped = true;
+-		o->log(ctx, N2D_L_STAGE, 2, 0, 0, 0);
+-		return st->result = N2D_E_STAGE;
++		if (cfg->max_step == 2) {
++			st->stopped = true;
++			o->log(ctx, N2D_L_STAGE, 2, 0, 0, 0);
++			return st->result = N2D_E_STAGE;
++		}
++
+ 	}
+ 
+ 	/* ---- step 2: DVFS hand-over, every cluster pinned at the bootloader row ---- */

@@ -1,0 +1,85 @@
+--- a/bsd/dev/nord2_cpufreq.c
++++ b/bsd/dev/nord2_cpufreq.c
+@@ -584,7 +584,8 @@
+ 		}
+ 		break;
+ 	case N2D_L_RAIL:
+-		printf("NORD2 DVFS step 0 rails cluster %s: Vproc %u.%02u mV, Vsram %u.%02u mV: %s\n", cl[a], b / 100, b % 100, c / 100, c % 100, d ? "ok" : "REFUSED (unreadable or outside the platform limits)");
++		printf("NORD2 DVFS step 0 rails cluster %s: Vproc %u.%02u mV, Vsram %u.%02u mV: %s\n", cl[a], b / 100, b % 100, c / 100, c % 100,
++		    d ? "ok" : "REFUSED (unreadable, below 500 mV or above 1120 mV, Vsram below Vproc, or Vsram more than 250 mV above Vproc)");
+ 		break;
+ 	case N2D_L_SHARE:
+ 		printf("NORD2 DVFS step 0 share buffer %#x +%#x: %s\n", a, b, c ? "mapped, zeroed, stock header written and read back" : "REFUSED");
+--- a/bsd/dev/nord2_dvfs.h
++++ b/bsd/dev/nord2_dvfs.h
+@@ -278,16 +278,17 @@
+ 		st->boot_mhz[c] = m;
+ 		st->orig[c] = st->cur[c] = st->target[c] = (uint8_t)row;
+ 	}
+-	for (unsigned c = 0; c < N2DV_NR_CLUSTERS; c++) {
++	bool rails_good = true;
++	for (unsigned c = 0; c < N2DV_NR_CLUSTERS; c++) {          /* all four are read and printed before the verdict: a refusal shows every rail */
+ 		uint32_t vp = 0, vs = 0;
+-		bool ok = o->rail(ctx, c, &vp, &vs) && vp >= N2DV_MIN_VPROC && vp <= N2DV_MAX_VPROC && vs >= N2DV_MIN_VSRAM && vs <= N2DV_MAX_VSRAM &&
+-		    vs >= vp && vs - vp <= 25000u;                          /* the stock probe's own sanity check: Vsram >= Vproc, difference <= 250 mV */
++		bool ok = o->rail(ctx, c, &vp, &vs) && n2dv_rails_ok(vp, vs);     /* the stock probe's own check (Vsram >= Vproc, difference <= 250 mV) plus garbage floors */
+ 		o->log(ctx, N2D_L_RAIL, c, vp, vs, ok);
+-		if (!ok) {
+-			st->stopped = true;
+-			o->log(ctx, N2D_L_RESULT, N2D_E_PRE_RAIL, 0, 0, 0);
+-			return st->result = N2D_E_PRE_RAIL;
+-		}
++		rails_good = rails_good && ok;
++	}
++	if (!rails_good) {
++		st->stopped = true;
++		o->log(ctx, N2D_L_RESULT, N2D_E_PRE_RAIL, 0, 0, 0);
++		return st->result = N2D_E_PRE_RAIL;
+ 	}
+ 	if (!n2d_share_ok(N2D_SHARE_PA, N2D_SHARE_SIZE) || !o->share_init(ctx, N2D_SHARE_PA, N2D_SHARE_SIZE)) {
+ 		o->log(ctx, N2D_L_SHARE, N2D_SHARE_PA, N2D_SHARE_SIZE, 0, 0);
+--- a/bsd/dev/nord2_cpuhvfs_init.h
++++ b/bsd/dev/nord2_cpuhvfs_init.h
+@@ -50,11 +50,16 @@
+ #define N2DV_CMD_CLUSTER_ONOFF 2u            /* unused: ENABLE_CLUSTER_ONOFF_SRAM stores the magic instead */
+ #define N2DV_CMD_SET_FREQ      4u            /* debug path only */
+ #define N2DV_CMD_INIT_VOLT     10u
+-/* platform limits for the init voltages, 10 uV units (mtk_cpufreq_platform.h) */
+-#define N2DV_MIN_VPROC         60000u
++/* Limits for the init voltages, 10 uV units.  The stock probe (mtk_cpufreq_main.c, _mt_cpufreq_pdrv_probe) checks ONLY Vsram >= Vproc and Vsram - Vproc <=
++ * MAX_DIFF_VSRAM_VPROC (25000 = 250 mV) on the rails it reads.  The platform MIN_VPROC_VOLT 60000 / MIN_VSRAM_VOLT 85000 are floors for voltages the AP itself SETS
++ * (non-hybrid path); they do not apply to what the bootloader left: device reading P18 (c6t): L at its 700 MHz row had Vproc 650.00 mV and Vsram 750.00 mV, the
++ * hardware-tracked Vsram = Vproc + NORMAL_DIFF_VRSAM_VPROC (100 mV) below the 850 mV floor.  Here the floors only reject a garbage read: the PMIC ranges start at
++ * 500 mV (Vsram LDO) and the lowest table row is 650 mV. */
++#define N2DV_MIN_VPROC         50000u
+ #define N2DV_MAX_VPROC         112000u
+-#define N2DV_MIN_VSRAM         85000u
++#define N2DV_MIN_VSRAM         50000u
+ #define N2DV_MAX_VSRAM         112000u
++#define N2DV_MAX_VSRAM_DIFF    25000u
+ #define N2DV_ONLY_LEVEL        1u            /* the only level whose tables are embedded (FY_30G26G / CCI_30G26G): this phone */
+ 
+ struct n2dv_ops {
+@@ -222,12 +227,20 @@
+ 	m[2] = m[3] = 0;
+ }
+ 
++/* The stock probe's own rail check plus sanity bounds: Vsram >= Vproc, Vsram - Vproc <= 250 mV, both inside [500 mV, 1120 mV]. */
++static inline bool
++n2dv_rails_ok(uint32_t vproc_10uv, uint32_t vsram_10uv)
++{
++	return vproc_10uv >= N2DV_MIN_VPROC && vproc_10uv <= N2DV_MAX_VPROC && vsram_10uv >= N2DV_MIN_VSRAM && vsram_10uv <= N2DV_MAX_VSRAM && vsram_10uv >= vproc_10uv &&
++	       vsram_10uv - vproc_10uv <= N2DV_MAX_VSRAM_DIFF;
++}
++
+ /* cmd 10: {10, cluster, Vproc, Vsram}, the rail voltages in 10 uV units (µV / 10) as the stock driver reads them from the regulators.  false (message not built)
+- * for a cluster that does not exist or a voltage outside the platform limits. */
++ * for a cluster that does not exist or rails that fail n2dv_rails_ok. */
+ static inline bool
+ n2dv_msg_init_volt(uint32_t m[N2DV_IPI_WORDS], unsigned cluster, uint32_t vproc_10uv, uint32_t vsram_10uv)
+ {
+-	if (cluster >= N2DV_NR_CLUSTERS || vproc_10uv < N2DV_MIN_VPROC || vproc_10uv > N2DV_MAX_VPROC || vsram_10uv < N2DV_MIN_VSRAM || vsram_10uv > N2DV_MAX_VSRAM) {
++	if (cluster >= N2DV_NR_CLUSTERS || !n2dv_rails_ok(vproc_10uv, vsram_10uv)) {
+ 		return false;
+ 	}
+ 	m[0] = N2DV_CMD_INIT_VOLT;

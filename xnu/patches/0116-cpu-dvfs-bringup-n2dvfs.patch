@@ -1,0 +1,1159 @@
+--- a/bsd/dev/nord2_cpufreq.c
++++ b/bsd/dev/nord2_cpufreq.c
+@@ -26,16 +26,19 @@
+ 
+ #include "nord2_cpufreq.h"
+ #include "nord2_mcupm_scan.h"
++#include "nord2_dvfs.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+ TUNABLE(int, nord2_cpufreq_arg, "n2cpu", 0);
+ TUNABLE(int, nord2_mcu_arg, "n2mcu", 0);
+ TUNABLE(int, nord2_mcuping_arg, "n2mcuping", 0);
++TUNABLE(int, nord2_dvfs_arg, "n2dvfs", 0);
+ 
+ extern unsigned nord2_cpu_mhz(int cpu);                                                /* nord2_sched.c (0099) */
+ extern int nord2_sched_mode;                                                            /* nord2_sched.c (0099): placement mode bits */
+ extern bool nord2_battery_temperature_cC(int *centi);                                  /* Nord2GPU.cpp */
++extern int nord2_pmic_read(unsigned bus, unsigned sid, unsigned reg, unsigned *val);  /* Nord2GPU.cpp (0116): read-only PMIC access on the owner thread */
+ 
+ #define N2CF_FIRST_S    60u     /* let the boot settle and the 0099 thread print its baseline first */
+ #define N2CF_TICK_S     2u
+@@ -471,6 +474,203 @@
+ 	printf("NORD2 MCUPM probe2 end\n");
+ }
+ 
++/*
++ * n2dvfs=<n> (patch 0116): the CPU DVFS bring-up of nord2_dvfs.h on the device.  n2dvfs=1: platform init and the DVFS hand-over with every cluster pinned at
++ * the bootloader row, no frequency change.  n2dvfs=<MHz >= 500>: the same, then the measured ramp of the A78 clusters (L, B) up to <MHz> with the battery guard,
++ * and the 0099 placement once the big cores measure faster than the A55s (unless n2sch= was given).  Every step logs a `NORD2 DVFS` line; any unexpected reply or
++ * measurement runs the fallback (limits and requests back to the bootloader rows) and stops.  Ignores n2cpu, n2mcu and n2mcuping.
++ */
++#define N2DV_CTL_PA        0x10300000ull
++#define N2DV_MBOX_PAGE_PA  0x1031f000ull
++#define N2DV_MBOX_BASE     0xce0u          /* offset of mailbox 0 in the mailbox page; mailbox n at + 0xa0 * n */
++
++static volatile uint32_t *n2dv_ctl, *n2dv_mbpage, *n2dv_share;
++
++static int
++n2dv_mbox(__unused void *ctx, unsigned ch, const uint32_t *w, unsigned n, uint32_t *reply, unsigned nreply, unsigned timeout_ms)
++{
++	if (ch > 1 || n == 0 || n > 9 || nreply > 4 || n2dv_ctl == NULL || n2dv_mbpage == NULL) {
++		return -1;
++	}
++	volatile uint32_t *box = n2dv_mbpage + (N2DV_MBOX_BASE + 0xa0u * ch) / 4;
++	uint32_t bit = 1u << ch;
++	if ((n2dv_ctl[N2MS_PING_SEND_OFF / 4] & bit) != 0 || (n2dv_ctl[N2MS_PING_RECV_OFF / 4] & bit) != 0) {
++		return -3;                                                          /* a previous doorbell is still pending, or an unread reply: do not stack */
++	}
++	for (unsigned i = 0; i < n; i++) {
++		box[i] = w[i];
++	}
++	__asm__ volatile ("dsb st" ::: "memory");
++	n2dv_ctl[N2MS_PING_SET_OFF / 4] = bit;
++	__asm__ volatile ("dsb st" ::: "memory");
++	unsigned waited_us = 0;
++	for (;;) {
++		if ((n2dv_ctl[N2MS_PING_RECV_OFF / 4] & bit) != 0) {
++			for (unsigned k = 0; k < nreply; k++) {
++				reply[k] = box[N2MS_PING_REPLY_OFF / 4 + k];
++			}
++			n2dv_ctl[N2MS_PING_CLR_OFF / 4] = bit;                          /* clear the incoming bit, as mtk_mbox_polling does */
++			__asm__ volatile ("dsb st" ::: "memory");
++			return 0;
++		}
++		if (waited_us >= timeout_ms * 1000u) {
++			return -2;                                                      /* the doorbell stays pending: no retry, no clearing */
++		}
++		if (waited_us < 20000u) {
++			delay(50);
++			waited_us += 50;
++		} else {
++			n2cf_sleep_ms(NULL, 1);
++			waited_us += 1000;
++		}
++	}
++}
++
++/* Stock mcupm_plt_init: zero the header, the mark at both ends of the region, then magic, size of the header (3 words) and the region size. */
++static bool
++n2dv_share_init(__unused void *ctx, uint32_t pa, uint32_t size)
++{
++	if (n2dv_share == NULL) {
++		n2dv_share = (volatile uint32_t *)ml_io_map(pa, size);
++	}
++	if (n2dv_share == NULL) {
++		return false;
++	}
++	for (uint32_t i = 0; i < size / 4; i++) {
++		n2dv_share[i] = 0;
++	}
++	n2dv_share[0] = N2D_PLT_INIT;
++	n2dv_share[size / 4 - 1] = N2D_PLT_INIT;
++	n2dv_share[0] = N2D_PLT_INIT;                                       /* plt_ctl->magic */
++	n2dv_share[1] = 12;                                                 /* sizeof(struct plt_ctrl_s) */
++	n2dv_share[2] = size;                                               /* mem_sz */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	bool ok = n2dv_share[0] == N2D_PLT_INIT && n2dv_share[1] == 12 && n2dv_share[2] == size && n2dv_share[size / 4 - 1] == N2D_PLT_INIT;
++	for (uint32_t i = 3; ok && i < 4096; i++) {
++		ok = n2dv_share[i] == 0;
++	}
++	return ok;
++}
++
++static bool
++n2dv_rail(__unused void *ctx, unsigned cluster, uint32_t *vproc, uint32_t *vsram)
++{
++	struct n2dv_rail_regs r = n2dv_cluster_rails(cluster);
++	unsigned a = 0, b = 0;
++	if (nord2_pmic_read(0, r.vproc_sid, r.vproc_reg, &a) != 0 || nord2_pmic_read(1, 0, r.vsram_reg, &b) != 0) {
++		return false;
++	}
++	*vproc = n2dv_vproc_10uv(a & 0xffu);
++	*vsram = n2dv_vsram_10uv((b >> 8) & 0x7fu);
++	return *vproc != 0 && *vsram != 0;
++}
++
++static void
++n2dv_set_place(__unused void *ctx, int mode)
++{
++	nord2_sched_mode = mode;
++}
++
++static void
++n2dv_log(__unused void *ctx, int code, unsigned a, unsigned b, unsigned c, unsigned d)
++{
++	static const char *const cl[] = { "LL", "L", "B", "CCI" };
++	switch (code) {
++	case N2D_L_PREFLIGHT:
++		if (c == 99) {
++			printf("NORD2 DVFS step 0 preflight: cluster %s measures %u MHz: NOT the bootloader state of the earlier boots, nothing will be sent\n", cl[a], b);
++		} else {
++			printf("NORD2 DVFS step 0 preflight: cluster %s measures %u MHz -> bootloader row %u (%u MHz)\n", cl[a], b, c, d);
++		}
++		break;
++	case N2D_L_RAIL:
++		printf("NORD2 DVFS step 0 rails cluster %s: Vproc %u.%02u mV, Vsram %u.%02u mV: %s\n", cl[a], b / 100, b % 100, c / 100, c % 100, d ? "ok" : "REFUSED (unreadable or outside the platform limits)");
++		break;
++	case N2D_L_SHARE:
++		printf("NORD2 DVFS step 0 share buffer %#x +%#x: %s\n", a, b, c ? "mapped, zeroed, stock header written and read back" : "REFUSED");
++		break;
++	case N2D_L_PLT:
++		if (a == 0) {
++			printf("NORD2 DVFS step 1 platform init: sending {%#x, %#x, %#x} to mailbox 0\n", N2D_PLT_INIT, b, c);
++		} else if (a == 1) {
++			printf("NORD2 DVFS step 1 platform init: reply %#x (%s)\n", b, b == 1 ? "accepted" : "NOT 1: refused");
++		} else {
++			printf("NORD2 DVFS step 1 platform init: no reply (%d)\n", (int)b);
++		}
++		break;
++	case N2D_L_CSRAM:
++		if (a == 0) {
++			printf("NORD2 DVFS step 2 CSRAM: pinned init plan stored (table, CCI map, limits, requests)\n");
++		} else {
++			printf("NORD2 DVFS step 2 CSRAM readback: %s (%u mismatching words)\n", a == 1 ? "verified" : "MISMATCH", b);
++		}
++		break;
++	case N2D_L_IPI:
++		printf("NORD2 DVFS step 2 DVFS command %u arg %u: %s (status %d, first reply word %#x)\n", a, b, (int)c == 0 ? "reply seen" : "FAILED", (int)c, d);
++		break;
++	case N2D_L_INITOK:
++		printf("NORD2 DVFS step 2 cluster %s: firmware reports row %u, CPU measures %u MHz (pinned row %u MHz)\n", cl[a], b, c, d);
++		break;
++	case N2D_L_RAMP:
++		if (d) {
++			printf("NORD2 DVFS step 3 cluster %s row %u (%u MHz): CPU measures %u MHz\n", cl[a], b, c, d);
++		} else {
++			printf("NORD2 DVFS step 3 cluster %s row %u (%u MHz): NOT reached\n", cl[a], b, c);
++		}
++		break;
++	case N2D_L_RAMPDONE:
++		printf("NORD2 DVFS step 3 cluster %s done: row %u -> %u, CPU measures %u MHz\n", cl[a], b, c, d);
++		break;
++	case N2D_L_THERMAL: {
++		static const char *const why[] = { "?", "no ramp: battery at or above 40.0 C", "no ramp: battery gauge unreadable", "ramp stopped: battery at or above 40.0 C", "battery at or above 43.0 C: one row slower",
++			                           "battery below 38.0 C: one row faster" };
++		printf("NORD2 DVFS thermal: %s (battery %d.%02d C, cluster %s, row %u)\n", a < 6 ? why[a] : "?", (int)b / 100, (int)b % 100, c < 4 ? cl[c] : "-", d);
++		break;
++	}
++	case N2D_L_PLACE:
++		printf("NORD2 DVFS step 4 placement mode %#x (big cores measure %u MHz, A55s %u MHz)\n", a, b, c);
++		break;
++	case N2D_L_FALLBACK:
++		printf("NORD2 DVFS FALLBACK (%u): limits and requests of LL/L/B pinned back to the bootloader rows %u/%u/%u, nothing more is sent\n", a, b, c, d);
++		break;
++	case N2D_L_RESULT: {
++		static const char *const res[] = { "?", "hand-over done, clusters pinned at the bootloader rows", "ramp reached the cap rows", "STOPPED in preflight: clocks (nothing sent)",
++			                           "STOPPED in preflight: rails (nothing sent)", "STOPPED in preflight: share buffer (nothing sent)", "STOPPED: platform init refused",
++			                           "STOPPED: CSRAM readback mismatch", "STOPPED: DVFS command failed", "STOPPED: a clock disagreed", "STOPPED: a ramp row was not reached", "STOPPED: bad arguments" };
++		printf("NORD2 DVFS result %u: %s\n", a, a < sizeof(res) / sizeof(res[0]) ? res[a] : "?");
++		break;
++	}
++	}
++}
++
++static const struct n2d_ops n2dv_ops = { n2cf_wr, n2cf_rd, n2dv_mbox, n2dv_share_init, n2dv_rail, n2cf_mhz, n2cf_gauge, n2cf_sleep_ms, n2dv_set_place, n2dv_log };
++
++static void
++n2dvfs_main(void)
++{
++	struct n2d_cfg cfg;
++	struct n2d_state st;
++	int user_sched = 0;
++	cfg.cap_mhz = nord2_dvfs_arg >= 500 ? (unsigned)nord2_dvfs_arg : 0;
++	cfg.place = cfg.cap_mhz != 0 && !PE_parse_boot_argn("n2sch", &user_sched, sizeof(user_sched));
++	n2cf_csram = (volatile uint32_t *)ml_io_map(N2CF_CSRAM_PA, N2CF_CSRAM_SIZE);
++	n2dv_ctl = (volatile uint32_t *)ml_io_map(N2DV_CTL_PA, 0x1000);
++	n2dv_mbpage = (volatile uint32_t *)ml_io_map(N2DV_MBOX_PAGE_PA, 0x1000);
++	if (n2cf_csram == NULL || n2dv_ctl == NULL || n2dv_mbpage == NULL) {
++		printf("NORD2 DVFS: mapping failed, nothing done\n");
++		return;
++	}
++	printf("NORD2 DVFS begin: n2dvfs=%d (%s), placement %s\n", nord2_dvfs_arg, cfg.cap_mhz ? "hand-over then ramp of L and B to the cap" : "hand-over only, no frequency change",
++	    cfg.place ? "managed" : "not managed");
++	enum n2d_result r = n2d_bringup(&n2dv_ops, NULL, &cfg, &st);
++	printf("NORD2 DVFS bring-up finished with result %u\n", (unsigned)r);
++	while (!st.stopped && st.inited && cfg.cap_mhz != 0) {
++		n2cf_sleep_ms(NULL, 1000u * N2CF_TICK_S);
++		n2d_tick(&n2dv_ops, NULL, &cfg, &st);
++	}
++	printf("NORD2 DVFS thread ends (stopped %u)\n", (unsigned)st.stopped);
++}
++
+ __attribute__((noreturn)) static void
+ nord2_cpufreq_exit(void)
+ {
+@@ -492,6 +692,10 @@
+ 	assert_wait_timeout((event_t)&nord2_cpufreq_thread, THREAD_UNINT, N2CF_FIRST_S, NSEC_PER_SEC);
+ 	thread_block(THREAD_CONTINUE_NULL);
+ 
++	if (nord2_dvfs_arg > 0) {
++		n2dvfs_main();
++		nord2_cpufreq_exit();
++	}
+ 	if (nord2_mcu_arg == 1) {
+ 		n2mcu_probe();
+ 	} else if (nord2_mcu_arg >= 2) {
+@@ -539,9 +743,12 @@
+ static void
+ nord2_cpufreq_init(void)
+ {
+-	if (nord2_cpufreq_arg <= 0 && nord2_mcu_arg <= 0) {
++	if (nord2_cpufreq_arg <= 0 && nord2_mcu_arg <= 0 && nord2_dvfs_arg <= 0) {
+ 		return;
+ 	}
++	if (nord2_dvfs_arg > 0) {
++		printf("NORD2 DVFS: n2dvfs=%d, bring-up at boot+%us (n2cpu, n2mcu and n2mcuping are ignored)\n", nord2_dvfs_arg, N2CF_FIRST_S);
++	}
+ 	if (nord2_mcuping_arg == 1 && nord2_mcu_arg == 2) {
+ 		printf("NORD2 MCUPM: n2mcuping=1: ONE write test at boot+60s (alive check to mailbox 0, doorbell bit 0)\n");
+ 	}
+--- a/bsd/dev/nord2_dvfs.h
++++ b/bsd/dev/nord2_dvfs.h
+@@ -0,0 +1,473 @@
++#ifndef NORD2_DVFS_H
++#define NORD2_DVFS_H
++/*
++ * MT6893 CPU DVFS bring-up engine (patch 0116): platform init of the MCUPM firmware, the DVFS hand-over with every cluster pinned at the row the bootloader
++ * left, an optional measured row-by-row ramp of the A78 clusters, the battery guard and the 0099 placement switch.  Pure and host-testable: every register,
++ * mailbox, rail, clock and gauge access goes through struct n2d_ops.  Derivation of every number and message: README-0107-design.md sections 11, 12 and
++ * nord2_cpuhvfs_init.h.  Rules (all tested):
++ *   - PREFLIGHT sends and writes nothing: the clocks must match the state every earlier boot showed, all four rails must be readable and inside the platform
++ *     clamps, the share buffer must be a free region.  Any failure stops with nothing touched.
++ *   - Every step is verified (reply word, CSRAM readback, measured clocks).  Once any init message has gone out, ANY unexpected reply, timeout or
++ *     measurement runs the fallback: limits and requests of LL/L/B back to the bootloader rows, then stop; nothing is sent again.
++ *   - The ramp moves one row at a time, L and B alternately, never above the cap, never while the gauge is unreadable or at or above 40.0 C, and each row
++ *     must be reached (measured within 8 %) before the next one.
++ */
++#include <stdbool.h>
++#include <stdint.h>
++#include "nord2_cpuhvfs_init.h"
++
++#define N2D_SHARE_PA       0x70000000u       /* mcupm_share: free first-bank DRAM (no mblock of the live FDT, outside the loader/payload/Wi-Fi claims) */
++#define N2D_SHARE_SIZE     0x00200000u
++#define N2D_PLT_INIT       0x504c5401u
++#define N2D_MBOX_ALIVE     0u                /* channel 0: platform */
++#define N2D_MBOX_DVFS      1u                /* channel 1: CPU DVFS */
++#define N2D_IPI_TIMEOUT_MS 2000u
++#define N2D_START_MAX_CC   4000              /* no ramp step at or above 40.0 C */
++#define N2D_THROTTLE_CC    4300              /* one row slower per tick at or above 43.0 C */
++#define N2D_RECOVER_CC     3800              /* one row faster per tick again below 38.0 C */
++#define N2D_CLOCK_PCT      8u
++#define N2D_SETTLE_MS      50u
++#define N2D_SETTLE_TRIES   6u
++
++enum n2d_log {
++	N2D_L_PREFLIGHT,    /* a = cluster, b = measured MHz, c = bootloader row, d = row MHz */
++	N2D_L_RAIL,         /* a = cluster, b = Vproc (10 uV), c = Vsram (10 uV), d = 1 ok / 0 refused */
++	N2D_L_SHARE,        /* a = pa, b = size, c = 1 ok / 0 refused */
++	N2D_L_PLT,          /* a = 0 sent, 1 reply, 2 refused; b = reply word / error */
++	N2D_L_CSRAM,        /* a = 0 written, 1 verified ok, 2 mismatching words; b = count */
++	N2D_L_IPI,          /* a = command, b = cluster/level, c = status (0 ok, < 0 error), d = first reply word */
++	N2D_L_INITOK,       /* a = cluster, b = current row reported by the firmware, c = measured MHz, d = row MHz */
++	N2D_L_RAMP,         /* a = cluster, b = row, c = row MHz, d = measured MHz (0 = row not reached) */
++	N2D_L_RAMPDONE,     /* a = cluster, b = bootloader row, c = final row, d = final MHz */
++	N2D_L_THERMAL,      /* a = reason (1 hot at start, 2 gauge unreadable, 3 stopped hot, 4 step slower, 5 step faster), b = cC, c = cluster, d = row */
++	N2D_L_PLACE,        /* a = mode written, b = big MHz, c = little MHz */
++	N2D_L_FALLBACK,     /* a = reason (enum n2d_result), b/c/d = bootloader rows of LL/L/B */
++	N2D_L_RESULT,       /* a = enum n2d_result */
++};
++
++enum n2d_result {
++	N2D_OK_INIT = 1,         /* platform + DVFS hand-over done, clusters pinned at the bootloader rows */
++	N2D_OK_RAMPED,           /* the ramp reached the cap rows */
++	N2D_E_PRE_CLOCK,         /* preflight: a clock is not what every earlier boot showed (nothing sent) */
++	N2D_E_PRE_RAIL,          /* preflight: a rail unreadable or out of the clamps (nothing sent) */
++	N2D_E_PRE_SHARE,         /* preflight: the share region was refused (nothing sent) */
++	N2D_E_PLT,               /* platform init failed (one message sent, no fallback needed: nothing was configured) */
++	N2D_E_CSRAM,             /* CSRAM readback mismatch before any DVFS message (nothing sent to the DVFS channel) */
++	N2D_E_IPI,               /* a DVFS message failed: fallback run */
++	N2D_E_CLOCK,             /* a clock disagreed after the hand-over or during the ramp: fallback run */
++	N2D_E_RAMP,              /* a ramp row was not reached: fallback run */
++	N2D_E_ARGS,
++};
++
++struct n2d_ops {
++	void (*w32)(void *ctx, uint32_t off, uint32_t v);                      /* CSRAM store + barrier */
++	uint32_t (*r32)(void *ctx, uint32_t off);
++	/* one mailbox exchange on channel `ch`: store the n words, ring the doorbell, wait up to timeout_ms for the reply bit, read nreply words, clear the bit.
++	 * 0 = reply seen, < 0 = busy/timeout/bad arguments (the doorbell may be pending). */
++	int (*mbox)(void *ctx, unsigned ch, const uint32_t *w, unsigned n, uint32_t *reply, unsigned nreply, unsigned timeout_ms);
++	bool (*share_init)(void *ctx, uint32_t pa, uint32_t size);              /* map, zero, write the stock header, verify the readback */
++	bool (*rail)(void *ctx, unsigned cluster, uint32_t *vproc_10uv, uint32_t *vsram_10uv);
++	unsigned (*mhz)(void *ctx, int cpu);                                     /* measured clock, 0 = cannot measure */
++	bool (*gauge)(void *ctx, int *centi_c);
++	void (*sleep_ms)(void *ctx, unsigned ms);
++	void (*set_place)(void *ctx, int mode);                                  /* write nord2_sched_mode */
++	void (*log)(void *ctx, int code, unsigned a, unsigned b, unsigned c, unsigned d);
++};
++
++struct n2d_cfg {
++	unsigned cap_mhz;            /* 0 = hand-over only, no ramp; otherwise the cap of L and B (>= 500) */
++	bool place;                  /* manage the 0099 placement */
++};
++
++struct n2d_state {
++	uint8_t orig[3];             /* bootloader rows LL, L, B */
++	uint8_t cur[3];              /* last row written and confirmed */
++	uint8_t target[3];           /* ramp targets (= orig when not ramping) */
++	unsigned boot_mhz[3];
++	bool sent;                   /* a DVFS-channel message went out: fallback applies */
++	bool inited;
++	bool stopped;
++	bool fallback_done;
++	int place_mode;
++	enum n2d_result result;
++};
++
++static const int n2d_first_cpu[3] = { 0, 4, 7 };
++
++static inline unsigned
++n2d_row_mhz(unsigned cluster, unsigned row)
++{
++	return n2dv_l1_pvt[N2DV_NR_FREQ * cluster + row][0];
++}
++
++static inline bool
++n2d_within_pct(unsigned measured, unsigned wanted, unsigned pct)
++{
++	if (measured == 0 || wanted == 0) {
++		return false;
++	}
++	unsigned d = measured > wanted ? measured - wanted : wanted - measured;
++	return (uint64_t)d * 100u <= (uint64_t)wanted * pct;
++}
++
++/* After the hand-over the clock must either be unchanged or at the pinned row (B is pinned 10 % below what the bootloader runs). */
++static inline bool
++n2d_clock_ok(unsigned measured, unsigned boot_mhz, unsigned row_mhz)
++{
++	return n2d_within_pct(measured, boot_mhz, N2D_CLOCK_PCT) || n2d_within_pct(measured, row_mhz, N2D_CLOCK_PCT);
++}
++
++/* The bootloader state of every earlier boot: LL ~1791, L and B ~730 MHz.  Anything else means this boot is not what the pinned rows were derived from. */
++static inline bool
++n2d_boot_window_ok(unsigned cluster, unsigned mhz)
++{
++	static const unsigned lo[3] = { 1700, 650, 650 }, hi[3] = { 1900, 800, 800 };
++	return cluster < 3 && mhz >= lo[cluster] && mhz <= hi[cluster];
++}
++
++/* First row (fastest) of a cluster whose frequency does not exceed cap_mhz; -1 if none. */
++static inline int
++n2d_row_for_cap(unsigned cluster, unsigned cap_mhz)
++{
++	for (unsigned i = 0; i < N2DV_NR_FREQ; i++) {
++		if (n2d_row_mhz(cluster, i) <= cap_mhz) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++/* The share region must be 64 KiB aligned, 2 MiB, below 4 GiB and clear of every reservation the live FDT and the loader know (README 12.7). */
++static inline bool
++n2d_share_ok(uint64_t pa, uint64_t size)
++{
++	static const struct { uint64_t base, size; } busy[] = {
++		{ 0x40000000, 0x14000000 },                                          /* loader, stock kernel + ramdisk, SWEETXNU payload window */
++		{ 0x48080000, 0x00180000 },                                          /* aee_debug_kinfo, pstore, minirdump */
++		{ 0x48c00000, 0x00200000 },                                          /* atf-reserved */
++		{ 0x5ff00000, 0x00080000 },                                          /* PICACHU */
++		{ 0x74000000, 0x00e30000 },                                          /* adsp */
++		{ 0x75e00000, 0x00010000 },                                          /* SPM */
++		{ 0x76e10000, 0x01df0000 },                                          /* framebuffer */
++		{ 0x78c00000, 0x05800000 },                                          /* tee-reserved */
++		{ 0x7e400000, 0x00400000 },                                          /* tee-secmem */
++		{ 0x7e800000, 0x00041000 },                                          /* gz-log */
++		{ 0x7e900000, 0x00100000 },                                          /* MCUPM-reserved */
++		{ 0x7ea00000, 0x01400000 },                                          /* gz */
++		{ 0x7feb0000, 0x00100000 },                                          /* SSPM-reserved */
++		{ 0x7ffbf000, 0x00040000 },                                          /* log_store */
++		{ 0x7ffff000, 0x00001000 },                                          /* emi_mbist_buf */
++		{ 0x8a000000, 0x03560000 },                                          /* ccci */
++		{ 0x8e000000, 0x01800000 },                                          /* ap_md_nc_smem */
++		{ 0x8fb00000, 0x01500000 },                                          /* Wi-Fi CONN claim and DMA pool (0x8fb00000 + 0x450000, 0x90000000 + 0xf20000) */
++		{ 0x9fa00000, 0x00500000 },                                          /* SCP-reserved */
++		{ 0xbd6c0000, 0x02740000 },                                          /* vpu_binary */
++		{ 0xbfe00000, 0x00200000 },                                          /* atf-log, atf-ramdump, ccci_tag_mem, up to 4 GiB bank end */
++		{ 0xdfe70000, 0x00190000 },                                          /* DPM */
++		{ 0xe0000000, 0x20000000 },                                          /* md_mem_usage */
++	};
++	if (size != N2D_SHARE_SIZE || (pa & 0xffffu) != 0 || pa + size > 0x100000000ull) {
++		return false;
++	}
++	for (unsigned i = 0; i < sizeof(busy) / sizeof(busy[0]); i++) {
++		if (pa < busy[i].base + busy[i].size && busy[i].base < pa + size) {
++			return false;
++		}
++	}
++	return true;
++}
++
++/* Placement: the A78 clusters are about twice as fast per clock as the A55s, so "measured faster than the A55s" is enough; 5 % hysteresis. */
++static inline int
++n2d_place_decide(unsigned big_mhz, unsigned little_mhz, int cur_mode)
++{
++	if (big_mhz == 0 || little_mhz == 0) {
++		return cur_mode;
++	}
++	if (cur_mode == 0 && (uint64_t)big_mhz * 100u >= (uint64_t)little_mhz * 105u) {
++		return 0xf;
++	}
++	if (cur_mode != 0 && (uint64_t)big_mhz * 100u < (uint64_t)little_mhz * 95u) {
++		return 0;
++	}
++	return cur_mode;
++}
++
++static inline void
++n2d_fallback(const struct n2d_ops *o, void *ctx, struct n2d_state *st, enum n2d_result why)
++{
++	if (st->stopped) {
++		return;
++	}
++	if (st->sent) {                                    /* nothing was configured before the first DVFS message: nothing to pin */
++		n2dv_fallback_pin(&(const struct n2dv_ops){ o->w32 }, ctx, st->orig);
++		o->w32(ctx, N2DV_OFF_REQ + 4 * N2DV_CCI, n2dv_cci_row(st->orig[N2DV_LL], st->orig[N2DV_B]));
++		for (unsigned c = 0; c < 3; c++) {
++			st->cur[c] = st->orig[c];
++		}
++		st->fallback_done = true;
++	}
++	st->stopped = true;
++	st->result = why;
++	o->log(ctx, N2D_L_FALLBACK, (unsigned)why, st->orig[0], st->orig[1], st->orig[2]);
++	o->log(ctx, N2D_L_RESULT, (unsigned)why, 0, 0, 0);
++}
++
++static inline bool
++n2d_ipi(const struct n2d_ops *o, void *ctx, const uint32_t m[N2DV_IPI_WORDS], unsigned arg)
++{
++	uint32_t reply[4] = { 0, 0, 0, 0 };
++	int rc = o->mbox(ctx, N2D_MBOX_DVFS, m, N2DV_IPI_WORDS, reply, 4, N2D_IPI_TIMEOUT_MS);
++	o->log(ctx, N2D_L_IPI, m[0], arg, (unsigned)rc, reply[0]);
++	return rc == 0;
++}
++
++/* Write limits then request for one cluster and wait until the CPU measures the row.  false when it does not. */
++static inline bool
++n2d_goto_row(const struct n2d_ops *o, void *ctx, struct n2d_state *st, unsigned c, unsigned row)
++{
++	/* The CCI request follows the vendor CCI map [LL row][B row] (assumption: README 12.7); faster uncore first, slower uncore last. */
++	uint8_t next[3] = { st->cur[0], st->cur[1], st->cur[2] };
++	next[c] = (uint8_t)row;
++	uint32_t cci = n2dv_cci_row(next[N2DV_LL], next[N2DV_B]);
++	if (row < st->cur[c]) {
++		o->w32(ctx, N2DV_OFF_REQ + 4 * N2DV_CCI, cci);
++	}
++	o->w32(ctx, N2DV_OFF_PPM_LIMIT + 4 * c, (uint32_t)row << 16 | row);
++	o->w32(ctx, N2DV_OFF_REQ + 4 * c, row);
++	if (row >= st->cur[c]) {
++		o->w32(ctx, N2DV_OFF_REQ + 4 * N2DV_CCI, cci);
++	}
++	unsigned want = n2d_row_mhz(c, row), m = 0;
++	for (unsigned t = 0; t < N2D_SETTLE_TRIES; t++) {
++		o->sleep_ms(ctx, N2D_SETTLE_MS);
++		m = o->mhz(ctx, n2d_first_cpu[c]);
++		if (n2d_within_pct(m, want, N2D_CLOCK_PCT)) {
++			st->cur[c] = (uint8_t)row;
++			o->log(ctx, N2D_L_RAMP, c, row, want, m);
++			return true;
++		}
++	}
++	o->log(ctx, N2D_L_RAMP, c, row, want, 0);
++	return false;
++}
++
++/* Steps 1 and 2 (and 3 when cfg->cap_mhz != 0).  Returns the final result; the state holds the rows. */
++static inline enum n2d_result
++n2d_bringup(const struct n2d_ops *o, void *ctx, const struct n2d_cfg *cfg, struct n2d_state *st)
++{
++	st->orig[0] = st->orig[1] = st->orig[2] = 0;
++	st->sent = st->inited = st->stopped = st->fallback_done = false;
++	st->place_mode = 0;
++	if (cfg->cap_mhz != 0 && cfg->cap_mhz < 500) {
++		st->stopped = true;
++		o->log(ctx, N2D_L_RESULT, N2D_E_ARGS, 0, 0, 0);
++		return st->result = N2D_E_ARGS;
++	}
++
++	/* ---- preflight: nothing is sent or written ---- */
++	for (unsigned c = 0; c < 3; c++) {
++		unsigned m = o->mhz(ctx, n2d_first_cpu[c]);
++		int row = n2d_boot_window_ok(c, m) ? n2dv_row_for_mhz(c, m) : -1;
++		o->log(ctx, N2D_L_PREFLIGHT, c, m, row < 0 ? 99u : (unsigned)row, row < 0 ? 0 : n2d_row_mhz(c, (unsigned)row));
++		if (row < 0) {
++			st->stopped = true;
++			o->log(ctx, N2D_L_RESULT, N2D_E_PRE_CLOCK, 0, 0, 0);
++			return st->result = N2D_E_PRE_CLOCK;
++		}
++		st->boot_mhz[c] = m;
++		st->orig[c] = st->cur[c] = st->target[c] = (uint8_t)row;
++	}
++	for (unsigned c = 0; c < N2DV_NR_CLUSTERS; c++) {
++		uint32_t vp = 0, vs = 0;
++		bool ok = o->rail(ctx, c, &vp, &vs) && vp >= N2DV_MIN_VPROC && vp <= N2DV_MAX_VPROC && vs >= N2DV_MIN_VSRAM && vs <= N2DV_MAX_VSRAM &&
++		    vs >= vp && vs - vp <= 25000u;                          /* the stock probe's own sanity check: Vsram >= Vproc, difference <= 250 mV */
++		o->log(ctx, N2D_L_RAIL, c, vp, vs, ok);
++		if (!ok) {
++			st->stopped = true;
++			o->log(ctx, N2D_L_RESULT, N2D_E_PRE_RAIL, 0, 0, 0);
++			return st->result = N2D_E_PRE_RAIL;
++		}
++	}
++	if (!n2d_share_ok(N2D_SHARE_PA, N2D_SHARE_SIZE) || !o->share_init(ctx, N2D_SHARE_PA, N2D_SHARE_SIZE)) {
++		o->log(ctx, N2D_L_SHARE, N2D_SHARE_PA, N2D_SHARE_SIZE, 0, 0);
++		st->stopped = true;
++		o->log(ctx, N2D_L_RESULT, N2D_E_PRE_SHARE, 0, 0, 0);
++		return st->result = N2D_E_PRE_SHARE;
++	}
++	o->log(ctx, N2D_L_SHARE, N2D_SHARE_PA, N2D_SHARE_SIZE, 1, 0);
++
++	/* ---- step 1: platform init (stock mcupm_plt_init): {0x504C5401, phys, size}, reply word must be exactly 1 ---- */
++	{
++		uint32_t w[3] = { N2D_PLT_INIT, N2D_SHARE_PA, N2D_SHARE_SIZE }, reply[1] = { 0 };
++		o->log(ctx, N2D_L_PLT, 0, w[1], w[2], 0);
++		int rc = o->mbox(ctx, N2D_MBOX_ALIVE, w, 3, reply, 1, N2D_IPI_TIMEOUT_MS);
++		o->log(ctx, N2D_L_PLT, rc == 0 ? 1u : 2u, rc == 0 ? reply[0] : (unsigned)rc, 0, 0);
++		if (rc != 0 || reply[0] != 1) {
++			st->stopped = true;                                    /* nothing configured yet, so nothing to pin */
++			o->log(ctx, N2D_L_RESULT, N2D_E_PLT, 0, 0, 0);
++			return st->result = N2D_E_PLT;
++		}
++	}
++
++	/* ---- step 2: DVFS hand-over, every cluster pinned at the bootloader row ---- */
++	{
++		struct n2dv_plan plan = { .level = N2DV_ONLY_LEVEL, .pin = true, .row = { st->orig[0], st->orig[1], st->orig[2] } };
++		struct n2dv_ops wops = { o->w32 };
++		if (n2dv_csram_init(&wops, ctx, &plan) != 0) {
++			st->stopped = true;
++			o->log(ctx, N2D_L_RESULT, N2D_E_ARGS, 0, 0, 0);
++			return st->result = N2D_E_ARGS;
++		}
++		o->log(ctx, N2D_L_CSRAM, 0, 0, 0, 0);
++		unsigned bad = 0;
++		for (unsigned k = 0; k < (N2DV_OFF_TBL_END - N2DV_OFF_TBL) / 4u; k++) {
++			bad += o->r32(ctx, N2DV_OFF_TBL + 4 * k) != n2dv_pvt_word(k);
++		}
++		for (unsigned k = 0; k < N2DV_CCI_MAP_BYTES / 4u; k++) {
++			const uint8_t *b = &n2dv_l1_cci[0][0] + 4 * k;
++			uint32_t want = (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
++			bad += o->r32(ctx, N2DV_OFF_CCI_MAP + 4 * k) != want;
++		}
++		for (unsigned c = 0; c < 3; c++) {
++			bad += o->r32(ctx, N2DV_OFF_PPM_LIMIT + 4 * c) != ((uint32_t)st->orig[c] << 16 | st->orig[c]);
++			bad += o->r32(ctx, N2DV_OFF_REQ + 4 * c) != st->orig[c];
++		}
++		o->log(ctx, N2D_L_CSRAM, bad ? 2u : 1u, bad, 0, 0);
++		if (bad) {
++			st->stopped = true;                                    /* no DVFS message sent yet */
++			o->log(ctx, N2D_L_RESULT, N2D_E_CSRAM, 0, 0, 0);
++			return st->result = N2D_E_CSRAM;
++		}
++	}
++	uint32_t m[N2DV_IPI_WORDS];
++	st->sent = true;                                                  /* from here on a failure runs the fallback */
++	n2dv_msg_init_ptbl(m);
++	if (!n2d_ipi(o, ctx, m, 0)) {
++		n2d_fallback(o, ctx, st, N2D_E_IPI);
++		return st->result;
++	}
++	for (unsigned c = 0; c < N2DV_NR_CLUSTERS; c++) {
++		uint32_t vp = 0, vs = 0;
++		if (!o->rail(ctx, c, &vp, &vs) || !n2dv_msg_init_volt(m, c, vp, vs) || !n2d_ipi(o, ctx, m, c)) {
++			n2d_fallback(o, ctx, st, N2D_E_IPI);
++			return st->result;
++		}
++	}
++	n2dv_msg_init_sta(m, N2DV_ONLY_LEVEL);
++	if (!n2d_ipi(o, ctx, m, N2DV_ONLY_LEVEL)) {
++		n2d_fallback(o, ctx, st, N2D_E_IPI);
++		return st->result;
++	}
++	{
++		struct n2dv_ops wops = { o->w32 };
++		n2dv_sched_disable(&wops, ctx);
++		for (unsigned c = 0; c < 3; c++) {
++			n2dv_cluster_on(&wops, ctx, c);
++		}
++	}
++	o->sleep_ms(ctx, 100);
++	for (unsigned c = 0; c < 3; c++) {
++		unsigned meas = o->mhz(ctx, n2d_first_cpu[c]), want = n2d_row_mhz(c, st->orig[c]);
++		o->log(ctx, N2D_L_INITOK, c, o->r32(ctx, N2DV_OFF_CUR_FREQ + 4 * c), meas, want);
++		if (!n2d_clock_ok(meas, st->boot_mhz[c], want)) {
++			n2d_fallback(o, ctx, st, N2D_E_CLOCK);
++			return st->result;
++		}
++	}
++	st->inited = true;
++	st->result = N2D_OK_INIT;
++	o->log(ctx, N2D_L_RESULT, N2D_OK_INIT, 0, 0, 0);
++	if (cfg->cap_mhz == 0) {
++		return st->result;
++	}
++
++	/* ---- step 3: the ramp, one row at a time, L and B alternately, up to the cap ---- */
++	int tl = n2d_row_for_cap(N2DV_L, cfg->cap_mhz), tb = n2d_row_for_cap(N2DV_B, cfg->cap_mhz);
++	if (tl < 0 || tb < 0) {
++		return st->result;
++	}
++	st->target[N2DV_L] = (uint8_t)(tl < st->orig[N2DV_L] ? tl : st->orig[N2DV_L]);       /* set before the gauge test: the tick ramps later once the battery is cool */
++	st->target[N2DV_B] = (uint8_t)(tb < st->orig[N2DV_B] ? tb : st->orig[N2DV_B]);
++	int cC = 0;
++	if (!o->gauge(ctx, &cC)) {
++		o->log(ctx, N2D_L_THERMAL, 2, 0, 0, 0);
++		return st->result;
++	}
++	if (cC >= N2D_START_MAX_CC) {
++		o->log(ctx, N2D_L_THERMAL, 1, (unsigned)cC, 0, 0);
++		return st->result;
++	}
++	for (;;) {
++		bool moved = false;
++		for (unsigned c = N2DV_L; c <= N2DV_B; c++) {
++			if (st->cur[c] <= st->target[c]) {
++				continue;
++			}
++			if (!o->gauge(ctx, &cC)) {
++				o->log(ctx, N2D_L_THERMAL, 2, 0, c, st->cur[c]);
++				return st->result;
++			}
++			if (cC >= N2D_START_MAX_CC) {
++				o->log(ctx, N2D_L_THERMAL, 3, (unsigned)cC, c, st->cur[c]);
++				return st->result;
++			}
++			if (!n2d_goto_row(o, ctx, st, c, (unsigned)st->cur[c] - 1u)) {
++				n2d_fallback(o, ctx, st, N2D_E_RAMP);
++				return st->result;
++			}
++			moved = true;
++		}
++		if (!moved) {
++			break;
++		}
++	}
++	for (unsigned c = N2DV_L; c <= N2DV_B; c++) {
++		o->log(ctx, N2D_L_RAMPDONE, c, st->orig[c], st->cur[c], o->mhz(ctx, n2d_first_cpu[c]));
++	}
++	st->result = N2D_OK_RAMPED;
++	o->log(ctx, N2D_L_RESULT, N2D_OK_RAMPED, 0, 0, 0);
++	return st->result;
++}
++
++/* Every two seconds after the bring-up: the battery guard for the ramped clusters, a sanity check of the clocks, and the placement switch. */
++static inline void
++n2d_tick(const struct n2d_ops *o, void *ctx, const struct n2d_cfg *cfg, struct n2d_state *st)
++{
++	if (st->stopped || !st->inited) {
++		return;
++	}
++	if (cfg->cap_mhz != 0) {
++		int cC = 0;
++		if (o->gauge(ctx, &cC)) {
++			for (unsigned c = N2DV_L; c <= N2DV_B && !st->stopped; c++) {
++				if (cC >= N2D_THROTTLE_CC && st->cur[c] < st->orig[c]) {
++					o->log(ctx, N2D_L_THERMAL, 4, (unsigned)cC, c, (unsigned)st->cur[c] + 1u);
++					if (!n2d_goto_row(o, ctx, st, c, (unsigned)st->cur[c] + 1u)) {
++						n2d_fallback(o, ctx, st, N2D_E_CLOCK);
++					}
++				} else if (cC < N2D_RECOVER_CC && st->cur[c] > st->target[c]) {
++					o->log(ctx, N2D_L_THERMAL, 5, (unsigned)cC, c, (unsigned)st->cur[c] - 1u);
++					if (!n2d_goto_row(o, ctx, st, c, (unsigned)st->cur[c] - 1u)) {
++						n2d_fallback(o, ctx, st, N2D_E_RAMP);
++					}
++				}
++			}
++			if (!st->stopped && st->result == N2D_OK_INIT && st->cur[N2DV_L] <= st->target[N2DV_L] && st->cur[N2DV_B] <= st->target[N2DV_B] &&
++			    (st->target[N2DV_L] < st->orig[N2DV_L] || st->target[N2DV_B] < st->orig[N2DV_B])) {
++				st->result = N2D_OK_RAMPED;
++				o->log(ctx, N2D_L_RESULT, N2D_OK_RAMPED, 0, 0, 0);
++			}
++		}
++	}
++	if (!st->stopped && cfg->place) {
++		unsigned big = o->mhz(ctx, n2d_first_cpu[N2DV_L]), little = o->mhz(ctx, n2d_first_cpu[N2DV_LL]);
++		int next = n2d_place_decide(big, little, st->place_mode);
++		if (next != st->place_mode) {
++			st->place_mode = next;
++			o->set_place(ctx, next);
++			o->log(ctx, N2D_L_PLACE, (unsigned)next, big, little, 0);
++		}
++	}
++}
++#endif
+--- a/bsd/dev/nord2_cpuhvfs_init.h
++++ b/bsd/dev/nord2_cpuhvfs_init.h
+@@ -0,0 +1,273 @@
++#ifndef NORD2_CPUHVFS_INIT_H
++#define NORD2_CPUHVFS_INIT_H
++/*
++ * MT6893 CPU DVFS ("cpuhvfs", MCUPM firmware) initial hand-over, pure and host-testable: step 3 of README-0107-design.md section 12.6.  No kernel headers and
++ * no register access: every CSRAM store goes through struct n2dv_ops.  NOT part of any kernel image yet.
++ *
++ * Source of every number: the vendor 4.19 tree on disk (work/nord2-current-kernel/drivers/misc/mediatek/base/power/cpufreq_v1/src): v2/mtk_cpufreq_hybrid.c
++ * (cpuhvfs_pre_module_init -> init_cpuhvfs_debug_repo, cpuhvfs_pvt_tbl_create, cpuhvfs_set_init_ptbl; cpuhvfs_set_init_volt, cpuhvfs_set_init_sta,
++ * cpuhvfs_set_cluster_on_off, cpuhvfs_set_dvfs, cpuhvfs_set_min_max), mach/mt6893/{mtk_cpufreq_platform.[ch],mtk_cpufreq_opp_pv_table.h}, cross-checked with
++ * the stock Image (IPI command numbers 0, 1, 10, the 4-word message, level 1).  What the AP really does (README-0107-design.md 12.7):
++ *   1. CSRAM: debug-repo guards, zero 0x2a0..0x1400, PPM limit defaults, the per-chip PVT table at +0x10 (4 clusters x 36 words), the CCI map at +0xfa0;
++ *   2. IPI cmd 0 {0, segment 0}; 3. IPI cmd 10 per cluster {j, Vproc, Vsram} (10 uV units, read back from the PMICs); 4. IPI cmd 1 {1, cpu level};
++ *   5. sched-dvfs-disable word, cluster-on magics, then frequency REQUESTS are one 32-bit store of a row index at +0x37c + 4*cluster.
++ * Voltages are never written by the AP: the firmware owns Vproc, Vsram and the PLLs.
++ */
++#include <stdbool.h>
++#include <stdint.h>
++#include "nord2_cpuhvfs_tables.h"
++
++#define N2DV_CSRAM_PA          0x0011bc00ull
++#define N2DV_CSRAM_SIZE        0x1400u
++#define N2DV_NR_FREQ           16u
++#define N2DV_LL 0u
++#define N2DV_L  1u
++#define N2DV_B  2u
++#define N2DV_CCI 3u
++#define N2DV_NR_CLUSTERS 4u
++
++#define N2DV_OFF_TBL           0x0010u        /* 4 x 36 words: [0..15] {Vproc<<16 | MHz}, [16..31] {clk_div<<16 | post_div}, [32] = 0xffffffff, [33..35] = 0 */
++#define N2DV_OFF_TBL_END       0x0250u
++#define N2DV_OFF_DATA          0x02a0u        /* firmware/driver data, zeroed by init */
++#define N2DV_OFF_SCHED_DIS     0x02bcu
++#define N2DV_OFF_PPM_LIMIT     0x0320u        /* + 4*cluster: (limit_row << 16) | base_row */
++#define N2DV_OFF_CUR_VPROC     0x032cu
++#define N2DV_OFF_CUR_FREQ      0x0354u        /* + 4*cluster: current row, written by the firmware */
++#define N2DV_OFF_REQ           0x037cu        /* + 4*cluster: requested row, written by the AP (OFFS_WFI_S) */
++#define N2DV_OFF_CCI_MAP       0x0fa0u
++#define N2DV_CCI_MAP_ZERO      0x01fcu        /* memset_io size of the vendor code */
++#define N2DV_CCI_MAP_BYTES     512u           /* 32 x 16 bytes stored */
++#define N2DV_OFF_CLUSTER_ONOFF 0x1224u        /* + 4*cluster: 'CCON' / 'CCOF' */
++#define N2DV_GUARD0            0x55aa55aau
++#define N2DV_GUARD1            0xaa55aa55u
++#define N2DV_CLUSTER_ON        0x43434f4eu
++#define N2DV_CLUSTER_OFF       0x43434f46u
++
++/* IPI id 1 (mailbox 1), 4-word messages {cmd, arg0, arg1, arg2}; numbering of the build with CONFIG_MTK_CPU_MSSV (confirmed in the stock Image) */
++#define N2DV_IPI_WORDS         4u
++#define N2DV_CMD_INIT_PTBL     0u
++#define N2DV_CMD_INIT          1u
++#define N2DV_CMD_CLUSTER_ONOFF 2u            /* unused: ENABLE_CLUSTER_ONOFF_SRAM stores the magic instead */
++#define N2DV_CMD_SET_FREQ      4u            /* debug path only */
++#define N2DV_CMD_INIT_VOLT     10u
++/* platform limits for the init voltages, 10 uV units (mtk_cpufreq_platform.h) */
++#define N2DV_MIN_VPROC         60000u
++#define N2DV_MAX_VPROC         112000u
++#define N2DV_MIN_VSRAM         85000u
++#define N2DV_MAX_VSRAM         112000u
++#define N2DV_ONLY_LEVEL        1u            /* the only level whose tables are embedded (FY_30G26G / CCI_30G26G): this phone */
++
++struct n2dv_ops {
++	void (*w32)(void *ctx, uint32_t off, uint32_t value);
++};
++
++/* pin = 1: instead of the full-range defaults (limit 0 = fastest, base 15 = slowest) write min = max = row[c] for LL, L, B, and write the matching
++ * REQUEST words (including the CCI request taken from the vendor CCI map) so that the firmware's first decision keeps every cluster on the row the
++ * bootloader left; zeroing the request words alone would mean "row 0 = fastest". */
++struct n2dv_plan {
++	unsigned level;
++	bool pin;
++	uint8_t row[3];
++};
++
++/* The level of this chip from the efuse words (`_mt_cpufreq_get_cpu_level` in the stock Image): devinfo[7] low byte 0x10 -> 0, 0x40 -> 1, else bit 13 of devinfo[0x84]. */
++static inline unsigned
++n2dv_level_from_devinfo(uint32_t devinfo7, uint32_t devinfo84)
++{
++	if ((devinfo7 & 0xffu) == 0x10u) {
++		return 0;
++	}
++	if ((devinfo7 & 0xffu) == 0x40u) {
++		return 1;
++	}
++	return (devinfo84 >> 13) & 1u;
++}
++
++/* Fastest row of LL/L/B whose frequency does not exceed `mhz` by more than 1 %; -1 if every row is faster (or the cluster is not LL/L/B). */
++static inline int
++n2dv_row_for_mhz(unsigned cluster, unsigned mhz)
++{
++	if (cluster > N2DV_B) {
++		return -1;
++	}
++	for (unsigned i = 0; i < N2DV_NR_FREQ; i++) {
++		if ((uint64_t)n2dv_l1_pvt[N2DV_NR_FREQ * cluster + i][0] * 100u <= (uint64_t)mhz * 101u) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++static inline bool
++n2dv_plan_ok(const struct n2dv_plan *p)
++{
++	if (p == 0 || p->level != N2DV_ONLY_LEVEL) {
++		return false;
++	}
++	if (p->pin) {
++		for (unsigned c = 0; c < 3; c++) {
++			if (p->row[c] >= N2DV_NR_FREQ) {
++				return false;
++			}
++		}
++	}
++	return true;
++}
++
++/* CCI row for given LL and B rows (vendor map, first half, [LL row][B row]); the choice for the pinned CCI request is an ASSUMPTION, see README 12.7. */
++static inline unsigned
++n2dv_cci_row(unsigned ll_row, unsigned b_row)
++{
++	return n2dv_l1_cci[ll_row & 15u][b_row & 15u];
++}
++
++/* word of the PVT table region, index k = 0..143 */
++static inline uint32_t
++n2dv_pvt_word(unsigned k)
++{
++	unsigned c = k / 36u, i = k % 36u;
++	if (c >= N2DV_NR_CLUSTERS) {
++		return 0;
++	}
++	if (i < N2DV_NR_FREQ) {
++		const uint16_t *r = n2dv_l1_pvt[N2DV_NR_FREQ * c + i];
++		return ((uint32_t)(r[1] & 0xfffu) << 16) | (uint32_t)r[0];
++	}
++	if (i < 2 * N2DV_NR_FREQ) {
++		const uint16_t *r = n2dv_l1_pvt[N2DV_NR_FREQ * c + i - N2DV_NR_FREQ];
++		return ((uint32_t)(r[3] & (c == N2DV_B ? 0xfffu : 0xffu)) << 16) | (uint32_t)(r[2] & 0xffu);
++	}
++	return i == 32 ? 0xffffffffu : 0;
++}
++
++/* Stores of the AP-side CSRAM initialisation, in the vendor order, 32-bit stores only.  Returns 0, or -1 (nothing written) for a plan that is not allowed. */
++static inline int
++n2dv_csram_init(const struct n2dv_ops *ops, void *ctx, const struct n2dv_plan *plan)
++{
++	if (ops == 0 || ops->w32 == 0 || !n2dv_plan_ok(plan)) {
++		return -1;
++	}
++	/* init_cpuhvfs_debug_repo */
++	ops->w32(ctx, 0x0, N2DV_GUARD0);
++	ops->w32(ctx, 0x4, N2DV_GUARD1);
++	ops->w32(ctx, 0x8, N2DV_GUARD0);
++	ops->w32(ctx, 0xc, N2DV_GUARD1);
++	/* The vendor zero loop clears the limit and request windows too.  In the pinned plan those words are stored ONCE, with the pinned value, inside the loop: the
++	 * request window never holds 0 (= the fastest row) even for a moment, whatever the firmware is doing. */
++	for (uint32_t off = N2DV_OFF_DATA; off < N2DV_CSRAM_SIZE; off += 4) {
++		uint32_t v = 0;
++		if (plan->pin && off >= N2DV_OFF_PPM_LIMIT && off < N2DV_OFF_PPM_LIMIT + 12) {
++			unsigned c = (off - N2DV_OFF_PPM_LIMIT) / 4;
++			v = (uint32_t)plan->row[c] << 16 | plan->row[c];
++		} else if (plan->pin && off >= N2DV_OFF_REQ && off < N2DV_OFF_REQ + 16) {
++			unsigned c = (off - N2DV_OFF_REQ) / 4;
++			v = c < 3 ? plan->row[c] : n2dv_cci_row(plan->row[N2DV_LL], plan->row[N2DV_B]);
++		} else if (!plan->pin && off >= N2DV_OFF_PPM_LIMIT && off < N2DV_OFF_PPM_LIMIT + 12) {
++			v = 0u << 16 | (N2DV_NR_FREQ - 1u);                                              /* default plan: full range, as the vendor driver */
++		}
++		ops->w32(ctx, off, v);
++	}
++	ops->w32(ctx, N2DV_OFF_DATA, N2DV_GUARD0);
++	/* cpuhvfs_pvt_tbl_create */
++	for (unsigned k = 0; k < (N2DV_OFF_TBL_END - N2DV_OFF_TBL) / 4u; k++) {
++		ops->w32(ctx, N2DV_OFF_TBL + 4 * k, n2dv_pvt_word(k));
++	}
++	/* CCI map: memset 0x1fc bytes, then 512 bytes of table; one store per word, same final bytes */
++	for (unsigned k = 0; k < N2DV_CCI_MAP_BYTES / 4u; k++) {
++		const uint8_t *b = &n2dv_l1_cci[0][0] + 4 * k;
++		ops->w32(ctx, N2DV_OFF_CCI_MAP + 4 * k, (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24);
++	}
++	return 0;
++}
++
++/* after cmd 1 (cpuhvfs_set_sched_dvfs_disable(1)) and per online cluster (cpuhvfs_set_cluster_on_off) */
++static inline void
++n2dv_sched_disable(const struct n2dv_ops *ops, void *ctx)
++{
++	ops->w32(ctx, N2DV_OFF_SCHED_DIS, 1);
++}
++
++static inline void
++n2dv_cluster_on(const struct n2dv_ops *ops, void *ctx, unsigned cluster)
++{
++	if (cluster < N2DV_NR_CLUSTERS) {
++		ops->w32(ctx, N2DV_OFF_CLUSTER_ONOFF + 4 * cluster, N2DV_CLUSTER_ON);
++	}
++}
++
++/* the fallback after ANY failure once an init message was sent: pin limits and requests to the rows and stop (nothing is undone, nothing is sent again) */
++static inline void
++n2dv_fallback_pin(const struct n2dv_ops *ops, void *ctx, const uint8_t row[3])
++{
++	for (unsigned c = 0; c < 3; c++) {
++		ops->w32(ctx, N2DV_OFF_PPM_LIMIT + 4 * c, (uint32_t)row[c] << 16 | row[c]);
++		ops->w32(ctx, N2DV_OFF_REQ + 4 * c, row[c]);
++	}
++}
++
++/* 4-word messages */
++static inline void
++n2dv_msg_init_ptbl(uint32_t m[N2DV_IPI_WORDS])
++{
++	m[0] = N2DV_CMD_INIT_PTBL;
++	m[1] = 0;                                              /* segment code 0 */
++	m[2] = m[3] = 0;                                       /* uninitialised stack words in the stock driver */
++}
++
++static inline void
++n2dv_msg_init_sta(uint32_t m[N2DV_IPI_WORDS], unsigned level)
++{
++	m[0] = N2DV_CMD_INIT;
++	m[1] = level;
++	m[2] = m[3] = 0;
++}
++
++/* cmd 10: {10, cluster, Vproc, Vsram}, the rail voltages in 10 uV units (µV / 10) as the stock driver reads them from the regulators.  false (message not built)
++ * for a cluster that does not exist or a voltage outside the platform limits. */
++static inline bool
++n2dv_msg_init_volt(uint32_t m[N2DV_IPI_WORDS], unsigned cluster, uint32_t vproc_10uv, uint32_t vsram_10uv)
++{
++	if (cluster >= N2DV_NR_CLUSTERS || vproc_10uv < N2DV_MIN_VPROC || vproc_10uv > N2DV_MAX_VPROC || vsram_10uv < N2DV_MIN_VSRAM || vsram_10uv > N2DV_MAX_VSRAM) {
++		return false;
++	}
++	m[0] = N2DV_CMD_INIT_VOLT;
++	m[1] = cluster;
++	m[2] = vproc_10uv;
++	m[3] = vsram_10uv;
++	return true;
++}
++
++/* PMIC readback (the registers the stock regulators read; bucks and LDOs share the 6.25 mV step):
++ *   LL and CCI: Vproc2 = MT6315 SID 7 VBUCK3 DA_VOSEL (0x1599, 8 bit),  Vsram2 = MT6359P VSRAM_PROC2 DA_VOSEL (VOSEL1 0x1eb0 [14:8])
++ *   L and B:    Vproc1 = MT6315 SID 6 VBUCK1 DA_VOSEL (0x1499, 8 bit),  Vsram1 = MT6359P VSRAM_PROC1 DA_VOSEL (VOSEL1 0x1e90 [14:8])
++ * vproc: 300000 uV + (sel - 0x30) * 6250 for sel 0x30..0xbf; vsram: 500000 uV + sel * 6250 for sel 0..0x6f; results in 10 uV units, 0 = invalid selector. */
++struct n2dv_rail_regs {
++	uint8_t vproc_sid;
++	uint16_t vproc_reg;
++	uint16_t vsram_reg;
++};
++
++static inline struct n2dv_rail_regs
++n2dv_cluster_rails(unsigned cluster)
++{
++	struct n2dv_rail_regs r;
++	if (cluster == N2DV_LL || cluster == N2DV_CCI) {
++		r.vproc_sid = 7; r.vproc_reg = 0x1599; r.vsram_reg = 0x1eb0;
++	} else {
++		r.vproc_sid = 6; r.vproc_reg = 0x1499; r.vsram_reg = 0x1e90;
++	}
++	return r;
++}
++
++static inline uint32_t
++n2dv_vproc_10uv(unsigned sel)
++{
++	return (sel >= 0x30u && sel <= 0xbfu) ? 30000u + (sel - 0x30u) * 625u : 0;
++}
++
++static inline uint32_t
++n2dv_vsram_10uv(unsigned sel)
++{
++	return sel <= 0x6fu ? 50000u + sel * 625u : 0;
++}
++#endif
+--- a/bsd/dev/nord2_cpuhvfs_tables.h
++++ b/bsd/dev/nord2_cpuhvfs_tables.h
+@@ -0,0 +1,113 @@
++/* GENERATED by gen_cpuhvfs_tables.py from the vendor mt6893 mtk_cpufreq_opp_pv_table.h (level 1: FY_30G26G, CCI_30G26G). Do not edit. */
++#ifndef NORD2_CPUHVFS_TABLES_H
++#define NORD2_CPUHVFS_TABLES_H
++#include <stdint.h>
++
++/* rows: {MHz, Vproc in 6.25 mV PMIC steps, post_div, clk_div}; LL rows 0..15, L 16..31, B 32..47, CCI 48..63 */
++static const uint16_t n2dv_l1_pvt[64][4] = {
++	{ 2000, 160, 1, 1 },
++	{ 1800, 152, 1, 1 },
++	{ 1725, 149, 1, 1 },
++	{ 1625, 145, 1, 1 },
++	{ 1525, 141, 2, 1 },
++	{ 1450, 138, 2, 1 },
++	{ 1350, 134, 2, 1 },
++	{ 1250, 130, 2, 1 },
++	{ 1075, 123, 2, 1 },
++	{ 1000, 120, 2, 1 },
++	{ 925, 117, 2, 1 },
++	{ 850, 114, 2, 1 },
++	{ 750, 110, 2, 1 },
++	{ 675, 107, 4, 1 },
++	{ 600, 104, 4, 1 },
++	{ 500, 104, 4, 1 },
++	{ 2600, 168, 1, 1 },
++	{ 2507, 165, 1, 1 },
++	{ 2354, 160, 1, 1 },
++	{ 2200, 155, 1, 1 },
++	{ 1985, 147, 1, 1 },
++	{ 1855, 143, 1, 1 },
++	{ 1740, 139, 1, 1 },
++	{ 1624, 135, 1, 1 },
++	{ 1537, 133, 2, 1 },
++	{ 1451, 130, 2, 1 },
++	{ 1335, 126, 2, 1 },
++	{ 1162, 120, 2, 1 },
++	{ 1046, 116, 2, 1 },
++	{ 902, 111, 2, 1 },
++	{ 700, 104, 4, 1 },
++	{ 700, 104, 4, 1 },
++	{ 3000, 168, 1, 1 },
++	{ 2892, 165, 1, 1 },
++	{ 2713, 160, 1, 1 },
++	{ 2600, 157, 1, 1 },
++	{ 2463, 153, 1, 1 },
++	{ 2284, 148, 1, 1 },
++	{ 2141, 144, 1, 1 },
++	{ 1998, 140, 1, 1 },
++	{ 1820, 135, 1, 1 },
++	{ 1632, 130, 1, 1 },
++	{ 1482, 126, 2, 1 },
++	{ 1370, 123, 2, 1 },
++	{ 1258, 120, 2, 1 },
++	{ 1108, 116, 2, 1 },
++	{ 921, 111, 2, 1 },
++	{ 659, 104, 4, 1 },
++	{ 1700, 160, 1, 1 },
++	{ 1540, 160, 2, 1 },
++	{ 1400, 160, 2, 1 },
++	{ 1322, 155, 2, 1 },
++	{ 1288, 152, 2, 1 },
++	{ 1255, 150, 2, 1 },
++	{ 1182, 145, 2, 1 },
++	{ 1092, 139, 2, 1 },
++	{ 1021, 134, 2, 1 },
++	{ 949, 130, 2, 1 },
++	{ 895, 126, 2, 1 },
++	{ 824, 121, 2, 1 },
++	{ 770, 118, 2, 1 },
++	{ 716, 115, 4, 1 },
++	{ 627, 110, 4, 1 },
++	{ 520, 104, 4, 1 },
++};
++
++/* CCI frequency map: 32 rows x 16 bytes (two 16 x 16 halves) */
++static const uint8_t n2dv_l1_cci[32][16] = {
++	{ 1, 2, 3, 4, 5, 6, 7, 8, 8, 8, 8, 8, 8, 8, 8, 8 },
++	{ 1, 2, 3, 4, 5, 6, 7, 8, 10, 10, 10, 10, 10, 10, 10, 10 },
++	{ 1, 2, 3, 4, 5, 6, 7, 8, 10, 10, 10, 10, 10, 10, 10, 10 },
++	{ 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 11, 11, 11, 11, 11, 11 },
++	{ 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 12, 12, 12, 12, 12 },
++	{ 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 13, 13, 13, 13, 13 },
++	{ 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 13, 13, 13, 13, 13 },
++	{ 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 13, 14, 14, 14, 14 },
++	{ 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 13, 14, 15, 15, 15 },
++	{ 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 13, 14, 15, 15, 15 },
++	{ 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 13, 14, 15, 15, 15 },
++	{ 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 13, 14, 15, 15, 15 },
++	{ 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 13, 14, 15, 15, 15 },
++	{ 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 13, 14, 15, 15, 15 },
++	{ 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 13, 14, 15, 15, 15 },
++	{ 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 13, 14, 15, 15, 15 },
++	{ 0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2 },
++	{ 0, 0, 0, 0, 0, 1, 1, 2, 4, 5, 5, 5, 5, 5, 5, 5 },
++	{ 0, 0, 0, 0, 0, 1, 1, 2, 4, 6, 6, 6, 6, 6, 6, 6 },
++	{ 0, 0, 0, 0, 0, 1, 1, 2, 4, 6, 6, 6, 6, 6, 6, 6 },
++	{ 0, 0, 0, 0, 0, 1, 1, 2, 4, 6, 7, 7, 7, 7, 7, 7 },
++	{ 0, 0, 0, 0, 0, 1, 1, 2, 4, 6, 8, 8, 8, 8, 8, 8 },
++	{ 0, 0, 0, 0, 0, 1, 1, 2, 4, 6, 8, 9, 9, 9, 9, 9 },
++	{ 0, 0, 0, 0, 0, 1, 1, 2, 4, 6, 8, 9, 10, 10, 10, 10 },
++	{ 0, 0, 0, 0, 0, 1, 1, 2, 4, 6, 8, 9, 10, 12, 12, 12 },
++	{ 0, 0, 0, 0, 0, 1, 1, 2, 4, 6, 8, 9, 10, 12, 13, 13 },
++	{ 0, 0, 0, 0, 0, 1, 1, 2, 4, 6, 8, 9, 10, 12, 14, 14 },
++	{ 0, 0, 0, 0, 0, 1, 1, 2, 4, 6, 8, 9, 10, 12, 14, 14 },
++	{ 0, 0, 0, 0, 0, 1, 1, 2, 4, 6, 8, 9, 10, 12, 14, 15 },
++	{ 0, 0, 0, 0, 0, 1, 1, 2, 4, 6, 8, 9, 10, 12, 14, 15 },
++	{ 0, 0, 0, 0, 0, 1, 1, 2, 4, 6, 8, 9, 10, 12, 14, 15 },
++	{ 0, 0, 0, 0, 0, 1, 1, 2, 4, 6, 8, 9, 10, 12, 14, 15 },
++};
++
++/* golden: FNV-1a 64 of the 0x1400-byte CSRAM after the init plan, starting from the test's noise image (i * 2654435761 + 12345) */
++#define N2DV_GOLDEN_FNV64_DEFAULT 0x8329b434dae8ea82ull
++#define N2DV_GOLDEN_FNV64_PINNED_1_14_15 0x8d4f1aac2f41a4efull
++#endif
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -170,6 +170,7 @@
+         void emitJobStats();
+         void surfaceHook(void *surface, bool acquire);
+         bool surfaceBusy(void *surface);
++        static int pmicRead(void *);   /* 0116: one PMIC register read on the PWRAP owner thread (CPU DVFS init voltages) */
+         /* Optional job interrupt (boot-arg nord2_gpu_irq=1; polling stays the fallback). */
+         bool irqWanted = false, irqTried = false, irqArmed = false;
+         uint32_t irqSpi = NORD2_GPU_JOB_SPI_DEFAULT, irqIntid = 0, irqLearnMisses = 0;
+@@ -701,6 +702,29 @@
+         if (!t || !v || v != kOSBooleanTrue) return false;
+         *centi = (int)(int32_t)t->unsigned32BitValue(); return true;
+ }
++/* 0116, used by bsd/dev/nord2_cpufreq.c (CPU DVFS init): read-only access to the PMIC registers the stock regulators read for the init voltages.  bus 0 = MT6315 on SPMI
++ * (8-bit register of slave `sid`), bus 1 = MT6359P on PWRAP (16-bit register).  Runs on the owner thread like every other rail transaction; returns 0 and the value, or
++ * -1 when the GPU driver is not ready, the owner thread is not polling, or the read failed.  Never writes. */
++struct PmicReq { Nord2GPU *d; unsigned bus, sid, reg, val; int rc; };
++int Nord2GPU::pmicRead(void *p) {
++        PmicReq *q = (PmicReq *)p;
++        if (q->bus == 0) { uint8_t v = 0; q->rc = n2pmif_spmi_read(&q->d->pm15, (uint8_t)q->sid, (uint16_t)q->reg, &v); q->val = v; }
++        else { uint16_t v = 0; q->rc = n2pmif_pwrap_read(&q->d->pm59, (uint16_t)q->reg, &v); q->val = v; }
++        return q->rc;
++}
++extern "C" int nord2_pmic_read(unsigned bus, unsigned sid, unsigned reg, unsigned *val) {
++        Nord2GPU *d = gSurfaceGpu;
++        if (!d || !d->ready || d->stopping || !val || bus > 1 || !n2owner_ready(&gpu_owner_queue)) return -1;
++        PmicReq q = { d, bus, sid, reg, 0, -1 };
++        int result = -1;
++        IOLockLock(d->lock);
++        n2owner_wait wait = { now_ms, sleep_ms, NULL };
++        bool ok = !d->stopping && n2owner_call(&gpu_owner_queue, Nord2GPU::pmicRead, &q, &wait, 1000, &result);
++        IOLockUnlock(d->lock);
++        if (!ok || result || q.rc) return -1;
++        *val = q.val;
++        return 0;
++}
+ /* Used by bsd/dev/nord2_cpufreq.c (patch 0104): the battery gauge is the only temperature the CPU DVFS guard has. */
+ extern "C" bool nord2_battery_temperature_cC(int *centi) { return battery_temperature(centi); }
+ void Nord2GPU::emitJobStats() {

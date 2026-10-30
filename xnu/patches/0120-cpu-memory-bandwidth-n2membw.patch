@@ -1,0 +1,112 @@
+--- a/bsd/dev/nord2_cpufreq.c
++++ b/bsd/dev/nord2_cpufreq.c
+@@ -34,6 +34,7 @@
+ TUNABLE(int, nord2_mcu_arg, "n2mcu", 0);
+ TUNABLE(int, nord2_mcuping_arg, "n2mcuping", 0);
+ TUNABLE(int, nord2_dvfs_arg, "n2dvfs", 0);
++TUNABLE(int, nord2_membw_arg, "n2membw", 0);   /* patch 0120: CPU memory bandwidth measurement (read/write/copy of 64 MiB); touches only DRAM */
+ TUNABLE(int, nord2_dvfs_stage_arg, "n2dvst", 3);   /* 0 preflight only, 1 + share buffer, 2 + platform init, 3 = everything (default) */
+ 
+ extern unsigned nord2_cpu_mhz(int cpu);                                                /* nord2_sched.c (0099) */
+@@ -667,6 +668,77 @@
+ 
+ static const struct n2d_ops n2dv_ops = { n2cf_wr, n2cf_rd, n2dv_mbox, n2dv_share_init, n2dv_rail, n2cf_mhz, n2cf_gauge, n2cf_sleep_ms, n2dv_set_place, n2dv_log, n2dv_flush };
+ 
++/* ---- patch 0120: CPU memory bandwidth ------------------------------------------------------------------------------------------
++ * The GPU renders ~1 Gpixel/s whatever its clock, shader length or job count.  If the DRAM clock was left at a low bootloader value
++ * (the CPU clocks were), the same limit shows on the CPU.  Plain cacheable kernel memory, 64 MiB per buffer (far above every cache),
++ * best of 4 passes per test; nothing but DRAM is touched.  MB/s = 10^6 bytes/s; copy counts the bytes moved once. */
++#define N2MB_BYTES   (64u << 20)
++#define N2MB_PASSES  4u
++
++static uint64_t
++n2mb_ns(uint64_t t0, uint64_t t1)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	return ns ? ns : 1;
++}
++
++static void
++n2membw_run(const char *tag)
++{
++	vm_offset_t a = 0, b = 0;
++	uint64_t best_w = 0, best_r = 0, best_c = 0;
++	volatile uint64_t sink = 0;
++
++	if (kmem_alloc(kernel_map, &a, N2MB_BYTES, KMA_KOBJECT | KMA_ZERO, VM_KERN_MEMORY_DIAG) != KERN_SUCCESS ||
++	    kmem_alloc(kernel_map, &b, N2MB_BYTES, KMA_KOBJECT | KMA_ZERO, VM_KERN_MEMORY_DIAG) != KERN_SUCCESS) {
++		printf("NORD2 MEMBW %s: allocation failed\n", tag);
++		goto out;
++	}
++	for (unsigned pass = 0; pass < N2MB_PASSES; pass++) {
++		uint64_t t0, t1, mbs;
++		t0 = mach_absolute_time();
++		memset((void *)a, 0x5a + (int)pass, N2MB_BYTES);
++		t1 = mach_absolute_time();
++		mbs = ((uint64_t)N2MB_BYTES * 1000ull) / n2mb_ns(t0, t1);
++		if (mbs > best_w)
++			best_w = mbs;
++
++		t0 = mach_absolute_time();
++		{
++			const uint64_t *p = (const uint64_t *)a;
++			uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
++			for (size_t i = 0; i < N2MB_BYTES / 8; i += 8) {
++				s0 += p[i] + p[i + 4];
++				s1 += p[i + 1] + p[i + 5];
++				s2 += p[i + 2] + p[i + 6];
++				s3 += p[i + 3] + p[i + 7];
++			}
++			sink += s0 + s1 + s2 + s3;
++		}
++		t1 = mach_absolute_time();
++		mbs = ((uint64_t)N2MB_BYTES * 1000ull) / n2mb_ns(t0, t1);
++		if (mbs > best_r)
++			best_r = mbs;
++
++		t0 = mach_absolute_time();
++		memcpy((void *)b, (const void *)a, N2MB_BYTES);
++		t1 = mach_absolute_time();
++		mbs = ((uint64_t)N2MB_BYTES * 1000ull) / n2mb_ns(t0, t1);
++		if (mbs > best_c)
++			best_c = mbs;
++	}
++	printf("NORD2 MEMBW %s: cpu %d (%u MHz), LL %u / L %u / B %u MHz: write %llu MB/s, read %llu MB/s, copy %llu MB/s (best of %u, %u MiB buffers)\n",
++	    tag, cpu_number(), nord2_cpu_mhz(cpu_number()), nord2_cpu_mhz(0), nord2_cpu_mhz(4), nord2_cpu_mhz(7),
++	    (unsigned long long)best_w, (unsigned long long)best_r, (unsigned long long)best_c, N2MB_PASSES, N2MB_BYTES >> 20);
++	(void)sink;
++out:
++	if (a)
++		kmem_free(kernel_map, a, N2MB_BYTES);
++	if (b)
++		kmem_free(kernel_map, b, N2MB_BYTES);
++}
++
+ static void
+ n2dvfs_main(void)
+ {
+@@ -689,8 +761,12 @@
+ 	}
+ 	printf("NORD2 DVFS begin: n2dvfs=%d n2dvst=%u (%s), placement %s\n", nord2_dvfs_arg, cfg.max_step, cfg.cap_mhz ? "hand-over then ramp of L and B to the cap" : "hand-over only, no frequency change",
+ 	    cfg.place ? "managed" : "not managed");
++	if (nord2_membw_arg)
++		n2membw_run("before DVFS");
+ 	enum n2d_result r = n2d_bringup(&n2dv_ops, NULL, &cfg, &st);
+ 	printf("NORD2 DVFS bring-up finished with result %u\n", (unsigned)r);
++	if (nord2_membw_arg)
++		n2membw_run("after DVFS");
+ 	while (!st.stopped && st.inited && cfg.cap_mhz != 0) {
+ 		n2cf_sleep_ms(NULL, 1000u * N2CF_TICK_S);
+ 		n2d_tick(&n2dv_ops, NULL, &cfg, &st);
+@@ -723,6 +799,10 @@
+ 		n2dvfs_main();
+ 		nord2_cpufreq_exit();
+ 	}
++	if (nord2_membw_arg) {
++		n2membw_run("boot clocks");
++		nord2_cpufreq_exit();
++	}
+ 	if (nord2_mcu_arg == 1) {
+ 		n2mcu_probe();
+ 	} else if (nord2_mcu_arg >= 2) {

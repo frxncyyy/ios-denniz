@@ -1,0 +1,48 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp	2026-10-29 22:13:23.321761938 +0100
++++ b/iokit/Kernel/arm/Nord2GPU.cpp	2026-10-29 22:31:06.984311570 +0100
+@@ -173,6 +173,9 @@
+         unsigned pfBytes = 0;
+         uint64_t pfLastUs = 0, pfWinUs = 0;
+         bool pfPending = false, pfArmed = false;
++        uint64_t ckCycles = 0, ckStamp = 0, ckUs = 0;      /* 0127: GPU cycle counter / timestamp at the previous stats window */
++        bool ckRunning = false;
++        void clockCheck();
+         unsigned pfWaits = 0, pfArms = 0;
+         void prfcntSample();
+         uint32_t waitN = 0, waitGapMax = 0, waitDurMax = 0, waitRetMax = 0;
+@@ -773,6 +776,27 @@
+         seqWaits = seqJobs = seqDurMax = 0; seqDurSum = 0;
+         if (pfMode > 0) prfcntSample();
+ }
++/* patch 0127: the real GPU core clock.  GPU_CONTROL CYCLE_COUNT (0x90/0x94) counts core cycles once GPU_COMMAND 5 (CYCLE_COUNT_START) was issued, TIMESTAMP (0x98/0x9c)
++ * runs on a fixed reference.  cycles per microsecond of CPU time between two stats windows is the frequency the shader cores really run at; the PLL value the driver
++ * logs (gpu_khz) says what was programmed.  Read-only apart from the harmless start command. */
++void Nord2GPU::clockCheck() {
++        if (!core || core->state != N2C_CORE_READY || !core->gpu_powered) { ckRunning = false; return; }
++        if (!ckRunning) {
++                write_bank(&gpu, 0x30, 5u);
++                ckCycles = ((uint64_t)read_bank(&gpu, 0x94) << 32) | read_bank(&gpu, 0x90);
++                ckStamp = ((uint64_t)read_bank(&gpu, 0x9c) << 32) | read_bank(&gpu, 0x98);
++                ckUs = now_us(NULL); ckRunning = true; return;
++        }
++        uint32_t lo = read_bank(&gpu, 0x90), hi = read_bank(&gpu, 0x94);
++        uint64_t cyc = ((uint64_t)hi << 32) | lo;
++        uint64_t st = ((uint64_t)read_bank(&gpu, 0x9c) << 32) | read_bank(&gpu, 0x98);
++        uint64_t t = now_us(NULL);
++        if (cyc >= ckCycles && t > ckUs) {
++                uint64_t dc = cyc - ckCycles, ds = st - ckStamp, dt = t - ckUs;
++                IOLog("NORD2 GPUCLK: win_us=%llu cycles=%llu core_khz=%llu stamp_ticks=%llu stamp_khz=%llu\n", dt, dc, dc * 1000 / dt, ds, ds * 1000 / dt);
++        } else IOLog("NORD2 GPUCLK: counter restarted (cycles %llu -> %llu)\n", ckCycles, cyc);
++        ckCycles = cyc; ckStamp = st; ckUs = t;
++}
+ /* patch 0123 (n2pf=1): hardware counters, v2.  The v1 sampler (0122) spun up to 20 ms with the driver lock held and, after its first sample timeout, left the job
+  * manager waiting behind the unfinished dump (job queue delays of 2..13 s).  v2 never waits: it issues PRFCNT_SAMPLE in one stats window and collects the dump in the next
+  * one, drops everything when the GPU was power-cycled in between, and on a stuck sample prints the fault registers, switches the counters off (PRFCNT_CONFIG = 0) and stops.
+@@ -791,6 +815,7 @@
+         IOLog("NORD2 MEM: free=%u wired=%u active=%u inactive=%u spec=%u throttled=%u pageable_int=%u pageable_ext=%u avail=%u compressed=%u free_target=%u (16K pages)\n",
+               vm_page_free_count, vm_page_wire_count, vm_page_active_count, vm_page_inactive_count, vm_page_speculative_count, vm_page_throttled_count,
+               vm_page_pageable_internal_count, vm_page_pageable_external_count, memorystatus_available_pages, c_segment_pages_compressed, vm_page_free_target);
++        clockCheck();
+         if (pfMode == 2 || pfFailed || !core) return;                       /* n2pf=2: memory statistics only, the GPU counters stay off */
+         bool up = core->state == N2C_CORE_READY && core->gpu_powered;
+         if (pfPending) {

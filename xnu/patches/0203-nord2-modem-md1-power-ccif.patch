@@ -1,0 +1,74 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -469,6 +469,64 @@
+ 	sweet_modem_dump("md_img", 0x8a000000UL, 8);
+ }
+ 
++
++/*
++ * 0203: MD1 MTCMOS power-on and CCIF access (stage 2 of the modem bring-up), Linux clk-mt6885-pg.c spm_mtcmos_ctrl_md1()
++ * and clk-mt6885.c gates.  SPM 0x10006000, infracfg_ao 0x10001000.  The sequence only runs when SPM reports MD1 off; every
++ * wait is bounded.  CCIF (0x10209000) is read only after the domain is on and the CCIF AP/MD clock gates are released.
++ * The modem is NOT started: no MD_KERNEL_BOOT_UP.
++ */
++extern void delay_for_interval(uint32_t interval, uint32_t scale_factor);
++
++static void
++sweet_modem_wr(volatile uint32_t *base, uint32_t off, uint32_t v)
++{
++	base[off / 4] = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++sweet_modem_power(void)
++{
++	volatile uint32_t *spm = (volatile uint32_t *)ml_io_map(0x10006000UL, 0x1000);
++	volatile uint32_t *ic = (volatile uint32_t *)ml_io_map(0x10001000UL, 0x1000);
++	unsigned n;
++
++	if (spm == NULL || ic == NULL) {
++		printf("NORD2 MODEM: spm/infracfg map failed\n");
++		return;
++	}
++	printf("NORD2 MODEM: spm PWR_STATUS=%08x 2ND=%08x MD1_PWR_CON=%08x EXT_BUCK_ISO=%08x\n",
++	    spm[0x16C / 4], spm[0x170 / 4], spm[0x300 / 4], spm[0x398 / 4]);
++	printf("NORD2 MODEM: infracfg CG1_STA=%08x (ccif_ap b23, ccif_md b26) CG3_STA=%08x (dpmaif b26) PROT_STA1=%08x\n",
++	    ic[0x94 / 4], ic[0xC8 / 4], ic[0x228 / 4]);
++
++	if ((spm[0x16C / 4] & 1) == 0) {
++		printf("NORD2 MODEM: MD1 domain off, powering on (Linux sequence)\n");
++		sweet_modem_wr(spm, 0x000, (0xB16U << 16) | 1U);
++		sweet_modem_wr(spm, 0x398, spm[0x398 / 4] & ~0x3U);
++		sweet_modem_wr(spm, 0x300, spm[0x300 / 4] | 0x1U);         /* PWR_RST_B */
++		sweet_modem_wr(spm, 0x300, spm[0x300 / 4] | 0x4U);         /* PWR_ON */
++		for (n = 0; n < 20000 && (spm[0x16C / 4] & 1) == 0; n++) {
++			delay_for_interval(10, NSEC_PER_USEC);
++		}
++		printf("NORD2 MODEM: MD1 PWR_STATUS after %u polls = %08x\n", n, spm[0x16C / 4]);
++		if ((spm[0x16C / 4] & 1) == 0) {
++			printf("NORD2 MODEM: MD1 power-on timed out, stopping\n");
++			return;
++		}
++		sweet_modem_wr(ic, 0xB88, (1U << 10) | (1U << 21) | (1U << 29));   /* VDNR_CLR step2_0 */
++		sweet_modem_wr(ic, 0xBBC, (1U << 6) | (1U << 7));                   /* SUB_INFRA_VDNR_CLR step2_1 */
++		sweet_modem_wr(ic, 0x2A4, 1U << 7);                                 /* PROTECTEN_CLR step1_0 */
++		printf("NORD2 MODEM: bus protect released, PROT_STA1=%08x\n", ic[0x228 / 4]);
++	}
++	/* ungate CCIF AP/MD (CG1 clr 0x8c, bits 23/26); gates are active-high */
++	sweet_modem_wr(ic, 0x8C, (1U << 23) | (1U << 26));
++	printf("NORD2 MODEM: CG1_STA after ungate=%08x\n", ic[0x94 / 4]);
++	sweet_modem_dump("ccif0", 0x10209000UL, 8);
++	sweet_modem_dump("ccif0_sram", 0x1020a000UL, 8);
++}
++
+ /* Called from bsd_init once MAC policies can register, before any exec. */
+ void sweet_amfi_policy_register(void);
+ 
+@@ -482,5 +540,6 @@
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
+ 	sweet_modem_probe();
++	sweet_modem_power();
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

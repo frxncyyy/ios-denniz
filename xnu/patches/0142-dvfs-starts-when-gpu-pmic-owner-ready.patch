@@ -1,0 +1,51 @@
+--- a/bsd/dev/nord2_cpufreq.c
++++ b/bsd/dev/nord2_cpufreq.c
+@@ -41,6 +41,7 @@
+ extern unsigned nord2_cpu_mhz(int cpu);                                                /* nord2_sched.c (0099) */
+ extern int nord2_sched_mode;                                                            /* nord2_sched.c (0099): placement mode bits */
+ extern bool nord2_battery_temperature_cC(int *centi);                                  /* Nord2GPU.cpp */
++extern int nord2_gpu_pmic_ready(void);  /* Nord2GPU.cpp (0142): the GPU driver is ready and its PMIC owner thread answers */
+ extern int nord2_pmic_read(unsigned bus, unsigned sid, unsigned reg, unsigned *val);  /* Nord2GPU.cpp (0116): read-only PMIC access on the owner thread */
+ 
+ #define N2CF_FIRST_S    60u     /* let the boot settle and the 0099 thread print its baseline first */
+@@ -835,8 +836,25 @@
+ 	unsigned cap = nord2_cpufreq_arg >= 500 ? (unsigned)nord2_cpufreq_arg : 0;
+ 
+ 	bzero(dom, sizeof(dom));
+-	assert_wait_timeout((event_t)&nord2_cpufreq_thread, THREAD_UNINT, N2CF_FIRST_S, NSEC_PER_SEC);
+-	thread_block(THREAD_CONTINUE_NULL);
++	if (nord2_dvfs_arg > 0) {
++		/* 0142: the CPUs run at the bootloader clocks (the big clusters at 730 MHz) until this bring-up, and the first minute is when the
++		 * user unlocks and opens the first apps.  It needs the GPU driver's PMIC owner (the rail reads), which is ready some 23 s into the
++		 * boot: start as soon as it is (at least 10 s in, then 4 s of settle), and give up waiting after two minutes. */
++		unsigned waited_ms = 0;
++		assert_wait_timeout((event_t)&nord2_cpufreq_thread, THREAD_UNINT, 10, NSEC_PER_SEC);
++		thread_block(THREAD_CONTINUE_NULL);
++		while (waited_ms < 110000 && !nord2_gpu_pmic_ready()) {
++			assert_wait_timeout((event_t)&nord2_cpufreq_thread, THREAD_UNINT, 500, NSEC_PER_MSEC);
++			thread_block(THREAD_CONTINUE_NULL);
++			waited_ms += 500;
++		}
++		assert_wait_timeout((event_t)&nord2_cpufreq_thread, THREAD_UNINT, 4, NSEC_PER_SEC);
++		thread_block(THREAD_CONTINUE_NULL);
++		printf("NORD2 DVFS: GPU/PMIC owner %s after %u ms of waiting; bring-up starts now (was a fixed boot+60 s)\n", nord2_gpu_pmic_ready() ? "ready" : "NOT ready", waited_ms);
++	} else {
++		assert_wait_timeout((event_t)&nord2_cpufreq_thread, THREAD_UNINT, N2CF_FIRST_S, NSEC_PER_SEC);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
+ 
+ 	if (nord2_dvfs_arg > 0) {
+ 		n2dvfs_main();
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -746,6 +746,10 @@
+         else { uint16_t v = 0; q->rc = n2pmif_pwrap_read(&q->d->pm59, (uint16_t)q->reg, &v); q->val = v; }
+         return q->rc;
+ }
++extern "C" int nord2_gpu_pmic_ready(void) {
++        Nord2GPU *d = gSurfaceGpu;
++        return d && d->ready && !d->stopping && n2owner_ready(&gpu_owner_queue);
++}
+ extern "C" int nord2_pmic_read(unsigned bus, unsigned sid, unsigned reg, unsigned *val) {
+         Nord2GPU *d = gSurfaceGpu;
+         if (!d || !d->ready || d->stopping || !val || bus > 1 || !n2owner_ready(&gpu_owner_queue)) return -1;

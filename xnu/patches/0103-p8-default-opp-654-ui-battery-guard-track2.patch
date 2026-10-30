@@ -1,0 +1,74 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -103,13 +103,14 @@
+         c->full_cache_maint = v == 1;
+         /* Tracking level (0087 scoping is level 0): 1 = buffers the CPU can never touch are maintained once;
+          * 2 = plus IOSurface lock/unlock-bracketed CPU access.  nord2_gpu_track=<n>, short alias n2trk. */
+-        int tr = 1, got = 0;
++        int tr = 2, got = 0;     /* P8: level 2 is the default (it ran on the device in every P6/P7 UI image); n2trk=1 gives the old default */
+         got = PE_parse_boot_argn("nord2_gpu_track", &tr, sizeof(tr)); if (!got) got = PE_parse_boot_argn("n2trk", &tr, sizeof(tr));
+         if (tr < 0 || tr > 2) tr = 1;
+         (void)n2c_set_track_level(c, (unsigned)tr);
+         IOLog("NORD2 GPU: cache maintenance %s, CPU-access tracking level %d\n", c->full_cache_maint ? "whole-context (boot-arg)" : "per-job buffer list", tr);
+         return true;
+ }
++static bool battery_temperature(int *centi);
+ /* Cold-start GPU clock: boot-arg nord2_gpu_khz=<kHz> selects an exact vendor OPP
+  * (350000..886000, see n2rail_opp_table).  Default (absent) keeps the 350 MHz minimum.
+  * Honoured only when the boot chain left MFGPLL unusable and every MFG domain off. */
+@@ -118,7 +119,11 @@
+         b->target_khz = khz > 0 ? (uint32_t)khz : 0;
+         int mhz = 0; uint32_t alias = 0;
+         if (!b->target_khz && PE_parse_boot_argn("n2mhz", &mhz, sizeof(mhz)) && nord2_gpu_mhz_alias_to_khz(mhz, &alias)) b->target_khz = alias;
+-        if (b->target_khz) IOLog("NORD2 GPU: cold-start OPP requested: %u kHz (exact vendor entry or refused)\n", b->target_khz);
++        if (!b->target_khz) {                       /* P8 policy (nord2_gpu_transport.h): UI images start at 654 MHz, others at the minimum */
++                int metal = 0; PE_parse_boot_argn("nord2_metal", &metal, sizeof(metal));
++                b->target_khz = nord2_gpu_default_opp_khz(metal == 1);
++                if (b->target_khz) IOLog("NORD2 GPU: cold-start OPP default %u kHz (UI image; n2mhz=350 selects the old minimum)\n", b->target_khz);
++        } else IOLog("NORD2 GPU: cold-start OPP requested: %u kHz (exact vendor entry or refused)\n", b->target_khz);
+         return true;
+ }
+ static IOReturn io_error(enum n2c_error e) {
+@@ -293,6 +298,15 @@
+         Nord2GPU *d = (Nord2GPU *)p;
+         if (d->lvtsMode && !d->lvtsTried) d->lvtsSetup();
+         if (d->board.target_khz > N2CLK_BOOT_KHZ) {
++                /* Battery-gauge guard (the only temperature available without LVTS): a hot start gets the minimum OPP. */
++                int bat = 0; bool bok = battery_temperature(&bat);
++                if (!nord2_gpu_opp_battery_allows(d->board.target_khz, bok, bat)) {
++                        IOLog("NORD2 GPU: battery %d.%02d C above the cold-start limit for %u kHz: using the minimum OPP\n", bat / 100, bat % 100, d->board.target_khz);
++                        d->board.target_khz = 0;
++                } else if (bok) IOLog("NORD2 GPU: battery gauge %d.%02d C: cold-start OPP %u kHz allowed\n", bat / 100, bat % 100, d->board.target_khz);
++                else IOLog("NORD2 GPU: battery gauge not readable yet: cold-start OPP %u kHz not blocked\n", d->board.target_khz);
++        }
++        if (d->board.target_khz > N2CLK_BOOT_KHZ) {
+                 /* Cold-start high-OPP guard: a known-hot GPU gets the minimum OPP.  An unreadable sensor never blocks. */
+                 int32_t gmC = 0; bool ok = d->lvtsGpu(&gmC);
+                 if (ok && !n2lvts_allows_cold_start_opp(gmC, true, !d->lvts.cal.defaulted, d->lvtsMaxC * 1000)) {
+--- a/bsd/dev/nord2_gpu_transport.h
++++ b/bsd/dev/nord2_gpu_transport.h
+@@ -169,6 +169,24 @@
+         return true;
+ }
+ 
++/* P8 cold-start OPP policy.  The UI (nord2_metal=1) starts at 654 MHz (0.65 V; a 654 MHz boot ran on the device, c6k); images without the UI
++ * keep the 350 MHz minimum.  n2mhz=<MHz> / nord2_gpu_khz=<kHz> override either way (n2mhz=350 is the old UI default, n2mhz=886 is opt-in).
++ * Both are cold-start only: there is no live OPP switch and no GPU temperature (LVTS level 1: valid_sensors=0), so the only guard is the
++ * battery gauge reading at power-on, which is slow and lags the SoC: a hot start never gets a high OPP.  An unreadable gauge never blocks. */
++#define NORD2_GPU_DEFAULT_UI_KHZ 654000u
++#define NORD2_GPU_BAT_LIMIT_MID_CC  4000    /* 40.0 C: refuse 351..654 MHz at or above */
++#define NORD2_GPU_BAT_LIMIT_HIGH_CC 3800    /* 38.0 C: refuse > 654 MHz at or above */
++static inline uint32_t nord2_gpu_default_opp_khz(bool metal_ui)
++{
++        return metal_ui ? NORD2_GPU_DEFAULT_UI_KHZ : 0u;      /* 0 = keep the minimum */
++}
++static inline bool nord2_gpu_opp_battery_allows(uint32_t khz, bool gauge_valid, int32_t bat_cC)
++{
++        if (khz <= 350000u || !gauge_valid)
++                return true;
++        return bat_cC < (khz > NORD2_GPU_DEFAULT_UI_KHZ ? NORD2_GPU_BAT_LIMIT_HIGH_CC : NORD2_GPU_BAT_LIMIT_MID_CC);
++}
++
+ /* Clamp a boot-arg value given in MiB; 0/absent keeps the default. */
+ static inline uint64_t nord2_gpu_budget_mib(uint64_t mib, uint64_t lo_mib,
+                                             uint64_t hi_mib, uint64_t dflt)

@@ -1,0 +1,1511 @@
+--- a/gpu/src/Nord2GPU.cpp
++++ b/gpu/src/Nord2GPU.cpp
+@@ -34,6 +34,7 @@
+ #include "../../../bsd/dev/nord2_gpu_jm.h"
+ #include "../../../bsd/dev/nord2_gpu_transport.h"
+ #include "../../../bsd/dev/nord2_gpu_irq.h"
++#include "../../../bsd/dev/nord2_gpu_lvts.h"
+ }
+ 
+ static struct n2owner gpu_owner_queue;
+@@ -149,6 +150,16 @@
+         struct nord2_irq_guard irqGuard = {};
+         volatile uint32_t irqFlag = 0, irqTops = 0;
+         uint32_t irqSleeps = 0, irqTimeouts = 0;
++        /* LVTS thermal sensing (boot-arg nord2_lvts=1 read-only | 2 start the GPU controller | 3 also open the clock gate). */
++        struct n2lvts lvts = {};
++        Bank lvtsAp = {}, lvtsMcu = {};
++        unsigned lvtsMode = 0, lvtsState = 0;     /* state: 0 off, 1 reading, 2 started by us, 3 failed */
++        uint32_t lvtsMask = N2LVTS_MASK_GPU; int lvtsMaxC = 65; bool lvtsTried = false;
++        void lvtsSetup();
++        bool lvtsGpu(int32_t *mC);
++        int lvtsHottest(uint32_t mask);
++        static uint32_t lvtsRd(void *, enum n2lvts_block, uint32_t);
++        static void lvtsWr(void *, enum n2lvts_block, uint32_t, uint32_t);
+         void irqSetup();
+         void irqLearnCheck();
+         void irqArm();
+@@ -268,6 +279,16 @@
+ }
+ int Nord2GPU::powerOn(void *p) {
+         Nord2GPU *d = (Nord2GPU *)p;
++        if (d->lvtsMode && !d->lvtsTried) d->lvtsSetup();
++        if (d->board.target_khz > N2CLK_BOOT_KHZ) {
++                /* Cold-start high-OPP guard: a known-hot GPU gets the minimum OPP.  An unreadable sensor never blocks. */
++                int32_t gmC = 0; bool ok = d->lvtsGpu(&gmC);
++                if (ok && !n2lvts_allows_cold_start_opp(gmC, true, !d->lvts.cal.defaulted, d->lvtsMaxC * 1000)) {
++                        IOLog("NORD2 GPU: GPU %d.%d C%s above the cold-start limit %d C: using the minimum OPP instead of %u kHz\n",
++                              gmC / 1000, (gmC % 1000) / 100, d->lvts.cal.defaulted ? " (approximate, 10 C margin)" : "", d->lvtsMaxC, d->board.target_khz);
++                        d->board.target_khz = 0;
++                } else if (ok) IOLog("NORD2 GPU: GPU %d.%d C: cold-start OPP %u kHz allowed\n", gmC / 1000, (gmC % 1000) / 100, d->board.target_khz);
++        }
+         bool preflight = nord2_gpu_board_preflight(&d->board);
+         const nord2_gpu_board_report &r = d->board.report;
+         /* Cached owner-thread observations only: do not touch an unpowered
+@@ -353,6 +374,10 @@
+         lock = IOLockAlloc(); if (!lock) return false;
+         int opt = 0; PE_parse_boot_argn("nord2_gpu", &opt, sizeof(opt)); enabled = opt == 1;
+         int stats = 1; PE_parse_boot_argn("nord2_gpu_stats", &stats, sizeof(stats)); jobStats = stats != 0;
++        int lv = 0; PE_parse_boot_argn("nord2_lvts", &lv, sizeof(lv)); lvtsMode = (lv >= 1 && lv <= 3) ? (unsigned)lv : 0;
++        int lm = 0; if (PE_parse_boot_argn("nord2_lvts_mask", &lm, sizeof(lm)) && lm > 0 && (lm & ~(int)N2LVTS_MASK_ALL) == 0) lvtsMask = (uint32_t)lm;
++        int lc = 0; if (PE_parse_boot_argn("nord2_lvts_max_c", &lc, sizeof(lc)) && lc >= 30 && lc <= 100) lvtsMaxC = lc;
++        if (lvtsMode) IOLog("NORD2 GPU: LVTS thermal sensing requested: mode %u mask %x cold-start guard %d C\n", lvtsMode, lvtsMask, lvtsMaxC);
+         int irq = 0; PE_parse_boot_argn("nord2_gpu_irq", &irq, sizeof(irq)); irqWanted = irq == 1;
+         int spi = 0; if (PE_parse_boot_argn("nord2_gpu_irq_spi", &spi, sizeof(spi)) && spi >= 32 && spi <= 900) irqSpi = (uint32_t)spi;
+         if (irqWanted) IOLog("NORD2 GPU: job interrupt requested (spi %u), polling remains the fallback\n", irqSpi);
+@@ -530,6 +555,59 @@
+         }
+         IOLockUnlock(lock); if (step) IODelay(step); else IOSleep(1); IOLockLock(lock);
+ }
++/* ---- LVTS thermal sensing (opt-in; see nord2_gpu_lvts.h for the safety model) ---- */
++uint32_t Nord2GPU::lvtsRd(void *p, enum n2lvts_block b, uint32_t off) {
++        Nord2GPU *d = (Nord2GPU *)p;
++        return read_bank(b == N2LVTS_AP ? &d->lvtsAp : b == N2LVTS_MCU ? &d->lvtsMcu : &d->infra, off);
++}
++void Nord2GPU::lvtsWr(void *p, enum n2lvts_block b, uint32_t off, uint32_t v) {
++        Nord2GPU *d = (Nord2GPU *)p;
++        write_bank(b == N2LVTS_AP ? &d->lvtsAp : b == N2LVTS_MCU ? &d->lvtsMcu : &d->infra, off, v);
++}
++void Nord2GPU::lvtsSetup() {
++        lvtsTried = true;
++        if (!lvtsMode) return;
++        n2lvts_ops o = { lvtsRd, lvtsWr, delay_us, log_msg };
++        if (!map_bank(&lvtsAp, N2LVTS_AP_PHYS, N2LVTS_BLOCK_BYTES) ||
++            ((lvtsMask & 7u) && !map_bank(&lvtsMcu, N2LVTS_MCU_PHYS, N2LVTS_BLOCK_BYTES)) || !n2lvts_init(&lvts, &o, this)) {
++                lvtsState = 3; IOLog("NORD2 GPU LVTS: cannot map thermal controllers\n"); return;
++        }
++        int golden = 0;
++        if (PE_parse_boot_argn("nord2_lvts_golden", &golden, sizeof(golden)) && golden > 0) lvts.cal.golden = (uint32_t)golden;
++        enum n2lvts_error e = N2LVTS_OK;
++        if (lvtsMode >= 2) {
++                e = n2lvts_start(&lvts, lvtsMask, lvtsMode >= 3);
++                if (e == N2LVTS_OK) {
++                        lvtsState = 2;
++                        for (unsigned i = 0; i < 40; i++) {            /* first sensor interval is ~20 ms; allow 200 ms */
++                                if (n2lvts_read(&lvts, lvtsMask)) break;
++                                IOSleep(5);
++                        }
++                } else lvtsState = 3;
++        } else lvtsState = 1;
++        n2lvts_probe probe = {}; bool pr = (n2lvts_probe_ctrl(&lvts, N2LVTS_CTRL_GPU, &probe) == N2LVTS_OK);
++        unsigned good = n2lvts_read(&lvts, lvtsMask);
++        IOLog("NORD2 GPU LVTS: mode=%u mask=%x start=%s state=%u gate_open=%u cal=%s valid_sensors=%u gpu_ctrl clken=%x monctl0=%x id=%x msr0=%x step=%u\n",
++              lvtsMode, lvtsMask, n2lvts_error_string(e), lvtsState, pr ? 1u : (unsigned)probe.gate_open,
++              lvts.cal.defaulted ? "default(approx)" : "efuse", good, probe.clken, probe.monctl0, probe.id, probe.msr[0], lvts.step);
++}
++bool Nord2GPU::lvtsGpu(int32_t *mC) {
++        if (!lvtsMode || lvtsState == 3 || !lvtsState) return false;
++        n2lvts_read(&lvts, N2LVTS_MASK_GPU);
++        bool a = lvts.temp_ok[10], b = lvts.temp_ok[11];
++        if (!a && !b) return false;
++        *mC = a && b ? (lvts.temp_mC[10] > lvts.temp_mC[11] ? lvts.temp_mC[10] : lvts.temp_mC[11]) : (a ? lvts.temp_mC[10] : lvts.temp_mC[11]);
++        return true;
++}
++int Nord2GPU::lvtsHottest(uint32_t mask) {   /* centi-C of the hottest valid sensor of the controllers in mask, or INT32_MIN */
++        int best = (int)0x80000000; n2lvts_read(&lvts, mask);
++        for (unsigned c = 0; c < N2LVTS_CTRL_COUNT; c++) if (mask & (1u << c))
++                for (unsigned j = 0; j < n2lvts_ctrl[c].nsens; j++) {
++                        unsigned s = n2lvts_ctrl[c].first_sensor + j;
++                        if (lvts.temp_ok[s] && lvts.temp_mC[s] / 10 > best) best = lvts.temp_mC[s] / 10;
++                }
++        return best;
++}
+ /* Battery fuel-gauge temperature (centi-C) from the SweetBattery power source, if it is a real
+  * measurement; the SoC/GPU thermal sensors (LVTS) are not driven by this port. */
+ static bool battery_temperature(int *centi) {
+@@ -551,15 +629,19 @@
+         uint32_t pll_khz = n2rail_mfgpll_khz(read_bank(&clocks[N2CLK_APMIXED], N2CLK_MFGPLL_CON1));
+         uint32_t mux = (read_bank(&clocks[N2CLK_TOPCK], N2CLK_CFG_5) >> N2CLK_MFG_MUX_SHIFT) & N2CLK_MFG_MUX_MASK;
+         int bat = 0; bool bat_ok = battery_temperature(&bat);
++        if (lvtsMode && !lvtsTried) lvtsSetup();
++        int32_t gmC = 0; bool gpu_ok = lvtsGpu(&gmC);
++        int hot = (lvtsMode && lvtsState && lvtsState != 3) ? lvtsHottest(lvtsMask) : (int)0x80000000;
+         uint32_t n = t.jobs ? t.jobs : 1, w = waitN ? waitN : 1;
+         IOLog("NORD2 GPU JOBS: n=%u fault=%u full=%u win_ms=%llu q_us=%llu/%u run_us=%llu/%u tot_us=%llu/%u "
+-              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u gpu_khz=%u mux=%u bat_cC=%d bat_ok=%u irq=%u:%u/%u/%u/%u\n",
++              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u gpu_khz=%u mux=%u bat_cC=%d bat_ok=%u gpu_cC=%d soc_cC=%d lvts=%u%s irq=%u:%u/%u/%u/%u\n",
+               t.jobs, t.faulted, t.full_jobs, t.window_start_us / 1000, t.sum_queue_us / n, t.max_queue_us,
+               t.sum_run_us / n, t.max_run_us, t.sum_total_us / n, t.max_total_us, t.sum_clean_us / n, t.max_clean_us,
+               t.sum_inval_us / n, t.max_inval_us, t.sum_clean_pages * 4, t.sum_inval_pages * 4, waitN,
+               waitGapSum / w, waitGapMax, waitDurSum / w, waitDurMax, waitRetSum / w, waitRetMax,
+               seqWaits, seqJobs, seqWaits ? seqDurSum / seqWaits : 0ull, seqDurMax, pll_khz, mux,
+-              bat_ok ? bat : 0, (unsigned)bat_ok,
++              bat_ok ? bat : 0, (unsigned)bat_ok, gpu_ok ? gmC / 10 : -9999, hot != (int)0x80000000 ? hot : -9999,
++              lvtsState, (lvtsState && lvts.cal.defaulted) ? "~" : "",
+               (unsigned)irqState, irqTops, irqGuard.spurious_total, irqSleeps, irqTimeouts);
+         waitN = waitGapMax = waitDurMax = waitRetMax = 0; waitGapSum = waitDurSum = waitRetSum = 0;
+         seqWaits = seqJobs = seqDurMax = 0; seqDurSum = 0;
+--- a/shim/nord2-xnu/Nord2GPU.cpp
++++ b/shim/nord2-xnu/Nord2GPU.cpp
+@@ -34,6 +34,7 @@
+ #include "../../../bsd/dev/nord2_gpu_jm.h"
+ #include "../../../bsd/dev/nord2_gpu_transport.h"
+ #include "../../../bsd/dev/nord2_gpu_irq.h"
++#include "../../../bsd/dev/nord2_gpu_lvts.h"
+ }
+ 
+ static struct n2owner gpu_owner_queue;
+@@ -149,6 +150,16 @@
+         struct nord2_irq_guard irqGuard = {};
+         volatile uint32_t irqFlag = 0, irqTops = 0;
+         uint32_t irqSleeps = 0, irqTimeouts = 0;
++        /* LVTS thermal sensing (boot-arg nord2_lvts=1 read-only | 2 start the GPU controller | 3 also open the clock gate). */
++        struct n2lvts lvts = {};
++        Bank lvtsAp = {}, lvtsMcu = {};
++        unsigned lvtsMode = 0, lvtsState = 0;     /* state: 0 off, 1 reading, 2 started by us, 3 failed */
++        uint32_t lvtsMask = N2LVTS_MASK_GPU; int lvtsMaxC = 65; bool lvtsTried = false;
++        void lvtsSetup();
++        bool lvtsGpu(int32_t *mC);
++        int lvtsHottest(uint32_t mask);
++        static uint32_t lvtsRd(void *, enum n2lvts_block, uint32_t);
++        static void lvtsWr(void *, enum n2lvts_block, uint32_t, uint32_t);
+         void irqSetup();
+         void irqLearnCheck();
+         void irqArm();
+@@ -268,6 +279,16 @@
+ }
+ int Nord2GPU::powerOn(void *p) {
+         Nord2GPU *d = (Nord2GPU *)p;
++        if (d->lvtsMode && !d->lvtsTried) d->lvtsSetup();
++        if (d->board.target_khz > N2CLK_BOOT_KHZ) {
++                /* Cold-start high-OPP guard: a known-hot GPU gets the minimum OPP.  An unreadable sensor never blocks. */
++                int32_t gmC = 0; bool ok = d->lvtsGpu(&gmC);
++                if (ok && !n2lvts_allows_cold_start_opp(gmC, true, !d->lvts.cal.defaulted, d->lvtsMaxC * 1000)) {
++                        IOLog("NORD2 GPU: GPU %d.%d C%s above the cold-start limit %d C: using the minimum OPP instead of %u kHz\n",
++                              gmC / 1000, (gmC % 1000) / 100, d->lvts.cal.defaulted ? " (approximate, 10 C margin)" : "", d->lvtsMaxC, d->board.target_khz);
++                        d->board.target_khz = 0;
++                } else if (ok) IOLog("NORD2 GPU: GPU %d.%d C: cold-start OPP %u kHz allowed\n", gmC / 1000, (gmC % 1000) / 100, d->board.target_khz);
++        }
+         bool preflight = nord2_gpu_board_preflight(&d->board);
+         const nord2_gpu_board_report &r = d->board.report;
+         /* Cached owner-thread observations only: do not touch an unpowered
+@@ -353,6 +374,10 @@
+         lock = IOLockAlloc(); if (!lock) return false;
+         int opt = 0; PE_parse_boot_argn("nord2_gpu", &opt, sizeof(opt)); enabled = opt == 1;
+         int stats = 1; PE_parse_boot_argn("nord2_gpu_stats", &stats, sizeof(stats)); jobStats = stats != 0;
++        int lv = 0; PE_parse_boot_argn("nord2_lvts", &lv, sizeof(lv)); lvtsMode = (lv >= 1 && lv <= 3) ? (unsigned)lv : 0;
++        int lm = 0; if (PE_parse_boot_argn("nord2_lvts_mask", &lm, sizeof(lm)) && lm > 0 && (lm & ~(int)N2LVTS_MASK_ALL) == 0) lvtsMask = (uint32_t)lm;
++        int lc = 0; if (PE_parse_boot_argn("nord2_lvts_max_c", &lc, sizeof(lc)) && lc >= 30 && lc <= 100) lvtsMaxC = lc;
++        if (lvtsMode) IOLog("NORD2 GPU: LVTS thermal sensing requested: mode %u mask %x cold-start guard %d C\n", lvtsMode, lvtsMask, lvtsMaxC);
+         int irq = 0; PE_parse_boot_argn("nord2_gpu_irq", &irq, sizeof(irq)); irqWanted = irq == 1;
+         int spi = 0; if (PE_parse_boot_argn("nord2_gpu_irq_spi", &spi, sizeof(spi)) && spi >= 32 && spi <= 900) irqSpi = (uint32_t)spi;
+         if (irqWanted) IOLog("NORD2 GPU: job interrupt requested (spi %u), polling remains the fallback\n", irqSpi);
+@@ -530,6 +555,59 @@
+         }
+         IOLockUnlock(lock); if (step) IODelay(step); else IOSleep(1); IOLockLock(lock);
+ }
++/* ---- LVTS thermal sensing (opt-in; see nord2_gpu_lvts.h for the safety model) ---- */
++uint32_t Nord2GPU::lvtsRd(void *p, enum n2lvts_block b, uint32_t off) {
++        Nord2GPU *d = (Nord2GPU *)p;
++        return read_bank(b == N2LVTS_AP ? &d->lvtsAp : b == N2LVTS_MCU ? &d->lvtsMcu : &d->infra, off);
++}
++void Nord2GPU::lvtsWr(void *p, enum n2lvts_block b, uint32_t off, uint32_t v) {
++        Nord2GPU *d = (Nord2GPU *)p;
++        write_bank(b == N2LVTS_AP ? &d->lvtsAp : b == N2LVTS_MCU ? &d->lvtsMcu : &d->infra, off, v);
++}
++void Nord2GPU::lvtsSetup() {
++        lvtsTried = true;
++        if (!lvtsMode) return;
++        n2lvts_ops o = { lvtsRd, lvtsWr, delay_us, log_msg };
++        if (!map_bank(&lvtsAp, N2LVTS_AP_PHYS, N2LVTS_BLOCK_BYTES) ||
++            ((lvtsMask & 7u) && !map_bank(&lvtsMcu, N2LVTS_MCU_PHYS, N2LVTS_BLOCK_BYTES)) || !n2lvts_init(&lvts, &o, this)) {
++                lvtsState = 3; IOLog("NORD2 GPU LVTS: cannot map thermal controllers\n"); return;
++        }
++        int golden = 0;
++        if (PE_parse_boot_argn("nord2_lvts_golden", &golden, sizeof(golden)) && golden > 0) lvts.cal.golden = (uint32_t)golden;
++        enum n2lvts_error e = N2LVTS_OK;
++        if (lvtsMode >= 2) {
++                e = n2lvts_start(&lvts, lvtsMask, lvtsMode >= 3);
++                if (e == N2LVTS_OK) {
++                        lvtsState = 2;
++                        for (unsigned i = 0; i < 40; i++) {            /* first sensor interval is ~20 ms; allow 200 ms */
++                                if (n2lvts_read(&lvts, lvtsMask)) break;
++                                IOSleep(5);
++                        }
++                } else lvtsState = 3;
++        } else lvtsState = 1;
++        n2lvts_probe probe = {}; bool pr = (n2lvts_probe_ctrl(&lvts, N2LVTS_CTRL_GPU, &probe) == N2LVTS_OK);
++        unsigned good = n2lvts_read(&lvts, lvtsMask);
++        IOLog("NORD2 GPU LVTS: mode=%u mask=%x start=%s state=%u gate_open=%u cal=%s valid_sensors=%u gpu_ctrl clken=%x monctl0=%x id=%x msr0=%x step=%u\n",
++              lvtsMode, lvtsMask, n2lvts_error_string(e), lvtsState, pr ? 1u : (unsigned)probe.gate_open,
++              lvts.cal.defaulted ? "default(approx)" : "efuse", good, probe.clken, probe.monctl0, probe.id, probe.msr[0], lvts.step);
++}
++bool Nord2GPU::lvtsGpu(int32_t *mC) {
++        if (!lvtsMode || lvtsState == 3 || !lvtsState) return false;
++        n2lvts_read(&lvts, N2LVTS_MASK_GPU);
++        bool a = lvts.temp_ok[10], b = lvts.temp_ok[11];
++        if (!a && !b) return false;
++        *mC = a && b ? (lvts.temp_mC[10] > lvts.temp_mC[11] ? lvts.temp_mC[10] : lvts.temp_mC[11]) : (a ? lvts.temp_mC[10] : lvts.temp_mC[11]);
++        return true;
++}
++int Nord2GPU::lvtsHottest(uint32_t mask) {   /* centi-C of the hottest valid sensor of the controllers in mask, or INT32_MIN */
++        int best = (int)0x80000000; n2lvts_read(&lvts, mask);
++        for (unsigned c = 0; c < N2LVTS_CTRL_COUNT; c++) if (mask & (1u << c))
++                for (unsigned j = 0; j < n2lvts_ctrl[c].nsens; j++) {
++                        unsigned s = n2lvts_ctrl[c].first_sensor + j;
++                        if (lvts.temp_ok[s] && lvts.temp_mC[s] / 10 > best) best = lvts.temp_mC[s] / 10;
++                }
++        return best;
++}
+ /* Battery fuel-gauge temperature (centi-C) from the SweetBattery power source, if it is a real
+  * measurement; the SoC/GPU thermal sensors (LVTS) are not driven by this port. */
+ static bool battery_temperature(int *centi) {
+@@ -551,15 +629,19 @@
+         uint32_t pll_khz = n2rail_mfgpll_khz(read_bank(&clocks[N2CLK_APMIXED], N2CLK_MFGPLL_CON1));
+         uint32_t mux = (read_bank(&clocks[N2CLK_TOPCK], N2CLK_CFG_5) >> N2CLK_MFG_MUX_SHIFT) & N2CLK_MFG_MUX_MASK;
+         int bat = 0; bool bat_ok = battery_temperature(&bat);
++        if (lvtsMode && !lvtsTried) lvtsSetup();
++        int32_t gmC = 0; bool gpu_ok = lvtsGpu(&gmC);
++        int hot = (lvtsMode && lvtsState && lvtsState != 3) ? lvtsHottest(lvtsMask) : (int)0x80000000;
+         uint32_t n = t.jobs ? t.jobs : 1, w = waitN ? waitN : 1;
+         IOLog("NORD2 GPU JOBS: n=%u fault=%u full=%u win_ms=%llu q_us=%llu/%u run_us=%llu/%u tot_us=%llu/%u "
+-              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u gpu_khz=%u mux=%u bat_cC=%d bat_ok=%u irq=%u:%u/%u/%u/%u\n",
++              "clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu waits=%u gap_us=%llu/%u wait_us=%llu/%u ret_us=%llu/%u seqw=%u/%u/%llu/%u gpu_khz=%u mux=%u bat_cC=%d bat_ok=%u gpu_cC=%d soc_cC=%d lvts=%u%s irq=%u:%u/%u/%u/%u\n",
+               t.jobs, t.faulted, t.full_jobs, t.window_start_us / 1000, t.sum_queue_us / n, t.max_queue_us,
+               t.sum_run_us / n, t.max_run_us, t.sum_total_us / n, t.max_total_us, t.sum_clean_us / n, t.max_clean_us,
+               t.sum_inval_us / n, t.max_inval_us, t.sum_clean_pages * 4, t.sum_inval_pages * 4, waitN,
+               waitGapSum / w, waitGapMax, waitDurSum / w, waitDurMax, waitRetSum / w, waitRetMax,
+               seqWaits, seqJobs, seqWaits ? seqDurSum / seqWaits : 0ull, seqDurMax, pll_khz, mux,
+-              bat_ok ? bat : 0, (unsigned)bat_ok,
++              bat_ok ? bat : 0, (unsigned)bat_ok, gpu_ok ? gmC / 10 : -9999, hot != (int)0x80000000 ? hot : -9999,
++              lvtsState, (lvtsState && lvts.cal.defaulted) ? "~" : "",
+               (unsigned)irqState, irqTops, irqGuard.spurious_total, irqSleeps, irqTimeouts);
+         waitN = waitGapMax = waitDurMax = waitRetMax = 0; waitGapSum = waitDurSum = waitRetSum = 0;
+         seqWaits = seqJobs = seqDurMax = 0; seqDurSum = 0;
+--- a/gpu/include/nord2_gpu_lvts.h
++++ b/gpu/include/nord2_gpu_lvts.h
+@@ -0,0 +1,157 @@
++/*
++ * Nord 2 MT6893 LVTS thermal sensing (GPU/CPU/SoC temperatures), opt-in.
++ *
++ * Sources (Android kernel, drivers/misc/mediatek/thermal/mt6893/): mtk_lvts_tc.c, inc/tscpu_lvts_config.h,
++ * inc/mach/mtk_thermal.h; arch/arm64/boot/dts/mediatek/mt6893.dts (therm_ctrl@1100b000, efuse@11c10000);
++ * drivers/clk/mediatek/clk-mt6885.c (ifrao_therm = infracfg_ao CG0 bit 10, STA 0x090 / CLR 0x084).
++ *
++ * Seven thermal controllers: MCU (CPU) at 0x11278000 + {0,0x100,0x200}, AP at 0x1100b000 + {0,0x100,0x200,0x300}.
++ * GPU is LVTS5 (controller 4, AP+0x100, two sensors, device id 0x85).
++ *
++ * Safety model:
++ *  - every register access goes through struct n2lvts_ops (host register-model tested);
++ *  - level 1 (probe) only READS: the infracfg thermal clock gate first (a gated block must never be touched),
++ *    then the controller's monitor/MSR registers.  Level 2 runs the vendor init for the selected controllers
++ *    (never the hardware-protect / reset registers, never interrupts), level 3 additionally opens the clock gate.
++ *  - the efuse calibration cannot be read offline (devinfo index -> MMIO mapping is not linear, the data is handed
++ *    over by the bootloader in /chosen atag,devinfo): without it the vendor's own "uncalibrated" defaults are used and
++ *    every result is flagged approximate; implausible results are never reported or used.
++ *
++ * Copyright (c) 2026 ios-sweet contributors.  SPDX-License-Identifier: MIT.
++ */
++#ifndef NORD2_GPU_LVTS_H
++#define NORD2_GPU_LVTS_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define N2LVTS_AP_PHYS    0x1100b000u
++#define N2LVTS_MCU_PHYS   0x11278000u
++#define N2LVTS_BLOCK_BYTES 0x400u        /* four controllers of 0x100 */
++#define N2LVTS_INFRA_CG_CLR 0x084u
++#define N2LVTS_INFRA_CG_STA 0x090u
++#define N2LVTS_INFRA_THERM_BIT 10u       /* 1 = gated */
++
++/* Controller registers (offset from the controller base). */
++#define N2LVTS_MONCTL0  0x000u
++#define N2LVTS_MONCTL1  0x004u
++#define N2LVTS_MONCTL2  0x008u
++#define N2LVTS_MONINT   0x00cu
++#define N2LVTS_MSRCTL0  0x038u
++#define N2LVTS_MSRCTL1  0x03cu
++#define N2LVTS_TSSEL    0x040u
++#define N2LVTS_CALSCALE 0x048u
++#define N2LVTS_ID       0x04cu
++#define N2LVTS_CONFIG   0x050u
++#define N2LVTS_EDATA0   0x054u           /* + 4*sensor */
++#define N2LVTS_MSR0     0x090u           /* + 4*sensor */
++#define N2LVTS_RDATA0   0x0b0u
++#define N2LVTS_CLKEN    0x0e4u
++
++#define N2LVTS_CTRL_COUNT 7u
++#define N2LVTS_SENSOR_COUNT 17u
++#define N2LVTS_CTRL_GPU 4u
++#define N2LVTS_MASK_GPU (1u << N2LVTS_CTRL_GPU)
++#define N2LVTS_MASK_ALL ((1u << N2LVTS_CTRL_COUNT) - 1u)
++
++/* Vendor fallback calibration for an uncalibrated sample (DEFAULT_EFUSE_*). */
++#define N2LVTS_DEFAULT_GOLDEN 50u        /* 2 x degC */
++#define N2LVTS_DEFAULT_COUNT_R 35000u
++#define N2LVTS_DEFAULT_COUNT_RC 2750u
++
++enum n2lvts_block { N2LVTS_AP = 0, N2LVTS_MCU = 1, N2LVTS_INFRA = 2 };
++
++struct n2lvts_ctrl_desc {
++        uint8_t block;          /* N2LVTS_AP / N2LVTS_MCU */
++        uint16_t offset;        /* controller offset in the block */
++        uint8_t nsens;
++        uint8_t first_sensor;   /* index into the 17-entry sensor arrays */
++        const char *role;
++};
++extern const struct n2lvts_ctrl_desc n2lvts_ctrl[N2LVTS_CTRL_COUNT];
++
++struct n2lvts_ops {
++        uint32_t (*rd)(void *ctx, enum n2lvts_block b, uint32_t off);
++        void (*wr)(void *ctx, enum n2lvts_block b, uint32_t off, uint32_t v);
++        void (*udelay)(void *ctx, unsigned us);
++        void (*log)(void *ctx, const char *msg);
++};
++
++struct n2lvts_cal {
++        bool defaulted;                          /* vendor fake values: temperatures are approximate */
++        uint32_t golden;                         /* 2 x degC */
++        uint32_t count_r[N2LVTS_SENSOR_COUNT];
++        uint32_t count_rc[N2LVTS_CTRL_COUNT];
++};
++
++enum n2lvts_error {
++        N2LVTS_OK = 0,
++        N2LVTS_E_ARGS,
++        N2LVTS_E_GATED,        /* infracfg thermal clock gate closed: block not touched */
++        N2LVTS_E_CAL,          /* calibration implausible */
++        N2LVTS_E_BUSY,         /* device access never completed */
++        N2LVTS_E_ID,           /* device id mismatch: controller left as found */
++        N2LVTS_E_NODATA,       /* no valid sample before the deadline */
++};
++
++struct n2lvts_probe {
++        bool gate_open;
++        uint32_t clken, monctl0, id, msr[4];
++};
++
++struct n2lvts {
++        struct n2lvts_ops ops;
++        void *ctx;
++        struct n2lvts_cal cal;
++        uint32_t running;                        /* controllers we started and verified */
++        uint32_t saved_clken[N2LVTS_CTRL_COUNT], saved_monctl0[N2LVTS_CTRL_COUNT];
++        bool ungated_by_us;
++        uint32_t step;                           /* last init step, for diagnostics */
++        int32_t temp_mC[N2LVTS_SENSOR_COUNT];
++        uint32_t raw[N2LVTS_SENSOR_COUNT];
++        bool temp_ok[N2LVTS_SENSOR_COUNT];
++};
++
++bool n2lvts_init(struct n2lvts *l, const struct n2lvts_ops *ops, void *ctx);
++
++/* Calibration.  efuse words are devinfo indices 116..119, 190..207 in this order (22 words). */
++void n2lvts_cal_default(struct n2lvts_cal *c);
++bool n2lvts_cal_from_efuse(const uint32_t w[22], struct n2lvts_cal *c);   /* false: all zero -> defaults, or implausible */
++bool n2lvts_cal_plausible(const struct n2lvts_cal *c);
++
++/* raw MSR -> milli-degC (vendor formula: -252.5 * raw / 2^14 + golden/2 + 252.5).  false: invalid bit, raw 0, or outside -40..150 C. */
++bool n2lvts_msr_to_mC(uint32_t msr, uint32_t golden, int32_t *mC);
++
++/* Level 1: read-only. */
++enum n2lvts_error n2lvts_probe_ctrl(struct n2lvts *l, unsigned ctrl, struct n2lvts_probe *p);
++/* Level 2/3: vendor init of the controllers in mask (open_gate = level 3). */
++enum n2lvts_error n2lvts_start(struct n2lvts *l, uint32_t mask, bool open_gate);
++/* Refresh temp_mC/temp_ok for every controller that is running or measuring (read-only). */
++unsigned n2lvts_read(struct n2lvts *l, uint32_t mask);
++/* Stop what we started: sensing off, devices reset, clock enable restored; re-gate only if we opened it. */
++void n2lvts_stop(struct n2lvts *l);
++const char *n2lvts_error_string(enum n2lvts_error e);
++
++/* ---- guard and (design only, not wired) throttle policy ---- */
++/* Cold-start high-OPP guard: false = refuse the request and use the minimum OPP.  Uncalibrated readings
++ * count with a 10 C safety margin.  An unreadable sensor never blocks (nothing known). */
++bool n2lvts_allows_cold_start_opp(int32_t temp_mC, bool valid, bool calibrated, int32_t max_mC);
++
++struct n2lvts_throttle {
++        int32_t soft_mC, hard_mC, hyst_mC;       /* e.g. 70 C / 80 C / 5 C */
++        uint8_t level;                           /* 0 free, 1 mid cap, 2 minimum */
++        uint8_t invalid_run;                     /* consecutive unreadable samples */
++};
++#define N2LVTS_THROTTLE_INVALID_MAX 5u
++/* One decision step; hysteresis on the way down.  Persistently unreadable sensors go to level 1, never higher. */
++uint8_t n2lvts_throttle_step(struct n2lvts_throttle *t, int32_t temp_mC, bool valid);
++uint32_t n2lvts_throttle_khz_cap(uint8_t level);   /* 886000 / 654000 / 350000 */
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- a/shim/nord2-xnu/nord2_gpu_lvts.h
++++ b/shim/nord2-xnu/nord2_gpu_lvts.h
+@@ -0,0 +1,157 @@
++/*
++ * Nord 2 MT6893 LVTS thermal sensing (GPU/CPU/SoC temperatures), opt-in.
++ *
++ * Sources (Android kernel, drivers/misc/mediatek/thermal/mt6893/): mtk_lvts_tc.c, inc/tscpu_lvts_config.h,
++ * inc/mach/mtk_thermal.h; arch/arm64/boot/dts/mediatek/mt6893.dts (therm_ctrl@1100b000, efuse@11c10000);
++ * drivers/clk/mediatek/clk-mt6885.c (ifrao_therm = infracfg_ao CG0 bit 10, STA 0x090 / CLR 0x084).
++ *
++ * Seven thermal controllers: MCU (CPU) at 0x11278000 + {0,0x100,0x200}, AP at 0x1100b000 + {0,0x100,0x200,0x300}.
++ * GPU is LVTS5 (controller 4, AP+0x100, two sensors, device id 0x85).
++ *
++ * Safety model:
++ *  - every register access goes through struct n2lvts_ops (host register-model tested);
++ *  - level 1 (probe) only READS: the infracfg thermal clock gate first (a gated block must never be touched),
++ *    then the controller's monitor/MSR registers.  Level 2 runs the vendor init for the selected controllers
++ *    (never the hardware-protect / reset registers, never interrupts), level 3 additionally opens the clock gate.
++ *  - the efuse calibration cannot be read offline (devinfo index -> MMIO mapping is not linear, the data is handed
++ *    over by the bootloader in /chosen atag,devinfo): without it the vendor's own "uncalibrated" defaults are used and
++ *    every result is flagged approximate; implausible results are never reported or used.
++ *
++ * Copyright (c) 2026 ios-sweet contributors.  SPDX-License-Identifier: MIT.
++ */
++#ifndef NORD2_GPU_LVTS_H
++#define NORD2_GPU_LVTS_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define N2LVTS_AP_PHYS    0x1100b000u
++#define N2LVTS_MCU_PHYS   0x11278000u
++#define N2LVTS_BLOCK_BYTES 0x400u        /* four controllers of 0x100 */
++#define N2LVTS_INFRA_CG_CLR 0x084u
++#define N2LVTS_INFRA_CG_STA 0x090u
++#define N2LVTS_INFRA_THERM_BIT 10u       /* 1 = gated */
++
++/* Controller registers (offset from the controller base). */
++#define N2LVTS_MONCTL0  0x000u
++#define N2LVTS_MONCTL1  0x004u
++#define N2LVTS_MONCTL2  0x008u
++#define N2LVTS_MONINT   0x00cu
++#define N2LVTS_MSRCTL0  0x038u
++#define N2LVTS_MSRCTL1  0x03cu
++#define N2LVTS_TSSEL    0x040u
++#define N2LVTS_CALSCALE 0x048u
++#define N2LVTS_ID       0x04cu
++#define N2LVTS_CONFIG   0x050u
++#define N2LVTS_EDATA0   0x054u           /* + 4*sensor */
++#define N2LVTS_MSR0     0x090u           /* + 4*sensor */
++#define N2LVTS_RDATA0   0x0b0u
++#define N2LVTS_CLKEN    0x0e4u
++
++#define N2LVTS_CTRL_COUNT 7u
++#define N2LVTS_SENSOR_COUNT 17u
++#define N2LVTS_CTRL_GPU 4u
++#define N2LVTS_MASK_GPU (1u << N2LVTS_CTRL_GPU)
++#define N2LVTS_MASK_ALL ((1u << N2LVTS_CTRL_COUNT) - 1u)
++
++/* Vendor fallback calibration for an uncalibrated sample (DEFAULT_EFUSE_*). */
++#define N2LVTS_DEFAULT_GOLDEN 50u        /* 2 x degC */
++#define N2LVTS_DEFAULT_COUNT_R 35000u
++#define N2LVTS_DEFAULT_COUNT_RC 2750u
++
++enum n2lvts_block { N2LVTS_AP = 0, N2LVTS_MCU = 1, N2LVTS_INFRA = 2 };
++
++struct n2lvts_ctrl_desc {
++        uint8_t block;          /* N2LVTS_AP / N2LVTS_MCU */
++        uint16_t offset;        /* controller offset in the block */
++        uint8_t nsens;
++        uint8_t first_sensor;   /* index into the 17-entry sensor arrays */
++        const char *role;
++};
++extern const struct n2lvts_ctrl_desc n2lvts_ctrl[N2LVTS_CTRL_COUNT];
++
++struct n2lvts_ops {
++        uint32_t (*rd)(void *ctx, enum n2lvts_block b, uint32_t off);
++        void (*wr)(void *ctx, enum n2lvts_block b, uint32_t off, uint32_t v);
++        void (*udelay)(void *ctx, unsigned us);
++        void (*log)(void *ctx, const char *msg);
++};
++
++struct n2lvts_cal {
++        bool defaulted;                          /* vendor fake values: temperatures are approximate */
++        uint32_t golden;                         /* 2 x degC */
++        uint32_t count_r[N2LVTS_SENSOR_COUNT];
++        uint32_t count_rc[N2LVTS_CTRL_COUNT];
++};
++
++enum n2lvts_error {
++        N2LVTS_OK = 0,
++        N2LVTS_E_ARGS,
++        N2LVTS_E_GATED,        /* infracfg thermal clock gate closed: block not touched */
++        N2LVTS_E_CAL,          /* calibration implausible */
++        N2LVTS_E_BUSY,         /* device access never completed */
++        N2LVTS_E_ID,           /* device id mismatch: controller left as found */
++        N2LVTS_E_NODATA,       /* no valid sample before the deadline */
++};
++
++struct n2lvts_probe {
++        bool gate_open;
++        uint32_t clken, monctl0, id, msr[4];
++};
++
++struct n2lvts {
++        struct n2lvts_ops ops;
++        void *ctx;
++        struct n2lvts_cal cal;
++        uint32_t running;                        /* controllers we started and verified */
++        uint32_t saved_clken[N2LVTS_CTRL_COUNT], saved_monctl0[N2LVTS_CTRL_COUNT];
++        bool ungated_by_us;
++        uint32_t step;                           /* last init step, for diagnostics */
++        int32_t temp_mC[N2LVTS_SENSOR_COUNT];
++        uint32_t raw[N2LVTS_SENSOR_COUNT];
++        bool temp_ok[N2LVTS_SENSOR_COUNT];
++};
++
++bool n2lvts_init(struct n2lvts *l, const struct n2lvts_ops *ops, void *ctx);
++
++/* Calibration.  efuse words are devinfo indices 116..119, 190..207 in this order (22 words). */
++void n2lvts_cal_default(struct n2lvts_cal *c);
++bool n2lvts_cal_from_efuse(const uint32_t w[22], struct n2lvts_cal *c);   /* false: all zero -> defaults, or implausible */
++bool n2lvts_cal_plausible(const struct n2lvts_cal *c);
++
++/* raw MSR -> milli-degC (vendor formula: -252.5 * raw / 2^14 + golden/2 + 252.5).  false: invalid bit, raw 0, or outside -40..150 C. */
++bool n2lvts_msr_to_mC(uint32_t msr, uint32_t golden, int32_t *mC);
++
++/* Level 1: read-only. */
++enum n2lvts_error n2lvts_probe_ctrl(struct n2lvts *l, unsigned ctrl, struct n2lvts_probe *p);
++/* Level 2/3: vendor init of the controllers in mask (open_gate = level 3). */
++enum n2lvts_error n2lvts_start(struct n2lvts *l, uint32_t mask, bool open_gate);
++/* Refresh temp_mC/temp_ok for every controller that is running or measuring (read-only). */
++unsigned n2lvts_read(struct n2lvts *l, uint32_t mask);
++/* Stop what we started: sensing off, devices reset, clock enable restored; re-gate only if we opened it. */
++void n2lvts_stop(struct n2lvts *l);
++const char *n2lvts_error_string(enum n2lvts_error e);
++
++/* ---- guard and (design only, not wired) throttle policy ---- */
++/* Cold-start high-OPP guard: false = refuse the request and use the minimum OPP.  Uncalibrated readings
++ * count with a 10 C safety margin.  An unreadable sensor never blocks (nothing known). */
++bool n2lvts_allows_cold_start_opp(int32_t temp_mC, bool valid, bool calibrated, int32_t max_mC);
++
++struct n2lvts_throttle {
++        int32_t soft_mC, hard_mC, hyst_mC;       /* e.g. 70 C / 80 C / 5 C */
++        uint8_t level;                           /* 0 free, 1 mid cap, 2 minimum */
++        uint8_t invalid_run;                     /* consecutive unreadable samples */
++};
++#define N2LVTS_THROTTLE_INVALID_MAX 5u
++/* One decision step; hysteresis on the way down.  Persistently unreadable sensors go to level 1, never higher. */
++uint8_t n2lvts_throttle_step(struct n2lvts_throttle *t, int32_t temp_mC, bool valid);
++uint32_t n2lvts_throttle_khz_cap(uint8_t level);   /* 886000 / 654000 / 350000 */
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- a/gpu/src/nord2_gpu_lvts.c
++++ b/gpu/src/nord2_gpu_lvts.c
+@@ -0,0 +1,347 @@
++/* MT6893 LVTS thermal sensing: see nord2_gpu_lvts.h.  SPDX-License-Identifier: MIT */
++#include "nord2_gpu_lvts.h"
++
++#include <string.h>
++
++#define CTRL(blk, off, n, first, name) { (blk), (off), (n), (first), (name) }
++const struct n2lvts_ctrl_desc n2lvts_ctrl[N2LVTS_CTRL_COUNT] = {
++        CTRL(N2LVTS_MCU, 0x000, 2, 0, "cpu-big"),      /* LVTS1: MCU_BIG, MCU_BIGBIG */
++        CTRL(N2LVTS_MCU, 0x100, 2, 2, "cpu-big2"),     /* LVTS2 */
++        CTRL(N2LVTS_MCU, 0x200, 4, 4, "cpu-little"),   /* LVTS3 */
++        CTRL(N2LVTS_AP,  0x000, 2, 8, "vpu-mdla"),     /* LVTS4 */
++        CTRL(N2LVTS_AP,  0x100, 2, 10, "gpu"),         /* LVTS5: GPU (T11,T12) */
++        CTRL(N2LVTS_AP,  0x200, 2, 12, "infra-cam"),   /* LVTS6 */
++        CTRL(N2LVTS_AP,  0x300, 3, 14, "md"),          /* LVTS7 */
++};
++#undef CTRL
++
++static void note(struct n2lvts *l, const char *m)
++{
++        if (l->ops.log)
++                l->ops.log(l->ctx, m);
++}
++static uint32_t rd(struct n2lvts *l, unsigned c, uint32_t off)
++{
++        return l->ops.rd(l->ctx, (enum n2lvts_block)n2lvts_ctrl[c].block, n2lvts_ctrl[c].offset + off);
++}
++static void wr(struct n2lvts *l, unsigned c, uint32_t off, uint32_t v)
++{
++        l->ops.wr(l->ctx, (enum n2lvts_block)n2lvts_ctrl[c].block, n2lvts_ctrl[c].offset + off, v);
++}
++
++bool n2lvts_init(struct n2lvts *l, const struct n2lvts_ops *ops, void *ctx)
++{
++        if (!l || !ops || !ops->rd || !ops->wr || !ops->udelay)
++                return false;
++        memset(l, 0, sizeof(*l));
++        l->ops = *ops;
++        l->ctx = ctx;
++        n2lvts_cal_default(&l->cal);
++        return true;
++}
++
++/* ---------------- calibration ---------------- */
++void n2lvts_cal_default(struct n2lvts_cal *c)
++{
++        memset(c, 0, sizeof(*c));
++        c->defaulted = true;
++        c->golden = N2LVTS_DEFAULT_GOLDEN;
++        for (unsigned i = 0; i < N2LVTS_SENSOR_COUNT; i++)
++                c->count_r[i] = N2LVTS_DEFAULT_COUNT_R;
++        for (unsigned i = 0; i < N2LVTS_CTRL_COUNT; i++)
++                c->count_rc[i] = N2LVTS_DEFAULT_COUNT_RC;
++}
++
++bool n2lvts_cal_plausible(const struct n2lvts_cal *c)
++{
++        /* Generous physical bounds around the vendor defaults; a decode that leaves them is wrong data. */
++        if (!c || c->golden < 40u || c->golden > 120u)
++                return false;
++        for (unsigned i = 0; i < N2LVTS_SENSOR_COUNT; i++)
++                if (c->count_r[i] < 10000u || c->count_r[i] > 100000u)
++                        return false;
++        for (unsigned i = 0; i < N2LVTS_CTRL_COUNT; i++)
++                if (c->count_rc[i] < 1000u || c->count_rc[i] > 6000u)
++                        return false;
++        return true;
++}
++
++bool n2lvts_cal_from_efuse(const uint32_t t[22], struct n2lvts_cal *c)
++{
++        if (!t || !c)
++                return false;
++        struct n2lvts_cal x;
++        memset(&x, 0, sizeof(x));
++        x.golden = (t[0] >> 24) & 0xffu;
++        for (unsigned k = 0; k < 17; k++)
++                x.count_r[k] = t[k + 1] & 0xffffffu;
++        x.count_rc[0] = t[21] & 0xffffffu;
++        for (unsigned g = 1; g < N2LVTS_CTRL_COUNT; g++) {
++                unsigned w = 1 + 3 * (g - 1);                    /* words 1-3, 4-6, ... 16-18 */
++                x.count_rc[g] = ((t[w] & 0xff000000u) >> 8) + ((t[w + 1] & 0xff000000u) >> 16) +
++                                ((t[w + 2] & 0xff000000u) >> 24);
++        }
++        bool any = false;                                        /* vendor test: all zero = unfused sample */
++        for (unsigned i = 0; i < N2LVTS_SENSOR_COUNT; i++)
++                if (i == 0 ? (t[0] & 0xffu) != 0 : t[i] != 0) { any = true; break; }
++        if (!any || !n2lvts_cal_plausible(&x)) {
++                n2lvts_cal_default(c);
++                return false;
++        }
++        *c = x;
++        c->defaulted = false;
++        return true;
++}
++
++bool n2lvts_msr_to_mC(uint32_t msr, uint32_t golden, int32_t *mC)
++{
++        uint32_t raw = msr & 0xffffu;
++        if (!(msr & 0x10000u) || !raw)
++                return false;
++        /* vendor: ((int)-252500 * raw) >> 14 truncates toward -infinity of the magnitude: -ceil(252500*raw/2^14) */
++        int64_t t = -(int64_t)(((uint64_t)252500u * raw + 16383u) >> 14);
++        t += (int64_t)golden * 500 + 252500;
++        if (t < -40000 || t > 150000)
++                return false;
++        if (mC)
++                *mC = (int32_t)t;
++        return true;
++}
++
++/* ---------------- device access ---------------- */
++static bool dev_wait(struct n2lvts *l, unsigned c, uint32_t bit)
++{
++        for (unsigned n = 0; n < 100; n++) {
++                if (!(rd(l, c, N2LVTS_CONFIG) & bit))
++                        return true;
++                l->ops.udelay(l->ctx, 2);
++        }
++        return false;
++}
++static bool dev_write(struct n2lvts *l, unsigned c, uint32_t cfg_hi, uint32_t reg, uint32_t data)
++{
++        wr(l, c, N2LVTS_CONFIG, cfg_hi | ((reg & 0xffu) << 8) | (data & 0xffu));
++        l->ops.udelay(l->ctx, 3);
++        return dev_wait(l, c, 1u << 24);
++}
++static bool dev_read(struct n2lvts *l, unsigned c, uint32_t reg, uint32_t *v)
++{
++        wr(l, c, N2LVTS_CONFIG, 0x81020000u | ((reg & 0xffu) << 8));
++        l->ops.udelay(l->ctx, 5);
++        bool ok = dev_wait(l, c, 1u << 24);
++        *v = rd(l, c, N2LVTS_RDATA0);
++        return ok;
++}
++#define DW(c, reg, data) do { if (!dev_write(l, (c), 0x81030000u, (reg), (data))) return N2LVTS_E_BUSY; } while (0)
++
++static bool gate_open(struct n2lvts *l)
++{
++        return !((l->ops.rd(l->ctx, N2LVTS_INFRA, N2LVTS_INFRA_CG_STA) >> N2LVTS_INFRA_THERM_BIT) & 1u);
++}
++
++enum n2lvts_error n2lvts_probe_ctrl(struct n2lvts *l, unsigned c, struct n2lvts_probe *p)
++{
++        if (!l || !p || c >= N2LVTS_CTRL_COUNT)
++                return N2LVTS_E_ARGS;
++        memset(p, 0, sizeof(*p));
++        p->gate_open = gate_open(l);
++        if (!p->gate_open)
++                return N2LVTS_E_GATED;                   /* nothing else touched */
++        p->clken = rd(l, c, N2LVTS_CLKEN);
++        p->monctl0 = rd(l, c, N2LVTS_MONCTL0);
++        p->id = rd(l, c, N2LVTS_ID);
++        for (unsigned j = 0; j < n2lvts_ctrl[c].nsens && j < 4; j++)
++                p->msr[j] = rd(l, c, N2LVTS_MSR0 + 4 * j);
++        return N2LVTS_OK;
++}
++
++/* One controller, vendor order (wrapper: identification, enable/init devices, RC count, efuse, periodic off,
++ * data-fetch setup, initial_all_tc, enable).  Interrupts, protection registers and resets are never written. */
++static enum n2lvts_error start_ctrl(struct n2lvts *l, unsigned c)
++{
++        const struct n2lvts_ctrl_desc *d = &n2lvts_ctrl[c];
++        l->saved_clken[c] = rd(l, c, N2LVTS_CLKEN);
++        l->saved_monctl0[c] = rd(l, c, N2LVTS_MONCTL0);
++        l->step = 1;
++        wr(l, c, N2LVTS_MONCTL0, 0);                                     /* no sensing while configuring */
++        wr(l, c, N2LVTS_CLKEN, 1);
++        l->step = 2;
++        DW(c, 0xff, 0xff);                                               /* reset devices */
++        l->step = 3;
++        if (!dev_write(l, c, 0x85020000u, 0xfc, 0x55))                   /* read back device id with update */
++                return N2LVTS_E_BUSY;
++        if ((rd(l, c, N2LVTS_ID) & 0xffu) != 0x81u + c) {
++                note(l, "Nord2 LVTS: device id mismatch, controller left as found");
++                return N2LVTS_E_ID;
++        }
++        l->step = 4;                                                     /* lvts_Device_Enable_Init_all_Devices */
++        DW(c, 0x03, 0x00); DW(c, 0x04, 0x20); DW(c, 0x05, 0x00);
++        DW(c, 0x0a, 0xc4); DW(c, 0x0c, 0x7c); DW(c, 0x09, 0x8d);
++        DW(c, 0x08, 0xf5); DW(c, 0x08, 0xfc); DW(c, 0x08, 0xf5); DW(c, 0x07, 0xa6);
++        l->step = 5;                                                     /* lvts_device_read_count_RC_N (manual RCK) */
++        uint32_t rc_now[4] = {0, 0, 0, 0};
++        DW(c, 0x0e, 0x00);
++        for (unsigned j = 0; j < d->nsens; j++) {
++                DW(c, 0x0d, j); DW(c, 0x06, 0x78); DW(c, 0x07, 0xa6);
++                DW(c, 0x08, 0xf5); DW(c, 0x08, 0xfc); DW(c, 0x08, 0xf5);
++                l->ops.udelay(l->ctx, 10);
++                DW(c, 0x03, 0x02);                                       /* kick RCK counting */
++                l->ops.udelay(l->ctx, 30);
++                if (!dev_wait(l, c, 1u << 25))
++                        return N2LVTS_E_BUSY;                            /* DEVICE_SENSING_STATUS */
++                uint32_t v;
++                if (!dev_read(l, c, 0x00, &v))
++                        return N2LVTS_E_BUSY;
++                l->ops.udelay(l->ctx, 5);
++                uint32_t rc = v & 0xffffffu, ref = l->cal.count_rc[c];
++                /* LVTS_REFINE_MANUAL_RCK_WITH_EFUSE: a missing or >6% off count is replaced by the efuse value */
++                bool off = !rc || (ref > rc ? ref * 1000ull / rc : rc * 1000ull / ref) > 1061u;
++                rc_now[j] = off ? ref : rc;
++                DW(c, 0x08, 0xf1);
++                if (!dev_wait(l, c, 1u << 24))
++                        return N2LVTS_E_BUSY;
++        }
++        DW(c, 0x0d, 0x10);
++        l->step = 6;                                                     /* lvts_efuse_setting */
++        for (unsigned j = 0; j < d->nsens; j++)
++                wr(l, c, N2LVTS_EDATA0 + 4 * j,
++                   (uint32_t)(((uint64_t)rc_now[j] * l->cal.count_r[d->first_sensor + j]) >> 14));
++        l->step = 7;                                                     /* data fetch + initial_all_tc */
++        wr(l, c, N2LVTS_TSSEL, 0x13121110u);
++        wr(l, c, N2LVTS_MSRCTL0, 0x53);
++        wr(l, c, N2LVTS_CALSCALE, 0x300);
++        wr(l, c, N2LVTS_MONCTL1, 0x3ff);
++        wr(l, c, N2LVTS_MONCTL2, 0x3ff);
++        DW(c, 0x06, 0xb8);                                               /* device single mode */
++        wr(l, c, N2LVTS_MONCTL1, (1u << 20) | 0x00cu);                   /* group delay 1, period unit 0x0c */
++        wr(l, c, N2LVTS_MONCTL2, (1u << 16) | 1u);                       /* filter 1, sensor interval 1 */
++        wr(l, c, N2LVTS_MSRCTL0, 0x492);                                 /* 2 of 4 samples */
++        l->ops.udelay(l->ctx, 1);
++        l->step = 8;
++        wr(l, c, N2LVTS_MONCTL0, 0x200u | ((1u << d->nsens) - 1u));      /* enable sensing points */
++        return N2LVTS_OK;
++}
++
++static void restore_ctrl(struct n2lvts *l, unsigned c)
++{
++        wr(l, c, N2LVTS_MONCTL0, 0);
++        (void)dev_write(l, c, 0x81030000u, 0xff, 0xff);
++        wr(l, c, N2LVTS_CLKEN, l->saved_clken[c]);
++        if (l->saved_monctl0[c])
++                wr(l, c, N2LVTS_MONCTL0, l->saved_monctl0[c]);
++}
++
++enum n2lvts_error n2lvts_start(struct n2lvts *l, uint32_t mask, bool open_gate)
++{
++        if (!l || !mask || (mask & ~N2LVTS_MASK_ALL))
++                return N2LVTS_E_ARGS;
++        if (!n2lvts_cal_plausible(&l->cal))
++                return N2LVTS_E_CAL;
++        if (!gate_open(l)) {
++                if (!open_gate)
++                        return N2LVTS_E_GATED;
++                l->ops.wr(l->ctx, N2LVTS_INFRA, N2LVTS_INFRA_CG_CLR, 1u << N2LVTS_INFRA_THERM_BIT);
++                l->ops.udelay(l->ctx, 10);
++                if (!gate_open(l))
++                        return N2LVTS_E_GATED;
++                l->ungated_by_us = true;
++        }
++        enum n2lvts_error e = N2LVTS_OK;
++        for (unsigned c = 0; c < N2LVTS_CTRL_COUNT; c++) {
++                if (!(mask & (1u << c)))
++                        continue;
++                enum n2lvts_error r = start_ctrl(l, c);
++                if (r != N2LVTS_OK) {
++                        restore_ctrl(l, c);
++                        e = r;
++                        break;
++                }
++                l->running |= 1u << c;
++        }
++        if (e != N2LVTS_OK)
++                n2lvts_stop(l);                              /* all-or-nothing for what we started */
++        return e;
++}
++
++unsigned n2lvts_read(struct n2lvts *l, uint32_t mask)
++{
++        unsigned good = 0;
++        if (!l || !gate_open(l))
++                return 0;
++        for (unsigned c = 0; c < N2LVTS_CTRL_COUNT; c++) {
++                if (!(mask & (1u << c)))
++                        continue;
++                bool sensing = (rd(l, c, N2LVTS_MONCTL0) & 0x200u) != 0;
++                for (unsigned j = 0; j < n2lvts_ctrl[c].nsens; j++) {
++                        unsigned s = n2lvts_ctrl[c].first_sensor + j;
++                        uint32_t msr = sensing ? rd(l, c, N2LVTS_MSR0 + 4 * j) : 0;
++                        l->raw[s] = msr & 0xffffu;
++                        l->temp_ok[s] = sensing && n2lvts_msr_to_mC(msr, l->cal.golden, &l->temp_mC[s]);
++                        good += l->temp_ok[s];
++                }
++        }
++        return good;
++}
++
++void n2lvts_stop(struct n2lvts *l)
++{
++        if (!l)
++                return;
++        for (unsigned c = 0; c < N2LVTS_CTRL_COUNT; c++)
++                if (l->running & (1u << c))
++                        restore_ctrl(l, c);
++        l->running = 0;
++        if (l->ungated_by_us) {
++                /* Re-gating needs the SET alias (0x080); the gate was closed when we found it. */
++                l->ops.wr(l->ctx, N2LVTS_INFRA, 0x080u, 1u << N2LVTS_INFRA_THERM_BIT);
++                l->ungated_by_us = false;
++        }
++}
++
++const char *n2lvts_error_string(enum n2lvts_error e)
++{
++        switch (e) {
++        case N2LVTS_OK: return "ok";
++        case N2LVTS_E_ARGS: return "bad arguments";
++        case N2LVTS_E_GATED: return "thermal clock gate closed";
++        case N2LVTS_E_CAL: return "calibration implausible";
++        case N2LVTS_E_BUSY: return "device access timed out";
++        case N2LVTS_E_ID: return "device id mismatch";
++        case N2LVTS_E_NODATA: return "no valid sample";
++        }
++        return "?";
++}
++
++/* ---------------- guard and throttle policy ---------------- */
++bool n2lvts_allows_cold_start_opp(int32_t temp_mC, bool valid, bool calibrated, int32_t max_mC)
++{
++        if (!valid)
++                return true;
++        return temp_mC <= (calibrated ? max_mC : max_mC - 10000);
++}
++
++uint8_t n2lvts_throttle_step(struct n2lvts_throttle *t, int32_t temp_mC, bool valid)
++{
++        if (!valid) {
++                if (t->invalid_run < 255)
++                        t->invalid_run++;
++                if (t->invalid_run >= N2LVTS_THROTTLE_INVALID_MAX && t->level < 1)
++                        t->level = 1;                    /* unknown temperature: cap, never minimum */
++                return t->level;
++        }
++        t->invalid_run = 0;
++        if (temp_mC >= t->hard_mC)
++                t->level = 2;
++        else if (temp_mC >= t->soft_mC && t->level < 1)
++                t->level = 1;
++        else if (t->level == 2 && temp_mC < t->hard_mC - t->hyst_mC)
++                t->level = 1;
++        else if (t->level == 1 && temp_mC < t->soft_mC - t->hyst_mC)
++                t->level = 0;
++        return t->level;
++}
++
++uint32_t n2lvts_throttle_khz_cap(uint8_t level)
++{
++        return level == 0 ? 886000u : level == 1 ? 654000u : 350000u;
++}
+--- a/shim/nord2-xnu/nord2_gpu_lvts.c
++++ b/shim/nord2-xnu/nord2_gpu_lvts.c
+@@ -0,0 +1,347 @@
++/* MT6893 LVTS thermal sensing: see nord2_gpu_lvts.h.  SPDX-License-Identifier: MIT */
++#include "nord2_gpu_lvts.h"
++
++#include <string.h>
++
++#define CTRL(blk, off, n, first, name) { (blk), (off), (n), (first), (name) }
++const struct n2lvts_ctrl_desc n2lvts_ctrl[N2LVTS_CTRL_COUNT] = {
++        CTRL(N2LVTS_MCU, 0x000, 2, 0, "cpu-big"),      /* LVTS1: MCU_BIG, MCU_BIGBIG */
++        CTRL(N2LVTS_MCU, 0x100, 2, 2, "cpu-big2"),     /* LVTS2 */
++        CTRL(N2LVTS_MCU, 0x200, 4, 4, "cpu-little"),   /* LVTS3 */
++        CTRL(N2LVTS_AP,  0x000, 2, 8, "vpu-mdla"),     /* LVTS4 */
++        CTRL(N2LVTS_AP,  0x100, 2, 10, "gpu"),         /* LVTS5: GPU (T11,T12) */
++        CTRL(N2LVTS_AP,  0x200, 2, 12, "infra-cam"),   /* LVTS6 */
++        CTRL(N2LVTS_AP,  0x300, 3, 14, "md"),          /* LVTS7 */
++};
++#undef CTRL
++
++static void note(struct n2lvts *l, const char *m)
++{
++        if (l->ops.log)
++                l->ops.log(l->ctx, m);
++}
++static uint32_t rd(struct n2lvts *l, unsigned c, uint32_t off)
++{
++        return l->ops.rd(l->ctx, (enum n2lvts_block)n2lvts_ctrl[c].block, n2lvts_ctrl[c].offset + off);
++}
++static void wr(struct n2lvts *l, unsigned c, uint32_t off, uint32_t v)
++{
++        l->ops.wr(l->ctx, (enum n2lvts_block)n2lvts_ctrl[c].block, n2lvts_ctrl[c].offset + off, v);
++}
++
++bool n2lvts_init(struct n2lvts *l, const struct n2lvts_ops *ops, void *ctx)
++{
++        if (!l || !ops || !ops->rd || !ops->wr || !ops->udelay)
++                return false;
++        memset(l, 0, sizeof(*l));
++        l->ops = *ops;
++        l->ctx = ctx;
++        n2lvts_cal_default(&l->cal);
++        return true;
++}
++
++/* ---------------- calibration ---------------- */
++void n2lvts_cal_default(struct n2lvts_cal *c)
++{
++        memset(c, 0, sizeof(*c));
++        c->defaulted = true;
++        c->golden = N2LVTS_DEFAULT_GOLDEN;
++        for (unsigned i = 0; i < N2LVTS_SENSOR_COUNT; i++)
++                c->count_r[i] = N2LVTS_DEFAULT_COUNT_R;
++        for (unsigned i = 0; i < N2LVTS_CTRL_COUNT; i++)
++                c->count_rc[i] = N2LVTS_DEFAULT_COUNT_RC;
++}
++
++bool n2lvts_cal_plausible(const struct n2lvts_cal *c)
++{
++        /* Generous physical bounds around the vendor defaults; a decode that leaves them is wrong data. */
++        if (!c || c->golden < 40u || c->golden > 120u)
++                return false;
++        for (unsigned i = 0; i < N2LVTS_SENSOR_COUNT; i++)
++                if (c->count_r[i] < 10000u || c->count_r[i] > 100000u)
++                        return false;
++        for (unsigned i = 0; i < N2LVTS_CTRL_COUNT; i++)
++                if (c->count_rc[i] < 1000u || c->count_rc[i] > 6000u)
++                        return false;
++        return true;
++}
++
++bool n2lvts_cal_from_efuse(const uint32_t t[22], struct n2lvts_cal *c)
++{
++        if (!t || !c)
++                return false;
++        struct n2lvts_cal x;
++        memset(&x, 0, sizeof(x));
++        x.golden = (t[0] >> 24) & 0xffu;
++        for (unsigned k = 0; k < 17; k++)
++                x.count_r[k] = t[k + 1] & 0xffffffu;
++        x.count_rc[0] = t[21] & 0xffffffu;
++        for (unsigned g = 1; g < N2LVTS_CTRL_COUNT; g++) {
++                unsigned w = 1 + 3 * (g - 1);                    /* words 1-3, 4-6, ... 16-18 */
++                x.count_rc[g] = ((t[w] & 0xff000000u) >> 8) + ((t[w + 1] & 0xff000000u) >> 16) +
++                                ((t[w + 2] & 0xff000000u) >> 24);
++        }
++        bool any = false;                                        /* vendor test: all zero = unfused sample */
++        for (unsigned i = 0; i < N2LVTS_SENSOR_COUNT; i++)
++                if (i == 0 ? (t[0] & 0xffu) != 0 : t[i] != 0) { any = true; break; }
++        if (!any || !n2lvts_cal_plausible(&x)) {
++                n2lvts_cal_default(c);
++                return false;
++        }
++        *c = x;
++        c->defaulted = false;
++        return true;
++}
++
++bool n2lvts_msr_to_mC(uint32_t msr, uint32_t golden, int32_t *mC)
++{
++        uint32_t raw = msr & 0xffffu;
++        if (!(msr & 0x10000u) || !raw)
++                return false;
++        /* vendor: ((int)-252500 * raw) >> 14 truncates toward -infinity of the magnitude: -ceil(252500*raw/2^14) */
++        int64_t t = -(int64_t)(((uint64_t)252500u * raw + 16383u) >> 14);
++        t += (int64_t)golden * 500 + 252500;
++        if (t < -40000 || t > 150000)
++                return false;
++        if (mC)
++                *mC = (int32_t)t;
++        return true;
++}
++
++/* ---------------- device access ---------------- */
++static bool dev_wait(struct n2lvts *l, unsigned c, uint32_t bit)
++{
++        for (unsigned n = 0; n < 100; n++) {
++                if (!(rd(l, c, N2LVTS_CONFIG) & bit))
++                        return true;
++                l->ops.udelay(l->ctx, 2);
++        }
++        return false;
++}
++static bool dev_write(struct n2lvts *l, unsigned c, uint32_t cfg_hi, uint32_t reg, uint32_t data)
++{
++        wr(l, c, N2LVTS_CONFIG, cfg_hi | ((reg & 0xffu) << 8) | (data & 0xffu));
++        l->ops.udelay(l->ctx, 3);
++        return dev_wait(l, c, 1u << 24);
++}
++static bool dev_read(struct n2lvts *l, unsigned c, uint32_t reg, uint32_t *v)
++{
++        wr(l, c, N2LVTS_CONFIG, 0x81020000u | ((reg & 0xffu) << 8));
++        l->ops.udelay(l->ctx, 5);
++        bool ok = dev_wait(l, c, 1u << 24);
++        *v = rd(l, c, N2LVTS_RDATA0);
++        return ok;
++}
++#define DW(c, reg, data) do { if (!dev_write(l, (c), 0x81030000u, (reg), (data))) return N2LVTS_E_BUSY; } while (0)
++
++static bool gate_open(struct n2lvts *l)
++{
++        return !((l->ops.rd(l->ctx, N2LVTS_INFRA, N2LVTS_INFRA_CG_STA) >> N2LVTS_INFRA_THERM_BIT) & 1u);
++}
++
++enum n2lvts_error n2lvts_probe_ctrl(struct n2lvts *l, unsigned c, struct n2lvts_probe *p)
++{
++        if (!l || !p || c >= N2LVTS_CTRL_COUNT)
++                return N2LVTS_E_ARGS;
++        memset(p, 0, sizeof(*p));
++        p->gate_open = gate_open(l);
++        if (!p->gate_open)
++                return N2LVTS_E_GATED;                   /* nothing else touched */
++        p->clken = rd(l, c, N2LVTS_CLKEN);
++        p->monctl0 = rd(l, c, N2LVTS_MONCTL0);
++        p->id = rd(l, c, N2LVTS_ID);
++        for (unsigned j = 0; j < n2lvts_ctrl[c].nsens && j < 4; j++)
++                p->msr[j] = rd(l, c, N2LVTS_MSR0 + 4 * j);
++        return N2LVTS_OK;
++}
++
++/* One controller, vendor order (wrapper: identification, enable/init devices, RC count, efuse, periodic off,
++ * data-fetch setup, initial_all_tc, enable).  Interrupts, protection registers and resets are never written. */
++static enum n2lvts_error start_ctrl(struct n2lvts *l, unsigned c)
++{
++        const struct n2lvts_ctrl_desc *d = &n2lvts_ctrl[c];
++        l->saved_clken[c] = rd(l, c, N2LVTS_CLKEN);
++        l->saved_monctl0[c] = rd(l, c, N2LVTS_MONCTL0);
++        l->step = 1;
++        wr(l, c, N2LVTS_MONCTL0, 0);                                     /* no sensing while configuring */
++        wr(l, c, N2LVTS_CLKEN, 1);
++        l->step = 2;
++        DW(c, 0xff, 0xff);                                               /* reset devices */
++        l->step = 3;
++        if (!dev_write(l, c, 0x85020000u, 0xfc, 0x55))                   /* read back device id with update */
++                return N2LVTS_E_BUSY;
++        if ((rd(l, c, N2LVTS_ID) & 0xffu) != 0x81u + c) {
++                note(l, "Nord2 LVTS: device id mismatch, controller left as found");
++                return N2LVTS_E_ID;
++        }
++        l->step = 4;                                                     /* lvts_Device_Enable_Init_all_Devices */
++        DW(c, 0x03, 0x00); DW(c, 0x04, 0x20); DW(c, 0x05, 0x00);
++        DW(c, 0x0a, 0xc4); DW(c, 0x0c, 0x7c); DW(c, 0x09, 0x8d);
++        DW(c, 0x08, 0xf5); DW(c, 0x08, 0xfc); DW(c, 0x08, 0xf5); DW(c, 0x07, 0xa6);
++        l->step = 5;                                                     /* lvts_device_read_count_RC_N (manual RCK) */
++        uint32_t rc_now[4] = {0, 0, 0, 0};
++        DW(c, 0x0e, 0x00);
++        for (unsigned j = 0; j < d->nsens; j++) {
++                DW(c, 0x0d, j); DW(c, 0x06, 0x78); DW(c, 0x07, 0xa6);
++                DW(c, 0x08, 0xf5); DW(c, 0x08, 0xfc); DW(c, 0x08, 0xf5);
++                l->ops.udelay(l->ctx, 10);
++                DW(c, 0x03, 0x02);                                       /* kick RCK counting */
++                l->ops.udelay(l->ctx, 30);
++                if (!dev_wait(l, c, 1u << 25))
++                        return N2LVTS_E_BUSY;                            /* DEVICE_SENSING_STATUS */
++                uint32_t v;
++                if (!dev_read(l, c, 0x00, &v))
++                        return N2LVTS_E_BUSY;
++                l->ops.udelay(l->ctx, 5);
++                uint32_t rc = v & 0xffffffu, ref = l->cal.count_rc[c];
++                /* LVTS_REFINE_MANUAL_RCK_WITH_EFUSE: a missing or >6% off count is replaced by the efuse value */
++                bool off = !rc || (ref > rc ? ref * 1000ull / rc : rc * 1000ull / ref) > 1061u;
++                rc_now[j] = off ? ref : rc;
++                DW(c, 0x08, 0xf1);
++                if (!dev_wait(l, c, 1u << 24))
++                        return N2LVTS_E_BUSY;
++        }
++        DW(c, 0x0d, 0x10);
++        l->step = 6;                                                     /* lvts_efuse_setting */
++        for (unsigned j = 0; j < d->nsens; j++)
++                wr(l, c, N2LVTS_EDATA0 + 4 * j,
++                   (uint32_t)(((uint64_t)rc_now[j] * l->cal.count_r[d->first_sensor + j]) >> 14));
++        l->step = 7;                                                     /* data fetch + initial_all_tc */
++        wr(l, c, N2LVTS_TSSEL, 0x13121110u);
++        wr(l, c, N2LVTS_MSRCTL0, 0x53);
++        wr(l, c, N2LVTS_CALSCALE, 0x300);
++        wr(l, c, N2LVTS_MONCTL1, 0x3ff);
++        wr(l, c, N2LVTS_MONCTL2, 0x3ff);
++        DW(c, 0x06, 0xb8);                                               /* device single mode */
++        wr(l, c, N2LVTS_MONCTL1, (1u << 20) | 0x00cu);                   /* group delay 1, period unit 0x0c */
++        wr(l, c, N2LVTS_MONCTL2, (1u << 16) | 1u);                       /* filter 1, sensor interval 1 */
++        wr(l, c, N2LVTS_MSRCTL0, 0x492);                                 /* 2 of 4 samples */
++        l->ops.udelay(l->ctx, 1);
++        l->step = 8;
++        wr(l, c, N2LVTS_MONCTL0, 0x200u | ((1u << d->nsens) - 1u));      /* enable sensing points */
++        return N2LVTS_OK;
++}
++
++static void restore_ctrl(struct n2lvts *l, unsigned c)
++{
++        wr(l, c, N2LVTS_MONCTL0, 0);
++        (void)dev_write(l, c, 0x81030000u, 0xff, 0xff);
++        wr(l, c, N2LVTS_CLKEN, l->saved_clken[c]);
++        if (l->saved_monctl0[c])
++                wr(l, c, N2LVTS_MONCTL0, l->saved_monctl0[c]);
++}
++
++enum n2lvts_error n2lvts_start(struct n2lvts *l, uint32_t mask, bool open_gate)
++{
++        if (!l || !mask || (mask & ~N2LVTS_MASK_ALL))
++                return N2LVTS_E_ARGS;
++        if (!n2lvts_cal_plausible(&l->cal))
++                return N2LVTS_E_CAL;
++        if (!gate_open(l)) {
++                if (!open_gate)
++                        return N2LVTS_E_GATED;
++                l->ops.wr(l->ctx, N2LVTS_INFRA, N2LVTS_INFRA_CG_CLR, 1u << N2LVTS_INFRA_THERM_BIT);
++                l->ops.udelay(l->ctx, 10);
++                if (!gate_open(l))
++                        return N2LVTS_E_GATED;
++                l->ungated_by_us = true;
++        }
++        enum n2lvts_error e = N2LVTS_OK;
++        for (unsigned c = 0; c < N2LVTS_CTRL_COUNT; c++) {
++                if (!(mask & (1u << c)))
++                        continue;
++                enum n2lvts_error r = start_ctrl(l, c);
++                if (r != N2LVTS_OK) {
++                        restore_ctrl(l, c);
++                        e = r;
++                        break;
++                }
++                l->running |= 1u << c;
++        }
++        if (e != N2LVTS_OK)
++                n2lvts_stop(l);                              /* all-or-nothing for what we started */
++        return e;
++}
++
++unsigned n2lvts_read(struct n2lvts *l, uint32_t mask)
++{
++        unsigned good = 0;
++        if (!l || !gate_open(l))
++                return 0;
++        for (unsigned c = 0; c < N2LVTS_CTRL_COUNT; c++) {
++                if (!(mask & (1u << c)))
++                        continue;
++                bool sensing = (rd(l, c, N2LVTS_MONCTL0) & 0x200u) != 0;
++                for (unsigned j = 0; j < n2lvts_ctrl[c].nsens; j++) {
++                        unsigned s = n2lvts_ctrl[c].first_sensor + j;
++                        uint32_t msr = sensing ? rd(l, c, N2LVTS_MSR0 + 4 * j) : 0;
++                        l->raw[s] = msr & 0xffffu;
++                        l->temp_ok[s] = sensing && n2lvts_msr_to_mC(msr, l->cal.golden, &l->temp_mC[s]);
++                        good += l->temp_ok[s];
++                }
++        }
++        return good;
++}
++
++void n2lvts_stop(struct n2lvts *l)
++{
++        if (!l)
++                return;
++        for (unsigned c = 0; c < N2LVTS_CTRL_COUNT; c++)
++                if (l->running & (1u << c))
++                        restore_ctrl(l, c);
++        l->running = 0;
++        if (l->ungated_by_us) {
++                /* Re-gating needs the SET alias (0x080); the gate was closed when we found it. */
++                l->ops.wr(l->ctx, N2LVTS_INFRA, 0x080u, 1u << N2LVTS_INFRA_THERM_BIT);
++                l->ungated_by_us = false;
++        }
++}
++
++const char *n2lvts_error_string(enum n2lvts_error e)
++{
++        switch (e) {
++        case N2LVTS_OK: return "ok";
++        case N2LVTS_E_ARGS: return "bad arguments";
++        case N2LVTS_E_GATED: return "thermal clock gate closed";
++        case N2LVTS_E_CAL: return "calibration implausible";
++        case N2LVTS_E_BUSY: return "device access timed out";
++        case N2LVTS_E_ID: return "device id mismatch";
++        case N2LVTS_E_NODATA: return "no valid sample";
++        }
++        return "?";
++}
++
++/* ---------------- guard and throttle policy ---------------- */
++bool n2lvts_allows_cold_start_opp(int32_t temp_mC, bool valid, bool calibrated, int32_t max_mC)
++{
++        if (!valid)
++                return true;
++        return temp_mC <= (calibrated ? max_mC : max_mC - 10000);
++}
++
++uint8_t n2lvts_throttle_step(struct n2lvts_throttle *t, int32_t temp_mC, bool valid)
++{
++        if (!valid) {
++                if (t->invalid_run < 255)
++                        t->invalid_run++;
++                if (t->invalid_run >= N2LVTS_THROTTLE_INVALID_MAX && t->level < 1)
++                        t->level = 1;                    /* unknown temperature: cap, never minimum */
++                return t->level;
++        }
++        t->invalid_run = 0;
++        if (temp_mC >= t->hard_mC)
++                t->level = 2;
++        else if (temp_mC >= t->soft_mC && t->level < 1)
++                t->level = 1;
++        else if (t->level == 2 && temp_mC < t->hard_mC - t->hyst_mC)
++                t->level = 1;
++        else if (t->level == 1 && temp_mC < t->soft_mC - t->hyst_mC)
++                t->level = 0;
++        return t->level;
++}
++
++uint32_t n2lvts_throttle_khz_cap(uint8_t level)
++{
++        return level == 0 ? 886000u : level == 1 ? 654000u : 350000u;
++}
+--- a/gpu/tests/nord2_lvts_test.c
++++ b/gpu/tests/nord2_lvts_test.c
+@@ -0,0 +1,214 @@
++/* LVTS thermal: conversion, calibration decode, init sequence and guards against a controller/device register model.
++ * Protocol/contract checks derived from the vendor driver; not evidence of silicon behaviour. */
++#include "nord2_gpu_lvts.h"
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++
++#define N 7
++struct model {
++        uint32_t infra_sta;                   /* bit 10: 1 = thermal clock gated */
++        uint32_t reg[N][0x100 / 4];           /* controller registers */
++        uint8_t dev[N][256];                  /* LVTS device registers */
++        uint32_t rc_count[N][4];              /* what the device reports for RCK on sensor j */
++        uint32_t raw[N][4];                   /* MSR raw count the "silicon" produces once sensing */
++        int busy_reads[N];                    /* CONFIG reads that still show DEVICE_ACCESS_START after an access */
++        bool stuck[N];
++        unsigned wrong_id;                    /* controller whose device id is wrong (1+index), 0 none */
++        unsigned reads_ctrl, writes_ctrl[N], writes_infra, forbidden, touched_wrong, gate_reads_before_ctrl;
++        bool ctrl_read_while_gated;
++        unsigned udelays;
++        uint32_t last_edata[N][4];
++};
++static struct model m;
++
++static int ctrl_of(enum n2lvts_block b, uint32_t off, uint32_t *rel)
++{
++        for (unsigned c = 0; c < N; c++)
++                if (n2lvts_ctrl[c].block == b && off >= n2lvts_ctrl[c].offset && off < n2lvts_ctrl[c].offset + 0x100u) {
++                        *rel = off - n2lvts_ctrl[c].offset;
++                        return (int)c;
++                }
++        return -1;
++}
++static uint32_t rd(void *ctx, enum n2lvts_block b, uint32_t off)
++{
++        (void)ctx;
++        if (b == N2LVTS_INFRA) return off == N2LVTS_INFRA_CG_STA ? m.infra_sta : 0;
++        uint32_t rel; int c = ctrl_of(b, off, &rel);
++        assert(c >= 0 && !(rel & 3));
++        m.reads_ctrl++;
++        if (m.infra_sta & (1u << 10)) m.ctrl_read_while_gated = true;
++        if (rel == N2LVTS_CONFIG) {
++                uint32_t v = m.reg[c][rel / 4];
++                if (m.stuck[c]) return v | (1u << 24);
++                if (m.busy_reads[c] > 0) { m.busy_reads[c]--; return v | (1u << 24); }
++                return v & ~(3u << 24);
++        }
++        if (rel >= N2LVTS_MSR0 && rel < N2LVTS_MSR0 + 16) {
++                unsigned j = (rel - N2LVTS_MSR0) / 4;
++                return (m.reg[c][N2LVTS_MONCTL0 / 4] & 0x200u) && (m.reg[c][N2LVTS_MONCTL0 / 4] & (1u << j)) ? (0x10000u | m.raw[c][j]) : 0;
++        }
++        return m.reg[c][rel / 4];
++}
++static void wr(void *ctx, enum n2lvts_block b, uint32_t off, uint32_t v)
++{
++        (void)ctx;
++        if (b == N2LVTS_INFRA) {
++                m.writes_infra++;
++                if (off == N2LVTS_INFRA_CG_CLR) m.infra_sta &= ~v;
++                else if (off == 0x080u) m.infra_sta |= v;
++                else assert(!"unexpected infra write");
++                return;
++        }
++        uint32_t rel; int c = ctrl_of(b, off, &rel);
++        assert(c >= 0 && !(rel & 3));
++        m.writes_ctrl[c]++;
++        /* never: interrupt enable, protection, debug and spare registers */
++        if (rel == N2LVTS_MONINT || (rel >= 0xc0 && rel <= 0xcc) || rel >= 0xe8 || (rel >= 0x10 && rel <= 0x20) || (rel >= 0x24 && rel <= 0x34))
++                m.forbidden++;
++        if (rel >= N2LVTS_EDATA0 && rel < N2LVTS_EDATA0 + 16) m.last_edata[c][(rel - N2LVTS_EDATA0) / 4] = v;
++        if (rel == N2LVTS_CONFIG) {
++                m.reg[c][rel / 4] = v & 0x00ffffffu;
++                if (v & (1u << 24)) {
++                        uint32_t op = (v >> 16) & 0xff, reg = (v >> 8) & 0xff, data = v & 0xff;
++                        if (op == 0x03 || op == 0x02) {
++                                if (op == 0x03) {
++                                        if (reg == 0xff && data == 0xff) memset(m.dev[c], 0, 256);
++                                        else m.dev[c][reg] = (uint8_t)data;
++                                        if (reg == 0x08 && data == 0xf5 && m.dev[c][0x0d] < 4) m.dev[c][0xee] = (uint8_t)m.dev[c][0x0d]; /* selected sensor */
++                                        if (reg == 0x03 && data == 0x02) m.dev[c][0xef] = 1; /* RCK counting done */
++                                } else {
++                                        m.reg[c][N2LVTS_RDATA0 / 4] = reg == 0x00 ? m.rc_count[c][m.dev[c][0x0d] & 3] : m.dev[c][reg];
++                                }
++                        }
++                        if (reg == 0xfc && data == 0x55)                      /* read ID with update */
++                                m.reg[c][N2LVTS_ID / 4] = (m.wrong_id == c + 1u) ? 0x99u : 0x81u + c;
++                }
++                return;
++        }
++        m.reg[c][rel / 4] = v;
++}
++static void udelay(void *ctx, unsigned us) { (void)ctx; (void)us; m.udelays++; }
++static struct n2lvts_ops ops = { rd, wr, udelay, NULL };
++
++static void reset_model(void)
++{
++        memset(&m, 0, sizeof(m));
++        for (unsigned c = 0; c < N; c++) { m.reg[c][N2LVTS_CLKEN / 4] = 0; for (unsigned j = 0; j < 4; j++) { m.rc_count[c][j] = 2750; m.raw[c][j] = 16384; } }
++}
++static int32_t abs32(int32_t v) { return v < 0 ? -v : v; }
++
++int main(void)
++{
++        /* ---- conversion (vendor formula) ---- */
++        int32_t t;
++        assert(n2lvts_msr_to_mC(0x10000u | 16384u, 50, &t) && t == 25000);          /* raw 2^14, golden 25 C */
++        assert(n2lvts_msr_to_mC(0x10000u | 16384u, 56, &t) && t == 28000);          /* golden 28 C */
++        assert(n2lvts_msr_to_mC(0x10000u | 12000u, 50, &t) && abs32(t - (int32_t)(277500 - 252500.0 * 12000 / 16384)) <= 2);
++        assert(n2lvts_msr_to_mC(0x10000u | 11000u, 50, &t) && t > 80000);           /* hotter = smaller count */
++        assert(!n2lvts_msr_to_mC(16384u, 50, &t));                                  /* valid bit clear */
++        assert(!n2lvts_msr_to_mC(0x10000u, 50, &t));                                /* raw 0 */
++        assert(!n2lvts_msr_to_mC(0x10000u | 100u, 50, &t));                         /* 276 C: implausible */
++        assert(!n2lvts_msr_to_mC(0x10000u | 0xffffu, 50, &t));                      /* below -40 C */
++        /* ---- calibration ---- */
++        struct n2lvts_cal cal;
++        n2lvts_cal_default(&cal);
++        assert(cal.defaulted && cal.golden == 50 && n2lvts_cal_plausible(&cal));
++        uint32_t ef[22] = {0};
++        assert(!n2lvts_cal_from_efuse(ef, &cal) && cal.defaulted);                  /* unfused: vendor defaults */
++        /* implausible rc bytes (24-bit sum of the top bytes of three words) are refused as a whole */
++        ef[0] = (56u << 24) | 1u;
++        for (unsigned k = 1; k <= 17; k++) ef[k] = ((0x0au + k) << 24) | (33000u + 100u * k);
++        ef[21] = 2800u;
++        assert(!n2lvts_cal_from_efuse(ef, &cal) && cal.defaulted && cal.golden == 50);
++        /* implausible golden temperature (100 C) */
++        for (unsigned k = 1; k <= 17; k++) ef[k] = 33000u;
++        memset(ef + 18, 0, 3 * 4); ef[0] = (200u << 24) | 1u; ef[21] = 2800u;
++        assert(!n2lvts_cal_from_efuse(ef, &cal) && cal.defaulted && cal.golden == 50);
++        /* plausible fused sample: rc of every controller 2750 = bytes 0x00,0x0a,0xbe in the top bytes of three words */
++        ef[0] = (56u << 24) | 1u;
++        for (unsigned k = 1; k <= 17; k++) ef[k] = 33000u + 100u * k;
++        for (unsigned g = 0; g < 6; g++) { ef[2 + 3 * g] |= 0x0au << 24; ef[3 + 3 * g] |= 0xbeu << 24; }
++        assert(n2lvts_cal_from_efuse(ef, &cal) && !cal.defaulted && cal.golden == 56);
++        assert(cal.count_r[0] == 33100 && cal.count_r[16] == 34700 && cal.count_rc[0] == 2800);
++        for (unsigned g = 1; g < 7; g++) assert(cal.count_rc[g] == 2750);
++        assert(n2lvts_cal_plausible(&cal));
++
++        /* ---- read-only probe never touches a gated block ---- */
++        struct n2lvts l; struct n2lvts_probe p;
++        reset_model(); m.infra_sta = 1u << 10;
++        assert(n2lvts_init(&l, &ops, NULL));
++        assert(n2lvts_probe_ctrl(&l, N2LVTS_CTRL_GPU, &p) == N2LVTS_E_GATED && !p.gate_open && !m.reads_ctrl && !m.writes_infra);
++        assert(n2lvts_read(&l, N2LVTS_MASK_GPU) == 0 && !m.reads_ctrl);
++        assert(n2lvts_start(&l, N2LVTS_MASK_GPU, false) == N2LVTS_E_GATED && !m.writes_ctrl[4] && !m.writes_infra);
++        m.infra_sta = 0;
++        assert(n2lvts_probe_ctrl(&l, N2LVTS_CTRL_GPU, &p) == N2LVTS_OK && p.gate_open && !p.monctl0 && !m.writes_ctrl[4]);
++        assert(n2lvts_read(&l, N2LVTS_MASK_GPU) == 0);                              /* not sensing: no data, no writes */
++        assert(!m.writes_ctrl[4] && n2lvts_probe_ctrl(&l, 7, &p) == N2LVTS_E_ARGS);
++        /* an already-running controller (bootloader/firmware) is readable without any write */
++        m.reg[4][N2LVTS_MONCTL0 / 4] = 0x203;
++        assert(n2lvts_read(&l, N2LVTS_MASK_GPU) == 2 && l.temp_ok[10] && l.temp_ok[11] && l.temp_mC[10] == 25000 && !m.writes_ctrl[4]);
++
++        /* ---- vendor init of the GPU controller only ---- */
++        reset_model(); m.reg[4][N2LVTS_CLKEN / 4] = 0; n2lvts_init(&l, &ops, NULL);
++        m.rc_count[4][0] = 2750; m.rc_count[4][1] = 2800;                          /* within 6%: measured value used */
++        assert(n2lvts_start(&l, N2LVTS_MASK_GPU, false) == N2LVTS_OK && l.running == N2LVTS_MASK_GPU);
++        for (unsigned c = 0; c < N; c++) if (c != 4) assert(m.writes_ctrl[c] == 0);
++        assert(m.forbidden == 0 && m.writes_infra == 0);
++        assert(m.reg[4][N2LVTS_MONCTL0 / 4] == 0x203 && m.reg[4][N2LVTS_CLKEN / 4] == 1);
++        assert(m.reg[4][N2LVTS_TSSEL / 4] == 0x13121110u && m.reg[4][N2LVTS_CALSCALE / 4] == 0x300 && m.reg[4][N2LVTS_MSRCTL0 / 4] == 0x492);
++        assert(m.reg[4][N2LVTS_MONCTL1 / 4] == ((1u << 20) | 0xc) && m.reg[4][N2LVTS_MONCTL2 / 4] == ((1u << 16) | 1));
++        assert(m.last_edata[4][0] == (uint32_t)(((uint64_t)2750 * 35000) >> 14) && m.last_edata[4][1] == (uint32_t)(((uint64_t)2800 * 35000) >> 14));
++        assert(m.dev[4][0x06] == 0xb8 && m.dev[4][0x0d] == 0x10 && m.dev[4][0x04] == 0x20 && m.dev[4][0x0c] == 0x7c);
++        assert(m.reg[4][N2LVTS_ID / 4] == 0x85);
++        m.raw[4][0] = 16384; m.raw[4][1] = 15000;
++        assert(n2lvts_read(&l, N2LVTS_MASK_GPU) == 2 && l.temp_mC[10] == 25000 && l.temp_mC[11] > 30000 && l.temp_mC[11] < 60000);
++        assert(!m.ctrl_read_while_gated);
++        n2lvts_stop(&l);
++        assert(l.running == 0 && m.reg[4][N2LVTS_MONCTL0 / 4] == 0 && m.reg[4][N2LVTS_CLKEN / 4] == 0 && m.forbidden == 0);
++
++        /* RC refinement: zero or >6% off count falls back to the efuse RC value */
++        reset_model(); n2lvts_init(&l, &ops, NULL);
++        m.rc_count[4][0] = 0; m.rc_count[4][1] = 3200;                              /* 16% off */
++        assert(n2lvts_start(&l, N2LVTS_MASK_GPU, false) == N2LVTS_OK);
++        assert(m.last_edata[4][0] == (uint32_t)(((uint64_t)2750 * 35000) >> 14) && m.last_edata[4][1] == (uint32_t)(((uint64_t)2750 * 35000) >> 14));
++        n2lvts_stop(&l);
++
++        /* ---- failures leave the controller as found ---- */
++        reset_model(); n2lvts_init(&l, &ops, NULL);
++        m.reg[4][N2LVTS_CLKEN / 4] = 0; m.reg[4][N2LVTS_MONCTL0 / 4] = 0x201; m.wrong_id = 5;   /* ctrl 4 = id 0x85 expected, model says 0x99 */
++        assert(n2lvts_start(&l, N2LVTS_MASK_GPU, false) == N2LVTS_E_ID && l.running == 0);
++        assert(m.reg[4][N2LVTS_CLKEN / 4] == 0 && m.reg[4][N2LVTS_MONCTL0 / 4] == 0x201 && m.forbidden == 0);
++        reset_model(); n2lvts_init(&l, &ops, NULL); m.stuck[4] = true;
++        assert(n2lvts_start(&l, N2LVTS_MASK_GPU, false) == N2LVTS_E_BUSY && l.running == 0 && m.reg[4][N2LVTS_CLKEN / 4] == 0);
++        reset_model(); n2lvts_init(&l, &ops, NULL); l.cal.golden = 5;
++        assert(n2lvts_start(&l, N2LVTS_MASK_GPU, false) == N2LVTS_E_CAL && !m.writes_ctrl[4]);   /* implausible calibration: nothing written */
++        assert(n2lvts_start(&l, 0, false) == N2LVTS_E_ARGS && n2lvts_start(&l, 1u << 9, false) == N2LVTS_E_ARGS);
++
++        /* ---- level 3: opening and re-closing the clock gate ---- */
++        reset_model(); m.infra_sta = 1u << 10; n2lvts_init(&l, &ops, NULL);
++        assert(n2lvts_start(&l, N2LVTS_MASK_GPU, true) == N2LVTS_OK && l.ungated_by_us && !(m.infra_sta & (1u << 10)) && !m.ctrl_read_while_gated);
++        n2lvts_stop(&l);
++        assert((m.infra_sta & (1u << 10)) && !l.ungated_by_us);
++        reset_model(); m.infra_sta = 1u << 10; n2lvts_init(&l, &ops, NULL); m.wrong_id = 5;
++        assert(n2lvts_start(&l, N2LVTS_MASK_GPU, true) == N2LVTS_E_ID && (m.infra_sta & (1u << 10)));   /* failure re-gates */
++
++        /* ---- guard and throttle design ---- */
++        assert(n2lvts_allows_cold_start_opp(60000, true, true, 65000) && !n2lvts_allows_cold_start_opp(66000, true, true, 65000));
++        assert(!n2lvts_allows_cold_start_opp(56000, true, false, 65000) && n2lvts_allows_cold_start_opp(54000, true, false, 65000));  /* 10 C margin */
++        assert(n2lvts_allows_cold_start_opp(99000, false, true, 65000));                                                             /* unknown never blocks */
++        struct n2lvts_throttle th = { 70000, 80000, 5000, 0, 0 };
++        assert(n2lvts_throttle_step(&th, 69999, true) == 0 && n2lvts_throttle_step(&th, 70000, true) == 1);
++        assert(n2lvts_throttle_step(&th, 66000, true) == 1);                         /* inside hysteresis */
++        assert(n2lvts_throttle_step(&th, 64999, true) == 0);
++        assert(n2lvts_throttle_step(&th, 85000, true) == 2 && n2lvts_throttle_step(&th, 76000, true) == 2);
++        assert(n2lvts_throttle_step(&th, 74999, true) == 1);
++        for (unsigned i = 0; i < N2LVTS_THROTTLE_INVALID_MAX; i++) n2lvts_throttle_step(&th, 0, false);
++        assert(th.level == 1);                                                       /* unreadable: stays capped, not minimum */
++        struct n2lvts_throttle th2 = { 70000, 80000, 5000, 0, 0 };
++        for (unsigned i = 0; i < 20; i++) n2lvts_throttle_step(&th2, 0, false);
++        assert(th2.level == 1 && n2lvts_throttle_khz_cap(0) == 886000 && n2lvts_throttle_khz_cap(1) == 654000 && n2lvts_throttle_khz_cap(2) == 350000);
++        puts("nord2_lvts_test: conversion, efuse decode, gated-probe safety, GPU-only init order, forbidden-register check, fail-safe restore, guard and throttle design pass (register model)");
++        return 0;
++}

@@ -1,0 +1,115 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp	2026-10-29 22:31:06.984311570 +0100
++++ b/iokit/Kernel/arm/Nord2GPU.cpp	2026-10-29 22:45:39.838784896 +0100
+@@ -176,7 +176,7 @@
+         uint64_t ckCycles = 0, ckStamp = 0, ckUs = 0;      /* 0127: GPU cycle counter / timestamp at the previous stats window */
+         bool ckRunning = false;
+         void clockCheck();
+-        unsigned pfWaits = 0, pfArms = 0;
++        unsigned pfWaits = 0, pfArms = 0, pfFails = 0;
+         void prfcntSample();
+         uint32_t waitN = 0, waitGapMax = 0, waitDurMax = 0, waitRetMax = 0;
+         uint64_t waitGapSum = 0, waitDurSum = 0, waitRetSum = 0;
+@@ -811,43 +811,17 @@
+ extern unsigned int memorystatus_available_pages, c_segment_pages_compressed;
+ }
+ void Nord2GPU::prfcntSample() {
+-        /* Memory state of the 992 MiB iOS window (16 KiB pages), once per stats window. */
++        /* Memory state of the iOS window (16 KiB pages), once per stats window. */
+         IOLog("NORD2 MEM: free=%u wired=%u active=%u inactive=%u spec=%u throttled=%u pageable_int=%u pageable_ext=%u avail=%u compressed=%u free_target=%u (16K pages)\n",
+               vm_page_free_count, vm_page_wire_count, vm_page_active_count, vm_page_inactive_count, vm_page_speculative_count, vm_page_throttled_count,
+               vm_page_pageable_internal_count, vm_page_pageable_external_count, memorystatus_available_pages, c_segment_pages_compressed, vm_page_free_target);
+         clockCheck();
+-        if (pfMode == 2 || pfFailed || !core) return;                       /* n2pf=2: memory statistics only, the GPU counters stay off */
+-        bool up = core->state == N2C_CORE_READY && core->gpu_powered;
+-        if (pfPending) {
+-                if (!up) { pfPending = false; pfArmed = false; return; }                       /* power-cycled: the dump is gone */
+-                if (read_bank(&gpu, 0x20) & (1u << 16)) {
+-                        write_bank(&gpu, 0x24, 1u << 16);
+-                        sync_page(NULL, pfPa, pfCpu, pfBytes, true);
+-                        pfPending = false;
+-                        const uint32_t *w = (const uint32_t *)pfCpu;
+-                        uint64_t jm[64] = {}, ti[64] = {}, ms[64] = {}, sh[64] = {};
+-                        unsigned cores = 0;
+-                        for (unsigned i = 0; i < 64; i++) { jm[i] = w[i]; ti[i] = w[64 + i]; }
+-                        for (unsigned b = 2; b < N2PF_SHADER_BASE; b++) for (unsigned i = 0; i < 64; i++) ms[i] += w[b * 64 + i];
+-                        uint64_t present = ((uint64_t)read_bank(&gpu, N2HW_SHADER_PRESENT_HI) << 32) | read_bank(&gpu, N2HW_SHADER_PRESENT_LO);
+-                        for (unsigned c = 0; c < 29 && (N2PF_SHADER_BASE + c + 1) * 64 <= pfBytes / 4; c++) if (present >> c & 1) {
+-                                cores++;
+-                                for (unsigned i = 0; i < 64; i++) sh[i] += w[(N2PF_SHADER_BASE + c) * 64 + i];
+-                        }
+-                        IOLog("NORD2 PRFCNT: win_us=%llu cores=%u | JM gpu=%llu js0=%llu js1=%llu | TIL act=%llu | L2 look=%llu rlook=%llu wlook=%llu rbeat=%llu wbeat=%llu arstall=%llu wstall=%llu "
+-                              "lat0_127=%llu lat128_191=%llu lat192_255=%llu lat256_319=%llu lat320_383=%llu | SC frag=%llu exec=%llu fpk=%llu quads=%llu warps=%llu ptiles=%llu fma=%llu "
+-                              "texflit=%llu texdfch=%llu texstall=%llu texstarve=%llu rdtex=%llu wrtib=%llu rdftc=%llu\n",
+-                              pfWinUs, cores, jm[6], jm[10], jm[18], ti[4], ms[25], ms[26], ms[27], ms[32], ms[47], ms[33], ms[48], ms[37], ms[38], ms[39], ms[40], ms[41],
+-                              sh[4], sh[26], sh[7], sh[11], sh[9], sh[18], sh[27], sh[35], sh[36], sh[37], sh[38], sh[58], sh[62], sh[54]);
+-                } else if (++pfWaits > 2) {
+-                        IOLog("NORD2 PRFCNT: sample stuck, gpu_irq_raw=%08x gpu_faultstatus=%08x mmu_irq_raw=%08x as0_fault=%08x as0_status=%08x; counters off\n",
+-                              read_bank(&gpu, 0x20), read_bank(&gpu, N2HW_GPU_FAULTSTATUS), read_bank(&gpu, N2HW_MMU_IRQ_RAWSTAT), read_bank(&gpu, 0x241c), read_bank(&gpu, 0x2428));
+-                        write_bank(&gpu, 0x68, 0u);
+-                        pfPending = false; pfFailed = true;
+-                }
+-                return;
+-        }
+-        if (!up) { pfArmed = false; return; }
++        if (pfMode == 2 || pfFailed || !core) return;                       /* n2pf=2: memory statistics and clock only, the GPU counters stay off */
++        /* patch 0128 (n2pf=1): v3.  v2 issued PRFCNT_SAMPLE and looked at the completion bit one stats window (2 s) later; when the sample did not complete the job manager
++         * held every new job behind it (job queue delays of 2.1 s) until the counters were switched off.  v3 polls for at most ~1 ms in the same call (the caller holds the
++         * driver lock, jobs are not being started meanwhile), and on a timeout switches PRFCNT off at once (that releases the job manager), prints which job slots were busy
++         * and the job/MMU registers, re-arms in the next window and gives up after 8 failures. */
++        if (!(core->state == N2C_CORE_READY && core->gpu_powered)) { pfArmed = false; return; }
+         if (!pfMd) {
+                 pfMd = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut, 16384, 16384);
+                 IOByteCount length = 0;
+@@ -860,7 +834,7 @@
+                         ok = nord2_gpu_mmu_map(&pfmmu, N2PF_VA + i * 4096ull, pfPa + i * 4096ull, 4096, NORD2_GPU_MEMATTR_NON_CACHEABLE, true, false);
+                 if (!ok) { IOLog("NORD2 PRFCNT: mapping failed\n"); pfFailed = true; return; }
+         }
+-        if (!pfArmed || read_bank(&gpu, 0x68) != 1u) {      /* first use or after a power cycle: program AS0 and the counters, the first window is only armed */
++        if (!pfArmed || read_bank(&gpu, 0x68) != 1u) {      /* first use, after a power cycle or after a failed sample: program AS0 and the counters, the window is only armed */
+                 if (n2hw_as_configure(&hw, 0, pfmmu.root_pa) != N2HW_OK) { IOLog("NORD2 PRFCNT: AS0 configure failed\n"); pfFailed = true; return; }
+                 write_bank(&gpu, 0x60, (uint32_t)N2PF_VA); write_bank(&gpu, 0x64, (uint32_t)(N2PF_VA >> 32));
+                 write_bank(&gpu, 0x6c, 0xffffffffu); write_bank(&gpu, 0x70, 0xffffffffu);
+@@ -875,9 +849,41 @@
+         bzero(pfCpu, pfBytes);
+         sync_page(NULL, pfPa, pfCpu, pfBytes, true);
+         write_bank(&gpu, 0x24, 1u << 16);
+-        uint64_t t = now_us(NULL);
+-        pfWinUs = t - pfLastUs; pfLastUs = t; pfWaits = 0; pfPending = true;
++        unsigned busy = (n2hw_js_idle(&hw, 0) ? 0u : 1u) | (n2hw_js_idle(&hw, 1) ? 0u : 2u);
++        uint64_t t0 = now_us(NULL);
+         write_bank(&gpu, 0x30, 4u);
++        unsigned spin = 0;
++        while (!(read_bank(&gpu, 0x20) & (1u << 16)) && spin++ < 500) IODelay(1);
++        uint64_t t1 = now_us(NULL);
++        if (!(read_bank(&gpu, 0x20) & (1u << 16))) {
++                pfFails++;
++                IOLog("NORD2 PRFCNT: sample incomplete after %llu us (busy slots mask %u, now %u), job_irq_raw=%08x js_state=%08x js0_status=%08x js1_status=%08x gpu_irq_raw=%08x mmu_irq_raw=%08x gpu_faultstatus=%08x as0_status=%08x; counters off (failure %u)\n",
++                      t1 - t0, busy, (n2hw_js_idle(&hw, 0) ? 0u : 1u) | (n2hw_js_idle(&hw, 1) ? 0u : 2u), read_bank(&gpu, N2HW_JOB_IRQ_RAWSTAT), read_bank(&gpu, 0x1010),
++                      read_bank(&gpu, 0x1824), read_bank(&gpu, 0x18a4), read_bank(&gpu, 0x20), read_bank(&gpu, N2HW_MMU_IRQ_RAWSTAT), read_bank(&gpu, N2HW_GPU_FAULTSTATUS),
++                      read_bank(&gpu, 0x2428), pfFails);
++                write_bank(&gpu, 0x68, 0u);                         /* releases the job manager */
++                pfArmed = false;
++                if (pfFails >= 8) pfFailed = true;
++                return;
++        }
++        write_bank(&gpu, 0x24, 1u << 16);
++        sync_page(NULL, pfPa, pfCpu, pfBytes, true);
++        uint64_t winUs = t0 - pfLastUs; pfLastUs = t0;
++        const uint32_t *w = (const uint32_t *)pfCpu;
++        uint64_t jm[64] = {}, ti[64] = {}, ms[64] = {}, sh[64] = {};
++        unsigned cores = 0;
++        for (unsigned i = 0; i < 64; i++) { jm[i] = w[i]; ti[i] = w[64 + i]; }
++        for (unsigned b = 2; b < N2PF_SHADER_BASE; b++) for (unsigned i = 0; i < 64; i++) ms[i] += w[b * 64 + i];
++        uint64_t present = ((uint64_t)read_bank(&gpu, N2HW_SHADER_PRESENT_HI) << 32) | read_bank(&gpu, N2HW_SHADER_PRESENT_LO);
++        for (unsigned c = 0; c < 29 && (N2PF_SHADER_BASE + c + 1) * 64 <= pfBytes / 4; c++) if (present >> c & 1) {
++                cores++;
++                for (unsigned i = 0; i < 64; i++) sh[i] += w[(N2PF_SHADER_BASE + c) * 64 + i];
++        }
++        IOLog("NORD2 PRFCNT: win_us=%llu took_us=%llu busy=%u cores=%u | JM gpu=%llu js0=%llu js1=%llu | TIL act=%llu | L2 look=%llu rlook=%llu wlook=%llu rbeat=%llu wbeat=%llu arstall=%llu wstall=%llu "
++              "lat0_127=%llu lat128_191=%llu lat192_255=%llu lat256_319=%llu lat320_383=%llu | SC frag=%llu exec=%llu fpk=%llu quads=%llu warps=%llu ptiles=%llu fma=%llu "
++              "texflit=%llu texdfch=%llu texstall=%llu texstarve=%llu rdtex=%llu wrtib=%llu rdftc=%llu\n",
++              winUs, t1 - t0, busy, cores, jm[6], jm[10], jm[18], ti[4], ms[25], ms[26], ms[27], ms[32], ms[47], ms[33], ms[48], ms[37], ms[38], ms[39], ms[40], ms[41],
++              sh[4], sh[26], sh[7], sh[11], sh[9], sh[18], sh[27], sh[35], sh[36], sh[37], sh[38], sh[58], sh[62], sh[54]);
+ }
+ void Nord2GPU::budgetReject(const char *what, unsigned c, uint64_t request, uint64_t limit) {
+         uint64_t t = now_ms(NULL);

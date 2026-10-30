@@ -1,0 +1,257 @@
+--- a/iokit/Kernel/arm/sweet_surface_abi.h
++++ b/iokit/Kernel/arm/sweet_surface_abi.h
+@@ -0,0 +1,110 @@
++#ifndef SWEET_SURFACE_ABI_H
++#define SWEET_SURFACE_ABI_H
++/*
++ * Pure, host-testable pieces of the built-in IOSurface ABI (no IOKit).
++ *
++ * Selector policy.  Every selector the framework may send gets a deliberate answer; names for 5-12, 20, 27 come from the Topaz
++ * kernel's reverse engineering (references/ios-topaz 0132/0133), 13/34/35 from the original SweetSurface.
++ * 40, 41 and 43 are unidentified: they are tolerated (success, zeroed output) and their call shape is logged once so
++ * they can be named; the answer for an unidentified selector is NEVER an error, because the UI is known to run with them accepted.
++ */
++#include <stdbool.h>
++#include <stdint.h>
++#include <string.h>
++
++enum {
++	SWEET_SEL_CREATE = 0, SWEET_SEL_LOOKUP = 4, SWEET_SEL_SET_YCBCR = 5, SWEET_SEL_WRAP_IMAGE = 6, SWEET_SEL_WRAP_MEMORY = 7,
++	SWEET_SEL_SET_VALUE = 9, SWEET_SEL_COPY_VALUE = 10, SWEET_SEL_REMOVE_VALUE = 11, SWEET_SEL_BIND_ACCEL = 12,
++	SWEET_SEL_LIMITS = 13, SWEET_SEL_SET_PURGEABLE = 20, SWEET_SEL_SET_BULK_ATTACH = 27,
++	SWEET_SEL_LOOKUP_PORT = 34, SWEET_SEL_CREATE_PORT = 35,
++};
++
++enum sweet_sel_policy {
++	SWEET_POLICY_HANDLED = 0,      /* implemented by the dispatcher */
++	SWEET_POLICY_ACCEPT,           /* known, deliberately has no effect: success, zeroed output */
++	SWEET_POLICY_PURGEABLE,        /* state kept per surface, old state returned */
++	SWEET_POLICY_NOT_FOUND,        /* no such value: kIOReturnNotFound */
++	SWEET_POLICY_UNSUPPORTED,      /* fail so the caller falls back (CoreAnimation uploads pixels instead) */
++	SWEET_POLICY_UNKNOWN,          /* unidentified: tolerated, shape logged once */
++};
++
++static inline enum sweet_sel_policy
++sweet_selector_policy(uint32_t sel)
++{
++	switch (sel) {
++	case SWEET_SEL_CREATE: case SWEET_SEL_LOOKUP: case SWEET_SEL_LIMITS:
++	case SWEET_SEL_LOOKUP_PORT: case SWEET_SEL_CREATE_PORT:
++		return SWEET_POLICY_HANDLED;
++	case SWEET_SEL_SET_YCBCR:        /* surface, matrix: only matters to video */
++	case SWEET_SEL_SET_VALUE:        /* IOSurfaceSetValue: values are not kept (nothing reads them back; CopyValue says so) */
++	case SWEET_SEL_REMOVE_VALUE:
++	case SWEET_SEL_BIND_ACCEL:       /* surface, accelerator id, sub id */
++	case SWEET_SEL_SET_BULK_ATTACH:  /* colour space / transfer function attachments */
++		return SWEET_POLICY_ACCEPT;
++	case SWEET_SEL_COPY_VALUE:
++		return SWEET_POLICY_NOT_FOUND;
++	case SWEET_SEL_SET_PURGEABLE:
++		return SWEET_POLICY_PURGEABLE;
++	case SWEET_SEL_WRAP_IMAGE:       /* IOSurfaceWrapClientImage / memory: not implemented -> fail, CA uploads instead */
++	case SWEET_SEL_WRAP_MEMORY:
++		return SWEET_POLICY_UNSUPPORTED;
++	default:
++		return SWEET_POLICY_UNKNOWN;
++	}
++}
++
++/* IOSurfacePurgeable: 3 only asks; the previous state is always returned. */
++static inline uint32_t
++sweet_purgeable_update(uint32_t *state, uint32_t requested)
++{
++	uint32_t old = *state;
++	if (requested != 3) {
++		*state = requested;
++	}
++	return old;
++}
++
++/*
++ * Per-plane record inside the lock result (at +0x68 + 0x80 * plane), as read by IOSurface.framework (U2-PROGRESS.md 63-66):
++ * +0 width, +4 height, +0xc offset, +0x10 bytesPerRow, +0x14 size, +0x18 bytesPerElement (u16), +0x1a/+0x1b element
++ * width/height.  +0x08 is not bytes-per-row (an earlier version wrote it there and IOSurfaceGetBytesPerRowOfPlane returned 0).
++ */
++struct sweet_plane_abi {
++	uint32_t width, height, bytesPerRow, offset, size;
++	uint16_t bytesPerElement;
++	uint8_t elementWidth, elementHeight;
++};
++#define SWEET_PLANE_RECORD_BYTES 0x80
++
++static inline void
++sweet_plane_record(uint8_t *p, const struct sweet_plane_abi *pl)
++{
++	memset(p, 0, SWEET_PLANE_RECORD_BYTES);
++	memcpy(p + 0x00, &pl->width, 4);
++	memcpy(p + 0x04, &pl->height, 4);
++	memcpy(p + 0x0c, &pl->offset, 4);
++	memcpy(p + 0x10, &pl->bytesPerRow, 4);
++	memcpy(p + 0x14, &pl->size, 4);
++	memcpy(p + 0x18, &pl->bytesPerElement, 2);
++	p[0x1a] = pl->elementWidth;
++	p[0x1b] = pl->elementHeight;
++}
++
++/*
++ * IOSurfaceAddress / IOSurfaceClientAddress: the creator hands over memory it already filled (CoreAnimation does this for
++ * images without a pixel-format code).  The surface keeps a SNAPSHOT copy of `used` bytes taken at creation: correct for the
++ * immutable images this path is used for (icons, layer contents), unlike zeros.  Returns 0 if the range is unusable.
++ */
++static inline uint64_t
++sweet_client_range_bytes(uint64_t address, uint64_t offset, uint64_t rows_bytes, uint64_t plane_end, uint64_t alloc)
++{
++	uint64_t used = offset + rows_bytes;
++	if (plane_end > used) {
++		used = plane_end;
++	}
++	if (address == 0 || used == 0 || used > alloc || address + used < address) {
++		return 0;
++	}
++	return used;
++}
++#endif
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -39,6 +39,7 @@
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
++	uint32_t                  purgeable;    /* IOSurfaceSetPurgeable state (0 = non-volatile) */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -26,6 +26,7 @@
+  * ignored (logged once per selector).
+  */
+ #include "SweetSurface.h"
++#include "sweet_surface_abi.h"
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -586,16 +587,10 @@
+ 	put32(out, 0x50, s->parentID);
+ 	put32(out, 0x54, 1);
+ 	for (uint32_t i = 0; i < s->planeCount; i++) {
+-		uint8_t *p = out + 0x68 + i * 0x80;
+ 		const struct sweet_surface_plane *pl = &s->planes[i];
+-		put32(p, 0x00, pl->width);
+-		put32(p, 0x04, pl->height);
+-		put32(p, 0x08, pl->bytesPerRow);
+-		put32(p, 0x0c, pl->offset);
+-		put32(p, 0x14, pl->size);
+-		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+-		p[0x1a] = pl->elementWidth;
+-		p[0x1b] = pl->elementHeight;
++		struct sweet_plane_abi abi = { pl->width, pl->height, pl->bytesPerRow, pl->offset, pl->size,
++			                       pl->bytesPerElement, pl->elementWidth, pl->elementHeight };
++		sweet_plane_record(out + 0x68 + i * SWEET_PLANE_RECORD_BYTES, &abi);   /* bytesPerRow at +0x10 */
+ 	}
+ }
+ 
+@@ -696,11 +691,41 @@
+ 			ret = kIOReturnNoMemory;
+ 		} else {
+ 			bzero(mem->getBytesNoCopy(), s->allocSize);
++			/* IOSurfaceAddress / IOSurfaceClientAddress: memory the creator already filled.  Keep a snapshot (see
++			 * sweet_surface_abi.h) instead of zeros; an unusable range fails the creation so the caller falls back. */
++			OSNumber *client = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++			if (client == NULL) { client = OSDynamicCast(OSNumber, props->getObject("IOSurfaceClientAddress")); }
++			if (client != NULL) {
++				uint64_t rows = (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight), plane_end = 0;
++				for (uint32_t i = 0; i < s->planeCount; i++) {
++					if ((uint64_t)s->planes[i].offset + s->planes[i].size > plane_end) {
++						plane_end = (uint64_t)s->planes[i].offset + s->planes[i].size;
++					}
++				}
++				uint64_t address = client->unsigned64BitValue();
++				uint64_t used = sweet_client_range_bytes(address, s->offset, rows, plane_end, s->allocSize);
++				int err = used == 0 ? EINVAL : copyin((user_addr_t)address, mem->getBytesNoCopy(), (size_t)used);
++				static uint32_t told;
++				if (told++ < 6) {
++					char name[32];
++					proc_selfname(name, sizeof(name));
++					IOLog("SWEET SURF: %s create from client memory %#llx (%llu of %u bytes) %ux%u fmt 0x%x -> %s\n",
++					    name, address, used, s->allocSize, s->width, s->height, s->pixelFormat, err ? "refused" : "snapshot copied");
++				}
++				if (err) {
++					OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++					mem->release();
++					mem = NULL;
++					ret = kIOReturnBadArgument;
++				}
++			}
++			if (mem != NULL) {
+ 			s->memory = mem;
+ 			s->mapCache = kIOMapDefaultCache;
+ 			if (!sweet_surface_publish(s)) {
+ 				ret = kIOReturnNoResources;
+ 			}
++			}
+ 		}
+ 	}
+ 	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64) {
+@@ -773,16 +798,54 @@
+ 		return kIOReturnSuccess;
+ 	}
+ 	default:
+-		/* Values, notifications, ownership, timestamps...: accept and ignore. */
+-		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+-			args->scalarOutput[i] = 0;
+-		}
+-		if (args->structureOutput != NULL) {
+-			bzero(args->structureOutput, args->structureOutputSize);
++		break;
++	}
++	/* Everything that is not implemented above has a deliberate answer (sweet_surface_abi.h). */
++	sweet_surf_log_once("sel", selector);
++	switch (sweet_selector_policy(selector)) {
++	case SWEET_POLICY_UNSUPPORTED:
++		/* IOSurfaceWrapClientImage/Memory: failing makes CoreAnimation upload the pixels itself. */
++		return kIOReturnUnsupported;
++	case SWEET_POLICY_NOT_FOUND:
++		return kIOReturnNotFound;
++	case SWEET_POLICY_PURGEABLE: {
++		SweetSurface *s = args->scalarInputCount >= 2 ? sweet_surface_copy((uint32_t)arg0) : NULL;
++		if (s == NULL) {
++			return args->scalarInputCount >= 2 ? kIOReturnNotFound : kIOReturnBadArgument;
++		}
++		IOLockLock(sweet_surface_lock);
++		uint32_t old = sweet_purgeable_update(&s->purgeable, (uint32_t)args->scalarInput[1]);
++		IOLockUnlock(sweet_surface_lock);
++		if (args->scalarOutputCount >= 1) {
++			args->scalarOutput[0] = old;
++			args->scalarOutputCount = 1;
+ 		}
+-		sweet_surf_log_once("sel", selector);
++		s->release();
+ 		return kIOReturnSuccess;
+ 	}
++	case SWEET_POLICY_UNKNOWN: {
++		/* Unidentified selector (seen: 40, 41, 43): tolerated as before; log its shape once so it can be named. */
++		static uint64_t shape_logged;
++		if (selector < 64 && !(shape_logged & (1ULL << selector))) {
++			shape_logged |= 1ULL << selector;
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("SWEET SURF: %s unidentified selector %u: scalars in %u out %u, struct in %u out %u, arg0 %llx -> accepted, zeroed output\n",
++			    name, selector, args->scalarInputCount, args->scalarOutputCount, (uint32_t)args->structureInputSize,
++			    (uint32_t)args->structureOutputSize, (unsigned long long)arg0);
++		}
++		break;
++	}
++	default:                /* SWEET_POLICY_ACCEPT: known, no effect */
++		break;
++	}
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = 0;
++	}
++	if (args->structureOutput != NULL) {
++		bzero(args->structureOutput, args->structureOutputSize);
++	}
++	return kIOReturnSuccess;
+ }
+ 
+ IOReturn

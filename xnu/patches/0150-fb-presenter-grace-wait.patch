@@ -1,0 +1,64 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -432,6 +432,25 @@
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
++#if defined(NORD2)
++	/* 0150: with 0149 a frame starts its panel copy a few ms after the tick and finishes right around the next one; a presenter that is only
++	 * just finishing would make this tick skip the new swap for a whole period (30 fps).  Clients have their vsync already: give it a few ms. */
++	{
++		uint8_t st = __atomic_load_n(&fb->fPState, __ATOMIC_ACQUIRE);
++		if (fb->fDirty && (st == 1 || st == 2)) {
++			IOLockUnlock(fb->fLock);
++			uint64_t w0 = mach_absolute_time(), waited = 0;
++			while ((st == 1 || st == 2) && waited < SWEET_FB_PRES_WAIT_US) {
++				IOSleep(1);
++				st = __atomic_load_n(&fb->fPState, __ATOMIC_ACQUIRE);
++				waited = sweet_fb_abs_to_us(mach_absolute_time() - w0);
++			}
++			IOLockLock(fb->fLock);
++			fb->fStats.pres_waits++;
++			if (st == 0) { fb->fStats.pres_wait_ok++; }
++		}
++	}
++#endif
+ 	if (fb->fPowerOff) {
+ 		if (fb->fDiag.enabled) { __atomic_fetch_add(&fb->fDiag.off, 1, __ATOMIC_RELAXED); }
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+@@ -698,12 +717,13 @@
+ 	uint64_t now_us = sweet_fb_abs_to_us(mach_absolute_time());
+ 	if (sweet_fb_stats_due(&fStats, now_us)) {
+ 		uint32_t n = fStats.n ? fStats.n : 1;
+-		IOLog("NORD2 FB PRESENT: n=%u avg_us=%llu max_us=%u copy_us=%llu/%u xfer_us=%llu/%u legacy=%u timeouts=%u busy_skips=%u busy_forced=%u late_ticks=%u rate_hz=%u resv_expired=%llu busy_same=%u busy_diff=%u busy_maxrun=%u busy_waits=%u busy_wait_ok=%u busy_wait_avg_us=%llu\n",
++		IOLog("NORD2 FB PRESENT: n=%u avg_us=%llu max_us=%u copy_us=%llu/%u xfer_us=%llu/%u legacy=%u timeouts=%u busy_skips=%u busy_forced=%u late_ticks=%u rate_hz=%u resv_expired=%llu busy_same=%u busy_diff=%u busy_maxrun=%u\n",
+ 		    fStats.n, fStats.sum_us / n, fStats.max_us, fStats.sum_copy_us / n, fStats.max_copy_us,
+ 		    fStats.sum_xfer_us / n, fStats.max_xfer_us, fStats.legacy, fStats.timeouts, fStats.busy_skips,
+ 		    fStats.busy_forced, fStats.late_ticks, 60 / fFlushTicks, nord2_gpu_resv_expired(),
+-		    fStats.busy_same, fStats.busy_diff, fStats.busy_maxrun, fStats.busy_waits, fStats.busy_wait_ok,
+-		    fStats.busy_waits ? fStats.busy_wait_us / fStats.busy_waits : 0ULL);
++		    fStats.busy_same, fStats.busy_diff, fStats.busy_maxrun);
++		IOLog("NORD2 FB WAITS: busy_waits=%u ok=%u avg_us=%llu presenter_waits=%u ok=%u\n", fStats.busy_waits, fStats.busy_wait_ok,
++		    fStats.busy_waits ? fStats.busy_wait_us / fStats.busy_waits : 0ULL, fStats.pres_waits, fStats.pres_wait_ok);
+ 		IOLog("NORD2 FB SEEN: presents=%u different=%u same=%u gaps_ms<=20/34/67/100/more=%u/%u/%u/%u/%u max_gap_ms=%llu\n", fStats.n, fDistinct, fSame,
+ 		    fGapBin[0], fGapBin[1], fGapBin[2], fGapBin[3], fGapBin[4], fDistinctGapMaxUs / 1000);
+ 		fDistinct = fSame = 0; fDistinctGapMaxUs = 0; for (unsigned i = 0; i < 5; i++) { fGapBin[i] = 0; }
+--- a/iokit/Kernel/arm/sweet_fb_present.h
++++ b/iokit/Kernel/arm/sweet_fb_present.h
+@@ -16,6 +16,7 @@
+ 
+ #define SWEET_FB_DEFAULT_HZ 30u          /* panel present rate; one panel transfer plus the copy is ~20-25 ms */
+ #define SWEET_FB_BUSY_MAX_TICKS 6u       /* 100 ms at 60 Hz: then present anyway */
++#define SWEET_FB_PRES_WAIT_US 4000u      /* 0150: a presenter still finishing the previous frame is waited for this long at the tick */
+ #define SWEET_FB_BUSY_WAIT_US 10000u     /* 0149: a swap whose GPU work is still in flight at the tick is waited for, this long at most, before it is skipped */
+ #define SWEET_FB_XFER_TIMEOUT_US 40000u  /* frame-done not seen: give up on this transfer */
+ #define SWEET_FB_XFER_POLL_US 500u
+@@ -84,7 +85,7 @@
+ /* Present timing, windowed; reported at most every SWEET_FB_STAT_INTERVAL_US and only if something presented. */
+ struct sweet_fb_present_stats {
+ 	uint32_t n, timeouts, busy_skips, busy_forced, late_ticks, legacy;
+-	uint32_t busy_same, busy_diff, busy_maxrun, busy_waits, busy_wait_ok;
++	uint32_t busy_same, busy_diff, busy_maxrun, busy_waits, busy_wait_ok, pres_waits, pres_wait_ok;
+ 	uint64_t busy_wait_us;   /* 0148: skips with the same / a different newest surface than the previous skip; longest run of skips */
+ 	uint64_t sum_us, sum_copy_us, sum_xfer_us;
+ 	uint32_t max_us, max_copy_us, max_xfer_us;

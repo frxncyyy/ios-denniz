@@ -1,0 +1,98 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -179,6 +179,11 @@
+ 	uint64_t            fSwapLastUs, fSwapArrUs;
+ 	uint32_t            fArrBin[5], fLatBin[5];
+ 	bool                fRegsDumped;
++	/* 0154: panel link rate. The bootloader leaves MIPI TX0 at 600 Mbps/lane (PCW 92.31, POSDIV 2); the transfer (~11 ms) is link bound
++	 * (ansuz: 6.9 ms at 934 Mbps on the same DSI IP).  Raised to 900 Mbps (= the Android 90 Hz mode's 1.5x) once, with the D-PHY timing counts scaled. */
++	volatile uint32_t  *fTx;
++	uint8_t             fRetuneState;        /* 0 not yet, 1 raised, 2 done / refused / reverted */
++	uint32_t            fRetunePresents, fSaveCon0, fSaveTim[4];
+ 	uint64_t            fNextTick, fPeriodAbs;
+ 	uint64_t            fCopyUs, fXferStart;
+ 	/* 0133: how many of the presented frames actually differ from the previous one, and the gaps between the different ones (the panel is refreshed at 60 Hz
+@@ -193,6 +198,7 @@
+ 	bool        presentCopy(const uint8_t *rec, SweetSurface *const surfaces[SWEET_FB_LAYERS]);
+ 	void        presentDone(bool shown, bool timeout, bool legacy);
+ 	void        dumpDisplayRegs(void);
++	void        linkRetune(bool up);
+ 	bool        xferStart(void);
+ 	bool        xferDone(void);
+ 	/* SwapWait / swap retirement (boot-arg n2swait, sweet_fb_swapwait.h).  fRetire, fLateSurfaces: fLock. */
+@@ -723,10 +729,75 @@
+ #endif
+ }
+ 
++/* 0154: link rate 600 -> 900 Mbps/lane between two frames (DSI idle, presenter owns the engine), or back.  Only the exact configuration read on
++ * this phone is touched (PCW 0x5c4ec4ec, POSDIV 2, PLL enabled); anything else is left alone. */
++void
++AppleCLCD::linkRetune(bool up)
++{
++#if defined(NORD2)
++	if (fDsi == NULL) { fRetuneState = 2; return; }
++	if (fTx == NULL) { fTx = (volatile uint32_t *)ml_io_map(0x11e50000UL, 0x1000); }
++	if (fTx == NULL) { fRetuneState = 2; return; }
++	uint32_t con0 = fTx[0x2c / 4], con1 = fTx[0x30 / 4];
++	if (up) {
++		if (con0 != 0x5c4ec4ecu || ((con1 >> 8) & 7u) != 2u || !(con1 & 0x10u)) {
++			fRetuneState = 2;
++			IOLog("NORD2 FB LINK: retune refused (PLL_CON0 %08x CON1 %08x)\n", con0, con1);
++			return;
++		}
++		fSaveCon0 = con0;
++		uint32_t tim[4];
++		for (unsigned i = 0; i < 4; i++) {
++			fSaveTim[i] = fDsi[(0x110 + 4 * i) / 4];
++			tim[i] = 0;
++			for (unsigned b = 0; b < 4; b++) {
++				uint32_t v = (fSaveTim[i] >> (8 * b)) & 0xffu;
++				/* DA_HS_SYNC (TIMECON2 byte 1) and CONT_DET (byte 0) are not byte-clock timings */
++				if (!(i == 2 && b < 2)) { v = (v * 3 + 1) / 2; if (v > 255) { v = 255; } }
++				tim[i] |= v << (8 * b);
++			}
++		}
++		fTx[0x2c / 4] = (uint32_t)(((uint64_t)con0 * 3) / 2);
++		fTx[0x30 / 4] = con1 & ~1u;
++		__asm__ volatile("dsb sy" ::: "memory");
++		IODelay(2);
++		fTx[0x30 / 4] = con1 | 1u;
++		__asm__ volatile("dsb sy" ::: "memory");
++		IODelay(100);
++		for (unsigned i = 0; i < 4; i++) { fDsi[(0x110 + 4 * i) / 4] = tim[i]; }
++		__asm__ volatile("dsb sy" ::: "memory");
++		IODelay(200);
++		fRetuneState = 1; fRetunePresents = fPresents;
++		IOLog("NORD2 FB LINK: raised to 900 Mbps (PCW %08x, timing %08x %08x %08x %08x)\n", fTx[0x2c / 4], tim[0], tim[1], tim[2], tim[3]);
++	} else {
++		fTx[0x2c / 4] = fSaveCon0;
++		fTx[0x30 / 4] = con1 & ~1u;
++		__asm__ volatile("dsb sy" ::: "memory");
++		IODelay(2);
++		fTx[0x30 / 4] = con1 | 1u;
++		__asm__ volatile("dsb sy" ::: "memory");
++		IODelay(100);
++		for (unsigned i = 0; i < 4; i++) { fDsi[(0x110 + 4 * i) / 4] = fSaveTim[i]; }
++		__asm__ volatile("dsb sy" ::: "memory");
++		IODelay(200);
++		fRetuneState = 2;
++		IOLog("NORD2 FB LINK: reverted to 600 Mbps\n");
++	}
++#endif
++}
++
+ void
+ AppleCLCD::presentDone(bool shown, bool timeout, bool legacy)
+ {
+ 	uint64_t xfer = shown ? sweet_fb_abs_to_us(mach_absolute_time() - fXferStart) : 0;
++#if defined(NORD2)
++	/* 0154: the presenter still owns the engine here (fPState != 0), the link is idle */
++	if (shown && !legacy) {
++		if (fRetuneState == 0 && fPresents > 400 && !timeout) { linkRetune(true); }
++		else if (fRetuneState == 1 && fPresents - fRetunePresents < 40 && fDsi != NULL &&
++		    (timeout || xfer > 30000 || (fDsi[SWEET_FB_DSI_INTSTA / 4] & (1u << 12)))) { linkRetune(false); }
++	}
++#endif
+ 	IOLockLock(fLock);
+ 	uint8_t *rec = fWorkRec;
+ 	sweet_fb_pending_surfaces surfaces = fWorkSurfaces;

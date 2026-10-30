@@ -1,0 +1,73 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -25,7 +25,7 @@
+ extern "C" {
+ extern unsigned long gPhysBase, gPhysSize;
+ extern int PE_parse_boot_argn(const char *, void *, int);
+-static uint32_t gAllocExt = 0;   /* 0136/0137: boot-arg n2ext, which ALLOC flags beyond 'executable' are accepted: 1 GPU-only, 2 write-combine (kernel-allocated), 4 write-combine (pageable, wired) */
++static uint32_t gAllocExt = 5;   /* 0139: GPU-only and pageable write-combine on by default */   /* 0136/0137: boot-arg n2ext, which ALLOC flags beyond 'executable' are accepted: 1 GPU-only, 2 write-combine (kernel-allocated), 4 write-combine (pageable, wired) */
+ extern int proc_selfpid(void);
+ extern void proc_selfname(char *, int);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -940,9 +940,9 @@
+         if (!nord2_gpu_global_private_ok(privateTotal(), bytes, globalLimit)) {
+                 budgetReject("global-private", c, requested, globalLimit); return kIOReturnNoMemory;
+         }
+-        static unsigned extLogs; bool ext = (flags & 6u) != 0; bool lg = ext && extLogs < 14; if (lg) extLogs++;
++        static unsigned extLogs; bool ext = (flags & 6u) != 0; bool lg = ext && extLogs < 4; if (lg) extLogs++;
+         bool pageableWc = (flags & 4u) && (gAllocExt & 4u);
+-        if (lg) { IOLog("NORD2 GPU EXT: flags=%u bytes=%llu pageable=%d stage=md-create\n", flags, bytes, (int)pageableWc); IOSleep(250); }
++        if (lg) { IOLog("NORD2 GPU EXT: flags=%u bytes=%llu pageable=%d stage=md-create\n", flags, bytes, (int)pageableWc); }
+         IOBufferMemoryDescriptor *md;
+         if (pageableWc) {
+                 /* Pageable memory has a VM object of its own, so its cache mode can be set without touching the kernel's shared object */
+@@ -950,7 +950,7 @@
+         } else {
+                 md = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared | ((flags & 4u) ? kIOMapWriteCombineCache : 0), (vm_size_t)bytes, 16384);
+         }
+-        if (lg) { IOLog("NORD2 GPU EXT: flags=%u md=%p stage=md-created\n", flags, (void *)md); IOSleep(250); }
++        if (lg) { IOLog("NORD2 GPU EXT: flags=%u md=%p stage=md-created\n", flags, (void *)md); }
+         if (!md) return kIOReturnNoMemory;
+         BufferOwner *owner = (BufferOwner *)IOMallocZero(sizeof(*owner));
+         unsigned count = (unsigned)(bytes / 4096);
+@@ -959,26 +959,26 @@
+         if (pageableWc) {
+                 if (md->prepare(kIODirectionInOut) != kIOReturnSuccess) { IOFree(owner, sizeof(*owner)); IOFree(pages, count*sizeof(*pages)); md->release(); return kIOReturnNoMemory; }
+                 owner->prepared = true;
+-                if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=prepared\n", flags); IOSleep(250); }
++                if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=prepared\n", flags); }
+                 static uint8_t zeros[4096];
+                 for (uint64_t off = 0; off < bytes; off += sizeof(zeros)) md->writeBytes(off, zeros, sizeof(zeros));
+         } else {
+-                if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=bzero\n", flags); IOSleep(250); }
++                if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=bzero\n", flags); }
+                 bzero(md->getBytesNoCopy(), (size_t)bytes);
+         }
+-        if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=zeroed\n", flags); IOSleep(250); }
++        if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=zeroed\n", flags); }
+         bool valid = true;
+         for (unsigned i = 0; i < count; i++) {
+                 IOByteCount length; pages[i].pa = md->getPhysicalSegment((uint64_t)i * 4096, &length, kIOMemoryMapperNone);
+                 pages[i].cpu = pageableWc ? NULL : (uint8_t *)md->getBytesNoCopy() + (uint64_t)i * 4096;
+                 if (!valid_ram(pages[i].pa) || length < 4096) valid = false;
+         }
+-        if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=segments valid=%d\n", flags, (int)valid); IOSleep(250); }
++        if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=segments valid=%d\n", flags, (int)valid); }
+         owner->md = md; bool adopted = false;
+         enum n2c_error e = valid ? n2c_bo_map(core, c, pages, count, N2C_BO_GPU_READ | N2C_BO_GPU_WRITE |
+                 ((flags & 1) ? N2C_BO_GPU_EXEC : 0) | ((flags & 2) ? N2C_BO_GPU_ONLY : 0) | ((flags & 4u) ? N2C_BO_CPU_UNCACHED : 0), owner, bytes, h, va, &adopted) : N2C_E_ARGS;
+         IOFree(pages, count * sizeof(*pages)); if (!adopted) free_owner(this, owner);
+-        if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=mapped e=%d\n", flags, (int)e); IOSleep(250); }
++        if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=mapped e=%d\n", flags, (int)e); }
+         if (e == N2C_OK) {
+                 *actual = bytes;
+                 if ((*h >> 8) <= 8 || bytes >= (8ull << 20)) {
+@@ -1170,7 +1170,7 @@
+         if(b)(void)n2c_bo_cpu_visible(gpu->core,context,type);     /* from now on the CPU may touch it: normal maintenance */
+         BufferOwner *o=b?(BufferOwner *)b->cookie:NULL;
+         if(b && (b->flags & N2C_BO_CPU_UNCACHED))*options=kIOMapWriteCombineCache;   /* 0135: the user mapping has the memory's own cache mode */
+-        { static unsigned wl; if(b && (b->flags & N2C_BO_CPU_UNCACHED) && wl<8){wl++;IOLog("NORD2 GPU EXT: clientMemoryForType type=%u wc-mapping-requested\n",(unsigned)type);IOSleep(250);} }
++        { static unsigned wl; if(b && (b->flags & N2C_BO_CPU_UNCACHED) && wl<2){wl++;IOLog("NORD2 GPU EXT: clientMemoryForType type=%u wc-mapping-requested\n",(unsigned)type);} }
+         if(o && o->md){*memory=o->md;(*memory)->retain();}
+         IOLockUnlock(gpu->lock);IOLockUnlock(lock);return *memory?kIOReturnSuccess:kIOReturnNotFound;
+ }

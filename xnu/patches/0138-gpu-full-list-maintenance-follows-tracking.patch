@@ -1,0 +1,63 @@
+--- a/bsd/dev/nord2_gpu_core.c
++++ b/bsd/dev/nord2_gpu_core.c
+@@ -457,10 +457,20 @@
+                 if (j->full_maint) {
+                         for (unsigned i = 0; i < N2C_MAX_BOS; i++) {
+                                 struct n2c_bo *b = c->ctxs[j->ctx].bos[i];
+-                                if (b && (b->flags & N2C_BO_GPU_WRITE)) {
++                                if (!b || !(b->flags & N2C_BO_GPU_WRITE))
++                                        continue;
++                                if (j->full_hard || c->track_level == N2C_TRACK_LEGACY || (b->cpu_visible && !b->explicit_track)) {
+                                         bo_cache_sync(c, b, false);
+                                         b->gpu_written = true;
+                                         b->gpu_dirty = false;
++                                } else if (!b->cpu_visible) {
++                                        b->gpu_written = true;      /* no CPU alias: no CPU line can be stale */
++                                        if (!(b->flags & N2C_BO_CPU_UNCACHED))
++                                                c->stats.cache_skip_inval_pages += b->nr_pages;
++                                } else {
++                                        b->gpu_written = true;
++                                        b->gpu_dirty = true;        /* invalidated by the CPU's acquire */
++                                        c->stats.cache_deferred_pages += b->nr_pages;
+                                 }
+                         }
+                 } else {
+@@ -1075,9 +1085,8 @@
+         j->nr_bos = r->nr_handles;
+         j->write_mask = r->write_mask;
+         j->t_submit_us = n2c_now_us(c);
+-        j->full_maint = c->full_cache_maint ||
+-                        (r->flags & N2C_SUBMIT_FULL_MAINT) ||
+-                        r->nr_handles >= N2C_JOB_BOS;
++        j->full_hard = c->full_cache_maint || (r->flags & N2C_SUBMIT_FULL_MAINT);
++        j->full_maint = j->full_hard || r->nr_handles >= N2C_JOB_BOS;
+         for (unsigned i = 0; i < r->nr_handles; i++) {
+                 struct n2c_bo *b = bos[i];
+                 j->bos[i] = b;
+@@ -1147,9 +1156,15 @@
+                                 c->stats.cache_full_jobs++;
+                                 for (unsigned i = 0; i < N2C_MAX_BOS; i++) {
+                                         struct n2c_bo *b = c->ctxs[pick->ctx].bos[i];
+-                                        if (b && b->state == N2C_BO_MAPPED) {
++                                        if (!b || b->state != N2C_BO_MAPPED)
++                                                continue;
++                                        /* A list that was only too long (not the rollback valve) covers the whole context under the same
++                                         * tracking rule as a listed buffer: a buffer the CPU never mapped is clean after its first sync. */
++                                        if (pick->full_hard || c->track_level == N2C_TRACK_LEGACY || b->cpu_dirty) {
+                                                 bo_cache_sync(c, b, true);
+                                                 b->cpu_dirty = b->cpu_visible && !b->explicit_track;
++                                        } else if (!(b->flags & N2C_BO_CPU_UNCACHED)) {
++                                                c->stats.cache_skip_clean_pages += b->nr_pages;
+                                         }
+                                 }
+                         } else {
+--- a/bsd/dev/nord2_gpu_core.h
++++ b/bsd/dev/nord2_gpu_core.h
+@@ -203,6 +203,7 @@
+         unsigned nr_bos;
+         uint32_t write_mask;
+         bool full_maint;          /* cache maintenance covers the whole context */
++        bool full_hard;           /* ... unconditionally (rollback valve or explicit flag), not just because the list was full */
+         /* Timing (us, n2c ops.now_us), set by submit / try_start / job_finish. */
+         uint64_t t_submit_us, t_start_us, t_end_us;
+         uint32_t clean_us, inval_us, clean_pages, inval_pages;
