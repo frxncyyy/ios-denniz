@@ -1,0 +1,50 @@
+set +e
+fsck.hfsplus -f -n /dev/vda | tail -2
+mount -t hfsplus -o rw,force /dev/vda /work/root || exit 1
+python3 - <<'GUEST'
+import hashlib, json, os
+R='/work/root'; REL='System/Library/Extensions/Nord2Metal.bundle'; B=R+'/'+REL
+OLD='a8ec06c1e63c8bf5cd2d8369c2b31c0d81fafef4ec6dc4d9059453a850bf60da'      # gpu/build/y2s33 (addon y2s33/y2s34)
+NEW='434d382ba98f47b3c5581f2076eb8e66b6c87cc9653eb256e1f5a9bae8014969'      # gpu/build/y2s36-planar: y2s33 with the two-plane surface check
+sha=lambda p: hashlib.sha256(open(p,'rb').read()).hexdigest()
+def inventory(d):       # as tools/stage_metal_root.py inventory(): every entry of the bundle, files by hash
+    out={}
+    for base,dirs,files in os.walk(d):
+        for n in dirs+files:
+            p=os.path.join(base,n); assert not os.path.islink(p) and (os.path.isdir(p) or os.path.isfile(p)), 'non-regular entry '+p
+            out[os.path.relpath(p,d)]='directory' if os.path.isdir(p) else sha(p)
+    return out
+def put(path, data, like):
+    st=os.stat(like); tmp=path+'.nord2tmp'
+    with open(tmp,'xb') as f: f.write(data); f.flush(); os.fsync(f.fileno())
+    os.chmod(tmp,st.st_mode&0o7777); os.chown(tmp,st.st_uid,st.st_gid); os.replace(tmp,path)
+    assert open(path,'rb').read()==data
+exe=B+'/Nord2Metal'; bak=R+'/private/var/db/nord2-metal/Nord2Metal.pre-planar'; RP=R+'/private/var/db/nord2-metal/receipt.json'
+rc=json.load(open(RP)); inv=dict(rc['inventory'][REL])
+assert rc.get('version')==2 and rc.get('phase')=='committed', 'unexpected addon receipt'
+assert inventory(B)==inv, 'the installed bundle differs from its receipt: %r'%sorted(set(inventory(B).items())^set(inv.items()))
+cur=sha(exe)
+assert cur in (OLD,NEW), 'Nord2Metal is neither the y2s33 executable nor the y2s36-planar one: %s'%cur
+did=[]
+if cur==NEW:
+    assert os.path.exists(bak) and sha(bak)==OLD, 'no backup of the y2s33 executable'
+    put(exe, open(bak,'rb').read(), exe); did.append('Nord2Metal restored')
+assert sha(exe)==OLD
+if os.path.exists(bak):
+    assert sha(bak)==OLD, 'unexpected backup'
+    os.unlink(bak); did.append('backup removed')
+print('PLANAR_UNDONE', did or 'nothing to do', 'Nord2Metal', sha(exe)[:12], 'mode %o'%(os.stat(exe).st_mode&0o7777))
+print('CC_JOB_ADDED Nord2Metal y2s36-planar removed')
+if inv['Nord2Metal']!=OLD:
+    inv['Nord2Metal']=OLD; rc['inventory'][REL]=inv; put(RP, (json.dumps(rc,indent=2)+'\n').encode(), RP)
+    print('CC_RECEIPT_UPDATED inventory Nord2Metal ->', OLD[:12])
+else:
+    print('CC_RECEIPT_UPDATED unchanged')
+assert inventory(B)==json.load(open(RP))['inventory'][REL], 'receipt does not match the bundle after the undo'
+print('PLANAR_BUNDLE', sorted(os.listdir(B)))
+os.sync()
+GUEST
+sync
+umount /work/root
+fsck.hfsplus -f -n /dev/vda
+echo INSTALL_DONE
