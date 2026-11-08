@@ -1,0 +1,408 @@
+--- a/bsd/dev/nord2_camsv.inc
++++ b/bsd/dev/nord2_camsv.inc
+@@ -78,13 +78,17 @@
+ 	mtk_cam_seninf_cammux(&n2s_ctx, N2V_CAMMUX);
+ }
+ 
+-/* CAMSV_BUF_CTRL::enqueueHwBuf: frame address, header address (64 bytes, after the frame), RCNT_INC */
++/*
++ * CAMSV_BUF_CTRL::enqueueHwBuf: frame address, header address (64 bytes, after the frame), RCNT_INC.
++ * 0289: the stock HAL writes the constant 0x11 to 0x2c at every enqueue (270 of 270 writes in camsv_hal_writes_ordered.txt) and
++ * nothing else ever writes that register; reading it back and setting bit 0 never gave the hardware bit 4.
++ */
+ static void
+ n2v_enqueue(vm_offset_t sv, uint64_t pa, uint32_t frame_bytes)
+ {
+ 	ni_wr(sv, 0x420, (uint32_t)pa);
+ 	ni_wr(sv, 0x804, (uint32_t)((pa + frame_bytes + 63) & ~63ULL));
+-	ni_wr(sv, 0x2c, ni_rd(sv, 0x2c) | 1u);
++	ni_wr(sv, 0x2c, 0x11);
+ }
+ 
+ /* the stock HAL's writes, in its order (uprobes on IspDrvCamsv::writeReg: logs/camsv_hal_writes_ordered.txt) */
+@@ -139,9 +143,9 @@
+ static void __attribute__((unused))
+ n2v_status(const char *what, vm_offset_t sv, unsigned i)
+ {
+-	printf("NORD2 CAMSV: %s camsv%u: tg inter %#x frmsize %#x datno %#x module %#x sw %#x fbc %#x/%#x base %#x dma rst %#x busy %#x cnt %#x\n", what, i,
++	printf("NORD2 CAMSV: %s camsv%u: tg inter %#x frmsize %#x datno %#x module %#x sw %#x fbc %#x/%#x base %#x dma rst %#x busy %#x cnt %#x int %#x rcnt %#x\n", what, i,
+ 	    ni_rd(sv, 0x16c), ni_rd(sv, 0x168), ni_rd(sv, 0x160), ni_rd(sv, 0x10), ni_rd(sv, 0x20), ni_rd(sv, 0xa00), ni_rd(sv, 0xa04),
+-	    ni_rd(sv, 0x420), ni_rd(sv, 0x400), ni_rd(sv, 0x48), ni_rd(sv, 0x0));
++	    ni_rd(sv, 0x420), ni_rd(sv, 0x400), ni_rd(sv, 0x48), ni_rd(sv, 0x0), ni_rd(sv, 0x1c), ni_rd(sv, 0x2c));
+ }
+ 
+ /* what is in a buffer: lines written, high bytes of RAW10, and a 64x48 thumbnail (HakiOS tools/camthumb.py) */
+--- a/bsd/dev/nord2_camdev.inc
++++ b/bsd/dev/nord2_camdev.inc
+@@ -5,7 +5,7 @@
+  *   sensor 1 = the wide (main) camera IMX766, 2 = the front IMX615, 3 = the ultra-wide IMX355
+  *   (the numbers of the frame header's `sensor` field; REDWOOD_CAMERA_SENSOR switches, the next read starts it).
+  * A session starts when something reads and ends when nothing has for 4 s. Frames are MIPI RAW10 (4 pixels in 5
+- * bytes) as the DMA writes them (CAMSV PAK RAW10). A frame is done when the last 64 bytes of its buffer are no longer
++ * bytes) as the DMA writes them (CAMSV PAK RAW10; since 0289 handed out as they are, format 4). A frame is done when the last 64 bytes of its buffer are no longer
+  * the fill pattern (HakiOS' rule); the DMA is then pointed at the next free buffer.
+  * Gain over the ABI is linear, 256 = 1x (gain_unity 256); the kernel turns it into the Sony code
+  * (code = 1024 - 1024 * 256 / gain, the OnePlus drivers' gain2reg with BASEGAIN 64 -> 1024 scale).
+@@ -24,7 +24,13 @@
+ enum { REDWOOD_CAMERA_EXPOSURE = 1, REDWOOD_CAMERA_KEEP = 2, REDWOOD_CAMERA_SENSOR = 3 };
+ struct redwood_camera_command { uint32_t command, bytes, a, b, c, d; };
+ 
+-#define N2D_NBUF 3
++/*
++ * 0289: four buffers (was three): one the DMA writes, one more waiting in the hardware's queue (as the stock HAL always has: it
++ * enqueues a second buffer 19 ms after the enable and then one per frame), the newest finished one and the one being read.
++ * The claim below 4 GB is 0xD0000000..0xD4000000 (nord2_camsv.inc: nothing carved out in 0xC0000000..0xDFE70000).
++ */
++#define N2D_NBUF 4
++#define N2D_QUEUED 2                            /* buffers kept in the hardware's queue, the one being written included */
+ #define N2D_FILL 0x5a
+ #define N2D_IDLE_MS 4000u
+ 
+@@ -48,13 +54,15 @@
+ static uint64_t n2d_pa[N2D_NBUF];
+ static uint32_t n2d_bufsz;
+ static unsigned n2d_sensor = N2C_IMX766, n2d_want_sensor = N2C_IMX766;
+-static int n2d_dma = -1;                       /* the buffer the DMA writes now */
++static int n2d_dma = -1;                       /* the buffer the DMA writes now: n2d_q[0] */
++static int n2d_q[N2D_NBUF];                    /* 0289: the buffers given to the hardware, in its order */
++static unsigned n2d_qn;
++static unsigned n2d_failed;                    /* sessions that ended for want of frames, in a row */
+ static uint32_t n2d_opens;
+ static bool n2d_wanted, n2d_streaming, n2d_reading, n2d_broken, n2d_made;
+ static uint64_t n2d_seq, n2d_given, n2d_last_read_ms;
+ static struct { bool pending; uint32_t lines, gain, frame; } n2d_ask;
+ static uint32_t n2d_cur_exp = 1000, n2d_cur_gain = 256, n2d_cur_frame;
+-static uint8_t n2d_chunk[8 * 5120];
+ 
+ static uint64_t
+ n2d_ms(void)
+@@ -71,7 +79,7 @@
+ {
+ 	if (bytes > N2V_BUF_BYTES - 4096) { return false; }
+ 	if (n2d_buf[0]) { return true; }
+-	for (unsigned i = 0; i < N2D_NBUF; i++) {            /* the fixed claim below 4 GB (nord2_camsv.inc), 3 x 16 MiB */
++	for (unsigned i = 0; i < N2D_NBUF; i++) {            /* the fixed claim below 4 GB (nord2_camsv.inc), N2D_NBUF x 16 MiB */
+ 		n2d_pa[i] = N2V_BUF_PA + (uint64_t)i * N2V_BUF_BYTES;
+ 		n2d_buf[i] = ml_io_map_unmappable(n2d_pa[i], N2V_BUF_BYTES, VM_WIMG_DEFAULT);
+ 		if (!n2d_buf[i]) { printf("NORD2 CAMERA: buffer %u cannot be mapped\n", i); return false; }
+@@ -107,10 +115,57 @@
+ 	memset((void *)(n2d_buf[b] + size - 64), N2D_FILL, 64);
+ 	n2v_inval(n2d_buf[b] + size - 64, 64);
+ 	n2d_slot[b].state = N2D_DMA;
+-	n2d_dma = (int)b;
++	n2d_q[n2d_qn++] = (int)b;
++	n2d_dma = n2d_q[0];
+ 	n2v_enqueue(n2v_sv[N2V_SV], n2d_pa[b], size);
+ }
+ 
++/* a free buffer, the one after `after' first */
++static int
++n2d_free_slot(unsigned after)
++{
++	for (unsigned i = 1; i <= N2D_NBUF; i++) {
++		unsigned c = (after + i) % N2D_NBUF;
++		if (n2d_slot[c].state == N2D_FREE) { return (int)c; }
++	}
++	return -1;
++}
++
++/* keep N2D_QUEUED buffers with the hardware while there are free ones */
++static void
++n2d_top_up(unsigned after)
++{
++	while (n2d_qn < N2D_QUEUED) {
++		lck_mtx_lock(&n2d_lock);
++		int c = n2d_free_slot(after);
++		if (c >= 0) { n2d_slot[c].state = N2D_DMA; }      /* taken under the lock; n2d_arm() fills and enqueues it */
++		lck_mtx_unlock(&n2d_lock);
++		if (c < 0) { break; }
++		n2d_arm((unsigned)c);
++		after = (unsigned)c;
++	}
++}
++
++/* CAMSV configured and enabled on a free buffer, a second one behind it: the start of a session, and after a stall */
++static void
++n2d_camsv_begin(unsigned s)
++{
++	const struct n2c_sensor *se = &n2c_sensors[s];
++	uint32_t stride = n2d_stride(s), size = stride * se->h;
++	lck_mtx_lock(&n2d_lock);
++	for (unsigned k = 0; k < N2D_NBUF; k++) { if (n2d_slot[k].state == N2D_DMA) { n2d_slot[k].state = N2D_FREE; } }
++	int b = n2d_free_slot(N2D_NBUF - 1);
++	if (b >= 0) { n2d_slot[b].state = N2D_DMA; }
++	lck_mtx_unlock(&n2d_lock);
++	n2d_qn = 0; n2d_dma = -1;
++	if (b < 0) { return; }                         /* (cannot be: at most two are ready or being read) */
++	memset((void *)(n2d_buf[b] + size - 64), N2D_FILL, 64); n2v_inval(n2d_buf[b] + size - 64, 64);
++	n2d_q[n2d_qn++] = b; n2d_dma = b;
++	n2v_camsv_cfg(n2v_sv[N2V_SV], se->w, se->h, stride, n2d_pa[b]);
++	n2v_camsv_go(n2v_sv[N2V_SV]);
++	n2d_top_up((unsigned)b);
++}
++
+ /* Sony exposure, gain and frame length (OnePlus write_shutter / set_gain: 0x0104 group hold) */
+ static void
+ n2d_set_exposure(uint32_t lines, uint32_t gain, uint32_t frame)
+@@ -137,7 +192,7 @@
+ n2d_start(unsigned s)
+ {
+ 	const struct n2c_sensor *se = &n2c_sensors[s];
+-	uint32_t stride = n2d_stride(s), size = stride * se->h;
++	uint32_t size = n2d_stride(s) * se->h;
+ 	if (se->port < 0) { printf("NORD2 CAMERA: %s has no receiver port yet\n", se->name); return false; }
+ 	if (!n2d_platform() || !n2d_alloc(5120 * 3072 + 4096)) { return false; }
+ 	n2c_s = se;
+@@ -159,9 +214,7 @@
+ 	n2v_xoff = s == N2C_IMX615 ? 8 : 0;
+ 	n2s_rx(se->port, se->cphy, se->lanes, se->pixel_rate);
+ 	n2v_cammux(se->w, se->h);
+-	n2d_slot[0].state = N2D_DMA; n2d_dma = 0;
+-	n2v_camsv_cfg(n2v_sv[N2V_SV], se->w, se->h, stride, n2d_pa[0]);
+-	n2v_camsv_go(n2v_sv[N2V_SV]);
++	n2d_camsv_begin(s);
+ 	(void)n2c_s_wr(0x0100, 1);
+ 	n2d_sensor = s;
+ 	printf("NORD2 CAMERA: %s streaming %ux%u RAW10\n", se->name, se->w, se->h);
+@@ -176,27 +229,63 @@
+ 	(void)n2c_s_wr(0x0100, 0);
+ 	n2c_sleep(40);
+ 	(void)n2c_power(s, false);
+-	n2d_dma = -1;
++	n2d_dma = -1; n2d_qn = 0;
++}
++
++/* how long without a frame is a stall: three frame times and 50 ms, 150 ms at least (the frame length follows the exposure) */
++static uint32_t
++n2d_stall_ms(void)
++{
++	uint64_t frame_ms = ((uint64_t)(n2d_cur_frame ? n2d_cur_frame : n2d_info[n2d_sensor].frame_lines) * n2d_info[n2d_sensor].line_ns) / 1000000u;
++	uint64_t ms = 3 * frame_ms + 50;
++	return (uint32_t)(ms < 150 ? 150 : ms);
+ }
+ 
+-/* a session: one sensor until nobody reads */
++/*
++ * a session: one sensor until nobody reads.
++ * 0289: (a) the hardware's queue is kept N2D_QUEUED deep, so a frame's end no longer races the next frame's start for a buffer
++ * (the DMA used to find its queue empty at every frame end; the mode's vertical blanking is 104 lines, 1.1 ms, and this loop
++ * sleeps 3 ms); (b) a stall says what CAMSV and the receiver look like, once per session in full; (c) and is answered by
++ * configuring and enabling CAMSV again on a free buffer, the sensor left streaming; (d) the session's own frame count is said.
++ */
+ static bool
+ n2d_session(unsigned s)
+ {
+ 	uint32_t size = n2d_stride(s) * n2c_sensors[s].h;
+-	uint64_t last_frame = n2d_ms();
++	uint64_t last_frame = n2d_ms(), seq0 = n2d_seq;
++	unsigned rearms = 0, rearms_now = 0, dropped_head = 0;
++	bool stall_said = false, first = true;
+ 	if (!n2d_start(s)) { return false; }
+ 	lck_mtx_lock(&n2d_lock);
+ 	n2d_given = 0; n2d_streaming = true; n2d_last_read_ms = n2d_ms();
+ 	lck_mtx_unlock(&n2d_lock);
++	last_frame = n2d_ms();
++	uint64_t watch = last_frame;                   /* the last frame, or the last time CAMSV was started again */
+ 	for (;;) {
+ 		bool stop = false;
+-		int b = n2d_dma;
++		int b = n2d_qn ? n2d_q[0] : -1;
+ 		if (b >= 0) {
+ 			n2v_inval(n2d_buf[b] + size - 64, 64);
+ 			const volatile uint8_t *tail = (const volatile uint8_t *)(n2d_buf[b] + size - 64);
+ 			bool done = false;
+ 			for (unsigned k = 0; k < 64; k++) { if (tail[k] != N2D_FILL) { done = true; break; } }
++			if (!done && n2d_qn > 1) {
++				/* the hardware went past the head of the queue without writing it? then the next one has an end and this one has not */
++				int b2 = n2d_q[1];
++				n2v_inval(n2d_buf[b2] + size - 64, 64);
++				const volatile uint8_t *tail2 = (const volatile uint8_t *)(n2d_buf[b2] + size - 64);
++				bool done2 = false;
++				for (unsigned k = 0; k < 64; k++) { if (tail2[k] != N2D_FILL) { done2 = true; break; } }
++				if (done2) {
++					if (dropped_head++ < 4) { printf("NORD2 CAMERA: buffer %d of the queue was passed over, buffer %d has the frame\n", b, b2); }
++					lck_mtx_lock(&n2d_lock);
++					n2d_slot[b].state = N2D_FREE;
++					lck_mtx_unlock(&n2d_lock);
++					for (unsigned k = 1; k < n2d_qn; k++) { n2d_q[k - 1] = n2d_q[k]; }
++					n2d_qn--;
++					b = b2; done = true;
++				}
++			}
+ 			if (done) {
+ 				lck_mtx_lock(&n2d_lock);
+ 				for (unsigned i = 0; i < N2D_NBUF; i++) { if (n2d_slot[i].state == N2D_READY) { n2d_slot[i].state = N2D_FREE; } }
+@@ -204,18 +293,17 @@
+ 				n2d_slot[b].seq = ++n2d_seq;
+ 				n2d_slot[b].time = mach_absolute_time();
+ 				n2d_slot[b].exp = n2d_cur_exp; n2d_slot[b].gain = n2d_cur_gain; n2d_slot[b].frame = n2d_cur_frame;
+-				int next = -1;
+-				for (unsigned i = 1; i <= N2D_NBUF; i++) { unsigned c = ((unsigned)b + i) % N2D_NBUF; if (n2d_slot[c].state == N2D_FREE) { next = (int)c; break; } }
+ 				wakeup(&n2d_seq);
+ 				lck_mtx_unlock(&n2d_lock);
+-				if (next >= 0) { n2d_arm((unsigned)next); } else { n2d_dma = -1; }
+-				last_frame = n2d_ms();
++				for (unsigned k = 1; k < n2d_qn; k++) { n2d_q[k - 1] = n2d_q[k]; }
++				n2d_qn--;
++				n2d_dma = n2d_qn ? n2d_q[0] : -1;
++				n2d_top_up((unsigned)b);
++				last_frame = watch = n2d_ms();
++				first = false; rearms_now = 0;
+ 			}
+-		} else {
+-			lck_mtx_lock(&n2d_lock);
+-			for (unsigned i = 0; i < N2D_NBUF; i++) { if (n2d_slot[i].state == N2D_FREE) { lck_mtx_unlock(&n2d_lock); n2d_arm(i); lck_mtx_lock(&n2d_lock); break; } }
+-			lck_mtx_unlock(&n2d_lock);
+ 		}
++		if (n2d_qn < N2D_QUEUED) { n2d_top_up(n2d_qn ? (unsigned)n2d_q[n2d_qn - 1] : 0); }
+ 		lck_mtx_lock(&n2d_lock);
+ 		if (n2d_ask.pending) {
+ 			uint32_t l = n2d_ask.lines, g = n2d_ask.gain, f = n2d_ask.frame;
+@@ -232,21 +320,46 @@
+ 		}
+ 		lck_mtx_unlock(&n2d_lock);
+ 		if (stop) { break; }
++		/* the sensor's first frame may take longer: 500 ms for it */
++		uint32_t limit = first ? 500u : n2d_stall_ms();
++		if (n2d_ms() - watch > limit) {
++			vm_offset_t sv = n2v_sv[N2V_SV];
++			if (!stall_said || rearms_now >= 3) {
++				printf("NORD2 CAMERA: stall: no frame for %llu ms (limit %u) after %llu of this session; queue %u [%d %d], exposure %u lines, frame %u lines, gain %u\n",
++				    n2d_ms() - last_frame, limit, n2d_seq - seq0, n2d_qn, n2d_qn > 0 ? n2d_q[0] : -1, n2d_qn > 1 ? n2d_q[1] : -1,
++				    n2d_cur_exp, n2d_cur_frame, n2d_cur_gain);
++				n2v_status("stall", sv, N2V_SV);
++				uint32_t inter0 = ni_rd(sv, 0x16c);
++				n2c_sleep(40);
++				n2v_status("stall +40 ms", sv, N2V_SV);
++				printf("NORD2 CAMERA: stall: TG frame count %s in 40 ms (%#x -> %#x): %s\n", ni_rd(sv, 0x16c) != inter0 ? "moved" : "did NOT move",
++				    inter0, ni_rd(sv, 0x16c), ni_rd(sv, 0x16c) != inter0 ? "frames reach CAMSV, its DMA/FBC is what stopped" : "no frames reach CAMSV (sensor or receiver)");
++				n2s_report("stall");
++				stall_said = true; rearms_now = 0;
++			}
++			n2v_camsv_stop(sv);
++			n2d_camsv_begin(s);
++			rearms++; rearms_now++;
++			if (rearms <= 8 || (rearms & 15) == 0) { printf("NORD2 CAMERA: CAMSV started again on buffer %d (#%u of this session), the sensor left streaming\n", n2d_dma, rearms); }
++			watch = n2d_ms();
++		}
+ 		n2c_sleep(3);
+ 	}
+ 	lck_mtx_lock(&n2d_lock);
+ 	n2d_streaming = false;
+ 	lck_mtx_unlock(&n2d_lock);
+ 	n2d_stop(s);
+-	printf("NORD2 CAMERA: session of %s stopped after %llu frames\n", n2c_sensors[s].name, n2d_seq);
++	printf("NORD2 CAMERA: session of %s stopped after %llu frames (%llu since boot), CAMSV started again %u times\n", n2c_sensors[s].name,
++	    n2d_seq - seq0, n2d_seq, rearms);
+ 	return n2d_ms() - last_frame <= 3000u;
+ }
+ 
+ static int
+ n2d_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+ {
+-	if (n2d_broken) { return EIO; }
+-	lck_mtx_lock(&n2d_lock); n2d_opens++; lck_mtx_unlock(&n2d_lock);
++	lck_mtx_lock(&n2d_lock);
++	if (n2d_opens++ == 0) { n2d_failed = 0; }      /* 0289: a new opener starts with a clean count */
++	lck_mtx_unlock(&n2d_lock);
+ 	return 0;
+ }
+ 
+@@ -291,7 +404,7 @@
+ 	bzero(&f, sizeof(f));
+ 	memcpy(f.magic, REDWOOD_CAMERA_MAGIC, 8);
+ 	f.header_bytes = sizeof(f);
+-	f.width = se->w; f.height = se->h; f.stride = stride; f.format = 1;
++	f.width = se->w; f.height = se->h; f.stride = stride; f.format = 4;
+ 	f.bayer = n2d_info[s].bayer; f.black = n2d_info[s].black;
+ 	f.sequence = n2d_slot[b].seq; f.time = n2d_slot[b].time;
+ 	f.exposure_lines = n2d_slot[b].exp; f.line_ns = n2d_info[s].line_ns;
+@@ -300,18 +413,19 @@
+ 	f.margin = n2d_info[s].margin; f.sensor = n2d_info[s].abi;
+ 	lck_mtx_unlock(&n2d_lock);
+ 	error = uiomove((caddr_t)&f, (int)MIN(sizeof(f), (size_t)uio_resid(uio)), uio);
+-	for (uint32_t y = 0; y < se->h && !error && uio_resid(uio) > 0; y += 8) {
+-		uint32_t n = MIN(8u, se->h - y);
+-		n2v_inval(n2d_buf[b] + y * stride, n * stride);
+-		/* the DMA packs 4 pixels as one little-endian 40-bit word (PAK mode 2); the ABI is MIPI RAW10: 4 high bytes, then the low bits */
+-		const uint8_t *src = (const uint8_t *)(n2d_buf[b] + y * stride);
+-		for (uint32_t k = 0; k + 5 <= n * stride; k += 5) {
+-			uint64_t x = (uint64_t)src[k] | (uint64_t)src[k + 1] << 8 | (uint64_t)src[k + 2] << 16 | (uint64_t)src[k + 3] << 24 | (uint64_t)src[k + 4] << 32;
+-			uint32_t p0 = (uint32_t)x & 0x3ff, p1 = (uint32_t)(x >> 10) & 0x3ff, p2 = (uint32_t)(x >> 20) & 0x3ff, p3 = (uint32_t)(x >> 30) & 0x3ff;
+-			n2d_chunk[k] = (uint8_t)(p0 >> 2); n2d_chunk[k + 1] = (uint8_t)(p1 >> 2); n2d_chunk[k + 2] = (uint8_t)(p2 >> 2); n2d_chunk[k + 3] = (uint8_t)(p3 >> 2);
+-			n2d_chunk[k + 4] = (uint8_t)((p0 & 3) | (p1 & 3) << 2 | (p2 & 3) << 4 | (p3 & 3) << 6);
++	/*
++	 * 0289: format 4 (REDWOOD_CAMERA_FORMAT_LE40_RAW10): the DMA's buffer as it is, four pixels in one little-endian 40-bit word,
++	 * same stride and height; the bundle unpacks it (camera_isp.c group()). No repacking here, 1 MiB at a time.
++	 */
++	if (!error && uio_resid(uio) > 0) {
++		uint32_t total = stride * se->h;
++		n2v_inval(n2d_buf[b], total);
++		for (uint32_t off = 0; off < total && !error && uio_resid(uio) > 0; ) {
++			uint32_t n = MIN(total - off, 1u << 20);
++			if ((user_ssize_t)n > uio_resid(uio)) { n = (uint32_t)uio_resid(uio); }
++			error = uiomove((caddr_t)(n2d_buf[b] + off), (int)n, uio);
++			off += n;
+ 		}
+-		error = uiomove((caddr_t)n2d_chunk, (int)MIN((user_ssize_t)(n * stride), uio_resid(uio)), uio);
+ 	}
+ 	lck_mtx_lock(&n2d_lock);
+ 	n2d_slot[b].state = N2D_FREE;
+@@ -355,7 +469,6 @@
+ static void
+ n2d_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+-	unsigned failed = 0;
+ 	int major = cdevsw_add(-1, &n2d_cdevsw);
+ 	n2d_made = major >= 0 && devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-camera") != NULL;
+ 	printf("NORD2 CAMERA: /dev/redwood-camera %s (sensors: 1 wide IMX766, 2 front IMX615, 3 ultra-wide IMX355)\n", n2d_made ? "made" : "CANNOT BE MADE");
+@@ -369,9 +482,16 @@
+ 		lck_mtx_unlock(&n2d_lock);
+ 		if (!any) { continue; }
+ 		if (!n2d_session(s)) {
+-			if (++failed >= 5) { printf("NORD2 CAMERA: five sessions failed: given up\n"); n2d_broken = true; }
++			/* 0289: no giving up for good (it took a reboot to get the camera back): say it and slow down; n2d_open() clears the count */
++			lck_mtx_lock(&n2d_lock);
++			unsigned failed = ++n2d_failed;
++			lck_mtx_unlock(&n2d_lock);
++			if (failed >= 5) {
++				if (failed == 5 || failed % 20 == 0) { printf("NORD2 CAMERA: %u sessions in a row without frames: each next one waits 2 s\n", failed); }
++				n2c_sleep(2000);
++			}
+ 		} else {
+-			failed = 0;
++			lck_mtx_lock(&n2d_lock); n2d_failed = 0; lck_mtx_unlock(&n2d_lock);
+ 		}
+ 	}
+ 	(void)thread_terminate(current_thread());
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -439,7 +439,27 @@
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	/*
++	 * 0289: QuartzCore and VideoToolbox (iOS 16.7) read these two as dictionaries, DisplayPipePlaneBaseAlignment =
++	 * { PlaneBaseAlignmentLinear = 64 } and DisplayPipeStrideRequirements = { StrideLinearHorizontal = 64 }; the bare
++	 * number 64 published before is not what they look for.
++	 */
++	{
++		static const char *const pipe_keys[2][2] = {
++			{ "DisplayPipePlaneBaseAlignment", "PlaneBaseAlignmentLinear" },
++			{ "DisplayPipeStrideRequirements", "StrideLinearHorizontal" },
++		};
++		for (unsigned i = 0; i < 2; i++) {
++			OSDictionary *d = OSDictionary::withCapacity(1);
++			OSNumber *n = OSNumber::withNumber(64ULL, 32);
++			if (d != NULL && n != NULL) {
++				d->setObject(pipe_keys[i][1], n);
++				setProperty(pipe_keys[i][0], d);
++			}
++			OSSafeReleaseNULL(n);
++			OSSafeReleaseNULL(d);
++		}
++	}
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);

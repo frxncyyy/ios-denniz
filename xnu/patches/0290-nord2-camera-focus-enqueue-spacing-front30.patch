@@ -1,0 +1,287 @@
+--- a/bsd/dev/nord2_camdev.inc
++++ b/bsd/dev/nord2_camdev.inc
+@@ -19,9 +19,10 @@
+ 	char magic[8]; uint32_t header_bytes, width, height, stride, format, bayer, black;
+ 	uint64_t sequence, time;
+ 	uint32_t exposure_lines, line_ns, gain, gain_unity, gain_max, frame_lines, frame_lines_min, frame_lines_max, margin, sensor;
+-	uint32_t reserved[6];
++	uint32_t focus, focus_max;      /* 0290: the lens's position as last given to the actuator; 0 to focus_max (0: the lens is not moved) */
++	uint32_t reserved[4];
+ };
+-enum { REDWOOD_CAMERA_EXPOSURE = 1, REDWOOD_CAMERA_KEEP = 2, REDWOOD_CAMERA_SENSOR = 3 };
++enum { REDWOOD_CAMERA_EXPOSURE = 1, REDWOOD_CAMERA_KEEP = 2, REDWOOD_CAMERA_SENSOR = 3, REDWOOD_CAMERA_FOCUS = 4 };
+ struct redwood_camera_command { uint32_t command, bytes, a, b, c, d; };
+ 
+ /*
+@@ -39,8 +40,10 @@
+ static const struct n2d_info n2d_info[N2C_NSENSORS] = {
+ 	/* IMX766: 4096x3072 QBIN, Bayer B first (SENSOR_OUTPUT_FORMAT_RAW_4CELL_HW_BAYER_B, HV mirror) = BGGR; 15616/1488 MHz */
+ 	[N2C_IMX766] = { 1, 3, 64, 10495, 3176, 48, 64 * 256 },
+-	/* IMX615: 3280x2464, R first (RAW_4CELL_HW_BAYER_R, normal) = RGGB; 3768/597.6 MHz */
+-	[N2C_IMX615] = { 2, 0, 64, 6305, 2642, 48, 16 * 256 },
++	/* IMX615: 3280x2464, R first (RAW_4CELL_HW_BAYER_R, normal) = RGGB; 3768/597.6 MHz.
++	 * 0290: the mode's own frame is 2642 lines = 60 frames a second; nothing wants 60 and they double everybody's work, so the
++	 * shortest frame given out is twice that, 5284 lines = 30 a second (n2d_set_exposure() writes it before the stream starts). */
++	[N2C_IMX615] = { 2, 0, 64, 6305, 2 * 2642, 48, 16 * 256 },
+ 	/* IMX355: 3264x2448, B first (RAW_B, HV mirror) = BGGR; 3672/280.8 MHz */
+ 	[N2C_IMX355] = { 3, 3, 64, 13077, 2548, 10, 16 * 256 },
+ 	[N2C_GC02M1B] = { 0, 0, 64, 26095, 1276, 16, 12 * 256 },
+@@ -49,7 +52,7 @@
+ static LCK_GRP_DECLARE(n2d_grp, "nord2-camera");
+ static LCK_MTX_DECLARE(n2d_lock, &n2d_grp);
+ enum { N2D_FREE, N2D_DMA, N2D_READY, N2D_READING };
+-static struct { int state; uint64_t seq, time; uint32_t exp, gain, frame; } n2d_slot[N2D_NBUF];
++static struct { int state; uint64_t seq, time; uint32_t exp, gain, frame, focus; } n2d_slot[N2D_NBUF];
+ static vm_offset_t n2d_buf[N2D_NBUF];
+ static uint64_t n2d_pa[N2D_NBUF];
+ static uint32_t n2d_bufsz;
+@@ -63,6 +66,26 @@
+ static uint64_t n2d_seq, n2d_given, n2d_last_read_ms;
+ static struct { bool pending; uint32_t lines, gain, frame; } n2d_ask;
+ static uint32_t n2d_cur_exp = 1000, n2d_cur_gain = 256, n2d_cur_frame;
++static uint64_t n2d_enq_ok_us;                 /* 0290: no buffer is given to the hardware before this (n2d_top_up) */
++
++/*
++ * 0290: the main camera's lens. The stock kernel's driver for this phone (OnePlus kernel source,
++ * drivers/misc/mediatek/lens/main/common/ak7377af/AK7377AF.c; lens_list.h: "add for 20817 sensor af"; 20817 is the project of
++ * the vendor's imx766_mipi_raw20817) is the AK7377AF: I2C address 0x18 >> 1 = 0x0c on the sensor's bus (i2c2), supply FAN53870
++ * LDO6 2.8 V (AK7377AF_DoExtLdo; on since n2c_fan_setup). Its whole protocol there:
++ *   initAF      reg 0x02 = 0x00 (active; "00:active mode, 10:Standby mode, x1:Sleep mode"), 10 ms
++ *   moveAF(p)   p 0..1023 from the HAL, DAC = p * 4 (12 bits): reg 0x00 = DAC >> 4, reg 0x01 = (DAC & 0xf) << 4
++ *   Release     reg 0x02 = 0x20 (standby), 20 ms
++ * No identification register is read by that driver, so the chip is taken as an AK7377 when it acknowledges at 0x0c and takes
++ * the activation; its registers 0x00-0x0f are printed at every power-on for whoever wants to check. The ABI's position is the
++ * HAL's 10 bits (focus_max 1023).
++ */
++#define N2D_AF_DEV 0x0c
++#define N2D_FOCUS_MAX 1023u
++static bool n2d_af_ok;                         /* the actuator is active and takes positions */
++static struct { bool pending, ever; uint32_t pos; } n2d_focus_ask;
++static uint32_t n2d_focus_cur;                 /* the position last written */
++static unsigned n2d_focus_said;
+ 
+ static uint64_t
+ n2d_ms(void)
+@@ -131,24 +154,50 @@
+ 	return -1;
+ }
+ 
+-/* keep N2D_QUEUED buffers with the hardware while there are free ones */
++static uint64_t
++n2d_us(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_USEC;
++}
++
++static uint64_t
++n2d_frame_us(void)
++{
++	return ((uint64_t)(n2d_cur_frame ? n2d_cur_frame : n2d_info[n2d_sensor].frame_lines) * n2d_info[n2d_sensor].line_ns) / 1000u;
++}
++
++/*
++ * keep N2D_QUEUED buffers with the hardware while there are free ones.
++ * 0290: never two enqueues one right after the other while frames flow. q10hf, front camera at 60 frames a second: after
++ * 15 s this thread fell two frames behind once, found both queued buffers done and gave the hardware two more within
++ * microseconds; from then on the first of every such pair never got a frame ("buffer N of the queue was passed over"), which
++ * left the queue empty again at the next frame: two more at once, and so on - every other frame lost, 30 a second for good.
++ * The stock HAL never does that (one enqueue per frame, 19 ms or more apart). So: after an enqueue into an EMPTY queue the
++ * next one waits a whole frame time and 2 ms (the first is the DMA's by then); otherwise half a frame time, 8 ms at least.
++ */
+ static void
+ n2d_top_up(unsigned after)
+ {
+ 	while (n2d_qn < N2D_QUEUED) {
++		if (n2d_us() < n2d_enq_ok_us) { break; }
++		bool empty = n2d_qn == 0;
++		uint64_t frame_us = n2d_frame_us(), half = frame_us / 2 < 8000 ? 8000 : frame_us / 2;
+ 		lck_mtx_lock(&n2d_lock);
+ 		int c = n2d_free_slot(after);
+ 		if (c >= 0) { n2d_slot[c].state = N2D_DMA; }      /* taken under the lock; n2d_arm() fills and enqueues it */
+ 		lck_mtx_unlock(&n2d_lock);
+ 		if (c < 0) { break; }
+ 		n2d_arm((unsigned)c);
++		n2d_enq_ok_us = n2d_us() + (empty ? frame_us + 2000 : half);
+ 		after = (unsigned)c;
+ 	}
+ }
+ 
+ /* CAMSV configured and enabled on a free buffer, a second one behind it: the start of a session, and after a stall */
+ static void
+-n2d_camsv_begin(unsigned s)
++n2d_camsv_begin(unsigned s, bool frames_flow)
+ {
+ 	const struct n2c_sensor *se = &n2c_sensors[s];
+ 	uint32_t stride = n2d_stride(s), size = stride * se->h;
+@@ -163,6 +212,8 @@
+ 	n2d_q[n2d_qn++] = b; n2d_dma = b;
+ 	n2v_camsv_cfg(n2v_sv[N2V_SV], se->w, se->h, stride, n2d_pa[b]);
+ 	n2v_camsv_go(n2v_sv[N2V_SV]);
++	/* the second buffer at once before the sensor streams (as every session so far); a frame time later when frames already flow */
++	n2d_enq_ok_us = frames_flow ? n2d_us() + n2d_frame_us() + 2000 : 0;
+ 	n2d_top_up((unsigned)b);
+ }
+ 
+@@ -189,6 +240,54 @@
+ }
+ 
+ static bool
++n2d_af_move(uint32_t pos)
++{
++	uint32_t dac = (pos > N2D_FOCUS_MAX ? N2D_FOCUS_MAX : pos) * 4;
++	n2c_bus_init(&n2c_i2c2);
++	bool ok = n2c_wr(N2D_AF_DEV, 0x00, 1, (uint8_t)(dac >> 4)) && n2c_wr(N2D_AF_DEV, 0x01, 1, (uint8_t)((dac & 0xf) << 4));
++	if (ok) { n2d_focus_cur = dac / 4; }
++	if (!ok || n2d_focus_said < 12) {
++		n2d_focus_said++;
++		printf("NORD2 CAMERA: lens to %u of %u (DAC %u): %s\n", dac / 4, N2D_FOCUS_MAX, dac, ok ? "written" : "NOT ACKNOWLEDGED");
++	}
++	return ok;
++}
++
++/* after the sensor's power-on (AFVDD is up with it): what the actuator's registers say, then active */
++static void
++n2d_af_start(void)
++{
++	uint8_t r[16], mode = 0xff;
++	unsigned acks = 0;
++	n2d_af_ok = false;
++	n2c_bus_init(&n2c_i2c2);
++	for (unsigned i = 0; i < 16; i++) { r[i] = 0xee; if (n2c_rd(N2D_AF_DEV, (uint16_t)i, 1, &r[i], 1)) { acks++; } }
++	printf("NORD2 CAMERA: lens actuator, i2c2 0x0c: %u of 16 registers read, 00-0f = %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
++	    "(ee: not read; the stock driver here is AK7377AF: 02 mode, 00/01 position)\n", acks, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
++	    r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]);
++	if (acks == 0) { printf("NORD2 CAMERA: lens actuator does not answer: the lens is not moved (focus_max 0)\n"); return; }
++	bool ok = n2c_wr(N2D_AF_DEV, 0x02, 1, 0x00);
++	n2c_sleep(10);
++	(void)n2c_rd(N2D_AF_DEV, 0x02, 1, &mode, 1);
++	if (!ok) { printf("NORD2 CAMERA: lens actuator did not take the activation (02 <- 00): the lens is not moved (focus_max 0)\n"); return; }
++	n2d_af_ok = true;
++	n2d_focus_cur = (((uint32_t)r[0] << 4) | (r[1] >> 4)) / 4;
++	printf("NORD2 CAMERA: lens actuator active (02 reads %02x), position registers say %u of %u%s\n", mode, n2d_focus_cur, N2D_FOCUS_MAX,
++	    n2d_focus_ask.ever ? "; the position asked before is given again" : "");
++	if (n2d_focus_ask.ever) { (void)n2d_af_move(n2d_focus_ask.pos); }
++}
++
++static void
++n2d_af_stop(void)
++{
++	if (!n2d_af_ok) { return; }
++	n2d_af_ok = false;
++	n2c_bus_init(&n2c_i2c2);
++	(void)n2c_wr(N2D_AF_DEV, 0x02, 1, 0x20);       /* standby (AK7377AF_Release) */
++	n2c_sleep(20);
++}
++
++static bool
+ n2d_start(unsigned s)
+ {
+ 	const struct n2c_sensor *se = &n2c_sensors[s];
+@@ -197,6 +296,7 @@
+ 	if (!n2d_platform() || !n2d_alloc(5120 * 3072 + 4096)) { return false; }
+ 	n2c_s = se;
+ 	n2d_sensor = s;
++	n2d_af_ok = false;
+ 	if (!n2c_power(s, true)) { (void)n2c_power(s, false); return false; }
+ 	n2c_bus_init(se->bus);
+ 	int hi = n2c_s_rd(se->idreg_hi), lo = n2c_s_rd(se->idreg_lo);
+@@ -209,12 +309,13 @@
+ 	(void)n2c_s_wr(0x0101, se->mirror);
+ 	(void)n2c_s_table(se->mode, se->mode_n);
+ 	n2d_set_exposure(n2d_info[s].frame_lines / 2, 2 * 256, 0);
++	if (s == N2C_IMX766) { n2d_af_start(); n2c_s = se; }
+ 	for (unsigned k = 0; k < N2D_NBUF; k++) { memset((void *)(n2d_buf[k] + size - 64), N2D_FILL, 64); n2v_inval(n2d_buf[k] + size - 64, 64); n2d_slot[k].state = N2D_FREE; }
+ 	/* the receiver and CAMSV armed on buffer 0 first, then the stream */
+ 	n2v_xoff = s == N2C_IMX615 ? 8 : 0;
+ 	n2s_rx(se->port, se->cphy, se->lanes, se->pixel_rate);
+ 	n2v_cammux(se->w, se->h);
+-	n2d_camsv_begin(s);
++	n2d_camsv_begin(s, false);
+ 	(void)n2c_s_wr(0x0100, 1);
+ 	n2d_sensor = s;
+ 	printf("NORD2 CAMERA: %s streaming %ux%u RAW10\n", se->name, se->w, se->h);
+@@ -228,6 +329,7 @@
+ 	n2c_s = &n2c_sensors[s];
+ 	(void)n2c_s_wr(0x0100, 0);
+ 	n2c_sleep(40);
++	if (s == N2C_IMX766) { n2d_af_stop(); }
+ 	(void)n2c_power(s, false);
+ 	n2d_dma = -1; n2d_qn = 0;
+ }
+@@ -277,7 +379,10 @@
+ 				bool done2 = false;
+ 				for (unsigned k = 0; k < 64; k++) { if (tail2[k] != N2D_FILL) { done2 = true; break; } }
+ 				if (done2) {
+-					if (dropped_head++ < 4) { printf("NORD2 CAMERA: buffer %d of the queue was passed over, buffer %d has the frame\n", b, b2); }
++					if (dropped_head++ < 4 || (dropped_head & 63) == 0) {
++						printf("NORD2 CAMERA: buffer %d of the queue was passed over, buffer %d has the frame (#%u of this session, frame %llu of it)\n", b, b2,
++						    dropped_head, n2d_seq - seq0 + 1);
++					}
+ 					lck_mtx_lock(&n2d_lock);
+ 					n2d_slot[b].state = N2D_FREE;
+ 					lck_mtx_unlock(&n2d_lock);
+@@ -293,8 +398,18 @@
+ 				n2d_slot[b].seq = ++n2d_seq;
+ 				n2d_slot[b].time = mach_absolute_time();
+ 				n2d_slot[b].exp = n2d_cur_exp; n2d_slot[b].gain = n2d_cur_gain; n2d_slot[b].frame = n2d_cur_frame;
++				n2d_slot[b].focus = n2d_focus_cur;
+ 				wakeup(&n2d_seq);
+ 				lck_mtx_unlock(&n2d_lock);
++				if (n2d_seq - seq0 <= 3) {
++					/* 0290: the 64 bytes the DMA writes after a frame (0x804; the TG's time stamp is on, 0x130 bit 16): said for the
++					 * first three frames of a session, to see whether a hardware time is in there */
++					const volatile uint8_t *h = (const volatile uint8_t *)(n2d_buf[b] + size);
++					char hex[64 * 2 + 1];
++					n2v_inval(n2d_buf[b] + size, 64);
++					for (unsigned k = 0; k < 64; k++) { snprintf(hex + k * 2, 3, "%02x", h[k]); }
++					printf("NORD2 CAMERA: frame %llu of the session, seen done at %llu us: DMA header %s\n", n2d_seq - seq0, n2d_us(), hex);
++				}
+ 				for (unsigned k = 1; k < n2d_qn; k++) { n2d_q[k - 1] = n2d_q[k]; }
+ 				n2d_qn--;
+ 				n2d_dma = n2d_qn ? n2d_q[0] : -1;
+@@ -312,6 +427,13 @@
+ 			n2d_set_exposure(l, g, f);
+ 			lck_mtx_lock(&n2d_lock);
+ 		}
++		if (n2d_focus_ask.pending) {
++			uint32_t pos = n2d_focus_ask.pos;
++			n2d_focus_ask.pending = false;
++			lck_mtx_unlock(&n2d_lock);
++			if (s == N2C_IMX766 && n2d_af_ok) { (void)n2d_af_move(pos); n2c_s = &n2c_sensors[s]; }
++			lck_mtx_lock(&n2d_lock);
++		}
+ 		if (n2d_opens == 0 || n2d_ms() - n2d_last_read_ms > N2D_IDLE_MS || n2d_want_sensor != s) {
+ 			stop = true;
+ 		} else if (n2d_ms() - last_frame > 3000u) {
+@@ -338,7 +460,7 @@
+ 				stall_said = true; rearms_now = 0;
+ 			}
+ 			n2v_camsv_stop(sv);
+-			n2d_camsv_begin(s);
++			n2d_camsv_begin(s, true);
+ 			rearms++; rearms_now++;
+ 			if (rearms <= 8 || (rearms & 15) == 0) { printf("NORD2 CAMERA: CAMSV started again on buffer %d (#%u of this session), the sensor left streaming\n", n2d_dma, rearms); }
+ 			watch = n2d_ms();
+@@ -411,6 +533,8 @@
+ 	f.gain = n2d_slot[b].gain; f.gain_unity = 256; f.gain_max = n2d_info[s].gain_max;
+ 	f.frame_lines = n2d_slot[b].frame; f.frame_lines_min = n2d_info[s].frame_lines; f.frame_lines_max = 0xffff;
+ 	f.margin = n2d_info[s].margin; f.sensor = n2d_info[s].abi;
++	f.focus = n2d_slot[b].focus; f.focus_max = (s == N2C_IMX766 && n2d_af_ok) ? N2D_FOCUS_MAX : 0;
++	if (!f.focus_max) { f.focus = 0; }
+ 	lck_mtx_unlock(&n2d_lock);
+ 	error = uiomove((caddr_t)&f, (int)MIN(sizeof(f), (size_t)uio_resid(uio)), uio);
+ 	/*
+@@ -453,6 +577,11 @@
+ 			}
+ 		}
+ 		return EINVAL;
++	case REDWOOD_CAMERA_FOCUS:
++		lck_mtx_lock(&n2d_lock);
++		n2d_focus_ask.pos = c.a > N2D_FOCUS_MAX ? N2D_FOCUS_MAX : c.a; n2d_focus_ask.pending = true; n2d_focus_ask.ever = true;
++		lck_mtx_unlock(&n2d_lock);
++		return 0;
+ 	case REDWOOD_CAMERA_KEEP:
+ 		return ENOSPC;
+ 	default:

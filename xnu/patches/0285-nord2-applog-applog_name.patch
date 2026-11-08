@@ -1,0 +1,134 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2623,6 +2623,79 @@
+ }
+ 
+ /*
++ * NORD2 applog (port of ios-topaz 0920 + 0921, themselves after the HakiOS/darwin-redwood applog).
++ *
++ * applog_name=NAME[,NAME...]: programs whose file names begin with one of the NAMEs get
++ * OS_ACTIVITY_DT_MODE=YES appended to their environment at exec, which makes os_log mirror its
++ * messages on standard error. It works on its own (0921): what such a program writes to /dev/null
++ * (where launchd points the standard output and error of its jobs and of applications) is copied
++ * to the kernel log by the SWEET /dev/null tee in bsd/dev/mem.c as "|name| text", which asks
++ * exec_applog_name_match() below (the names in boot-arg sweetnull are tee'd as before).
++ *
++ * applog=1: in posix_spawn file actions, standard output and error opened on /dev/null are
++ * opened on /dev/console instead, for every program (0920; not needed for applog_name).
++ * applog=2: also OS_ACTIVITY_DT_MODE for every program (slow).
++ *
++ * NORD2_APPLOG_NAME_DEFAULT is the value of applog_name when the boot-arg is absent: the Nord 2
++ * command line (BOOT_LINE_LENGTH 608) is full, so a diagnostic build sets it with -D. A boot-arg
++ * applog_name=... replaces it (applog_name=- matches nothing in practice).
++ */
++#ifndef NORD2_APPLOG_NAME_DEFAULT
++#define NORD2_APPLOG_NAME_DEFAULT ""
++#endif
++static TUNABLE(uint32_t, exec_applog, "applog", 0);
++static TUNABLE_STR(exec_applog_name, 128, "applog_name", NORD2_APPLOG_NAME_DEFAULT);
++
++bool exec_applog_name_match(const char *name, size_t namelen);
++
++/* does name (namelen bytes, need not be terminated) begin with one of the applog_name words? */
++bool
++exec_applog_name_match(const char *name, size_t namelen)
++{
++	const char *p = exec_applog_name;
++
++	if (name == NULL) {
++		return false;
++	}
++	while (*p != 0) {
++		const char *word = p;
++
++		while (*p != 0 && *p != ',') {
++			p++;
++		}
++		if (p != word && (size_t)(p - word) <= namelen &&
++		    strncmp(word, name, (size_t)(p - word)) == 0) {
++			return true;
++		}
++		if (*p == ',') {
++			p++;
++		}
++	}
++	return false;
++}
++
++static bool
++exec_applog_oslog(struct image_params *imgp)
++{
++	if (exec_applog >= 2) {
++		return true;
++	}
++	if (exec_applog_name[0] == 0 || imgp->ip_ndp == NULL) {
++		return false;
++	}
++	return exec_applog_name_match(imgp->ip_ndp->ni_cnd.cn_nameptr, imgp->ip_ndp->ni_cnd.cn_namelen);
++}
++
++static const char *
++exec_applog_path(int fd, const char *path)
++{
++	if (exec_applog && (fd == 1 || fd == 2) && strcmp(path, "/dev/null") == 0) {
++		return "/dev/console";
++	}
++	return path;
++}
++
++/*
+  * exec_handle_file_actions
+  *
+  * Description:	Go through the _posix_file_actions_t contents applying the
+@@ -2691,7 +2764,7 @@
+ 			AUDIT_SUBCALL_ENTER(OPEN, p, uthread);
+ 
+ 			NDINIT(ndp, LOOKUP, OP_OPEN, FOLLOW | AUDITVNPATH1, UIO_SYSSPACE,
+-			    CAST_USER_ADDR_T(psfa->psfaa_openargs.psfao_path),
++			    CAST_USER_ADDR_T(exec_applog_path(psfa->psfaa_filedes, psfa->psfaa_openargs.psfao_path)),
+ 			    imgp->ip_vfs_context);
+ 
+ 			error = open1(imgp->ip_vfs_context, ndp,
+@@ -5741,6 +5814,20 @@
+ 		imgp->ip_envc++;
+ 	}
+ 
++	/* NORD2 applog: os_log on standard error for the programs applog_name names (see exec_applog_oslog) */
++	if (exec_applog_oslog(imgp)) {
++		error = exec_add_user_string(imgp, CAST_USER_ADDR_T("OS_ACTIVITY_DT_MODE=YES"), UIO_SYSSPACE, TRUE);
++		if (error) {
++			goto bad;
++		}
++		if (imgp->ip_argspace < new_ptr_size) {
++			error = E2BIG;
++			goto bad;
++		}
++		imgp->ip_argspace -= new_ptr_size;
++		imgp->ip_envc++;
++	}
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -165,6 +165,9 @@
+ static char sweet_null_names[128];
+ static int sweet_null_parsed;
+ 
++/* NORD2 applog (bsd/kern/kern_exec.c): the programs applog_name names are tee'd too */
++extern bool exec_applog_name_match(const char *name, size_t namelen);
++
+ static bool
+ sweet_null_tee(char *name, size_t len)
+ {
+@@ -187,6 +190,9 @@
+ 		}
+ 		t = end + 1;
+ 	}
++	if (n > 0 && exec_applog_name_match(name, n)) {
++		return true;
++	}
+ 	return false;
+ }
+ #endif

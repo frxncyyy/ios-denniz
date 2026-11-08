@@ -1,0 +1,212 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -901,6 +901,9 @@
+ extern int use_panic_on_proc_spawn_fail;
+ #endif
+ 
++/* NORD2 applog (0286): see exec_applog_report() */
++static void exec_applog_report(struct image_params *imgp, proc_t p);
++
+ void
+ set_proc_name(struct image_params *imgp, proc_t p)
+ {
+@@ -1923,6 +1926,9 @@
+ 
+ 	set_proc_name(imgp, p);
+ 
++	/* NORD2 applog (0286): one line per exec of a program applog_name names; its fd 1/2 onto /dev/null */
++	exec_applog_report(imgp, p);
++
+ #if CONFIG_SECLUDED_MEMORY
+ 	if (secluded_for_apps &&
+ 	    load_result.platform_binary) {
+@@ -2696,6 +2702,144 @@
+ }
+ 
+ /*
++ * NORD2 applog (0286). q10gz showed "exec Camera" and no "|Camera|" line: nothing told which link was
++ * missing. For every exec of a program applog_name names, after the image is loaded and named
++ * (posix_spawn file actions and close-on-exec are done by then, so descriptors are final):
++ *  - is OS_ACTIVITY_DT_MODE=YES really in the environment strings that were copied out;
++ *  - what are descriptors 1 and 2 (the tee in bsd/dev/mem.c only sees writes to the null device);
++ *  - when one of them is not the null device (closed, a pipe, a socket, another file), /dev/null is
++ *    opened on it, the same way a posix_spawn open file action would have: only for these programs,
++ *    so that what they write to standard output/error reaches the tee.
++ * One line: "NORD2 APPLOG: exec NAME pid N: env added=E (envc C), fd1=..., fd2=...".
++ */
++extern bool nord2_applog_is_null_dev(dev_t dev);        /* bsd/dev/mem.c */
++
++#define EXEC_APPLOG_FD_NULL     0x1     /* is the null device */
++#define EXEC_APPLOG_FD_GUARDED  0x2     /* guarded against close: left alone */
++
++static int
++exec_applog_fd_describe(proc_t p, int fd, char *buf, size_t len)
++{
++	static const char *const kinds[] = {
++		[DTYPE_SOCKET] = "socket", [DTYPE_PSXSHM] = "shm", [DTYPE_PSXSEM] = "sem", [DTYPE_KQUEUE] = "kqueue",
++		[DTYPE_PIPE] = "pipe", [DTYPE_FSEVENTS] = "fsevents", [DTYPE_NETPOLICY] = "netpolicy",
++		[DTYPE_CHANNEL] = "channel", [DTYPE_NEXUS] = "nexus",
++	};
++	struct fileproc *fp;
++	int res = 0;
++
++	if (fp_lookup(p, fd, &fp, 0) != 0) {
++		strlcpy(buf, "closed", len);
++		return 0;
++	}
++	if (fp_isguarded(fp, GUARD_CLOSE)) {
++		res |= EXEC_APPLOG_FD_GUARDED;
++	}
++	unsigned int type = (unsigned int)FILEGLOB_DTYPE(fp->fp_glob);
++	if (type == DTYPE_VNODE) {
++		vnode_t vp = (vnode_t)fp_get_data(fp);
++
++		if (vp != NULLVP && vnode_getwithref(vp) == 0) {
++			char path[96];
++			int plen = (int)sizeof(path);
++
++			if (vn_getpath(vp, path, &plen) != 0) {
++				strlcpy(path, "?", sizeof(path));
++			}
++			if (vp->v_type == VCHR) {
++				dev_t rdev = vnode_specrdev(vp);
++
++				if (nord2_applog_is_null_dev(rdev)) {
++					res |= EXEC_APPLOG_FD_NULL;
++				}
++				snprintf(buf, len, "chr %d,%d %s", major(rdev), minor(rdev), path);
++			} else {
++				snprintf(buf, len, "vnode vtype %d %s", (int)vp->v_type, path);
++			}
++			vnode_put(vp);
++		} else {
++			strlcpy(buf, "vnode ?", len);
++		}
++	} else if (type < sizeof(kinds) / sizeof(kinds[0]) && kinds[type] != NULL) {
++		strlcpy(buf, kinds[type], len);
++	} else {
++		snprintf(buf, len, "dtype %u", type);
++	}
++	if (res & EXEC_APPLOG_FD_GUARDED) {
++		strlcat(buf, " guarded", len);
++	}
++	fp_drop(p, fd, fp, 0);
++	return res;
++}
++
++/* open /dev/null for writing on descriptor fd of p (what a posix_spawn PSFA_OPEN file action does) */
++static int
++exec_applog_fd_to_null(struct image_params *imgp, proc_t p, int fd)
++{
++	struct applog_open {
++		struct vnode_attr va;
++		struct nameidata nd;
++	} *od;
++	int error, origfd = -1, ival[2];
++
++	/* data heap on purpose: a kalloc_type here would add a typed-allocator view to this object (compile_0285.py) */
++	od = kalloc_data(sizeof(*od), Z_WAITOK | Z_ZERO);
++	if (od == NULL) {
++		return ENOMEM;
++	}
++	VATTR_INIT(&od->va);
++	VATTR_SET(&od->va, va_mode, 0);
++	NDINIT(&od->nd, LOOKUP, OP_OPEN, FOLLOW, UIO_SYSSPACE, CAST_USER_ADDR_T("/dev/null"), imgp->ip_vfs_context);
++	error = open1(imgp->ip_vfs_context, &od->nd, O_WRONLY, &od->va, NULL, NULL, &origfd, AUTH_OPEN_NOAUTHFD);
++	kfree_data(od, sizeof(*od));
++	if (error || origfd == fd) {
++		return error;
++	}
++	error = dup2(p, origfd, fd, ival);
++	(void)close_nocancel(p, origfd);
++	return error;
++}
++
++static void
++exec_applog_report(struct image_params *imgp, proc_t p)
++{
++	static const char want[] = "OS_ACTIVITY_DT_MODE=YES";
++	char desc[2][160];
++	int env = 0;
++
++	if (exec_applog_name[0] == 0 || !exec_applog_name_match(p->p_name, strnlen(p->p_name, sizeof(p->p_name)))) {
++		return;
++	}
++	if (imgp->ip_endargv != NULL && imgp->ip_endenvv != NULL) {
++		for (const char *s = imgp->ip_endargv; s < imgp->ip_endenvv;
++		    s += strnlen(s, (size_t)(imgp->ip_endenvv - s)) + 1) {
++			if ((size_t)(imgp->ip_endenvv - s) >= sizeof(want) && memcmp(s, want, sizeof(want)) == 0) {
++				env = 1;
++				break;
++			}
++		}
++	}
++	for (int i = 0; i < 2; i++) {
++		int fd = i + 1;
++		int res = exec_applog_fd_describe(p, fd, desc[i], sizeof(desc[i]));
++
++		if ((res & (EXEC_APPLOG_FD_NULL | EXEC_APPLOG_FD_GUARDED)) == 0) {
++			char tail[40];
++			int error = exec_applog_fd_to_null(imgp, p, fd);
++
++			if (error) {
++				snprintf(tail, sizeof(tail), " -> /dev/null FAILED %d", error);
++			} else {
++				strlcpy(tail, " -> now /dev/null", sizeof(tail));
++			}
++			strlcat(desc[i], tail, sizeof(desc[i]));
++		}
++	}
++	printf("NORD2 APPLOG: exec %s pid %d: env added=%d (envc %d), fd1=%s, fd2=%s\n",
++	    p->p_name, proc_getpid(p), env, imgp->ip_envc, desc[0], desc[1]);
++}
++
++/*
+  * exec_handle_file_actions
+  *
+  * Description:	Go through the _posix_file_actions_t contents applying the
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -168,6 +168,34 @@
+ /* NORD2 applog (bsd/kern/kern_exec.c): the programs applog_name names are tee'd too */
+ extern bool exec_applog_name_match(const char *name, size_t namelen);
+ 
++/* NORD2 applog (0286): is dev the null device this tee watches (kern_exec.c reports/redirects fd 1 and 2 with it) */
++bool nord2_applog_is_null_dev(dev_t dev);
++
++bool
++nord2_applog_is_null_dev(dev_t dev)
++{
++	return major(dev) >= 0 && major(dev) < nchrdev && minor(dev) == 2 &&
++	       (uintptr_t)(void *)cdevsw[major(dev)].d_write == (uintptr_t)(void *)mmwrite;
++}
++
++/* NORD2 applog (0286): one line the first time each such process is seen writing here */
++static int nord2_applog_seen_pid[8];
++static unsigned int nord2_applog_seen_next;
++
++static void
++nord2_applog_first_write(const char *name)
++{
++	int pid = proc_selfpid();
++
++	for (unsigned int i = 0; i < 8; i++) {
++		if (nord2_applog_seen_pid[i] == pid) {
++			return;
++		}
++	}
++	nord2_applog_seen_pid[nord2_applog_seen_next++ & 7] = pid;
++	printf("NORD2 APPLOG: first /dev/null write from %s pid %d\n", name, pid);
++}
++
+ static bool
+ sweet_null_tee(char *name, size_t len)
+ {
+@@ -191,6 +219,7 @@
+ 		t = end + 1;
+ 	}
+ 	if (n > 0 && exec_applog_name_match(name, n)) {
++		nord2_applog_first_write(name);
+ 		return true;
+ 	}
+ 	return false;

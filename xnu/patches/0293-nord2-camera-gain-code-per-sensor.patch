@@ -1,0 +1,74 @@
+--- a/bsd/dev/nord2_camdev.inc
++++ b/bsd/dev/nord2_camdev.inc
+@@ -10,8 +10,7 @@
+  * 0292: TWO instances, /dev/redwood-camera (node 1, default sensor 1) and /dev/redwood-camera2 (node 2, default sensor 3),
+  * each with its own session thread, receiver (SENINF context and mux), cam mux, CAMSV, buffers and exposure; they can stream
+  * two different sensors at the same time. The ABI is gpu/build/camera-userland-20261109/KERNEL_ABI_DUAL.md.
+- * Gain over the ABI is linear, 256 = 1x (gain_unity 256); the kernel turns it into the Sony code
+- * (code = 1024 - 1024 * 256 / gain, the OnePlus drivers' gain2reg with BASEGAIN 64 -> 1024 scale).
++ * Gain over the ABI is linear, 256 = 1x (gain_unity 256); the kernel turns it into each sensor's own code (0293: n2d_info).
+  */
+ #include <miscfs/devfs/devfs.h>
+ #include <sys/conf.h>
+@@ -39,17 +38,26 @@
+ #define N2D_IDLE_MS 4000u
+ 
+ /* per sensor (index into n2c_sensors): ABI number, Bayer order and black level of its preview mode, line time */
+-struct n2d_info { uint32_t abi, bayer, black, line_ns, frame_lines, margin, gain_max; };
++/*
++ * 0293: the analog gain code is NOT the same for the three Sony sensors (their OnePlus drivers' gain2reg, gain in 1/64):
++ *   IMX766  16384 - 16384 * 64 / gain   (gain = 16384 / (16384 - code), up to 64x)
++ *   IMX615   4096 -  1024 * 64 / gain   (gain =  1024 / ( 4096 - code), up to 64x; code 3072 is 1x)
++ *   IMX355   1024 -  1024 * 64 / gain   (gain =  1024 / ( 1024 - code), up to 16x)
++ * Until 0293 all three were given the IMX355's code: the IMX766 then had 1.0x to 1.07x whatever was asked, and the IMX615
++ * 0.29x to 0.33x (codes far below its 1x) - AE asked for more and more gain and nothing came (q10hm: the front camera black in
++ * a dim room at "16x"; q10hf: its green did not follow the gain asked). code = gain_full - gain_num * 256 / gain (gain in 1/256).
++ */
++struct n2d_info { uint32_t abi, bayer, black, line_ns, frame_lines, margin, gain_max, gain_full, gain_num; };
+ static const struct n2d_info n2d_info[N2C_NSENSORS] = {
+ 	/* IMX766: 4096x3072 QBIN, Bayer B first (SENSOR_OUTPUT_FORMAT_RAW_4CELL_HW_BAYER_B, HV mirror) = BGGR; 15616/1488 MHz */
+-	[N2C_IMX766] = { 1, 3, 64, 10495, 3176, 48, 64 * 256 },
++	[N2C_IMX766] = { 1, 3, 64, 10495, 3176, 48, 64 * 256, 16384, 16384 },
+ 	/* IMX615: 3280x2464, R first (RAW_4CELL_HW_BAYER_R, normal) = RGGB; 3768/597.6 MHz.
+ 	 * 0290: the mode's own frame is 2642 lines = 60 frames a second; nothing wants 60 and they double everybody's work, so the
+ 	 * shortest frame given out is twice that, 5284 lines = 30 a second (n2d_set_exposure() writes it before the stream starts). */
+-	[N2C_IMX615] = { 2, 0, 64, 6305, 2 * 2642, 48, 16 * 256 },
++	[N2C_IMX615] = { 2, 0, 64, 6305, 2 * 2642, 48, 64 * 256, 4096, 1024 },      /* 0293: max_gain 4096 / 64 = 64x in its driver */
+ 	/* IMX355: 3264x2448, B first (RAW_B, HV mirror) = BGGR; 3672/280.8 MHz */
+-	[N2C_IMX355] = { 3, 3, 64, 13077, 2548, 10, 16 * 256 },
+-	[N2C_GC02M1B] = { 0, 0, 64, 26095, 1276, 16, 12 * 256 },
++	[N2C_IMX355] = { 3, 3, 64, 13077, 2548, 10, 16 * 256, 1024, 1024 },
++	[N2C_GC02M1B] = { 0, 0, 64, 26095, 1276, 16, 12 * 256, 1024, 1024 },
+ };
+ 
+ static LCK_GRP_DECLARE(n2d_grp, "nord2-camera");
+@@ -94,6 +102,7 @@
+ 	struct { bool pending; uint32_t lines, gain, frame; } ask;
+ 	uint32_t cur_exp, cur_gain, cur_frame;
+ 	uint64_t enq_ok_us;                     /* no buffer is given to the hardware before this (n2d_top_up) */
++	unsigned exp_said;                      /* exposures said in this session (0293) */
+ 	struct { bool pending, ever; uint32_t pos; } focus_ask;
+ };
+ static struct n2d_inst n2d_i[N2D_NINST] = {
+@@ -305,7 +314,12 @@
+ 	if (frame > 0xffff) { frame = 0xffff; }
+ 	if (lines > frame - info->margin) { lines = frame - info->margin; }
+ 	if (lines < 1) { lines = 1; }
+-	uint32_t code = 1024 - (1024 * 256) / gain;
++	uint32_t code = info->gain_full - (info->gain_num * 256) / gain;
++	if (in->exp_said < 4) {
++		in->exp_said++;
++		printf("NORD2 CAMERA: %s: %s exposure %u lines, frame %u lines, gain %u/256 = code %u (0x0204/5 <- %#06x)\n", in->node,
++		    n2c_sensors[in->sensor].name, lines, frame, gain, code, code);
++	}
+ 	lck_mtx_lock(&n2d_hw);                         /* the eight writes together: a few ms */
+ 	n2c_s = &n2c_sensors[in->sensor];
+ 	(void)n2c_s_wr(0x0104, 1);
+@@ -386,6 +400,7 @@
+ 	lck_mtx_unlock(&n2d_hw);
+ 	if (!ok || !n2d_alloc(in, 5120 * 3072 + 4096)) { return false; }
+ 	in->sensor = s;
++	in->exp_said = 0;
+ 	if (s == N2C_IMX766) { n2d_af_ok = false; }
+ 	lck_mtx_lock(&n2d_hw);
+ 	ok = n2c_power(s, true);

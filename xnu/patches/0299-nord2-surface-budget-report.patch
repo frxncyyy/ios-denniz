@@ -1,0 +1,119 @@
+diff -ruN a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -74,7 +74,69 @@
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+-#define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
++/*
++ * 0299: every surface here is wired kernel memory (nothing is purgeable or paged as on Apple's IOSurface), under one budget.
++ * 1536 MiB was reached by the Photos application and the camera together (run user2: 1438 creations refused with
++ * kIOReturnNoMemory, of every size). 2048 MiB of the 3776 MiB the kernel is given; each refusal now says what is held, by whom.
++ */
++#define SWEET_SURFACE_WIRED_MAX         (2048ull << 20)
++static int32_t       sweet_surface_owner[SWEET_SURFACE_MAX_ID];     /* pid that put the surface in the table */
++static uint32_t      sweet_surface_buffers;     /* buffer surfaces alive (in the table or only held by a port / the kernel) */
++static uint64_t      sweet_surface_refused, sweet_surface_report_ns;
++
++/* One line at most every two seconds: the budget, what the table holds and the five processes that created most of it. */
++static void
++sweet_surface_report(const char *why, uint32_t asked)
++{
++	struct { int32_t pid; uint32_t count; uint64_t bytes; } top[24];
++	uint32_t used = 0, in_table = 0, other_count = 0;
++	uint64_t table_bytes = 0, other_bytes = 0, now = 0;
++	uint64_t refused = OSAddAtomic64(1, (volatile SInt64 *)&sweet_surface_refused) + 1;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &now);
++	IOLockLock(sweet_surface_lock);
++	if (sweet_surface_report_ns != 0 && now - sweet_surface_report_ns < 2000000000ull) {
++		IOLockUnlock(sweet_surface_lock);
++		return;
++	}
++	sweet_surface_report_ns = now;
++	for (uint32_t id = 1; id < SWEET_SURFACE_MAX_ID; id++) {
++		SweetSurface *t = sweet_surface_table[id];
++		if (t == NULL || OSDynamicCast(IOBufferMemoryDescriptor, t->memory) == NULL) {
++			continue;
++		}
++		in_table++;
++		table_bytes += t->allocSize;
++		uint32_t k = 0;
++		while (k < used && top[k].pid != sweet_surface_owner[id]) {
++			k++;
++		}
++		if (k == used && used < 24) {
++			top[used].pid = sweet_surface_owner[id]; top[used].count = 0; top[used].bytes = 0;
++			used++;
++		}
++		if (k < used) {
++			top[k].count++; top[k].bytes += t->allocSize;
++		} else {
++			other_count++; other_bytes += t->allocSize;
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	IOLog("SWEET SURF: refused (%s, %u bytes asked, refusal %llu): %llu of %llu MiB wired in %u buffer surfaces; table has %u of them, %llu MiB\n",
++	    why, asked, refused, sweet_surface_wired >> 20, SWEET_SURFACE_WIRED_MAX >> 20, sweet_surface_buffers, in_table, table_bytes >> 20);
++	for (uint32_t n = 0; n < 5 && n < used; n++) {
++		uint32_t best = n;
++		for (uint32_t k = n + 1; k < used; k++) {
++			if (top[k].bytes > top[best].bytes) {
++				best = k;
++			}
++		}
++		__typeof__(top[0]) tmp = top[n]; top[n] = top[best]; top[best] = tmp;
++		char name[32] = "?";
++		proc_name(top[n].pid, name, sizeof(name));
++		IOLog("SWEET SURF:   %s[%d] created %u of them, %llu MiB\n", name, top[n].pid, top[n].count, top[n].bytes >> 20);
++	}
++	(void)other_count; (void)other_bytes;
++}
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
+@@ -83,6 +145,7 @@
+ {
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
++		OSDecrementAtomic((volatile SInt32 *)&sweet_surface_buffers);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
+ 	OSSafeReleaseNULL(memory);
+@@ -126,6 +189,7 @@
+ 			s->retain();
+ 			sweet_surface_table[id] = s;
+ 			sweet_surface_users[id] = 1;
++			sweet_surface_owner[id] = proc_selfpid();
+ 			*(uint64_t *)s->state->getBytesNoCopy() = id;   /* registry id */
+ 			return true;
+ 		}
+@@ -681,15 +745,18 @@
+ 	ret = sweet_surface_layout(s, props);
+ 	if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+-		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+-		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
++		bool in_budget = (uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
++		    s->allocSize <= SWEET_SURFACE_WIRED_MAX;
++		if (in_budget) {
+ 			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+ 			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
+ 		}
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 			ret = kIOReturnNoMemory;
++			sweet_surface_report(in_budget ? "the kernel gave no memory" : "over the budget", s->allocSize);   /* 0299 */
+ 		} else {
++			OSIncrementAtomic((volatile SInt32 *)&sweet_surface_buffers);
+ 			bzero(mem->getBytesNoCopy(), s->allocSize);
+ 			/* IOSurfaceAddress / IOSurfaceClientAddress: memory the creator already filled.  Keep a snapshot (see
+ 			 * sweet_surface_abi.h) instead of zeros; an unusable range fails the creation so the caller falls back. */
+@@ -714,6 +781,7 @@
+ 				}
+ 				if (err) {
+ 					OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++					OSDecrementAtomic((volatile SInt32 *)&sweet_surface_buffers);
+ 					mem->release();
+ 					mem = NULL;
+ 					ret = kIOReturnBadArgument;

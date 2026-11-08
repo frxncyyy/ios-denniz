@@ -1,0 +1,3048 @@
+diff -ruN a/bsd/dev/nord2_jpegdev.inc b/bsd/dev/nord2_jpegdev.inc
+--- a/bsd/dev/nord2_jpegdev.inc
++++ b/bsd/dev/nord2_jpegdev.inc
+@@ -0,0 +1,624 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * nord2_jpegdev.inc -- /dev/redwood-jpeg, the MT6893 hardware JPEG encoder as a real character device.
++ *
++ * Included by bsd/dev/sweet_touch.c after nord2_hwcodec.inc (the phone-verified 0298 model). It reuses that model's
++ * n2j_* power/clock/reset/bus sequences unchanged: n2j_power(), n2j_bus() and n2j_off() are called, never copied, so
++ * every register sequence here is the one already run on the phone (gpu/hwcodec/runs/q10hw1).
++ *
++ * Host builds define N2J_HOST and provide the kernel shims (dev_t, cdevsw, devfs, locks, msleep, copyin/copyout,
++ * thread_call, ml_io_map_unmappable, mach_absolute_time, n2j_map/n2j_us/n2j_log): see kern/test_k01/t_jpegdev.c.
++ *
++ * ABI: include/redwood_jpeg.h (frozen). One job at a time, callers sleep interruptibly. The source picture is copied into
++ * the 24 MiB source area at RW_CLAIM_JPEG_PA, re-laid out to the hardware's stride with the right and bottom padding
++ * replicated; the JPEG is written by the block into the 16 MiB after it and copied out. The VEN domain is powered on for
++ * the first job and off again RWJ_IDLE_OFF_MS after the last one, from a thread call.
++ *
++ * Memory: RW_CLAIM_JPEG_PA .. +RW_CLAIM_JPEG_BYTES (40 MiB: source 24 MiB, output 16 MiB), mapped lazily on the first job.
++ * The DMA address registers are 32 bits wide and the larb7 ports run with the IOMMU bypassed (as the cameras do).
++ */
++#ifndef NORD2_JPEGDEV_INC
++#define NORD2_JPEGDEV_INC 1
++
++/*
++ * The frozen ABI headers are in gpu/hwcodec/include. Host builds pass -Igpu/hwcodec/include; in the kernel tree the .inc
++ * is included from a source file, so fall back to paths relative to this file (and to the kernel/b copy of it).
++ */
++#if defined(__has_include)
++# if __has_include("redwood_jpeg.h")
++#  include "redwood_jpeg.h"
++#  include "redwood_vcodec.h"
++# elif __has_include("../../../include/redwood_jpeg.h")
++#  include "../../../include/redwood_jpeg.h"
++#  include "../../../include/redwood_vcodec.h"
++# elif __has_include("../../../../include/redwood_jpeg.h")
++#  include "../../../../include/redwood_jpeg.h"
++#  include "../../../../include/redwood_vcodec.h"
++# else
++#  error "redwood_jpeg.h not found: add -Igpu/hwcodec/include or keep this file under gpu/hwcodec/kern/bsd/dev"
++# endif
++#else
++# include "redwood_jpeg.h"
++# include "redwood_vcodec.h"
++#endif
++
++#ifdef N2J_HOST
++/* kernel types and functions are supplied by kern/test_k01/t_jpegdev.c */
++#else
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/conf.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <kern/thread_call.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#endif
++
++#define N2JD_NODE        "redwood-jpeg"
++#define N2JD_SRC_PA      ((uint32_t)RW_CLAIM_JPEG_PA)
++#define N2JD_SRC_BYTES   0x01800000u            /* 24 MiB */
++#define N2JD_DST_OFF     N2JD_SRC_BYTES
++#define N2JD_DST_PA      (N2JD_SRC_PA + N2JD_SRC_BYTES)
++#define N2JD_DST_BYTES   0x01000000u            /* 16 MiB */
++#define N2JD_STALL_BYTES (N2JD_DST_BYTES - 0x1000u)
++#define N2JD_POLL_US     100u
++#define N2JD_POLLS       20000u                 /* 2 s, as the 0298 model */
++#define N2JD_LOG_JOBS    8u                     /* per-job log lines after a power-on (bring-up verbosity) */
++
++#if defined(__cplusplus)
++#error "nord2_jpegdev.inc is C"
++#endif
++_Static_assert(RW_CLAIM_JPEG_BYTES == N2JD_SRC_BYTES + N2JD_DST_BYTES,
++    "the 40 MiB JPEG claim in redwood_vcodec.h no longer matches source+output");
++_Static_assert(RWJ_MAX_WIDTH <= 8192u && RWJ_MAX_HEIGHT <= 8192u, "header limits changed: check the 32-bit DMA registers");
++
++/* hw-k02's VEN reference count, registered when its file is in the build (see the board note of K01). */
++typedef int (*n2jd_ven_get_fn)(void);
++typedef void (*n2jd_ven_put_fn)(void);
++
++static struct {
++	int major;
++	bool made;
++	bool busy;                              /* one hardware job at a time */
++	uint32_t powered;                        /* this driver holds a VEN reference and the block is set up (atomic: INFO reads it) */
++	bool mapped;
++	unsigned opens;
++	uint32_t jobs_done, jobs_failed;
++	uint32_t last_hw_us;
++	unsigned session_jobs;
++	uint64_t last_job_ns;
++	thread_call_t idle;
++	n2jd_ven_get_fn ven_get;
++	n2jd_ven_put_fn ven_put;
++	vm_offset_t src, dst;                   /* the 40 MiB claim, mapped lazily */
++} n2jd;
++
++LCK_GRP_DECLARE(n2jd_grp, "nord2-jpeg");
++LCK_MTX_DECLARE(n2jd_lock, &n2jd_grp);
++
++static uint64_t
++n2jd_now_ns(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns;
++}
++
++static uint32_t
++n2jd_align16(uint32_t v)
++{
++	return (v + 15u) & ~15u;
++}
++
++static uint32_t
++n2jd_align8(uint32_t v)
++{
++	return (v + 7u) & ~7u;
++}
++
++/* include/redwood_jpeg.h: nearest hardware code not above the requested quality, mtk_jpeg_core.c:1148 */
++static uint32_t
++n2jd_quality_code(uint32_t q)
++{
++	if (q >= 97) { return 0x10; }           /* Q97 */
++	if (q >= 95) { return 3; }              /* Q95 */
++	if (q >= 90) { return 7; }              /* Q90 */
++	if (q >= 85) { return 2; }              /* Q85 */
++	if (q >= 78) { return 6; }              /* Q78 */
++	if (q >= 72) { return 0x0f; }           /* Q72 */
++	if (q >= 60) { return 1; }              /* Q60 */
++	if (q >= 52) { return 0x0a; }           /* Q52 */
++	if (q >= 44) { return 0x0e; }           /* Q44 */
++	if (q >= 38) { return 0; }              /* Q38 */
++	return 4;                               /* Q30 */
++}
++
++/* a user range must be non-empty, start above 0 and not wrap the 64-bit address space */
++static bool
++n2jd_urange(uint64_t base, uint64_t off, uint64_t len)
++{
++	if (base == 0 || len == 0) { return false; }
++	if (off > UINT64_MAX - base) { return false; }
++	uint64_t a = base + off;
++	return len <= UINT64_MAX - a;
++}
++
++struct n2jd_geom {
++	uint32_t w, h, rows, hw_stride, line_bytes, chroma_stride, chroma_rows;
++	bool yuyv;
++	uint32_t src_bytes;
++	uint32_t blk_num;
++};
++
++static bool
++n2jd_geometry(const struct rwj_encode *j, struct n2jd_geom *g)
++{
++	g->w = j->width;
++	g->h = j->height;
++	g->yuyv = (j->format == RWJ_FMT_YUYV || j->format == RWJ_FMT_YVYU);
++	g->hw_stride = g->yuyv ? 2u * n2jd_align16(j->width) : n2jd_align16(j->width);
++	g->rows = g->yuyv ? n2jd_align8(j->height) : n2jd_align16(j->height);
++	g->line_bytes = g->yuyv ? 2u * j->width : j->width;
++	g->chroma_stride = j->chroma_stride ? j->chroma_stride : j->stride;
++	g->chroma_rows = g->yuyv ? 0 : g->rows / 2u;
++	/* mtk_jpeg_core.c:1188: 4:2:0 sixteen-pixel MCUs, 4:2:2 eight-line MCUs of four blocks */
++	g->blk_num = g->yuyv
++	    ? (n2jd_align16(j->width) >> 4) * (n2jd_align8(j->height) >> 3) * 4u - 1u
++	    : (n2jd_align16(j->width) >> 4) * (n2jd_align16(j->height) >> 4) * 6u - 1u;
++	uint64_t bytes = (uint64_t)g->hw_stride * g->rows * (g->yuyv ? 1u : 3u) / (g->yuyv ? 1u : 2u);
++	if (bytes > N2JD_SRC_BYTES) { return false; }
++	g->src_bytes = (uint32_t)bytes;
++	return true;
++}
++
++/* every limit in include/redwood_jpeg.h; EINVAL except the documented ENOSPC of dst_capacity */
++static int
++n2jd_validate(const struct rwj_encode *j, struct n2jd_geom *g)
++{
++	if (j->width < 16u || j->height < 16u) { return EINVAL; }
++	if (j->width > RWJ_MAX_WIDTH || j->height > RWJ_MAX_HEIGHT) { return EINVAL; }
++	if ((j->width & 1u) || (j->height & 1u)) { return EINVAL; }
++	if ((uint64_t)j->width * j->height > (uint64_t)RWJ_MAX_PIXELS) { return EINVAL; }
++	if (j->format != RWJ_FMT_NV12 && j->format != RWJ_FMT_NV21 &&
++	    j->format != RWJ_FMT_YUYV && j->format != RWJ_FMT_YVYU) { return EINVAL; }
++	if (j->quality < 1u || j->quality > 100u) { return EINVAL; }
++	bool yuyv = (j->format == RWJ_FMT_YUYV || j->format == RWJ_FMT_YVYU);
++	if (j->stride < (yuyv ? 2u * j->width : j->width)) { return EINVAL; }
++	uint32_t cs = j->chroma_stride ? j->chroma_stride : j->stride;
++	if (!yuyv && cs < j->width) { return EINVAL; }
++	/* the JPEG DRI interval is a 16-bit field; > 0xffff cannot be represented in the stream */
++	if (j->restart_interval > 0xffffu) { return EINVAL; }
++	if (j->flags & ~((uint32_t)RWJ_FLAG_EXIF_GAP)) { return EINVAL; }
++	if (j->dst == 0 || j->src_y == 0 || (!yuyv && j->src_c == 0)) { return EINVAL; }
++	uint64_t need = ((uint64_t)j->width * j->height) / 2u + 4096u;
++	if ((uint64_t)j->dst_capacity < need) { return ENOSPC; }
++	if (!n2jd_urange(j->dst, 0, j->dst_capacity)) { return EINVAL; }
++	uint32_t line_bytes = yuyv ? 2u * j->width : j->width;
++	if (!n2jd_urange(j->src_y, (uint64_t)(j->height - 1u) * j->stride, line_bytes)) { return EINVAL; }
++	if (!yuyv && !n2jd_urange(j->src_c, (uint64_t)(j->height / 2u - 1u) * cs, j->width)) { return EINVAL; }
++	if (!n2jd_geometry(j, g)) { return EINVAL; }             /* packed picture does not fit the 24 MiB source claim */
++	return 0;
++}
++
++/*
++ * Bring the block up: K02's VEN reference first when it exists, then the model's own sequences (idempotent: an already
++ * powered domain is left powered, the larb and encoder are always configured for the four JPEG ports).
++ */
++static uint32_t
++n2jd_power_on(void)
++{
++	if (__atomic_load_n(&n2jd.powered, __ATOMIC_RELAXED) && n2j.bus_ready && n2j_clocked()) { return 0; }   /* the domain, larb7 and JPEG clock are still ours */
++	bool shared = n2jd.ven_get != NULL;
++	uint32_t r;
++	if (shared) {
++		/* K02 owns the domain and leaves the JPGENC gate (bit 8) off; it releases protection and the larb gate */
++		if (n2jd.ven_get() != 0) {
++			__atomic_store_n(&n2jd.powered, 0u, __ATOMIC_RELEASE);
++			return RWJ_E_POWER;
++		}
++		if (!n2j_domain_on()) {                          /* a contract violation from the provider: do not touch registers */
++			n2jd.ven_put();
++			__atomic_store_n(&n2jd.powered, 0u, __ATOMIC_RELEASE);
++			return RWJ_E_POWER;
++		}
++		ni_wr(n2j.cg, 0x4, 1u << 8);                     /* vencsys SET: JPGENC clock on (bit 8 only) */
++	} else {
++		r = n2j_power();
++		if (r != N2J_OK) {
++			__atomic_store_n(&n2jd.powered, 0u, __ATOMIC_RELEASE);
++			return r == N2J_E_NO_BUS ? RWJ_E_BUS : RWJ_E_POWER;
++		}
++	}
++	r = n2j_bus();
++	if (r != N2J_OK) {
++		if (shared) {
++			ni_wr(n2j.cg, 0x8, 1u << 8);                 /* gate our block before dropping the reference */
++			n2jd.ven_put();
++		} else {
++			(void)n2j_off();
++		}
++		__atomic_store_n(&n2jd.powered, 0u, __ATOMIC_RELEASE);
++		return r == N2J_E_NO_BUS ? RWJ_E_BUS : RWJ_E_POWER;
++	}
++	__atomic_store_n(&n2jd.powered, 1u, __ATOMIC_RELEASE);
++	n2jd.session_jobs = 0;
++	return 0;
++}
++
++static uint32_t
++n2jd_power_off(void)
++{
++	if (n2jd.ven_put != NULL) {
++		if (n2j_clocked()) {                     /* gate the JPEG block before K02's reference is dropped */
++			ni_wr(n2j.cg, 0x8, 1u << 8);
++		}
++		n2jd.ven_put();                          /* K02 drops its reference; it powers off at zero */
++		__atomic_store_n(&n2jd.powered, 0u, __ATOMIC_RELEASE);
++		n2j.bus_ready = false;
++		return 0;
++	}
++	uint32_t r = n2j_off();
++	if (r == N2J_OK || !(ni_rd(n2j.spm, 0x16c) & N2J_PWR_STA)) { __atomic_store_n(&n2jd.powered, 0u, __ATOMIC_RELEASE); return 0; }
++	return r == N2J_E_PROT_TIMEOUT ? RWJ_E_BUS : RWJ_E_POWER;
++}
++
++/* map the register windows and the 40 MiB claim once, on the first job; mapping touches no register */
++static bool
++n2jd_maps(void)
++{
++	if (n2jd.mapped) { return true; }
++	n2j.spm = n2j_map(0x10006000, 0x1000, 1);
++	n2j.infra = n2j_map(0x10001000, 0x1000, 1);
++	n2j.top = n2j_map(0x10000000, 0x1000, 1);
++	n2j.cg = n2j_map(0x17000000, 0x1000, 1);
++	n2j.larb = n2j_map(0x17010000, 0x1000, 1);
++	n2j.enc = n2j_map(0x17030000, 0x1000, 1);
++	n2j.dispsmi = n2j_map(0x1411f000, 0x1000, 1);
++	if (!n2j.spm || !n2j.infra || !n2j.top || !n2j.cg || !n2j.larb || !n2j.enc || !n2j.dispsmi) { return false; }
++	n2j.buf = n2j_map(RW_CLAIM_JPEG_PA, N2JD_SRC_BYTES + N2JD_DST_BYTES, 0);
++	if (!n2j.buf) { return false; }
++	n2jd.src = n2j.buf;
++	n2jd.dst = n2j.buf + N2JD_DST_OFF;
++	n2jd.mapped = true;
++	return true;
++}
++
++/*
++ * Copy the user's picture into the packed source area: luma lines of `width` bytes (YUYV: 2 * width), the last pixel
++ * replicated to the hardware stride, the last line replicated to the aligned height, chroma the same with U,V pairs.
++ */
++static int
++n2jd_copy_src(const struct rwj_encode *j, const struct n2jd_geom *g)
++{
++	uint8_t *p = (uint8_t *)n2jd.src;
++	uint32_t rs = g->hw_stride;
++
++	for (uint32_t y = 0; y < g->h; y++) {
++		uint8_t *d = p + (size_t)y * rs;
++		int e = copyin((user_addr_t)(j->src_y + (uint64_t)y * j->stride), d, g->line_bytes);
++		if (e) { return e; }
++		if (g->yuyv) {
++			for (uint32_t x = g->line_bytes; x < rs; x += 4u) { memcpy(d + x, d + g->line_bytes - 4u, 4); }
++		} else {
++			memset(d + g->line_bytes, d[g->line_bytes - 1u], rs - g->line_bytes);
++		}
++	}
++	uint8_t *last = p + (size_t)(g->h - 1u) * rs;
++	for (uint32_t y = g->h; y < g->rows; y++) { memcpy(p + (size_t)y * rs, last, rs); }
++	if (!g->yuyv) {
++		uint8_t *c = p + (size_t)rs * g->rows;
++		uint32_t ch = g->h / 2u;
++		for (uint32_t y = 0; y < ch; y++) {
++			uint8_t *d = c + (size_t)y * rs;
++			int e = copyin((user_addr_t)(j->src_c + (uint64_t)y * g->chroma_stride), d, g->w);
++			if (e) { return e; }
++			for (uint32_t x = g->w; x < rs; x += 2u) { memcpy(d + x, d + g->w - 2u, 2); }
++		}
++		uint8_t *clast = c + (size_t)(ch - 1u) * rs;
++		for (uint32_t y = ch; y < g->chroma_rows; y++) { memcpy(c + (size_t)y * rs, clast, rs); }
++	}
++	return 0;
++}
++
++/* the last FF D9 in the last 64 bytes (the block rounds its byte count up to 64); 0: no EOI found */
++static uint32_t
++n2jd_cut(const uint8_t *o, uint32_t size)
++{
++	if (size < 4u) { return 0; }
++	for (uint32_t k = 0; k < 64u && k + 2u <= size; k++) {
++		uint32_t i = size - 2u - k;
++		if (o[i] == 0xffu && o[i + 1u] == 0xd9u) { return i + 2u; }
++	}
++	return 0;
++}
++
++/*
++ * One job. Called with n2jd.busy set and no lock held (the idle thread call sees busy and reschedules). Returns an errno;
++ * j->out_status says what the hardware did (RWJ_E_*). j->out_bytes is 0 unless a complete JPEG was cut.
++ */
++static int
++n2jd_run(struct rwj_encode *j, const struct n2jd_geom *g)
++{
++	j->out_bytes = 0;
++	j->out_hw_us = 0;
++	j->out_status = 0;
++	if (!n2jd_maps()) {
++		n2j_log("NORD2 JPEG: the register windows or the 40 MiB claim cannot be mapped\n");
++		j->out_status = RWJ_E_BUS;
++		return EIO;
++	}
++	int err = n2jd_copy_src(j, g);
++	if (err) { return err; }
++	n2j_cache(n2jd.src, g->src_bytes);
++
++	uint32_t pr = n2jd_power_on();
++	if (pr != 0) {
++		n2j_log("NORD2 JPEG: power-on failed (%u)\n", pr);
++		j->out_status = pr;
++		return EIO;
++	}
++	uint32_t q = n2jd_quality_code(j->quality);
++	uint32_t src_pa = N2JD_SRC_PA;
++	uint32_t dst_pa = N2JD_DST_PA;
++	vm_offset_t e = n2j.enc;
++
++	n2j_reset();
++	ni_wr(e, 0x154, (j->width << 16) | j->height);                          /* IMG_SIZE */
++	ni_mask(e, 0x104, 0x18u, (uint32_t)j->format << 3);                     /* YUV format 0..3 */
++	ni_wr(e, 0x10c, g->blk_num);                                            /* BLK_NUM */
++	ni_wr(e, 0x17c, g->hw_stride);                                          /* IMG_STRIDE */
++	ni_wr(e, 0x178, g->hw_stride);                                          /* STRIDE */
++	ni_wr(e, 0x170, src_pa);                                                /* SRC_LUMA_ADDR */
++	ni_wr(e, 0x174, src_pa + g->hw_stride * g->rows);                       /* SRC_CHROMA_ADDR */
++	ni_wr(e, 0x138, 0);                                                     /* OFFSET_ADDR */
++	ni_wr(e, 0x16c, dst_pa & 0xfu);                                         /* BYTE_OFFSET_MASK */
++	ni_wr(e, 0x120, dst_pa & ~0xfu);                                        /* DST_ADDR0 */
++	ni_wr(e, 0x128, (dst_pa + N2JD_STALL_BYTES) & ~0xfu);                   /* STALL_ADDR0 */
++	ni_mask(e, 0x108, 0xffffu, q);                                          /* QUALITY low 16 bits */
++	ni_mask(e, 0x104, 1u << 10, j->restart_interval ? 1u << 10 : 0);        /* restart enable */
++	ni_wr(e, 0x150, j->restart_interval);                                   /* RST_MCU_NUM */
++	ni_mask(e, 0x104, 1u << 5, (j->flags & RWJ_FLAG_EXIF_GAP) ? 1u << 5 : 0);
++	uint32_t ctrl = (ni_rd(e, 0x104) | (1u << 2) | (1u << 0) | (1u << 20) | (1u << 29)) & ~(1u << 30);
++
++	uint64_t t0 = mach_absolute_time();
++	ni_wr(e, 0x104, ctrl);                                                  /* start */
++	uint32_t st = 0;
++	unsigned polls = 0;
++	for (; polls < N2JD_POLLS; polls++) {
++		st = ni_rd(e, 0x11c) & 0x13u;
++		if (st) { break; }
++		n2j_us(N2JD_POLL_US);
++	}
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	uint32_t us = ns / 1000u > UINT32_MAX ? UINT32_MAX : (uint32_t)(ns / 1000u);
++	j->out_hw_us = us;
++	if (st) { ni_wr(e, 0x11c, 0); }
++	if (!st) {
++		n2j_log("NORD2 JPEG: encode timeout after %u polls (%u us)\n", polls, us);
++		n2j_reset();
++		j->out_status = RWJ_E_TIMEOUT;
++		return EIO;
++	}
++	if (!(st & 1u)) {
++		n2j_reset();
++		j->out_status = RWJ_E_STALL;
++		return EIO;
++	}
++	uint32_t dma = ni_rd(e, 0x124);                                         /* DMA_ADDR0 */
++	uint32_t base = ni_rd(e, 0x120);                                        /* DST_ADDR0 */
++	if (dma < base || dma > N2JD_DST_PA + N2JD_STALL_BYTES) {
++		j->out_status = RWJ_E_SIZE;
++		return EIO;
++	}
++	uint32_t size = dma - base;
++	if (size < 4u) {
++		j->out_status = RWJ_E_SIZE;
++		return EIO;
++	}
++	n2j_cache(n2jd.dst, size);
++	uint8_t *o = (uint8_t *)n2jd.dst;
++	if (o[0] != 0xffu || o[1] != 0xd8u) {
++		n2j_log("NORD2 JPEG: the block did not write a JPEG start (%02x %02x)\n", o[0], o[1]);
++		j->out_status = RWJ_E_SIZE;
++		return EIO;
++	}
++	uint32_t cut = n2jd_cut(o, size);
++	if (cut == 0) {
++		n2j_log("NORD2 JPEG: no FF D9 in the last 64 bytes of %u\n", size);
++		j->out_status = RWJ_E_SIZE;
++		return EIO;
++	}
++	if (cut > j->dst_capacity) {
++		n2j_log("NORD2 JPEG: %u bytes of JPEG do not fit the user's %u\n", cut, j->dst_capacity);
++		j->out_status = RWJ_E_SIZE;
++		return EIO;
++	}
++	j->out_bytes = cut;
++	err = copyout(o, (user_addr_t)j->dst, cut);
++	if (err) { return err; }
++	if (n2jd.session_jobs < N2JD_LOG_JOBS) {
++		n2jd.session_jobs++;
++		n2j_log("NORD2 JPEG: %ux%u fmt %u q %u -> %u bytes in %u us\n", j->width, j->height, j->format, j->quality, cut, us);
++	}
++	return 0;
++}
++
++static void
++n2jd_schedule_off(void)
++{
++	if (n2jd.idle == NULL) { return; }
++	uint64_t dl;
++	clock_interval_to_deadline(RWJ_IDLE_OFF_MS, NSEC_PER_MSEC, &dl);
++	(void)thread_call_enter_delayed(n2jd.idle, dl);
++}
++
++/* RWJ_IDLE_OFF_MS after the last job, from the thread call; a job in progress makes it look again */
++static void
++n2jd_idle(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	lck_mtx_lock(&n2jd_lock);
++	if (!__atomic_load_n(&n2jd.powered, __ATOMIC_ACQUIRE)) { lck_mtx_unlock(&n2jd_lock); return; }
++	if (n2jd.busy) { n2jd_schedule_off(); lck_mtx_unlock(&n2jd_lock); return; }
++	uint64_t now = n2jd_now_ns(), idle = (uint64_t)RWJ_IDLE_OFF_MS * NSEC_PER_MSEC;
++	if (now < n2jd.last_job_ns || now - n2jd.last_job_ns < idle) { n2jd_schedule_off(); lck_mtx_unlock(&n2jd_lock); return; }
++	uint32_t r = n2jd_power_off();
++	if (r != 0) {
++		n2j_log("NORD2 JPEG: idle power-off failed (%u), the domain is left as it is\n", r);
++		n2jd_schedule_off();                     /* try again in RWJ_IDLE_OFF_MS, do not lie about the state */
++	}
++	lck_mtx_unlock(&n2jd_lock);
++}
++
++static int
++n2jd_open(dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	if (n2jd.made == false || minor(dev) != 0) { return ENXIO; }
++	lck_mtx_lock(&n2jd_lock);
++	n2jd.opens++;
++	lck_mtx_unlock(&n2jd_lock);
++	return 0;
++}
++
++static int
++n2jd_close(dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	if (n2jd.made == false || minor(dev) != 0) { return ENXIO; }
++	lck_mtx_lock(&n2jd_lock);
++	if (n2jd.opens) { n2jd.opens--; }
++	lck_mtx_unlock(&n2jd_lock);
++	return 0;                                       /* close needs nothing: the idle call owns the power-off */
++}
++
++static int
++n2jd_info(caddr_t data)
++{
++	struct rwj_info info;
++	memset(&info, 0, sizeof(info));
++	info.abi_version = RWJ_ABI_VERSION;
++	info.max_pixels = RWJ_MAX_PIXELS;
++	lck_mtx_lock(&n2jd_lock);
++	info.jobs_done = n2jd.jobs_done;
++	info.jobs_failed = n2jd.jobs_failed;
++	info.powered = __atomic_load_n(&n2jd.powered, __ATOMIC_ACQUIRE);
++	info.last_hw_us = n2jd.last_hw_us;
++	lck_mtx_unlock(&n2jd_lock);
++	info.caps = 1u;                                 /* bit 0 encoder; the decoder is track J */
++	return copyout(&info, (user_addr_t)(uintptr_t)data, sizeof(info)) != 0 ? EFAULT : 0;
++}
++
++static int
++n2jd_ioctl(dev_t dev, unsigned long cmd, caddr_t data, __unused int fflag, __unused struct proc *p)
++{
++	uint32_t c = (uint32_t)cmd;
++	if (n2jd.made == false || minor(dev) != 0) { return ENXIO; }
++	if (data == NULL) { return EFAULT; }
++	if (c == (uint32_t)RWJ_INFO) { return n2jd_info(data); }
++	if (c == (uint32_t)RWJ_DECODE) { return ENOTSUP; }
++	if (c != (uint32_t)RWJ_ENCODE) { return ENOTTY; }
++
++	struct rwj_encode j;
++	if (copyin((user_addr_t)(uintptr_t)data, &j, sizeof(j)) != 0) { return EFAULT; }
++	struct n2jd_geom g;
++	int err = n2jd_validate(&j, &g);
++	if (err) { return err; }
++	j.out_bytes = 0;
++	j.out_hw_us = 0;
++	j.out_status = 0;
++
++	lck_mtx_lock(&n2jd_lock);
++	while (n2jd.busy) {
++		err = msleep(&n2jd.busy, &n2jd_lock, PZERO | PCATCH, "redwood-jpeg", NULL);
++		if (err) {
++			lck_mtx_unlock(&n2jd_lock);
++			return err == EWOULDBLOCK ? EAGAIN : err;
++		}
++	}
++	n2jd.busy = true;
++	lck_mtx_unlock(&n2jd_lock);
++
++	err = n2jd_run(&j, &g);
++
++	lck_mtx_lock(&n2jd_lock);
++	n2jd.busy = false;
++	if (j.out_hw_us) { n2jd.last_hw_us = j.out_hw_us; }
++	if (j.out_status == 0 && err == 0) { n2jd.jobs_done++; }
++	else if (j.out_status == 0 && err != 0) { n2jd.jobs_failed++; }       /* source fault, copyout fault: no hardware failure */
++	else { n2jd.jobs_failed++; }
++	if (__atomic_load_n(&n2jd.powered, __ATOMIC_ACQUIRE)) {
++		n2jd.last_job_ns = n2jd_now_ns();
++		n2jd_schedule_off();
++	}
++	wakeup(&n2jd.busy);
++	lck_mtx_unlock(&n2jd_lock);
++	/* deliver out_bytes/out_status/out_hw_us even after a hardware failure; a faulting struct copyout is EFAULT */
++	if (copyout(&j, (user_addr_t)(uintptr_t)data, sizeof(j)) != 0) { return err ? err : EFAULT; }
++	return err;
++}
++
++#ifdef N2J_HOST
++static const struct cdevsw n2jd_cdevsw = {
++	.d_open = n2jd_open, .d_close = n2jd_close, .d_ioctl = n2jd_ioctl,
++};
++#else
++static const struct cdevsw n2jd_cdevsw = {
++	.d_open = n2jd_open, .d_close = n2jd_close,
++	.d_read = eno_rdwrt, .d_write = eno_rdwrt, .d_ioctl = n2jd_ioctl,
++	.d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL,
++	.d_select = eno_select, .d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0,
++};
++#endif
++
++/*
++ * Called from nord2_input_init() (the integrator adds the call). No register is touched here: the node exists and the
++ * first RWJ_ENCODE maps the windows, copies the picture in and powers the domain on.
++ */
++static int nord2_jpegdev_start(void) __attribute__((unused));
++static int
++nord2_jpegdev_start(void)
++{
++	if (n2jd.made) { return 0; }
++	int major = cdevsw_add(-1, &n2jd_cdevsw);
++	if (major < 0) {
++		n2j_log("NORD2 JPEG: cdevsw_add failed (%d)\n", major);
++		return EIO;
++	}
++	if (devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "%s", N2JD_NODE) == NULL) {
++		n2j_log("NORD2 JPEG: devfs_make_node failed\n");
++		(void)cdevsw_remove(major, &n2jd_cdevsw);
++		return EIO;
++	}
++	n2jd.idle = thread_call_allocate(n2jd_idle, NULL);
++	if (n2jd.idle == NULL) {
++		n2j_log("NORD2 JPEG: no thread call: the VEN domain stays on after the first job\n");
++	}
++	n2jd.major = major;
++	n2jd.made = true;
++	n2j_log("NORD2 JPEG: /dev/%s made (major %d, 0666), %u MiB source + %u MiB output at %#x\n",
++	    N2JD_NODE, major, N2JD_SRC_BYTES >> 20, N2JD_DST_BYTES >> 20, (uint32_t)RW_CLAIM_JPEG_PA);
++	return 0;
++}
++
++/*
++ * hw-k02 registers its VEN reference count here (it calls this once after n2vc_ven_get/put exist). Without the hook the
++ * driver powers the domain with the model's n2j_power()/n2j_off() itself; with it, get() is called per job and put() on
++ * the idle timer, and this driver never powers the shared domain off.
++ */
++int
++n2jd_share_ven(n2jd_ven_get_fn get, n2jd_ven_put_fn put)
++{
++	if (get == NULL || put == NULL) { return EINVAL; }
++	lck_mtx_lock(&n2jd_lock);
++	if (n2jd.busy) { lck_mtx_unlock(&n2jd_lock); return EBUSY; }
++	n2jd.ven_get = get;
++	n2jd.ven_put = put;
++	lck_mtx_unlock(&n2jd_lock);
++	return 0;
++}
++
++#endif /* NORD2_JPEGDEV_INC */
+diff -ruN a/bsd/dev/nord2_vcodec.inc b/bsd/dev/nord2_vcodec.inc
+--- a/bsd/dev/nord2_vcodec.inc
++++ b/bsd/dev/nord2_vcodec.inc
+@@ -0,0 +1,1407 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * nord2_vcodec.inc -- /dev/redwood-vcodec, the hardware half: the MT6893 VENC (0x17020000, core 1 0x17820000) and VDEC
++ * (0x16000000, LAT 0x16010000) as raw blocks for the user-space codec host, plus the register-window DMA pool.
++ *
++ * Included once by bsd/dev/sweet_touch.c, after nord2_hwcodec.inc (this file uses its helpers nothing else: it is
++ * self-contained apart from ni_rd/ni_wr/ni_mask and the kernel facilities listed below).  Everything runs on demand: no
++ * register is touched until an ioctl asks for it.  No phone has run this file yet; the source of every number is
++ * kern/VCODEC_HW.md (path:line for each).
++ *
++ * Kernel facilities used: ml_io_map_unmappable(), copyin/copyout, lck_mtx, delay(), msleep(), mach_absolute_time(),
++ * cdevsw_add/devfs_make_node, printf.  Waits longer than 100 us sleep with msleep() and drop n2vc_mtx; every wake
++ * re-validates the open file and the block's power before any register access.
++ * Host test: gpu/hwcodec/kern/test_k02 (compiled with -DN2VC_HOST against a register model; the model fails the test on
++ * any access to a block's registers, gates or LARB while its domain is off/isolated/protected, on any write to another
++ * user's LARB port or protection bit, and on every wait that does not end).
++ */
++#ifndef N2VC_ABI_HDR
++#define N2VC_ABI_HDR "redwood_vcodec.h"
++#endif
++#include N2VC_ABI_HDR
++
++#ifdef N2VC_HOST
++/* the host model supplies these (test_k02/t_k02.c) */
++typedef unsigned long u_long;
++typedef char *caddr_t;
++struct proc;
++extern void *n2vc_host_map(uint32_t pa, uint32_t bytes);
++extern void n2vc_host_us(uint32_t us);
++extern uint64_t n2vc_host_now_us(void);
++extern void n2vc_host_sleep(uint32_t us);
++extern int n2vc_host_copyin(uint64_t uaddr, void *kaddr, uint32_t bytes);
++extern int n2vc_host_copyout(const void *kaddr, uint64_t uaddr, uint32_t bytes);
++#define n2vc_pa_map(pa, bytes, io) ((vm_offset_t)(uintptr_t)n2vc_host_map((pa), (bytes)))
++#define n2vc_us(us) n2vc_host_us((uint32_t)(us))
++#define n2vc_now_us() n2vc_host_now_us()
++#define n2vc_sleep() n2vc_host_sleep(500u)
++#define n2vc_copyin(u, k, n) n2vc_host_copyin((uint64_t)(u), (k), (uint32_t)(n))
++#define n2vc_copyout(k, u, n) n2vc_host_copyout((k), (uint64_t)(u), (uint32_t)(n))
++#define n2vc_lock() ((void)0)
++#define n2vc_unlock() ((void)0)
++#define N2VC_KERNEL 0
++#else
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/conf.h>
++#include <sys/types.h>
++#include <miscfs/devfs/devfs.h>
++#include <libkern/copyio.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++#define n2vc_pa_map(pa, bytes, io) ml_io_map_unmappable((pa), (bytes), (io) ? VM_WIMG_IO : VM_WIMG_DEFAULT)
++#define n2vc_us(us) delay((int)(us))
++#define n2vc_copyin(u, k, n) copyin((user_addr_t)(u), (k), (size_t)(n))
++#define n2vc_copyout(k, u, n) copyout((k), (user_addr_t)(u), (size_t)(n))
++static LCK_GRP_DECLARE(n2vc_grp, "nord2-vcodec");
++static LCK_MTX_DECLARE(n2vc_mtx, &n2vc_grp);
++#define n2vc_lock() lck_mtx_lock(&n2vc_mtx)
++#define n2vc_unlock() lck_mtx_unlock(&n2vc_mtx)
++#define N2VC_KERNEL 1
++#endif
++
++/* ---- facts (kern/VCODEC_HW.md §0-§6) --------------------------------------------------------------------------- */
++#define N2VC_SPM_PA      0x10006000u
++#define N2VC_INFRA_PA    0x10001000u
++#define N2VC_TOP_PA      0x10000000u
++#define N2VC_MM_OFF      0x2d0u
++#define N2VC_MM_SET      0x2d4u
++#define N2VC_MM_CLR      0x2d8u
++#define N2VC_MM_STA      0x2ecu
++#define N2VC_MM2_OFF     0xdc8u
++#define N2VC_MM2_SET     0xdccu
++#define N2VC_MM2_CLR     0xdd0u
++#define N2VC_MM2_STA     0xdd8u
++#define N2VC_PWR_STA     0x16cu
++#define N2VC_PWR_STA2    0x170u
++#define N2VC_DIS_BIT     (1u << 20)
++#define N2VC_MDP_BIT     (1u << 19)       /* MDP domain: SMI common of larb8 (VENC_C1) and larb4 (VDEC_CORE) */
++#define N2VC_KEY         ((0xb16u << 16) | 1u)
++#define N2VC_CFG1        0x020u           /* CLK_CFG_1: disp_sel bits 3:0 gate 7, mdp_sel bits 11:8 gate 15 (clk-mt6885.c:1693-1702) */
++#define N2VC_DISP_GATE   (1u << 7)
++#define N2VC_MDP_GATE    (1u << 15)
++#define N2VC_GICD_PA     0x0c000000u      /* GIC distributor (dts gic: 0x0c000000 + 0x40000); read-only ISPENDR probe */
++#define N2VC_CFG13       0x0e0u
++#define N2VC_CFG14       0x0f0u
++#define N2VC_CFG_UPDATE1 0x008u
++/* venc_sel: CLK_CFG_13 bits 27:24 parent, bit 31 gate, update CLK_CFG_UPDATE1 bit 24 (clk-mt6885.c:1958-1963).
++ * venc_parents[] (clk-mt6885.c:1221-1237): 4 = mainpll_d4_d2 = 273 MHz (mt6893.dts mmdvfs venc_step3, lowest VENC OPP),
++ * 12 = univpll_d4 = 624 MHz (venc_step0, what the bootloader leaves: CLK_CFG_13 0x0c030601 on the phone, q10hw1). */
++#ifndef N2VC_VENC_SLOW
++#define N2VC_VENC_SLOW 1u                 /* 1 = a VENC power-on run by vcodecd (RWVC_POWER) selects the 273 MHz parent
++                                           * (root's decision for the first phone encode, 11 Nov); 0 = 624 MHz. The
++                                           * JPEG driver's shared n2vc_ven_get() always asks for 624 MHz and, like every
++                                           * path here, never rewrites a running mux. */
++#endif
++#define N2VC_VENC_PARENT_SLOW 4u          /* mainpll_d4_d2, 273 MHz */
++#define N2VC_VENC_PARENT_FAST 12u         /* univpll_d4, 624 MHz */
++#define N2VC_VDEC_PARENT 14u              /* univpll_d4 in vdec_parents/vdec_lat_parents */
++
++#define N2VC_POOL_PAGES  (RW_CLAIM_VCODEC_BYTES / 4096u)
++#define N2VC_POOL_WORDS  ((N2VC_POOL_PAGES + 31u) / 32u)
++#define N2VC_DMA_MAX     1024u
++#define N2VC_DMA_PER_FILE 128u
++#define N2VC_MAX_FILES   16u
++#define N2VC_MAX_SLOTS   16u
++#define N2VC_MM_MAX      24u
++#define N2VC_CHUNK       64u
++#define N2VC_RW_CHUNK    0x00100000u     /* RWVC_DMA_RW copies at most 1 MiB per copyin/copyout */
++#define N2VC_BATCH_US    2000000u         /* one RWVC_REGS batch may run this long at most */
++#define N2VC_POLL_MAX_US 1000000u
++#define N2VC_IRQ_POLL_US 500u             /* msleep() duration while waiting for an interrupt or a poll */
++#define N2VC_WAIT_MS_MAX 5000u
++
++#define N2VC_NONE 0xffu
++
++/* ABI rev 3 (2026-11-11, DEC07): RWVC_WIN_VDEC_ALL = 12, 0x16000000+0x30000, block per 4 KiB page.  The tree's
++ * include/redwood_vcodec.h is still rev 2 while this patch waits for hw-lead, so the constant and the window count are
++ * supplied here when it is absent; with rev 3 in place the two definitions collapse to the header's and only N2VC_WIN_N
++ * remains (then delete the #ifndef block and put RWVC_WIN_COUNT back). */
++#ifndef RWVC_WIN_VDEC_ALL
++#define RWVC_WIN_VDEC_ALL 12u
++#define N2VC_WIN_N 13u
++#else
++#define N2VC_WIN_N RWVC_WIN_COUNT
++#endif
++#define N2VC_BLK_PER_PAGE 0xfeu       /* n2vc_wins[].blk: the block comes from the per-page table, not the window */
++
++/* ---- per-block tables ------------------------------------------------------------------------------------------ */
++struct n2vc_win { uint32_t pa, bytes; uint8_t blk; };
++struct n2vc_gate { uint16_t set_off, clr_off, sta_off; uint8_t bit; };
++struct n2vc_larb { uint32_t pa; uint8_t nports; uint8_t int_conf; const uint8_t *ostdl; uint32_t ports; uint32_t nsmask; };
++struct n2vc_blk {
++	const char *name;
++	uint16_t con;                 /* SPM power control register */
++	uint8_t sta;                  /* status bit number 15..18 */
++	uint8_t dep;                  /* block that must be powered first, N2VC_NONE if none */
++	uint32_t step1_mm, step2_mm;  /* bus-protect bits in INFRA MM (0x2d0..) */
++	uint32_t step1_mm2, step2_mm2;/* bus-protect bits in INFRA MM_2 (0xdc8..) */
++	const struct n2vc_gate *gates; uint8_t ngates;
++	const struct n2vc_larb *larb;
++	uint32_t gate_pa;             /* gate controller block */
++	uint16_t post_write;          /* pg.c fidelity value written to the first SET register, 0 = none */
++	uint8_t mdp_smi;              /* its larb hangs off the MDP SMI common (needs the MDP domain), else the DISP one */
++};
++
++static const struct n2vc_win n2vc_wins[N2VC_WIN_N] = {
++	[RWVC_WIN_VENC]          = { 0x17020000u, 0x3000u, RWVC_BLK_VENC },   /* vpud maps 0x3000; JPGENC starts at 0x17030000 */
++	[RWVC_WIN_VENC_C1]       = { 0x17820000u, 0x3000u, RWVC_BLK_VENC_C1 },
++	[RWVC_WIN_VDEC_SYS]      = { 0x1602f000u, 0x1000u, RWVC_BLK_VDEC_CORE },
++	[RWVC_WIN_VDEC_BASE]     = { 0x16000000u, 0x1000u, RWVC_BLK_VDEC_CORE },
++	[RWVC_WIN_VDEC_VLD]      = { 0x16020000u, 0x1000u, RWVC_BLK_VDEC_CORE },
++	[RWVC_WIN_VDEC_MC]       = { 0x16021000u, 0x1000u, RWVC_BLK_VDEC_CORE },
++	[RWVC_WIN_VDEC_MV]       = { 0x16023000u, 0x1000u, RWVC_BLK_VDEC_CORE },
++	[RWVC_WIN_VDEC_MISC]     = { 0x16025000u, 0x4000u, RWVC_BLK_VDEC_CORE },
++	[RWVC_WIN_VDEC_LAT_MISC] = { 0x16010000u, 0x1000u, RWVC_BLK_VDEC_SOC },
++	[RWVC_WIN_VDEC_LAT_VLD]  = { 0x16011000u, 0x0400u, RWVC_BLK_VDEC_SOC },
++	[RWVC_WIN_VDEC_RACING]   = { 0x16004000u, 0x1000u, RWVC_BLK_VDEC_CORE },
++	[RWVC_WIN_VDEC_SOC_GCON] = { 0x1600f000u, 0x1000u, RWVC_BLK_VDEC_SOC },
++	[RWVC_WIN_VDEC_ALL]      = { 0x16000000u, 0x30000u, N2VC_BLK_PER_PAGE },
++};
++
++/* smi_conf.h mt6885: smi_larb7_init_pair :247-276, smi_larb8_init_pair :277-305, smi_larb4 :220-232, smi_larb5 :234-243 */
++static const uint8_t n2vc_ostdl7[27] = { 1, 4, 1, 1, 1, 1, 1, 1, 1, 4, 4, 1, 4, 1, 0xa, 6, 1, 0xa, 6, 1, 1, 1, 1, 5, 3, 3, 4 };
++static const uint8_t n2vc_ostdl8[27] = { 1, 4, 1, 1, 1, 1, 1, 1, 1, 4, 4, 1, 4, 1, 0xa, 6, 1, 0xa, 6, 1, 1, 1, 1, 5, 3, 3, 4 };
++static const uint8_t n2vc_ostdl4[11] = { 0x28, 0x19, 0xb, 1, 1, 1, 1, 1, 1, 4, 1 };
++static const uint8_t n2vc_ostdl5[8] = { 1, 1, 4, 1, 1, 1, 1, 0x16 };
++/* VENC/VENC_C1 own larb7/larb8 ports 0-6 and 13-22 (dt-bindings/memory/mt6885-larb-port.h:91-113/119-141). 7-12 and
++ * 23-26 are the JPEG encoder's (K01) and are never written here. */
++#define N2VC_PORTS_VENC ((uint32_t)((1u << 7) - 1u) | (uint32_t)(0x3ffu << 13))
++
++/* NON_SEC_CON(p) bits cleared on our ports: bit 0 MMU_EN and bits 8-15 address bits 32+ (pseudo_m4u_v2.c:563-575); on the
++ * VENC larbs additionally bits 16-19, the MMSRAM route Linux sets on ports 5,6,13,14,21,22 (smi_drv.c:498-524 called from
++ * mt6885/mtk_vcodec_enc_pm.c:308-317).  This kernel does not power MMSRAM, so every VENC port goes to DRAM. */
++#define N2VC_NS_IOMMU    0x0000ff01u
++#define N2VC_NS_VENC     0x000fff01u
++static const struct n2vc_larb n2vc_larb7 = { 0x17010000u, 27, 1, n2vc_ostdl7, N2VC_PORTS_VENC, N2VC_NS_VENC };
++static const struct n2vc_larb n2vc_larb8 = { 0x17810000u, 27, 1, n2vc_ostdl8, N2VC_PORTS_VENC, N2VC_NS_VENC };
++static const struct n2vc_larb n2vc_larb4 = { 0x1602e000u, 11, 0, n2vc_ostdl4, 0x7ffu, N2VC_NS_IOMMU };
++static const struct n2vc_larb n2vc_larb5 = { 0x1600d000u,  8, 0, n2vc_ostdl5, 0x0ffu, N2VC_NS_IOMMU };
++
++/* gate layout: VENC/VENC_C1 set 0x4, clear 0x8, status 0x0 (clk-mt6885-ven.c:27-31,103-116);
++ * VDE/VDE2 three word pairs 0x0/0x4, 0x200/0x204, 0x8/0xc with status = set offset (clk-mt6885-vde.c:28-39,142-151). */
++static const struct n2vc_gate n2vc_g_venc[3]  = { { 0x4, 0x8, 0x0, 0 }, { 0x4, 0x8, 0x0, 4 }, { 0x4, 0x8, 0x0, 28 } };
++static const struct n2vc_gate n2vc_g_venc1[3] = { { 0x4, 0x8, 0x0, 0 }, { 0x4, 0x8, 0x0, 4 }, { 0x4, 0x8, 0x0, 28 } };
++static const struct n2vc_gate n2vc_g_vde[3]   = { { 0x0, 0x4, 0x0, 0 }, { 0x200, 0x204, 0x200, 0 }, { 0x8, 0xc, 0x8, 0 } };
++static const struct n2vc_gate n2vc_g_vde2[3]  = { { 0x0, 0x4, 0x0, 0 }, { 0x200, 0x204, 0x200, 0 }, { 0x8, 0xc, 0x8, 0 } };
++
++/* mdp_smi: smi_bus_prepare_enable() (smi_drv.c:198-232) puts larb7 and larb5 on the DISP common (smi 21/24/25) and larb8
++ * and larb4 on the MDP common (smi 22/26/27: mdp_smi_common@1f002000, clocks SCP_SYS_MDP + CLK_MDP_SMI1/2; iommu1
++ * m4u@1f027000 serves larb4/larb8).  The power-domain parent of all four is PG_DIS (pg.c:4994-4999). */
++static const struct n2vc_blk n2vc_blocks[RWVC_BLK_COUNT] = {
++	[RWVC_BLK_VENC]       = { "VENC",       0x344, 17, N2VC_NONE,           1u << 26, 1u << 27, 1u << 0, 1u << 1,
++	                          n2vc_g_venc, 3, &n2vc_larb7, 0x17000000u, 0x4, 0 },
++	[RWVC_BLK_VENC_C1]    = { "VENC_C1",    0x348, 18, RWVC_BLK_VENC,      (1u << 28) | (1u << 30), (1u << 29) | (1u << 31), 0, 0,
++	                          n2vc_g_venc1, 3, &n2vc_larb8, 0x17800000u, 0x4, 1 },
++	[RWVC_BLK_VDEC_SOC]   = { "VDEC_SOC",   0x33c, 15, N2VC_NONE,           1u << 24, 1u << 25, 0, 0,
++	                          n2vc_g_vde, 3, &n2vc_larb5, 0x1600f000u, 0, 0 },
++	[RWVC_BLK_VDEC_CORE]  = { "VDEC_CORE",  0x340, 16, RWVC_BLK_VDEC_SOC,  0, 0, 1u << 6, 1u << 7,
++	                          n2vc_g_vde2, 3, &n2vc_larb4, 0x1602f000u, 0, 1 },
++};
++
++/* IRQ lines: status/clear register and the block that must be powered (kern/VCODEC_HW.md §5). */
++struct n2vc_irq { uint32_t status_off, ack_off; uint32_t match, clear_mask; uint8_t win, blk; };
++static const struct n2vc_irq n2vc_irqs[RWVC_IRQ_COUNT] = {
++	[RWVC_IRQ_VENC]     = { 0x05c, 0x060, 0x0bfu, 0x0bfu, RWVC_WIN_VENC,      RWVC_BLK_VENC },
++	[RWVC_IRQ_VENC_C1]  = { 0x05c, 0x060, 0x0bfu, 0x0bfu, RWVC_WIN_VENC_C1,   RWVC_BLK_VENC_C1 },
++	[RWVC_IRQ_VDEC]     = { 0x0a4, 0x0a4, 0x10000u, 0, RWVC_WIN_VDEC_MISC,    RWVC_BLK_VDEC_CORE },
++	[RWVC_IRQ_VDEC_LAT] = { 0x0a4, 0x0a4, 0x10000u, 0, RWVC_WIN_VDEC_LAT_MISC, RWVC_BLK_VDEC_SOC },
++};
++
++/* ---- state ----------------------------------------------------------------------------------------------------- */
++struct n2vc_dma {
++	uint8_t used, flags;
++	uint16_t gen;
++	uint32_t page, npages, bytes;
++	struct n2vc_open *owner;
++};
++
++struct n2vc_open {
++	uint8_t used;
++	uint8_t minor;
++	uint16_t refs[RWVC_BLK_COUNT];
++	uint32_t irq_seen[RWVC_IRQ_COUNT];
++	uint32_t ndma;
++	uint32_t id;                        /* unique per open: a destroyed slot may be reused while a waiter sleeps */
++	struct proc *proc;                  /* kernel: identity of a minor-1 client (IK's relay); NULL on host */
++};
++
++static struct {
++	uint8_t inited;
++	uint8_t on[RWVC_BLK_COUNT];
++	uint32_t refs[RWVC_BLK_COUNT];      /* every reference: open files, child blocks, n2vc_ven_get() */
++	uint32_t hidden[RWVC_BLK_COUNT];    /* how many of refs[] are not owned by an open file */
++	uint8_t dep_ref[RWVC_BLK_COUNT];    /* this block currently holds its hidden reference on its parent */
++	uint32_t pool_bits[N2VC_POOL_WORDS];
++	struct n2vc_dma dma[N2VC_DMA_MAX];
++	struct n2vc_open files[N2VC_MAX_FILES];
++	struct { uint32_t pa, bytes; vm_offset_t va; } mm[N2VC_MM_MAX];
++	uint8_t nmm;
++	uint32_t next_file_id;
++} n2vc;
++
++/* Kernel time and sleeping.  A wait longer than 100 us sleeps with msleep(), which drops n2vc_mtx: another thread may
++ * close the file or power the block off while we sleep, so every caller re-validates f->used and n2vc.on[blk] after a
++ * wake before touching a register.  The host shim keeps a deterministic fake clock and runs an optional callback
++ * "during" the sleep (test_k02 uses it to power a block off / close a file under a sleeping waiter). */
++#ifdef N2VC_HOST
++/* n2vc_now_us() and n2vc_sleep() are the macros above (n2vc_host_now_us / n2vc_host_sleep). */
++#else
++static uint64_t
++n2vc_now_us(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000u;
++}
++
++static void
++n2vc_sleep(void)
++{
++	struct timespec ts = { 0, (long)N2VC_IRQ_POLL_US * 1000 };
++	(void)msleep(&n2vc, &n2vc_mtx, PZERO, "n2vc-wait", &ts);
++}
++#endif
++
++/* ---- small helpers --------------------------------------------------------------------------------------------- */
++static vm_offset_t
++n2vc_pa(uint32_t pa, uint32_t bytes, int io)
++{
++#if !N2VC_KERNEL
++	(void)io;
++#endif
++	for (unsigned i = 0; i < n2vc.nmm; i++) {
++		if (n2vc.mm[i].pa == pa && n2vc.mm[i].bytes >= bytes) { return n2vc.mm[i].va; }
++	}
++	vm_offset_t va = n2vc_pa_map(pa, bytes, io);
++	if (!va) { return 0; }
++	if (n2vc.nmm < N2VC_MM_MAX) { n2vc.mm[n2vc.nmm].pa = pa; n2vc.mm[n2vc.nmm].bytes = bytes; n2vc.mm[n2vc.nmm].va = va; n2vc.nmm++; }
++	return va;
++}
++
++static bool
++n2vc_wait(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want)
++{
++	if (!base) { return false; }
++	for (unsigned i = 0; i < 2000; i++) {
++		if ((ni_rd(base, off) & mask) == want) { return true; }
++		n2vc_us(10);
++	}
++	return false;
++}
++
++static void
++n2vc_cache(vm_offset_t va, uint32_t len)
++{
++#if N2VC_KERNEL
++	for (vm_offset_t a = va & ~63ul; a < va + len; a += 64) { __asm__ volatile("dc civac, %0" :: "r"(a) : "memory"); }
++	__asm__ volatile("dsb sy" ::: "memory");
++#else
++	(void)va; (void)len;
++#endif
++}
++
++/* ---- power ----------------------------------------------------------------------------------------------------- */
++static bool
++n2vc_status_on(const struct n2vc_blk *b)
++{
++	vm_offset_t spm = n2vc_pa(N2VC_SPM_PA, 0x1000, 1);
++	uint32_t sta = 1u << b->sta;
++	return spm && (ni_rd(spm, N2VC_PWR_STA) & sta) && (ni_rd(spm, N2VC_PWR_STA2) & sta);
++}
++
++/* domain powered, out of reset/isolation, SRAM on and bus protection released */
++static bool
++n2vc_usable(unsigned blk)
++{
++	const struct n2vc_blk *b = &n2vc_blocks[blk];
++	vm_offset_t spm = n2vc_pa(N2VC_SPM_PA, 0x1000, 1), infra = n2vc_pa(N2VC_INFRA_PA, 0x1000, 1);
++	if (!spm || !infra || !n2vc_status_on(b)) { return false; }
++	uint32_t con = ni_rd(spm, b->con);
++	if ((con & 0x1fu) != 0x0du) { return false; }
++	if (con & ((1u << 8) | (1u << 12))) { return false; }
++	if ((b->step1_mm | b->step2_mm) && (ni_rd(infra, N2VC_MM_OFF) & (b->step1_mm | b->step2_mm))) { return false; }
++	if ((b->step1_mm2 | b->step2_mm2) && (ni_rd(infra, N2VC_MM2_OFF) & (b->step1_mm2 | b->step2_mm2))) { return false; }
++	return true;
++}
++
++/* one top mux: leave a running one alone; otherwise CLR the field+gate, SET the parent, pulse update, verify. */
++static int
++n2vc_mux(uint32_t cfg, unsigned shift, unsigned gate_bit, unsigned update_bit, unsigned parent, const char *what)
++{
++	vm_offset_t top = n2vc_pa(N2VC_TOP_PA, 0x1000, 1);
++	if (!top) { return ENXIO; }
++	uint32_t v = ni_rd(top, cfg);
++	if (!(v & (1u << gate_bit)) && (((v >> shift) & 0xfu) != 0)) { return 0; }
++	uint32_t clr = (0x8fu << shift);
++	ni_wr(top, cfg + 8, clr);
++	ni_wr(top, cfg + 4, (uint32_t)parent << shift);
++	ni_wr(top, N2VC_CFG_UPDATE1, 1u << update_bit);
++	n2vc_us(100);
++	v = ni_rd(top, cfg);
++	if ((v & (1u << gate_bit)) || (((v >> shift) & 0xfu) != parent)) {
++		printf("NORD2 VCODEC: %s mux %#x did not take parent %u (reads %#x)\n", what, cfg, parent, v);
++		return EIO;
++	}
++	return 0;
++}
++
++/*
++ * venc_sel. Unlike n2vc_mux() this rewrites even a running mux when the wanted parent differs, so its only caller
++ * (n2vc_hw_on) has already established that VEN and VENC_C1 are off. vcodecd's RWVC_POWER asks for N2VC_VENC_SLOW's
++ * parent (root's 273 MHz decision); the JPEG driver's shared n2vc_ven_get() asks for 624 MHz, the phone's boot value.
++ */
++static int
++n2vc_venc_mux(unsigned want)
++{
++	vm_offset_t top = n2vc_pa(N2VC_TOP_PA, 0x1000, 1);
++	if (!top) { return ENXIO; }
++	uint32_t v = ni_rd(top, N2VC_CFG13), was = v;
++	if (!(v & (1u << 31)) && (((v >> 24) & 0xfu) == want)) { return 0; }
++	ni_wr(top, N2VC_CFG13 + 8, 0x8fu << 24);
++	ni_wr(top, N2VC_CFG13 + 4, (uint32_t)want << 24);
++	ni_wr(top, N2VC_CFG_UPDATE1, 1u << 24);
++	n2vc_us(100);
++	v = ni_rd(top, N2VC_CFG13);
++	if ((v & (1u << 31)) || (((v >> 24) & 0xfu) != want)) {
++		printf("NORD2 VCODEC: venc_sel mux 0xe0 did not take parent %u (reads %#x)\n", want, v);
++		return EIO;
++	}
++	/* the phone log proves the clock without a second ioctl: 4 = 273 MHz (venc_step3), 12 = 624 MHz (venc_step0) */
++	printf("NORD2 VCODEC: venc_sel %#x -> %#x (%s)\n", was, v,
++	    want == N2VC_VENC_PARENT_SLOW ? "273 MHz" : want == N2VC_VENC_PARENT_FAST ? "624 MHz" : "parent");
++	return 0;
++}
++
++static int
++n2vc_gates(const struct n2vc_blk *b, bool on)
++{
++	vm_offset_t g = n2vc_pa(b->gate_pa, 0x1000, 1);
++	if (!g) { return ENXIO; }
++	if (on && b->post_write) { ni_wr(g, b->gates[0].set_off, b->post_write); }   /* clk-mt6885-pg.c:1178/1181 */
++	for (unsigned i = 0; i < b->ngates; i++) {
++		ni_wr(g, on ? b->gates[i].set_off : b->gates[i].clr_off, 1u << b->gates[i].bit);
++	}
++	for (unsigned i = 0; i < b->ngates; i++) {
++		uint32_t want = on ? (1u << b->gates[i].bit) : 0;
++		for (unsigned t = 0; t < 100; t++) {
++			if ((ni_rd(g, b->gates[i].sta_off) & (1u << b->gates[i].bit)) == want) { break; }
++			if (t == 99) {
++				printf("NORD2 VCODEC: %s gate %#x bit %u did not switch %s\n", b->name, b->gate_pa, b->gates[i].bit, on ? "on" : "off");
++				return EIO;
++			}
++			n2vc_us(100);
++		}
++	}
++	return 0;
++}
++
++static int n2vc_hw_off(unsigned blk);
++
++static int
++n2vc_larb_on(const struct n2vc_larb *l, const char *name)
++{
++	vm_offset_t base = n2vc_pa(l->pa, 0x1000, 1);
++	if (!base) { return ENXIO; }
++	ni_wr(base, 0x24, 0x300256);                 /* smi_conf.h :87-90/:95-99 */
++	ni_wr(base, 0x40, 1);
++	if (l->int_conf) { ni_wr(base, 0x524, 0x300256); }
++	for (unsigned p = 0; p < l->nports; p++) {
++		if (!(l->ports & (1u << p))) { continue; }
++		ni_wr(base, 0x200 + 4 * p, l->ostdl[p]);
++		uint32_t was = ni_rd(base, 0x380 + 4 * p);
++		if (was & 0x000f0000u & l->nsmask) {
++			printf("NORD2 VCODEC: %s larb port %u was routed to MMSRAM (%#x): back to DRAM\n", name, p, was);
++		}
++		ni_mask(base, 0x380 + 4 * p, l->nsmask, 0); /* IOMMU off, address bits 32+ zero (pseudo_m4u_v2.c:563-575), no MMSRAM */
++	}
++	for (unsigned p = 0; p < l->nports; p++) {
++		if (!(l->ports & (1u << p))) { continue; }
++		if (ni_rd(base, 0x380 + 4 * p) & l->nsmask) {
++			printf("NORD2 VCODEC: %s larb port %u still translates (%#x)\n", name, p, ni_rd(base, 0x380 + 4 * p));
++			return EIO;
++		}
++	}
++	return 0;
++}
++
++static int
++n2vc_prot_set(vm_offset_t infra, uint32_t set, uint32_t ack, uint32_t bits, const char *name)
++{
++	if (!bits) { return 0; }
++	if (!infra) { return ENXIO; }
++	ni_wr(infra, set, bits);
++	if (!n2vc_wait(infra, ack, bits, bits)) {
++		printf("NORD2 VCODEC: %s bus protection %#x not acknowledged (%#x)\n", name, bits, ni_rd(infra, ack));
++		return ETIMEDOUT;
++	}
++	return 0;
++}
++
++static int
++n2vc_hw_on(unsigned blk, unsigned venc_parent)
++{
++	const struct n2vc_blk *b = &n2vc_blocks[blk];
++	vm_offset_t spm = n2vc_pa(N2VC_SPM_PA, 0x1000, 1), infra = n2vc_pa(N2VC_INFRA_PA, 0x1000, 1);
++	if (!spm || !infra) { return ENXIO; }
++	/* the display domain (the SMI common's power) must be on before any video bus protection is released */
++	if (!(ni_rd(spm, N2VC_PWR_STA) & N2VC_DIS_BIT) || !(ni_rd(spm, N2VC_PWR_STA2) & N2VC_DIS_BIT)) {
++		printf("NORD2 VCODEC: %s not powered: the display domain is off\n", b->name);
++		return EACCES;
++	}
++	/* larb8 (VENC core 1) and larb4 (VDEC core) hang off the MDP SMI common, not the display's: releasing their bus
++	 * protection with MDP off is the camera bring-up's hang pattern (smi_drv.c:198-232, dts mdp_smi_common@1f002000). */
++	if (b->mdp_smi && (!(ni_rd(spm, N2VC_PWR_STA) & N2VC_MDP_BIT) || !(ni_rd(spm, N2VC_PWR_STA2) & N2VC_MDP_BIT))) {
++		printf("NORD2 VCODEC: %s not powered: the MDP domain (its SMI common) is off\n", b->name);
++		return EACCES;
++	}
++	/* and the common's clock root must run: CLK_CFG_1 disp_sel (bit 7) / mdp_sel (bit 15) are gate bits, set = gated */
++	vm_offset_t topc = n2vc_pa(N2VC_TOP_PA, 0x1000, 1);
++	if (!topc) { return ENXIO; }
++	uint32_t cfg1 = ni_rd(topc, N2VC_CFG1);
++	if ((cfg1 & N2VC_DISP_GATE) || (b->mdp_smi && (cfg1 & N2VC_MDP_GATE))) {
++		printf("NORD2 VCODEC: %s not powered: the %s clock is gated (CLK_CFG_1 %#x)\n", b->name,
++		    (cfg1 & N2VC_DISP_GATE) ? "disp_sel" : "mdp_sel", cfg1);
++		return EACCES;
++	}
++	int err;
++	if (blk == RWVC_BLK_VENC || blk == RWVC_BLK_VENC_C1) {
++		/* venc_sel is shared by both VENC cores and by the JPEG encoder, and its owner's wanted parent is passed in:
++		 * vcodecd asks for N2VC_VENC_SLOW (root's 273 MHz first-encode decision), the JPEG driver's shared reference
++		 * asks for 624 MHz (the value the bootloader leaves, M1). Program it only while both VENC domains are off:
++		 * n2vc_hw_on runs at reference zero for the requesting block, but core 1's hidden VEN parent may be on. */
++		bool ven_on = n2vc.refs[RWVC_BLK_VENC] || n2vc.refs[RWVC_BLK_VENC_C1] ||
++		    n2vc_status_on(&n2vc_blocks[RWVC_BLK_VENC]) || n2vc_status_on(&n2vc_blocks[RWVC_BLK_VENC_C1]);
++		uint32_t v = ni_rd(topc, N2VC_CFG13);
++		err = 0;
++		if (ven_on) {
++			if ((v & (1u << 31)) || ((v >> 24) & 0xfu) == 0) {   /* a running block without a clock: driver conflict */
++				printf("NORD2 VCODEC: %s: venc_sel has no clock while VEN is on (%#x)\n", b->name, v);
++				err = EIO;
++			}
++		} else if (venc_parent != 0 || (v & (1u << 31)) || ((v >> 24) & 0xfu) == 0) {
++			/* a wanted parent, or no clock at all (gated / 26 MHz): program it; otherwise keep what is running */
++			err = n2vc_venc_mux(venc_parent != 0 ? venc_parent : N2VC_VENC_PARENT_FAST);
++		}
++	} else {
++		err = n2vc_mux(N2VC_CFG14, 0, 7, 25, N2VC_VDEC_PARENT, "vdec_sel");
++		if (!err) { err = n2vc_mux(N2VC_CFG14, 8, 15, 26, N2VC_VDEC_PARENT, "vdec_lat_sel"); }
++	}
++	if (err) { return err; }
++
++	ni_wr(spm, 0x000, N2VC_KEY);
++	uint32_t sta = 1u << b->sta;
++	if (!n2vc_status_on(b)) {
++		ni_mask(spm, b->con, (1u << 2) | (1u << 3), (1u << 2) | (1u << 3));
++		if (!n2vc_wait(spm, N2VC_PWR_STA, sta, sta) || !n2vc_wait(spm, N2VC_PWR_STA2, sta, sta)) {
++			ni_mask(spm, b->con, (1u << 2) | (1u << 3), 0);
++			printf("NORD2 VCODEC: %s power status timeout (con %#x): request withdrawn\n", b->name, ni_rd(spm, b->con));
++			return ETIMEDOUT;
++		}
++	}
++	ni_mask(spm, b->con, 1u << 4, 0);            /* PWR_CLK_DIS off */
++	ni_mask(spm, b->con, 1u << 1, 0);            /* PWR_ISO off */
++	ni_mask(spm, b->con, 1u << 0, 1u << 0);      /* PWR_RST_B on */
++	ni_mask(spm, b->con, 1u << 8, 0);            /* SRAM_PDN off */
++	if (!n2vc_wait(spm, b->con, 1u << 12, 0)) {
++		printf("NORD2 VCODEC: %s SRAM ack timeout (con %#x): bus protection left on\n", b->name, ni_rd(spm, b->con));
++		return ETIMEDOUT;
++	}
++	ni_wr(infra, N2VC_MM_CLR, b->step2_mm);      /* release step 2, then step 1 (spm_mtcmos_ctrl_*, see VCODEC_HW.md §1.1) */
++	ni_wr(infra, N2VC_MM2_CLR, b->step2_mm2);
++	ni_wr(infra, N2VC_MM_CLR, b->step1_mm);
++	ni_wr(infra, N2VC_MM2_CLR, b->step1_mm2);
++	/* let the protection release settle; every delay() is <= 100 us */
++	for (unsigned i = 0; i < 4 && !n2vc_usable(blk); i++) { n2vc_us(50); }
++	if (!n2vc_usable(blk)) {
++		printf("NORD2 VCODEC: %s still isolated/protected after power-on (spm %#x/%#x con %#x mm %#x mm2 %#x)\n", b->name,
++		    ni_rd(spm, N2VC_PWR_STA), ni_rd(spm, N2VC_PWR_STA2), ni_rd(spm, b->con), ni_rd(infra, N2VC_MM_OFF), ni_rd(infra, N2VC_MM2_OFF));
++		(void)n2vc_hw_off(blk);              /* do not leave a half-powered block behind */
++		return EIO;
++	}
++	if ((err = n2vc_gates(b, true)) != 0) { (void)n2vc_hw_off(blk); return err; }
++	if ((err = n2vc_larb_on(b->larb, b->name)) != 0) { (void)n2vc_hw_off(blk); return err; }
++	n2vc.on[blk] = 1;
++	return 0;
++}
++
++static int
++n2vc_hw_off(unsigned blk)
++{
++	const struct n2vc_blk *b = &n2vc_blocks[blk];
++	vm_offset_t spm = n2vc_pa(N2VC_SPM_PA, 0x1000, 1), infra = n2vc_pa(N2VC_INFRA_PA, 0x1000, 1);
++	if (!spm || !infra) { return ENXIO; }
++	n2vc.on[blk] = 0;
++	if (!n2vc_status_on(b)) { return 0; }          /* already off */
++	/* Gate the clocks first, but only if the domain is really usable: a protected/isolated block refuses register
++	 * access (and its clocks are already off in the paths that leave it that way). */
++	int err = 0;
++	/* opus-decint (phone run vc19, q10je): VDE/VDE2's VDEC_CKEN/LAT_CKEN/LARB1_CKEN are never cleared by Linux: their
++	 * clk ops are mtk_clk_gate_ops_setclr_inv_dummy (clk-mt6885-vde.c:76-123/184-231, clk-gate.c:310-314: disable is a
++	 * no-op), so spm_mtcmos_ctrl_vde2() sets the bus protection with the core/larb4 clocks RUNNING.  Gating them first
++	 * left MM_2 bit 6 unacknowledged ("VDEC_CORE bus protection 0x40 not acknowledged (0x103)", power-off ETIMEDOUT
++	 * after every decoded frame).  The VENC gates are real gates (VENC_CG) and stay gated first, as before. */
++	bool vdec = blk == RWVC_BLK_VDEC_SOC || blk == RWVC_BLK_VDEC_CORE;
++	if (!vdec && n2vc_usable(blk)) { err = n2vc_gates(b, false); }
++	if (err) { return err; }
++	ni_wr(spm, 0x000, N2VC_KEY);
++	if ((err = n2vc_prot_set(infra, N2VC_MM_SET, N2VC_MM_STA, b->step1_mm, b->name)) != 0) { return err; }
++	if ((err = n2vc_prot_set(infra, N2VC_MM2_SET, N2VC_MM2_STA, b->step1_mm2, b->name)) != 0) { return err; }
++	if ((err = n2vc_prot_set(infra, N2VC_MM_SET, N2VC_MM_STA, b->step2_mm, b->name)) != 0) { return err; }
++	if ((err = n2vc_prot_set(infra, N2VC_MM2_SET, N2VC_MM2_STA, b->step2_mm2, b->name)) != 0) { return err; }
++	ni_mask(spm, b->con, 1u << 8, 1u << 8);
++	if (!n2vc_wait(spm, b->con, 1u << 12, 1u << 12)) {
++		printf("NORD2 VCODEC: %s off: SRAM ack timeout (con %#x): domain left powered\n", b->name, ni_rd(spm, b->con));
++		return EIO;
++	}
++	ni_mask(spm, b->con, 1u << 1, 1u << 1);
++	ni_mask(spm, b->con, 1u << 4, 1u << 4);
++	ni_mask(spm, b->con, 1u << 0, 0);
++	ni_mask(spm, b->con, 1u << 2, 0);
++	ni_mask(spm, b->con, 1u << 3, 0);
++	if (!n2vc_wait(spm, N2VC_PWR_STA, 1u << b->sta, 0) || !n2vc_wait(spm, N2VC_PWR_STA2, 1u << b->sta, 0)) {
++		printf("NORD2 VCODEC: %s off: power status did not drop (con %#x)\n", b->name, ni_rd(spm, b->con));
++		return ETIMEDOUT;
++	}
++	return 0;
++}
++
++/* ---- references (per open file, per child block, and n2vc_ven_get) ---------------------------------------------- */
++static int n2vc_acquire_ex(unsigned blk, struct n2vc_open *f, bool hidden, unsigned venc_parent);
++static int n2vc_release_locked(unsigned blk, struct n2vc_open *f, bool hidden);
++
++/* venc_parent: the parent to select for venc_sel when VEN is off, 0 = keep the running parent (never re-mux).
++ * The 3-argument name is what hw-kern's autotest (kern/p031x/.../nord2_vcodec_at.inc) calls; its step 1 sets the mux
++ * itself for the --slow/--fast knob, so the driver must not undo that -> parent 0. Kept as a macro so that file needs no
++ * edit and no unused-function warning appears in a build without the autotest (IK's 0299-only compile check). */
++#define n2vc_acquire_locked(blk, f, hidden) n2vc_acquire_ex((blk), (f), (hidden), 0u)
++
++static int
++n2vc_acquire_ex(unsigned blk, struct n2vc_open *f, bool hidden, unsigned venc_parent)
++{
++	const struct n2vc_blk *b = &n2vc_blocks[blk];
++	int err = 0;
++	if (!hidden && f && f->refs[blk] == 0xffffu) { return EOVERFLOW; }
++	if (n2vc.refs[blk] == 0) {
++		if (b->dep != N2VC_NONE && !n2vc.dep_ref[blk]) {
++			if ((err = n2vc_acquire_ex(b->dep, NULL, true, venc_parent)) != 0) { return err; }
++			n2vc.dep_ref[blk] = 1;
++		}
++		if ((err = n2vc_hw_on(blk, venc_parent)) != 0) {
++			if (b->dep != N2VC_NONE && n2vc.dep_ref[blk]) { (void)n2vc_release_locked(b->dep, NULL, true); n2vc.dep_ref[blk] = 0; }
++			return err;
++		}
++	}
++	n2vc.refs[blk]++;
++	if (hidden) { n2vc.hidden[blk]++; }
++	else if (f) { f->refs[blk]++; }
++	return 0;
++}
++
++static int
++n2vc_release_locked(unsigned blk, struct n2vc_open *f, bool hidden)
++{
++	const struct n2vc_blk *b = &n2vc_blocks[blk];
++	if (n2vc.refs[blk] == 0) {
++		printf("NORD2 VCODEC: %s reference underflow\n", b->name);
++		return EINVAL;
++	}
++	n2vc.refs[blk]--;
++	if (hidden) { if (n2vc.hidden[blk]) { n2vc.hidden[blk]--; } }
++	else if (f && f->refs[blk]) { f->refs[blk]--; }
++	if (n2vc.refs[blk] != 0) { return 0; }
++	int err = n2vc_hw_off(blk);
++	if (err) {
++		/* the block is marked unusable; keep the parent powered rather than pull a live bus parent out from under it */
++		printf("NORD2 VCODEC: %s power-off failed (%d): its parent reference is kept\n", b->name, err);
++		return err;
++	}
++	if (b->dep != N2VC_NONE && n2vc.dep_ref[blk]) { n2vc.dep_ref[blk] = 0; (void)n2vc_release_locked(b->dep, NULL, true); }
++	return 0;
++}
++
++int
++n2vc_ven_get(void)
++{
++	n2vc_lock();
++	/* K01's JPEG driver: its own clock, 624 MHz, the parent the phone boots with (M1). Only programmed while VEN is
++	 * off (see n2vc_hw_on); a running domain is never re-muxed. */
++	int err = n2vc_acquire_ex(RWVC_BLK_VENC, NULL, true, N2VC_VENC_PARENT_FAST);
++	n2vc_unlock();
++	return err;
++}
++
++void
++n2vc_ven_put(void)
++{
++	n2vc_lock();
++	(void)n2vc_release_locked(RWVC_BLK_VENC, NULL, true);
++	n2vc_unlock();
++}
++
++/* ---- DMA pool -------------------------------------------------------------------------------------------------- */
++static bool
++n2vc_pg_free(uint32_t p)
++{
++	return !(n2vc.pool_bits[p >> 5] & (1u << (p & 31u)));
++}
++
++static void
++n2vc_pg_mark(uint32_t p, bool used)
++{
++	if (used) { n2vc.pool_bits[p >> 5] |= 1u << (p & 31u); }
++	else { n2vc.pool_bits[p >> 5] &= ~(1u << (p & 31u)); }
++}
++
++static uint32_t
++n2vc_pool_free_pages(void)
++{
++	uint32_t n = 0;
++	for (uint32_t p = 0; p < N2VC_POOL_PAGES; p++) { if (n2vc_pg_free(p)) { n++; } }
++	return n;
++}
++
++static uint32_t
++n2vc_pool_take(uint32_t pages)
++{
++	uint32_t run = 0, first = 0;
++	if (pages == 0 || pages > N2VC_POOL_PAGES) { return 0xffffffffu; }
++	for (uint32_t p = 0; p < N2VC_POOL_PAGES; p++) {
++		if (n2vc_pg_free(p)) {
++			if (!run) { first = p; }
++			if (++run == pages) {
++				for (uint32_t k = 0; k < pages; k++) { n2vc_pg_mark(first + k, true); }
++				return first;
++			}
++		} else { run = 0; }
++	}
++	return 0xffffffffu;
++}
++
++/* The pool access rule (frozen header): the allocator may always use its handle; another file only when the handle was
++ * allocated RWVC_DMA_SHARED and the caller is on the OTHER minor.  Two clients on minor 1 never see each other.  This is
++ * IK's n2vr_dma_allowed() in the kernel build (per-process identity) and the same rule in the host model. */
++static bool
++n2vc_dma_usable(struct n2vc_open *f, const struct n2vc_dma *d)
++{
++	if (d->owner == f) { return true; }
++	if (!(d->flags & RWVC_DMA_SHARED)) { return false; }
++#if N2VC_KERNEL
++	return n2vr_dma_allowed(d->owner->minor, d->owner->proc, d->flags, f->minor, f->proc);
++#else
++	return d->owner->minor != f->minor;
++#endif
++}
++
++static struct n2vc_dma *
++n2vc_dma_lookup(struct n2vc_open *f, uint32_t handle, int *err)
++{
++	uint32_t idx = (handle & 0xfffu);
++	uint32_t gen = handle >> 12;
++	if (idx == 0 || idx > N2VC_DMA_MAX) { *err = EINVAL; return NULL; }
++	struct n2vc_dma *d = &n2vc.dma[idx - 1];
++	if (!d->used || d->gen != (uint16_t)gen) { *err = EINVAL; return NULL; }
++	if (!f) { *err = EINVAL; return NULL; }
++	if (!n2vc_dma_usable(f, d)) { *err = EACCES; return NULL; }
++	*err = 0;
++	return d;
++}
++
++/* RWVC_DMA_INFO: the same rule, with the header's own errors: EINVAL handle 0, ENOENT unknown/stale, EPERM not usable. */
++static int
++n2vc_dma_info_locked(struct n2vc_open *f, struct rwvc_dma_info *di)
++{
++	if (di->handle == 0) { return EINVAL; }
++	uint32_t idx = di->handle & 0xfffu;
++	uint32_t gen = di->handle >> 12;
++	if (idx == 0 || idx > N2VC_DMA_MAX) { return ENOENT; }
++	struct n2vc_dma *d = &n2vc.dma[idx - 1];
++	if (!d->used || d->gen != (uint16_t)gen) { return ENOENT; }
++	if (!n2vc_dma_usable(f, d)) { return EPERM; }
++	di->bytes = d->bytes;
++	di->out_pa = RW_CLAIM_VCODEC_PA + d->page * 4096u;
++	return 0;
++}
++
++static void
++n2vc_dma_free_all(struct n2vc_open *f)
++{
++	for (uint32_t i = 0; i < N2VC_DMA_MAX; i++) {
++		struct n2vc_dma *d = &n2vc.dma[i];
++		if (!d->used || d->owner != f) { continue; }
++		for (uint32_t k = 0; k < d->npages; k++) { n2vc_pg_mark(d->page + k, false); }
++		d->used = 0; d->owner = NULL; d->gen = (uint16_t)(d->gen + 1u); d->flags = 0; d->page = d->npages = d->bytes = 0;
++	}
++	f->ndma = 0;
++}
++
++/* ---- open/close ------------------------------------------------------------------------------------------------ */
++struct n2vc_open *
++n2vc_open_create(unsigned minor)
++{
++	struct n2vc_open *f = NULL;
++	if (minor > 1) { return NULL; }
++	n2vc_lock();
++	for (unsigned i = 0; i < N2VC_MAX_FILES; i++) {
++		if (!n2vc.files[i].used) {
++			f = &n2vc.files[i];
++			memset(f, 0, sizeof(*f));
++			f->used = 1;
++			f->minor = (uint8_t)minor;
++			if (++n2vc.next_file_id == 0) { n2vc.next_file_id = 1; }
++			f->id = n2vc.next_file_id;
++			break;
++		}
++	}
++	n2vc_unlock();
++	return f;
++}
++
++void
++n2vc_open_destroy(struct n2vc_open *f)
++{
++	if (!f) { return; }
++	n2vc_lock();
++	n2vc_dma_free_all(f);
++	for (unsigned b = 0; b < RWVC_BLK_COUNT; b++) {
++		while (f->refs[b] > 0) { (void)n2vc_release_locked(b, f, false); }
++	}
++	for (unsigned i = 0; i < RWVC_IRQ_COUNT; i++) { f->irq_seen[i] = 0; }
++	f->used = 0;
++	n2vc_unlock();
++}
++
++unsigned
++n2vc_minor_opens(unsigned minor)
++{
++	unsigned n = 0;
++	n2vc_lock();
++	for (unsigned i = 0; i < N2VC_MAX_FILES; i++) { if (n2vc.files[i].used && n2vc.files[i].minor == minor) { n++; } }
++	n2vc_unlock();
++	return n;
++}
++
++uint32_t
++n2vc_powered_mask(void)
++{
++	uint32_t m = 0;
++	n2vc_lock();
++	for (unsigned b = 0; b < RWVC_BLK_COUNT; b++) { if (n2vc.on[b]) { m |= 1u << b; } }
++	n2vc_unlock();
++	return m;
++}
++
++/* ---- ioctls ---------------------------------------------------------------------------------------------------- */
++/*
++ * RWVC_WIN_VDEC_ALL (ABI rev 3, DEC07): one 0x30000 window over the vendor decoder's mapping of 0x16000000, with the
++ * power block decided per 4 KiB page.  48 pages, from facts/VDEC_PROTOCOL.md section 4 and the sources it cites
++ * (mt6893.dts:6281-6292, mtk_vcodec_dec_pm.c:154-288, clk-mt6885-vde.c):
++ *
++ *   0x00-0x0c  VDEC_CORE  VDEC_BASE 0x16000000 (+0x800 UFO), the vendor's 0x16001000/0x16002000/0x16003800,
++ *                         VDEC_RACING_CTRL 0x16004000.  K02's separate VDEC_BASE/VDEC_RACING windows already require
++ *                         VDEC_CORE for these registers.
++ *   0x0d       VDEC_SOC   larb5 0x1600d000: kernel-owned, read-only (allow-list below).
++ *   0x0e       VDEC_CORE  larb6 0x1600e000 (mt6893.dts:6051, zero ports, never programmed here, so writable).
++ *   0x0f-0x1f  VDEC_SOC   VDEC_SOC_GCON 0x1600f000, VDEC_LAT_MISC 0x16010000, VDEC_LAT_VLD 0x16011000 and the vendor's
++ *                         LAT sub-blocks 0x16011800-0x16018800 (mt6893.dts:6283-6292; clk-mt6885-vde.c:214-232).
++ *   0x20-0x2d  VDEC_CORE  VDEC_VLD 0x16020000, VDEC_MC 0x16021000, AVC_VLD 0x16022000, VDEC_MV 0x16023000, PP
++ *                         0x16024000, VDEC_MISC 0x16025000-0x16028fff, 0x16029000 (mt6893.dts:6283-6292).
++ *   0x2e       VDEC_CORE  larb4 0x1602e000: kernel-owned, read-only (allow-list below).
++ *   0x2f       VDEC_CORE  VDEC_SYS 0x1602f000.
++ *
++ * The core's clock-on path enables MT_CG_SOC (the VDE gate block) and MT_CG_VDEC0 (mtk_vcodec_dec_pm.c:160-170), which
++ * n2vc_blocks[] expresses as VDEC_CORE's hidden reference on VDEC_SOC: a core page needs both domains, so mapping the
++ * base/racing/unknown low pages to the core cannot widen anything the separate windows allow today.
++ */
++#define N2VC_VDEC_PAGES (0x30000u / 4096u)
++static uint8_t
++n2vc_vdec_page_blk(uint32_t page)
++{
++	if (page < 0x0du) { return RWVC_BLK_VDEC_CORE; }
++	if (page == 0x0du) { return RWVC_BLK_VDEC_SOC; }     /* larb5 */
++	if (page == 0x0eu) { return RWVC_BLK_VDEC_CORE; }    /* larb6 */
++	if (page < 0x20u) { return RWVC_BLK_VDEC_SOC; }      /* SOC_GCON + LAT_* */
++	return RWVC_BLK_VDEC_CORE;                           /* VLD .. VDEC_SYS, larb4 */
++}
++
++/*
++ * Writes to the two kernel-owned larb pages are refused unless the exact word is listed here.  n2vc_larb_on() programs
++ * larb4/larb5 itself, so a client may only change the bits the vendor's sleep-protect handshake needs:
++ *   - larb5 0x1600d00c (page 0x0d, offset 0x00c) is SMI_LARB_SLP_CON; opus-dec1's host frame trace has the vendor
++ *     writing bit 0 there and polling bit 16 (vdec_hal_wait_larb_sleep_protect / release_larb_sleep_protect), so a flat
++ *     read-only rule would break the first frame.  Bit 0 only; `wmask` refuses a write that touches any other bit.
++ *   - larb4 0x1602e00c (page 0x2e, offset 0x00c) is the same SMI_LARB_SLP_CON word on the core's larb; DEC04's
++ *     reading of opus-dec2's trace has the core path writing it too (board 1794414983), so it gets the same bit 0.
++ * An unknown offset is refused, never silently allowed.
++ */
++struct n2vc_vdec_allow { uint8_t page; uint32_t off, wmask; };
++static const struct n2vc_vdec_allow n2vc_vdec_allow[] = {
++	{ 0x0du, 0x00cu, 0x00000001u },     /* larb5 SMI_LARB_SLP_CON bit 0 (sleep protect, LAT path) */
++	{ 0x2eu, 0x00cu, 0x00000001u },     /* larb4 SMI_LARB_SLP_CON bit 0 (core path, DEC04/opus-dec2) */
++};
++static const unsigned n2vc_vdec_allow_n = sizeof(n2vc_vdec_allow) / sizeof(n2vc_vdec_allow[0]);
++
++/* may this write change exactly these bits?  `off` is the offset inside the 4 KiB page, `bits` is what the caller asks
++ * to modify (value, or value&mask for a masked write); an offset that is not in the table is refused. */
++static bool
++n2vc_vdec_larb_write_allowed(uint32_t page, uint32_t off, uint32_t bits)
++{
++	for (unsigned i = 0; i < n2vc_vdec_allow_n; i++) {
++		const struct n2vc_vdec_allow *a = &n2vc_vdec_allow[i];
++		if (a->page == page && a->off == off) { return (bits & ~a->wmask) == 0; }
++	}
++	return false;
++}
++
++/* the block that must be powered for this op, and the read-only refusal of RWVC_WIN_VDEC_ALL's larb pages */
++static int
++n2vc_op_block(const struct rwvc_reg_op *o, unsigned *blk)
++{
++	const struct n2vc_win *w = &n2vc_wins[o->window];
++	if (w->blk != N2VC_BLK_PER_PAGE) { *blk = w->blk; return 0; }
++	uint32_t page = o->offset >> 12;
++	if (page >= N2VC_VDEC_PAGES) { return EINVAL; }      /* not reached: the window is 0x30000 bytes and 4-aligned */
++	*blk = n2vc_vdec_page_blk(page);
++	if ((o->op == RWVC_OP_WRITE || o->op == RWVC_OP_WRITE_MASK) && (page == 0x0du || page == 0x2eu)) {
++		uint32_t bits = o->op == RWVC_OP_WRITE_MASK ? (o->value & o->mask) : o->value;
++		if (!n2vc_vdec_larb_write_allowed(page, o->offset & 0xfffu, bits)) { return EACCES; }
++	}
++	return 0;
++}
++
++static int
++n2vc_op_window(const struct rwvc_reg_op *o, unsigned *win, vm_offset_t *base, uint32_t *off)
++{
++	if (o->window >= N2VC_WIN_N) { return EINVAL; }
++	if (o->offset & 3u) { return EINVAL; }
++	if (o->offset > n2vc_wins[o->window].bytes - 4u) { return EINVAL; }
++	unsigned blk = 0;
++	int err = n2vc_op_block(o, &blk);
++	if (err) { return err; }
++	if (!n2vc.on[blk]) { return EACCES; }
++	vm_offset_t va = n2vc_pa(n2vc_wins[o->window].pa, n2vc_wins[o->window].bytes, 1);
++	if (!va) { return ENXIO; }
++	*win = o->window; *base = va; *off = o->offset;
++	return 0;
++}
++
++static int
++n2vc_regs_locked(struct n2vc_open *f, struct rwvc_reg_batch *b)
++{
++	struct rwvc_reg_op ops[N2VC_CHUNK];
++	uint64_t batch0 = n2vc_now_us();
++	uint32_t fid = f->id;
++	if (b->count > RWVC_REG_MAX_OPS) { return EINVAL; }
++	if (b->count && !b->ops) { return EINVAL; }
++	uint32_t timeout = b->poll_timeout_us;
++	if (timeout > N2VC_POLL_MAX_US) { timeout = N2VC_POLL_MAX_US; }
++	uint32_t done = 0;
++	for (uint32_t start = 0; start < b->count; start += N2VC_CHUNK) {
++		uint32_t n = b->count - start;
++		if (n > N2VC_CHUNK) { n = N2VC_CHUNK; }
++		uint64_t uaddr = b->ops + (uint64_t)start * sizeof(struct rwvc_reg_op);
++		int err = n2vc_copyin(uaddr, ops, n * (uint32_t)sizeof(struct rwvc_reg_op));
++		if (err) { b->out_done = done; return err; }
++		for (uint32_t i = 0; i < n; i++) {
++			struct rwvc_reg_op *o = &ops[i];
++			vm_offset_t base = 0;
++			uint32_t off = 0;
++			unsigned win = 0;
++			switch (o->op) {
++			case RWVC_OP_READ:
++			case RWVC_OP_WRITE:
++			case RWVC_OP_WRITE_MASK:
++			case RWVC_OP_POLL: {
++				err = n2vc_op_window(o, &win, &base, &off);
++				if (err) { (void)n2vc_copyout(ops, uaddr, n * (uint32_t)sizeof(struct rwvc_reg_op)); b->out_done = done; return err; }
++				(void)win;
++				if (o->op == RWVC_OP_READ) { o->value = ni_rd(base, off); }
++				else if (o->op == RWVC_OP_WRITE) { ni_wr(base, off, o->value); }
++				else if (o->op == RWVC_OP_WRITE_MASK) { ni_mask(base, off, o->mask, o->value); }
++				else {
++					uint64_t start_us = n2vc_now_us();
++					for (;;) {
++						uint32_t v = ni_rd(base, off);
++						if ((v & o->mask) == (o->value & o->mask)) { break; }
++						uint64_t now = n2vc_now_us();
++						if (now - start_us >= timeout || now - batch0 >= N2VC_BATCH_US) {
++							(void)n2vc_copyout(ops, uaddr, n * (uint32_t)sizeof(struct rwvc_reg_op));
++							b->out_done = done;
++							return ETIMEDOUT;
++						}
++						n2vc_sleep();       /* drops n2vc_mtx; revalidate before the next register access */
++						if (!f->used || f->id != fid) {
++							(void)n2vc_copyout(ops, uaddr, n * (uint32_t)sizeof(struct rwvc_reg_op));
++							b->out_done = done;
++							return ENXIO;
++						}
++						unsigned rblk = 0;
++						if (n2vc_op_block(o, &rblk) != 0 || !n2vc.on[rblk]) {
++							(void)n2vc_copyout(ops, uaddr, n * (uint32_t)sizeof(struct rwvc_reg_op));
++							b->out_done = done;
++							return EACCES;
++						}
++					}
++				}
++				break;
++			}
++			case RWVC_OP_DELAY_US:
++				if (o->value > 1000u) { b->out_done = done; return EINVAL; }
++				if (n2vc_now_us() - batch0 + o->value > N2VC_BATCH_US) { b->out_done = done; return ETIMEDOUT; }
++				for (uint32_t left = o->value; left != 0; ) {
++					uint32_t d = left > 100u ? 100u : left;   /* delay() only for waits <= 100 us */
++					n2vc_us(d);
++					left -= d;
++				}
++				break;
++			default:
++				b->out_done = done;
++				return EINVAL;
++			}
++			done++;
++		}
++		err = n2vc_copyout(ops, uaddr, n * (uint32_t)sizeof(struct rwvc_reg_op));
++		if (err) { b->out_done = done; return err; }
++	}
++	b->out_done = done;
++	return 0;
++}
++
++static uint32_t
++n2vc_irq_status(unsigned irq)
++{
++	const struct n2vc_irq *q = &n2vc_irqs[irq];
++	vm_offset_t va = n2vc_pa(n2vc_wins[q->win].pa, n2vc_wins[q->win].bytes, 1);
++	return va ? ni_rd(va, q->status_off) : 0;
++}
++
++static bool
++n2vc_irq_match(unsigned irq, uint32_t st)
++{
++	return (st & n2vc_irqs[irq].match) != 0;
++}
++
++static void
++n2vc_irq_ack(unsigned irq, uint32_t st)
++{
++	const struct n2vc_irq *q = &n2vc_irqs[irq];
++	vm_offset_t va = n2vc_pa(n2vc_wins[q->win].pa, n2vc_wins[q->win].bytes, 1);
++	if (!va) { return; }
++	if (irq == RWVC_IRQ_VDEC || irq == RWVC_IRQ_VDEC_LAT) {
++		uint32_t v = ni_rd(va, q->status_off);
++		ni_wr(va, q->status_off, v | 0x11u);
++		ni_wr(va, q->status_off, (v | 0x11u) & ~0x10u);
++	} else {
++		ni_wr(va, q->ack_off, st & q->clear_mask);
++	}
++}
++
++/*
++ * GIC evidence for the future interrupt path, read only.  SPI 308 (VENC) and 313 (core 1) are INTID 340 / 345.  This
++ * driver never enables them (ml_install_interrupt_handler keeps ONE handler per CPU and Nord2GPU.cpp owns it), but a level
++ * line that is asserted shows in GICD_ISPENDR even while disabled.  -1 = GICD not mapped (host build or map failure).
++ */
++#define N2VC_INTID_VENC    (308u + 32u)
++#define N2VC_INTID_VENC_C1 (313u + 32u)
++static int
++n2vc_gic_pending(uint32_t intid)
++{
++#if N2VC_KERNEL
++	vm_offset_t gicd = n2vc_pa(N2VC_GICD_PA, 0x1000, 1);
++	if (!gicd) { return -1; }
++	return (int)((ni_rd(gicd, 0x200u + 4u * (intid / 32u)) >> (intid % 32u)) & 1u);
++#else
++	(void)intid;
++	return -1;
++#endif
++}
++static bool n2vc_gic_logged[2];
++
++static int
++n2vc_wait_irq_locked(struct n2vc_open *f, struct rwvc_wait_irq *w)
++{
++	if (w->irq >= RWVC_IRQ_COUNT) { return EINVAL; }
++	if (w->timeout_ms > N2VC_WAIT_MS_MAX) { return EINVAL; }
++	unsigned blk = n2vc_irqs[w->irq].blk;
++	uint32_t fid = f->id;
++	if (!f->used || f->id != fid) { return ENXIO; }
++	if (!n2vc.on[blk]) { return EACCES; }
++	uint64_t start = n2vc_now_us();
++	uint64_t limit = (uint64_t)w->timeout_ms * 1000u;
++	uint32_t st = 0;
++	for (;;) {
++		st = n2vc_irq_status(w->irq);
++		if (n2vc_irq_match(w->irq, st)) {
++			if (w->irq <= RWVC_IRQ_VENC_C1 && !n2vc_gic_logged[w->irq]) {
++				n2vc_gic_logged[w->irq] = true;          /* once per boot and line: is the dts SPI the one that asserts? */
++				printf("NORD2 VCODEC: first %s done status %#x; GIC INTID %u pending %d (before the ack)\n",
++				    w->irq == RWVC_IRQ_VENC ? "VENC" : "VENC_C1", st,
++				    w->irq == RWVC_IRQ_VENC ? N2VC_INTID_VENC : N2VC_INTID_VENC_C1,
++				    n2vc_gic_pending(w->irq == RWVC_IRQ_VENC ? N2VC_INTID_VENC : N2VC_INTID_VENC_C1));
++			}
++			n2vc_irq_ack(w->irq, st);
++			f->irq_seen[w->irq]++;
++			w->out_count = f->irq_seen[w->irq];
++			f->irq_seen[w->irq] = 0;
++			w->out_status = st;
++			return 0;
++		}
++		if (n2vc_now_us() - start >= limit) { w->out_count = 0; w->out_status = st; return ETIMEDOUT; }
++		n2vc_sleep();                   /* drops n2vc_mtx: the file may close or the block may power off meanwhile */
++		if (!f->used || f->id != fid) { w->out_count = 0; w->out_status = st; return ENXIO; }
++		if (!n2vc.on[blk]) { w->out_count = 0; w->out_status = st; return EACCES; }
++	}
++}
++
++/* the hardware half of struct rwvc_info; the relay's minor-1 INFO fills the same fields */
++static void
++n2vc_info_fill_locked(struct rwvc_info *i)
++{
++	if (!i) { return; }
++	memset(i, 0, sizeof(*i));
++	i->abi_version = RWVC_ABI_VERSION;
++	for (unsigned b = 0; b < RWVC_BLK_COUNT; b++) { if (n2vc.on[b]) { i->powered_mask |= 1u << b; } }
++	i->pool_pa = RW_CLAIM_VCODEC_PA;
++	i->pool_bytes = RW_CLAIM_VCODEC_BYTES;
++	i->pool_free = n2vc_pool_free_pages() * 4096u;
++	i->irq_mode = 0;
++#if !N2VC_KERNEL
++	for (unsigned k = 0; k < N2VC_MAX_FILES; k++) { if (n2vc.files[k].used && n2vc.files[k].minor == 0) { i->server_present = 1; } }
++#endif
++	/* kernel: the caller sets server_present from n2vr_server_present() outside this lock (no nested locks) */
++}
++
++void
++n2vc_info_fill(struct rwvc_info *i)
++{
++	if (!i) { return; }
++	n2vc_lock();
++	n2vc_info_fill_locked(i);
++	n2vc_unlock();
++}
++
++static int
++n2vc_ioctl_locked(struct n2vc_open *f, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	(void)flag; (void)p;
++	if (!data) { return EINVAL; }
++	if (cmd == RWVC_INFO) {
++		n2vc_info_fill_locked((struct rwvc_info *)data);
++		return 0;
++	}
++	if (f->minor != 0) {
++		if (cmd != RWVC_DMA_ALLOC && cmd != RWVC_DMA_FREE && cmd != RWVC_DMA_RW &&
++		    cmd != RWVC_DMA_INFO && cmd != RWVC_MSG_SEND && cmd != RWVC_MSG_RECV) { return EACCES; }
++	}
++	switch (cmd) {
++	case RWVC_POWER: {
++		struct rwvc_power *p = (struct rwvc_power *)data;
++		if (p->block >= RWVC_BLK_COUNT) { return EINVAL; }
++		/* vcodecd: N2VC_VENC_SLOW's 273 MHz parent for the first phone encode (root, 11 Nov) */
++		if (p->on) { return n2vc_acquire_ex(p->block, f, false, N2VC_VENC_SLOW ? N2VC_VENC_PARENT_SLOW : N2VC_VENC_PARENT_FAST); }
++		if (!f->refs[p->block]) { return EINVAL; }
++		return n2vc_release_locked(p->block, f, false);
++	}
++	case RWVC_REGS:
++		return n2vc_regs_locked(f, (struct rwvc_reg_batch *)data);
++	case RWVC_WAIT_IRQ:
++		return n2vc_wait_irq_locked(f, (struct rwvc_wait_irq *)data);
++	case RWVC_IRQ_CLEAR: {
++		struct rwvc_irq_clear *c = (struct rwvc_irq_clear *)data;
++		if (c->irq >= RWVC_IRQ_COUNT) { return EINVAL; }
++		if (n2vc.on[n2vc_irqs[c->irq].blk]) { n2vc_irq_ack(c->irq, n2vc_irq_status(c->irq)); }
++		f->irq_seen[c->irq] = 0;
++		return 0;
++	}
++	case RWVC_DMA_ALLOC: {
++		struct rwvc_dma_alloc *a = (struct rwvc_dma_alloc *)data;
++		if (!a->bytes || (a->flags & ~RWVC_DMA_SHARED)) { return EINVAL; }
++		if (f->ndma >= N2VC_DMA_PER_FILE) { return ENOMEM; }
++		uint32_t pages = (a->bytes + 4095u) / 4096u;
++		unsigned slot = N2VC_DMA_MAX;
++		for (unsigned i = 0; i < N2VC_DMA_MAX; i++) { if (!n2vc.dma[i].used) { slot = i; break; } }
++		if (slot == N2VC_DMA_MAX) { return ENOMEM; }
++		uint32_t page = n2vc_pool_take(pages);
++		if (page == 0xffffffffu) { return ENOMEM; }
++		vm_offset_t va = n2vc_pa(RW_CLAIM_VCODEC_PA, RW_CLAIM_VCODEC_BYTES, 0);
++		if (!va) {
++			for (uint32_t k = 0; k < pages; k++) { n2vc_pg_mark(page + k, false); }
++			return ENXIO;
++		}
++		struct n2vc_dma *d = &n2vc.dma[slot];
++		d->used = 1; d->flags = (uint8_t)a->flags; d->gen = (uint16_t)(d->gen + 1u);
++		d->page = page; d->npages = pages; d->bytes = pages * 4096u; d->owner = f;
++		memset((void *)(va + page * 4096u), 0, pages * 4096u);
++		n2vc_cache(va + page * 4096u, pages * 4096u);
++		a->out_handle = (uint32_t)((uint32_t)d->gen << 12) | (slot + 1u);
++		a->out_pa = RW_CLAIM_VCODEC_PA + page * 4096u;
++		f->ndma++;
++		return 0;
++	}
++	case RWVC_DMA_FREE: {
++		struct rwvc_dma_free *fr = (struct rwvc_dma_free *)data;
++		int err = 0;
++		struct n2vc_dma *d = n2vc_dma_lookup(f, fr->handle, &err);
++		if (!d) { return err; }
++		if (d->owner != f) { return EACCES; }
++		for (uint32_t k = 0; k < d->npages; k++) { n2vc_pg_mark(d->page + k, false); }
++		d->used = 0; d->owner = NULL; d->gen = (uint16_t)(d->gen + 1u); d->flags = 0; d->page = d->npages = d->bytes = 0;
++		if (f->ndma) { f->ndma--; }
++		return 0;
++	}
++	case RWVC_DMA_RW: {
++		struct rwvc_dma_rw *rw = (struct rwvc_dma_rw *)data;
++		int err = 0;
++		struct n2vc_dma *d = n2vc_dma_lookup(f, rw->handle, &err);
++		if (!d) { return err; }
++		if (rw->offset > d->bytes || rw->bytes > d->bytes - rw->offset) { return EINVAL; }
++		if (!rw->bytes) { return 0; }
++		if (!rw->user) { return EFAULT; }
++		vm_offset_t va = n2vc_pa(RW_CLAIM_VCODEC_PA, RW_CLAIM_VCODEC_BYTES, 0);
++		if (!va) { return ENXIO; }
++		va += d->page * 4096u + rw->offset;
++		/* the mutex is held throughout, so the handle cannot go away: chunk only to bound how long a copy keeps the
++		 * relay/JPEG callers out.  Cache maintenance is per chunk, after writes and before reads. */
++		uint64_t user = rw->user;
++		uint32_t left = rw->bytes;
++		while (left) {
++			uint32_t n = left > N2VC_RW_CHUNK ? N2VC_RW_CHUNK : left;
++			if (rw->write) {
++				err = n2vc_copyin(user, (void *)va, n);
++				if (!err) { n2vc_cache(va, n); }
++			} else {
++				n2vc_cache(va, n);
++				err = n2vc_copyout((void *)va, user, n);
++			}
++			if (err) { return err; }
++			va += n; user += n; left -= n;
++		}
++		return 0;
++	}
++	case RWVC_DMA_FILL: {
++		struct rwvc_dma_fill *fl = (struct rwvc_dma_fill *)data;
++		int err = 0;
++		struct n2vc_dma *d = n2vc_dma_lookup(f, fl->handle, &err);
++		if (!d) { return err; }
++		if (fl->offset > d->bytes || fl->bytes > d->bytes - fl->offset) { return EINVAL; }
++		vm_offset_t va = n2vc_pa(RW_CLAIM_VCODEC_PA, RW_CLAIM_VCODEC_BYTES, 0);
++		if (!va) { return ENXIO; }
++		va += d->page * 4096u + fl->offset;
++		memset((void *)va, (int)(fl->value & 0xffu), fl->bytes);
++		n2vc_cache(va, fl->bytes);
++		return 0;
++	}
++	case RWVC_DMA_INFO:
++		return n2vc_dma_info_locked(f, (struct rwvc_dma_info *)data);
++	default:
++		return ENOTTY;
++	}
++}
++
++int
++n2vc_ioctl(struct n2vc_open *f, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	(void)flag; (void)p;
++	if (!f) { return ENXIO; }
++	n2vc_lock();
++	int err = f->used ? n2vc_ioctl_locked(f, cmd, data, flag, p) : ENXIO;
++	n2vc_unlock();
++#if N2VC_KERNEL
++	if (!err && cmd == RWVC_INFO && data) { ((struct rwvc_info *)data)->server_present = n2vr_server_present(); }
++#endif
++	return err;
++}
++
++/* ---- open slots (character device; also compiled for the host test with N2VC_HOST_SLOTS) ----------------------- */
++#if N2VC_KERNEL || defined(N2VC_HOST_SLOTS)
++static struct { struct n2vc_open *f; uint8_t minor, dead; uint32_t busy; } n2vc_slot[N2VC_MAX_SLOTS];
++
++/* allocate a slot for an open file; caller holds n2vc_lock */
++static int
++n2vc_slot_add(struct n2vc_open *f, unsigned mn, struct proc *p)
++{
++	for (unsigned i = 0; i < N2VC_MAX_SLOTS; i++) {
++		if (n2vc_slot[i].f) { continue; }
++		n2vc_slot[i].f = f; n2vc_slot[i].minor = (uint8_t)mn; n2vc_slot[i].dead = 0; n2vc_slot[i].busy = 0;
++		f->proc = p;
++		return 0;
++	}
++	return EBUSY;
++}
++
++/* Remove every slot of this minor (XNU calls d_close once for the last close but d_open per open): non-busy files are
++ * returned in out[] for the caller to destroy, a busy one is marked dead and n2vc_dev_ioctl destroys it when its ioctl
++ * returns.  *found counts the slots seen (one n2vr_server_close() is owed per minor-0 slot).  Caller holds n2vc_lock. */
++static unsigned
++n2vc_slot_close_all(unsigned mn, struct n2vc_open **out, unsigned cap, unsigned *found)
++{
++	unsigned n = 0;
++	*found = 0;
++	for (unsigned i = 0; i < N2VC_MAX_SLOTS; i++) {
++		if (!n2vc_slot[i].f || n2vc_slot[i].minor != mn) { continue; }
++		(*found)++;
++		if (n2vc_slot[i].busy) { n2vc_slot[i].dead = 1; }
++		else {
++			if (n < cap) { out[n++] = n2vc_slot[i].f; }
++			n2vc_slot[i].f = NULL;
++		}
++	}
++	return n;
++}
++#endif
++
++/* ---- character device ------------------------------------------------------------------------------------------ */
++#if N2VC_KERNEL
++
++/* K01's JPEG driver (nord2_jpegdev.inc, included after this file) registers n2vc_ven_get/put here. */
++extern int n2jd_share_ven(int (*get)(void), void (*put)(void));
++
++/* IK's relay (nord2_vcodec_relay.inc, included before this file) calls this for a minor-1 client's DMA ioctls. */
++static int
++n2vc_relay_hw_ioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	(void)dev;
++	struct n2vc_open *f = NULL;
++	n2vc_lock();
++	for (unsigned i = 0; i < N2VC_MAX_FILES; i++) {
++		if (n2vc.files[i].used && n2vc.files[i].minor == 1 && n2vc.files[i].proc == p) { f = &n2vc.files[i]; break; }
++	}
++	for (unsigned i = 0; f == NULL && i < N2VC_MAX_FILES; i++) {
++		if (!n2vc.files[i].used) { f = &n2vc.files[i]; memset(f, 0, sizeof(*f)); f->used = 1; f->minor = 1; f->proc = p; break; }
++	}
++	n2vc_unlock();
++	if (!f) { return ENOMEM; }
++	return n2vc_ioctl(f, cmd, data, flag, p);
++}
++
++/* IK's relay client close should call this (one line, posted to hw-ik): free that client's DMA handles and references. */
++void
++n2vc_relay_closed(struct proc *p)
++{
++	struct n2vc_open *dying = NULL;
++	n2vc_lock();
++	for (unsigned i = 0; i < N2VC_MAX_FILES; i++) {
++		if (n2vc.files[i].used && n2vc.files[i].minor == 1 && n2vc.files[i].proc == p) { dying = &n2vc.files[i]; break; }
++	}
++	n2vc_unlock();
++	if (dying) { n2vc_open_destroy(dying); }
++}
++
++static int n2vc_dev_open_body(dev_t dev, struct proc *p);
++static int n2vc_dev_close_body(dev_t dev);
++static int n2vc_dev_ioctl_body(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p);
++/* q10jz breadcrumbs: IK's n2vr_trace() lines (kern.n2vctrace) around every entry into minor 0 */
++static int
++n2vc_dev_open(dev_t dev, __unused int flags, __unused int type, struct proc *p)
++{
++	bool t = n2vr_trace('o', (unsigned)minor(dev), 0, p);
++	return n2vr_trace_end(t, n2vc_dev_open_body(dev, p));
++}
++static int
++n2vc_dev_close(dev_t dev, __unused int flags, __unused int type, struct proc *p)
++{
++	bool t = n2vr_trace('c', (unsigned)minor(dev), 0, p);
++	return n2vr_trace_end(t, n2vc_dev_close_body(dev));
++}
++static int
++n2vc_dev_ioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	bool t = n2vr_trace('i', (unsigned)minor(dev), cmd, p);
++	return n2vr_trace_end(t, n2vc_dev_ioctl_body(dev, cmd, data, flag, p));
++}
++
++static int
++n2vc_dev_open_body(dev_t dev, struct proc *p)
++{
++	unsigned minor = (unsigned)minor(dev);
++	if (minor > 1) { return ENXIO; }
++	struct n2vc_open *f = n2vc_open_create(minor);
++	if (!f) { return ENOMEM; }
++	n2vc_lock();
++	int err = n2vc_slot_add(f, minor, p);
++	n2vc_unlock();
++	if (err) { n2vc_open_destroy(f); return err; }
++	if (minor == 0) { n2vr_server_open(); }
++	return 0;
++}
++
++static int
++n2vc_dev_close_body(dev_t dev)
++{
++	/* XNU calls d_close once at the last close of the vnode but d_open for every open (spec_vnops.c:2760 has no
++	 * D_TRACKCLOSE), so there can be several slots of this minor: destroy every one of them here, and count one
++	 * n2vr_server_close() per slot because each open counted one server open.  A slot with an ioctl in flight is
++	 * marked dead and destroyed by n2vc_dev_ioctl when that ioctl returns. */
++	struct n2vc_open *dying[N2VC_MAX_SLOTS];
++	unsigned found = 0;
++	unsigned mn = (unsigned)minor(dev);
++	n2vc_lock();
++	unsigned ndying = n2vc_slot_close_all(mn, dying, N2VC_MAX_SLOTS, &found);
++	n2vc_unlock();
++	for (unsigned i = 0; i < ndying; i++) { n2vc_open_destroy(dying[i]); }
++	if (mn == 0) { for (unsigned i = 0; i < found; i++) { n2vr_server_close(); } }
++	if (found > 1) { printf("NORD2 VCODEC: last close of minor %u ended %u opens\n", mn, found); }
++	return 0;
++}
++
++static int
++n2vc_dev_ioctl_body(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	if (n2vr_relay_cmd(cmd)) { return n2vr_ioctl(dev, cmd, data, flag, p); }
++	struct n2vc_open *f = NULL;
++	n2vc_lock();
++	for (unsigned i = 0; i < N2VC_MAX_SLOTS; i++) {
++		if (n2vc_slot[i].f && n2vc_slot[i].minor == (unsigned)minor(dev) && !n2vc_slot[i].dead) {
++			n2vc_slot[i].busy++;
++			f = n2vc_slot[i].f;
++			break;
++		}
++	}
++	n2vc_unlock();
++	if (!f) { return ENXIO; }
++	int err = n2vc_ioctl(f, cmd, data, flag, p);
++	n2vc_lock();
++	for (unsigned i = 0; i < N2VC_MAX_SLOTS; i++) {
++		if (n2vc_slot[i].f == f) {
++			if (n2vc_slot[i].busy) { n2vc_slot[i].busy--; }
++			if (n2vc_slot[i].dead && !n2vc_slot[i].busy) {
++				struct n2vc_open *dying = n2vc_slot[i].f;
++				n2vc_slot[i].f = NULL; n2vc_slot[i].dead = 0;
++				n2vc_unlock();
++				n2vc_open_destroy(dying);
++				return err;
++			}
++			break;
++		}
++	}
++	n2vc_unlock();
++	return err;
++}
++
++static const struct cdevsw n2vc_cdevsw = {
++	.d_open = n2vc_dev_open, .d_close = n2vc_dev_close, .d_read = eno_rdwrt, .d_write = eno_rdwrt,
++	.d_ioctl = n2vc_dev_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++static bool n2vc_started;
++
++void
++nord2_vcodec_start(void)
++{
++	if (n2vc_started) { return; }
++	int major = cdevsw_add(-1, &n2vc_cdevsw);
++	bool a = major >= 0 && devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "redwood-vcodec") != NULL;
++	n2vc_started = a;
++	struct n2vr_hw hw = { n2vc_relay_hw_ioctl, n2vc_info_fill };
++	bool r = n2vr_start(&hw);
++	int jd = n2jd_share_ven(n2vc_ven_get, n2vc_ven_put);
++	printf("NORD2 VCODEC: /dev/redwood-vcodec %s, /dev/redwood-vcodec-client %s, JPEG VEN sharing %s (VENC 0x17020000, "
++	    "VDEC 0x16000000; pool %#x+%#x; polled, irq_mode 0)\n",
++	    a ? "made" : "CANNOT BE MADE", r ? "made" : "CANNOT BE MADE", jd == 0 ? "on" : "NOT shared",
++	    RW_CLAIM_VCODEC_PA, RW_CLAIM_VCODEC_BYTES);
++}
++#endif /* N2VC_KERNEL */
+diff -ruN a/bsd/dev/nord2_vcodec_relay.inc b/bsd/dev/nord2_vcodec_relay.inc
+--- a/bsd/dev/nord2_vcodec_relay.inc
++++ b/bsd/dev/nord2_vcodec_relay.inc
+@@ -0,0 +1,797 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * nord2_vcodec_relay.inc -- minor 1 "/dev/redwood-vcodec-client" and the datagram relay between the VideoToolbox
++ * plug-ins (minor 1, unprivileged, 0666) and vcodecd (minor 0, 0600, owned by nord2_vcodec.inc / K02).
++ *
++ * Interface: include/redwood_vcodec.h (frozen), section "Relay".  This file owns every rule of the relay:
++ *   - a client is one process that has minor 1 open; the kernel assigns its id 1, 2, ... (monotonic, never reused until
++ *     the 32-bit wrap).  XNU's cdevsw gives d_open/d_close/d_ioctl only (dev_t, ..., struct proc *), no file pointer
++ *     (bsd/miscfs/specfs/spec_vnops.c:353), so two descriptors in one process are one client; the close notification is
++ *     queued when its use of the node ends.  d_open runs per open but d_close only when the node's last descriptor
++ *     anywhere closes (spec_vnops.c:2760), so n2vr_reap() checks each open client's process at every relay entry and
++ *     turns a dead one into the same notice; a client that closed the node but is still alive is not detectable (XNU has
++ *     no per-open close) and vcodecd must not depend on that.  The VT plug-in is one process; this is the documented
++ *     identity (accepted by hw-lead in header rev 2).
++ *   - at most N2VR_MAX_CLIENTS clients, each with N2VR_CLIENT_QUEUE datagrams inbound from the server, and at most
++ *     N2VR_CLIENT_QUEUE datagrams outstanding from that client toward the server.  A SEND into a full queue returns
++ *     EAGAIN; nothing is ever dropped while the receiver lives.
++ *   - RECV blocks on &n2vr for timeout_ms (<= N2VR_RECV_MAX_MS; 0 = EAGAIN, expiry = ETIMEDOUT, no server and nothing
++ *     queued = ENXIO, buffer smaller than the datagram = EMSGSIZE and the datagram stays queued).  A RECV always needs a
++ *     valid user address and bytes >= 1, also when only a {client, 0} close notice is expected.  SEND never blocks:
++ *     timeout_ms is ignored and a full queue is EAGAIN.
++ *   - a client's end queues a synthetic datagram {client = id, bytes = 0} to the server.  Its slot stays CLOSING
++ *     until the server has read the notice, so ids are never reused under a notice (8 closes can therefore be pending;
++ *     a 9th open gets EBUSY).  If no server is present the slot is freed at once (there is nobody to notify).
++ *   - server SEND needs client = destination id (0 = EINVAL, unknown/closed = ESRCH); close notices and data keep their
++ *     arrival order through a sequence number.
++ *   - DMA handles: the file that allocated a handle may always use it; any other file only when the handle was allocated
++ *     with RWVC_DMA_SHARED (the frozen header's flags bit 0, "shared with the other minor") and the accessor is on the
++ *     other minor.  Two clients on minor 1 never share a handle.  n2vr_dma_allowed() is the whole rule; nord2_vcodec.inc
++ *     applies it.  RWVC_DMA_INFO follows the same rule (header rev 2): the pool fills bytes/out_pa, EINVAL handle 0,
++ *     ENOENT unknown, EPERM not usable by the caller.  It is a pool ioctl, so the hardware half (K02) answers it on
++ *     minor 0 and this relay only forwards the minor-1 call after checking that the process still has a client slot.
++ *   - data is copied with copyin/copyout OUTSIDE the lock (a user fault may sleep); a failed copyout loses that datagram
++ *     (datagram semantics, documented, never a kernel fault).
++ *
++ * Only minor 1 accepts RWVC_INFO, RWVC_MSG_* and RWVC_DMA_ALLOC/FREE/RW/INFO.  Everything else on minor 1 is EACCES: the
++ * hardware ioctls (POWER, REGS, WAIT_IRQ, IRQ_CLEAR, DMA_FILL) belong to vcodecd on minor 0.  Minor 0 reaches the relay
++ * through n2vr_relay_cmd()/n2vr_ioctl() from nord2_vcodec.inc.
++ *
++ * Registration (called by nord2_vcodec.inc, included after this file):
++ *   static bool n2vr_start(const struct n2vr_hw *hw);
++ *   static void n2vr_server_open(void); <-> n2vr_server_close(void);      minor 0 d_open/d_close
++ *   static bool n2vr_relay_cmd(u_long cmd); static int n2vr_ioctl(dev_t, u_long, caddr_t, int, struct proc *);
++ *   static bool n2vr_dma_allowed(minor, proc, flags, minor, proc);
++ *   static uint32_t n2vr_server_present(void);
++ * The host test (test_ik/t_relay.c) defines N2VR_HOST and supplies the kernel primitives before including this file.
++ */
++#ifndef N2VR_RELAY_INC
++#define N2VR_RELAY_INC
++
++#ifndef N2VR_HOST
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/proc_internal.h>          /* proc_find/proc_rele: a client's process is held by reference */
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/lock.h>
++#include <libkern/copyio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>                /* delay(): q10ja flush-safe trace */
++#endif
++/* The frozen ABI header.  In the kernel build 0299 places a byte-identical copy next to this file (bsd/dev/, generated by
++ * make_patch.sh from gpu/hwcodec/include/redwood_vcodec.h and checked by compile_check.sh); host tests pass
++ * -I gpu/hwcodec/include. */
++#include "redwood_vcodec.h"
++
++/* nord2_vcodec.inc: free everything nord2_vcodec.inc allocated for this minor-1 client (its n2vc_open slot: DMA handles,
++ * power references).  The relay calls it at the last close of the process, outside its own lock; the host test defines a
++ * counting stub with the same signature. */
++extern void n2vc_relay_closed(struct proc *p);
++
++#ifdef N2VR_HOST
++/* the host shim (test_ik/t_relay.c) provides: struct proc, proc_find(), proc_rele(), proc_exiting(), proc_pid(),
++ * proc_uniqueid(), dev_t, minor(), makedev(), u_long, caddr_t, user_addr_t, struct timespec, struct cdevsw,
++ * cdevsw_add(), devfs_make_node(), DEVFS_CHAR, UID_ROOT, GID_WHEEL, LCK_GRP_DECLARE, LCK_MTX_DECLARE,
++ * lck_mtx_lock/unlock, msleep(), wakeup(), copyin/copyout(), mach_absolute_time(), absolutetime_to_nanoseconds(),
++ * printf(), errno values, PZERO, PCATCH, ERESTART, EWOULDBLOCK */
++#endif
++
++#define N2VR_MAX_CLIENTS    8u
++#define N2VR_CLIENT_QUEUE   16u
++#define N2VR_SERVER_QUEUE   (N2VR_MAX_CLIENTS * N2VR_CLIENT_QUEUE)
++#define N2VR_RECV_MAX_MS    60000u
++/* RWVC_DMA_SHARED is the frozen header's macro (rev 2); a local copy would silently fork the ABI if the header changes. */
++
++/* how a client slot is used; a CLOSING slot keeps its id until the server has read the close notice */
++enum { N2VR_SLOT_FREE = 0, N2VR_SLOT_OPEN = 1, N2VR_SLOT_CLOSING = 2 };
++
++struct n2vr_dgram {
++	uint64_t seq;
++	uint32_t bytes;
++	uint32_t client;
++	uint8_t data[RWVC_MSG_MAX];
++};
++struct n2vr_close {
++	uint64_t seq;
++	uint32_t client;
++	uint32_t pad;
++};
++struct n2vr_client {
++	int state;
++	struct proc *proc;                      /* the caller pointer K02 stored; valid while open, matched only */
++	struct proc *ref;                       /* proc_find() reference: keeps the struct alive until the slot frees */
++	pid_t pid;
++	uint64_t uniqueid;
++	uint32_t id;
++	uint32_t outstanding;                   /* datagrams of this client queued toward the server */
++	bool notice_queued;                     /* CLOSING: its {client, 0} is in n2vr.close[...] */
++	uint32_t head, count;                   /* inbound from the server */
++	struct n2vr_dgram q[N2VR_CLIENT_QUEUE];
++};
++
++/* what nord2_vcodec.inc supplies: its ioctl (minor 1 DMA ioctls only) and the hardware part of RWVC_INFO */
++struct n2vr_hw {
++	int (*ioctl)(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p);
++	void (*info)(struct rwvc_info *out);
++};
++
++static LCK_GRP_DECLARE(n2vr_grp, "nord2-vcodec-relay");
++static LCK_MTX_DECLARE(n2vr_lock, &n2vr_grp);
++static struct {
++	bool started;
++	struct n2vr_hw hw;
++	uint32_t server_opens;
++	bool server_present;
++	uint32_t next_id;
++	uint64_t next_seq;
++	struct n2vr_client c[N2VR_MAX_CLIENTS];
++	uint32_t server_head, server_count;
++	struct n2vr_dgram server[N2VR_SERVER_QUEUE];
++	struct n2vr_close close[N2VR_MAX_CLIENTS];
++	uint32_t close_head, close_count;
++} n2vr;
++
++/*
++ * Crash breadcrumbs (q10jz, opus-relaycrash).  q10jy reset the phone ~45 s after n2vcd_probe started, i.e. at its first
++ * contact with the vcodec nodes, with no panic text (no 0301 crash log).  Each of the first kern.n2vctrace entries into
++ * either node (open/close/ioctl, both minors) prints one line BEFORE the handler runs and one with its result, so the
++ * live USB log stops at the culprit:  "NORD2 VCT o1 p43" (o/c/i = open/close/ioctl, minor, pid, ioctl number) and
++ * "NORD2 VCT =<err>".  The budget (default 64) is shared; n2vcd_probe re-arms it with sysctl kern.n2vctrace before its
++ * first open.  Racy decrement: an extra or a missing line is harmless.
++ * q10ja (flush-safe): q10jz died again at the probe's wake-up with no "VCT o1" line; the host polls the USB log ring, so
++ * the tail printed just before a reset can be lost.  From the 5th traced entry on (vcodecd's own first entries are not
++ * slowed), the entry line is followed by a 1.5 s busy-wait and the result line by 0.5 s, in 100 ms delay() chunks, in the
++ * cdevsw wrapper before any lock is taken (preemption and interrupts enabled), so the poll fetches the line first.  The
++ * kern.n2vctrace handler logs every call ("NORD2 VCT sysctl ...") and waits the same way before and after the write.
++ */
++static unsigned int n2vr_trace_left = 0u;   /* q10jf: breadcrumbs off by default (each entry cost 2 s); sysctl re-arms */
++static unsigned int n2vr_trace_n;            /* traced entries so far */
++/* q10jb: q10ja's trace stopped right after the probe's first "VCT o1" (relay d_open).  From the first minor-1 entry on,
++ * the first 60 internal steps of open / reap / INFO / close print "NORD2 VCT r<step>" and wait 300 ms each (r0-r7 open,
++ * r10-r16 reap, r20-r22 INFO, r30-r33 close; 9/19/39 = NULL results).  Delays with n2vr_lock held only block other relay
++ * callers (a mutex may be held across a blocking delay). */
++static bool n2vr_steps_on;
++static unsigned int n2vr_steps_left = 60u;
++
++static void
++n2vr_spin(unsigned tenths)
++{
++#ifndef N2VR_HOST
++	for (unsigned i = 0; i < tenths; i++) { delay(100000); }
++#else
++	(void)tenths;
++#endif
++}
++
++#ifndef N2VR_HOST
++#include <sys/sysctl.h>
++static int
++n2vr_sysctl_trace(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	printf("NORD2 VCT sysctl %s left %u\n", req->newptr ? "write" : "read", n2vr_trace_left);
++	n2vr_spin(15);
++	int v = (int)n2vr_trace_left;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, NULL);
++	if (err == 0 && req->newptr) {
++		n2vr_trace_left = v < 0 ? 0u : (unsigned int)v;
++		printf("NORD2 VCT sysctl set %u\n", n2vr_trace_left);
++		n2vr_spin(15);
++	}
++	return err;
++}
++SYSCTL_PROC(_kern, OID_AUTO, n2vctrace, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, n2vr_sysctl_trace, "I",
++    "vcodec node entries to log");
++#endif
++
++static void
++n2vr_step_ex(unsigned code, unsigned tenths)
++{
++	if (!__atomic_load_n(&n2vr_steps_on, __ATOMIC_RELAXED)) { return; }
++	unsigned left = __atomic_load_n(&n2vr_steps_left, __ATOMIC_RELAXED);
++	if (left == 0 || !__atomic_compare_exchange_n(&n2vr_steps_left, &left, left - 1, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { return; }
++	printf("NORD2 VCT r%u\n", code);
++	n2vr_spin(tenths);
++}
++#define n2vr_step(code) n2vr_step_ex((code), 3u)
++
++static bool
++n2vr_trace(char op, unsigned mn, u_long cmd, struct proc *p)
++{
++	unsigned left = __atomic_load_n(&n2vr_trace_left, __ATOMIC_RELAXED);
++	if (left == 0 || !__atomic_compare_exchange_n(&n2vr_trace_left, &left, left - 1, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { return false; }
++	unsigned n = __atomic_fetch_add(&n2vr_trace_n, 1u, __ATOMIC_RELAXED);
++	if (op == 'i') { printf("NORD2 VCT i%u p%d %#lx #%u\n", mn, proc_pid(p), cmd, n); }
++	else { printf("NORD2 VCT %c%u p%d #%u\n", op, mn, proc_pid(p), n); }
++	if (mn == 1) { __atomic_store_n(&n2vr_steps_on, true, __ATOMIC_RELAXED); }
++	if (n >= 4) { n2vr_spin(mn == 1 ? 3 : 15); }
++	return true;
++}
++
++static int
++n2vr_trace_end(bool on, int err)
++{
++	if (on) {
++		printf("NORD2 VCT =%d\n", err);
++		if (__atomic_load_n(&n2vr_trace_n, __ATOMIC_RELAXED) > 4) { n2vr_spin(5); }
++	}
++	return err;
++}
++
++static uint64_t
++n2vr_now_ms(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000u;
++}
++
++static struct n2vr_client *
++n2vr_by_proc(struct proc *p, int state)
++{
++	pid_t pid = proc_pid(p);
++	uint64_t uid = proc_uniqueid(p);
++	for (unsigned i = 0; i < N2VR_MAX_CLIENTS; i++) {
++		/* process identity, not the struct address: the slot may hold proc_find()'s reference and the caller's
++		 * `p` may be a different (shadow) proc during exec; pid + uniqueid are stable and never reused. */
++		if (n2vr.c[i].state == state && n2vr.c[i].pid == pid && n2vr.c[i].uniqueid == uid) { return &n2vr.c[i]; }
++	}
++	return NULL;
++}
++
++static struct n2vr_client *
++n2vr_by_id(uint32_t id)
++{
++	if (id == 0) { return NULL; }
++	for (unsigned i = 0; i < N2VR_MAX_CLIENTS; i++) {
++		if (n2vr.c[i].state != N2VR_SLOT_FREE && n2vr.c[i].id == id) { return &n2vr.c[i]; }
++	}
++	return NULL;
++}
++
++/* a fresh id: 1, 2, ..., skipping 0 and every id a live or closing slot holds; with at most 8 used ids, 9 tries suffice */
++static uint32_t
++n2vr_new_id(void)
++{
++	for (unsigned tries = 0; tries <= N2VR_MAX_CLIENTS; tries++) {
++		uint32_t id = ++n2vr.next_id;
++		if (id == 0) { continue; }
++		if (n2vr_by_id(id) == NULL) { return id; }
++	}
++	return 0;
++}
++
++/* queue a CLOSING client's close notice, if there is room; called with the lock held */
++static void
++n2vr_queue_closes(void)
++{
++	if (!n2vr.server_present) { return; }
++	for (unsigned i = 0; i < N2VR_MAX_CLIENTS; i++) {
++		struct n2vr_client *c = &n2vr.c[i];
++		if (c->state != N2VR_SLOT_CLOSING || c->notice_queued) { continue; }
++		if (n2vr.close_count >= N2VR_MAX_CLIENTS) { return; }
++		uint32_t tail = (n2vr.close_head + n2vr.close_count) % N2VR_MAX_CLIENTS;
++		n2vr.close[tail].client = c->id;
++		n2vr.close[tail].seq = ++n2vr.next_seq;
++		n2vr.close_count++;
++		c->notice_queued = true;
++	}
++}
++
++/* free a slot's resources; the lock is held.  The proc_find() reference is dropped here, after every user of
++ * c->proc (n2vc_relay_closed) has run. */
++static void
++n2vr_slot_free(struct n2vr_client *c)
++{
++	if (c->ref != NULL) { proc_rele(c->ref); }
++	c->state = N2VR_SLOT_FREE;
++	c->proc = NULL;
++	c->ref = NULL;
++	c->pid = 0;
++	c->uniqueid = 0;
++	c->id = 0;
++	c->outstanding = 0;
++	c->head = 0;
++	c->count = 0;
++	c->notice_queued = false;
++}
++
++/*
++ * A client's process is gone (last close or detected death).  Tell the server, clean up the hardware part, and keep
++ * only the id in a CLOSING slot until the server has read the notice.  The lock is held; the caller wakes &n2vr.
++ * n2vc_relay_closed() runs while the process reference is still held, so its pointer cannot have been reused (ABA).
++ */
++static void
++n2vr_client_gone_locked(struct n2vr_client *c)
++{
++	struct proc *p = c->proc;
++	bool notify = n2vr.server_present;
++	c->head = 0;
++	c->count = 0;                           /* replies still queued are undeliverable */
++	if (notify) {
++		c->state = N2VR_SLOT_CLOSING;
++		c->notice_queued = false;
++		n2vr_queue_closes();
++	}
++	if (p != NULL) {
++		/* Free the hardware part's per-client state (DMA handles, power references) while the relay lock is held:
++		 * a re-open of the same process then cannot allocate new handles between the release and the cleanup.  K02
++		 * holds n2vc_lock only inside his own functions and never calls back into the relay while it is held, so
++		 * n2vr_lock -> n2vc_lock is the only order.  The host test counts this call. */
++		n2vc_relay_closed(p);
++	}
++	if (notify) {
++		if (c->ref != NULL) { proc_rele(c->ref); c->ref = NULL; }
++		c->proc = NULL;
++		c->pid = 0;
++		c->uniqueid = 0;
++	} else {
++		n2vr_slot_free(c);              /* nobody to notify: free at once (drops the reference) */
++	}
++}
++
++/* ---- ioctls ------------------------------------------------------------- */
++
++static int
++n2vr_client_open(dev_t dev, __unused int flags, __unused int type, struct proc *p)
++{
++	(void)dev;
++	n2vr_step(0);
++	/*
++	 * q10je (opus-relaycrash): no process reference is taken or held any more.  q10jb/q10jc died 0.5-1 s after this
++	 * open returned while the slot held a proc_find() reference; XNU's exit path drains a process's references
++	 * (proc_refdrain) BEFORE it closes its descriptors, so a reference released only at d_close can never be released
++	 * if the client exits.  The slot keeps pid + uniqueid (identity) and the caller's pointer (matched, never
++	 * dereferenced, by nord2_vcodec.inc); the reaper looks the pid up transiently.
++	 */
++	struct proc *ref = NULL;
++	n2vr_step(1);
++	int error = 0;
++	lck_mtx_lock(&n2vr_lock);
++	n2vr_step(3);
++	struct n2vr_client *c = n2vr_by_proc(p, N2VR_SLOT_OPEN);
++	n2vr_step(c != NULL ? 4 : 5);
++	if (c == NULL) {
++		c = NULL;
++		for (unsigned i = 0; i < N2VR_MAX_CLIENTS; i++) {
++			if (n2vr.c[i].state == N2VR_SLOT_FREE) { c = &n2vr.c[i]; break; }
++		}
++		if (c == NULL) {
++			error = EBUSY;              /* every slot is open or waiting for its close notice to be read */
++		} else {
++			uint32_t id = n2vr_new_id();
++			if (id == 0) {
++				error = EBUSY;
++			} else {
++				c->state = N2VR_SLOT_OPEN;
++				c->proc = p;
++				c->pid = proc_pid(p);
++				c->uniqueid = proc_uniqueid(p);
++				/*
++				 * The reference keeps the process alive until this slot is freed.  XNU calls d_close only
++				 * when the device's last fd anywhere is closed (spec_vnops.c:2760), so a client that dies
++				 * while another keeps the device open would otherwise leave a pointer that can be reused;
++				 * with the reference, n2vc_relay_closed() in the reaper always sees the same struct proc.
++				 */
++				c->ref = ref;
++				ref = NULL;
++				c->id = id;
++				c->outstanding = 0;
++				c->head = 0;
++				c->count = 0;
++				c->notice_queued = false;
++			}
++		}
++	}
++	n2vr_step(6);
++	lck_mtx_unlock(&n2vr_lock);
++	if (ref != NULL) { proc_rele(ref); }
++	n2vr_step(7);
++	return error;
++}
++
++static int
++n2vr_client_close(dev_t dev, __unused int flags, __unused int type, struct proc *p)
++{
++	(void)dev;
++	n2vr_step(30);
++	lck_mtx_lock(&n2vr_lock);
++	struct n2vr_client *c = n2vr_by_proc(p, N2VR_SLOT_OPEN);
++	n2vr_step(c != NULL ? 31 : 39);
++	if (c == NULL) {
++		lck_mtx_unlock(&n2vr_lock);
++		return 0;                           /* an open that failed has no slot; close is still called */
++	}
++	/*
++	 * XNU's spec_close() calls d_close only when vcount(vp) reaches 0 (bsd/miscfs/specfs/spec_vnops.c:2760, no
++	 * per-open close), so this call is the end of the client process's use of the node; d_open may have run more
++	 * than once (two descriptors share the id) and there is no counter to keep.  A client that dies while another
++	 * one keeps the device open is found by n2vr_reap().
++	 */
++	n2vr_client_gone_locked(c);
++	n2vr_step(32);
++	wakeup(&n2vr);
++	lck_mtx_unlock(&n2vr_lock);
++	n2vr_step(33);
++	return 0;
++}
++
++/*
++ * Detect clients whose process is gone.  XNU gives a character device no per-open close callback: d_close fires only
++ * when the last descriptor of the node anywhere closes, so with two or more client processes the first exits silently.
++ * Each relay entry snapshots the open slots, looks their pids up outside the relay lock (proc_find may wait for an
++ * exec), and turns every dead one into a normal close notice.  A client that closed the node but is still alive is not
++ * detectable; the relay documents that (vcodecd must not keep per-client state across unrelated clients).
++ */
++static void
++n2vr_reap(void)
++{
++	struct { pid_t pid; uint64_t uid; bool dead; } s[N2VR_MAX_CLIENTS];
++	unsigned n = 0;
++	lck_mtx_lock(&n2vr_lock);
++	for (unsigned i = 0; i < N2VR_MAX_CLIENTS; i++) {
++		struct n2vr_client *c = &n2vr.c[i];
++		if (c->state != N2VR_SLOT_OPEN) { continue; }
++		s[n].pid = c->pid;
++		s[n].uid = c->uniqueid;
++		s[n].dead = false;
++		n++;
++	}
++	lck_mtx_unlock(&n2vr_lock);
++	if (n == 0) { return; }
++	n2vr_step(10);
++	for (unsigned k = 0; k < n; k++) {
++		struct proc *q = proc_find(s[k].pid);
++		n2vr_step_ex(q != NULL ? 11 : 19, 0);   /* q10jc: no wait here (vc7 died after this line) */
++		/*
++		 * q10jc (opus-relaycrash): q10jb's phone run died right after "VCT r11", i.e. in proc_uniqueid(q) /
++		 * proc_exiting(q) or the wait after r11.  Liveness is now proc_find() alone: it returns NULL for a process
++		 * that has exited or is exiting (its reference count is drained/dead), and the slot's own reference keeps the
++		 * struct proc (and so its pid) from being reused while the slot is open.  s[k].uid stays for the match below.
++		 */
++		s[k].dead = q == NULL;
++		n2vr_step(s[k].dead ? 18 : 12);
++		if (q != NULL) { proc_rele(q); }
++		n2vr_step(13);
++	}
++	bool any = false;
++	lck_mtx_lock(&n2vr_lock);
++	n2vr_step(14);
++	for (unsigned k = 0; k < n; k++) {
++		if (!s[k].dead) { continue; }
++		for (unsigned i = 0; i < N2VR_MAX_CLIENTS; i++) {
++			struct n2vr_client *c = &n2vr.c[i];
++			if (c->state == N2VR_SLOT_OPEN && c->pid == s[k].pid && c->uniqueid == s[k].uid) {
++				n2vr_client_gone_locked(c);
++				any = true;
++				break;
++			}
++		}
++	}
++	if (any) { wakeup(&n2vr); }
++	lck_mtx_unlock(&n2vr_lock);
++	n2vr_step(any ? 16 : 15);
++}
++
++/* minor 0 d_open/d_close (nord2_vcodec.inc calls these for its own node) */
++static void
++n2vr_server_open(void)
++{
++	lck_mtx_lock(&n2vr_lock);
++	n2vr.server_opens++;
++	n2vr.server_present = true;
++	lck_mtx_unlock(&n2vr_lock);
++}
++
++static void
++n2vr_server_close(void)
++{
++	lck_mtx_lock(&n2vr_lock);
++	if (n2vr.server_opens > 0) { n2vr.server_opens--; }
++	if (n2vr.server_opens == 0) {
++		n2vr.server_present = false;
++		/* nobody can read the server queue or the close notices any more: drop them and free the closing slots */
++		n2vr.server_head = 0;
++		n2vr.server_count = 0;
++		n2vr.close_head = 0;
++		n2vr.close_count = 0;
++		for (unsigned i = 0; i < N2VR_MAX_CLIENTS; i++) {
++			n2vr.c[i].outstanding = 0;
++			if (n2vr.c[i].state == N2VR_SLOT_CLOSING) { n2vr_slot_free(&n2vr.c[i]); }
++		}
++		wakeup(&n2vr);                      /* blocked RECVs see ENXIO */
++	}
++	lck_mtx_unlock(&n2vr_lock);
++}
++
++static uint32_t
++n2vr_server_present(void)
++{
++	uint32_t present;
++	lck_mtx_lock(&n2vr_lock);
++	present = n2vr.server_present ? 1u : 0u;
++	lck_mtx_unlock(&n2vr_lock);
++	return present;
++}
++
++static int
++n2vr_client_send(struct proc *p, struct rwvc_msg *m)
++{
++	uint8_t buf[RWVC_MSG_MAX];
++	if (m->bytes == 0 || m->bytes > RWVC_MSG_MAX || m->user == 0) { return EINVAL; }
++	if (copyin((user_addr_t)m->user, buf, m->bytes) != 0) { return EFAULT; }
++	int error = 0;
++	lck_mtx_lock(&n2vr_lock);
++	struct n2vr_client *c = n2vr_by_proc(p, N2VR_SLOT_OPEN);
++	if (c == NULL) {
++		error = EBADF;                      /* the descriptor was closed by another thread while we copied */
++	} else if (!n2vr.server_present) {
++		error = ENXIO;
++	} else if (c->outstanding >= N2VR_CLIENT_QUEUE || n2vr.server_count >= N2VR_SERVER_QUEUE) {
++		error = EAGAIN;
++	} else {
++		uint32_t tail = (n2vr.server_head + n2vr.server_count) % N2VR_SERVER_QUEUE;
++		struct n2vr_dgram *d = &n2vr.server[tail];
++		d->seq = ++n2vr.next_seq;
++		d->bytes = m->bytes;
++		d->client = c->id;
++		memcpy(d->data, buf, m->bytes);
++		n2vr.server_count++;
++		c->outstanding++;
++		wakeup(&n2vr);
++	}
++	lck_mtx_unlock(&n2vr_lock);
++	return error;
++}
++
++/* copy the oldest datagram out (the lock is held); returns the error and the size */
++static int
++n2vr_client_drain(struct n2vr_client *c, struct rwvc_msg *m, uint32_t capacity)
++{
++	struct n2vr_dgram *d = &c->q[c->head];
++	if (capacity < d->bytes) { return EMSGSIZE; }       /* stay queued: a bigger buffer can read it */
++	uint8_t buf[RWVC_MSG_MAX];
++	uint32_t bytes = d->bytes;
++	memcpy(buf, d->data, bytes);
++	c->head = (c->head + 1) % N2VR_CLIENT_QUEUE;
++	c->count--;
++	int error = copyout(buf, (user_addr_t)m->user, bytes);
++	m->bytes = bytes;
++	return error;                                       /* EFAULT loses this datagram (documented) */
++}
++
++static int
++n2vr_client_recv(struct proc *p, struct rwvc_msg *m)
++{
++	if (m->bytes == 0 || m->user == 0 || m->timeout_ms > N2VR_RECV_MAX_MS) { return EINVAL; }
++	uint32_t capacity = m->bytes > RWVC_MSG_MAX ? RWVC_MSG_MAX : m->bytes;
++	uint64_t deadline = n2vr_now_ms() + m->timeout_ms;
++	lck_mtx_lock(&n2vr_lock);
++	struct n2vr_client *c = n2vr_by_proc(p, N2VR_SLOT_OPEN);
++	if (c == NULL) { lck_mtx_unlock(&n2vr_lock); return EBADF; }
++	for (;;) {
++		c = n2vr_by_proc(p, N2VR_SLOT_OPEN);        /* the lock was dropped while sleeping */
++		if (c == NULL) { lck_mtx_unlock(&n2vr_lock); return EBADF; }
++		if (c->count > 0) {
++			int error = n2vr_client_drain(c, m, capacity);
++			if (error != EMSGSIZE) { m->client = c->id; }
++			lck_mtx_unlock(&n2vr_lock);
++			return error;
++		}
++		if (m->timeout_ms == 0) { lck_mtx_unlock(&n2vr_lock); return EAGAIN; }
++		if (!n2vr.server_present) { lck_mtx_unlock(&n2vr_lock); return ENXIO; }
++		uint64_t now = n2vr_now_ms();
++		if (now >= deadline) { lck_mtx_unlock(&n2vr_lock); return ETIMEDOUT; }
++		uint64_t left = deadline - now;
++		struct timespec ts;
++		ts.tv_sec = (time_t)(left / 1000u);
++		ts.tv_nsec = (long)((left % 1000u) * 1000000u);
++		int err = msleep(&n2vr, &n2vr_lock, PZERO | PCATCH, "n2vr-recv", &ts);
++		if (err == EINTR || err == ERESTART) { lck_mtx_unlock(&n2vr_lock); return EINTR; }
++		if (err != 0 && err != EWOULDBLOCK && err != ETIMEDOUT) { lck_mtx_unlock(&n2vr_lock); return err; }
++	}
++}
++
++static int
++n2vr_server_send(struct rwvc_msg *m)
++{
++	uint8_t buf[RWVC_MSG_MAX];
++	if (m->bytes == 0 || m->bytes > RWVC_MSG_MAX || m->user == 0) { return EINVAL; }
++	if (m->client == 0) { return EINVAL; }
++	if (copyin((user_addr_t)m->user, buf, m->bytes) != 0) { return EFAULT; }
++	int error = 0;
++	lck_mtx_lock(&n2vr_lock);
++	if (!n2vr.server_present) { n2vr.server_opens = 1; n2vr.server_present = true; }   /* defensive: an ioctl on minor 0 implies an open */
++	struct n2vr_client *c = n2vr_by_id(m->client);
++	if (c == NULL || c->state != N2VR_SLOT_OPEN) {
++		error = ESRCH;
++	} else if (c->count >= N2VR_CLIENT_QUEUE) {
++		error = EAGAIN;
++	} else {
++		uint32_t tail = (c->head + c->count) % N2VR_CLIENT_QUEUE;
++		struct n2vr_dgram *d = &c->q[tail];
++		d->seq = ++n2vr.next_seq;
++		d->bytes = m->bytes;
++		d->client = c->id;
++		memcpy(d->data, buf, m->bytes);
++		c->count++;
++		wakeup(&n2vr);
++	}
++	lck_mtx_unlock(&n2vr_lock);
++	return error;
++}
++
++static int
++n2vr_server_recv(struct rwvc_msg *m)
++{
++	if (m->user == 0 || m->timeout_ms > N2VR_RECV_MAX_MS) { return EINVAL; }
++	uint32_t capacity = m->bytes > RWVC_MSG_MAX ? RWVC_MSG_MAX : m->bytes;
++	uint64_t deadline = n2vr_now_ms() + m->timeout_ms;
++	lck_mtx_lock(&n2vr_lock);
++	if (!n2vr.server_present) { n2vr.server_opens = 1; n2vr.server_present = true; }
++	n2vr_queue_closes();
++	for (;;) {
++		n2vr_queue_closes();
++		bool have_data = n2vr.server_count > 0;
++		bool have_close = n2vr.close_count > 0;
++		if (have_data || have_close) {
++			uint64_t dseq = have_data ? n2vr.server[n2vr.server_head].seq : UINT64_MAX;
++			uint64_t cseq = have_close ? n2vr.close[n2vr.close_head].seq : UINT64_MAX;
++			if (dseq <= cseq) {                 /* data in arrival order, close notices merged by sequence */
++				struct n2vr_dgram *d = &n2vr.server[n2vr.server_head];
++				if (capacity < d->bytes) { lck_mtx_unlock(&n2vr_lock); return EMSGSIZE; }
++				uint8_t buf[RWVC_MSG_MAX];
++				uint32_t bytes = d->bytes, from = d->client;
++				memcpy(buf, d->data, bytes);
++				n2vr.server_head = (n2vr.server_head + 1) % N2VR_SERVER_QUEUE;
++				n2vr.server_count--;
++				struct n2vr_client *c = n2vr_by_id(from);
++				if (c != NULL && c->outstanding > 0) { c->outstanding--; }
++				m->bytes = bytes;
++				m->client = from;
++				int error = copyout(buf, (user_addr_t)m->user, bytes);
++				lck_mtx_unlock(&n2vr_lock);
++				return error;               /* EFAULT loses this datagram (documented) */
++			}
++			uint32_t id = n2vr.close[n2vr.close_head].client;
++			n2vr.close_head = (n2vr.close_head + 1) % N2VR_MAX_CLIENTS;
++			n2vr.close_count--;
++			struct n2vr_client *c = n2vr_by_id(id);
++			if (c != NULL && c->state == N2VR_SLOT_CLOSING) { n2vr_slot_free(c); }
++			m->bytes = 0;
++			m->client = id;
++			lck_mtx_unlock(&n2vr_lock);     /* {client, bytes = 0}: the client is gone */
++			return 0;
++		}
++		if (m->timeout_ms == 0) { lck_mtx_unlock(&n2vr_lock); return EAGAIN; }
++		uint64_t now = n2vr_now_ms();
++		if (now >= deadline) { lck_mtx_unlock(&n2vr_lock); return ETIMEDOUT; }
++		uint64_t left = deadline - now;
++		struct timespec ts;
++		ts.tv_sec = (time_t)(left / 1000u);
++		ts.tv_nsec = (long)((left % 1000u) * 1000000u);
++		int err = msleep(&n2vr, &n2vr_lock, PZERO | PCATCH, "n2vr-recv", &ts);
++		if (err == EINTR || err == ERESTART) { lck_mtx_unlock(&n2vr_lock); return EINTR; }
++		if (err != 0 && err != EWOULDBLOCK && err != ETIMEDOUT) { lck_mtx_unlock(&n2vr_lock); return err; }
++		if (n2vr.server_opens == 0) { lck_mtx_unlock(&n2vr_lock); return ENXIO; }   /* the server closed while we slept */
++	}
++}
++
++static int
++n2vr_client_info(struct rwvc_info *out)
++{
++	n2vr_step(20);
++	memset(out, 0, sizeof(*out));
++	if (n2vr.hw.info != NULL) { n2vr.hw.info(out); }
++	n2vr_step(21);
++	out->abi_version = RWVC_ABI_VERSION;
++	out->server_present = n2vr_server_present();
++	n2vr_step(22);
++	return 0;
++}
++
++/* true for the commands nord2_vcodec.inc must hand to n2vr_ioctl() (both minors) */
++static bool
++n2vr_relay_cmd(u_long cmd)
++{
++	return cmd == RWVC_MSG_SEND || cmd == RWVC_MSG_RECV;
++}
++
++static int
++n2vr_ioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	struct rwvc_msg *m = (struct rwvc_msg *)data;
++	unsigned mn = (unsigned)minor(dev);
++	n2vr_reap();                             /* a dead client becomes a close notice before this call is served */
++	if (cmd != RWVC_MSG_SEND && cmd != RWVC_MSG_RECV && cmd != RWVC_INFO && cmd != RWVC_DMA_ALLOC &&
++	    cmd != RWVC_DMA_FREE && cmd != RWVC_DMA_RW && cmd != RWVC_DMA_INFO) {
++		return mn == 0 ? ENOTTY : EACCES;   /* hardware ioctls are minor 0 only */
++	}
++	if (data == NULL) { return EINVAL; }
++	switch (cmd) {
++	case RWVC_MSG_SEND: return mn == 0 ? n2vr_server_send(m) : n2vr_client_send(p, m);
++	case RWVC_MSG_RECV: return mn == 0 ? n2vr_server_recv(m) : n2vr_client_recv(p, m);
++	case RWVC_INFO:
++		if (mn == 0) { return ENOTTY; }      /* nord2_vcodec.inc answers minor 0's INFO itself */
++		return n2vr_client_info((struct rwvc_info *)data);
++	default:                                 /* RWVC_DMA_ALLOC / FREE / RW / INFO: the pool belongs to nord2_vcodec.inc */
++		if (mn != 0) {
++			bool open;
++			lck_mtx_lock(&n2vr_lock);
++			open = n2vr_by_proc(p, N2VR_SLOT_OPEN) != NULL;
++			lck_mtx_unlock(&n2vr_lock);
++			if (!open) { return EBADF; }     /* the client closed while this descriptor was being used */
++			if (n2vr.hw.ioctl != NULL) { return n2vr.hw.ioctl(dev, cmd, data, flag, p); }
++			return ENXIO;
++		}
++		/* minor 0 is nord2_vcodec.inc's own cdevsw: it answers the pool ioctls (including DMA_INFO) itself. */
++		return ENOTTY;
++	}
++}
++
++/*
++ * The access rule of the DMA pool (nord2_vcodec.inc calls this from RWVC_DMA_FREE/RW/FILL with the handle's owner):
++ * the allocator may always use its handle; another file only if the handle was allocated shared and it is on the other
++ * minor.  Two clients on minor 1 never share, and neither does the server with a non-shared client buffer.
++ */
++static bool
++n2vr_dma_allowed(unsigned owner_minor, struct proc *owner_proc, uint32_t alloc_flags,
++    unsigned accessor_minor, struct proc *accessor_proc)
++{
++	if (owner_minor == accessor_minor && owner_proc == accessor_proc) { return true; }
++	return (alloc_flags & RWVC_DMA_SHARED) != 0 && owner_minor != accessor_minor;
++}
++
++/* ---- node --------------------------------------------------------------- */
++
++static int
++n2vr_open(dev_t dev, int flags, int type, struct proc *p)
++{
++	bool t = n2vr_trace('o', (unsigned)minor(dev), 0, p);
++	return n2vr_trace_end(t, n2vr_client_open(dev, flags, type, p));
++}
++
++static int
++n2vr_close(dev_t dev, int flags, int type, struct proc *p)
++{
++	bool t = n2vr_trace('c', (unsigned)minor(dev), 0, p);
++	return n2vr_trace_end(t, n2vr_client_close(dev, flags, type, p));
++}
++
++static int
++n2vr_ioctl_entry(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	bool t = n2vr_trace('i', (unsigned)minor(dev), cmd, p);
++	return n2vr_trace_end(t, n2vr_ioctl(dev, cmd, data, flag, p));
++}
++
++/* every slot is filled: spec_read()/spec_write() call d_read/d_write without a NULL check (spec_vnops.c:529), so a
++ * stray read()/write() on the node must reach the kernel's eno_* stubs, exactly like bsd/dev/nord2_camdev.inc */
++static const struct cdevsw n2vr_cdevsw = {
++	.d_open = n2vr_open, .d_close = n2vr_close, .d_read = eno_rdwrt, .d_write = eno_rdwrt,
++	.d_ioctl = n2vr_ioctl_entry, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++/*
++ * Create /dev/redwood-vcodec-client (minor 1, 0666).  Called once from nord2_vcodec_start(); true = the node exists.
++ * The hardware callbacks are copied (not referenced) so they may live in nord2_vcodec.inc's static scope.
++ */
++static bool
++n2vr_start(const struct n2vr_hw *hw)
++{
++	if (hw == NULL || hw->ioctl == NULL || hw->info == NULL) { return false; }
++	if (n2vr.started) { return true; }
++	n2vr.hw = *hw;
++	int major = cdevsw_add(-1, &n2vr_cdevsw);
++	if (major < 0) { return false; }
++	if (devfs_make_node(makedev(major, 1), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-vcodec-client") == NULL) {
++		return false;
++	}
++	n2vr.started = true;
++	return true;
++}
++
++#endif /* N2VR_RELAY_INC */
+diff -ruN a/bsd/dev/redwood_jpeg.h b/bsd/dev/redwood_jpeg.h
+--- a/bsd/dev/redwood_jpeg.h
++++ b/bsd/dev/redwood_jpeg.h
+@@ -0,0 +1,64 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * redwood_jpeg.h -- FROZEN user/kernel ABI of /dev/redwood-jpeg (XNU character device, mode 0666), the MT6893 hardware JPEG
++ * encoder (and, once track J proves it, decoder). Owner: hwcodec-lead. Shared by the kernel (bsd/dev/nord2_jpegdev.inc), the
++ * VideoToolbox plug-in back end and the tools. Fixed-width fields only; every struct is a multiple of 8 bytes.
++ *
++ * Verified on the phone 2026-11-11 with patch 0298 (gpu/hwcodec/runs/q10hw1): 640x480 NV12 in 0.73 ms, 1920x1080 in 4.6 ms,
++ * complete JFIF files (APP0, 2 DQT, SOF0 4:2:0, 4 DHT, SOS), the hardware's size (DMA_ADDR0 - DST_ADDR0) is rounded up: the bytes after EOI are
++ * padding. The KERNEL trims to the last FF D9 before copyout, so out_bytes is the exact JPEG size.
++ *
++ * Model: open; ioctl(RWJ_ENCODE) is synchronous and serialised in the kernel (one hardware job at a time, callers sleep
++ * interruptibly); the kernel copies the picture in and the JPEG out (copyin/copyout), powers the VEN domain on demand and
++ * off again RWJ_IDLE_OFF_MS after the last job. close() needs nothing.
++ */
++#ifndef REDWOOD_JPEG_H
++#define REDWOOD_JPEG_H
++#include <stdint.h>
++
++#define RWJ_ABI_VERSION   1u
++#define RWJ_MAX_WIDTH     8192u
++#define RWJ_MAX_HEIGHT    8192u
++#define RWJ_MAX_PIXELS    (4096u * 3072u)       /* 12.6 MP: the kernel's source buffer is 24 MiB (NV12 with 16-padding) */
++#define RWJ_IDLE_OFF_MS   3000u
++enum { RWJ_FMT_NV12 = 2, RWJ_FMT_NV21 = 3, RWJ_FMT_YUYV = 0, RWJ_FMT_YVYU = 1 };   /* = the hardware's codes; BGRA is converted in user space */
++enum { RWJ_FLAG_EXIF_GAP = 1u };              /* hardware "EXIF" mode: see FACTS.md once K01/J02 have measured what it emits */
++/* quality 1..100 is mapped by the kernel to the nearest hardware code not above it (mtk_jpeg_core.c): >=97 Q97(0x10), >=95 Q95(3),
++ * >=90 Q90(7), >=85 Q85(2), >=78 Q78(6), >=72 Q72(0xf), >=60 Q60(1), >=52 Q52(0xa), >=44 Q44(0xe), >=38 Q38(0), else Q30(4) */
++
++struct rwj_info {                             /* RWJ_INFO */
++	uint32_t abi_version, max_pixels;
++	uint32_t jobs_done, jobs_failed;
++	uint32_t powered, last_hw_us;             /* domain on now; hardware time of the last job */
++	uint32_t caps;                            /* bit 0 encoder, bit 1 decoder */
++	uint32_t reserved[9];
++};
++struct rwj_encode {                           /* RWJ_ENCODE */
++	uint32_t width, height;                   /* even, 16..RWJ_MAX_*; width * height <= RWJ_MAX_PIXELS */
++	uint32_t format;                          /* RWJ_FMT_* */
++	uint32_t quality;                         /* 1..100 */
++	uint32_t stride;                          /* bytes per source line, >= width (>= 2 * width for YUYV) */
++	uint32_t chroma_stride;                   /* NV12/NV21: bytes per chroma line; 0 = stride */
++	uint32_t restart_interval;                /* MCUs, 0 = none */
++	uint32_t flags;
++	uint64_t src_y;                           /* user address: height lines of `stride` (YUYV: the whole picture) */
++	uint64_t src_c;                           /* user address: height / 2 lines of chroma_stride (unused for YUYV) */
++	uint64_t dst;                             /* user address of the output buffer */
++	uint32_t dst_capacity;                    /* bytes; the kernel needs width * height / 2 + 4096 at least, else ENOSPC */
++	uint32_t out_bytes;                       /* result: JPEG size (padding after EOI already cut by the kernel) */
++	uint32_t out_hw_us;                       /* result: start -> done, microseconds */
++	uint32_t out_status;                      /* result: 0 ok, else RWJ_E_* (errno is EIO then) */
++};
++enum { RWJ_E_TIMEOUT = 1, RWJ_E_STALL = 2, RWJ_E_POWER = 3, RWJ_E_BUS = 4, RWJ_E_SIZE = 5 };
++struct rwj_decode {                           /* RWJ_DECODE: reserved for track J's decoder work; the kernel answers ENOTSUP until then */
++	uint64_t src, dst_y, dst_c;
++	uint32_t src_bytes, dst_stride, dst_capacity_y, dst_capacity_c;
++	uint32_t out_width, out_height, out_format, out_status;
++	uint32_t reserved[4];
++};
++/* BSD ioctl encoding, group 'J' */
++#define RWJ_IOC(dir, nr, type)  ((dir) | ((uint32_t)(sizeof(type) & 0x1fff) << 16) | ((uint32_t)'J' << 8) | (nr))
++#define RWJ_INFO    RWJ_IOC(0x40000000u, 1, struct rwj_info)       /* _IOR  */
++#define RWJ_ENCODE  RWJ_IOC(0xc0000000u, 2, struct rwj_encode)     /* _IOWR */
++#define RWJ_DECODE  RWJ_IOC(0xc0000000u, 3, struct rwj_decode)     /* _IOWR */
++#endif
+diff -ruN a/bsd/dev/redwood_vcodec.h b/bsd/dev/redwood_vcodec.h
+--- a/bsd/dev/redwood_vcodec.h
++++ b/bsd/dev/redwood_vcodec.h
+@@ -0,0 +1,114 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * redwood_vcodec.h -- FROZEN user/kernel ABI of /dev/redwood-vcodec (XNU character device), the MT6893 VENC/VDEC blocks as
++ * raw hardware for the user-space codec host (vcodecd), and the message relay between VideoToolbox plug-ins and vcodecd.
++ * Owner: hwcodec-lead. Fixed-width fields; structs are multiples of 8 bytes.
++ *
++ * Two minors:  0 "/dev/redwood-vcodec"  (0600 root: vcodecd; hardware ioctls + the server side of the relay)
++ *              1 "/dev/redwood-vcodec-client" (0666: plug-ins; ONLY RWVC_INFO, RWVC_MSG_*, RWVC_DMA_ALLOC/FREE/RW on own buffers)
++ * The kernel is policy-free: it does not know codecs. It gives (a) power/clock control per block, (b) batched register
++ * access restricted to the windows below, (c) interrupt wait, (d) DMA memory below 4 GB from a fixed pool with physical
++ * addresses (larb ports of the block run with the IOMMU bypassed, as the cameras and the JPEG encoder do), (e) the relay.
++ *
++ * Register windows (mt6893.dts; index = RWVC_WIN_*):
++ *   VENC 0x17020000+0x2000, VENC_C1 0x17820000+0x2000, VDEC_SYS 0x1602f000, VDEC_BASE 0x16000000, VDEC_VLD 0x16020000,
++ *   VDEC_MC 0x16021000, VDEC_MV 0x16023000, VDEC_MISC 0x16025000+0x4000, VDEC_LAT_MISC 0x16010000, VDEC_LAT_VLD 0x16011000+0x400,
++ *   VDEC_RACING 0x16004000, VDEC_SOC_GCON 0x1600f000 (0x1000 each unless given)
++ *   VDEC_ALL 0x16000000+0x30000 (rev 3, 2026-11-11, DEC07; RWVC_WIN_COUNT becomes 13, RWVC_ABI_VERSION stays 1 because
++ *   no existing ioctl or struct changed): the vendor decoder maps 0x16000000+0x40000 and addresses
++ *   sub-blocks that the ten windows above do not cover (facts/VDEC_PROTOCOL.md section 4). This one window spans the
++ *   part it uses up to VDEC_SYS; the power block is decided per 4 KiB page, not per window:
++ *     0x00000-0x0cfff + 0x0e000-0x0efff + 0x20000-0x2ffff -> VDEC_CORE (VDE2): VDEC_BASE 0x16000000 (+0x800 UFO),
++ *       the vendor's 0x16001000/0x16002000/0x16003800, VDEC_RACING 0x16004000, VDEC_VLD 0x16020000, VDEC_MC 0x16021000,
++ *       AVC_VLD 0x16022000, VDEC_MV 0x16023000, PP 0x16024000, VDEC_MISC 0x16025000, 0x16029000, VDEC_SYS 0x1602f000,
++ *       larb4 0x1602e000.
++ *     0x0d000 + 0x0f000-0x1ffff -> VDEC_SOC (VDE): larb5 0x1600d000 (page 0x0d), VDEC_SOC_GCON 0x1600f000,
++ *       VDEC_LAT_MISC 0x16010000, VDEC_LAT_VLD 0x16011000, the vendor's LAT sub-blocks 0x16011800-0x16018800.
++ *   VDEC_CORE takes a hidden reference on VDEC_SOC, so a core page is usable only while both domains are on (the core
++ *   clock path needs MT_CG_SOC and MT_CG_VDEC0). The larb pages 0x0d000 (larb5) and 0x2e000 (larb4) are READ-ONLY
++ *   through this window except the words in the kernel's allow-list: offset 0x00c bit 0 of both, the sleep-protect bit
++ *   the vendor's vdec_hal_wait_larb_sleep_protect sets (opus-dec1's LAT trace, opus-dec2's CORE trace; DEC04 measured
++ *   both handshakes). The kernel owns the rest of the larb configuration; DEC02's facts/vdec_trace/PAGES.md can add a
++ *   word if a further one is measured.
++ * Power blocks (clk-mt6885-pg.c): VEN 0x344 bit 17 (larb7 0x17010000, vencsys 0x17000000), VEN_CORE1 0x348 bit 18 (larb8
++ * 0x17810000, 0x17800000), VDE 0x33c bit 15 (larb5 0x1600d000, vdec_soc_gcon), VDE2 0x340 bit 16 (larb4 0x1602e000, vdec_gcon).
++ * Interrupts: VENC SPI 308, VENC_C1 SPI 313?, VDEC core SPI 424, VDEC LAT SPI 425 (K02 verifies; polled mode first).
++ */
++#ifndef REDWOOD_VCODEC_H
++#define REDWOOD_VCODEC_H
++#include <stdint.h>
++
++#define RWVC_ABI_VERSION 1u
++enum { RWVC_WIN_VENC = 0, RWVC_WIN_VENC_C1, RWVC_WIN_VDEC_SYS, RWVC_WIN_VDEC_BASE, RWVC_WIN_VDEC_VLD, RWVC_WIN_VDEC_MC,
++	RWVC_WIN_VDEC_MV, RWVC_WIN_VDEC_MISC, RWVC_WIN_VDEC_LAT_MISC, RWVC_WIN_VDEC_LAT_VLD, RWVC_WIN_VDEC_RACING,
++	RWVC_WIN_VDEC_SOC_GCON, RWVC_WIN_VDEC_ALL, RWVC_WIN_COUNT };
++enum { RWVC_BLK_VENC = 0, RWVC_BLK_VENC_C1 = 1, RWVC_BLK_VDEC_SOC = 2, RWVC_BLK_VDEC_CORE = 3, RWVC_BLK_COUNT };
++enum { RWVC_IRQ_VENC = 0, RWVC_IRQ_VENC_C1 = 1, RWVC_IRQ_VDEC = 2, RWVC_IRQ_VDEC_LAT = 3, RWVC_IRQ_COUNT };
++
++struct rwvc_info {                            /* RWVC_INFO */
++	uint32_t abi_version, powered_mask;       /* bit per RWVC_BLK_* */
++	uint64_t pool_pa; uint32_t pool_bytes, pool_free;
++	uint32_t irq_mode;                        /* 0 polled, 1 interrupts */
++	uint32_t server_present;                  /* vcodecd has minor 0 open */
++	uint32_t reserved[8];
++};
++struct rwvc_power { uint32_t block, on; };    /* RWVC_POWER (reference counted per open file; all dropped on close) */
++
++/* Batched register access. The kernel runs the ops in order and stops at the first failure (out_done = ops completed).
++ * POLL: repeat reading until (value & mask) == (value field & mask) or timeout_us (bounded at 1 s) -> ETIMEDOUT.
++ * Offsets must be 4-aligned and inside the window; the block of the window must be powered, else EACCES. */
++enum { RWVC_OP_READ = 0, RWVC_OP_WRITE = 1, RWVC_OP_WRITE_MASK = 2, RWVC_OP_POLL = 3, RWVC_OP_DELAY_US = 4 };
++struct rwvc_reg_op { uint8_t op, window; uint16_t reserved; uint32_t offset, value, mask; };   /* READ: value = result; DELAY: value = microseconds <= 1000 */
++#define RWVC_REG_MAX_OPS 2048u
++struct rwvc_reg_batch { uint64_t ops; uint32_t count, out_done; uint32_t poll_timeout_us, reserved; };   /* RWVC_REGS; ops = user address of rwvc_reg_op[count] */
++
++struct rwvc_wait_irq {                        /* RWVC_WAIT_IRQ */
++	uint32_t irq, timeout_ms;                 /* RWVC_IRQ_*; timeout <= 5000 */
++	uint32_t out_count;                       /* interrupts since the last wait on this line (0 with ETIMEDOUT) */
++	uint32_t out_status;                      /* the block's interrupt status as the handler read it before clearing (K02 documents which register in kern/VCODEC_HW.md) */
++};
++struct rwvc_irq_clear { uint32_t irq, reserved; };   /* RWVC_IRQ_CLEAR: forget pending counts before starting a job */
++
++/* DMA buffers: page-aligned pieces of the pool, zero-filled, owned by the open file that allocated them (freed on close).
++ * The hardware address is `pa` (32 bits). Access from user space is by copy (RWVC_DMA_RW). Handles are global; a file may
++ * use a handle it allocated, or one allocated with RWVC_DMA_SHARED by a file of the OTHER minor (client buffers are visible to
++ * the server and server buffers to clients; clients never see each other's). The server learns the hardware address of a
++ * client's shared buffer with RWVC_DMA_INFO (rev 2, 2026-11-11, proposed by hw-ip).
++ * Client identity (hw-ik): XNU gives a character device no per-open pointer, so a relay client is a PROCESS: all its opens
++ * of minor 1 share one client id and one buffer set; the close notification fires at its last close. */
++#define RWVC_DMA_SHARED 1u
++struct rwvc_dma_alloc { uint32_t bytes, flags; uint32_t out_handle, out_pa; };     /* RWVC_DMA_ALLOC; flags: RWVC_DMA_SHARED */
++struct rwvc_dma_free { uint32_t handle, reserved; };                               /* RWVC_DMA_FREE */
++struct rwvc_dma_rw { uint32_t handle, offset; uint64_t user; uint32_t bytes, write; };   /* RWVC_DMA_RW: write = 1 user -> buffer (then cache-flushed), 0 buffer -> user */
++struct rwvc_dma_fill { uint32_t handle, offset, bytes, value; };                   /* RWVC_DMA_FILL: memset */
++struct rwvc_dma_info { uint32_t handle, bytes, out_pa, reserved; };                /* RWVC_DMA_INFO: bytes and out_pa are results. EINVAL handle 0,
++                                                                                    * ENOENT unknown, EPERM not usable by the caller (rule above) */
++
++/* Relay: datagrams of at most RWVC_MSG_MAX bytes. A client's messages carry its kernel-assigned client id; the server
++ * addresses replies to a client id. RECV blocks up to timeout_ms (EAGAIN at 0 / ETIMEDOUT). A client that closes makes the
++ * kernel queue a synthetic message {client, bytes = 0} for the server. */
++#define RWVC_MSG_MAX 1024u
++struct rwvc_msg { uint64_t user; uint32_t bytes, client; uint32_t timeout_ms, reserved; };   /* RWVC_MSG_SEND / RWVC_MSG_RECV */
++
++#define RWVC_IOC(dir, nr, type) ((dir) | ((uint32_t)(sizeof(type) & 0x1fff) << 16) | ((uint32_t)'V' << 8) | (nr))
++#define RWVC_INFO       RWVC_IOC(0x40000000u, 1, struct rwvc_info)
++#define RWVC_POWER      RWVC_IOC(0x80000000u, 2, struct rwvc_power)
++#define RWVC_REGS       RWVC_IOC(0xc0000000u, 3, struct rwvc_reg_batch)
++#define RWVC_WAIT_IRQ   RWVC_IOC(0xc0000000u, 4, struct rwvc_wait_irq)
++#define RWVC_IRQ_CLEAR  RWVC_IOC(0x80000000u, 5, struct rwvc_irq_clear)
++#define RWVC_DMA_ALLOC  RWVC_IOC(0xc0000000u, 6, struct rwvc_dma_alloc)
++#define RWVC_DMA_FREE   RWVC_IOC(0x80000000u, 7, struct rwvc_dma_free)
++#define RWVC_DMA_RW     RWVC_IOC(0x80000000u, 8, struct rwvc_dma_rw)
++#define RWVC_DMA_FILL   RWVC_IOC(0x80000000u, 9, struct rwvc_dma_fill)
++#define RWVC_MSG_SEND   RWVC_IOC(0x80000000u, 10, struct rwvc_msg)
++#define RWVC_MSG_RECV   RWVC_IOC(0xc0000000u, 11, struct rwvc_msg)
++#define RWVC_DMA_INFO   RWVC_IOC(0xc0000000u, 12, struct rwvc_dma_info)
++
++/* Fixed physical claims below 4 GB (nothing is carved out in 0xC0000000..0xDFE70000; cameras use 0xD0000000..0xD8000000):
++ *   JPEG   0xD8000000 .. 0xDA800000  (source 24 MiB at +0, output 16 MiB at +0x1800000)   bsd/dev/nord2_jpegdev.inc
++ *   vcodec 0xDA800000 .. 0xDFE00000  (the RWVC pool, 86 MiB)                              bsd/dev/nord2_vcodec.inc */
++#define RW_CLAIM_JPEG_PA    0xd8000000u
++#define RW_CLAIM_JPEG_BYTES 0x02800000u
++#define RW_CLAIM_VCODEC_PA    0xda800000u
++#define RW_CLAIM_VCODEC_BYTES 0x05600000u
++#endif
+diff -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -936,6 +936,9 @@
+ #include "nord2_hang.inc"  /* 0284: SpringBoard main-thread stack probe */
+ #include "nord2_cam.inc"   /* 0284: cameras (after HakiOS mtkcam) */
+ #include "nord2_hwcodec.inc"   /* 0298: hardware JPEG encoder, driven by autotest command 7 */
++#include "nord2_vcodec_relay.inc"   /* 0299: /dev/redwood-vcodec-client and the datagram relay (IK) */
++#include "nord2_vcodec.inc"   /* 0299: /dev/redwood-vcodec hardware part (K02) */
++#include "nord2_jpegdev.inc"   /* 0299: /dev/redwood-jpeg (K01) */
+ #include "nord2_autotest.inc"   /* 0296: synthetic touches/keys and panel pictures over the USB console */
+ 
+ void
+@@ -954,6 +957,8 @@
+ 	nord2_hang_start();  /* 0284 */
+ 	nord2_cam_start();   /* 0284 */
+ 	nord2_autotest_start();   /* 0296 */
++	nord2_jpegdev_start();   /* 0299: /dev/redwood-jpeg */
++	nord2_vcodec_start();   /* 0299: /dev/redwood-vcodec + /dev/redwood-vcodec-client */
+ }
+ #else /* original Sweet hardware */
+ /*

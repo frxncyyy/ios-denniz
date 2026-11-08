@@ -1,0 +1,139 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -280,7 +280,7 @@
+  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
+  * "profile not found"). SWEET runs without a sandbox: operations succeed
+  * (checks allow, profile init is accepted); the few that must return
+- * data (container paths, extension tokens) fail with ENOENT. The first
++ * data (container paths; extension tokens until 0288) fail with ENOENT. The first
+  * use of each operation number is logged.
+  */
+ static uint64_t sweet_sandbox_seen;
+@@ -335,6 +335,113 @@
+ 	}
+ }
+ 
++/*
++ * 0288: sandbox extensions. The stand-in answered ENOENT to "extension issue" (5) and "extension consume" (6), so
++ * sandbox_extension_issue_*() returned NULL everywhere. tccd, after granting kTCCServiceCamera/Microphone to Camera, issues the
++ * client an extension for the service, got NULL and answered the request with an error (q10h7, Camera's own log: kTCCErrorDomain
++ * Code=6 "server error: Failed to issue Sandbox Extension for kTCCServiceCamera", then AVFoundation -11852 "not authorized", no
++ * capture input, black preview). SWEET has no sandbox, so an extension restricts and grants nothing: it only has to exist.
++ *
++ * libsystem_sandbox, iOS 16.7 (disassembly of the shared cache):
++ *   issue    __sandbox_ms("Sandbox", 5, { u64 class (char *), u64 type (0 file, 1 mach, 2 iokit class, 3 generic, 4), u64 data (char *
++ *            or NULL), u64 flags (0x10000: to pid, 0x30000: to audit token), u64 token (char *, 2048 bytes), u64 pid, u64 pidversion })
++ *            the kernel writes the token, a C string; every sandbox_extension_issue_*() comes here (_sandbox_extension_issue).
++ *   consume  __sandbox_ms("Sandbox", 6, { u64 token (char *), u64 strlen + 1, u64 handle (int64_t *) }); the function returns
++ *            *handle, or -1 when the call fails.
++ *   release  __sandbox_ms("Sandbox", 7, { u64 handle, 0, 0 }): already answered 0 by the default below.
++ * The token is laid out like a real one (hex MAC field, then ';' separated fields, class, type, data) but the first field is not a
++ * MAC: "5357454554" ("SWEET") and a serial. Consume accepts any readable token and returns a new positive handle.
++ */
++static uint64_t sweet_sandbox_ext_serial;
++static uint64_t sweet_sandbox_ext_logged[32];           /* target pid and class, of the lines printed */
++static unsigned sweet_sandbox_ext_lognext, sweet_sandbox_ext_lines;
++
++static int
++sweet_sandbox_extension_issue(struct proc *p, user_addr_t arg)
++{
++	uint64_t a[7], key = 0;
++	char cls[128], data[256], tok[512], caller[32], target[32];
++	size_t done = 0;
++	int error;
++
++	if (arg == USER_ADDR_NULL || !proc_is64bit(p)) {
++		return EINVAL;
++	}
++	if ((error = copyin(arg, a, sizeof(a))) != 0) {
++		return error;
++	}
++	if (a[0] == 0 || a[4] == 0) {
++		return EINVAL;
++	}
++	error = copyinstr((user_addr_t)a[0], cls, sizeof(cls), &done);
++	if (error != 0 && error != ENAMETOOLONG) {
++		return error;
++	}
++	cls[sizeof(cls) - 1] = '\0';
++	data[0] = '\0';
++	if (a[2] != 0) {
++		error = copyinstr((user_addr_t)a[2], data, sizeof(data), &done);
++		if (error != 0 && error != ENAMETOOLONG) {
++			return error;
++		}
++		data[sizeof(data) - 1] = '\0';
++	}
++	uint64_t serial = __sync_add_and_fetch(&sweet_sandbox_ext_serial, 1);
++	snprintf(tok, sizeof(tok), "5357454554%054llx;00;00000000;00000000;00000000;%016llx;%s;%02x;%s",
++	    (unsigned long long)serial, (unsigned long long)strlen(cls), cls, (unsigned)(a[1] & 0xff), data);
++	if ((error = copyout(tok, (user_addr_t)a[4], strlen(tok) + 1)) != 0) {
++		return error;
++	}
++
++	/* one line for the first issue of each class to each target process */
++	int tpid = ((a[3] & 0x30000) != 0 && a[5] != 0 && a[5] <= (uint64_t)INT32_MAX) ? (int)a[5] : 0;
++	for (const char *c = cls; *c; c++) {
++		key = key * 131 + (unsigned char)*c;
++	}
++	key = (key << 24) ^ (uint64_t)(unsigned)tpid ^ (1ULL << 63);
++	for (unsigned i = 0; i < 32; i++) {
++		if (sweet_sandbox_ext_logged[i] == key) {
++			return 0;
++		}
++	}
++	if (sweet_sandbox_ext_lines < 400) {
++		sweet_sandbox_ext_lines++;
++		sweet_sandbox_ext_logged[sweet_sandbox_ext_lognext++ & 31] = key;
++		caller[0] = '\0';
++		proc_name(proc_pid(p), caller, sizeof(caller));
++		strlcpy(target, tpid ? "?" : "(no process)", sizeof(target));
++		if (tpid) {
++			proc_name(tpid, target, sizeof(target));
++		}
++		printf("SWEET Sandbox: extension issued to %s[%d] by %s class %s type %u%s%.80s\n", target, tpid, caller, cls,
++		    (unsigned)(a[1] & 0xff), data[0] ? " data " : "", data);
++	}
++	return 0;
++}
++
++static int
++sweet_sandbox_extension_consume(struct proc *p, user_addr_t arg)
++{
++	uint64_t a[3];
++	char first;
++	int error;
++
++	if (arg == USER_ADDR_NULL || !proc_is64bit(p)) {
++		return EINVAL;
++	}
++	if ((error = copyin(arg, a, sizeof(a))) != 0) {
++		return error;
++	}
++	if (a[0] == 0 || a[2] == 0) {
++		return EINVAL;
++	}
++	if ((error = copyin((user_addr_t)a[0], &first, 1)) != 0) {
++		return error;
++	}
++	int64_t handle = (int64_t)__sync_add_and_fetch(&sweet_sandbox_ext_serial, 1);
++	return copyout(&handle, (user_addr_t)a[2], sizeof(handle));
++}
++
+ static int
+ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+@@ -349,9 +456,11 @@
+ 		sweet_sandbox_self_check(p, arg);       /* 0277v */
+ 	}
+ 	switch (call) {
++	case 5:         /* extension issue (0288) */
++		return sweet_sandbox_extension_issue(p, arg);
++	case 6:         /* extension consume (0288) */
++		return sweet_sandbox_extension_consume(p, arg);
+ 	case 4:         /* container path (audit token / pid) */
+-	case 5:         /* extension issue */
+-	case 6:         /* extension consume */
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:

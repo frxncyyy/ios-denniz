@@ -1,0 +1,333 @@
+--- a/bsd/dev/nord2_camdev.inc
++++ b/bsd/dev/nord2_camdev.inc
+@@ -68,6 +68,26 @@
+  * (per register of a table), so one sensor's 2 s of tables do not hold up the other's exposure.
+  */
+ static LCK_MTX_DECLARE(n2d_hw, &n2d_grp);
++/*
++ * 0294: the lock is not fair, and one instance loading a sensor's tables took it again right after every release: the other
++ * instance's session thread, wanting it for its exposure, stood still for hundreds of ms, its queue ran dry and it then called
++ * that a stall (q10hp: every "stall" of node 2 is at the IMX766's start on node 1; FBC enqueued = done). So: who wants the lock
++ * says so, and the table loop lets him in between two registers; nothing but a power sequence or a receiver's setup holds it
++ * for more than one I2C transaction any more.
++ */
++static volatile int32_t n2d_hw_waiters;
++static void
++n2d_hw_get(void)
++{
++	(void)__sync_add_and_fetch(&n2d_hw_waiters, 1);
++	lck_mtx_lock(&n2d_hw);
++	(void)__sync_sub_and_fetch(&n2d_hw_waiters, 1);
++}
++static void
++n2d_hw_let_in(void)                             /* called WITHOUT the lock */
++{
++	for (unsigned i = 0; i < 50 && n2d_hw_waiters > 0; i++) { n2c_sleep(1); }
++}
+ enum { N2D_FREE, N2D_DMA, N2D_READY, N2D_READING };
+ 
+ /*
+@@ -103,6 +123,9 @@
+ 	uint32_t cur_exp, cur_gain, cur_frame;
+ 	uint64_t enq_ok_us;                     /* no buffer is given to the hardware before this (n2d_top_up) */
+ 	unsigned exp_said;                      /* exposures said in this session (0293) */
++	uint32_t w_frame, w_lines, w_code;      /* 0294: what the sensor's registers hold (~0: not written yet) */
++	struct { unsigned n, i; uint16_t reg[8]; uint8_t val[8]; uint32_t lines, gain, frame, code; } xw;   /* an exposure being written */
++	uint64_t hw_ticks_fallback;             /* frames stamped with the time they were seen (no hardware stamp) */
+ 	struct { bool pending, ever; uint32_t pos; } focus_ask;
+ };
+ static struct n2d_inst n2d_i[N2D_NINST] = {
+@@ -203,7 +226,7 @@
+ static bool
+ n2d_swr(const struct n2c_sensor *se, uint16_t reg, uint8_t v)
+ {
+-	lck_mtx_lock(&n2d_hw);
++	n2d_hw_get();
+ 	n2c_s = se;
+ 	bool ok = n2c_s_wr(reg, v);
+ 	lck_mtx_unlock(&n2d_hw);
+@@ -212,7 +235,7 @@
+ static int
+ n2d_srd(const struct n2c_sensor *se, uint16_t reg)
+ {
+-	lck_mtx_lock(&n2d_hw);
++	n2d_hw_get();
+ 	n2c_s = se;
+ 	int v = n2c_s_rd(reg);
+ 	lck_mtx_unlock(&n2d_hw);
+@@ -225,6 +248,7 @@
+ 	for (unsigned i = 0; i + 1 < words; i += 2) {
+ 		if (words > 600 && (i / 2) % 32 == 0) { printf("NORD2 CAM: %s table write %u: [%#06x] <- %#04x\n", se->name, i / 2, t[i], t[i + 1]); }
+ 		if (!n2d_swr(se, t[i], (uint8_t)t[i + 1])) { nak++; }
++		n2d_hw_let_in();
+ 	}
+ 	return nak;
+ }
+@@ -302,11 +326,16 @@
+ 	n2d_top_up(in, (unsigned)b);
+ }
+ 
+-/* Sony exposure, gain and frame length (OnePlus write_shutter / set_gain: 0x0104 group hold) */
++/*
++ * Sony exposure, gain and frame length (OnePlus write_shutter / set_gain: 0x0104 group hold).
++ * 0294: only the registers that change are written, and the session loop writes ONE of them per turn (n2d_exposure_step): the
++ * bit-banged I2C takes about 3 ms a register, eight in a row kept the loop from looking at its buffers for most of a frame.
++ */
+ static void
+-n2d_set_exposure(struct n2d_inst *in, uint32_t lines, uint32_t gain, uint32_t frame)
++n2d_exposure_plan(struct n2d_inst *in, uint32_t lines, uint32_t gain, uint32_t frame)
+ {
+ 	const struct n2d_info *info = &n2d_info[in->sensor];
++	unsigned n = 0;
+ 	if (gain < 256) { gain = 256; }
+ 	if (gain > info->gain_max) { gain = info->gain_max; }
+ 	if (!frame || frame < lines + info->margin) { frame = lines + info->margin; }
+@@ -320,22 +349,45 @@
+ 		printf("NORD2 CAMERA: %s: %s exposure %u lines, frame %u lines, gain %u/256 = code %u (0x0204/5 <- %#06x)\n", in->node,
+ 		    n2c_sensors[in->sensor].name, lines, frame, gain, code, code);
+ 	}
+-	lck_mtx_lock(&n2d_hw);                         /* the eight writes together: a few ms */
+-	n2c_s = &n2c_sensors[in->sensor];
+-	(void)n2c_s_wr(0x0104, 1);
+-	(void)n2c_s_wr(0x0340, (uint8_t)(frame >> 8)); (void)n2c_s_wr(0x0341, (uint8_t)frame);
+-	(void)n2c_s_wr(0x0202, (uint8_t)(lines >> 8)); (void)n2c_s_wr(0x0203, (uint8_t)lines);
+-	(void)n2c_s_wr(0x0204, (uint8_t)(code >> 8)); (void)n2c_s_wr(0x0205, (uint8_t)code);
+-	(void)n2c_s_wr(0x0104, 0);
+-	lck_mtx_unlock(&n2d_hw);
+-	in->cur_exp = lines; in->cur_gain = gain; in->cur_frame = frame;
++	in->xw.lines = lines; in->xw.gain = gain; in->xw.frame = frame; in->xw.code = code;
++#define N2D_XW(r, v) do { in->xw.reg[n] = (r); in->xw.val[n] = (uint8_t)(v); n++; } while (0)
++	if (frame != in->w_frame || lines != in->w_lines || code != in->w_code) {
++		N2D_XW(0x0104, 1);
++		if (frame != in->w_frame) { N2D_XW(0x0340, frame >> 8); N2D_XW(0x0341, frame); }
++		if (lines != in->w_lines) { N2D_XW(0x0202, lines >> 8); N2D_XW(0x0203, lines); }
++		if (code != in->w_code) { N2D_XW(0x0204, code >> 8); N2D_XW(0x0205, code); }
++		N2D_XW(0x0104, 0);
++	}
++#undef N2D_XW
++	in->xw.n = n; in->xw.i = 0;
++	if (n == 0) { in->cur_exp = lines; in->cur_gain = gain; in->cur_frame = frame; }
++}
++/* one register of the exposure being written; true while there is more */
++static bool
++n2d_exposure_step(struct n2d_inst *in)
++{
++	if (in->xw.i >= in->xw.n) { return false; }
++	(void)n2d_swr(&n2c_sensors[in->sensor], in->xw.reg[in->xw.i], in->xw.val[in->xw.i]);
++	if (++in->xw.i >= in->xw.n) {
++		in->w_frame = in->xw.frame; in->w_lines = in->xw.lines; in->w_code = in->xw.code;
++		in->cur_exp = in->xw.lines; in->cur_gain = in->xw.gain; in->cur_frame = in->xw.frame;
++		in->xw.n = in->xw.i = 0;
++		return false;
++	}
++	return true;
++}
++static void
++n2d_set_exposure(struct n2d_inst *in, uint32_t lines, uint32_t gain, uint32_t frame)   /* all of it now: before the stream */
++{
++	n2d_exposure_plan(in, lines, gain, frame);
++	while (n2d_exposure_step(in)) { }
+ }
+ 
+ static bool
+ n2d_af_move(uint32_t pos)
+ {
+ 	uint32_t dac = (pos > N2D_FOCUS_MAX ? N2D_FOCUS_MAX : pos) * 4;
+-	lck_mtx_lock(&n2d_hw);
++	n2d_hw_get();
+ 	n2c_bus_init(&n2c_i2c2);
+ 	bool ok = n2c_wr(N2D_AF_DEV, 0x00, 1, (uint8_t)(dac >> 4)) && n2c_wr(N2D_AF_DEV, 0x01, 1, (uint8_t)((dac & 0xf) << 4));
+ 	lck_mtx_unlock(&n2d_hw);
+@@ -354,9 +406,16 @@
+ 	uint8_t r[16], mode = 0xff;
+ 	unsigned acks = 0;
+ 	n2d_af_ok = false;
+-	lck_mtx_lock(&n2d_hw);
++	for (unsigned i = 0; i < 16; i++) {
++		r[i] = 0xee;
++		n2d_hw_get();
++		n2c_bus_init(&n2c_i2c2);
++		if (n2c_rd(N2D_AF_DEV, (uint16_t)i, 1, &r[i], 1)) { acks++; }
++		lck_mtx_unlock(&n2d_hw);
++		n2d_hw_let_in();
++	}
++	n2d_hw_get();
+ 	n2c_bus_init(&n2c_i2c2);
+-	for (unsigned i = 0; i < 16; i++) { r[i] = 0xee; if (n2c_rd(N2D_AF_DEV, (uint16_t)i, 1, &r[i], 1)) { acks++; } }
+ 	bool ok = acks != 0 && n2c_wr(N2D_AF_DEV, 0x02, 1, 0x00);
+ 	lck_mtx_unlock(&n2d_hw);
+ 	printf("NORD2 CAMERA: lens actuator, i2c2 0x0c: %u of 16 registers read, 00-0f = %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
+@@ -365,7 +424,7 @@
+ 	if (acks == 0) { printf("NORD2 CAMERA: lens actuator does not answer: the lens is not moved (focus_max 0)\n"); return; }
+ 	if (!ok) { printf("NORD2 CAMERA: lens actuator did not take the activation (02 <- 00): the lens is not moved (focus_max 0)\n"); return; }
+ 	n2c_sleep(10);
+-	lck_mtx_lock(&n2d_hw);
++	n2d_hw_get();
+ 	n2c_bus_init(&n2c_i2c2);
+ 	(void)n2c_rd(N2D_AF_DEV, 0x02, 1, &mode, 1);
+ 	lck_mtx_unlock(&n2d_hw);
+@@ -381,7 +440,7 @@
+ {
+ 	if (!n2d_af_ok) { return; }
+ 	n2d_af_ok = false;
+-	lck_mtx_lock(&n2d_hw);
++	n2d_hw_get();
+ 	n2c_bus_init(&n2c_i2c2);
+ 	(void)n2c_wr(N2D_AF_DEV, 0x02, 1, 0x20);       /* standby (AK7377AF_Release) */
+ 	lck_mtx_unlock(&n2d_hw);
+@@ -394,24 +453,25 @@
+ 	const struct n2c_sensor *se = &n2c_sensors[s];
+ 	uint32_t size = n2d_stride(s) * se->h;
+ 	if (se->port < 0) { printf("NORD2 CAMERA: %s has no receiver port yet\n", se->name); return false; }
+-	lck_mtx_lock(&n2d_hw);
++	n2d_hw_get();
+ 	bool ok = n2d_platform();
+ 	if (ok && !in->sctx_ok) { in->sctx = n2s_ctx; in->sctx_ok = true; }      /* the register bases; the rest is n2s_rx_x()'s */
+ 	lck_mtx_unlock(&n2d_hw);
+ 	if (!ok || !n2d_alloc(in, 5120 * 3072 + 4096)) { return false; }
+ 	in->sensor = s;
+ 	in->exp_said = 0;
++	in->w_frame = in->w_lines = in->w_code = ~0u; in->xw.n = in->xw.i = 0;
+ 	if (s == N2C_IMX766) { n2d_af_ok = false; }
+-	lck_mtx_lock(&n2d_hw);
++	n2d_hw_get();
+ 	ok = n2c_power(s, true);
+ 	if (!ok) { (void)n2c_power(s, false); }
+ 	lck_mtx_unlock(&n2d_hw);
+ 	if (!ok) { return false; }
+-	lck_mtx_lock(&n2d_hw); n2c_bus_init(se->bus); lck_mtx_unlock(&n2d_hw);
++	n2d_hw_get(); n2c_bus_init(se->bus); lck_mtx_unlock(&n2d_hw);
+ 	int hi = n2d_srd(se, se->idreg_hi), lo = n2d_srd(se, se->idreg_lo);
+ 	if (hi != (se->id >> 8) || lo != (se->id & 0xff)) {
+ 		printf("NORD2 CAMERA: %s chip id %#x %#x: not there\n", se->name, hi, lo);
+-		lck_mtx_lock(&n2d_hw); (void)n2c_power(s, false); lck_mtx_unlock(&n2d_hw);
++		n2d_hw_get(); (void)n2c_power(s, false); lck_mtx_unlock(&n2d_hw);
+ 		return false;
+ 	}
+ 	(void)n2d_stable(se, se->init, se->init_n);
+@@ -424,7 +484,7 @@
+ 	lck_mtx_unlock(&n2d_lock);
+ 	for (unsigned k = 0; k < N2D_NBUF; k++) { memset((void *)(in->buf[k] + size - 64), N2D_FILL, 64); n2v_inval(in->buf[k] + size - 64, 64); }
+ 	/* the receiver and the cam mux (shared registers: under n2d_hw), CAMSV armed on a buffer, then the stream */
+-	lck_mtx_lock(&n2d_hw);
++	n2d_hw_get();
+ 	n2s_rx_x(&in->sctx, in->mux, se->port, se->cphy, se->lanes, se->pixel_rate);
+ 	n2v_cammux_x(&in->sctx, in->mux, in->cammux, se->w, se->h);
+ 	printf("NORD2 CAMERA: %s: pipe: %s, CSI port %d %s %d %s -> SENINF%d -> mux%d -> cam mux %d -> CAMSV%u (%#x) -> pa %#llx; top mux %#x %#x, cam mux src %#x %#x en %#x\n",
+@@ -445,7 +505,7 @@
+ 	(void)n2d_swr(&n2c_sensors[s], 0x0100, 0);
+ 	n2c_sleep(40);
+ 	if (s == N2C_IMX766) { n2d_af_stop(); }
+-	lck_mtx_lock(&n2d_hw);
++	n2d_hw_get();
+ 	mtk_cam_seninf_disable_cammux(&in->sctx, in->cammux);
+ 	(void)n2c_power(s, false);
+ 	lck_mtx_unlock(&n2d_hw);
+@@ -460,6 +520,30 @@
+ 	return (uint32_t)(ms < 150 ? 150 : ms);
+ }
+ 
++/*
++ * 0294: when a frame began, by the hardware. The first four bytes of the 64 the DMA writes after a frame (0x804) are a 32-bit
++ * count at 13 MHz, latched about one read-out before the frame's end is seen (q10hm/q10hp: +433120 a frame of 33.3 ms on every
++ * CAMSV, and equal to the low 32 bits of mach_absolute_time() less 33.0 to 34.3 ms): the system's own 13 MHz counter. So the
++ * frame's `time` is mach_absolute_time() of that latch, the same clock for both instances, instead of when this loop's 3 ms
++ * polling noticed the frame. Used only when mach_absolute_time() counts 13 MHz and the count is less than 2 s old; else the
++ * time the frame was seen, as before. N2D_HW_TIME 0 turns it off.
++ */
++#define N2D_HW_TIME 1
++static uint64_t
++n2d_frame_time(struct n2d_inst *in, int b, uint32_t size, uint32_t *ticks_out)
++{
++	uint64_t now = mach_absolute_time(), ns = 0;
++	const volatile uint8_t *h = (const volatile uint8_t *)(in->buf[b] + size);
++	n2v_inval(in->buf[b] + size, 64);
++	uint32_t ticks = (uint32_t)h[0] | (uint32_t)h[1] << 8 | (uint32_t)h[2] << 16 | (uint32_t)h[3] << 24;
++	*ticks_out = ticks;
++	absolutetime_to_nanoseconds(13000000ULL, &ns);
++	uint32_t age = (uint32_t)now - ticks;
++	if (N2D_HW_TIME && ns > 990000000ULL && ns < 1010000000ULL && age != 0 && age < 2u * 13000000u) { return now - age; }
++	in->hw_ticks_fallback++;
++	return now;
++}
++
+ static bool
+ n2d_tail_done(const struct n2d_inst *in, int b, uint32_t size)
+ {
+@@ -523,6 +607,7 @@
+ 	uint64_t watch = last_frame;                   /* the last frame, or the last time CAMSV was started again */
+ 	for (;;) {
+ 		bool stop = false;
++		uint64_t looked = n2d_ms();                /* 0294: when this turn looked at its buffers */
+ 		int b = in->qn ? in->q[0] : -1;
+ 		if (b >= 0) {
+ 			bool done = n2d_tail_done(in, b, size);
+@@ -542,12 +627,14 @@
+ 			}
+ 			if (done) {
+ 				struct n2d_slot st = { 0 };
++				uint32_t hw_ticks = 0;
++				uint64_t seen = mach_absolute_time(), stamp = n2d_frame_time(in, b, size, &hw_ticks);
+ 				n2d_stats(in, b, &st);
+ 				lck_mtx_lock(&n2d_lock);
+ 				for (unsigned i = 0; i < N2D_NBUF; i++) { if (in->slot[i].state == N2D_READY) { in->slot[i].state = N2D_FREE; } }
+ 				in->slot[b].state = N2D_READY;
+ 				in->slot[b].seq = ++in->seq;
+-				in->slot[b].time = mach_absolute_time();
++				in->slot[b].time = stamp;
+ 				in->slot[b].exp = in->cur_exp; in->slot[b].gain = in->cur_gain; in->slot[b].frame = in->cur_frame;
+ 				in->slot[b].focus = n2d_focus_cur;
+ 				in->slot[b].stat_n = st.stat_n; in->slot[b].stat_g = st.stat_g; in->slot[b].stat_r = st.stat_r; in->slot[b].stat_b = st.stat_b;
+@@ -560,8 +647,10 @@
+ 					char hex[64 * 2 + 1];
+ 					n2v_inval(in->buf[b] + size, 64);
+ 					for (unsigned k = 0; k < 64; k++) { snprintf(hex + k * 2, 3, "%02x", h[k]); }
+-					printf("NORD2 CAMERA: %s: frame %llu of the session, seen done at %llu us (green %u red %u blue %u): DMA header %s\n", in->node,
+-					    in->seq - seq0, n2d_us(), st.stat_g, st.stat_r, st.stat_b, hex);
++					uint64_t age_ns = 0;
++					absolutetime_to_nanoseconds(seen - stamp, &age_ns);
++					printf("NORD2 CAMERA: %s: frame %llu of the session, seen done at %llu us, stamped %llu us before that (hardware count %#x, %llu not stamped by it) (green %u red %u blue %u): DMA header %s\n",
++					    in->node, in->seq - seq0, n2d_us(), age_ns / 1000, hw_ticks, in->hw_ticks_fallback, st.stat_g, st.stat_r, st.stat_b, hex);
+ 				}
+ 				for (unsigned k = 1; k < in->qn; k++) { in->q[k - 1] = in->q[k]; }
+ 				in->qn--;
+@@ -572,14 +661,16 @@
+ 			}
+ 		}
+ 		if (in->qn < N2D_QUEUED) { n2d_top_up(in, in->qn ? (unsigned)in->q[in->qn - 1] : 0); }
+-		lck_mtx_lock(&n2d_lock);
+-		if (in->ask.pending) {
++		/* 0294: the exposure asked, one register a turn (the newest ask waits for the one being written) */
++		if (!n2d_exposure_step(in)) {
++			lck_mtx_lock(&n2d_lock);
++			bool pend = in->ask.pending;
+ 			uint32_t l = in->ask.lines, g = in->ask.gain, f = in->ask.frame;
+ 			in->ask.pending = false;
+ 			lck_mtx_unlock(&n2d_lock);
+-			n2d_set_exposure(in, l, g, f);
+-			lck_mtx_lock(&n2d_lock);
++			if (pend) { n2d_exposure_plan(in, l, g, f); (void)n2d_exposure_step(in); }
+ 		}
++		lck_mtx_lock(&n2d_lock);
+ 		if (in->focus_ask.pending) {
+ 			uint32_t pos = in->focus_ask.pos;
+ 			in->focus_ask.pending = false;
+@@ -597,7 +688,8 @@
+ 		if (stop) { break; }
+ 		/* the sensor's first frame may take longer: 500 ms for it */
+ 		uint32_t limit = first ? 500u : n2d_stall_ms(in);
+-		if (n2d_ms() - watch > limit) {
++		/* 0294: not when this thread itself was kept waiting since it looked (the lock, the I2C): the next turn looks first */
++		if (n2d_ms() - watch > limit && n2d_ms() - looked <= 10) {
+ 			vm_offset_t sv = n2d_svb(in);
+ 			if (!stall_said || rearms_now >= 3) {
+ 				printf("NORD2 CAMERA: %s: stall: no frame for %llu ms (limit %u) after %llu of this session; queue %u [%d %d], exposure %u lines, frame %u lines, gain %u\n",
+@@ -609,7 +701,7 @@
+ 				n2v_status("stall +40 ms", sv, in->sv);
+ 				printf("NORD2 CAMERA: %s: stall: TG frame count %s in 40 ms (%#x -> %#x): %s\n", in->node, ni_rd(sv, 0x16c) != inter0 ? "moved" : "did NOT move",
+ 				    inter0, ni_rd(sv, 0x16c), ni_rd(sv, 0x16c) != inter0 ? "frames reach this CAMSV, its DMA/FBC is what stopped" : "no frames reach this CAMSV (sensor, receiver, mux or cam mux)");
+-				lck_mtx_lock(&n2d_hw);
++				n2d_hw_get();
+ 				n2s_report_x(&in->sctx, in->mux, in->node);
+ 				lck_mtx_unlock(&n2d_hw);
+ 				stall_said = true; rearms_now = 0;
