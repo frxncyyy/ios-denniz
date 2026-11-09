@@ -1,0 +1,35 @@
+# generate the iOS n2v_camsv_cfg sequence for camsv i, as n2d ops
+import sys
+pa=int(sys.argv[1],0); va=int(sys.argv[2],0); sv=0x1a090000+0x1000*int(sys.argv[3]); larbp=sys.argv[4]  # e.g. 0x1a00238c
+mux=int(sys.argv[5])  # cammux index
+import os
+V=lambda k,d: int(os.environ.get(k,str(d)),0)
+w,h,stride=V('W',4096),V('H',256),V('STRIDE',5120)
+h_full=V('HFULL',3072)
+o=[]
+W=lambda off,v: o.append(f"W {sv+off:#x} {v:#x}")
+M=lambda off,m,v: o.append(f"X {sv+off:#x} {m:#x} {v:#x}")
+o.append(f"F {va:#x} 0xdeadbeef 0x180000")
+o.append("G 0x1000616c 0x01980000 0x01980000")
+o.append(f"R {larbp} 1"); o.append(f"W {larbp} 0")
+o.append(f"X {0x1a004400+4*(mux//4):#x} {0xff<<(8*(mux%4)):#x} {V('MUXSRC',0)<<(8*(mux%4)):#x}")
+o.append(f"X 0x1a004410 {1<<mux:#x} {1<<mux:#x}")
+o.append(f"W {0x1a004420+4*mux:#x} 0x002b0003")
+o.append(f"W {0x1a004500+0x10*mux:#x} 3"); o.append(f"W {0x1a004504+0x10*mux:#x} {(h_full<<16)|w:#x}")
+W(0x20,0); W(0x20,1); o.append("S 2"); W(0x20,4); W(0x20,0)
+W(0x130,V('SENMODE',(1<<16)|(1<<1)|(1<<13))); W(0x134,0); W(0x138,w<<16); W(0x13c,h<<16); W(0x1a4,0)
+W(0x14,V('FMT',1)); M(0x4c,0x7f,V('PAK',0x29)); M(0x58,0x80,0); M(0x5c,1,0); M(0x2d0,0x1f<<16,0xe<<16)
+W(0x18,0x31871); W(0x800,0); M(0x7b0,0x80000000,0); W(0x7c4,0xffffffff); M(0x418,0x61000000,0x61000000)
+W(0x420,pa); W(0x424,pa>>32); W(0x428,0); W(0x430,stride-1); W(0x434,h-1); W(0x438,stride|V('STRHI',0x080f0000))
+W(0x43c,0x80000080); W(0x440,0x00400030); W(0x444,0x00200010); W(0x448,0)
+W(0xa00,0); W(0xa00,V('FBC',(1<<15)|(1<<11))); W(0x10,(1<<30)|(1<<4)|(1<<2)|1); M(0x800,1,1); M(0x30,0x8005,0x8005)
+W(0x420,pa); W(0x424,pa>>32); W(0x804,(pa+stride*h+63)&~63); M(0x2c,1,1)
+M(0x130,1,1); M(0x134,1,1)
+o.append("S 300")
+o.append(f"R {sv+0x400:#x} 1")
+o.append(f"R {sv+0x10:#x} 8"); o.append(f"R {sv+0x130:#x} 4"); o.append(f"R {sv+0x160:#x} 4"); o.append(f"R {sv+0x400:#x} 1"); o.append(f"R {sv+0x420:#x} 4"); o.append(f"R {sv+0xa00:#x} 2")
+o.append(f"Q {va:#x} 0xdeadbeef 0x180000")
+M(0x134,1,0); M(0x130,1,0); W(0x10,0)
+o.append(f"W {larbp} {V('LARBRESTORE',0xaa01):#x}")
+o.append("E")
+print("\n".join(x for x in o if x))
