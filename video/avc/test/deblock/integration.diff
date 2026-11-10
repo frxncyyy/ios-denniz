@@ -1,0 +1,82 @@
+# R2 build-only integration patches, against the tree of commit a7ab6d5 (2026-11-11 ~05:00).
+# Apply from gpu/video with: git apply integration.diff
+
+--- a/avc2/n2avc_core.c
++++ b/avc2/n2avc_core.c
+@@ -10,6 +10,9 @@
+  */
+ #include "n2avc_int.h"
+ 
++/* R2 deblocking filter (avc2/n2avc_deblock.c) */
++void n2avc_deblock_picture(n2avc_frame *rec, const n2avc_mbinfo *mb, int mb_w, int mb_h);
++
+ #include <pthread.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -741,8 +744,6 @@
+ 	c = *config;
+ 	if (c.width < 16 || c.width > 4096 || c.height < 16 || c.height > 2304 || (c.width & 1) || (c.height & 1))
+ 		return N2AVC_E_ARGUMENT;
+-	if (c.flags & N2AVC_F_DEBLOCK)
+-		return N2AVC_E_ARGUMENT;
+ 	if (c.fps_den == 0 || c.fps_num == 0) { c.fps_num = 30; c.fps_den = 1; }
+ 	if (c.qp != 0 && (c.qp < 10 || c.qp > 51))
+ 		return N2AVC_E_ARGUMENT;
+@@ -903,7 +904,13 @@
+ 		n2bw_u(&s->bw, 1, 0);                           /* adaptive_ref_pic_marking_mode_flag */
+ 	}
+ 	n2bw_se(&s->bw, s->qp - 26);                            /* slice_qp_delta */
+-	n2bw_ue(&s->bw, 1);                                     /* disable_deblocking_filter_idc */
++	if (e->cfg.flags & N2AVC_F_DEBLOCK) {
++		n2bw_ue(&s->bw, 0);                             /* disable_deblocking_filter_idc: filter everything */
++		n2bw_se(&s->bw, 0);                             /* slice_alpha_c0_offset_div2 */
++		n2bw_se(&s->bw, 0);                             /* slice_beta_offset_div2 */
++	} else {
++		n2bw_ue(&s->bw, 1);
++	}
+ 
+ 	if (s->slice_type == 0) {
+ 		s->inter_priv = n2avc_inter_slice_begin(s);
+@@ -1022,6 +1029,8 @@
+ 		PUT_NAL(e->slbuf[i], job[i].bytes, idr ? 3 : 2, idr ? 5 : 1, 0);
+ #undef PUT_NAL
+ 
++	if (e->cfg.flags & N2AVC_F_DEBLOCK)
++		n2avc_deblock_picture(rec, e->mb, e->mb_w, e->mb_h);
+ 	extend_plane(&rec->y, W, H, N2AVC_PAD);
+ 	extend_plane(&rec->cb, W / 2, H / 2, N2AVC_PAD / 2);
+ 	extend_plane(&rec->cr, W / 2, H / 2, N2AVC_PAD / 2);
+--- a/avc/n2avc_inter.c
++++ b/avc/n2avc_inter.c
+@@ -116,17 +116,21 @@
+ void
+ n2avc_inter_skip_mv(const n2avc_slice *s, int mbx, int mby, int *mvx, int *mvy)
+ {
+-	int ax = 0, ay = 0, bx = 0, by = 0;
+-	int a_ok, b_ok;
++	const n2avc_mbinfo *a, *b;
+ 
+-	a_ok = neighbour_inter(s, mbx - 1, mby, &ax, &ay);
+-	b_ok = neighbour_inter(s, mbx, mby - 1, &bx, &by);
+-
+-	/* Clause 8.4.1.1: unavailable A or B, an intra A or B, or an inter A/B
+-	 * whose vector is (0,0) makes the skip vector (0,0).  An intra
+-	 * neighbour is "available" in the 6.4.9 sense but the clause names it
+-	 * explicitly, so it must not fall through to the PMV. */
+-	if (!a_ok || !b_ok || (ax == 0 && ay == 0) || (bx == 0 && by == 0)) {
++	/* Clause 8.4.1.1 (11/2007), verbatim: mvL0 is (0,0) only when A or B is
++	 * not available, or when an inter A/B has refIdxL0 == 0 and mvL0 == (0,0).
++	 * An intra neighbour has refIdxL0 == -1 and does NOT force (0,0); the
++	 * predictor of 8.4.1.3 treats it as available with refIdx -1, mv (0,0). */
++	if (!n2avc_avail(s, mbx - 1, mby) || !n2avc_avail(s, mbx, mby - 1)) {
++		*mvx = 0;
++		*mvy = 0;
++		return;
++	}
++	a = &s->mb[mby * s->mb_w + mbx - 1];
++	b = &s->mb[(mby - 1) * s->mb_w + mbx];
++	if ((a->ref == 0 && a->mvx == 0 && a->mvy == 0) ||
++	    (b->ref == 0 && b->mvx == 0 && b->mvy == 0)) {
+ 		*mvx = 0;
+ 		*mvy = 0;
+ 		return;
