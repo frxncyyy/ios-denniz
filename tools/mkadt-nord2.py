@@ -123,6 +123,10 @@ def build(product_adt=None, wifi_service=False):
         phandle(),
         ('compatible', cstr('arm,gic-v3')),
         ('interrupt-controller', b''),
+        # This ADT uses one SPI-number cell per interrupt, not Linux's
+        # three-cell GIC binding. IOKit needs this to resolve the phandle.
+        ('#interrupt-cells', u32(1)),
+        ('#address-cells', u32(0)),
         ('virtual-timer-intid', u32(VTIMER_INTID)),
         ('reg', u64(GICD - SOC_BASE, GICD_SIZE, GICR - SOC_BASE, GICR_SIZE)),
     ])
@@ -143,7 +147,22 @@ def build(product_adt=None, wifi_service=False):
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('nord2,display')),
             ('canvas-width', u32(1125)),
-            ('canvas-height', u32(2436))])])
+            ('canvas-height', u32(2436))]),
+        # Mali-G77 (MT6893).  The reg is relative to the arm-io range base
+        # (SOC_BASE 0x01000000), exactly like the live FDT node
+        # mali@13000000.  Interrupt numbers are GIC SPI values; the XNU
+        # native transport currently polls completion. The explicit parent
+        # is still required by XNU's early IODeviceTreeAlloc interrupt walk:
+        # arm-io is a bus, not an interrupt controller or interrupt-map.
+        node('mali', [phandle(),
+            ('compatible', cstr('mediatek,mali') + cstr('arm,mali-valhall')),
+            ('reg', u64(0x13000000 - SOC_BASE, 0x4000)),
+            ('interrupts', u32(362, 363, 364, 365, 366)),
+            ('interrupt-parent', gic.prop('AAPL,phandle')),
+            ('interrupt-names', cstr('GPU') + cstr('MMU') + cstr('JOB') +
+             cstr('EVENT') + cstr('PWR')),
+            ('mediatek,mfgcfg', u64(0x13fbf000, 0x1000)),
+            ('mediatek,apmixedsys', u64(0x1000c000, 0x1000))])])
 
     defaults = node('defaults', [phandle(), ('no-effaceable-storage', u32(1))])
 

@@ -37,8 +37,9 @@ PAGE = 2048
 KERNEL_PA = 0x40080000
 RAMDISK_PA = 0x51100000
 LOADER_RESERVE = 0x200000
-PHYS_BASE = 0x142000000
-MEM_SIZE = 0x3e000000
+PHYS_BASE = int(__import__('os').environ.get('NORD2_PHYS_BASE', '0x142000000'), 0)   # 0x100000000 for the 5088 MiB window
+import os as _os
+MEM_SIZE = int(_os.environ.get('NORD2_MEM_SIZE', '0x3e000000'), 0)   # 0x7e000000 for the 2016 MiB window
 VIRT_BASE = 0xfffffe0006000000
 BLOCK_SHIFT = 25
 

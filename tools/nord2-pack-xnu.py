@@ -20,6 +20,7 @@ the stock kernel stays byte-for-byte at 0x40280000 for the chain-back.
 No device access. The packer refuses to overwrite an existing output and
 checks every size against the partition and the original layout.
 """
+import os
 import argparse
 import gzip
 import hashlib
@@ -93,7 +94,7 @@ def pack(stock, loader, payload, zopfli=None):
     stock_image = stock_image.ljust(image_size, b'\0')
 
     info = payload_span(payload)
-    if info['phys_base'] != 0x142000000 or info['mem_size'] != 0x3e000000:
+    if info['phys_base'] != int(os.environ.get('NORD2_PHYS_BASE', '0x142000000'), 0) or info['mem_size'] != int(os.environ.get('NORD2_MEM_SIZE', '0x3e000000'), 0):
         raise SystemExit('payload window is not the Nord 2 probe window')
     if info['adt_off'] + info['adt_size'] > len(payload):
         raise SystemExit('payload ADT out of range')
