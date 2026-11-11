@@ -1,0 +1,116 @@
+--- a/bsd/dev/nord2_gpu_core.h
++++ b/bsd/dev/nord2_gpu_core.h
+@@ -314,6 +314,10 @@
+         uint64_t wa_pa;
+         void *wa_cpu;
+         bool wa_as_live;
++        /* 0361 (boot-arg n2mapfm, default 1): a new mapping is published with AS FLUSH_MEM (L2 clean+invalidate and the region's
++         * TLB entries) instead of FLUSH_PT (TLB only), so no GPU cache line of whatever the range held before survives the map.
++         * Appended last: the objects compiled from the pristine header never see it. */
++        bool map_flush_mem;
+ 
+ };
+ 
+--- a/bsd/dev/nord2_gpu_core.c
++++ b/bsd/dev/nord2_gpu_core.c
+@@ -895,7 +895,7 @@
+                 return N2C_E_MAP;
+         }
+         if (c->gpu_powered && x->as_live &&
+-            n2hw_as_flush(c->hw, x->as, va, size, false) != N2HW_OK) {
++            n2hw_as_flush(c->hw, x->as, va, size, c->map_flush_mem) != N2HW_OK) {   /* 0361: FLUSH_MEM unless n2mapfm=0 */
+                 c->stats.flush_failures++;
+                 b->handle_live = false;
+                 b->refs = 0;
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -175,6 +175,8 @@
+         n2c_set_resv_enabled(c, rs != 0);
+         IOLog("NORD2 GPU: cache maintenance %s, CPU-access tracking level %d, invalidate scope %s, surface reservations %s\n", c->full_cache_maint ? "whole-context (boot-arg)" : "per-job buffer list", tr,
+               c->wmask_inval ? "declared writes (write_mask)" : "every listed GPU_WRITE buffer", rs ? "on" : "off");
++        { int fm = 1; (void)PE_parse_boot_argn("n2mapfm", &fm, sizeof(fm)); c->map_flush_mem = fm != 0;       /* 0361 */
++          IOLog("NORD2 GPU: 0361 new mappings published with %s (boot-arg n2mapfm=%d)\n", c->map_flush_mem ? "FLUSH_MEM (L2 clean+invalidate + TLB)" : "FLUSH_PT (TLB only)", fm); }
+         return true;
+ }
+ static bool battery_temperature(int *centi);
+@@ -1137,6 +1139,46 @@
+           IOLog("NORD2 GPU IMPORT: %s ctx=%u surface %u %ux%u fmt 0x%x client=%u bytes=%llu base=%#llx pa0=%#llx -> %s h=%u va=%#llx\n",
+                 name,c,id,s->width,s->height,s->pixelFormat,s->clientWired,mapped,base,(unsigned long long)pages[0].pa,
+                 e==N2C_OK?"ok":"refused",e==N2C_OK?*h:0u,e==N2C_OK?*va:0ull); } }
++        /*
++         * 0361: THE GPU'S VIEW OF AN IMPORTED YCbCr SURFACE, measured in the kernel (run q1: the Metal driver's GPU copy of these surfaces
++         * reads zeros or other buffers' bytes while the CPU reads the picture). For every import of a two-plane 4:2:0 surface made by
++         * MobileSlideShow/assetsd/photolibraryd/mediaserverd or of 375x667 (first 96): the pages at both ends, the page of the luma centre
++         * row and of the chroma at its row, each with the physical page the import holds, what the GPU page table maps at that VA (walk),
++         * the leaf attributes, and 16 bytes read through the kernel mapping of the same pages. Boot-arg n2impat=1: the first two such
++         * imports get 0xAA written over those 16 luma bytes (cleaned to memory) so the driver's GPU copy can be checked against a known
++         * pattern (it alters 16 bytes of the picture).
++         */
++        if (e==N2C_OK) {
++                static uint32_t n361, pat_done; static int pat = -1;
++                if (pat < 0) { int v = 0; (void)PE_parse_boot_argn("n2impat", &v, sizeof(v)); pat = v == 1; }
++                char nm[32]; proc_selfname(nm, sizeof(nm));
++                bool yuv = s->planeCount == 2 && (s->pixelFormat == 0x34323066 || s->pixelFormat == 0x34323076);
++                bool who = !strcmp(nm, "MobileSlideShow") || !strcmp(nm, "assetsd") || !strcmp(nm, "photolibraryd") || !strcmp(nm, "mediaserverd");
++                if (yuv && (who || (s->width == 375 && s->height == 667)) && n361 < 96) {
++                        n361++;
++                        uint64_t y = s->height / 2, x = s->width > 16 ? s->width / 2 - 8 : 0;
++                        uint64_t rel[2] = { (uint64_t)s->planes[0].offset + y * s->planes[0].bytesPerRow + x,
++                                            (uint64_t)s->planes[1].offset + (y / 2) * s->planes[1].bytesPerRow + (x & ~1ull) };
++                        IOLog("NORD2 GPU IMPCHK: %s[%d] ctx=%u surface %u %ux%u fmt 0x%x planes %u+%u rows %u/%u client=%u import offset %u bytes %llu "
++                              "va=%#llx pages %u first pa %#llx last pa %#llx\n", nm, proc_selfpid(), c, id, s->width, s->height, s->pixelFormat,
++                              s->planes[0].offset, s->planes[1].offset, s->planes[0].bytesPerRow, s->planes[1].bytesPerRow, s->clientWired,
++                              offset, mapped, *va, count, (unsigned long long)pages[0].pa, (unsigned long long)pages[count - 1].pa);
++                        for (unsigned k = 0; k < 2; k++) {
++                                if (rel[k] < offset) continue;
++                                uint64_t r = rel[k] - offset, pi = r / 4096, po = r % 4096;
++                                if (pi >= count) { IOLog("NORD2 GPU IMPCHK:   %s at %#llx is past the import\n", k ? "chroma" : "luma", r); continue; }
++                                uint64_t wpa = 0, pte = 0;
++                                bool walked = nord2_gpu_mmu_walk(&core->ctxs[c].mmu, *va + pi * 4096, &wpa, &pte);
++                                uint8_t *kv = (uint8_t *)pages[pi].cpu + po; unsigned nb = (unsigned)(4096 - po < 16 ? 4096 - po : 16);
++                                if (k == 0 && pat == 1 && pat_done < 2) { memset(kv, 0xAA, nb); FlushPoC_DcacheRegion((vm_offset_t)kv, nb); pat_done++; }
++                                char hex[40]; for (unsigned b = 0; b < nb; b++) snprintf(hex + 2 * b, 3, "%02x", kv[b]);
++                                IOLog("NORD2 GPU IMPCHK:   %s centre row %llu x %llu: page %llu+%llu pa(import)=%#llx gpu-walk=%s%#llx leaf=%#llx%s kernel-bytes=%s%s\n",
++                                      k ? "chroma" : "luma", k ? y / 2 : y, x, pi, po, (unsigned long long)pages[pi].pa, walked ? "" : "(none) ",
++                                      (unsigned long long)wpa, (unsigned long long)(pte & ((1ull << 54) | 0xfffull)),
++                                      walked && wpa == pages[pi].pa ? " MATCH" : " MISMATCH", hex, k == 0 && pat == 1 && pat_done <= 2 ? " (0xAA pattern written)" : "");
++                        }
++                }
++        }
+         IOFree(pages,count*sizeof(*pages)); if (!adopted) free_owner(this,owner);
+         /* Level 2: the surface's CPU access is bracketed by IOSurfaceLock/Unlock (see surfaceHook). */
+         if (e==N2C_OK && core->track_level>=N2C_TRACK_EXPLICIT) (void)n2c_bo_track(core,c,*h);
+@@ -1373,6 +1415,33 @@
+                 nord2_gpu_submit_request r;memcpy(&r,a->structureInput,sizeof(r));if(r.version!=2){result=kIOReturnBadArgument;break;}
+                 struct n2c_submit sub={};sub.kind=r.kind;sub.nr_handles=r.nr_handles;sub.heads[0]=r.heads[0];sub.heads[1]=r.heads[1];
+                 sub.write_mask=r.write_mask;memcpy(sub.handles,r.handles,sizeof(sub.handles));uint64_t id;
++                /* 0361: for MobileSlideShow's jobs, the GPU page table of every imported buffer the job lists, checked at its first, middle and
++                 * last page against the pages the import holds (first 64 mismatches; a summary every 256 such jobs) */
++                {
++                        static uint32_t jobs361, bos361, bad361; char pn[32]; proc_selfname(pn, sizeof(pn));
++                        if (!strcmp(pn, "MobileSlideShow")) {
++                                jobs361++;
++                                for (unsigned i = 0; i < sub.nr_handles && i < 32; i++) {
++                                        const struct n2c_bo *b = n2c_bo_lookup(gpu->core, context, sub.handles[i]);
++                                        if (!b || !(b->flags & N2C_BO_IMPORTED) || b->state != N2C_BO_MAPPED || !b->nr_pages || !b->pages) continue;
++                                        bos361++;
++                                        const unsigned at[3] = { 0, b->nr_pages / 2, b->nr_pages - 1 };
++                                        for (unsigned k = 0; k < 3; k++) {
++                                                uint64_t wpa = 0, pte = 0;
++                                                bool w = nord2_gpu_mmu_walk(&gpu->core->ctxs[context].mmu, b->va + (uint64_t)at[k] * 4096, &wpa, &pte);
++                                                if (!w || wpa != b->pages[at[k]].pa) {
++                                                        if (bad361++ < 64)
++                                                                IOLog("NORD2 GPU SUBMITCHK: MISMATCH ctx=%u bo h=%u va=%#llx page %u: import pa %#llx gpu-walk %s%#llx leaf %#llx\n",
++                                                                      context, b->handle, b->va, at[k], (unsigned long long)b->pages[at[k]].pa, w ? "" : "(none) ",
++                                                                      (unsigned long long)wpa, (unsigned long long)(pte & 0xfffull));
++                                                        break;
++                                                }
++                                        }
++                                }
++                                if ((jobs361 & 255) == 1)
++                                        IOLog("NORD2 GPU SUBMITCHK: MobileSlideShow jobs=%u imported buffers checked=%u mismatches=%u\n", jobs361, bos361, bad361);
++                        }
++                }
+                 result=io_error(n2c_submit(gpu->core,context,&sub,&id));if(result==kIOReturnSuccess){a->scalarOutput[0]=id;a->scalarOutputCount=1;if(gpu->irqState==NORD2_IRQ_ACTIVE)gpu->irqArm();}break;
+         }
+         case NORD2_GPU_SEL_WAIT: {

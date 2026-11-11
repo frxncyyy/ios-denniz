@@ -1,0 +1,467 @@
+--- a/bsd/dev/audio_device.c
++++ b/bsd/dev/audio_device.c
+@@ -1,6 +1,7 @@
+ /* Nord2 speaker PCM endpoint used by the unmodified upstream HAL plugin.
+  * Userspace only queues S16LE48k stereo. One retained worker exclusively owns
+- * AFE, amplifier I2C, start/stop and the live command consumer. */
++ * AFE, amplifier I2C, start/stop and the live command consumer.
++ * 0321: and the microphone the plug-in's "Codec" input reads, /dev/redwood-mic (audio_mic.inc). */
+ #include <kern/clock.h>
+ #include <kern/locks.h>
+ #include <kern/thread.h>
+@@ -274,10 +275,11 @@
+  * No console output between start and stop (the modem thread prints the in-call status). */
+ enum { NC_IDLE=0, NC_ACTIVE=5, NC_FAILED=9 };
+ static unsigned call_phase;
++static unsigned mic_blocks_call(void);      /* 0321, audio_mic.inc */
+ static uint64_t call_silent_us;
+ static void call_poll(void) {
+  unsigned want=nac_wanted();
+- if(call_phase==NC_IDLE && want) {
++ if(call_phase==NC_IDLE && want && !mic_blocks_call()) {   /* 0321: the recording gives the MT6359 back first */
+   unsigned top=0,bottom=0;int e;
+   if(hardware.status.error || hardware.status.uncertain || hardware.status.stop_error || !hardware.status.initialized) {
+    printf("NORD2 CALL: audio hardware unavailable (error=%d uncertain=%u) - call stays silent\n",hardware.status.error,hardware.status.uncertain);
+@@ -325,6 +327,7 @@
+  }
+  if(n){(void)nau_hw_feed(&hardware,pcm,n);call_silent_us=t;}
+ }
++#include "audio_mic.inc"                   /* 0321: /dev/redwood-mic */
+ static void audio_worker(__unused void *arg,__unused wait_result_t wr) {
+  struct nah_io io;void *cookie=NULL;
+  uint64_t nonce=0;read_random(&nonce,sizeof nonce);if(nonce)(void)nal_initialize(nonce);
+@@ -341,7 +344,8 @@
+  for(;;) {
+   commands();
+   call_poll();
+-  unsigned in_call=call_phase==NC_ACTIVE;
++  mic_poll();                               /* 0321 */
++  unsigned in_call=call_phase==NC_ACTIVE, recording=mic_holds_hw();
+   if(in_call){lck_mtx_lock(&nsa_lock);nsa_flush(&stream);device.stop=0;lck_mtx_unlock(&nsa_lock);}
+   unsigned stop=0,enabled=0,queued=0,sound_queued=0,idle=0;
+   unsigned downstream=hardware_sound_pending();uint64_t t;
+@@ -350,7 +354,7 @@
+   queued=stream.count;sound_queued=stream.sound_frames;t=now_us();
+   idle=nsa_idle_ready(&stream,t,downstream,&device.last_pending_us,drain_us);
+   lck_mtx_unlock(&nsa_lock);
+-  if(!in_call && hardware.status.running && (stop || (!device.tone_active && (!enabled || idle)))) {
++  if(!in_call && !recording && hardware.status.running && (stop || (!device.tone_active && (!enabled || idle)))) {
+    device.tone_active=0;(void)nau_hw_stop(&hardware);
+    /* Mute/disable already flush their producer queue. Preserve PCM that
+     * arrived during the bounded hardware stop; fresh idle checks below
+@@ -360,11 +364,12 @@
+   /* No amp power for an idle HAL's zero-filled writes. Errors remain visible
+    * and do not spin restarting hardware. Live ENABLE after a clean stop can
+    * accept subsequent playback; uncertain bus state is never retried. */
+-  if(call_phase==NC_IDLE && !hardware.status.running && !hardware.status.error && enabled && queued &&
++  if(call_phase==NC_IDLE && !recording && !hardware.status.running && !hardware.status.error && enabled && queued &&
+      sound_queued && !device.tone_active)(void)start(0,0);
+   if(hardware.status.running) {
+    if(device.tone_active)feed_tone();
+    else if(in_call)call_feed();
++   else if(recording)mic_feed();
+    else {
+     int16_t pcm[NSA_CHUNK*2];unsigned room=NAH_QUEUE_FRAMES-hardware.status.queued_frames;
+     if(room>NSA_CHUNK)room=NSA_CHUNK;
+@@ -388,6 +393,9 @@
+    printf("NORD2 AUDIO PCM: opens=%u writes=%u queued=%u peak=%u running=%u error=%d pcm=%u\n",
+     s.word[NAL_F_OPENS],s.word[NAL_F_WRITES],s.word[NAL_F_QUEUED],s.word[NAL_F_PEAK],
+     s.word[NAL_F_RUNNING],(int32_t)s.word[NAL_F_ERROR],s.word[NAL_F_PCM]);
++   if(nmic_opens)printf("NORD2 MIC: opens=%u users=%u reads=%u state=%u rc=%d sessions=%u upgrades=%u last: in=%llu out=%llu dropped=%llu underruns=%llu peak=%u silent=%u\n",
++    nmic_opens,nmic_users,nmic_reads,nmic_state,nmic_rc,nmic_sessions,nmic_upgrades,(unsigned long long)nmic_last.in,
++    (unsigned long long)nmic_last.out,(unsigned long long)nmic_last.dropped,(unsigned long long)nmic_last.underruns,nmic_last.peak,nmic_last.silent);
+   }
+   uint64_t deadline;clock_interval_to_deadline(2,NSEC_PER_MSEC,&deadline);
+   assert_wait_deadline((event_t)&device,THREAD_UNINT,deadline);thread_block(THREAD_CONTINUE_NULL);
+@@ -406,4 +414,5 @@
+  thread_deallocate(thread);device.ready=1;device.hal_status=1;
+  nac_init();
+  printf("NORD2 AUDIO: devfs redwood-audio rate=48000 channels=2 bits=16\n");
++ mic_initialize();                          /* 0321: after device.ready (mic_open refuses before) */
+ }
+--- /dev/null
++++ b/bsd/dev/audio_mic.inc
+@@ -0,0 +1,383 @@
++/* SPDX-License-Identifier: MIT
++ * Nord2 microphone for recording (patch 0321): /dev/redwood-mic, what the HAL plug-in's "Codec" input reads
++ * (RedwoodAudio.driver codec_read(): open O_RDONLY|O_NONBLOCK at the input's first read, mono 16-bit 48 kHz, short
++ * reads zero-filled by the plug-in).  Included by audio_device.c after call_feed(); the register work is audio_call.c's
++ * (0320: nac_mic_*): MT6359 uplink as for a call (AIN0 main mic, DCC, MICBIAS0 2.5 V, PGA kern.n2call.pga), ADDA UL ->
++ * VUL12 into AFE SRAM 0x11213800, drained by the worker every pass into a jitter buffer that read() empties.
++ *
++ * The AFE runs only while the speaker path's DMA runs (nau_hw: AUDIO MTCMOS, clocks, DL1 ring).  A recording without
++ * playback starts that path silent (nau_hw silent_only: DL1 clocks zeros, amplifiers never powered); sound that arrives
++ * for the speaker while it is silent is dropped, or (kern.n2mic.upgrade=1) restarts the path with the amplifiers (a gap of
++ * a few ms in the recording).  A call takes
++ * precedence: the microphone is given back (MT6359 down) before the call path starts, and taken again after it.
++ *
++ * Jitter buffer (pure, host-tested: NMIC_RING_ONLY): the worker pushes ~96 samples every 2 ms, the HAL reads a whole
++ * I/O buffer (512..1024 frames) per cycle by its own clock (mach time).  read() gives nothing until `prime` samples are
++ * there, then what there is; emptied -> primed again (an underrun).  More than `max` waiting: the oldest are dropped
++ * at once down to (prime + max) / 2 (the two clocks drift; latency stays bounded, one discontinuity per correction).
++ */
++#define NMIC_RING 8192u                  /* samples: 170 ms */
++struct nmic_ring {
++	int16_t s[NMIC_RING];
++	uint32_t r, count, prime, max;
++	unsigned primed;
++	uint64_t in, out, dropped, underruns;
++	uint32_t peak;
++};
++
++static void
++nmic_ring_reset(struct nmic_ring *q, uint32_t prime, uint32_t max)
++{
++	if (max > NMIC_RING) max = NMIC_RING;
++	if (max < 256u) max = 256u;
++	if (prime > max) prime = max;
++	q->r = q->count = 0;
++	q->prime = prime;
++	q->max = max;
++	q->primed = 0;
++	q->in = q->out = q->dropped = q->underruns = 0;
++	q->peak = 0;
++}
++
++static void
++nmic_ring_push(struct nmic_ring *q, const int16_t *v, unsigned n)
++{
++	if (n > q->max) {                        /* only the newest max fit */
++		q->dropped += n - q->max;
++		q->in += n - q->max;
++		v += n - q->max;
++		n = q->max;
++	}
++	if (q->count + n > q->max) {             /* drop the oldest, down to halfway between prime and max: one jump, not a click a push */
++		uint32_t keep = (q->prime + q->max) / 2u, d;
++		if (keep < n) keep = n;
++		d = q->count + n - keep;
++		if (d > q->count) d = q->count;
++		q->r = (q->r + d) % NMIC_RING;
++		q->count -= d;
++		q->dropped += d;
++	}
++	for (unsigned i = 0; i < n; i++) {
++		int a = v[i] < 0 ? -v[i] : v[i];
++		q->s[(q->r + q->count + i) % NMIC_RING] = v[i];
++		if ((uint32_t)a > q->peak) q->peak = (uint32_t)a;
++	}
++	q->count += n;
++	q->in += n;
++}
++
++static unsigned
++nmic_ring_pop(struct nmic_ring *q, int16_t *out, unsigned n)
++{
++	unsigned take;
++	if (!q->primed) {
++		if (q->count < q->prime || q->count == 0) return 0;
++		q->primed = 1;
++	}
++	take = n < q->count ? n : q->count;
++	for (unsigned i = 0; i < take; i++) out[i] = q->s[(q->r + i) % NMIC_RING];
++	q->r = (q->r + take) % NMIC_RING;
++	q->count -= take;
++	q->out += take;
++	if (q->count == 0 && take < n) {         /* ran dry: wait for `prime` again */
++		q->primed = 0;
++		q->underruns++;
++	}
++	return take;
++}
++
++/* Q8 digital gain (256 = unity) with saturation, in place */
++static void
++nmic_gain(int16_t *v, unsigned n, unsigned q8)
++{
++	if (q8 == 256u) return;
++	for (unsigned i = 0; i < n; i++) {
++		int32_t x = (int32_t)v[i] * (int32_t)q8 / 256;
++		v[i] = (int16_t)(x > 32767 ? 32767 : x < -32768 ? -32768 : x);
++	}
++}
++
++/* any sample of these stereo frames above the noise floor nsa_enqueue uses for "sound" (peak > 8) */
++static unsigned
++nmic_has_sound(const int16_t *pcm, unsigned frames)
++{
++	for (unsigned i = 0; i < 2 * frames; i++) if (pcm[i] > 8 || pcm[i] < -8) return 1;
++	return 0;
++}
++
++#ifndef NMIC_RING_ONLY
++#include <sys/sysctl.h>
++#include <sys/vnode.h>
++#include <sys/fcntl.h>
++
++static LCK_MTX_DECLARE(nmic_lock, &nsa_group);
++static struct nmic_ring nmic;
++static unsigned nmic_enable = 1, nmic_prime = 2048, nmic_max = 6144, nmic_gain_q8 = 256;
++/* 0: sound for the speaker while a recording runs on the silent path is not played (iOS mutes most sounds while it films);
++ * 1: the path restarts with the amplifiers.  Off by default: since the camera bring-up every amplifier start of a session
++ * has failed on I2C8 (NORD2 AUDIO ERROR i2c=5/16, uncertain=1: the path refuses every later start), which would end the
++ * recording and every later one. */
++static unsigned nmic_upgrade;
++static unsigned nmic_users, nmic_opens, nmic_reads, nmic_state, nmic_fails, nmic_upgrades, nmic_sessions;
++static int nmic_rc;
++static uint64_t nmic_bytes;
++/* last session, for the idle PCM line (the worker prints nothing while DMA runs) */
++static struct { uint64_t in, out, dropped, underruns; uint32_t peak; unsigned silent; int rc; } nmic_last;
++
++SYSCTL_NODE(_kern, OID_AUTO, n2mic, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "Nord2 microphone (/dev/redwood-mic)");
++SYSCTL_UINT(_kern_n2mic, OID_AUTO, enable, CTLFLAG_RW | CTLFLAG_LOCKED, &nmic_enable, 0, "0: open refused");
++SYSCTL_UINT(_kern_n2mic, OID_AUTO, prime, CTLFLAG_RW | CTLFLAG_LOCKED, &nmic_prime, 0, "samples before the first read (next open)");
++SYSCTL_UINT(_kern_n2mic, OID_AUTO, max, CTLFLAG_RW | CTLFLAG_LOCKED, &nmic_max, 0, "most samples kept (next open)");
++SYSCTL_UINT(_kern_n2mic, OID_AUTO, gain, CTLFLAG_RW | CTLFLAG_LOCKED, &nmic_gain_q8, 0, "digital gain, Q8 (256 = 0 dB)");
++SYSCTL_UINT(_kern_n2mic, OID_AUTO, upgrade, CTLFLAG_RW | CTLFLAG_LOCKED, &nmic_upgrade, 0, "1: speaker sound during a silent recording restarts the path with the amplifiers");
++SYSCTL_UINT(_kern_n2mic, OID_AUTO, users, CTLFLAG_RD | CTLFLAG_LOCKED, &nmic_users, 0, "opens since the node was last closed by all");
++SYSCTL_UINT(_kern_n2mic, OID_AUTO, opens, CTLFLAG_RD | CTLFLAG_LOCKED, &nmic_opens, 0, "");
++SYSCTL_UINT(_kern_n2mic, OID_AUTO, reads, CTLFLAG_RD | CTLFLAG_LOCKED, &nmic_reads, 0, "");
++SYSCTL_UINT(_kern_n2mic, OID_AUTO, state, CTLFLAG_RD | CTLFLAG_LOCKED, &nmic_state, 0, "0 idle 1 up 2 active 3/4 down 5 failed");
++SYSCTL_UINT(_kern_n2mic, OID_AUTO, sessions, CTLFLAG_RD | CTLFLAG_LOCKED, &nmic_sessions, 0, "");
++SYSCTL_INT(_kern_n2mic, OID_AUTO, rc, CTLFLAG_RD | CTLFLAG_LOCKED, &nmic_rc, 0, "");
++SYSCTL_QUAD(_kern_n2mic, OID_AUTO, in, CTLFLAG_RD | CTLFLAG_LOCKED, &nmic.in, "");
++SYSCTL_QUAD(_kern_n2mic, OID_AUTO, out, CTLFLAG_RD | CTLFLAG_LOCKED, &nmic.out, "");
++SYSCTL_QUAD(_kern_n2mic, OID_AUTO, dropped, CTLFLAG_RD | CTLFLAG_LOCKED, &nmic.dropped, "");
++SYSCTL_QUAD(_kern_n2mic, OID_AUTO, underruns, CTLFLAG_RD | CTLFLAG_LOCKED, &nmic.underruns, "");
++SYSCTL_UINT(_kern_n2mic, OID_AUTO, peak, CTLFLAG_RD | CTLFLAG_LOCKED, &nmic.peak, 0, "");
++
++static int
++mic_open(__unused dev_t d, int flags, __unused int t, __unused struct proc *p)
++{
++	if (!device.ready || !nmic_enable) return ENXIO;
++	if (flags & FWRITE) return EPERM;
++	lck_mtx_lock(&nmic_lock);
++	if (nmic_users++ == 0) nmic_ring_reset(&nmic, nmic_prime, nmic_max);
++	nmic_opens++;
++	lck_mtx_unlock(&nmic_lock);
++	notify_worker();
++	return 0;
++}
++
++static int
++mic_close(__unused dev_t d, __unused int f, __unused int t, __unused struct proc *p)
++{
++	/* devfs calls d_close on the LAST close of the node only (spec_close: vcount > 1 returns early; XNU has no
++	 * D_TRACKCLOSE): every reader is gone */
++	lck_mtx_lock(&nmic_lock);
++	nmic_users = 0;
++	lck_mtx_unlock(&nmic_lock);
++	wakeup(&nmic);
++	notify_worker();
++	return 0;
++}
++
++/* Never waits with O_NONBLOCK (the HAL's real-time thread): EWOULDBLOCK when nothing is ready.  Otherwise waits up to
++ * one second for the first samples (a diagnostic reader: dd if=/dev/redwood-mic bs=2048). */
++static int
++mic_read(__unused dev_t d, struct uio *u, int ioflag)
++{
++	int16_t buf[512];
++	unsigned total = 0, waits = 0;
++	int e = 0;
++	if (uio_resid(u) < 2) return uio_resid(u) == 0 ? 0 : EINVAL;
++	lck_mtx_lock(&nmic_lock);
++	nmic_reads++;
++	for (;;) {
++		unsigned want = (unsigned)(uio_resid(u) / 2), got;
++		if (want > 512u) want = 512u;
++		got = nmic_ring_pop(&nmic, buf, want);
++		if (got) {
++			total += got;
++			nmic_bytes += got * 2u;
++			lck_mtx_unlock(&nmic_lock);
++			e = uiomove((caddr_t)buf, (int)(got * 2u), u);
++			lck_mtx_lock(&nmic_lock);
++			if (e || got < want || uio_resid(u) < 2) break;
++			continue;
++		}
++		if (total || (ioflag & IO_NDELAY) || !nmic_users || waits >= 20) break;
++		{
++			struct timespec ts = { 0, 50 * 1000 * 1000 };
++			(void)msleep(&nmic, &nmic_lock, PZERO | PCATCH, "n2mic", &ts);
++		}
++		waits++;
++	}
++	lck_mtx_unlock(&nmic_lock);
++	if (!e && !total && (ioflag & IO_NDELAY)) e = EWOULDBLOCK;
++	return e;
++}
++
++static const struct cdevsw mic_cdev = {
++	.d_open = mic_open, .d_close = mic_close, .d_read = mic_read, .d_write = eno_rdwrt,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++/* ------------------------------------------------------------------------------------------ worker side */
++enum { NM_IDLE = 0, NM_UP_WAIT = 1, NM_ACTIVE = 2, NM_DOWN_SUBMIT = 3, NM_DOWN_WAIT = 4, NM_FAILED = 5 };
++#define NM_CALL_PHASE 7                          /* nac_note(): the modem thread prints the uplink status line */
++#define NM_CALL_PHASE_UP 8                       /* MT6359 uplink being powered for the recording */
++static unsigned nm_silent_hw;
++static uint64_t nm_fed_us;
++
++static unsigned
++mic_wanted(void)
++{
++	return __atomic_load_n(&nmic_users, __ATOMIC_RELAXED) != 0 && nmic_enable && !nac_wanted() && call_phase == NC_IDLE;
++}
++/* while recording the worker keeps the AFE running and feeds it (mic_feed) */
++static unsigned
++mic_holds_hw(void)
++{
++	return nmic_state == NM_ACTIVE;
++}
++/* a call starts only once the microphone has given the MT6359 back */
++static unsigned
++mic_blocks_call(void)
++{
++	return nmic_state != NM_IDLE && nmic_state != NM_FAILED;
++}
++
++static void
++mic_down(int rc)
++{
++	if (rc && !nmic_rc) nmic_rc = rc;
++	nmic_state = nac_mic_pmic_submit(0) == 0 ? NM_DOWN_WAIT : NM_DOWN_SUBMIT;
++}
++
++static void
++mic_session_end(void)
++{
++	lck_mtx_lock(&nmic_lock);
++	nmic_last.in = nmic.in; nmic_last.out = nmic.out; nmic_last.dropped = nmic.dropped;
++	nmic_last.underruns = nmic.underruns; nmic_last.peak = nmic.peak; nmic_last.silent = nm_silent_hw;
++	lck_mtx_unlock(&nmic_lock);
++	wakeup(&nmic);
++}
++
++/* hardware usable at all (the same test call_poll makes) */
++static unsigned
++mic_hw_ok(void)
++{
++	return hardware.status.initialized && !hardware.status.error && !hardware.status.uncertain && !hardware.status.stop_error;
++}
++
++static void
++mic_poll(void)
++{
++	int err = 0, e;
++	switch (nmic_state) {
++	case NM_IDLE:
++		if (!mic_wanted()) return;
++		if (!mic_hw_ok()) { nmic_rc = hardware.status.error ? hardware.status.error : -1; nmic_state = NM_FAILED; return; }
++		if (nac_mic_pmic_submit(1) == 0) { nmic_rc = 0; nmic_state = NM_UP_WAIT; nac_note(NM_CALL_PHASE_UP, 0); }
++		return;
++	case NM_UP_WAIT:
++		if (!nac_mic_pmic_poll(&err)) return;
++		if (err || !mic_wanted() || !mic_hw_ok()) { mic_down(err ? err : -2); return; }
++		if (!hardware.status.running) {
++			e = nau_hw_start_channels(&hardware, 48000, 2, 16, 1, output_gain[0], output_gain[1], 0, now_us());
++			if (e) { mic_down(e); return; }
++			device.starts++;
++			nm_silent_hw = 1;
++		} else {
++			nm_silent_hw = hardware.status.silent_only;
++		}
++		if ((e = nac_mic_afe_up(&hardware)) != 0) {
++			(void)nac_afe_down(&hardware);
++			if (nm_silent_hw && hardware.status.running) (void)nau_hw_stop(&hardware);
++			mic_down(e);
++			return;
++		}
++		lck_mtx_lock(&nmic_lock);
++		nmic_ring_reset(&nmic, nmic_prime, nmic_max);
++		lck_mtx_unlock(&nmic_lock);
++		nm_fed_us = now_us();
++		nmic_sessions++;
++		nmic_state = NM_ACTIVE;
++		nac_note(NM_CALL_PHASE, 0);
++		return;
++	case NM_ACTIVE:
++		if (mic_wanted() && hardware.status.running) return;
++		(void)nac_afe_down(&hardware);           /* nothing to restore when the AFE is already off */
++		if (nm_silent_hw && hardware.status.running) (void)nau_hw_stop(&hardware);
++		mic_session_end();
++		nm_silent_hw = 0;
++		mic_down(hardware.status.running || !hardware.status.error ? 0 : hardware.status.error);
++		return;
++	case NM_DOWN_SUBMIT:
++		if (nac_mic_pmic_submit(0) == 0) nmic_state = NM_DOWN_WAIT;
++		return;
++	case NM_DOWN_WAIT:
++		if (!nac_mic_pmic_poll(&err)) return;
++		if (err && !nmic_rc) nmic_rc = err;
++		nac_note(0, nmic_rc);
++		if (nmic_rc && ++nmic_fails >= 3) nmic_state = NM_FAILED;   /* stays off until every reader has closed */
++		else { if (!nmic_rc) nmic_fails = 0; nmic_state = NM_IDLE; }
++		return;
++	case NM_FAILED:
++		if (!__atomic_load_n(&nmic_users, __ATOMIC_RELAXED)) { nmic_state = NM_IDLE; nmic_fails = 0; }
++		return;
++	default:
++		nmic_state = NM_IDLE;
++	}
++}
++
++/* Restart a silent speaker path with the amplifiers (sound arrived while recording).  Worker, hardware running. */
++static int
++mic_upgrade(void)
++{
++	int e;
++	(void)nac_afe_down(&hardware);
++	(void)nau_hw_stop(&hardware);
++	if ((e = start(0, 0)) != 0) return e;
++	nm_silent_hw = 0;
++	nmic_upgrades++;
++	return nac_mic_afe_up(&hardware);
++}
++
++/* Recording: every worker pass while NM_ACTIVE and the hardware runs (instead of the playback feed). */
++static void
++mic_feed(void)
++{
++	int16_t mono[512], pcm[NSA_CHUNK * 2];
++	unsigned n, room;
++	uint64_t t;
++	nac_tick(&hardware);                       /* MTKAIF calibration (first use of the boot), codec monitors */
++	n = nac_mic_take(&hardware, mono, 512);
++	if (n) {
++		nmic_gain(mono, n, nmic_gain_q8);
++		lck_mtx_lock(&nmic_lock);
++		nmic_ring_push(&nmic, mono, n);
++		lck_mtx_unlock(&nmic_lock);
++		wakeup(&nmic);
++	}
++	/* the speaker path: what the HAL plays, or zeros, so the 750 ms input watchdog never stops the AFE */
++	room = NAH_QUEUE_FRAMES - hardware.status.queued_frames;
++	if (room > NSA_CHUNK) room = NSA_CHUNK;
++	lck_mtx_lock(&nsa_lock);
++	n = nsa_dequeue(&stream, pcm, room);
++	lck_mtx_unlock(&nsa_lock);
++	t = now_us();
++	if (n && nm_silent_hw && nmic_upgrade && nmic_has_sound(pcm, n)) {
++		int e = mic_upgrade();
++		if (e) { nmic_rc = e; return; }         /* NM_ACTIVE sees the hardware stopped / AFE down at its next poll */
++		if (!hardware.status.running) return;
++	}
++	if (!n && t - nm_fed_us >= 100000 && hardware.status.queued_frames < NSA_CHUNK && room >= NSA_CHUNK) {
++		for (unsigned i = 0; i < NSA_CHUNK * 2; i++) pcm[i] = 0;
++		n = NSA_CHUNK;
++	}
++	if (n) { (void)nau_hw_feed(&hardware, pcm, n); nm_fed_us = t; }
++}
++
++static void
++mic_initialize(void)
++{
++	int major = cdevsw_add(-1, &mic_cdev);
++	if (major < 0) { printf("NORD2 MIC: no device major\n"); return; }
++	if (!devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-mic")) {
++		(void)cdevsw_remove(major, &mic_cdev);
++		printf("NORD2 MIC: devfs failed\n");
++		return;
++	}
++	printf("NORD2 MIC: devfs redwood-mic rate=48000 channels=1 bits=16 prime=%u max=%u\n", nmic_prime, nmic_max);
++}
++#endif /* NMIC_RING_ONLY */

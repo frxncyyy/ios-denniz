@@ -1,0 +1,160 @@
+--- a/bsd/dev/nord2_gpsdl.inc
++++ b/bsd/dev/nord2_gpsdl.inc
+@@ -260,10 +260,10 @@
+ 	{ N2G_CFG_GALS_CONN2GPS, 1u << 4, 1u << 7 }, { N2G_CFG_GALS_CONN2GPS, 1u << 0, 1u << 3 },
+ 	{ N2G_CFG_GALS_GPS2CONN, 1u << 4, 1u << 7 }, { N2G_CFG_GALS_GPS2CONN, 1u << 0, 1u << 3 },
+ };
+-static const char *const n2gl_name[19] = { "", "GPS wake vote", "read conn_infra cfg page", "read conn_infra RGU page",
++static const char *const n2gl_name[20] = { "", "GPS wake vote", "read conn_infra cfg page", "read conn_infra RGU page",
+ 	"read WB_STA + GPS CSRs", "GPS EMI remap", "BGFSYS_ON_TOP power", "GP_FUNCTION_EN + BGF acks", "GALS sleep protection off",
+ 	"gps_top_off ACTIVE check", "A-die top clock", "read GPS bus (first)", "GPS CLKGEN1 DIGCK", "L1 DSP pwr_stat ON",
+-	"read GPS RGU_ON page", "L1 power on + soft reset release", "USRT on + DSP ROM okay", "5 s powered", "HOLD" };
++	"read GPS RGU_ON page", "L1 power on + soft reset release", "USRT on + DSP ROM okay", "5 s powered", "HOLD", "L1 read-only probe" };
+ /* 0357: GPS RGU_ON (bus 0x80000000 -> AP 0x18c00000) and CFG_ON (0x80001000 -> 0x18c01000), plat/v010 gps_rgu_on.h / gps_cfg_on.h */
+ #define N2G_GPS_RGU_L1_CR          0x18c00014u   /* [0] RGU_GPS_L1_ON [5] RGU_GPS_L1_SOFT_RST_B */
+ #define N2G_GPS_RGU_L1_DLY_CHAIN   0x18c00160u   /* [19:16] MEM_PDN_DELAY_DUMMY_NUM (vendor 5) */
+@@ -407,6 +407,111 @@
+ 	if (done[1]) { n2gl_field(N2G_CSR_WAKEPU_GPS, 1u, n2gl_o.vote); n2gl_show("ack after vote release", N2G_CSR_SLP_PROT_CTRL); }
+ 	return clean;
+ }
++/*
++ * 0358 (q10jr7b): q10jr7 l7b: after L1_ON + SOFT_RST_B the L1 sleep-power state read 0x33 at once, but every USRT word stayed
++ * 0xffffffff. Ladder K=19 runs steps 1..15 and then this READ-ONLY probe (no write at all), safest groups first, each value
++ * printed as it is read and 20 ms given to the console between groups (30 ms before each unknown page of group 8), so a reset
++ * localises to the group/address. Pages outside the GNSS list are mapped read-only-in-practice from kernel_map
++ * (ml_io_map_unmappable, Device), bypassing the write allow-list: this function never writes.
++ *   P1 USRT 0x18c73004 timeline: 20 reads 100 us apart, then 20 reads 1 ms apart (first non-0xffffffff time)
++ *   P2 conn_infra GPS config: 0x18001878 PWRCTRL0, 0x18001834/38/3c RC_CTL (GPSSYS_OSC_RC_EN = 0x18001834[4]), 0x180010f0
++ *      light security, 0x18001860 PWRCTRL0, 0x18001a00 CKGEN_BUS, 0x18005088/94/98 WB_GPS, 0x180601dc GPS peri remap, 0x18000090
++ *   P3 GPS RGU_ON 0x18c00000..1c, 0x18c00048..5c (L1 DSP P/X/Y RAM PDN/SLP), 0x18c00214 (L5 CR)
++ *   P4 GPS CFG_ON 0x18c01000..1c, 0x18c01024, 0x18c0103c
++ *   P5 GPS AON top 0x18c73100..11c, TCXO ms counter 0x18c73114/118 again after 2 ms (moves only if clocked)
++ *   P6 BGF_GPS_CFG 0x18c21010 (IP version) / 14, BGF_GPS_DMA 0x18c10108/0x18c10148
++ *   P7 USRT L1 0x18c73000/0c/10/20/24/30/50/54, L5 USRT 0x18c83004, GPS sys adrdec 0x18c70400/404
++ *   P8 first word of 0x18c70000, 71000, 72000, 74000 .. 7f000 (unknown blocks, last)
++ */
++#define N2GP_MAXPG 32
++static uint32_t n2gp_pg[N2GP_MAXPG];
++static vm_offset_t n2gp_va[N2GP_MAXPG];
++static uint32_t
++n2gp_rd(uint32_t pa, bool *ok)
++{
++	*ok = false;
++	if (!n2gl_guard()) { return 0xffffffffu; }
++	uint32_t pg = pa & ~0xfffu;
++	int i;
++	for (i = 0; i < N2GP_MAXPG && n2gp_pg[i] && n2gp_pg[i] != pg; i++) { }
++	if (i == N2GP_MAXPG) { printf("NORD2 GNSS PROBE: page table full at %#x\n", pa); return 0xffffffffu; }
++	if (!n2gp_pg[i]) {
++		vm_offset_t va = ml_io_map_unmappable(pg, 0x1000, VM_WIMG_IO);
++		if (!va) { printf("NORD2 GNSS PROBE: map %#x failed\n", pg); return 0xffffffffu; }
++		n2gp_pg[i] = pg; n2gp_va[i] = va;
++	}
++	*ok = true;
++	return *(volatile uint32_t *)(n2gp_va[i] + (pa & 0xfffu));
++}
++static bool
++n2gp_show(int g, uint32_t pa)
++{
++	bool ok;
++	uint32_t v = n2gp_rd(pa, &ok);
++	if (ok) { printf("NORD2 GNSS PROBE P%d: %#x = %#x\n", g, pa, v); }
++	return ok;
++}
++static bool
++n2gp_range(int g, uint32_t pa, uint32_t end)
++{
++	for (; pa <= end; pa += 4) { if (!n2gp_show(g, pa)) { return false; } }
++	return true;
++}
++static int
++n2gl_probe(void)
++{
++	bool ok;
++	/* P1 */
++	printf("NORD2 GNSS PROBE P1: USRT CTRL 0x18c73004 timeline\n"); delay(20000);
++	int first = -1; uint32_t v = 0, last = 0;
++	for (int i = 0; i < 40; i++) {
++		v = n2gp_rd(0x18c73004u, &ok);
++		if (!ok) { return N2G_E_ARG; }
++		if (v != 0xffffffffu && first < 0) { first = i; }
++		if (i == 0 || v != last) { printf("NORD2 GNSS PROBE P1: read %d (%s) = %#x\n", i, i < 20 ? "100us" : "1ms", v); }
++		last = v;
++		delay(i < 20 ? 100 : 1000);
++	}
++	printf("NORD2 GNSS PROBE P1: %s\n", first < 0 ? "USRT never answered within ~22 ms" : "USRT answered");
++	/* P2 */
++	delay(20000);
++	static const uint32_t p2[] = { 0x18001878u, 0x18001834u, 0x18001838u, 0x1800183cu, 0x180010f0u, 0x18001860u, 0x18001a00u,
++		0x18005088u, 0x18005094u, 0x18005098u, 0x180601dcu, 0x18000090u };
++	for (unsigned i = 0; i < sizeof p2 / sizeof p2[0]; i++) { if (!n2gp_show(2, p2[i])) { return N2G_E_ARG; } }
++	/* P3 */
++	delay(20000);
++	if (!n2gp_range(3, 0x18c00000u, 0x18c0001cu) || !n2gp_range(3, 0x18c00048u, 0x18c0005cu) || !n2gp_show(3, 0x18c00214u)) { return N2G_E_ARG; }
++	/* P4 */
++	delay(20000);
++	if (!n2gp_range(4, 0x18c01000u, 0x18c0101cu) || !n2gp_show(4, 0x18c01024u) || !n2gp_show(4, 0x18c0103cu)) { return N2G_E_ARG; }
++	/* P5 */
++	delay(20000);
++	if (!n2gp_range(5, 0x18c73100u, 0x18c7311cu)) { return N2G_E_ARG; }
++	delay(2000);
++	if (!n2gp_show(5, 0x18c73114u) || !n2gp_show(5, 0x18c73118u)) { return N2G_E_ARG; }
++	/* P6 */
++	delay(20000);
++	printf("NORD2 GNSS PROBE P6: BGF_GPS_CFG / BGF_GPS_DMA (new pages)\n"); delay(20000);
++	if (!n2gp_show(6, 0x18c21010u) || !n2gp_show(6, 0x18c21014u) || !n2gp_show(6, 0x18c10108u) || !n2gp_show(6, 0x18c10148u)) { return N2G_E_ARG; }
++	/* P7 */
++	delay(20000);
++	static const uint32_t p7[] = { 0x18c73000u, 0x18c7300cu, 0x18c73010u, 0x18c73020u, 0x18c73024u, 0x18c73030u, 0x18c73050u, 0x18c73054u,
++		0x18c83004u, 0x18c70400u, 0x18c70404u };
++	for (unsigned i = 0; i < sizeof p7 / sizeof p7[0]; i++) {
++		if (p7[i] == 0x18c83004u || p7[i] == 0x18c70400u) { printf("NORD2 GNSS PROBE P7: next %#x (new page)\n", p7[i]); delay(30000); }
++		if (!n2gp_show(7, p7[i])) { return N2G_E_ARG; }
++	}
++	/* P8 */
++	delay(20000);
++	for (uint32_t pg = 0x18c70000u; pg <= 0x18c7f000u; pg += 0x1000u) {
++		if (pg == 0x18c73000u) { continue; }
++		printf("NORD2 GNSS PROBE P8: next %#x\n", pg); delay(30000);
++		if (!n2gp_show(8, pg)) { return N2G_E_ARG; }
++	}
++	printf("NORD2 GNSS PROBE: done\n");
++	return 0;
++}
++
+ static uint32_t
+ n2gd_ladder(int k)
+ {
+@@ -419,9 +524,9 @@
+ 	if (!ok) { return 0x01000000u; }
+ 	if (n2gd_hw(&n2gl_hw)) { return 0x0300u; }
+ 	if (k == 18 && n2gd.powered) { printf("NORD2 GNSS LAD 18: already held\n"); return 1; }
+-	int last = k <= 16 ? k : 16, rc = 0, s;
++	int last = k <= 16 ? k : (k == 19 ? 15 : 16), rc = 0, s;
+ 	for (s = 1; s <= last && !rc; s++) {
+-		if (s == k || (k >= 17 && s == 16)) { printf("NORD2 GNSS LAD %d: about to run NEW step %d (%s)\n", k, s, n2gl_name[s]); delay(2000000); }
++		if (s == k || (k >= 17 && k <= 18 && s == 16) || (k == 19 && s == 15)) { printf("NORD2 GNSS LAD %d: about to run NEW step %d (%s)\n", k, s, n2gl_name[s]); delay(2000000); }
+ 		else { printf("NORD2 GNSS LAD %d: step %d (%s)\n", k, s, n2gl_name[s]); }
+ 		rc = n2gl_do(s, done);
+ 		if (n2gl_stop) { return ((uint32_t)s << 8) | 0x01000000u; }
+@@ -437,6 +542,12 @@
+ 		printf("NORD2 GNSS LAD 18: HOLD, GNSS left powered (conn_infra %#x), NOT rolled back until reboot\n", n2gd.conn_hw_ver);
+ 		return 1;
+ 	}
++	if (!rc && k == 19) {
++		printf("NORD2 GNSS LAD 19: about to run the READ-ONLY L1 probe (P1..P8)\n"); delay(2000000);
++		rc = n2gl_probe();
++		if (n2gl_stop) { return 0x01000000u | 0x1300u; }
++		if (rc) { failed = 19; }
++	}
+ 	if (!rc && k == 17) {
+ 		for (int t = 1; t <= 5 && !n2gl_stop; t++) {
+ 			delay(1000000);
+@@ -558,6 +669,7 @@
+ 	case (uint32_t)N2GD_IOC(156):                            /* 0357: ladder steps 14..16, 17 = 5 s, 18 = hold */
+ 	case (uint32_t)N2GD_IOC(157):
+ 	case (uint32_t)N2GD_IOC(158):
++	case (uint32_t)N2GD_IOC(159):                            /* 0358: K=19 = steps 1..15 + read-only L1 probe */
+ 		lck_mtx_lock(&n2gd_lock);
+ 		v = n2gd_ladder((int)((uint32_t)cmd & 0xff) - 140);
+ 		lck_mtx_unlock(&n2gd_lock);

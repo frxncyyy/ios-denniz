@@ -1,0 +1,86 @@
+--- a/bsd/dev/nord2_gpsdl.inc
++++ b/bsd/dev/nord2_gpsdl.inc
+@@ -115,6 +115,45 @@
+ 	printf("NORD2 GNSS ACC %u: write %#x = %#x\n", ++n2gd_acc, pa, v); delay(20000);
+ 	n2gd_inner.write32(n2gd_inner.ctx, pa, v);
+ }
++/*
++ * 0354 (q10jr4): after q10jr3 step 2 reset the phone (first host-CSR read), every single conn_infra access is its own
++ * ioctl, done the way the Wi-Fi driver does it: the six always-on predicates AND its GIC check (GICD+0x130 bits 23/26
++ * clear), Wi-Fi's own mapping of the host CSR page (npa_native.host, not a new ml_io_map), the Wi-Fi software state
++ * printed first (ap/wf ownership, asleep, stage: no register read), and a 2 s pause after the marker so the console
++ * drains before the access:
++ *   111: no access: predicates + GIC + Wi-Fi software state only
++ *   112: read 0x180601a0 (Wi-Fi's own HOST wake vote register; Wi-Fi reads it in nwfn wake/release)
++ *   113: read 0x18060184 (on2off sleep-protection ack; Wi-Fi polls it after its vote)
++ *   114: read 0x180601ac (GPS wake vote register from the vendor v010 headers; NOT one Wi-Fi ever touches)
++ *   115: ml_io_map of the 6 GNSS pages only, no access (tests the mapping step of q10jr3 step 2)
++ */
++static bool n2gd_wifi_guard(uint32_t out[9]);                    /* sweet_touch.c: predicates + GIC + Wi-Fi state */
++static vm_offset_t n2gd_wifi_host(void);                         /* sweet_touch.c: npa_native.host (0x18060000 page) */
++static uint32_t
++n2gd_single(int k)
++{
++	uint32_t g[9] = {0};
++	bool ok = n2gd_wifi_guard(g);
++	printf("NORD2 GNSS ONE %d: spm304=%#x gals504=%#x infra228=%#x infra724=%#x gic130=%#x wifi ap=%u wf=%u asleep=%u stage=%u -> %s\n",
++	    k, g[0], g[3], g[4], g[5], g[6], g[7] >> 16, g[7] & 0xffff, g[8] >> 16, g[8] & 0xffff, ok ? "guard ok" : "GUARD REFUSES");
++	if (k == 1) { return 1; }
++	if (!ok) { return 0x0100u; }
++	if (k == 5) {
++		struct n2g_hw hw;
++		printf("NORD2 GNSS ONE 5: about to ml_io_map the 6 GNSS pages (no access)\n"); delay(2000000);
++		int e = n2gd_hw(&hw);
++		printf("NORD2 GNSS ONE 5: mapped, rc=%d\n", e);
++		return e ? 0x0300u : 1u;
++	}
++	vm_offset_t host = n2gd_wifi_host();
++	if (!host) { printf("NORD2 GNSS ONE %d: no Wi-Fi host mapping\n", k); return 0x0400u; }
++	uint32_t off = k == 2 ? 0x1a0u : k == 3 ? 0x184u : 0x1acu;
++	printf("NORD2 GNSS ONE %d: about to read %#x through the Wi-Fi host mapping\n", k, 0x18060000u + off); delay(2000000);
++	uint32_t val = *(volatile uint32_t *)(host + off);
++	printf("NORD2 GNSS ONE %d: %#x = %#x\n", k, 0x18060000u + off, val);
++	return 1;
++}
++
+ static uint32_t
+ n2gd_step(int step)
+ {
+@@ -195,6 +234,15 @@
+ 	case (uint32_t)N2GD_IOC(GPSDL_IOC_GIVE_GPS_WAKELOCK):
+ 		v = 0;                                           /* no wakelocks on XNU */
+ 		break;
++	case (uint32_t)N2GD_IOC(111):                            /* 0354 single accesses, one per boot */
++	case (uint32_t)N2GD_IOC(112):
++	case (uint32_t)N2GD_IOC(113):
++	case (uint32_t)N2GD_IOC(114):
++	case (uint32_t)N2GD_IOC(115):
++		lck_mtx_lock(&n2gd_lock);
++		v = n2gd_single((int)((uint32_t)cmd & 0xff) - 110);
++		lck_mtx_unlock(&n2gd_lock);
++		break;
+ 	case (uint32_t)N2GD_IOC(101):                            /* 0353 single steps, one per call, markers first */
+ 	case (uint32_t)N2GD_IOC(102):
+ 	case (uint32_t)N2GD_IOC(103):
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -968,6 +968,19 @@
+ 	return (out[0] & 0x1f) == 0xd && (out[1] & 2) && (out[2] & 2) && (out[3] & 1) && !(out[4] & 0x2000) && !(out[5] & 4);
+ }
+ 
++/* 0354: Wi-Fi's guard, read-only: the six predicates, its GIC check (GICD+0x130 bits 23/26 must be clear) and the Wi-Fi
++ * driver's software ownership state (no register). out[6] = GICD+0x130, out[7] = ap<<16|wf, out[8] = asleep<<16|stage. */
++static bool
++n2gd_wifi_guard(uint32_t out[9])
++{
++	bool ok = n2gd_ao_predicates(out);
++	out[6] = nwfn_native.gic_va ? *(volatile uint32_t *)(nwfn_native.gic_va + 0x130) : 0xffffffffu;
++	out[7] = (nwfn_native.ap_owned << 16) | (nwfn_native.wf_owned & 0xffff);
++	out[8] = (nwfn_native.asleep << 16) | (nwfn_native.stage & 0xffff);
++	return ok && nwfn_native.gic_va && !(out[6] & ((1u << 23) | (1u << 26)));
++}
++static vm_offset_t n2gd_wifi_host(void) { return npa_native.host; }
++
+ #define N2GD_NPAGES 6
+ static const uint32_t n2gd_pages[N2GD_NPAGES] = { 0x18000000u, 0x18001000u, 0x18005000u, 0x18060000u, 0x18c01000u, 0x18c73000u };
+ static vm_offset_t n2gd_va[N2GD_NPAGES];

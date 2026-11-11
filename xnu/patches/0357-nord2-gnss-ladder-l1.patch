@@ -1,0 +1,200 @@
+--- a/bsd/dev/nord2_gpsdl.inc
++++ b/bsd/dev/nord2_gpsdl.inc
+@@ -180,6 +180,14 @@
+  *  12 GPS CLKGEN1 0x18c0103c[4] = 1                                                 rollback: [4] restored
+  *  13 L1 DSP on: 0x18c73108 [1:0] = 0, [3] = 0, [4] pulse; poll USRT D2AF 0x18c73024[3] (DSP ROM okay, 100 ms, info)
+  *                                                                                    rollback: [4:0] restored
++ * 0357 (q10jr7): q10jr6 lad13 passed (CLKGEN1 0x18c0103c read 0x10840, but every USRT word read 0xffffffff): the ladder
++ * never did plat/v010 gps_dl_hw_dep_set_dsp_on_and_poll_ack, the GPS L1 power/reset release in GPS RGU_ON. Now:
++ *  13 L1 DSP pwr_stat ON exactly as the vendor: [1:0] = 0, [3] = 0, [4] DIS_HW_RST_CNT = 1 (no pulse, no poll)
++ *  14 read only: GPS RGU_ON 0x18c00014/160/164 and CFG_ON 0x18c01020 (first access to the RGU_ON page)
++ *  15 L1_ON + SOFT_RST_B (0x18c00014 [0], [5]), poll 0x18c01020[3:0] == 3, MEM_ADJ_DLY_EN, DUMMY_NUM = 5, USRT readback
++ *  16 USRT on (DMA mode, 4-byte, interrupts left off), A2D1 = 0xe, A2DF3 = 1, poll D2AF3 (DSP ROM okay, 100 ms)
++ *  17 steps 1..16, 5 s powered with status reads, full rollback;  18 HOLD after 1..16 (not rolled back)
++ * The q10jr6 meaning of 14/15 below is replaced by 17/18.
+  *  14 HOLD: steps 1..13, then only the wake vote is released (as n2g_link_on does). NOT ROLLED BACK: GNSS stays powered
+  *     until the next reboot (needed for the data link; no power-off path exists in this image).
+  *  15 steps 1..13, 5 s powered with a status read every second, then the full rollback.
+@@ -198,7 +206,7 @@
+ static struct n2g_hw n2gl_hw;
+ static bool n2gl_stop;
+ static int n2gl_k;
+-static struct { uint32_t vote, emi, bgf, func, c2g, g2c, sel, adie, clk1, aon; } n2gl_o;
++static struct { uint32_t vote, emi, bgf, func, c2g, g2c, sel, adie, clk1, aon, l1cr, dly, mem; } n2gl_o;
+ static bool
+ n2gl_guard(void)
+ {
+@@ -252,12 +260,18 @@
+ 	{ N2G_CFG_GALS_CONN2GPS, 1u << 4, 1u << 7 }, { N2G_CFG_GALS_CONN2GPS, 1u << 0, 1u << 3 },
+ 	{ N2G_CFG_GALS_GPS2CONN, 1u << 4, 1u << 7 }, { N2G_CFG_GALS_GPS2CONN, 1u << 0, 1u << 3 },
+ };
+-static const char *const n2gl_name[16] = { "", "GPS wake vote", "read conn_infra cfg page", "read conn_infra RGU page",
++static const char *const n2gl_name[19] = { "", "GPS wake vote", "read conn_infra cfg page", "read conn_infra RGU page",
+ 	"read WB_STA + GPS CSRs", "GPS EMI remap", "BGFSYS_ON_TOP power", "GP_FUNCTION_EN + BGF acks", "GALS sleep protection off",
+-	"gps_top_off ACTIVE check", "A-die top clock", "read GPS bus (first)", "GPS CLKGEN1 DIGCK", "L1 DSP on", "HOLD", "5 s powered" };
++	"gps_top_off ACTIVE check", "A-die top clock", "read GPS bus (first)", "GPS CLKGEN1 DIGCK", "L1 DSP pwr_stat ON",
++	"read GPS RGU_ON page", "L1 power on + soft reset release", "USRT on + DSP ROM okay", "5 s powered", "HOLD" };
++/* 0357: GPS RGU_ON (bus 0x80000000 -> AP 0x18c00000) and CFG_ON (0x80001000 -> 0x18c01000), plat/v010 gps_rgu_on.h / gps_cfg_on.h */
++#define N2G_GPS_RGU_L1_CR          0x18c00014u   /* [0] RGU_GPS_L1_ON [5] RGU_GPS_L1_SOFT_RST_B */
++#define N2G_GPS_RGU_L1_DLY_CHAIN   0x18c00160u   /* [19:16] MEM_PDN_DELAY_DUMMY_NUM (vendor 5) */
++#define N2G_GPS_RGU_L1_MEM_DLY     0x18c00164u   /* [31] MEM_ADJ_DLY_EN */
++#define N2G_GPS_CFG_L1_SLP_PWR     0x18c01020u   /* [3:0] GPS_L1_SLP_PWR_CTL_CS: poll == 3 after L1 on */
+ /* one ladder step; 0 or an n2g error code. done[] is set before the first write so a partial step is rolled back. */
+ static int
+-n2gl_do(int s, bool done[16])
++n2gl_do(int s, bool done[19])
+ {
+ 	switch (s) {
+ 	case 1:
+@@ -319,24 +333,62 @@
+ 	case 12:
+ 		n2gl_o.clk1 = n2gl_rd(N2G_GPS_CLKGEN1_CTL); done[12] = true;
+ 		return n2gl_field(N2G_GPS_CLKGEN1_CTL, 1u << 4, 1u << 4) ? 0 : N2G_E_ARG;
+-	case 13: {
++	case 13:
++		/* gps_dl_hw_gps_pwr_stat_ctrl(GPS_L1_DSP_ON): PWR_STAT = 0, FORCE_OSC_EN_ON = 0, DIS_HW_RST_CNT = 1 (and it stays 1;
++		 * q10jr6 pulsed it back to 0, which is the OFF value) */
+ 		n2gl_o.aon = n2gl_rd(N2G_GPS_AON_DSLEEP_CTL); done[13] = true;
+ 		if (!n2gl_field(N2G_GPS_AON_DSLEEP_CTL, 0x3u, 0) || !n2gl_field(N2G_GPS_AON_DSLEEP_CTL, 1u << 3, 0) ||
+-		    !n2gl_field(N2G_GPS_AON_DSLEEP_CTL, 1u << 4, 1u << 4) || !n2gl_field(N2G_GPS_AON_DSLEEP_CTL, 1u << 4, 0)) { return N2G_E_ARG; }
++		    !n2gl_field(N2G_GPS_AON_DSLEEP_CTL, 1u << 4, 1u << 4)) { return N2G_E_ARG; }
++		return 0;
++	case 14:
++		n2gl_show("GPS RGU_ON L1_CR", N2G_GPS_RGU_L1_CR); n2gl_show("GPS RGU_ON L1_DLY_CHAIN", N2G_GPS_RGU_L1_DLY_CHAIN);
++		n2gl_show("GPS RGU_ON L1_MEM_DLY", N2G_GPS_RGU_L1_MEM_DLY); n2gl_show("GPS CFG_ON L1_SLP_PWR_CTL", N2G_GPS_CFG_L1_SLP_PWR);
++		return n2gl_stop ? N2G_E_ARG : 0;
++	case 15:
++		/* plat/v010 gps_dl_hw_dep_set_dsp_on_and_poll_ack(L1): L1_ON = 1, SOFT_RST_B = 1, poll SLP_PWR_CTL_CS == 3,
++		 * MEM_ADJ_DLY_EN = 1, MEM_PDN_DELAY_DUMMY_NUM = 5; then 100 us (3 x 32k) before the USRT is touched */
++		n2gl_o.l1cr = n2gl_rd(N2G_GPS_RGU_L1_CR); n2gl_o.dly = n2gl_rd(N2G_GPS_RGU_L1_DLY_CHAIN); n2gl_o.mem = n2gl_rd(N2G_GPS_RGU_L1_MEM_DLY);
++		done[15] = true;
++		if (!n2gl_field(N2G_GPS_RGU_L1_CR, 1u, 1u) || !n2gl_field(N2G_GPS_RGU_L1_CR, 1u << 5, 1u << 5)) { return N2G_E_ARG; }
++		if (!n2gl_poll(N2G_GPS_CFG_L1_SLP_PWR, 0xfu, 3u, 10000, "L1 SLP_PWR_CTL_CS == 3")) { return N2G_E_GPS_TOP; }
++		if (!n2gl_field(N2G_GPS_RGU_L1_MEM_DLY, 1u << 31, 1u << 31) || !n2gl_field(N2G_GPS_RGU_L1_DLY_CHAIN, 0xfu << 16, 5u << 16)) { return N2G_E_ARG; }
++		delay(100);
++		n2gl_show("USRT CTRL", N2G_USRT_CTRL(0)); n2gl_show("USRT INTEN", N2G_USRT_INTEN(0)); n2gl_show("USRT STA", N2G_USRT_STA(0));
++		n2gl_show("USRT A2DF", N2G_USRT_A2DF(0)); n2gl_show("USRT D2AF", N2G_USRT_D2AF(0)); n2gl_show("USRT A2D1", N2G_USRT_A2D1(0));
++		return n2gl_stop ? N2G_E_ARG : 0;
++	case 16: {
++		/* gps_dl_hw_usrt_ctrl(L1, on, DMA mode, 4-byte): BYTEN = 0, TX_EN = 1, RX_EN = 1, A2D1 = 0x000e (MVCD speed-up |
++		 * A-die MT6635 E2+ | 4-byte), A2DF3 = 1, then poll D2AF3 = DSP ROM okay. DEVIATION: the vendor also sets
++		 * INTEN TXIEN/NODAIEN; they stay 0 here (no GNSS interrupt handler exists; polling only). */
++		uint32_t ctl = n2gl_rd(N2G_USRT_CTRL(0));
++		if (n2gl_stop) { return N2G_E_ARG; }
++		if (ctl == 0xffffffffu) { printf("NORD2 GNSS LAD %d: USRT still reads 0xffffffff, not touching it\n", n2gl_k); return N2G_E_GPS_TOP; }
++		done[16] = true;
++		if (!n2gl_field(N2G_USRT_CTRL(0), 0xbu, 0x3u) || !n2gl_field(N2G_USRT_A2D1(0), 0xffffu, 0x000eu) ||
++		    !n2gl_field(N2G_USRT_A2DF(0), 1u << 3, 1u << 3)) { return N2G_E_ARG; }
+ 		bool rom = n2gl_poll(N2G_USRT_D2AF(0), 1u << 3, 1u << 3, 100000, "DSP ROM okay (USRT D2AF3)");
+ 		n2gl_show("USRT STA", N2G_USRT_STA(0));
+-		printf("NORD2 GNSS LAD %d: L1 DSP %s\n", n2gl_k, rom ? "ROM answered" : "no D2AF3 within 100 ms (info only, needs USRT on)");
+-		return n2gl_stop ? N2G_E_ARG : 0;
++		if (n2gl_stop) { return N2G_E_ARG; }
++		printf("NORD2 GNSS LAD %d: L1 DSP %s\n", n2gl_k, rom ? "ROM OKAY: ready for the MVCD download over the data link" : "ROM did not answer within 100 ms");
++		return rom ? 0 : 9;                                     /* N2G_E_TIMEOUT (not in the 0350 header) */
+ 	}
+ 	}
+ 	return 0;
+ }
+ /* rollback of the done steps, restoring the saved original bits; vendor off order (sleep protection first) */
+ static bool
+-n2gl_undo(bool done[16])
++n2gl_undo(bool done[19])
+ {
+ 	bool clean = true;
++	/* 0357: vendor GPS_L1_DSP_OFF order: USRT off (TX/RX/IEN = 0), pwr_stat, then set_dsp_off (SOFT_RST_B = 0, L1_ON = 0).
++	 * The USRT read 0xffffffff before L1 was on, so its rollback target is the vendor off value, not the saved word. */
++	if (done[16]) { n2gl_field(N2G_USRT_CTRL(0), 0x3u, 0); n2gl_field(N2G_USRT_INTEN(0), 0x3u, 0); }
+ 	if (done[13]) { n2gl_field(N2G_GPS_AON_DSLEEP_CTL, 0x1fu, n2gl_o.aon); }
++	if (done[15]) {
++		n2gl_field(N2G_GPS_RGU_L1_CR, 1u << 5, n2gl_o.l1cr); n2gl_field(N2G_GPS_RGU_L1_CR, 1u, n2gl_o.l1cr);
++		n2gl_field(N2G_GPS_RGU_L1_MEM_DLY, 1u << 31, n2gl_o.mem); n2gl_field(N2G_GPS_RGU_L1_DLY_CHAIN, 0xfu << 16, n2gl_o.dly);
++		n2gl_show("L1 SLP_PWR_CTL after", N2G_GPS_CFG_L1_SLP_PWR);
++	}
+ 	if (done[8]) {
+ 		static const int order[4] = { 1, 0, 3, 2 };              /* conn2gps tx, conn2gps rx, gps2conn tx, gps2conn rx */
+ 		for (int j = 0; j < 4; j++) {
+@@ -359,39 +411,39 @@
+ n2gd_ladder(int k)
+ {
+ 	uint32_t g[9] = {0};
+-	bool done[16] = {false};
++	bool done[19] = {false};
+ 	n2gl_k = k; n2gl_stop = false;
+ 	bool ok = n2gd_wifi_guard(g) && (g[7] >> 16) == 1 && (g[8] >> 16) == 0;
+ 	printf("NORD2 GNSS LAD %d (%s): spm304=%#x gals504=%#x infra228=%#x infra724=%#x gic130=%#x wifi ap=%u wf=%u asleep=%u stage=%u -> %s\n",
+ 	    k, n2gl_name[k], g[0], g[3], g[4], g[5], g[6], g[7] >> 16, g[7] & 0xffff, g[8] >> 16, g[8] & 0xffff, ok ? "guard ok" : "GUARD REFUSES");
+ 	if (!ok) { return 0x01000000u; }
+ 	if (n2gd_hw(&n2gl_hw)) { return 0x0300u; }
+-	if (k == 14 && n2gd.powered) { printf("NORD2 GNSS LAD 14: already held\n"); return 1; }
+-	int last = k <= 13 ? k : 13, rc = 0, s;
++	if (k == 18 && n2gd.powered) { printf("NORD2 GNSS LAD 18: already held\n"); return 1; }
++	int last = k <= 16 ? k : 16, rc = 0, s;
+ 	for (s = 1; s <= last && !rc; s++) {
+-		if (s == k || (k >= 14 && s == 13)) { printf("NORD2 GNSS LAD %d: about to run NEW step %d (%s)\n", k, s, n2gl_name[s]); delay(2000000); }
++		if (s == k || (k >= 17 && s == 16)) { printf("NORD2 GNSS LAD %d: about to run NEW step %d (%s)\n", k, s, n2gl_name[s]); delay(2000000); }
+ 		else { printf("NORD2 GNSS LAD %d: step %d (%s)\n", k, s, n2gl_name[s]); }
+ 		rc = n2gl_do(s, done);
+ 		if (n2gl_stop) { return ((uint32_t)s << 8) | 0x01000000u; }
+ 		printf("NORD2 GNSS LAD %d: step %d %s\n", k, s, rc ? "FAILED" : "done");
+ 	}
+ 	int failed = rc ? s - 1 : 0;
+-	if (!rc && k == 14) {
++	if (!rc && k == 18) {
+ 		/* HOLD: power stays on, only the GPS wake vote is released (n2g_link_on order). Not undoable in this image. */
+ 		n2gl_field(N2G_CSR_WAKEPU_GPS, 1u, n2gl_o.vote);
+-		if (n2gl_stop) { return 0x01000000u | 0x0e00u; }
++		if (n2gl_stop) { return 0x01000000u | 0x1200u; }
+ 		n2gd.powered = true; n2gd.hw_valid = true; n2gd.last_err = 0;
+ 		n2gd.conn_hw_ver = n2gl_rd(N2G_CONN_HW_VER);
+-		printf("NORD2 GNSS LAD 14: HOLD, GNSS left powered (conn_infra %#x), NOT rolled back until reboot\n", n2gd.conn_hw_ver);
++		printf("NORD2 GNSS LAD 18: HOLD, GNSS left powered (conn_infra %#x), NOT rolled back until reboot\n", n2gd.conn_hw_ver);
+ 		return 1;
+ 	}
+-	if (!rc && k == 15) {
++	if (!rc && k == 17) {
+ 		for (int t = 1; t <= 5 && !n2gl_stop; t++) {
+ 			delay(1000000);
+ 			uint32_t sta = n2gl_rd(N2G_USRT_STA(0)), d2a = n2gl_rd(N2G_USRT_D2AF(0)), top = n2gl_rd(N2G_CSR_GPS_CFG2HOST_DBG), ack = n2gl_rd(N2G_RGU_BGFSYS_PWR_ACK);
+-			if (!n2gl_stop) { printf("NORD2 GNSS LAD 15: t=%ds usrt_sta=%#x d2af=%#x top=%#x bgf_ack=%#x\n", t, sta, d2a, top, ack); }
++			if (!n2gl_stop) { printf("NORD2 GNSS LAD 17: t=%ds usrt_sta=%#x d2af=%#x top=%#x bgf_ack=%#x\n", t, sta, d2a, top, ack); }
+ 		}
+-		if (n2gl_stop) { return 0x01000000u | 0x0f00u; }
++		if (n2gl_stop) { return 0x01000000u | 0x1100u; }
+ 	}
+ 	printf("NORD2 GNSS LAD %d: rolling back\n", k);
+ 	bool clean = n2gl_undo(done);
+@@ -503,6 +555,9 @@
+ 	case (uint32_t)N2GD_IOC(153):
+ 	case (uint32_t)N2GD_IOC(154):
+ 	case (uint32_t)N2GD_IOC(155):
++	case (uint32_t)N2GD_IOC(156):                            /* 0357: ladder steps 14..16, 17 = 5 s, 18 = hold */
++	case (uint32_t)N2GD_IOC(157):
++	case (uint32_t)N2GD_IOC(158):
+ 		lck_mtx_lock(&n2gd_lock);
+ 		v = n2gd_ladder((int)((uint32_t)cmd & 0xff) - 140);
+ 		lck_mtx_unlock(&n2gd_lock);
+--- a/bsd/dev/nord2_gnss_pwr.inc
++++ b/bsd/dev/nord2_gnss_pwr.inc
+@@ -100,6 +100,8 @@
+ 	N2G_CONN_HW_VER, N2G_RGU_BGFSYS_PWR_CTL, N2G_RGU_BGFSYS_PWR_ACK, N2G_CFG_GPS_PWRCTRL0, N2G_CFG_EMI_CTL,
+ 	N2G_CFG_GALS_CONN2GPS, N2G_CFG_GALS_GPS2CONN, N2G_CFG_ADIE_CTL, N2G_WTSLP_WB_STA, N2G_CSR_CONN2AP_GPS_EMI,
+ 	N2G_CSR_HOST2GPS_DBG_SEL, N2G_CSR_GPS_CFG2HOST_DBG, N2G_CSR_WAKEPU_GPS, N2G_CSR_SLP_PROT_CTRL, N2G_GPS_CLKGEN1_CTL, N2G_GPS_AON_DSLEEP_CTL,
++	/* 0357: GPS RGU_ON L1 control/delay (bus 0x80000014/160/164) and CFG_ON L1 sleep-power state (0x80001020) */
++	0x18c00014u, 0x18c00160u, 0x18c00164u, 0x18c01020u,
+ };
+ 
+ N2G_API int n2g_reg_allowed(uint32_t pa)
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -981,8 +981,8 @@
+ }
+ static vm_offset_t n2gd_wifi_host(void) { return npa_native.host; }
+ 
+-#define N2GD_NPAGES 6
+-static const uint32_t n2gd_pages[N2GD_NPAGES] = { 0x18000000u, 0x18001000u, 0x18005000u, 0x18060000u, 0x18c01000u, 0x18c73000u };
++#define N2GD_NPAGES 7                                      /* 0357: + GPS RGU_ON 0x18c00000 (mapped lazily, kernel_map) */
++static const uint32_t n2gd_pages[N2GD_NPAGES] = { 0x18000000u, 0x18001000u, 0x18005000u, 0x18060000u, 0x18c01000u, 0x18c73000u, 0x18c00000u };
+ static vm_offset_t n2gd_va[N2GD_NPAGES];
+ 
+ /*

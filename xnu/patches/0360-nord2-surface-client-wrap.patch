@@ -1,0 +1,134 @@
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -40,6 +40,7 @@
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+ 	uint32_t                  purgeable;    /* IOSurfaceSetPurgeable state (0 = non-volatile) */
++	uint32_t                  clientWired;  /* 0360: memory wraps the creator's pages (prepared; complete() at free), 0: buffer/physical */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+--- a/iokit/Kernel/arm/sweet_surface_abi.h
++++ b/iokit/Kernel/arm/sweet_surface_abi.h
+@@ -95,6 +95,25 @@
+  * images without a pixel-format code).  The surface keeps a SNAPSHOT copy of `used` bytes taken at creation: correct for the
+  * immutable images this path is used for (icons, layer contents), unlike zeros.  Returns 0 if the range is unusable.
+  */
++/*
++ * 0360: how much of the creator's memory a client-memory surface WRAPS (its pages, wired, shared with the GPU and every other
++ * process) instead of copying once: the whole allocation when the creator's range is page aligned and covers it, else the used
++ * range rounded up to pages (then the surface is no longer than its memory: importSurface refuses an import past the end and the
++ * driver converts on the CPU), else 0: keep the snapshot.  `page` is a power of two.
++ */
++static inline uint64_t
++sweet_client_wrap_bytes(uint64_t address, uint64_t used, uint64_t alloc, uint64_t page)
++{
++	if (address == 0 || used == 0 || page == 0 || (page & (page - 1)) != 0 || (address & (page - 1)) != 0 || used > alloc) {
++		return 0;
++	}
++	uint64_t round_alloc = (alloc + page - 1) & ~(page - 1), round_used = (used + page - 1) & ~(page - 1);
++	if (address + round_alloc < address || address + round_used < address) {
++		return 0;
++	}
++	return round_used >= alloc ? round_alloc : round_used;
++}
++
+ static inline uint64_t
+ sweet_client_range_bytes(uint64_t address, uint64_t offset, uint64_t rows_bytes, uint64_t plane_end, uint64_t alloc)
+ {
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -107,6 +107,9 @@
+ 		OSDecrementAtomic((volatile SInt32 *)&sweet_surface_buffers);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
++	if (clientWired && memory != NULL) {
++		memory->complete(kIODirectionInOut);    /* 0360: the creator's pages, wired at creation */
++	}
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+@@ -121,7 +124,7 @@
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(kIOMapWriteCombineCache);
++		kernelMap = memory->map(clientWired ? kIOMapDefaultCache : kIOMapWriteCombineCache);   /* 0360: the creator's cached pages */
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -982,13 +985,48 @@
+ 				uint64_t address = client->unsigned64BitValue();
+ 				uint64_t used = sweet_client_range_bytes(address, s->offset, rows, plane_end, s->allocSize);
+ 				int err = used == 0 ? EINVAL : copyin((user_addr_t)address, mem->getBytesNoCopy(), (size_t)used);
++				/*
++				 * 0360: the creator keeps writing its own memory after the creation (Photos fills its thumbnail buffers after
++				 * wrapping them), and with a snapshot the GPU and every other process saw the picture as it was at the creation
++				 * (black) while the creator's CPU saw its own pages (run lm1: raw-check cpu=c0bdbf.. gpu=00..).  So the creator's
++				 * pages themselves become the surface: wrapped in its task and wired (prepare), mapped for every other user and
++				 * imported by the GPU as they are.  When they cannot be (unaligned, unmapped, not wireable) the snapshot stays.
++				 */
++				const char *how = err ? "refused" : "snapshot copied";
++				if (!err) {
++					uint64_t wrap = sweet_client_wrap_bytes(address, used, s->allocSize, PAGE_SIZE);
++					IOMemoryDescriptor *md = wrap != 0 ? IOMemoryDescriptor::withAddressRange((mach_vm_address_t)address,
++					    (mach_vm_size_t)wrap, kIODirectionInOut, current_task()) : NULL;
++					if (md != NULL && md->prepare(kIODirectionInOut) == kIOReturnSuccess) {
++						/* the buffer is not used: give its budget back (free() only counts buffer surfaces) */
++						OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++						OSDecrementAtomic((volatile SInt32 *)&sweet_surface_buffers);
++						mem->release();
++						mem = NULL;
++						s->memory = md;
++						s->clientWired = 1;
++						s->mapCache = kIOMapDefaultCache;
++						if (wrap < s->allocSize) {
++							s->allocSize = (uint32_t)wrap;     /* never longer than the memory behind it */
++						}
++						how = wrap >= s->allocSize ? "creator's pages wrapped (whole allocation)" : "creator's pages wrapped (used range)";
++						if (!sweet_surface_publish(s)) {
++							ret = kIOReturnNoResources;
++						}
++					} else {
++						OSSafeReleaseNULL(md);
++						how = wrap == 0 ? "snapshot copied (range not page aligned)" : "snapshot copied (pages not wireable)";
++					}
++				}
+ 				static uint32_t told;
+-				if (told++ < 6) {
++				if (told < 400 || (told % 64) == 0) {
+ 					char name[32];
+ 					proc_selfname(name, sizeof(name));
+-					IOLog("SWEET SURF: %s create from client memory %#llx (%llu of %u bytes) %ux%u fmt 0x%x -> %s\n",
+-					    name, address, used, s->allocSize, s->width, s->height, s->pixelFormat, err ? "refused" : "snapshot copied");
++					IOLog("SWEET SURF: client memory #%u: %s[%d] %#llx (%llu of %u bytes) %ux%u fmt 0x%x id %u -> %s\n",
++					    told, name, proc_selfpid(), address, used, s->allocSize, s->width, s->height, s->pixelFormat,
++					    s->clientWired ? s->id : 0u, how);
+ 				}
++				told++;
+ 				if (err) {
+ 					OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 					OSDecrementAtomic((volatile SInt32 *)&sweet_surface_buffers);
+@@ -997,7 +1035,7 @@
+ 					ret = kIOReturnBadArgument;
+ 				}
+ 			}
+-			if (mem != NULL) {
++			if (mem != NULL && !s->clientWired) {
+ 			s->memory = mem;
+ 			s->mapCache = kIOMapDefaultCache;
+ 			if (!sweet_surface_publish(s)) {
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -1132,6 +1132,11 @@
+         bool adopted = false;
+         enum n2c_error e = valid ? n2c_bo_map(core,c,pages,count,N2C_BO_GPU_READ|N2C_BO_GPU_WRITE|N2C_BO_IMPORTED,
+                                              owner,charged,h,va,&adopted) : N2C_E_ARGS;
++        /* 0360: which imports are of client-memory surfaces (the creator's wrapped pages) */
++        { static uint32_t told; if (told < 64 && (s->clientWired || told < 16)) { told++; char name[32]; proc_selfname(name,sizeof(name));
++          IOLog("NORD2 GPU IMPORT: %s ctx=%u surface %u %ux%u fmt 0x%x client=%u bytes=%llu base=%#llx pa0=%#llx -> %s h=%u va=%#llx\n",
++                name,c,id,s->width,s->height,s->pixelFormat,s->clientWired,mapped,base,(unsigned long long)pages[0].pa,
++                e==N2C_OK?"ok":"refused",e==N2C_OK?*h:0u,e==N2C_OK?*va:0ull); } }
+         IOFree(pages,count*sizeof(*pages)); if (!adopted) free_owner(this,owner);
+         /* Level 2: the surface's CPU access is bracketed by IOSurfaceLock/Unlock (see surfaceHook). */
+         if (e==N2C_OK && core->track_level>=N2C_TRACK_EXPLICIT) (void)n2c_bo_track(core,c,*h);

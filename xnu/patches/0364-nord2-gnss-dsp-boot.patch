@@ -1,0 +1,272 @@
+--- a/bsd/dev/nord2_gpsdl.inc
++++ b/bsd/dev/nord2_gpsdl.inc
+@@ -271,7 +271,8 @@
+ 	"V9 vendor-order capture (D2AF clear, EMI req, RX armed before TX, frame 1, 2 s)", "V9 HOLD (vendor order, RX armed, /dev/gpsdl0 pipe)",
+ 	"S10a RX DMA2 armed small (16 words) 3 s, no TX, disarm", "S10b RX DMA2 armed small + TX boot header, 1 s, disarm",
+ 	"S10c TX boot header, NO RX DMA (reply stays in the USRT FIFO), INTEN off", "S10d as S10c with USRT INTEN on (vendor)",
+-	"S10e RX DMA2 armed small, GPS wake vote RELEASED 3 s idle, vote back, disarm" };
++	"S10e RX DMA2 armed small, GPS wake vote RELEASED 3 s idle, vote back, disarm",
++	"S11 DSP code download (uploaded libmnl frames), post-boot command, rollback", "S11 DSP code download + HOLD (vote held, INTEN off, RX 256 B per arming)" };
+ /* 0357: GPS RGU_ON (bus 0x80000000 -> AP 0x18c00000) and CFG_ON (0x80001000 -> 0x18c01000), plat/v010 gps_rgu_on.h / gps_cfg_on.h */
+ #define N2G_GPS_RGU_L1_CR          0x18c00014u   /* [0] RGU_GPS_L1_ON [5] RGU_GPS_L1_SOFT_RST_B */
+ #define N2G_GPS_RGU_L1_DLY_CHAIN   0x18c00160u   /* [19:16] MEM_PDN_DELAY_DUMMY_NUM (vendor 5) */
+@@ -728,6 +729,204 @@
+ 	return n2gl_stop ? N2G_E_ARG : e;
+ }
+ 
++/*
++ * 0364 (q10jr11): the whole libmnl DSP code download inside one ladder ioctl ("S11", K = 30 boot + rollback, K = 31 boot +
++ * HOLD). q10jr10 gl10b proved RX DMA into 0xDFE02000 and the ROM's header ack (aa f0 0e 00 31 fe 00 00 13 19 ... 69 01 aa 0f).
++ * The frames (libmnl _BootDSP_UART_V2 replay: [0] header 0xFE08, [1] COMD4, [2..51] fragments 0xFE0C seq 1..50, [52] the
++ * post-boot command 0xFE05) are NOT in the image (70.7 KB > boot spare): user space pushes them with N2GD_IOC_CHUNK into BSS
++ * and the kernel checks markers, ids, sequence numbers and a sum before any hardware access. Polled, INTEN off, RX DMA2
++ * armed per exchange (64 bytes, never re-armed), GPS wake vote held for the whole run (also in the K = 31 HOLD).
++ */
++struct n2gb_chunk { uint32_t which, off, len, sum; uint8_t data[4096]; };   /* which 0 = data at off, 1 = table */
++#define N2GD_IOC_CHUNK    _IOW('G', 180, struct n2gb_chunk)
++#define N2GB_MAX          (80u * 1024u)
++#define N2GB_NF           53
++static uint8_t n2gb_data[N2GB_MAX];
++static uint32_t n2gb_tab[N2GB_NF][2], n2gb_total, n2gb_sum, n2gb_have;
++static int
++n2gb_chunk_in(const struct n2gb_chunk *c)
++{
++	if (c->len > sizeof c->data) { return EINVAL; }
++	if (c->which == 0) {
++		if (c->off > N2GB_MAX || c->len > N2GB_MAX - c->off) { return EINVAL; }
++		memcpy(n2gb_data + c->off, c->data, c->len);
++		if (c->off + c->len > n2gb_have) { n2gb_have = c->off + c->len; }
++		return 0;
++	}
++	if (c->which == 1) {                                     /* data = u32 nframes, total, sum, then nframes x (off, len) */
++		uint32_t h[3 + 2 * N2GB_NF];
++		if (c->len != sizeof h) { return EINVAL; }
++		memcpy(h, c->data, sizeof h);
++		if (h[0] != N2GB_NF || h[1] > N2GB_MAX) { return EINVAL; }
++		n2gb_total = h[1]; n2gb_sum = h[2];
++		for (int i = 0; i < N2GB_NF; i++) { n2gb_tab[i][0] = h[3 + 2 * i]; n2gb_tab[i][1] = h[4 + 2 * i]; }
++		return 0;
++	}
++	return EINVAL;
++}
++static uint16_t n2gb_id(int i) { const uint8_t *f = n2gb_data + n2gb_tab[i][0]; return (uint16_t)(f[4] | (f[5] << 8)); }
++static uint16_t n2gb_seq(int i) { const uint8_t *f = n2gb_data + n2gb_tab[i][0]; return (uint16_t)(f[6] | (f[7] << 8)); }
++/* the uploaded frames are what the replay says: sum, AA F0 .. AA 0F, ids, fragment seq 1..50, sizes that fit the TX ring */
++static bool
++n2gb_valid(void)
++{
++	uint32_t s = 0;
++	if (!n2gb_total || n2gb_have < n2gb_total) { printf("NORD2 GNSS S11: blob incomplete (%u of %u bytes)\n", n2gb_have, n2gb_total); return false; }
++	for (uint32_t i = 0; i < n2gb_total; i++) { s = s * 31u + n2gb_data[i]; }
++	if (s != n2gb_sum) { printf("NORD2 GNSS S11: blob sum %#x != %#x\n", s, n2gb_sum); return false; }
++	for (int i = 0; i < N2GB_NF; i++) {
++		uint32_t o = n2gb_tab[i][0], n = n2gb_tab[i][1];
++		const uint8_t *f = n2gb_data + o;
++		if (o > n2gb_total || n < 10u || n > n2gb_total - o || n > N2GL_RING - 8u || f[0] != 0xaa || f[1] != 0xf0 || f[n - 2] != 0xaa || f[n - 1] != 0x0f) {
++			printf("NORD2 GNSS S11: frame %d bad (off %u len %u)\n", i, o, n); return false;
++		}
++		uint16_t want = i == 0 ? 0xfe08 : (i == 1 || i == 52) ? 0xfe05 : 0xfe0c;
++		if (n2gb_id(i) != want || (i >= 2 && i <= 51 && n2gb_seq(i) != (uint16_t)(i - 1))) {
++			printf("NORD2 GNSS S11: frame %d id %#x seq %u unexpected\n", i, n2gb_id(i), n2gb_seq(i)); return false;
++		}
++	}
++	return true;
++}
++/* RX frame parser over the ring (consumes n2gl_rx.rd .. wr): AA F0 <stuffed len id payload cks> AA 0F, AA = DE DF, DE = DE E0 */
++static uint8_t n2gp_buf[512];
++static int n2gp_n = -1, n2gp_prev = -1;
++static uint32_t n2gp_frames, n2gp_id, n2gp_seq, n2gp_bad;
++static void
++n2gp_done(void)
++{
++	uint8_t u[512]; int n = 0;
++	for (int i = 0; i < n2gp_n; i++) {
++		if (n2gp_buf[i] == 0xde && i + 1 < n2gp_n) { u[n++] = n2gp_buf[i + 1] == 0xdf ? 0xaa : 0xde; i++; } else { u[n++] = n2gp_buf[i]; }
++	}
++	if (n < 6) { return; }
++	uint32_t sum = 0;
++	for (int i = 0; i < n - 2; i++) { sum += u[i]; }
++	bool ok = (sum & 0xffffu) == (uint32_t)(u[n - 2] | (u[n - 1] << 8));
++	n2gp_frames++;
++	if (!ok) { n2gp_bad++; }
++	n2gp_id = (uint32_t)(u[2] | (u[3] << 8)); n2gp_seq = n >= 8 ? (uint32_t)(u[4] | (u[5] << 8)) : 0xffffu;
++	if (n2gl_lines < 200) {
++		char line[3 * 16 + 1]; int p = 0;
++		for (int i = 4; i < n - 2 && i < 4 + 16; i++) { static const char hx[] = "0123456789abcdef"; line[p++] = hx[u[i] >> 4]; line[p++] = hx[u[i] & 15]; line[p++] = ' '; }
++		line[p] = 0;
++		n2gl_lines++;
++		printf("NORD2 GNSS LAD %d: DSP frame #%u id=%#x len=%#x cks=%s payload: %s\n", n2gl_k, n2gp_frames, n2gp_id, (uint32_t)(u[0] | (u[1] << 8)), ok ? "ok" : "BAD", line);
++	}
++	if (!ok) { n2gp_id = 0; }                                /* a bad checksum never counts as an ack */
++}
++static void
++n2gp_feed(void)
++{
++	while (n2gl_rx.rd != n2gl_rx.wr) {
++		uint8_t *pb = &n2gl_ring_va[N2GL_RING + n2gl_rx.rd];
++		int c = *pb;
++		*pb = N2GL_FILL;
++		n2gl_rx.rd = (n2gl_rx.rd + 1u) % N2GL_RING;
++		if (n2gp_prev == 0xaa && c == 0xf0) { n2gp_n = 0; }
++		else if (n2gp_prev == 0xaa && c == 0x0f && n2gp_n >= 0) { n2gp_n--; n2gp_done(); n2gp_n = -1; }
++		else if (n2gp_n >= 0) { if (n2gp_n < (int)sizeof n2gp_buf) { n2gp_buf[n2gp_n++] = (uint8_t)c; } else { n2gp_n = -1; } }
++		n2gp_prev = c;
++	}
++}
++/* close the current RX arming (if any), keep what it wrote */
++static void
++n2gb_rx_close(void)
++{
++	if (!n2gl_rx_armed) { return; }
++	uint32_t w = n2gl_rx_written();
++	if (w > n2gl_rx_cur) { n2gl_rx_total += w - n2gl_rx_cur; n2gl_rx_cur = w; n2gl_rx.wr = (n2gl_rx_at + w) % N2GL_RING; }
++	n2gl_dma_stop_q(N2GL_RXCH);
++	n2gl_rx_armed = false;
++	n2gp_feed();
++}
++/* send frame i with RX armed first; wait ms for frame id (seq if >= 0); true on the ack */
++static bool
++n2gb_xchg(int i, uint32_t id, int seq, int ms, int *tx_err)
++{
++	n2gb_rx_close();
++	n2gl_rx_cap = 64; n2gl_rx_norearm = true;
++	if (!n2gl_rx_arm(false)) { *tx_err = N2G_E_ARG; return false; }
++	uint32_t before = n2gp_frames;
++	*tx_err = n2gl_tx(n2gb_data + n2gb_tab[i][0], n2gb_tab[i][1], false);
++	if (*tx_err) { printf("NORD2 GNSS LAD %d: TX frame %d FAILED (%d)\n", n2gl_k, i, *tx_err); return false; }
++	for (int t = 0; t < ms && !n2gl_stop; t++) {
++		n2gl_rx_service(false);
++		n2gp_feed();
++		if (n2gp_frames != before && n2gp_id == id && (seq < 0 || n2gp_seq == (uint32_t)seq)) { n2gb_rx_close(); return true; }
++		if (!n2gl_rx_armed) { n2gl_rx_arm(false); }          /* the round closed (NODAINTB) without our ack: listen again */
++		delay(1000);
++	}
++	n2gb_rx_close();
++	return false;
++}
++/* K = 30 / 31: header (ack 0xFE31 seq 0; COMD4 x3 + header up to 3 rounds), 50 fragments (ack 0xFE32 seq k, 2 resends),
++ * the post-boot command, 3 s capture with RX re-armed (256 bytes per arming). Returns 0 on a complete boot. */
++static int
++n2gb_boot(bool done[32])
++{
++	int e = 0;
++	if (!n2gb_valid()) { return N2G_E_ARG; }
++	printf("NORD2 GNSS LAD %d: S11 blob ok: %u bytes, %d frames (header %u B, fragments %u..%u B)\n", n2gl_k, n2gb_total, N2GB_NF,
++	    n2gb_tab[0][1], n2gb_tab[51][1], n2gb_tab[2][1]);
++	n2gl_rx_cap = 64; n2gl_rx_norearm = true; n2gl_rx_armed = false; n2gl_rx_total = 0; n2gl_lines = 0;
++	n2gp_n = -1; n2gp_prev = -1; n2gp_frames = n2gp_bad = 0;
++	n2gl_gic("start");
++	n2gl_show("USRT INTEN", N2G_USRT_INTEN(0)); n2gl_show("USRT STA", N2G_USRT_STA(0)); n2gl_show("USRT D2AF", N2G_USRT_D2AF(0));
++	n2gl_mcub_ack(true);
++	n2gl_o.emictl = n2gl_rd(N2G_CFG_EMI_CTL); done[25] = true;
++	if (!n2gl_field(N2G_CFG_EMI_CTL, 1u, 1u)) { return N2G_E_ARG; }
++	for (uint32_t i = 0; i < N2GL_RING; i++) { n2gl_ring_va[N2GL_RING + i] = N2GL_FILL; }
++	__builtin_arm_dsb(0xf);
++	n2gl_rx.rd = n2gl_rx.wr = 0;
++	n2gl_pause("run the DSP code download (header, 50 fragments, post-boot command), continuous from here");
++	bool hdr = n2gb_xchg(0, 0xfe31, 0, 300, &e);
++	for (int r = 0; r < 3 && !hdr && !e && !n2gl_stop; r++) {
++		int x = 0;
++		for (int j = 0; j < 3 && !x; j++) { x = n2gl_tx(n2gb_data + n2gb_tab[1][0], n2gb_tab[1][1], false); }
++		delay(500000);
++		hdr = n2gb_xchg(0, 0xfe31, 0, 1000, &e);
++		printf("NORD2 GNSS LAD %d: S11 header round %d (after COMD4 x3): %s\n", n2gl_k, r + 1, hdr ? "ACK" : "no ack");
++	}
++	if (n2gl_stop) { return N2G_E_ARG; }
++	if (!hdr) { printf("NORD2 GNSS LAD %d: S11 RESULT: no header ack 0xFE31 (e=%d)\n", n2gl_k, e); return e ? e : 9; }
++	printf("NORD2 GNSS LAD %d: S11 header ACK 0xFE31 seq 0 (DSP ver/info above); sending 50 fragments\n", n2gl_k);
++	int acked = 0;
++	for (int k = 1; k <= 50 && !e && !n2gl_stop; k++) {
++		bool ok = false; int t;
++		for (t = 0; t < 3 && !ok && !e && !n2gl_stop; t++) { ok = n2gb_xchg(1 + k, 0xfe32, k, 300, &e); }
++		if (ok) { acked++; }
++		if (n2gl_lines < 200 && (!ok || t > 1 || k == 1 || k == 50 || k % 10 == 0)) {
++			n2gl_lines++;
++			printf("NORD2 GNSS LAD %d: S11 fragment %d/50 %s after %d send(s)\n", n2gl_k, k, ok ? "ACK 0xFE32" : "NO ACK", t);
++		}
++		if (!ok) { break; }
++	}
++	if (n2gl_stop) { return N2G_E_ARG; }
++	printf("NORD2 GNSS LAD %d: S11 fragments acked %d/50 (frames parsed %u, bad checksum %u)\n", n2gl_k, acked, n2gp_frames, n2gp_bad);
++	if (acked != 50) { printf("NORD2 GNSS LAD %d: S11 RESULT: download stopped at fragment %d\n", n2gl_k, acked + 1); return e ? e : 9; }
++	/* post-boot: MCUB RAMCODE_READY [0] is the vendor's "DSP RAM code running" (gps_dsp_fsm -> WORKING) */
++	n2gl_rx_cap = 256; n2gl_rx_norearm = false;
++	n2gb_rx_close();
++	n2gl_rx_arm(true);
++	uint32_t f0 = n2gp_frames, r0 = n2gl_rx_total;
++	e = n2gl_tx(n2gb_data + n2gb_tab[52][0], n2gb_tab[52][1], false);
++	printf("NORD2 GNSS LAD %d: S11 post-boot command 0xFE05 (old frame 1) sent (%d); 3 s capture\n", n2gl_k, e);
++	uint32_t rd0 = n2gl_rx.rd;
++	for (int t = 0; t < 3000 && !e && !n2gl_stop; t++) {
++		n2gl_rx_service(true);
++		if (t == 2999 || n2gl_rx_used() >= 256u) {
++			uint32_t u = n2gl_rx_used();
++			if (u && rd0 == n2gl_rx.rd) { n2gl_hexdump("post-boot RX", n2gl_rx.rd, u < 256u ? u : 256u); rd0 = ~0u; }
++			n2gp_feed();
++		}
++		delay(1000);
++	}
++	n2gb_rx_close();
++	printf("NORD2 GNSS LAD %d: S11 RESULT: DSP booted (50/50 fragments acked); after the post-boot command %u bytes, %u frames; D2AF %#x\n",
++	    n2gl_k, n2gl_rx_total - r0, n2gp_frames - f0, n2gl_rd(N2G_USRT_D2AF(0)));
++	return n2gl_stop ? N2G_E_ARG : e;
++}
++
+ static int
+ n2gl_do(int s, bool done[32])
+ {
+@@ -1024,7 +1223,7 @@
+ 	    k, n2gl_name[k], g[0], g[3], g[4], g[5], g[6], g[7] >> 16, g[7] & 0xffff, g[8] >> 16, g[8] & 0xffff, ok ? "guard ok" : "GUARD REFUSES");
+ 	if (!ok) { return 0x01000000u; }
+ 	if (n2gd_hw(&n2gl_hw)) { return 0x0300u; }
+-	if ((k == 22 || k == 24) && n2gd.powered) { printf("NORD2 GNSS LAD %d: already held\n", k); return 1; }
++	if ((k == 22 || k == 24 || k == 31) && n2gd.powered) { printf("NORD2 GNSS LAD %d: already held\n", k); return 1; }
+ 	n2gl_tx_started = n2gl_rx_started = false;
+ 	n2gl_v9 = k >= 23; n2gl_rx_armed = false;                /* 0362 */
+ 	int last = k <= 19 ? k : (k == 21 ? 15 : (k == 22 || k >= 23) ? 17 : 16), rc = 0, s;
+@@ -1053,7 +1252,22 @@
+ 		printf("NORD2 GNSS LAD 24: V9 HOLD, GNSS powered, RX DMA2 armed, /dev/gpsdl0 read/write enabled (conn_infra %#x), NOT rolled back until reboot\n", n2gd.conn_hw_ver);
+ 		return 1;
+ 	}
+-	if (!rc && k >= 25) {
++	if (!rc && k >= 30) {
++		printf("NORD2 GNSS LAD %d: about to run NEW S11 phase (%s)\n", k, n2gl_name[k]); delay(2000000);
++		rc = n2gb_boot(done);
++		if (n2gl_stop) { return 0x01000000u | ((uint32_t)k << 8); }
++		if (rc) { failed = k; }
++		if (!rc && k == 31) {
++			/* HOLD: the GPS wake vote stays HELD (q10jr9 released it; gl9b reset), INTEN off, RX 256 B per arming */
++			n2gl_rx_cap = 256; n2gl_rx_norearm = false;
++			n2gd.powered = true; n2gd.hw_valid = true; n2gd.last_err = 0;
++			n2gd.conn_hw_ver = n2gl_rd(N2G_CONN_HW_VER);
++			n2gl_v9hold = true; n2gd_dl_up = true;
++			printf("NORD2 GNSS LAD 31: S11 HOLD, DSP booted, GPS wake vote held, /dev/gpsdl0 read/write enabled, NOT rolled back until reboot\n");
++			return 1;
++		}
++	}
++	if (!rc && k >= 25 && k < 30) {
+ 		printf("NORD2 GNSS LAD %d: about to run NEW S10 phase (%s)\n", k, n2gl_name[k]); delay(2000000);
+ 		rc = n2gl_s10(k, done);
+ 		if (n2gl_stop) { return 0x01000000u | ((uint32_t)k << 8); }
+@@ -1163,6 +1377,12 @@
+ 	if (!n2gd.made || l < 0 || l >= N2GD_LINKS) { return ENXIO; }
+ 	if (data == NULL) { return EFAULT; }
+ 	uint32_t v = 0;
++	if ((uint32_t)cmd == (uint32_t)N2GD_IOC_CHUNK) {            /* 0364: S11 blob upload (kernel copy of the _IOW buffer) */
++		lck_mtx_lock(&n2gd_lock);
++		int ce = n2gb_chunk_in((const struct n2gb_chunk *)(const void *)data);
++		lck_mtx_unlock(&n2gd_lock);
++		return ce;
++	}
+ 	switch ((uint32_t)cmd) {
+ 	case (uint32_t)N2GD_IOC(GPSDL_IOC_QUERY_STATUS):
+ 		v = (n2gd.powered ? 1u : 0u) | ((uint32_t)(n2gd.last_err & 0xff) << 8);
+@@ -1212,6 +1432,8 @@
+ 	case (uint32_t)N2GD_IOC(167):
+ 	case (uint32_t)N2GD_IOC(168):
+ 	case (uint32_t)N2GD_IOC(169):
++	case (uint32_t)N2GD_IOC(170):                            /* 0364: S11 boot (K=30) / boot + HOLD (K=31) */
++	case (uint32_t)N2GD_IOC(171):
+ 		lck_mtx_lock(&n2gd_lock);
+ 		v = n2gd_ladder((int)((uint32_t)cmd & 0xff) - 140);
+ 		lck_mtx_unlock(&n2gd_lock);

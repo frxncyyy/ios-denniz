@@ -1,0 +1,131 @@
+diff -ruN a/bsd/dev/nord2_vcodec.inc b/bsd/dev/nord2_vcodec.inc
+--- a/bsd/dev/nord2_vcodec.inc
++++ b/bsd/dev/nord2_vcodec.inc
+@@ -34,7 +34,7 @@
+ #define n2vc_pa_map(pa, bytes, io) ((vm_offset_t)(uintptr_t)n2vc_host_map((pa), (bytes)))
+ #define n2vc_us(us) n2vc_host_us((uint32_t)(us))
+ #define n2vc_now_us() n2vc_host_now_us()
+-#define n2vc_sleep() n2vc_host_sleep(500u)
++#define n2vc_sleep_us(us) n2vc_host_sleep((uint32_t)(us))
+ #define n2vc_copyin(u, k, n) n2vc_host_copyin((uint64_t)(u), (k), (uint32_t)(n))
+ #define n2vc_copyout(k, u, n) n2vc_host_copyout((k), (uint64_t)(u), (uint32_t)(n))
+ #define n2vc_lock() ((void)0)
+@@ -108,6 +108,8 @@
+  * Voltage: the Android kernel raises vcore through mmdvfs before 624 MHz (venc_step0 needs the high vcore OPP); this
+  * kernel has no vcore/DVFSRC control, the phone runs at whatever OPP the bootloader/SPM left (see the 0312 notes). */
+ static unsigned int n2vc_venc_fast;
++static unsigned int n2vc_spin_us = 2000u;     /* sysctl kern.n2vc.spin_us, 0 = sleep from the first poll */
++static unsigned int n2vc_sleep_step = 200u;   /* sysctl kern.n2vc.sleep_us */
+ static inline unsigned
+ n2vc_vcodecd_venc_parent(void)
+ {
+@@ -133,6 +135,8 @@
+ 	return 0;
+ }
+ SYSCTL_NODE(_kern, OID_AUTO, n2vc, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "nord2 vcodec");
++SYSCTL_UINT(_kern_n2vc, OID_AUTO, spin_us, CTLFLAG_RW | CTLFLAG_LOCKED, &n2vc_spin_us, 0, "0314: spin-poll span of a wait (us)");
++SYSCTL_UINT(_kern_n2vc, OID_AUTO, sleep_us, CTLFLAG_RW | CTLFLAG_LOCKED, &n2vc_sleep_step, 0, "0314: sleep step after it (50..1000 us)");
+ SYSCTL_PROC(_kern_n2vc, OID_AUTO, venc_fast, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, n2vc_sysctl_venc_fast, "I",
+     "vcodecd VENC clock: 0 = 273 MHz (default), 1 = 624 MHz; applied at the next power-on while VEN is off");
+ #endif
+@@ -152,7 +156,12 @@
+ #define N2VC_RW_CHUNK    0x00100000u     /* RWVC_DMA_RW copies at most 1 MiB per copyin/copyout */
+ #define N2VC_BATCH_US    2000000u         /* one RWVC_REGS batch may run this long at most */
+ #define N2VC_POLL_MAX_US 1000000u
+-#define N2VC_IRQ_POLL_US 500u             /* msleep() duration while waiting for an interrupt or a poll */
++/* 0314: adaptive wait for WAIT_IRQ and RWVC_OP_POLL.  For the first kern.n2vc.spin_us of a wait the status is re-read
++ * every N2VC_SPIN_STEP_US (delay(), n2vc_mtx dropped around it); after that msleep() in kern.n2vc.sleep_us steps
++ * (clamped 50..1000).  Was a flat 500 us msleep (plus timer-coalescing leeway) from the first poll. */
++#define N2VC_SPIN_STEP_US 20u
++#define N2VC_IRQ_POLL_US N2VC_SPIN_STEP_US   /* the first step of a wait (spin_us > 0); test_k02 checks it */
++/* (n2vc_spin_us / n2vc_sleep_step: defined with the 0312 sysctl node above) */
+ #define N2VC_WAIT_MS_MAX 5000u
+ 
+ #define N2VC_NONE 0xffu
+@@ -282,6 +291,7 @@
+ 	struct { uint32_t pa, bytes; vm_offset_t va; } mm[N2VC_MM_MAX];
+ 	uint8_t nmm;
+ 	uint32_t next_file_id;
++	vm_offset_t win_va[N2VC_WIN_N];     /* 0314: n2vc_wins[] mappings, looked up once (mm[] entries are never unmapped) */
+ } n2vc;
+ 
+ /* Kernel time and sleeping.  A wait longer than 100 us sleeps with msleep(), which drops n2vc_mtx: another thread may
+@@ -300,13 +310,23 @@
+ }
+ 
+ static void
+-n2vc_sleep(void)
++n2vc_sleep_us(uint32_t us)
+ {
+-	struct timespec ts = { 0, (long)N2VC_IRQ_POLL_US * 1000 };
++	if (us < 100u) { lck_mtx_unlock(&n2vc_mtx); delay((int)us); lck_mtx_lock(&n2vc_mtx); return; }
++	struct timespec ts = { 0, (long)us * 1000 };
+ 	(void)msleep(&n2vc, &n2vc_mtx, PZERO, "n2vc-wait", &ts);
+ }
+ #endif
+ 
++/* one step of a wait that started `waited` us ago; drops n2vc_mtx in both branches (callers revalidate after it) */
++static void
++n2vc_wait_step(uint64_t waited)
++{
++	unsigned int sl = n2vc_sleep_step;
++	if (sl < 50u) { sl = 50u; } else if (sl > 1000u) { sl = 1000u; }
++	n2vc_sleep_us(waited < n2vc_spin_us ? N2VC_SPIN_STEP_US : sl);
++}
++
+ /* ---- small helpers --------------------------------------------------------------------------------------------- */
+ static vm_offset_t
+ n2vc_pa(uint32_t pa, uint32_t bytes, int io)
+@@ -323,6 +343,13 @@
+ 	return va;
+ }
+ 
++static vm_offset_t
++n2vc_win(unsigned w)
++{
++	if (!n2vc.win_va[w]) { n2vc.win_va[w] = n2vc_pa(n2vc_wins[w].pa, n2vc_wins[w].bytes, 1); }
++	return n2vc.win_va[w];
++}
++
+ static bool
+ n2vc_wait(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want)
+ {
+@@ -923,7 +950,7 @@
+ 	int err = n2vc_op_block(o, &blk);
+ 	if (err) { return err; }
+ 	if (!n2vc.on[blk]) { return EACCES; }
+-	vm_offset_t va = n2vc_pa(n2vc_wins[o->window].pa, n2vc_wins[o->window].bytes, 1);
++	vm_offset_t va = n2vc_win(o->window);
+ 	if (!va) { return ENXIO; }
+ 	*win = o->window; *base = va; *off = o->offset;
+ 	return 0;
+@@ -973,7 +1000,7 @@
+ 							b->out_done = done;
+ 							return ETIMEDOUT;
+ 						}
+-						n2vc_sleep();       /* drops n2vc_mtx; revalidate before the next register access */
++						n2vc_wait_step(now - start_us);   /* drops n2vc_mtx; revalidate before the next register access */
+ 						if (!f->used || f->id != fid) {
+ 							(void)n2vc_copyout(ops, uaddr, n * (uint32_t)sizeof(struct rwvc_reg_op));
+ 							b->out_done = done;
+@@ -1015,7 +1042,7 @@
+ n2vc_irq_status(unsigned irq)
+ {
+ 	const struct n2vc_irq *q = &n2vc_irqs[irq];
+-	vm_offset_t va = n2vc_pa(n2vc_wins[q->win].pa, n2vc_wins[q->win].bytes, 1);
++	vm_offset_t va = n2vc_win(q->win);
+ 	return va ? ni_rd(va, q->status_off) : 0;
+ }
+ 
+@@ -1090,8 +1117,9 @@
+ 			w->out_status = st;
+ 			return 0;
+ 		}
+-		if (n2vc_now_us() - start >= limit) { w->out_count = 0; w->out_status = st; return ETIMEDOUT; }
+-		n2vc_sleep();                   /* drops n2vc_mtx: the file may close or the block may power off meanwhile */
++		uint64_t waited = n2vc_now_us() - start;
++		if (waited >= limit) { w->out_count = 0; w->out_status = st; return ETIMEDOUT; }
++		n2vc_wait_step(waited);                   /* drops n2vc_mtx: the file may close or the block may power off meanwhile */
+ 		if (!f->used || f->id != fid) { w->out_count = 0; w->out_status = st; return ENXIO; }
+ 		if (!n2vc.on[blk]) { w->out_count = 0; w->out_status = st; return EACCES; }
+ 	}

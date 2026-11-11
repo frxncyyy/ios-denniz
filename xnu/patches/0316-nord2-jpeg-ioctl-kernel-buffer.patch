@@ -1,0 +1,80 @@
+diff -ruN a/bsd/dev/nord2_jpegdev.inc b/bsd/dev/nord2_jpegdev.inc
+--- a/bsd/dev/nord2_jpegdev.inc
++++ b/bsd/dev/nord2_jpegdev.inc
+@@ -624,18 +624,20 @@
+ 		n2j_cache(n2jd.dbuf + (RWJD_OUT_PA - RWJD_PA), d->dst_bytes);
+ 		err = copyout(b + (RWJD_OUT_PA - RWJD_PA), (user_addr_t)d->dst, d->dst_bytes);
+ 	}
+-	n2j_log("NORD2 JPEG: dec%s %u regs -> %u irq %#x mcu %u in %u us\n", probe ? " probe" : "", d->nregs, d->out_status,
+-	    d->out_irq, d->out_mcu, d->out_hw_us);
++	/* 0316: the only place the result words of a failed job are visible (sys_ioctl copies nothing out on an error) */
++	n2j_log("NORD2 JPEG: dec%s %u regs -> %u irq %#x state %#x mcu %u in %u us\n", probe ? " probe" : "", d->nregs,
++	    d->out_status, d->out_irq, d->out_state, d->out_mcu, d->out_hw_us);
+ 	return err;
+ }
+ 
+-/* RWJD_JOB: copyin + validation without the lock, the job under the one-job lock like an encode */
++/* RWJD_JOB: validation without the lock, the job under the one-job lock like an encode.  `data` is sys_ioctl's kernel
++ * copy of the struct (0316); d.src/d.regs/d.dst inside it are user addresses. */
+ static int
+ n2jd_dec_ioctl(caddr_t data)
+ {
+ 	struct rwjd_job d;
+ 	struct rwjd_reg r[RWJD_REGS_MAX];
+-	if (copyin((user_addr_t)(uintptr_t)data, &d, sizeof(d)) != 0) { return EFAULT; }
++	memcpy(&d, data, sizeof(d));
+ 	bool probe = (d.flags & RWJD_PROBE) != 0;
+ 	if ((d.flags & ~RWJD_PROBE) || d.nregs == 0 || d.nregs > RWJD_REGS_MAX || !d.regs || d.timeout_ms > RWJD_TIMEOUT_MAX_MS) { return EINVAL; }
+ 	if (!probe && (!d.src || d.src_bytes < 4u || d.src_bytes > RWJD_SRC_MAX - 256u || d.dst_bytes > RWJD_OUT_MAX ||
+@@ -651,7 +653,7 @@
+ 	err = n2jd_dec_run(&d, r);
+ 	n2jd_job_end(d.out_hw_us, d.out_status, err);
+ 	if (probe && copyout(r, (user_addr_t)d.regs, d.nregs * sizeof(r[0])) != 0 && !err) { err = EFAULT; }
+-	if (copyout(&d, (user_addr_t)(uintptr_t)data, sizeof(d)) != 0 && !err) { err = EFAULT; }
++	memcpy(data, &d, sizeof(d));                    /* sys_ioctl copies it out, only when err == 0 */
+ 	return err;
+ }
+ 
+@@ -690,9 +692,20 @@
+ 	lck_mtx_unlock(&n2jd_lock);
+ 	info.caps = 1u;                                 /* bit 0 encoder; the decoder is track J */
+ 	info.reserved[0] = RWJD_REV;                    /* 0315: RWJD_JOB (decoder experiment path) is present */
+-	return copyout(&info, (user_addr_t)(uintptr_t)data, sizeof(info)) != 0 ? EFAULT : 0;
++	memcpy(data, &info, sizeof(info));              /* 0316: kernel buffer; sys_ioctl does the copyout (_IOR) */
++	return 0;
+ }
+ 
++/*
++ * 0316: XNU's ioctl() (bsd/kern/sys_generic.c) decodes size and direction from the command word, copies an IOC_IN struct
++ * IN to a kernel buffer, zeroes it for an IOC_OUT-only command, calls d_ioctl with that KERNEL buffer and copies it OUT
++ * itself, and only when d_ioctl returned 0.  So `data` is never a user address here (copyin/copyout on it is EFAULT,
++ * which is what every RWJ_INFO/RWJ_ENCODE/RWJD_JOB returned on q10ji and earlier); the struct is read and written with
++ * memcpy.  The addresses INSIDE the structs (src_y/src_c/dst, src/regs/dst) are user addresses and keep copyin/copyout.
++ * On an error (EIO with out_status != 0, EFAULT, ...) nothing is copied out: user space sees errno only and its
++ * out_* fields stay as it sent them; the kernel log line of the job carries status/irq/state/mcu/hw_us instead.  The
++ * ABI (redwood_jpeg.h: "errno is EIO then") and the user tools (rwjpeg.c, n2jpeg_phone.c) decide on errno alone.
++ */
+ static int
+ n2jd_ioctl(dev_t dev, unsigned long cmd, caddr_t data, __unused int fflag, __unused struct proc *p)
+ {
+@@ -705,7 +718,7 @@
+ 	if (c != (uint32_t)RWJ_ENCODE) { return ENOTTY; }
+ 
+ 	struct rwj_encode j;
+-	if (copyin((user_addr_t)(uintptr_t)data, &j, sizeof(j)) != 0) { return EFAULT; }
++	memcpy(&j, data, sizeof(j));                    /* 0316: kernel copy of the request */
+ 	struct n2jd_geom g;
+ 	int err = n2jd_validate(&j, &g);
+ 	if (err) { return err; }
+@@ -717,8 +730,9 @@
+ 	if (err) { return err; }
+ 	err = n2jd_run(&j, &g);
+ 	n2jd_job_end(j.out_hw_us, j.out_status, err);
+-	/* deliver out_bytes/out_status/out_hw_us even after a hardware failure; a faulting struct copyout is EFAULT */
+-	if (copyout(&j, (user_addr_t)(uintptr_t)data, sizeof(j)) != 0) { return err ? err : EFAULT; }
++	/* out_bytes/out_status/out_hw_us reach user space only when err == 0 (sys_ioctl skips its copyout otherwise; a
++	 * faulting copyout of the struct is sys_ioctl's EFAULT after a job that is booked as done) */
++	memcpy(data, &j, sizeof(j));
+ 	return err;
+ }
+ 

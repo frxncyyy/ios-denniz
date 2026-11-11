@@ -1,0 +1,366 @@
+diff -ruN a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -84,58 +84,17 @@
+ static uint32_t      sweet_surface_buffers;     /* buffer surfaces alive (in the table or only held by a port / the kernel) */
+ static uint64_t      sweet_surface_refused, sweet_surface_report_ns;
+ 
+-/* One line at most every two seconds: the budget, what the table holds and the five processes that created most of it. */
+-static void
+-sweet_surface_report(const char *why, uint32_t asked)
++static uint32_t      sweet_surface_seq[SWEET_SURFACE_MAX_ID];       /* 0300: creation number of the surface in the slot */
++static uint32_t      sweet_surface_born[SWEET_SURFACE_MAX_ID];      /* 0300: second of uptime it was put there */
++static uint32_t      sweet_surface_created;     /* buffer surfaces ever made (released = created - alive) */
++static void sweet_surface_report(const char *why, uint32_t asked);      /* after the client class */
++
++static uint32_t
++sweet_surface_uptime(void)
+ {
+-	struct { int32_t pid; uint32_t count; uint64_t bytes; } top[24];
+-	uint32_t used = 0, in_table = 0, other_count = 0;
+-	uint64_t table_bytes = 0, other_bytes = 0, now = 0;
+-	uint64_t refused = OSAddAtomic64(1, (volatile SInt64 *)&sweet_surface_refused) + 1;
+-	absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+-	IOLockLock(sweet_surface_lock);
+-	if (sweet_surface_report_ns != 0 && now - sweet_surface_report_ns < 2000000000ull) {
+-		IOLockUnlock(sweet_surface_lock);
+-		return;
+-	}
+-	sweet_surface_report_ns = now;
+-	for (uint32_t id = 1; id < SWEET_SURFACE_MAX_ID; id++) {
+-		SweetSurface *t = sweet_surface_table[id];
+-		if (t == NULL || OSDynamicCast(IOBufferMemoryDescriptor, t->memory) == NULL) {
+-			continue;
+-		}
+-		in_table++;
+-		table_bytes += t->allocSize;
+-		uint32_t k = 0;
+-		while (k < used && top[k].pid != sweet_surface_owner[id]) {
+-			k++;
+-		}
+-		if (k == used && used < 24) {
+-			top[used].pid = sweet_surface_owner[id]; top[used].count = 0; top[used].bytes = 0;
+-			used++;
+-		}
+-		if (k < used) {
+-			top[k].count++; top[k].bytes += t->allocSize;
+-		} else {
+-			other_count++; other_bytes += t->allocSize;
+-		}
+-	}
+-	IOLockUnlock(sweet_surface_lock);
+-	IOLog("SWEET SURF: refused (%s, %u bytes asked, refusal %llu): %llu of %llu MiB wired in %u buffer surfaces; table has %u of them, %llu MiB\n",
+-	    why, asked, refused, sweet_surface_wired >> 20, SWEET_SURFACE_WIRED_MAX >> 20, sweet_surface_buffers, in_table, table_bytes >> 20);
+-	for (uint32_t n = 0; n < 5 && n < used; n++) {
+-		uint32_t best = n;
+-		for (uint32_t k = n + 1; k < used; k++) {
+-			if (top[k].bytes > top[best].bytes) {
+-				best = k;
+-			}
+-		}
+-		__typeof__(top[0]) tmp = top[n]; top[n] = top[best]; top[best] = tmp;
+-		char name[32] = "?";
+-		proc_name(top[n].pid, name, sizeof(name));
+-		IOLog("SWEET SURF:   %s[%d] created %u of them, %llu MiB\n", name, top[n].pid, top[n].count, top[n].bytes >> 20);
+-	}
+-	(void)other_count; (void)other_bytes;
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return (uint32_t)(ns / 1000000000ull);
+ }
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+@@ -190,6 +149,8 @@
+ 			sweet_surface_table[id] = s;
+ 			sweet_surface_users[id] = 1;
+ 			sweet_surface_owner[id] = proc_selfpid();
++			sweet_surface_seq[id] = sweet_surface_created;
++			sweet_surface_born[id] = sweet_surface_uptime();
+ 			*(uint64_t *)s->state->getBytesNoCopy() = id;   /* registry id */
+ 			return true;
+ 		}
+@@ -470,6 +431,8 @@
+ 	task_t   fTask;
+ 	IOLock  *fLock;
+ 	OSArray *fRefs;
++	int32_t  fPid;          /* 0300 */
++	friend void sweet_surface_report(const char *why, uint32_t asked);
+ 
+ 	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index);
+ 	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
+@@ -493,6 +456,205 @@
+ 
+ OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
+ 
++/*
++ * 0300: who HOLDS the surfaces. A surface stays in the table (and wired) as long as one client has it in its fRefs: its creator or
++ * anybody that looked it up; the table itself keeps nothing alive (sweet_surface_put). Run user3 showed all 719 buffer surfaces in
++ * the table and a dead creator still "owning" 16 of them, i.e. somebody else holds those. So every open client is listed here
++ * and a refusal says, besides the creators (0299): the holders, what of it is volatile (IOSurfaceSetPurgeable: the holder said the
++ * contents may be thrown away; nothing is thrown away here, the pages are wired and mapped), which sizes, how old.
++ * Lock order: sweet_clients_lock, then a client's fLock, then sweet_surface_lock (as fRefs' removal already takes the last two).
++ */
++#define SWEET_CLIENTS_MAX 512
++static IOSurfaceRootUserClient *sweet_clients[SWEET_CLIENTS_MAX];
++static IOLock *sweet_clients_lock;
++
++static void
++sweet_clients_init_lock(void)
++{
++	if (sweet_clients_lock == NULL) {
++		IOLock *lock = IOLockAlloc();
++		if (!OSCompareAndSwapPtr(NULL, lock, &sweet_clients_lock)) {
++			IOLockFree(lock);
++		}
++	}
++}
++
++struct sweet_report_who { int32_t pid; uint32_t count, vol_count, dead_count; uint64_t bytes, vol_bytes, dead_bytes; };
++struct sweet_report_size { uint32_t width, height, format, count, oldest; uint64_t bytes; };
++#define SWEET_REPORT_WHO 32
++#define SWEET_REPORT_SIZES 24
++
++static void
++sweet_report_sort(struct sweet_report_who *who, uint32_t used, uint32_t first)
++{
++	for (uint32_t n = 0; n < first && n < used; n++) {
++		uint32_t best = n;
++		for (uint32_t k = n + 1; k < used; k++) {
++			if (who[k].bytes > who[best].bytes) {
++				best = k;
++			}
++		}
++		struct sweet_report_who tmp = who[n]; who[n] = who[best]; who[best] = tmp;
++	}
++}
++
++static bool
++sweet_report_dead(int32_t pid)
++{
++	proc_t p = pid > 0 ? proc_find(pid) : NULL;
++	if (p != NULL) {
++		proc_rele(p);
++		return false;
++	}
++	return pid > 0;
++}
++
++/* At most every five seconds. Only reads; a client that is closing is kept out by sweet_clients_lock (free()) and its fLock. */
++static void
++sweet_surface_report(const char *why, uint32_t asked)
++{
++	static struct sweet_report_who made[SWEET_REPORT_WHO], held[SWEET_REPORT_WHO];     /* under sweet_clients_lock */
++	static struct sweet_report_size sizes[3][SWEET_REPORT_SIZES];
++	static bool dead[SWEET_REPORT_WHO];
++	uint32_t made_n = 0, held_n = 0, in_table = 0, vol_count = 0, now = sweet_surface_uptime();
++	uint64_t table_bytes = 0, vol_bytes = 0;
++	uint64_t refused = OSAddAtomic64(1, (volatile SInt64 *)&sweet_surface_refused) + 1;
++	sweet_clients_init_lock();
++	IOLockLock(sweet_clients_lock);
++	if (sweet_surface_report_ns != 0 && now - (uint32_t)sweet_surface_report_ns < 5) {
++		IOLockUnlock(sweet_clients_lock);
++		return;
++	}
++	sweet_surface_report_ns = now ? now : 1;
++	/* creators */
++	IOLockLock(sweet_surface_lock);
++	for (uint32_t id = 1; id < SWEET_SURFACE_MAX_ID; id++) {
++		SweetSurface *t = sweet_surface_table[id];
++		if (t == NULL || OSDynamicCast(IOBufferMemoryDescriptor, t->memory) == NULL) {
++			continue;
++		}
++		in_table++;
++		table_bytes += t->allocSize;
++		if (t->purgeable == 1) {
++			vol_count++; vol_bytes += t->allocSize;
++		}
++		uint32_t k = 0;
++		while (k < made_n && made[k].pid != sweet_surface_owner[id]) {
++			k++;
++		}
++		if (k == made_n && made_n < SWEET_REPORT_WHO) {
++			bzero(&made[made_n], sizeof(made[0]));
++			made[made_n++].pid = sweet_surface_owner[id];
++		}
++		if (k < made_n) {
++			made[k].count++; made[k].bytes += t->allocSize;
++			if (t->purgeable == 1) {
++				made[k].vol_count++; made[k].vol_bytes += t->allocSize;
++			}
++		}
++	}
++	sweet_report_sort(made, made_n, 5);
++	/* the sizes of the three biggest creators */
++	bzero(sizes, sizeof(sizes));
++	for (uint32_t id = 1; id < SWEET_SURFACE_MAX_ID; id++) {
++		SweetSurface *t = sweet_surface_table[id];
++		if (t == NULL || OSDynamicCast(IOBufferMemoryDescriptor, t->memory) == NULL) {
++			continue;
++		}
++		for (uint32_t n = 0; n < 3 && n < made_n; n++) {
++			if (made[n].pid != sweet_surface_owner[id]) {
++				continue;
++			}
++			uint32_t age = now - sweet_surface_born[id];
++			for (uint32_t k = 0; k < SWEET_REPORT_SIZES; k++) {
++				struct sweet_report_size *z = &sizes[n][k];
++				if (z->count == 0 || (z->width == t->width && z->height == t->height && z->format == t->pixelFormat)) {
++					z->width = t->width; z->height = t->height; z->format = t->pixelFormat;
++					z->count++; z->bytes += t->allocSize;
++					if (age > z->oldest) {
++						z->oldest = age;
++					}
++					break;
++				}
++			}
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	for (uint32_t k = 0; k < made_n; k++) {
++		dead[k] = k < 5 ? sweet_report_dead(made[k].pid) : false;
++	}
++	/* holders */
++	for (uint32_t i = 0; i < SWEET_CLIENTS_MAX; i++) {
++		IOSurfaceRootUserClient *c = sweet_clients[i];
++		if (c == NULL || c->fLock == NULL || c->fRefs == NULL) {
++			continue;
++		}
++		uint32_t k = 0;
++		while (k < held_n && held[k].pid != c->fPid) {
++			k++;
++		}
++		if (k == held_n) {
++			if (held_n == SWEET_REPORT_WHO) {
++				continue;
++			}
++			bzero(&held[held_n], sizeof(held[0]));
++			held[held_n++].pid = c->fPid;
++		}
++		IOLockLock(c->fLock);
++		for (unsigned int r = 0; r < c->fRefs->getCount(); r++) {
++			SweetSurface *t = ((SweetSurfaceRef *)c->fRefs->getObject(r))->surface;
++			if (t == NULL || t->id >= SWEET_SURFACE_MAX_ID || OSDynamicCast(IOBufferMemoryDescriptor, t->memory) == NULL) {
++				continue;
++			}
++			held[k].count++; held[k].bytes += t->allocSize;
++			if (t->purgeable == 1) {
++				held[k].vol_count++; held[k].vol_bytes += t->allocSize;
++			}
++			int32_t owner = sweet_surface_owner[t->id];
++			for (uint32_t m = 0; m < 5 && m < made_n; m++) {
++				if (made[m].pid == owner && dead[m] && owner != c->fPid) {
++					held[k].dead_count++; held[k].dead_bytes += t->allocSize;
++				}
++			}
++		}
++		IOLockUnlock(c->fLock);
++	}
++	sweet_report_sort(held, held_n, 6);
++	IOLog("SWEET SURF: refused (%s, %u bytes asked, refusal %llu): %llu of %llu MiB wired in %u buffer surfaces (%u made, %u released); table has %u, %llu MiB; volatile %u, %llu MiB\n",
++	    why, asked, refused, sweet_surface_wired >> 20, SWEET_SURFACE_WIRED_MAX >> 20, sweet_surface_buffers,
++	    sweet_surface_created, sweet_surface_created - sweet_surface_buffers, in_table, table_bytes >> 20, vol_count, vol_bytes >> 20);
++	for (uint32_t n = 0; n < 5 && n < made_n; n++) {
++		char name[32] = "?";
++		proc_name(made[n].pid, name, sizeof(name));
++		IOLog("SWEET SURF:   made by %s[%d]%s: %u, %llu MiB (volatile %u, %llu MiB)\n", name, made[n].pid, dead[n] ? " (gone)" : "",
++		    made[n].count, made[n].bytes >> 20, made[n].vol_count, made[n].vol_bytes >> 20);
++		if (n >= 3) {
++			continue;
++		}
++		for (uint32_t pass = 0; pass < 5; pass++) {      /* its five sizes with the most bytes */
++			struct sweet_report_size *best = NULL;
++			for (uint32_t k = 0; k < SWEET_REPORT_SIZES; k++) {
++				if (sizes[n][k].count != 0 && (best == NULL || sizes[n][k].bytes > best->bytes)) {
++					best = &sizes[n][k];
++				}
++			}
++			if (best == NULL) {
++				break;
++			}
++			IOLog("SWEET SURF:     %ux%u fmt 0x%x: %u, %llu MiB, oldest %u s\n", best->width, best->height, best->format,
++			    best->count, best->bytes >> 20, best->oldest);
++			best->count = 0;
++		}
++	}
++	for (uint32_t n = 0; n < 6 && n < held_n; n++) {
++		char name[32] = "?";
++		proc_name(held[n].pid, name, sizeof(name));
++		IOLog("SWEET SURF:   held by %s[%d]: %u, %llu MiB (volatile %u, %llu MiB; made by a process that is gone %u, %llu MiB)\n", name, held[n].pid,
++		    held[n].count, held[n].bytes >> 20, held[n].vol_count, held[n].vol_bytes >> 20, held[n].dead_count, held[n].dead_bytes >> 20);
++	}
++	IOLockUnlock(sweet_clients_lock);
++}
++
+ static uint64_t sweet_surf_logged;      /* selectors / traps already logged (< 64) */
+ 
+ static void
+@@ -517,12 +679,35 @@
+ 	fTask = owningTask;
+ 	fLock = IOLockAlloc();
+ 	fRefs = OSArray::withCapacity(16);
+-	return fLock != NULL && fRefs != NULL;
++	if (fLock == NULL || fRefs == NULL) {
++		return false;
++	}
++	fPid = proc_selfpid();
++	sweet_clients_init_lock();
++	IOLockLock(sweet_clients_lock);
++	for (uint32_t i = 0; i < SWEET_CLIENTS_MAX; i++) {
++		if (sweet_clients[i] == NULL) {
++			sweet_clients[i] = this;
++			break;
++		}
++	}
++	IOLockUnlock(sweet_clients_lock);
++	return true;
+ }
+ 
+ void
+ IOSurfaceRootUserClient::free()
+ {
++	if (sweet_clients_lock != NULL) {
++		/* out of the list before anything of it goes away; the report holds this lock while it reads fRefs */
++		IOLockLock(sweet_clients_lock);
++		for (uint32_t i = 0; i < SWEET_CLIENTS_MAX; i++) {
++			if (sweet_clients[i] == this) {
++				sweet_clients[i] = NULL;
++			}
++		}
++		IOLockUnlock(sweet_clients_lock);
++	}
+ 	OSSafeReleaseNULL(fRefs);
+ 	if (fLock != NULL) {
+ 		IOLockFree(fLock);
+@@ -757,7 +942,32 @@
+ 			sweet_surface_report(in_budget ? "the kernel gave no memory" : "over the budget", s->allocSize);   /* 0299 */
+ 		} else {
+ 			OSIncrementAtomic((volatile SInt32 *)&sweet_surface_buffers);
++			OSIncrementAtomic((volatile SInt32 *)&sweet_surface_created);
+ 			bzero(mem->getBytesNoCopy(), s->allocSize);
++			/*
++			 * 0300: a two-plane 4:2:0 surface that nobody has written yet must not read as green (Y 0, Cb Cr 0): the chroma
++			 * plane starts at mid level, the luma of the video-range formats at their black. '420f' '420v' 8 bit, 'xf20' 'x420'
++			 * 10 bit in 16 (level << 6); the packed/compressed kinds have other layouts and stay zero.
++			 */
++			if (s->planeCount == 2 && (s->pixelFormat == 0x34323066 || s->pixelFormat == 0x34323076 ||
++			    s->pixelFormat == 0x78663230 || s->pixelFormat == 0x78343230)) {
++				bool wide = (s->pixelFormat >> 24) == 0x78, video = (s->pixelFormat & 0xff) == 0x76 || s->pixelFormat == 0x78343230;
++				uint8_t *base = (uint8_t *)mem->getBytesNoCopy();
++				for (uint32_t i = 0; i < 2; i++) {
++					uint64_t off = s->planes[i].offset, len = s->planes[i].size;
++					if (off > s->allocSize || len > s->allocSize - off || (i == 0 && !video)) {
++						continue;
++					}
++					if (!wide) {
++						memset(base + off, i == 0 ? 16 : 0x80, (size_t)len);
++					} else {
++						uint16_t v = i == 0 ? 0x1000 : 0x8000;
++						for (uint64_t k = 0; k + 2 <= len; k += 2) {
++							memcpy(base + off + k, &v, 2);
++						}
++					}
++				}
++			}
+ 			/* IOSurfaceAddress / IOSurfaceClientAddress: memory the creator already filled.  Keep a snapshot (see
+ 			 * sweet_surface_abi.h) instead of zeros; an unusable range fails the creation so the caller falls back. */
+ 			OSNumber *client = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));

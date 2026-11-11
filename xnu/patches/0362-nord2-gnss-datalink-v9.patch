@@ -1,0 +1,357 @@
+--- a/bsd/dev/nord2_gpsdl.inc
++++ b/bsd/dev/nord2_gpsdl.inc
+@@ -206,7 +206,9 @@
+ static struct n2g_hw n2gl_hw;
+ static bool n2gl_stop;
+ static int n2gl_k;
+-static struct { uint32_t vote, emi, bgf, func, c2g, g2c, sel, adie, clk1, aon, l1cr, dly, mem; } n2gl_o;
++static struct { uint32_t vote, emi, bgf, func, c2g, g2c, sel, adie, clk1, aon, l1cr, dly, mem, emictl; } n2gl_o;
++static bool n2gl_v9;                                            /* 0362: K >= 23, vendor-order data link (INTEN, D2AF clear, EMI req, RX armed) */
++static bool n2gl_v9hold;                                        /* 0362: K = 24 HOLD: read() uses the pre-armed RX DMA */
+ static bool n2gd_dl_up;                                         /* 0359: HOLD with the data link up (read/write work) */
+ static bool
+ n2gl_guard(void)
+@@ -261,11 +263,12 @@
+ 	{ N2G_CFG_GALS_CONN2GPS, 1u << 4, 1u << 7 }, { N2G_CFG_GALS_CONN2GPS, 1u << 0, 1u << 3 },
+ 	{ N2G_CFG_GALS_GPS2CONN, 1u << 4, 1u << 7 }, { N2G_CFG_GALS_GPS2CONN, 1u << 0, 1u << 3 },
+ };
+-static const char *const n2gl_name[24] = { "", "GPS wake vote", "read conn_infra cfg page", "read conn_infra RGU page",
++static const char *const n2gl_name[32] = { "", "GPS wake vote", "read conn_infra cfg page", "read conn_infra RGU page",
+ 	"read WB_STA + GPS CSRs", "GPS EMI remap", "BGFSYS_ON_TOP power", "GP_FUNCTION_EN + BGF acks", "GALS sleep protection off",
+ 	"gps_top_off ACTIVE check", "A-die top clock", "read GPS bus (first)", "GPS CLKGEN1 DIGCK", "L1 DSP pwr_stat ON",
+ 	"read GPS RGU_ON page", "L1 power on + soft reset release", "USRT on + DSP ROM okay", "data link up (rings, DMA idle check)", "send libmnl frame 1 (A2D DMA)", "capture the DSP reply (D2A DMA)",
+-	"5 s powered", "L1 read-only probe", "HOLD + /dev/gpsdl0 read/write" };
++	"5 s powered", "L1 read-only probe", "HOLD + /dev/gpsdl0 read/write",
++	"V9 vendor-order capture (D2AF clear, EMI req, RX armed before TX, frame 1, 2 s)", "V9 HOLD (vendor order, RX armed, /dev/gpsdl0 pipe)" };
+ /* 0357: GPS RGU_ON (bus 0x80000000 -> AP 0x18c00000) and CFG_ON (0x80001000 -> 0x18c01000), plat/v010 gps_rgu_on.h / gps_cfg_on.h */
+ #define N2G_GPS_RGU_L1_CR          0x18c00014u   /* [0] RGU_GPS_L1_ON [5] RGU_GPS_L1_SOFT_RST_B */
+ #define N2G_GPS_RGU_L1_DLY_CHAIN   0x18c00160u   /* [19:16] MEM_PDN_DELAY_DUMMY_NUM (vendor 5) */
+@@ -374,7 +377,7 @@
+ 	for (i = 0; i < 100000 && !n2gl_stop; i++) {
+ 		done = n2gl_dma_done(N2GL_RXCH);
+ 		uint32_t s2 = n2gl_rd(N2G_USRT_STA(0));
+-		nodata = (s2 & ((1u << 1) | (1u << 5))) != 0;
++		nodata = (s2 & (1u << 1)) != 0;                        /* 0362: NODAINTB only (vendor); REGE [5] is set at idle (STA 0x22100030) */
+ 		if (done || nodata) { break; }
+ 		delay(1);
+ 	}
+@@ -404,8 +407,205 @@
+ /* libmnl's first frame to the DSP ROM (captured in the M3 emulator: _BootDSP_UART_V2) */
+ static const uint8_t n2gl_frame1[15] = { 0xaa, 0xf0, 0x09, 0x00, 0x05, 0xfe, 0x32, 0x00, 0x00, 0x01, 0x00, 0x3f, 0x01, 0xaa, 0x0f };
+ 
++/*
++ * 0362 (q10jr9): vendor-order data link ("V9", ladder K = 23 capture, K = 24 HOLD). q10jr8 gl8b: frame 1 left by A2D DMA
++ * (DMA1 done), USRT STA stayed 0x22100030, D2AF stayed 0x8 and no byte came back. Differences from the vendor gps_dl
++ * (hal/gps_dl_hal.c, hal/gps_dl_isr.c, hw/gps_dl_hw_usrt_apb.c, hw/gps_dl_hw_power_ctrl.c) closed here:
++ *  a) MCUB D2AF RESET_DONE [3] was never acknowledged. gps_dl_hal_mcub_flag_handler reads D2AF/D2A0/D2A1, writes the flag
++ *     back (W1C, gps_dl_hw_clear_mcub_d2a_flag) and only then gps_dsp_fsm(RESET_DONE) marks the link ready to write;
++ *  b) CONN_INFRA_CFG EMI_CTL_GPS 0x18001c1c [0] EMI_REQ_GPS was never set; the vendor claims it around every TX/RX DMA
++ *     (gps_dl_hal_emi_usage_claim -> gps_dl_hw_gps_sw_request_emi_usage, GPS_DL_USE_TIA = 0 on plat v010);
++ *  c) USRT INTEN TXIEN/NODAIEN stayed 0 (step 16 sets them when V9);
++ *  d) RX started only after a polled TX_IND. Now D2A DMA2 is armed on the whole free RX ring BEFORE the TX (the vendor
++ *     starts it from the has-data IRQ; arming first cannot miss a fast reply), the live write index comes from RLCT as in
++ *     gps_dl_real_dma_get_rx_write_index, the round is closed on DMA done or NODAINTB and re-armed. The RX ring is
++ *     pre-filled with 0xA5 so a DMA write shows up even when RLCT does not move.
++ */
++#ifndef N2G_USRT_MONF
++#define N2G_USRT_MONF(l)        (N2G_USRT_BASE(l) + 0x10u)
++#define N2G_USRT_D2A0(l)        (N2G_USRT_BASE(l) + 0x50u)
++#define N2G_USRT_D2A1(l)        (N2G_USRT_BASE(l) + 0x54u)
++#endif
++#define N2GL_FILL      0xA5u
++static bool n2gl_rx_armed, n2gl_rx_rlct_ok;
++static uint32_t n2gl_rx_at, n2gl_rx_len, n2gl_rx_cur, n2gl_rx_total;
++static int n2gl_lines;
++static bool
++n2gl_rmw_q(uint32_t pa, uint32_t mask, uint32_t val)               /* quiet read-modify-write (no console line) */
++{
++	uint32_t old = n2gl_rd(pa);
++	return !n2gl_stop && n2gl_wr(pa, (old & ~mask) | (val & mask));
++}
++static bool
++n2gl_dma_start_q(int ch, uint32_t con, uint32_t ring_off, uint32_t at, uint32_t bytes)
++{	/* gps_dl_hw_set_dma_start order: CON, PGMADDR, WPTO, WPPT, COUNT, START.STR */
++	return n2gl_wr(N2G_DMA_CON(ch), con) && n2gl_wr(N2G_DMA_PGMADDR(ch), n2gl_bus(ring_off + at)) &&
++	    n2gl_wr(N2G_DMA_WPTO(ch), n2gl_bus(ring_off)) && n2gl_rmw_q(N2G_DMA_WPPT(ch), 0xffffu, (N2GL_RING - at) / 4u) &&
++	    n2gl_rmw_q(N2G_DMA_COUNT(ch), 0xffffu, bytes / 4u) && n2gl_rmw_q(N2G_DMA_START(ch), N2G_DMA_BIT, N2G_DMA_BIT);
++}
++static void
++n2gl_dma_stop_q(int ch)
++{	/* gps_dl_hw_set_dma_stop: STR = 0, ACKINT = 1 */
++	n2gl_rmw_q(N2G_DMA_START(ch), N2G_DMA_BIT, 0);
++	n2gl_rmw_q(N2G_DMA_ACKINT(ch), N2G_DMA_BIT, N2G_DMA_BIT);
++}
++/* arm DMA2 on all free RX ring bytes from the write index (it wraps at the ring end through WPPT/WPTO) */
++static bool
++n2gl_rx_arm(bool log)
++{
++	if (n2gl_rx_armed) { return true; }
++	uint32_t fr = (N2GL_RING - 4u - n2gl_rx_used()) & ~3u;
++	if (fr < 4u) { return false; }                          /* ring full: data waits in the USRT FIFO until read() */
++	n2gl_rx_started = true;
++	if (!n2gl_dma_start_q(N2GL_RXCH, N2G_CON_L1_D2A, N2GL_RING, n2gl_rx.wr, fr)) { return false; }
++	n2gl_rx_armed = true; n2gl_rx_at = n2gl_rx.wr; n2gl_rx_len = fr; n2gl_rx_cur = 0;
++	uint32_t rl = n2gl_rd(N2G_DMA_RLCT(N2GL_RXCH)) & 0xffffu;
++	n2gl_rx_rlct_ok = rl == fr / 4u;                        /* RLCT loaded with COUNT at start: live index usable */
++	if (log) {
++		printf("NORD2 GNSS LAD %d: RX DMA2 ARMED at ring +%u for %u bytes (COUNT %u words), RLCT now %u (%s)\n", n2gl_k,
++		    n2gl_rx_at, fr, fr / 4u, rl, n2gl_rx_rlct_ok ? "live index from RLCT" : "RLCT not loaded: ring pattern decides");
++	}
++	return !n2gl_stop;
++}
++/* bytes the armed round has written: RLCT if usable, else the last word that is no longer the 0xA5 fill */
++static uint32_t
++n2gl_rx_written(void)
++{
++	if (n2gl_rx_rlct_ok) {
++		uint32_t left = (n2gl_rd(N2G_DMA_RLCT(N2GL_RXCH)) & 0xffffu) * 4u;
++		return left <= n2gl_rx_len ? n2gl_rx_len - left : 0;
++	}
++	uint32_t last = 0;
++	for (uint32_t o = 0; o < n2gl_rx_len; o += 4u) {
++		const uint8_t *w = &n2gl_ring_va[N2GL_RING + (n2gl_rx_at + o) % N2GL_RING];
++		if (w[0] != N2GL_FILL || w[1] != N2GL_FILL || w[2] != N2GL_FILL || w[3] != N2GL_FILL) { last = o + 4u; }
++	}
++	return last;
++}
++/* ack MCUB D2A flags like gps_dl_hal_mcub_flag_handler (read flag/d0/d1, write the flag back) */
++static void
++n2gl_mcub_ack(bool log)
++{
++	uint32_t f = n2gl_rd(N2G_USRT_D2AF(0));
++	if (n2gl_stop || f == 0 || f == 0xffffffffu) { return; }
++	uint32_t d0 = n2gl_rd(N2G_USRT_D2A0(0)), d1 = n2gl_rd(N2G_USRT_D2A1(0));
++	n2gl_wr(N2G_USRT_D2AF(0), f);
++	uint32_t after = n2gl_rd(N2G_USRT_D2AF(0));
++	if (log && n2gl_lines < 200) {
++		n2gl_lines++;
++		printf("NORD2 GNSS LAD %d: MCUB d2a flag=%#x d0=%#x d1=%#x%s%s%s -> acked (W1C), D2AF now %#x\n", n2gl_k, f, d0, d1,
++		    (f & 8u) ? " RESET_DONE" : "", (f & 1u) ? " RAMCODE_READY" : "", (f & 4u) ? " MCU_ACTION_REQ" : "", after);
++	}
++}
++/* one service pass: MCUB ack, live RX index, close the round on DMA done / NODAINTB and re-arm. Returns new bytes. */
++static uint32_t
++n2gl_rx_service(bool log)
++{
++	n2gl_mcub_ack(log);
++	if (n2gl_stop) { return 0; }
++	if (!n2gl_rx_armed) { n2gl_rx_arm(log); return 0; }
++	uint32_t got = 0;
++	bool done = (n2gl_rd(N2G_DMA_INTSTA(N2GL_RXCH)) & N2G_DMA_BIT) != 0;
++	bool nod = (n2gl_rd(N2G_USRT_STA(0)) & (1u << 1)) != 0;     /* NODAINTB: the DSP finished a burst */
++	if (n2gl_stop) { return 0; }
++	if (n2gl_rx_rlct_ok || done || nod) {
++		uint32_t w = done ? n2gl_rx_len : n2gl_rx_written();
++		if (w > n2gl_rx_cur) { got = w - n2gl_rx_cur; n2gl_rx_cur = w; n2gl_rx.wr = (n2gl_rx_at + w) % N2GL_RING; }
++	}
++	if (done || nod) {
++		n2gl_dma_stop_q(N2GL_RXCH);
++		if (nod) { n2gl_rmw_q(N2G_USRT_STA(0), 1u << 1, 1u << 1); }   /* gps_dl_hw_usrt_clear_nodata_irq (W1C) */
++		if (log && n2gl_lines < 200) {
++			n2gl_lines++;
++			printf("NORD2 GNSS LAD %d: RX round closed by %s: %u bytes in this round (ring +%u..+%u)\n", n2gl_k,
++			    done ? "DMA2 done" : "NODAINTB", n2gl_rx_cur, n2gl_rx_at, n2gl_rx.wr);
++		}
++		n2gl_rx_armed = false;
++		n2gl_rx_arm(log);
++	}
++	n2gl_rx_total += got;
++	return got;
++}
++/* data link prep in vendor order: show the mailbox, ack RESET_DONE, claim EMI, fill + arm RX. done[25] = EMI claim. */
++static int
++n2gl_v9_prep(bool done[32])
++{
++	n2gl_show("USRT MONF", N2G_USRT_MONF(0)); n2gl_show("USRT INTEN", N2G_USRT_INTEN(0)); n2gl_show("USRT STA", N2G_USRT_STA(0));
++	n2gl_show("USRT A2DF", N2G_USRT_A2DF(0)); n2gl_show("USRT D2AF", N2G_USRT_D2AF(0));
++	n2gl_show("USRT D2A0", N2G_USRT_D2A0(0)); n2gl_show("USRT D2A1", N2G_USRT_D2A1(0));
++	n2gl_lines = 0;
++	n2gl_mcub_ack(true);                                     /* (a) RESET_DONE acknowledged before any write */
++	n2gl_o.emictl = n2gl_rd(N2G_CFG_EMI_CTL); done[25] = true;
++	if (!n2gl_field(N2G_CFG_EMI_CTL, 1u, 1u)) { return N2G_E_ARG; }   /* (b) EMI_REQ_GPS = 1 */
++	for (uint32_t i = 0; i < N2GL_RING; i++) { n2gl_ring_va[N2GL_RING + i] = N2GL_FILL; }
++	__builtin_arm_dsb(0xf);
++	n2gl_rx.rd = n2gl_rx.wr = 0; n2gl_rx_total = 0; n2gl_rx_armed = false;
++	if (!n2gl_rx_arm(true)) { return N2G_E_ARG; }            /* (d) RX armed before the first TX */
++	n2gl_dma_regs("RX armed", N2GL_RXCH);
++	n2gl_show("USRT STA", N2G_USRT_STA(0));
++	return n2gl_stop ? N2G_E_ARG : 0;
++}
++/* watch for ms milliseconds: every change of STA / D2AF / DMA2 INTSTA / RLCT / MONF is printed, RX is serviced */
++static void
++n2gl_v9_watch(int ms, const char *phase)
++{
++	uint32_t ls = ~0u, lf = ~0u, li = ~0u, lr = ~0u, lm = ~0u;
++	int lines = 0;
++	for (int t = 0; t < ms && !n2gl_stop; t++) {
++		uint32_t sta = n2gl_rd(N2G_USRT_STA(0)), f = n2gl_rd(N2G_USRT_D2AF(0)), is = n2gl_rd(N2G_DMA_INTSTA(N2GL_RXCH));
++		uint32_t rl = n2gl_rd(N2G_DMA_RLCT(N2GL_RXCH)), m = n2gl_rd(N2G_USRT_MONF(0));
++		if (n2gl_stop) { break; }
++		if ((sta != ls || f != lf || is != li || rl != lr || m != lm) && lines < 60) {
++			lines++;
++			printf("NORD2 GNSS LAD %d: %s t=%dms sta=%#x%s%s d2af=%#x monf=%#x dma2 intsta=%#x rlct=%#x\n", n2gl_k, phase, t, sta,
++			    (sta & 8u) ? " TX_IND(has data)" : "", (sta & 2u) ? " NODAINTB" : "", f, m, is, rl);
++			ls = sta; lf = f; li = is; lr = rl; lm = m;
++		}
++		uint32_t g = n2gl_rx_service(true);
++		if (g && n2gl_lines < 200) { n2gl_lines++; printf("NORD2 GNSS LAD %d: %s t=%dms +%u bytes (total %u)\n", n2gl_k, phase, t, g, n2gl_rx_total); }
++		delay(1000);
++	}
++}
++/* what the RX ring holds: bytes that differ from the fill, and a hex dump */
++static uint32_t
++n2gl_v9_report(const char *phase)
++{
++	uint32_t first = N2GL_RING, last = 0, cnt = 0;
++	for (uint32_t i = 0; i < N2GL_RING; i++) {
++		if (n2gl_ring_va[N2GL_RING + i] != N2GL_FILL) { cnt++; if (first == N2GL_RING) { first = i; } last = i; }
++	}
++	printf("NORD2 GNSS LAD %d: %s: RX total %u bytes by index (wr=%u armed=%u rlct_ok=%u), ring bytes != 0xa5: %u (first +%u last +%u)\n",
++	    n2gl_k, phase, n2gl_rx_total, n2gl_rx.wr, n2gl_rx_armed, n2gl_rx_rlct_ok, cnt, cnt ? first : 0, cnt ? last : 0);
++	uint32_t end = cnt ? last + 1u : 0;
++	if (n2gl_rx.wr > end) { end = n2gl_rx.wr; }
++	if (end) { n2gl_hexdump("RX", 0, end < 512u ? end : 512u); }
++	n2gl_show("USRT STA", N2G_USRT_STA(0)); n2gl_show("USRT D2AF", N2G_USRT_D2AF(0)); n2gl_show("USRT MONF", N2G_USRT_MONF(0));
++	n2gl_dma_regs(phase, N2GL_RXCH);
++	return cnt > n2gl_rx_total ? cnt : n2gl_rx_total;
++}
++/* K = 23: frame 1 with RX already armed, 2 s capture; if silent, frame 1 once more and 1 s capture */
+ static int
+-n2gl_do(int s, bool done[24])
++n2gl_v9_capture(void)
++{
++	printf("NORD2 GNSS LAD %d: V9 TX libmnl frame 1 (15 bytes, RX armed before TX): aa f0 09 00 05 fe 32 00 00 01 00 3f 01 aa 0f\n", n2gl_k);
++	int e = n2gl_tx(n2gl_frame1, sizeof n2gl_frame1, true);
++	if (e) { return e; }
++	n2gl_show("USRT STA after TX", N2G_USRT_STA(0));
++	n2gl_v9_watch(2000, "after frame 1");
++	uint32_t n = n2gl_v9_report("after frame 1 (2 s)");
++	if (!n && !n2gl_stop) {
++		printf("NORD2 GNSS LAD %d: V9 silent; frame 1 again, 1 s capture\n", n2gl_k);
++		e = n2gl_tx(n2gl_frame1, sizeof n2gl_frame1, true);
++		if (e) { return e; }
++		n2gl_v9_watch(1000, "after frame 1 retry");
++		n = n2gl_v9_report("after frame 1 retry (1 s)");
++	}
++	printf("NORD2 GNSS LAD %d: V9 RESULT: DSP reply %u bytes\n", n2gl_k, n);
++	return n2gl_stop ? N2G_E_ARG : 0;
++}
++
++static int
++n2gl_do(int s, bool done[32])
+ {
+ 	switch (s) {
+ 	case 1:
+@@ -507,6 +707,9 @@
+ 		done[16] = true;
+ 		if (!n2gl_field(N2G_USRT_CTRL(0), 0xbu, 0x3u) || !n2gl_field(N2G_USRT_A2D1(0), 0xffffu, 0x000eu) ||
+ 		    !n2gl_field(N2G_USRT_A2DF(0), 1u << 3, 1u << 3)) { return N2G_E_ARG; }
++		/* 0362 (V9, K >= 23): vendor gps_dl_hw_usrt_ctrl also sets INTEN TXIEN [0] | NODAIEN [1]. The GIC lines (SPI 383..389 =
++		 * INTID 415..421) are not enabled by XNU (no handler), so this only raises the USRT-level status, as on Android. */
++		if (n2gl_v9 && !n2gl_field(N2G_USRT_INTEN(0), 0x3u, 0x3u)) { return N2G_E_ARG; }
+ 		bool rom = n2gl_poll(N2G_USRT_D2AF(0), 1u << 3, 1u << 3, 100000, "DSP ROM okay (USRT D2AF3)");
+ 		n2gl_show("USRT STA", N2G_USRT_STA(0));
+ 		if (n2gl_stop) { return N2G_E_ARG; }
+@@ -546,13 +749,15 @@
+ }
+ /* rollback of the done steps, restoring the saved original bits; vendor off order (sleep protection first) */
+ static bool
+-n2gl_undo(bool done[24])
++n2gl_undo(bool done[32])
+ {
+ 	bool clean = true;
+ 	/* 0357: vendor GPS_L1_DSP_OFF order: USRT off (TX/RX/IEN = 0), pwr_stat, then set_dsp_off (SOFT_RST_B = 0, L1_ON = 0).
+ 	 * The USRT read 0xffffffff before L1 was on, so its rollback target is the vendor off value, not the saved word. */
+ 	if (n2gl_rx_started) { n2gl_dma_stop(N2GL_RXCH); n2gl_rx_started = false; }      /* 0359: DMA channels stopped first */
+ 	if (n2gl_tx_started) { n2gl_dma_stop(N2GL_TXCH); n2gl_tx_started = false; }
++	n2gl_rx_armed = false;
++	if (done[25]) { n2gl_field(N2G_CFG_EMI_CTL, 1u, n2gl_o.emictl); }   /* 0362: EMI_REQ_GPS released after the DMAs stop */
+ 	if (done[16]) { n2gl_field(N2G_USRT_CTRL(0), 0x3u, 0); n2gl_field(N2G_USRT_INTEN(0), 0x3u, 0); }
+ 	if (done[13]) { n2gl_field(N2G_GPS_AON_DSLEEP_CTL, 0x1fu, n2gl_o.aon); }
+ 	if (done[15]) {
+@@ -687,24 +892,47 @@
+ n2gd_ladder(int k)
+ {
+ 	uint32_t g[9] = {0};
+-	bool done[24] = {false};
++	bool done[32] = {false};
+ 	n2gl_k = k; n2gl_stop = false;
+ 	bool ok = n2gd_wifi_guard(g) && (g[7] >> 16) == 1 && (g[8] >> 16) == 0;
+ 	printf("NORD2 GNSS LAD %d (%s): spm304=%#x gals504=%#x infra228=%#x infra724=%#x gic130=%#x wifi ap=%u wf=%u asleep=%u stage=%u -> %s\n",
+ 	    k, n2gl_name[k], g[0], g[3], g[4], g[5], g[6], g[7] >> 16, g[7] & 0xffff, g[8] >> 16, g[8] & 0xffff, ok ? "guard ok" : "GUARD REFUSES");
+ 	if (!ok) { return 0x01000000u; }
+ 	if (n2gd_hw(&n2gl_hw)) { return 0x0300u; }
+-	if (k == 22 && n2gd.powered) { printf("NORD2 GNSS LAD 22: already held\n"); return 1; }
++	if ((k == 22 || k == 24) && n2gd.powered) { printf("NORD2 GNSS LAD %d: already held\n", k); return 1; }
+ 	n2gl_tx_started = n2gl_rx_started = false;
+-	int last = k <= 19 ? k : (k == 21 ? 15 : k == 22 ? 17 : 16), rc = 0, s;
++	n2gl_v9 = k >= 23; n2gl_rx_armed = false;                /* 0362 */
++	int last = k <= 19 ? k : (k == 21 ? 15 : (k == 22 || k >= 23) ? 17 : 16), rc = 0, s;
+ 	for (s = 1; s <= last && !rc; s++) {
+-		if (s == k || (k == 20 && s == 16) || (k == 21 && s == 15) || (k == 22 && s == 17)) { printf("NORD2 GNSS LAD %d: about to run NEW step %d (%s)\n", k, s, n2gl_name[s]); delay(2000000); }
++		if (s == k || (k == 20 && s == 16) || (k == 21 && s == 15) || (k == 22 && s == 17) || (k >= 23 && s == 16)) { printf("NORD2 GNSS LAD %d: about to run NEW step %d (%s)\n", k, s, n2gl_name[s]); delay(2000000); }
+ 		else { printf("NORD2 GNSS LAD %d: step %d (%s)\n", k, s, n2gl_name[s]); }
+ 		rc = n2gl_do(s, done);
+ 		if (n2gl_stop) { return ((uint32_t)s << 8) | 0x01000000u; }
+ 		printf("NORD2 GNSS LAD %d: step %d %s\n", k, s, rc ? "FAILED" : "done");
+ 	}
+ 	int failed = rc ? s - 1 : 0;
++	if (!rc && k >= 23) {
++		/* 0362: vendor-order data link prep (MCUB ack, EMI_REQ_GPS, RX ring fill, DMA2 armed) */
++		printf("NORD2 GNSS LAD %d: about to run NEW V9 phase (%s)\n", k, n2gl_name[k]); delay(2000000);
++		rc = n2gl_v9_prep(done);
++		if (n2gl_stop) { return 0x01000000u | ((uint32_t)k << 8); }
++		if (rc) { failed = k; printf("NORD2 GNSS LAD %d: V9 prep FAILED (%d)\n", k, rc); }
++	}
++	if (!rc && k == 24) {
++		/* HOLD as K = 22, but read() serves the pre-armed RX DMA (n2gl_rx_service); EMI_REQ_GPS stays claimed */
++		n2gl_field(N2G_CSR_WAKEPU_GPS, 1u, n2gl_o.vote);
++		if (n2gl_stop) { return 0x01000000u | 0x1800u; }
++		n2gd.powered = true; n2gd.hw_valid = true; n2gd.last_err = 0;
++		n2gd.conn_hw_ver = n2gl_rd(N2G_CONN_HW_VER);
++		n2gl_v9hold = true; n2gd_dl_up = true;
++		printf("NORD2 GNSS LAD 24: V9 HOLD, GNSS powered, RX DMA2 armed, /dev/gpsdl0 read/write enabled (conn_infra %#x), NOT rolled back until reboot\n", n2gd.conn_hw_ver);
++		return 1;
++	}
++	if (!rc && k == 23) {
++		rc = n2gl_v9_capture();
++		if (n2gl_stop) { return 0x01000000u | 0x1700u; }
++		if (rc) { failed = 23; }
++	}
+ 	if (!rc && k == 22) {
+ 		/* HOLD: power stays on, only the GPS wake vote is released (n2g_link_on order). Not undoable in this image. */
+ 		n2gl_field(N2G_CSR_WAKEPU_GPS, 1u, n2gl_o.vote);
+@@ -846,6 +1074,8 @@
+ 	case (uint32_t)N2GD_IOC(161):
+ 	case (uint32_t)N2GD_IOC(162):
+ 	case (uint32_t)N2GD_IOC(159):                            /* 0358: K=19 = steps 1..15 + read-only L1 probe */
++	case (uint32_t)N2GD_IOC(163):                            /* 0362: K=23 V9 vendor-order capture, K=24 V9 HOLD */
++	case (uint32_t)N2GD_IOC(164):
+ 		lck_mtx_lock(&n2gd_lock);
+ 		v = n2gd_ladder((int)((uint32_t)cmd & 0xff) - 140);
+ 		lck_mtx_unlock(&n2gd_lock);
+@@ -900,6 +1130,12 @@
+ 	if (!n2gd_dl_up) { e = ENODEV; goto out; }
+ 	n2gl_k = 30; n2gl_stop = false;
+ 	for (int t = 0; !n2gl_rx_used() && t < 1000 && !n2gl_stop; t++) {
++		if (n2gl_v9hold) {                                   /* 0362: pre-armed RX DMA, MCUB flags acked and logged */
++			n2gl_rx_service(true);
++			if (n2gl_rx_used() || (flag & IO_NDELAY)) { break; }
++			delay(1000);
++			continue;
++		}
+ 		n2gl_rx_round(1000, false);
+ 		if (flag & IO_NDELAY) { break; }
+ 	}
+@@ -912,7 +1148,10 @@
+ 		uint32_t m = n < sizeof tmp ? n : (uint32_t)sizeof tmp;
+ 		for (uint32_t i = 0; i < m; i++) { tmp[i] = n2gl_ring_va[N2GL_RING + (n2gl_rx.rd + i) % N2GL_RING]; }
+ 		e = uiomove((caddr_t)tmp, (int)m, uio);
+-		if (!e) { n2gl_rx.rd = (n2gl_rx.rd + m) % N2GL_RING; n -= m; }
++		if (!e) {
++			if (n2gl_v9hold) { for (uint32_t i = 0; i < m; i++) { n2gl_ring_va[N2GL_RING + (n2gl_rx.rd + i) % N2GL_RING] = N2GL_FILL; } }
++			n2gl_rx.rd = (n2gl_rx.rd + m) % N2GL_RING; n -= m;
++		}
+ 	}
+ out:
+ 	lck_mtx_unlock(&n2gd_lock);

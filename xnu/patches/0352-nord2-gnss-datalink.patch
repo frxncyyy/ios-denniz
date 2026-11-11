@@ -1,0 +1,510 @@
+--- a/bsd/dev/nord2_gnss_dl.inc
++++ b/bsd/dev/nord2_gnss_dl.inc
+@@ -0,0 +1,239 @@
++/* SPDX-License-Identifier: MIT */
++/* nord2_gnss_dl.inc -- patch 0352: gpu/hwcodec/gnss/gnss_dl.h + gnss_dl.c (host-tested by gpu/hwcodec/gnss/run_tests.sh), functions static. */
++#ifndef NORD2_GNSS_DL_INC
++#define NORD2_GNSS_DL_INC 1
++#define N2G_KERNEL 1
++#define N2G_API static __attribute__((unused))
++/* SPDX-License-Identifier: MIT
++ * gnss_dl.h -- GNSS milestone 2: the MT6893 GNSS data link (the byte pipe /dev/gpsdl0,1 give libmnl), host-testable.
++ * Transcribed from the vendor gps_dl (plat/v010 = MT6885/MT6893): USRT APB control (hw/gps_dl_hw_usrt_apb.c
++ * gps_dl_hw_usrt_ctrl, DMA mode, 4-byte mode which is the vendor default dma_is_1byte_mode = false), BGF_GPS_DMA channel
++ * programming (hw/gps_dl_hw_gps.c gps_dl_hw_set_dma_start/stop, wait_until_dma_complete), RX start on USRT TX_IND
++ * ("has data"), RX end on DMA done or USRT NODAINTB/REGE ("no data"), ring arithmetic (lib/gps_dl_dma_buf.c
++ * gdl_dma_buf_entry_to_transfer). Addresses resolved from plat/v010/hw/inc on the host; AP view = 0x18C00000 + (bus - 0x80000000).
++ * Polling only (the vendor also has an IRQ path, SPI 383..389; the worker polls like gps_dl_hal_poll_event).
++ */
++#ifndef N2G_GNSS_DL_H
++#define N2G_GNSS_DL_H
++#ifndef N2G_KERNEL
++#include <stdint.h>
++#include <stddef.h>
++#endif
++/* gnss_pwr.h: in nord2_gnss_pwr.inc */
++
++#define N2G_DMA_WPPT(ch)        N2G_GPS_BUS(0x80010108u + 0x100u * (ch))   /* [15:0] units to wrap */
++#define N2G_DMA_WPTO(ch)        N2G_GPS_BUS(0x8001010cu + 0x100u * (ch))   /* buffer start (bus) */
++#define N2G_DMA_COUNT(ch)       N2G_GPS_BUS(0x80010110u + 0x100u * (ch))   /* [15:0] units */
++#define N2G_DMA_CON(ch)         N2G_GPS_BUS(0x80010114u + 0x100u * (ch))
++#define N2G_DMA_START(ch)       N2G_GPS_BUS(0x80010118u + 0x100u * (ch))   /* [15] STR */
++#define N2G_DMA_INTSTA(ch)      N2G_GPS_BUS(0x8001011cu + 0x100u * (ch))   /* [15] INT */
++#define N2G_DMA_ACKINT(ch)      N2G_GPS_BUS(0x80010120u + 0x100u * (ch))   /* [15] ACK */
++#define N2G_DMA_RLCT(ch)        N2G_GPS_BUS(0x80010124u + 0x100u * (ch))   /* [15:0] units left */
++#define N2G_DMA_PGMADDR(ch)     N2G_GPS_BUS(0x8001012cu + 0x100u * (ch))   /* transfer start (bus) */
++#define N2G_DMA_STATE(ch)       N2G_GPS_BUS(0x80010148u + 0x100u * (ch))   /* [6:0], 1 = done/idle after a transfer */
++#define N2G_DMA_BIT             0x8000u
++/* 4-byte mode CON values per channel: DMA1 L1 A2D, DMA2 L1 D2A, DMA3 L5 A2D, DMA4 L5 D2A */
++#define N2G_CON_L1_A2D 0x00128016u
++#define N2G_CON_L1_D2A 0x0007801Au
++#define N2G_CON_L5_A2D 0x00328016u
++#define N2G_CON_L5_D2A 0x0027801Au
++
++#define N2G_USRT_BASE(l)        N2G_GPS_BUS((l) ? 0x80083000u : 0x80073000u)
++#define N2G_USRT_CTRL(l)        (N2G_USRT_BASE(l) + 0x04u)   /* [3] BYTEN [1] TX_EN [0] RX_EN */
++#define N2G_USRT_INTEN(l)       (N2G_USRT_BASE(l) + 0x08u)   /* [0] TXIEN [1] NODAIEN */
++#define N2G_USRT_STA(l)         (N2G_USRT_BASE(l) + 0x0cu)   /* [3] TX_IND (DSP has data) [1] NODAINTB (w1c) [5] REGE [29] RX_EMP */
++#define N2G_USRT_A2DF(l)        (N2G_USRT_BASE(l) + 0x20u)   /* [3] A2DF3 */
++#define N2G_USRT_D2AF(l)        (N2G_USRT_BASE(l) + 0x24u)   /* [3] D2AF3: DSP ROM okay */
++#define N2G_USRT_A2D1(l)        (N2G_USRT_BASE(l) + 0x34u)   /* [15:0] DSP config */
++#define N2G_DSP_CFG_4BYTE       0x000eu   /* MVCD_SPEED_UP | ADIE_IS_MT6635_E2_OR_AFTER | USRT_4BYTE_MODE */
++
++#define N2G_EMI_BUS_BASE        0x78000000u   /* GPS_EMI_BUS_BASE: bus = 0x78000000 + (phys - remap base) */
++#define N2G_RING_BYTES          8192u         /* GPS_DL_TX/RX_BUF_SIZE */
++
++struct n2g_ring { uint8_t *va; uint32_t pa, rd, wr; };     /* bytes, 4-byte aligned indexes, one word kept free */
++struct n2g_link {
++	int id;                          /* 0 = L1, 1 = L5 */
++	const struct n2g_hw *hw;
++	uint32_t remap_pa;               /* the GPS EMI remap base (64 KiB aligned), same as hw->emi_base_pa */
++	struct n2g_ring tx, rx;
++	int tx_busy, rx_busy;
++	uint32_t tx_len, rx_max;         /* bytes programmed into the running transfer */
++	uint32_t stat_tx, stat_rx, stat_rx_nodata, stat_err;
++};
++
++/* rings: va/pa of 2 x N2G_RING_BYTES (TX then RX), inside the remap window */
++N2G_API int n2g_dl_init(struct n2g_link *l, int id, const struct n2g_hw *hw, uint8_t *va, uint32_t pa);
++/* USRT on in DMA mode (gps_dl_hw_usrt_ctrl(link, on, dma, 4-byte)), then wait for the DSP ROM okay flag */
++N2G_API int n2g_dl_usrt_on(struct n2g_link *l);
++N2G_API void n2g_dl_usrt_off(struct n2g_link *l);
++/* user write: copy into the TX ring (whole 4-byte words; a trailing partial word is zero padded), kick TX DMA */
++N2G_API size_t n2g_dl_write(struct n2g_link *l, const uint8_t *buf, size_t len);
++/* user read: copy out of the RX ring */
++N2G_API size_t n2g_dl_read(struct n2g_link *l, uint8_t *buf, size_t len);
++N2G_API size_t n2g_dl_rx_avail(const struct n2g_link *l);
++N2G_API size_t n2g_dl_tx_free(const struct n2g_link *l);
++/* worker step: finish/start DMA transfers; returns a bitmask: 1 tx progressed, 2 rx data arrived */
++N2G_API int n2g_dl_poll(struct n2g_link *l);
++
++#endif
++/* SPDX-License-Identifier: MIT
++ * gnss_dl.c -- see gnss_dl.h. Vendor source order kept for every register sequence; all accesses through n2g_hw.
++ */
++#ifndef N2G_KERNEL
++#include "gnss_dl.h"
++#endif
++
++static uint32_t dl_rd(const struct n2g_link *l, uint32_t pa) { return l->hw->read32(l->hw->ctx, pa); }
++static void dl_wr(const struct n2g_link *l, uint32_t pa, uint32_t v) { l->hw->write32(l->hw->ctx, pa, v); }
++static void dl_set(const struct n2g_link *l, uint32_t pa, uint32_t m, uint32_t v) { dl_wr(l, pa, (dl_rd(l, pa) & ~m) | (v & m)); }
++static uint32_t dl_bus(const struct n2g_link *l, uint32_t pa) { return N2G_EMI_BUS_BASE + (pa - l->remap_pa); }
++
++static uint32_t ring_used(const struct n2g_ring *r) { return (r->wr + N2G_RING_BYTES - r->rd) % N2G_RING_BYTES; }
++static uint32_t ring_free(const struct n2g_ring *r) { return N2G_RING_BYTES - 4u - ring_used(r); }
++
++N2G_API int n2g_dl_init(struct n2g_link *l, int id, const struct n2g_hw *hw, uint8_t *va, uint32_t pa)
++{
++	if (!l || !hw || !va || (id != 0 && id != 1) || (pa & 3u) || pa < hw->emi_base_pa ||
++	    pa + 2u * N2G_RING_BYTES - hw->emi_base_pa > (64u << 20)) return N2G_E_ARG;
++	for (size_t i = 0; i < sizeof *l; i++) ((uint8_t *)l)[i] = 0;
++	l->id = id; l->hw = hw; l->remap_pa = hw->emi_base_pa;
++	l->tx.va = va; l->tx.pa = pa;
++	l->rx.va = va + N2G_RING_BYTES; l->rx.pa = pa + N2G_RING_BYTES;
++	return N2G_OK;
++}
++
++/* gps_dl_hw_usrt_ctrl(link, is_on = true, is_dma_mode = true, is_1byte_mode = false) */
++N2G_API int n2g_dl_usrt_on(struct n2g_link *l)
++{
++	int i = l->id;
++	dl_set(l, N2G_USRT_CTRL(i), 1u << 3, 0);            /* BYTEN = 0 (4-byte mode) */
++	dl_set(l, N2G_USRT_CTRL(i), 1u << 1, 1u << 1);      /* TX_EN */
++	dl_set(l, N2G_USRT_CTRL(i), 1u << 0, 1u << 0);      /* RX_EN */
++	dl_set(l, N2G_USRT_INTEN(i), 1u << 0, 1u << 0);     /* TXIEN */
++	dl_set(l, N2G_USRT_INTEN(i), 1u << 1, 1u << 1);     /* NODAIEN */
++	dl_set(l, N2G_USRT_A2D1(i), 0xffffu, N2G_DSP_CFG_4BYTE);
++	dl_set(l, N2G_USRT_A2DF(i), 1u << 3, 1u << 3);      /* A2DF3 */
++	for (int n = 0; n < N2G_POLL_MAX; n++) {            /* wait ROM okay flag */
++		if (dl_rd(l, N2G_USRT_D2AF(i)) & (1u << 3)) return N2G_OK;
++		l->hw->delay_us(l->hw->ctx, 1);
++	}
++	l->stat_err++;
++	return N2G_E_TIMEOUT;
++}
++
++N2G_API void n2g_dl_usrt_off(struct n2g_link *l)
++{
++	int i = l->id;
++	dl_set(l, N2G_USRT_CTRL(i), 1u << 3, 0);
++	dl_set(l, N2G_USRT_CTRL(i), 1u << 1, 0);
++	dl_set(l, N2G_USRT_CTRL(i), 1u << 0, 0);
++	dl_set(l, N2G_USRT_INTEN(i), 1u << 0, 0);
++	dl_set(l, N2G_USRT_INTEN(i), 1u << 1, 0);
++}
++
++static int ch_a2d(const struct n2g_link *l) { return l->id ? 2 : 0; }
++static int ch_d2a(const struct n2g_link *l) { return l->id ? 3 : 1; }
++
++/* gps_dl_hw_set_dma_start: CON, PGMADDR, WPTO, WPPT, COUNT, START.STR (units of 4 bytes in 4-byte mode) */
++static void dma_start(const struct n2g_link *l, int ch, uint32_t con, const struct n2g_ring *r, uint32_t at, uint32_t bytes)
++{
++	dl_wr(l, N2G_DMA_CON(ch), con);
++	dl_wr(l, N2G_DMA_PGMADDR(ch), dl_bus(l, r->pa + at));
++	dl_wr(l, N2G_DMA_WPTO(ch), dl_bus(l, r->pa));
++	dl_set(l, N2G_DMA_WPPT(ch), 0xffffu, (N2G_RING_BYTES - at) / 4u);
++	dl_set(l, N2G_DMA_COUNT(ch), 0xffffu, bytes / 4u);
++	dl_set(l, N2G_DMA_START(ch), N2G_DMA_BIT, N2G_DMA_BIT);
++}
++/* gps_dl_hw_set_dma_stop: START.STR = 0, ACKINT = 1 */
++static void dma_stop(const struct n2g_link *l, int ch)
++{
++	dl_set(l, N2G_DMA_START(ch), N2G_DMA_BIT, 0);
++	dl_set(l, N2G_DMA_ACKINT(ch), N2G_DMA_BIT, N2G_DMA_BIT);
++}
++static int dma_done(const struct n2g_link *l, int ch)
++{
++	return (dl_rd(l, N2G_DMA_INTSTA(ch)) & N2G_DMA_BIT) && (dl_rd(l, N2G_DMA_STATE(ch)) & 0x7fu) == 1u;
++}
++
++static void tx_kick(struct n2g_link *l)
++{
++	uint32_t used = ring_used(&l->tx);
++	if (l->tx_busy || !used) return;
++	l->tx_len = used;
++	dma_start(l, ch_a2d(l), l->id ? N2G_CON_L5_A2D : N2G_CON_L1_A2D, &l->tx, l->tx.rd, used);
++	l->tx_busy = 1;
++}
++
++N2G_API size_t n2g_dl_write(struct n2g_link *l, const uint8_t *buf, size_t len)
++{
++	size_t done = 0;
++	while (done < len) {
++		uint32_t fr = ring_free(&l->tx);
++		if (fr < 4u) break;
++		uint32_t chunk = (uint32_t)(len - done);
++		if (chunk > fr) chunk = fr & ~3u;
++		uint32_t padded = (chunk + 3u) & ~3u;
++		if (padded > fr) { chunk = fr & ~3u; padded = chunk; }
++		if (!chunk) break;
++		for (uint32_t i = 0; i < padded; i++) {
++			l->tx.va[(l->tx.wr + i) % N2G_RING_BYTES] = i < chunk ? buf[done + i] : 0;
++		}
++		l->tx.wr = (l->tx.wr + padded) % N2G_RING_BYTES;
++		done += chunk;
++	}
++	tx_kick(l);
++	return done;
++}
++
++N2G_API size_t n2g_dl_read(struct n2g_link *l, uint8_t *buf, size_t len)
++{
++	size_t n = ring_used(&l->rx);
++	if (n > len) n = len;
++	for (size_t i = 0; i < n; i++) buf[i] = l->rx.va[(l->rx.rd + i) % N2G_RING_BYTES];
++	/* keep rd word aligned for the DMA: a partial word read leaves its rest for the next read */
++	l->rx.rd = (uint32_t)((l->rx.rd + n) % N2G_RING_BYTES);
++	return n;
++}
++
++N2G_API size_t n2g_dl_rx_avail(const struct n2g_link *l) { return ring_used(&l->rx); }
++N2G_API size_t n2g_dl_tx_free(const struct n2g_link *l) { return ring_free(&l->tx); }
++
++N2G_API int n2g_dl_poll(struct n2g_link *l)
++{
++	int r = 0, i = l->id;
++	/* TX: gps_dl_hw_wait_until_dma_complete_and_stop_it */
++	if (l->tx_busy && dma_done(l, ch_a2d(l))) {
++		dma_stop(l, ch_a2d(l));
++		l->tx.rd = (l->tx.rd + l->tx_len) % N2G_RING_BYTES;
++		l->stat_tx += l->tx_len;
++		l->tx_busy = 0;
++		r |= 1;
++		tx_kick(l);
++	}
++	/* RX end: DMA done, or USRT "no data" / REGE (gps_dl_hal_wait_and_handle_until_usrt_has_nodata_or_rx_dma_done) */
++	if (l->rx_busy) {
++		uint32_t sta = dl_rd(l, N2G_USRT_STA(i));
++		int done = dma_done(l, ch_d2a(l)), nodata = (sta & ((1u << 1) | (1u << 5))) != 0;
++		if (done || nodata) {
++			dma_stop(l, ch_d2a(l));
++			uint32_t left = (dl_rd(l, N2G_DMA_RLCT(ch_d2a(l))) & 0xffffu) * 4u;
++			uint32_t got = left <= l->rx_max ? l->rx_max - left : 0;
++			l->rx.wr = (l->rx.wr + got) % N2G_RING_BYTES;
++			l->stat_rx += got;
++			if (nodata) { l->stat_rx_nodata++; dl_set(l, N2G_USRT_STA(i), 1u << 1, 1u << 1); }   /* clear NODAINTB (w1c) */
++			l->rx_busy = 0;
++			if (got) r |= 2;
++		}
++	}
++	/* RX start: DSP has data (USRT TX_IND) and the RX ring has room */
++	if (!l->rx_busy && (dl_rd(l, N2G_USRT_STA(i)) & (1u << 3))) {
++		uint32_t fr = ring_free(&l->rx) & ~3u;
++		if (fr >= 4u) {
++			l->rx_max = fr;
++			dma_start(l, ch_d2a(l), l->id ? N2G_CON_L5_D2A : N2G_CON_L1_D2A, &l->rx, l->rx.wr, fr);
++			l->rx_busy = 1;
++		}
++	}
++	return r;
++}
++#endif
+--- a/bsd/dev/nord2_gnss_pwr.inc
++++ b/bsd/dev/nord2_gnss_pwr.inc
+@@ -1,5 +1,5 @@
+ /* SPDX-License-Identifier: MIT */
+-/* nord2_gnss_pwr.inc -- patch 0350: gpu/hwcodec/gnss/gnss_pwr.h + gnss_pwr.c (host-tested by run_tests.sh), functions static. */
++/* nord2_gnss_pwr.inc -- patch 0350: gpu/hwcodec/gnss/gnss_pwr.h + gnss_pwr.c (host-tested by gpu/hwcodec/gnss/run_tests.sh), functions static. */
+ #ifndef NORD2_GNSS_PWR_INC
+ #define NORD2_GNSS_PWR_INC 1
+ #define N2G_KERNEL 1
+@@ -69,6 +69,7 @@
+ 	N2G_E_GPS_TOP = 5,      /* gps_top_off never reached GPS_ACTIVE (debug readout != 2) */
+ 	N2G_E_ADIE_CLK = 6,     /* A-die top clock WB_STA busy did not clear */
+ 	N2G_E_ARG = 7,
++	N2G_E_TIMEOUT = 9,      /* data link: the DSP ROM okay flag (USRT D2AF3) never came */
+ 	N2G_E_WAKE = 8,         /* conn_infra did not wake for the GPS vote (on2off sleep protection ack stayed set) */
+ };
+ 
+@@ -106,6 +107,17 @@
+ {
+ 	for (unsigned i = 0; i < sizeof n2g_regs / sizeof n2g_regs[0]; i++)
+ 		if (n2g_regs[i] == pa) return 1;
++	/* M2 (gnss_dl.c): BGF_GPS_DMA channels 1..4 (bus 0x80010108..0x80010448) and the two USRT APB blocks */
++	if (pa >= 0x18c10108u && pa < 0x18c10500u) {
++		uint32_t o = (pa - 0x18c10000u) & 0xffu;
++		if (pa >= 0x18c10100u && ((pa - 0x18c10000u) >> 8) <= 4u &&
++		    (o == 0x08 || o == 0x0c || o == 0x10 || o == 0x14 || o == 0x18 || o == 0x1c || o == 0x20 || o == 0x24 || o == 0x2c || o == 0x48))
++			return 1;
++	}
++	if ((pa & ~0x3fu) == 0x18c73000u || (pa & ~0x3fu) == 0x18c83000u) {
++		uint32_t o = pa & 0x3fu;
++		if (o == 0x04 || o == 0x08 || o == 0x0c || o == 0x20 || o == 0x24 || o == 0x34) return 1;
++	}
+ 	return 0;
+ }
+ 
+--- a/bsd/dev/nord2_gpsdl.inc
++++ b/bsd/dev/nord2_gpsdl.inc
+@@ -10,7 +10,9 @@
+  *   - power path = n2g_common_on() + n2g_dsp_on() on the first open of a link, gated by boot-arg nord2gnss=1 AND the
+  *     (or n2gps=1) AND the Wi-Fi bring-up's conninfra owner being powered (n2gd_conninfra_ready(), to be wired to the persistent/wake state);
+  *   - read/write/select return ENODEV until milestone 2 (the DMA rings) exists: no EMI/DMA is touched here.
+- * Milestone 2 (not written): the per-link TX/RX DMA rings in a reserved EMI window (GPS_DL_TX/RX_BUF_SIZE 8 KiB),
++ * Milestone 2 (patch 0352, ../../../gnss_dl.c, host-tested by test_gnss_dl.c + test_gpsdl.c): read/write/select over the
++ *   per-link TX/RX rings below, a worker thread polling the links every N2GD_POLL_US while a link is open.
++ * Originally planned for M2: the per-link TX/RX DMA rings in a reserved EMI window (GPS_DL_TX/RX_BUF_SIZE 8 KiB),
+  *   BGF_GPS_DMA (bus 0x80010000 -> AP 0x18C10000) channel setup, the GNSS IRQs (GIC SPI 383..387 in the Android DT),
+  *   USRT APB mailbox for DSP wake/sleep (gps_usrt_apb.h), the DSP state machine (gps_dsp_fsm.c: RESET_DONE -> MVCD ->
+  *   WORKING; the DSP code itself is sent by libmnl over this data link, "_BootDSP_UART_V2"/"Send_DspCode").
+@@ -22,9 +24,10 @@
+ #define NORD2_GPSDL_INC 1
+ 
+ #ifdef N2GD_HOST
+-#include "../../../gnss_pwr.h"
++#include "../../../gnss_dl.h"
+ #else
+ #include "nord2_gnss_pwr.inc"   /* gnss_pwr.h + gnss_pwr.c with N2G_API static (patch 0350) */
++#include "nord2_gnss_dl.inc"    /* gnss_dl.h + gnss_dl.c with N2G_API static (patch 0352) */
+ #endif
+ 
+ #ifdef N2GD_HOST
+@@ -36,6 +39,9 @@
+ #include <sys/conf.h>
+ #include <sys/proc.h>
+ #include <sys/ioccom.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
++#include <kern/thread.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
+ #include <pexpert/pexpert.h>
+@@ -51,10 +57,14 @@
+ 	GPSDL_IOC_GPS_HW_RESUME = 19, GPSDL_IOC_GPS_LISTEN_RST_EVT = 20, GPSDL_IOC_GPS_GET_MD_STATUS = 21,
+ };
+ 
++#define N2GD_POLL_US      1000                               /* worker period while a link is open (I: vendor polls 1 ms-ish) */
+ struct n2gd_state {
+-	bool made, enabled, powered;
++	bool made, enabled, powered, worker;
+ 	int major;
+ 	unsigned opens[N2GD_LINKS];
++	bool link_up[N2GD_LINKS];
++	struct n2g_link link[N2GD_LINKS];
++	struct n2g_hw hw;
+ 	int last_err;
+ 	uint32_t conn_hw_ver;
+ };
+@@ -65,6 +75,8 @@
+ /* integration points (milestone 1 stubs; the integrator binds them to the existing owners) */
+ static bool n2gd_conninfra_ready(void);                        /* Wi-Fi persistent init done + HOST1a0 wake vote held */
+ static int n2gd_hw(struct n2g_hw *hw);                         /* fills callbacks over the mapped allow-listed pages */
++static int n2gd_rings(int link, uint8_t **va, uint32_t *pa);  /* 0352: 2 x 8 KiB uncached ring window per link (EMI) */
++static void n2gd_worker_kick(void);                            /* 0352: start the poll thread once */
+ 
+ static int
+ n2gd_power_on_locked(void)
+@@ -80,6 +92,7 @@
+ 		printf("NORD2 GNSS: power on failed, step %d\n", rc);
+ 		return EIO;
+ 	}
++	n2gd.hw = hw;
+ 	n2gd.conn_hw_ver = hw.read32(hw.ctx, N2G_CONN_HW_VER);
+ 	n2gd.powered = true;
+ 	printf("NORD2 GNSS: powered (conn_infra %#x)\n", n2gd.conn_hw_ver);
+@@ -93,6 +106,16 @@
+ 	if (!n2gd.made || l < 0 || l >= N2GD_LINKS) { return ENXIO; }
+ 	lck_mtx_lock(&n2gd_lock);
+ 	int e = n2gd_power_on_locked();
++	if (!e && !n2gd.link_up[l]) {                            /* 0352: rings + USRT in DMA mode, DSP ROM okay */
++		uint8_t *va; uint32_t pa;
++		e = n2gd_rings(l, &va, &pa);
++		if (!e && n2g_dl_init(&n2gd.link[l], l, &n2gd.hw, va, pa) != N2G_OK) { e = EINVAL; }
++		if (!e) {
++			int rc = n2g_dl_usrt_on(&n2gd.link[l]);
++			if (rc != N2G_OK) { printf("NORD2 GNSS: link %d usrt on failed %d (DSP ROM flag)\n", l, rc); e = EIO; n2gd.last_err = rc; }
++		}
++		if (!e) { n2gd.link_up[l] = true; printf("NORD2 GNSS: link %d up (rings %#x)\n", l, pa); n2gd_worker_kick(); }
++	}
+ 	if (!e) { n2gd.opens[l]++; }
+ 	lck_mtx_unlock(&n2gd_lock);
+ 	return e;
+@@ -119,7 +142,7 @@
+ 	uint32_t v = 0;
+ 	switch ((uint32_t)cmd) {
+ 	case (uint32_t)N2GD_IOC(GPSDL_IOC_QUERY_STATUS):
+-		v = (n2gd.powered ? 1u : 0u) | ((uint32_t)(n2gd.last_err & 0xff) << 8);
++		v = (n2gd.powered ? 1u : 0u) | (n2gd.link_up[l] ? 2u : 0u) | ((uint32_t)(n2gd.last_err & 0xff) << 8);
+ 		break;
+ 	case (uint32_t)N2GD_IOC(GPSDL_IOC_GPS_HWVER):
+ 		v = n2gd.conn_hw_ver;
+@@ -135,18 +158,93 @@
+ 	return 0;
+ }
+ 
++/* 0352: the worker polls every open link; readers/writers sleep on the link and are woken when it made progress */
++static void
++n2gd_worker_step(void)
++{
++	lck_mtx_lock(&n2gd_lock);
++	for (int l = 0; l < N2GD_LINKS; l++) {
++		if (!n2gd.link_up[l] || !n2gd.opens[l]) { continue; }
++		if (n2g_dl_poll(&n2gd.link[l])) { wakeup(&n2gd.link[l]); }
++	}
++	lck_mtx_unlock(&n2gd_lock);
++}
++
++static int
++n2gd_read(dev_t dev, struct uio *uio, int flag)
++{
++	int l = minor(dev), e = 0;
++	if (!n2gd.made || l < 0 || l >= N2GD_LINKS || !n2gd.link_up[l]) { return ENODEV; }
++	uint8_t buf[512];
++	lck_mtx_lock(&n2gd_lock);
++	while (n2g_dl_rx_avail(&n2gd.link[l]) == 0) {
++		if (flag & IO_NDELAY) { lck_mtx_unlock(&n2gd_lock); return EAGAIN; }
++		e = msleep(&n2gd.link[l], &n2gd_lock, PZERO | PCATCH, "gpsdl-rd", NULL);
++		if (e) { lck_mtx_unlock(&n2gd_lock); return e; }
++	}
++	while (uio_resid(uio) > 0 && n2g_dl_rx_avail(&n2gd.link[l]) > 0) {
++		size_t want = (size_t)uio_resid(uio) < sizeof buf ? (size_t)uio_resid(uio) : sizeof buf;
++		size_t n = n2g_dl_read(&n2gd.link[l], buf, want);
++		lck_mtx_unlock(&n2gd_lock);
++		e = uiomove((caddr_t)buf, (int)n, uio);
++		lck_mtx_lock(&n2gd_lock);
++		if (e) { break; }
++	}
++	lck_mtx_unlock(&n2gd_lock);
++	return e;
++}
++
+ static int
+-n2gd_rw(__unused dev_t dev, __unused struct uio *uio, __unused int flag)
++n2gd_write(dev_t dev, struct uio *uio, __unused int flag)       /* always blocking (libmnl writes blocking) */
+ {
+-	return ENODEV;                                           /* DMA rings: milestone 2 */
++	int l = minor(dev), e = 0;
++	if (!n2gd.made || l < 0 || l >= N2GD_LINKS || !n2gd.link_up[l]) { return ENODEV; }
++	uint8_t buf[512];
++	while (uio_resid(uio) > 0) {
++		size_t want = (size_t)uio_resid(uio) < sizeof buf ? (size_t)uio_resid(uio) : sizeof buf;
++		e = uiomove((caddr_t)buf, (int)want, uio);
++		if (e) { return e; }
++		size_t off = 0;
++		lck_mtx_lock(&n2gd_lock);
++		while (off < want) {
++			off += n2g_dl_write(&n2gd.link[l], buf + off, want - off);
++			if (off < want) {
++				e = msleep(&n2gd.link[l], &n2gd_lock, PZERO | PCATCH, "gpsdl-wr", NULL);
++				if (e) { lck_mtx_unlock(&n2gd_lock); return e; }
++			}
++		}
++		lck_mtx_unlock(&n2gd_lock);
++	}
++	return 0;
+ }
+ 
++#ifndef N2GD_HOST
++static void
++n2gd_worker(__unused void *arg, __unused wait_result_t w)
++{
++	for (;;) {
++		n2gd_worker_step();
++		bool any = (n2gd.opens[0] && n2gd.link_up[0]) || (n2gd.opens[1] && n2gd.link_up[1]);
++		struct timespec ts = { 0, any ? N2GD_POLL_US * 1000L : 100L * 1000 * 1000 };   /* idle: 100 ms */
++		(void)msleep(&n2gd.worker, NULL, PZERO, "gpsdl-poll", &ts);
++	}
++}
++static void
++n2gd_worker_kick(void)
++{
++	if (n2gd.worker) { return; }
++	thread_t t;
++	if (kernel_thread_start(n2gd_worker, NULL, &t) == KERN_SUCCESS) { thread_deallocate(t); n2gd.worker = true; }
++	else { printf("NORD2 GNSS: worker thread start failed\n"); }
++}
++#endif
++
+ #ifdef N2GD_HOST
+-static const struct cdevsw n2gd_cdevsw = { .d_open = n2gd_open, .d_close = n2gd_close, .d_ioctl = n2gd_ioctl, .d_read = n2gd_rw, .d_write = n2gd_rw };
++static const struct cdevsw n2gd_cdevsw = { .d_open = n2gd_open, .d_close = n2gd_close, .d_ioctl = n2gd_ioctl, .d_read = n2gd_read, .d_write = n2gd_write };
+ #else
+ static const struct cdevsw n2gd_cdevsw = {
+ 	.d_open = n2gd_open, .d_close = n2gd_close,
+-	.d_read = n2gd_rw, .d_write = n2gd_rw, .d_ioctl = n2gd_ioctl,
++	.d_read = n2gd_read, .d_write = n2gd_write, .d_ioctl = n2gd_ioctl,
+ 	.d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL,
+ 	.d_select = eno_select, .d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0,
+ };
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -952,8 +952,8 @@
+ 	return npa_persistent_lifetime && !npa_native.state.fatal && npa_native.state.result.phase == 10;
+ }
+ 
+-#define N2GD_NPAGES 6
+-static const uint32_t n2gd_pages[N2GD_NPAGES] = { 0x18000000u, 0x18001000u, 0x18005000u, 0x18060000u, 0x18c01000u, 0x18c73000u };
++#define N2GD_NPAGES 8   /* 0352: + BGF_GPS_DMA 0x18c10000 and the L5 USRT 0x18c83000 */
++static const uint32_t n2gd_pages[N2GD_NPAGES] = { 0x18000000u, 0x18001000u, 0x18005000u, 0x18060000u, 0x18c01000u, 0x18c73000u, 0x18c10000u, 0x18c83000u };
+ static vm_offset_t n2gd_va[N2GD_NPAGES];
+ 
+ static volatile uint32_t *
+@@ -983,9 +983,24 @@
+ static void n2gd_delay(__unused void *ctx, unsigned us) { delay(us); }
+ static void n2gd_note(__unused void *ctx, const char *step, uint32_t a, uint32_t b) { printf("NORD2 GNSS: %s %#x %#x\n", step, a, b); }
+ 
+-/* GPS DMA buffers are milestone 2; until then the EMI remap points at the CONN EMI region the Wi-Fi owner already
+- * remaps (0x8a000000 in npa_persistent_window), which the GNSS DMA does not use yet (no DMA is started). */
+-#define N2GD_EMI_BASE 0x8a000000u
++/* 0352: GPS DMA rings in the unclaimed physical gap after the vcodec pool (redwood_vcodec.h: nothing is carved out in
++ * 0xC0000000..0xDFE70000; vcodec ends at 0xDFE00000): 64 KiB at 0xDFE00000, L1 TX/RX at +0, L5 TX/RX at +0x8000, mapped
++ * uncached (no cache maintenance). The GPS EMI remap base is the window itself (bus 0x78000000 = phys 0xDFE00000). */
++#define N2GD_EMI_BASE 0xdfe00000u
++#define N2GD_RING_WIN 0x10000u
++static uint8_t *n2gd_ring_va;
++static int
++n2gd_rings(int link, uint8_t **va, uint32_t *pa)
++{
++	if (!n2gd_ring_va) {
++		n2gd_ring_va = (uint8_t *)ml_io_map_unmappable(N2GD_EMI_BASE, N2GD_RING_WIN, VM_WIMG_IO);
++		if (!n2gd_ring_va) { printf("NORD2 GNSS: ring window map failed\n"); return ENOMEM; }
++		for (uint32_t i = 0; i < N2GD_RING_WIN; i += 4) { *(volatile uint32_t *)(void *)(n2gd_ring_va + i) = 0; }
++	}
++	*va = n2gd_ring_va + (uint32_t)link * 0x8000u;
++	*pa = N2GD_EMI_BASE + (uint32_t)link * 0x8000u;
++	return 0;
++}
+ 
+ static int
+ n2gd_hw(struct n2g_hw *hw)

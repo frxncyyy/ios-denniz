@@ -1,0 +1,135 @@
+--- a/bsd/dev/nord2_gpsdl.inc
++++ b/bsd/dev/nord2_gpsdl.inc
+@@ -52,7 +52,7 @@
+ };
+ 
+ struct n2gd_state {
+-	bool made, enabled, powered;
++	bool made, enabled, powered, hw_valid;
+ 	int major;
+ 	unsigned opens[N2GD_LINKS];
+ 	int last_err;
+@@ -86,14 +86,81 @@
+ 	return 0;
+ }
+ 
++/*
++ * 0353 (q10jr3): after the q10jr reset (phone back to fastboot when the probe opened /dev/gpsdl0), the power path runs
++ * only as explicit single steps, each guarded like the Wi-Fi driver guards its own conn_infra accesses (nwfn_guard: SPM
++ * 0x10006304[4:0]=0xd, 0x1000616c/0x10006170 bit1, GALS 0x1020e504 bit0 = 1, infracfg bus protection 0x10001228[13] = 0
++ * and 0x10001724[2] = 0, all always-on AP registers), with a console marker and a 300 ms pause before every risky access:
++ *   step 1: read and print the six always-on predicates only (no conn_infra access at all)
++ *   step 2: + read CONN_HOST_CSR_TOP 0x18060184 (on2off sleep-protection ack) and 0x180601ac (GPS wake vote)
++ *   step 3: + GPS wake vote, poll the ack, read the conn_infra version 0x18001000, release the vote
++ *   step 4: the full n2g_link_on (common_on + L1 DSP on)
++ * Return value: bit 0 = step completed, bits 8..15 = n2g error / refusal code, bits 16..23 = failing predicate index.
++ */
++static bool n2gd_ao_predicates(uint32_t out[6]);                 /* sweet_touch.c binding: true when all six match */
++/* step 4: every register access is announced on the console (and given 20 ms to drain) before it is made */
++static struct n2g_hw n2gd_inner;
++static unsigned n2gd_acc;
++static uint32_t
++n2gd_trace_rd(__unused void *c, uint32_t pa)
++{
++	printf("NORD2 GNSS ACC %u: read %#x\n", ++n2gd_acc, pa); delay(20000);
++	uint32_t v = n2gd_inner.read32(n2gd_inner.ctx, pa);
++	printf("NORD2 GNSS ACC %u: = %#x\n", n2gd_acc, v);
++	return v;
++}
++static void
++n2gd_trace_wr(__unused void *c, uint32_t pa, uint32_t v)
++{
++	printf("NORD2 GNSS ACC %u: write %#x = %#x\n", ++n2gd_acc, pa, v); delay(20000);
++	n2gd_inner.write32(n2gd_inner.ctx, pa, v);
++}
++static uint32_t
++n2gd_step(int step)
++{
++	uint32_t ao[6] = {0};
++	printf("NORD2 GNSS STEP %d: begin, reading the always-on predicates\n", step);
++	bool ok = n2gd_ao_predicates(ao);
++	printf("NORD2 GNSS STEP %d: spm304=%#x spm16c=%#x spm170=%#x gals504=%#x infra228=%#x infra724=%#x -> %s\n", step,
++	    ao[0], ao[1], ao[2], ao[3], ao[4], ao[5], ok ? "conn_infra reachable (Wi-Fi guard ok)" : "REFUSED (Wi-Fi guard fails)");
++	if (step == 1) { return 1; }
++	if (!ok) { return 0x0100u; }
++	if (!n2gd.enabled || !n2gd_conninfra_ready()) { printf("NORD2 GNSS STEP %d: refused, Wi-Fi owner not retained\n", step); return 0x0200u; }
++	struct n2g_hw hw;
++	if (n2gd_hw(&hw)) { return 0x0300u; }
++	printf("NORD2 GNSS STEP %d: about to read 0x18060184 and 0x180601ac\n", step); delay(300000);
++	uint32_t ack = hw.read32(hw.ctx, N2G_CSR_SLP_PROT_CTRL), vote = hw.read32(hw.ctx, N2G_CSR_WAKEPU_GPS);
++	printf("NORD2 GNSS STEP %d: slp_prot_ctrl=%#x wakepu_gps=%#x\n", step, ack, vote);
++	if (step == 2) { return 1; }
++	if (step == 3) {
++		printf("NORD2 GNSS STEP 3: about to set the GPS wake vote\n"); delay(300000);
++		hw.write32(hw.ctx, N2G_CSR_WAKEPU_GPS, vote | 1u);
++		int i; for (i = 0; i < 10000 && (hw.read32(hw.ctx, N2G_CSR_SLP_PROT_CTRL) & 0x20u); i++) { delay(1); }
++		printf("NORD2 GNSS STEP 3: wake ack after %d polls (%s); about to read 0x18001000\n", i, i < 10000 ? "ok" : "TIMEOUT"); delay(300000);
++		uint32_t ver = i < 10000 ? hw.read32(hw.ctx, N2G_CONN_HW_VER) : 0;
++		hw.write32(hw.ctx, N2G_CSR_WAKEPU_GPS, vote & ~1u);
++		printf("NORD2 GNSS STEP 3: conn_infra version %#x, vote released\n", ver);
++		return i < 10000 ? 1u : 0x0800u;
++	}
++	printf("NORD2 GNSS STEP 4: about to run n2g_link_on (common_on + L1 DSP on), every access announced\n"); delay(300000);
++	n2gd_inner = hw; n2gd_acc = 0;
++	struct n2g_hw traced = hw; traced.read32 = n2gd_trace_rd; traced.write32 = n2gd_trace_wr;
++	int rc = n2g_link_on(&traced);
++	n2gd.last_err = rc;
++	if (rc == N2G_OK) { n2gd.powered = true; n2gd.hw_valid = true; n2gd.conn_hw_ver = hw.read32(hw.ctx, N2G_CONN_HW_VER); }
++	printf("NORD2 GNSS STEP 4: n2g_link_on -> %d\n", rc);
++	return rc == N2G_OK ? 1u : ((uint32_t)rc << 8);
++}
++
+ static int
+ n2gd_open(dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+ {
+ 	int l = minor(dev);
+ 	if (!n2gd.made || l < 0 || l >= N2GD_LINKS) { return ENXIO; }
+ 	lck_mtx_lock(&n2gd_lock);
+-	int e = n2gd_power_on_locked();
+-	if (!e) { n2gd.opens[l]++; }
++	int e = 0;                                               /* 0353: open never touches the hardware */
++	(void)n2gd_power_on_locked;
++	n2gd.opens[l]++;
+ 	lck_mtx_unlock(&n2gd_lock);
+ 	return e;
+ }
+@@ -128,6 +195,14 @@
+ 	case (uint32_t)N2GD_IOC(GPSDL_IOC_GIVE_GPS_WAKELOCK):
+ 		v = 0;                                           /* no wakelocks on XNU */
+ 		break;
++	case (uint32_t)N2GD_IOC(101):                            /* 0353 single steps, one per call, markers first */
++	case (uint32_t)N2GD_IOC(102):
++	case (uint32_t)N2GD_IOC(103):
++	case (uint32_t)N2GD_IOC(104):
++		lck_mtx_lock(&n2gd_lock);
++		v = n2gd_step((int)((uint32_t)cmd & 0xff) - 100);
++		lck_mtx_unlock(&n2gd_lock);
++		break;
+ 	default:
+ 		return ENOTSUP;                                  /* milestone 2+ */
+ 	}
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -952,6 +952,22 @@
+ 	return npa_persistent_lifetime && !npa_native.state.fatal && npa_native.state.result.phase == 10;
+ }
+ 
++/* 0353: the six always-on predicates the Wi-Fi driver checks before each conn_infra access (wifi_main_wfdma_bind.inc
++ * nwfn_guard): SPM, GALS and infracfg pages are always-on AP registers, safe to read at any time. */
++static vm_offset_t n2gd_ao_spm, n2gd_ao_gals, n2gd_ao_infra;
++static bool
++n2gd_ao_predicates(uint32_t out[6])
++{
++	if (!n2gd_ao_spm) { n2gd_ao_spm = ml_io_map(0x10006000, 0x1000); }
++	if (!n2gd_ao_gals) { n2gd_ao_gals = ml_io_map(0x1020e000, 0x1000); }
++	if (!n2gd_ao_infra) { n2gd_ao_infra = ml_io_map(0x10001000, 0x1000); }
++	if (!n2gd_ao_spm || !n2gd_ao_gals || !n2gd_ao_infra) { return false; }
++	out[0] = *(volatile uint32_t *)(n2gd_ao_spm + 0x304); out[1] = *(volatile uint32_t *)(n2gd_ao_spm + 0x16c);
++	out[2] = *(volatile uint32_t *)(n2gd_ao_spm + 0x170); out[3] = *(volatile uint32_t *)(n2gd_ao_gals + 0x504);
++	out[4] = *(volatile uint32_t *)(n2gd_ao_infra + 0x228); out[5] = *(volatile uint32_t *)(n2gd_ao_infra + 0x724);
++	return (out[0] & 0x1f) == 0xd && (out[1] & 2) && (out[2] & 2) && (out[3] & 1) && !(out[4] & 0x2000) && !(out[5] & 4);
++}
++
+ #define N2GD_NPAGES 6
+ static const uint32_t n2gd_pages[N2GD_NPAGES] = { 0x18000000u, 0x18001000u, 0x18005000u, 0x18060000u, 0x18c01000u, 0x18c73000u };
+ static vm_offset_t n2gd_va[N2GD_NPAGES];

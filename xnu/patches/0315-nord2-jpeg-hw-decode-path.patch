@@ -1,0 +1,318 @@
+diff -ruN a/bsd/dev/nord2_jpegdev.inc b/bsd/dev/nord2_jpegdev.inc
+--- a/bsd/dev/nord2_jpegdev.inc
++++ b/bsd/dev/nord2_jpegdev.inc
+@@ -28,6 +28,7 @@
+ # if __has_include("redwood_jpeg.h")
+ #  include "redwood_jpeg.h"
+ #  include "redwood_vcodec.h"
++#  include "redwood_jpegdec.h"
+ # elif __has_include("../../../include/redwood_jpeg.h")
+ #  include "../../../include/redwood_jpeg.h"
+ #  include "../../../include/redwood_vcodec.h"
+@@ -40,6 +41,7 @@
+ #else
+ # include "redwood_jpeg.h"
+ # include "redwood_vcodec.h"
++# include "redwood_jpegdec.h"
+ #endif
+ 
+ #ifdef N2J_HOST
+@@ -96,6 +98,7 @@
+ 	n2jd_ven_get_fn ven_get;
+ 	n2jd_ven_put_fn ven_put;
+ 	vm_offset_t src, dst;                   /* the 40 MiB claim, mapped lazily */
++	vm_offset_t dec, dbuf;                  /* 0315: jpgdec core 0 window and the decoder claim, mapped lazily */
+ } n2jd;
+ 
+ LCK_GRP_DECLARE(n2jd_grp, "nord2-jpeg");
+@@ -475,6 +478,183 @@
+ 	lck_mtx_unlock(&n2jd_lock);
+ }
+ 
++/* the one-job lock (callers sleep interruptibly); n2jd_job_end books the result and arms the idle power-off */
++static int
++n2jd_job_begin(void)
++{
++	lck_mtx_lock(&n2jd_lock);
++	while (n2jd.busy) {
++		int err = msleep(&n2jd.busy, &n2jd_lock, PZERO | PCATCH, "redwood-jpeg", NULL);
++		if (err) {
++			lck_mtx_unlock(&n2jd_lock);
++			return err == EWOULDBLOCK ? EAGAIN : err;
++		}
++	}
++	n2jd.busy = true;
++	lck_mtx_unlock(&n2jd_lock);
++	return 0;
++}
++
++static void
++n2jd_job_end(uint32_t hw_us, uint32_t status, int err)
++{
++	lck_mtx_lock(&n2jd_lock);
++	n2jd.busy = false;
++	if (hw_us) { n2jd.last_hw_us = hw_us; }
++	if (status == 0 && err == 0) { n2jd.jobs_done++; }
++	else { n2jd.jobs_failed++; }                    /* hardware failure, or a source/copyout fault */
++	if (__atomic_load_n(&n2jd.powered, __ATOMIC_ACQUIRE)) {
++		n2jd.last_job_ns = n2jd_now_ns();
++		n2jd_schedule_off();
++	}
++	wakeup(&n2jd.busy);
++	lck_mtx_unlock(&n2jd_lock);
++}
++
++/*
++ * 0315: the hardware decoder experiment path (include/redwood_jpegdec.h).  User space supplies the register words (J04),
++ * the kernel owns the addresses: an address register must be 0 or a 16-aligned address below RWJD_LEGAL_END inside the
++ * decoder claim, an [I] scalar slot must be < 2^24 (so a misread "stride" can never be a DRAM address), every other
++ * offset outside the allow-list is refused.  VEN + JPGENC come up exactly as for an encode (n2jd_power_on); the decoder
++ * adds vencsys bit 12 (jpgdec core 0) and larb7 ports 11/12 (OSTDL 1/4, smi_conf.h larb7; NON_SEC_CON bypass), and gates
++ * bit 12 again after every job.
++ */
++#define N2JD_DEC_W(o)   (1ull << ((o) >> 2 & 63u))
++/* offsets 0x000..0x37c as two 64-bit maps per 0x100: allowed, address class, scalar [I] */
++static const uint64_t n2jd_dec_ok[4] = {
++	N2JD_DEC_W(0x090) | N2JD_DEC_W(0x0f8) | N2JD_DEC_W(0x0fc),
++	0xffull << 16 | 3ull << 24 | 3ull << 27 | 1ull << 31,                  /* 0x140-0x164, 0x16c, 0x170, 0x17c (not 0x168/0x174/0x178) */
++	N2JD_DEC_W(0x200) | N2JD_DEC_W(0x20c) | N2JD_DEC_W(0x210) | N2JD_DEC_W(0x224) | N2JD_DEC_W(0x23c) |
++	    N2JD_DEC_W(0x240) | N2JD_DEC_W(0x248) | N2JD_DEC_W(0x24c) | N2JD_DEC_W(0x270) | N2JD_DEC_W(0x274),
++	N2JD_DEC_W(0x31c) | N2JD_DEC_W(0x320) | N2JD_DEC_W(0x330) | N2JD_DEC_W(0x334) | N2JD_DEC_W(0x338) |
++	    N2JD_DEC_W(0x33c) | N2JD_DEC_W(0x344) | N2JD_DEC_W(0x36c) | N2JD_DEC_W(0x370) | N2JD_DEC_W(0x374),
++};
++static const uint64_t n2jd_dec_addr[4] = {
++	0, 0x3full << 16,                                                                            /* DEST banks 0x140-0x154 */
++	N2JD_DEC_W(0x200) | N2JD_DEC_W(0x248),
++	N2JD_DEC_W(0x31c) | N2JD_DEC_W(0x338) | N2JD_DEC_W(0x36c) | N2JD_DEC_W(0x370) | N2JD_DEC_W(0x374),
++};
++static const uint64_t n2jd_dec_scalar[4] = {
++	0, 1ull << 31, 0, N2JD_DEC_W(0x330) | N2JD_DEC_W(0x334) | N2JD_DEC_W(0x33c) | N2JD_DEC_W(0x344),
++};
++_Static_assert(N2JD_DEC_W(0x17c) == 1ull << 31 && N2JD_DEC_W(0x140) == 1ull << 16, "allow-list bit layout");
++_Static_assert(RWJD_PA >= RW_CLAIM_JPEG_PA + RW_CLAIM_JPEG_BYTES && RWJD_PA + RWJD_BYTES <= 0xdfe70000u &&
++    (RW_CLAIM_VCODEC_PA + RW_CLAIM_VCODEC_BYTES <= RWJD_PA || RW_CLAIM_VCODEC_PA >= RWJD_PA + RWJD_BYTES),
++    "the decoder claim must sit between the JPEG claim and DPM and clear of the vcodec pool");
++
++/* 0 or the errno for one register of a write list */
++static int
++n2jd_dec_check(const struct rwjd_reg *r)
++{
++	uint32_t o = r->off;
++	if ((o & 3u) || o >= 0x380u) { return EINVAL; }
++	uint64_t b = N2JD_DEC_W(o);
++	unsigned i = o >> 8;
++	if (!(n2jd_dec_ok[i] & b)) { return EPERM; }
++	if ((n2jd_dec_addr[i] & b) && r->value != 0 &&
++	    (r->value < RWJD_PA || r->value >= RWJD_LEGAL_END || (r->value & 15u))) { return EFAULT; }
++	if ((n2jd_dec_scalar[i] & b) && r->value >= 0x01000000u) { return EFAULT; }
++	return 0;
++}
++
++static void
++n2jd_dec_clock(bool on)
++{
++	ni_wr(n2j.cg, on ? 0x4 : 0x8, 1u << 12);                     /* vencsys SET/CLR: jpgdec core 0 */
++}
++
++static int
++n2jd_dec_run(struct rwjd_job *d, struct rwjd_reg *r)
++{
++	bool probe = (d->flags & RWJD_PROBE) != 0;
++	if (!n2jd_maps()) { d->out_status = RWJ_E_BUS; return EIO; }
++	if (!n2jd.dec) { n2jd.dec = n2j_map(RWJD_DEC_PA, 0x1000, 1); }
++	if (!n2jd.dbuf) { n2jd.dbuf = n2j_map(RWJD_PA, RWJD_BYTES, 0); }
++	if (!n2jd.dec || !n2jd.dbuf) { d->out_status = RWJ_E_BUS; return EIO; }
++	uint8_t *b = (uint8_t *)n2jd.dbuf;
++	if (!probe) {
++		int e = copyin((user_addr_t)d->src, b, d->src_bytes);
++		if (e) { return e; }
++		uint32_t pad = ((d->src_bytes + 127u) & ~127u) - d->src_bytes + 128u;
++		memset(b + d->src_bytes, 0, pad);
++		n2j_cache(n2jd.dbuf, d->src_bytes + pad);
++		memset(b + (RWJD_IDX_PA - RWJD_PA), 0, 0x10000u);
++		n2j_cache(n2jd.dbuf + (RWJD_IDX_PA - RWJD_PA), 0x10000u);
++		n2j_cache(n2jd.dbuf + (RWJD_OUT_PA - RWJD_PA), d->dst_bytes);     /* no dirty line may land on the output later */
++	}
++	uint32_t pr = n2jd_power_on();
++	if (pr) { d->out_status = pr; return EIO; }
++	n2jd_dec_clock(true);
++	vm_offset_t v = n2jd.dec;
++	int err = 0;
++	if (probe) {
++		for (uint32_t i = 0; i < d->nregs; i++) { r[i].value = ni_rd(v, r[i].off); }
++	} else {
++		ni_wr(n2j.larb, 0x200 + 4 * 11, 1); ni_wr(n2j.larb, 0x200 + 4 * 12, 4);
++		ni_mask(n2j.larb, 0x380 + 4 * 11, 0xff01u, 0); ni_mask(n2j.larb, 0x380 + 4 * 12, 0xff01u, 0);
++		if ((ni_rd(n2j.larb, 0x380 + 4 * 11) | ni_rd(n2j.larb, 0x380 + 4 * 12)) & 0xff01u) {
++			d->out_status = RWJ_E_BUS;
++			err = EIO;
++		} else {
++			for (uint32_t i = 0; i < d->nregs; i++) { ni_wr(v, r[i].off, r[i].value); }
++			uint64_t t0 = mach_absolute_time(), ns = 0;
++			uint32_t st = 0;
++			for (uint32_t waited = 0;; ) {
++				st = ni_rd(v, 0x274) & 0x37u;
++				if (st) { break; }
++				absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++				if (ns >= (uint64_t)d->timeout_ms * 1000000u) { break; }
++				uint32_t step = waited < 2000u ? 20u : 100u;
++				n2j_us(step);
++				waited += step;
++			}
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++			d->out_hw_us = ns / 1000u > UINT32_MAX ? UINT32_MAX : (uint32_t)(ns / 1000u);
++			d->out_status = !st ? RWJ_E_TIMEOUT : (st & 1u) && !(st & 0x36u) ? 0 : RWJ_E_STALL;
++			if (d->out_status) { err = EIO; }
++		}
++	}
++	d->out_irq = ni_rd(v, 0x274); d->out_state = ni_rd(v, 0x278); d->out_mcu = ni_rd(v, 0x340);
++	if (!probe) {
++		ni_wr(v, 0x274, 0x37u);                                      /* clear, then the hybrid WAIT's reset 0x00/0x10 */
++		ni_wr(v, 0x090, 0); ni_wr(v, 0x090, 0x10u);
++	}
++	n2jd_dec_clock(false);
++	if (!err && !probe && d->dst_bytes) {
++		n2j_cache(n2jd.dbuf + (RWJD_OUT_PA - RWJD_PA), d->dst_bytes);
++		err = copyout(b + (RWJD_OUT_PA - RWJD_PA), (user_addr_t)d->dst, d->dst_bytes);
++	}
++	n2j_log("NORD2 JPEG: dec%s %u regs -> %u irq %#x mcu %u in %u us\n", probe ? " probe" : "", d->nregs, d->out_status,
++	    d->out_irq, d->out_mcu, d->out_hw_us);
++	return err;
++}
++
++/* RWJD_JOB: copyin + validation without the lock, the job under the one-job lock like an encode */
++static int
++n2jd_dec_ioctl(caddr_t data)
++{
++	struct rwjd_job d;
++	struct rwjd_reg r[RWJD_REGS_MAX];
++	if (copyin((user_addr_t)(uintptr_t)data, &d, sizeof(d)) != 0) { return EFAULT; }
++	bool probe = (d.flags & RWJD_PROBE) != 0;
++	if ((d.flags & ~RWJD_PROBE) || d.nregs == 0 || d.nregs > RWJD_REGS_MAX || !d.regs || d.timeout_ms > RWJD_TIMEOUT_MAX_MS) { return EINVAL; }
++	if (!probe && (!d.src || d.src_bytes < 4u || d.src_bytes > RWJD_SRC_MAX - 256u || d.dst_bytes > RWJD_OUT_MAX ||
++	    (d.dst_bytes && !n2jd_urange(d.dst, 0, d.dst_bytes)) || !n2jd_urange(d.src, 0, d.src_bytes))) { return EINVAL; }
++	if (copyin((user_addr_t)d.regs, r, d.nregs * sizeof(r[0])) != 0) { return EFAULT; }
++	for (uint32_t i = 0; i < d.nregs; i++) {
++		if (probe) { if ((r[i].off & 3u) || r[i].off >= 0x400u) { return EINVAL; } }
++		else { int e = n2jd_dec_check(&r[i]); if (e) { return e; } }
++	}
++	d.out_status = d.out_hw_us = d.out_irq = d.out_state = d.out_mcu = 0;
++	int err = n2jd_job_begin();
++	if (err) { return err; }
++	err = n2jd_dec_run(&d, r);
++	n2jd_job_end(d.out_hw_us, d.out_status, err);
++	if (probe && copyout(r, (user_addr_t)d.regs, d.nregs * sizeof(r[0])) != 0 && !err) { err = EFAULT; }
++	if (copyout(&d, (user_addr_t)(uintptr_t)data, sizeof(d)) != 0 && !err) { err = EFAULT; }
++	return err;
++}
++
+ static int
+ n2jd_open(dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+ {
+@@ -509,6 +689,7 @@
+ 	info.last_hw_us = n2jd.last_hw_us;
+ 	lck_mtx_unlock(&n2jd_lock);
+ 	info.caps = 1u;                                 /* bit 0 encoder; the decoder is track J */
++	info.reserved[0] = RWJD_REV;                    /* 0315: RWJD_JOB (decoder experiment path) is present */
+ 	return copyout(&info, (user_addr_t)(uintptr_t)data, sizeof(info)) != 0 ? EFAULT : 0;
+ }
+ 
+@@ -520,6 +701,7 @@
+ 	if (data == NULL) { return EFAULT; }
+ 	if (c == (uint32_t)RWJ_INFO) { return n2jd_info(data); }
+ 	if (c == (uint32_t)RWJ_DECODE) { return ENOTSUP; }
++	if (c == (uint32_t)RWJD_JOB) { return n2jd_dec_ioctl(data); }
+ 	if (c != (uint32_t)RWJ_ENCODE) { return ENOTTY; }
+ 
+ 	struct rwj_encode j;
+@@ -531,31 +713,10 @@
+ 	j.out_hw_us = 0;
+ 	j.out_status = 0;
+ 
+-	lck_mtx_lock(&n2jd_lock);
+-	while (n2jd.busy) {
+-		err = msleep(&n2jd.busy, &n2jd_lock, PZERO | PCATCH, "redwood-jpeg", NULL);
+-		if (err) {
+-			lck_mtx_unlock(&n2jd_lock);
+-			return err == EWOULDBLOCK ? EAGAIN : err;
+-		}
+-	}
+-	n2jd.busy = true;
+-	lck_mtx_unlock(&n2jd_lock);
+-
++	err = n2jd_job_begin();
++	if (err) { return err; }
+ 	err = n2jd_run(&j, &g);
+-
+-	lck_mtx_lock(&n2jd_lock);
+-	n2jd.busy = false;
+-	if (j.out_hw_us) { n2jd.last_hw_us = j.out_hw_us; }
+-	if (j.out_status == 0 && err == 0) { n2jd.jobs_done++; }
+-	else if (j.out_status == 0 && err != 0) { n2jd.jobs_failed++; }       /* source fault, copyout fault: no hardware failure */
+-	else { n2jd.jobs_failed++; }
+-	if (__atomic_load_n(&n2jd.powered, __ATOMIC_ACQUIRE)) {
+-		n2jd.last_job_ns = n2jd_now_ns();
+-		n2jd_schedule_off();
+-	}
+-	wakeup(&n2jd.busy);
+-	lck_mtx_unlock(&n2jd_lock);
++	n2jd_job_end(j.out_hw_us, j.out_status, err);
+ 	/* deliver out_bytes/out_status/out_hw_us even after a hardware failure; a faulting struct copyout is EFAULT */
+ 	if (copyout(&j, (user_addr_t)(uintptr_t)data, sizeof(j)) != 0) { return err ? err : EFAULT; }
+ 	return err;
+diff -ruN a/bsd/dev/redwood_jpegdec.h b/bsd/dev/redwood_jpegdec.h
+--- a/bsd/dev/redwood_jpegdec.h
++++ b/bsd/dev/redwood_jpegdec.h
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * redwood_jpegdec.h -- user/kernel ABI of the MT6893 hardware JPEG DECODER experiment path on /dev/redwood-jpeg
++ * (kernel patch 0315, opus-pool, 12 Nov 2026). Additive to the frozen redwood_jpeg.h: one new ioctl, RWJD_JOB.
++ *
++ * Model (Android's hybrid driver does the same: the vendor library computes the register words, the kernel programs
++ * them): user space parses the JPEG and computes the decoder words (gpu/hwcodec/jdec, J04: n2jdec_fill_words() /
++ * n2jdec_supplementary() with the RWJD_* addresses below); the kernel copies the bitstream into its claim, checks every
++ * register against an allow-list, refuses any DMA-address register that is not 0 or inside the decoder claim, powers
++ * VEN + the jpgdec clock + larb7 ports 11/12 (IOMMU bypass), writes the words in the given order (the list ends with
++ * the trigger), polls 0x274, resets the block and copies the plane area out. RWJD_PROBE writes no decoder register
++ * at all and returns the value of every listed offset (J04 experiments E0/E1: the power-on defaults).
++ *
++ * Decoder claim (free low DRAM, outside XNU's window; the RWVC pool moved to 0xA0000000 in 0313):
++ *   0xDA800000 +16 MiB  bitstream (RWJD_SRC_PA; zero padded to 128 after src_bytes)
++ *   0xDB800000 +1 MiB   index tables (RWJD_IDX_PA; the first 64 KiB are zeroed before every job: 3 x 16 KiB used)
++ *   0xDB900000 +64 MiB  output planes (RWJD_OUT_PA; Y/Cb/Cr wherever the words put them inside it)
++ *   0xDF900000 +3 MiB   guard, never a legal address (an overrun of the planes lands here, not in DPM at 0xDFE70000)
++ */
++#ifndef REDWOOD_JPEGDEC_H
++#define REDWOOD_JPEGDEC_H
++#include <stdint.h>
++
++#define RWJD_REV        1u
++#define RWJD_PA         0xda800000u
++#define RWJD_BYTES      0x05400000u
++#define RWJD_SRC_PA     RWJD_PA
++#define RWJD_SRC_MAX    0x01000000u
++#define RWJD_IDX_PA     (RWJD_PA + 0x01000000u)
++#define RWJD_IDX_BYTES  0x00100000u
++#define RWJD_OUT_PA     (RWJD_PA + 0x01100000u)
++#define RWJD_OUT_MAX    0x04000000u
++#define RWJD_LEGAL_END  (RWJD_OUT_PA + RWJD_OUT_MAX)    /* address registers must be < this */
++#define RWJD_DEC_PA     0x17040000u                     /* jpgdec core 0 (mt6893.dts jpgdec@17040000) */
++#define RWJD_REGS_MAX   64u
++#define RWJD_TIMEOUT_MAX_MS 2000u
++
++struct rwjd_reg { uint32_t off, value; };              /* off: 4-aligned, < 0x380, in the allow-list (kernel) */
++enum { RWJD_PROBE = 1u };                              /* flags */
++struct rwjd_job {                                      /* RWJD_JOB */
++	uint64_t src;                                  /* user JPEG bytes (unused with RWJD_PROBE) */
++	uint64_t regs;                                 /* user rwjd_reg[nregs]; with RWJD_PROBE the values are results */
++	uint64_t dst;                                  /* user buffer for the first dst_bytes of the plane area (0: none) */
++	uint32_t src_bytes, nregs, dst_bytes, flags;
++	uint32_t timeout_ms;                           /* poll limit after the last write, <= RWJD_TIMEOUT_MAX_MS */
++	uint32_t out_status;                           /* 0 = EOF (0x274 bit 0), else RWJ_E_TIMEOUT / RWJ_E_STALL (error bits) / RWJ_E_POWER / RWJ_E_BUS */
++	uint32_t out_hw_us;                            /* last write -> done */
++	uint32_t out_irq, out_state, out_mcu;          /* 0x274, 0x278, 0x340 before the post-job reset */
++	uint32_t reserved[2];
++};
++#define RWJD_JOB RWJ_IOC(0xc0000000u, 4, struct rwjd_job)
++#endif

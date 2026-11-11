@@ -1,0 +1,244 @@
+--- a/bsd/dev/nord2_gpsdl.inc
++++ b/bsd/dev/nord2_gpsdl.inc
+@@ -268,7 +268,10 @@
+ 	"gps_top_off ACTIVE check", "A-die top clock", "read GPS bus (first)", "GPS CLKGEN1 DIGCK", "L1 DSP pwr_stat ON",
+ 	"read GPS RGU_ON page", "L1 power on + soft reset release", "USRT on + DSP ROM okay", "data link up (rings, DMA idle check)", "send libmnl frame 1 (A2D DMA)", "capture the DSP reply (D2A DMA)",
+ 	"5 s powered", "L1 read-only probe", "HOLD + /dev/gpsdl0 read/write",
+-	"V9 vendor-order capture (D2AF clear, EMI req, RX armed before TX, frame 1, 2 s)", "V9 HOLD (vendor order, RX armed, /dev/gpsdl0 pipe)" };
++	"V9 vendor-order capture (D2AF clear, EMI req, RX armed before TX, frame 1, 2 s)", "V9 HOLD (vendor order, RX armed, /dev/gpsdl0 pipe)",
++	"S10a RX DMA2 armed small (16 words) 3 s, no TX, disarm", "S10b RX DMA2 armed small + TX boot header, 1 s, disarm",
++	"S10c TX boot header, NO RX DMA (reply stays in the USRT FIFO), INTEN off", "S10d as S10c with USRT INTEN on (vendor)",
++	"S10e RX DMA2 armed small, GPS wake vote RELEASED 3 s idle, vote back, disarm" };
+ /* 0357: GPS RGU_ON (bus 0x80000000 -> AP 0x18c00000) and CFG_ON (0x80001000 -> 0x18c01000), plat/v010 gps_rgu_on.h / gps_cfg_on.h */
+ #define N2G_GPS_RGU_L1_CR          0x18c00014u   /* [0] RGU_GPS_L1_ON [5] RGU_GPS_L1_SOFT_RST_B */
+ #define N2G_GPS_RGU_L1_DLY_CHAIN   0x18c00160u   /* [19:16] MEM_PDN_DELAY_DUMMY_NUM (vendor 5) */
+@@ -304,7 +307,8 @@
+ static uint8_t *n2gl_ring_va;
+ static struct { uint32_t rd, wr; } n2gl_rx;
+ static bool n2gl_tx_started, n2gl_rx_started;
+-static int n2gd_ringwin(uint8_t **va);          /* sweet_touch.c: maps (once) and zeroes the 64 KiB window */
++static int n2gd_ringwin(uint8_t **va);
++static uint32_t n2gd_gicd_rd(uint32_t off);                    /* 0363: sweet_touch.c, read-only GICD word */          /* sweet_touch.c: maps (once) and zeroes the 64 KiB window */
+ static uint32_t n2gl_bus(uint32_t off) { return 0x78000000u + off; }   /* off from the window base (= remap base) */
+ static uint32_t n2gl_rx_used(void) { return (n2gl_rx.wr + N2GL_RING - n2gl_rx.rd) % N2GL_RING; }
+ static bool
+@@ -427,7 +431,8 @@
+ #define N2G_USRT_D2A1(l)        (N2G_USRT_BASE(l) + 0x54u)
+ #endif
+ #define N2GL_FILL      0xA5u
+-static bool n2gl_rx_armed, n2gl_rx_rlct_ok;
++static bool n2gl_rx_armed, n2gl_rx_rlct_ok, n2gl_rx_norearm;   /* 0363: norearm = S10 single-shot RX */
++static uint32_t n2gl_rx_cap;                                    /* 0363: max bytes per RX arming (0 = whole free ring) */
+ static uint32_t n2gl_rx_at, n2gl_rx_len, n2gl_rx_cur, n2gl_rx_total;
+ static int n2gl_lines;
+ static bool
+@@ -455,6 +460,7 @@
+ {
+ 	if (n2gl_rx_armed) { return true; }
+ 	uint32_t fr = (N2GL_RING - 4u - n2gl_rx_used()) & ~3u;
++	if (n2gl_rx_cap && fr > n2gl_rx_cap) { fr = n2gl_rx_cap; }
+ 	if (fr < 4u) { return false; }                          /* ring full: data waits in the USRT FIFO until read() */
+ 	n2gl_rx_started = true;
+ 	if (!n2gl_dma_start_q(N2GL_RXCH, N2G_CON_L1_D2A, N2GL_RING, n2gl_rx.wr, fr)) { return false; }
+@@ -503,7 +509,7 @@
+ {
+ 	n2gl_mcub_ack(log);
+ 	if (n2gl_stop) { return 0; }
+-	if (!n2gl_rx_armed) { n2gl_rx_arm(log); return 0; }
++	if (!n2gl_rx_armed) { if (!n2gl_rx_norearm) { n2gl_rx_arm(log); } return 0; }
+ 	uint32_t got = 0;
+ 	bool done = (n2gl_rd(N2G_DMA_INTSTA(N2GL_RXCH)) & N2G_DMA_BIT) != 0;
+ 	bool nod = (n2gl_rd(N2G_USRT_STA(0)) & (1u << 1)) != 0;     /* NODAINTB: the DSP finished a burst */
+@@ -521,7 +527,7 @@
+ 			    done ? "DMA2 done" : "NODAINTB", n2gl_rx_cur, n2gl_rx_at, n2gl_rx.wr);
+ 		}
+ 		n2gl_rx_armed = false;
+-		n2gl_rx_arm(log);
++		if (!n2gl_rx_norearm) { n2gl_rx_arm(log); }
+ 	}
+ 	n2gl_rx_total += got;
+ 	return got;
+@@ -604,6 +610,124 @@
+ 	return n2gl_stop ? N2G_E_ARG : 0;
+ }
+ 
++/*
++ * 0363 (q10jr10): split ladders after gl9b (q10jr9, K=24 HOLD + boot replay) reset the phone 2..4 s after the HOLD, before any
++ * N2GRPL frame line: the first header TX / first reply was the new element. Candidates: (B) the first D2A DMA write into
++ * DRAM 0xDFE02000 (never done before; EMI MPU / bus), (C) the DSP's first "has data" with INTEN on -> a GPS IRQ storm,
++ * (A) GPS-bus accesses after the HOLD released the GPS wake vote. Every S10 ladder keeps the vote (except S10e on purpose),
++ * pauses 2 s with an "about to ..." line before each risky action, arms RX for 64 bytes at most, never re-arms, and prints the
++ * GIC enable/pending words of the GPS INTIDs (415 = ISENABLER12/ISPENDR12 bit 31; 416..421 = ISENABLER13/ISPENDR13 bits 0..5).
++ *   K=25 S10a: arm DMA2 (16 words), 3 s watch, disarm               -> arming alone
++ *   K=26 S10b: arm DMA2 (16 words), TX boot header, 1 s, disarm     -> first DMA write of a reply
++ *   K=27 S10c: TX boot header with DMA2 idle, INTEN off, 1 s watch; COMD4 x3, header again, 1 s -> does the ROM answer at all
++ *   K=28 S10d: as S10c with INTEN = TXIEN|NODAIEN                   -> IRQ hypothesis
++ *   K=29 S10e: arm DMA2 (16 words), release the GPS wake vote, 3 s without any access, vote back, disarm -> HOLD hypothesis
++ */
++static const uint8_t n2gl_bhdr[116] = { 0xaa, 0xf0, 0x6e, 0x00, 0x08, 0xfe, 0x1a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x58, 0x88, 0x00, 0x74, 0x04, 0x74, 0x7b, 0x00, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0xff, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x0f, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x93, 0x68, 0x00, 0x0a, 0x00, 0x00, 0x01, 0x00, 0x4e, 0x4f, 0xbf, 0x16, 0xaa, 0x0f };    /* libmnl _BootDSP_UART_V2 header 0xFE08 (n2mnld/runs/bootdsp_replay.json seq 1) */
++static const uint8_t n2gl_comd4[12] = { 0xaa, 0xf0, 0x06, 0x00, 0x05, 0xfe, 0x04, 0x00, 0x0d, 0x01, 0xaa, 0x0f };
++static void
++n2gl_pause(const char *what)
++{
++	printf("NORD2 GNSS LAD %d: about to %s\n", n2gl_k, what);
++	delay(2000000);
++}
++static void
++n2gl_gic(const char *phase)
++{
++	printf("NORD2 GNSS LAD %d: %s GIC isenabler12=%#x isenabler13=%#x ispendr12=%#x ispendr13=%#x (GPS: 415 = 12[31], 416..421 = 13[0..5])\n",
++	    n2gl_k, phase, n2gd_gicd_rd(0x130), n2gd_gicd_rd(0x134), n2gd_gicd_rd(0x230), n2gd_gicd_rd(0x234));
++}
++/* watch ms milliseconds, print every change (USRT STA/D2AF/MONF, DMA2 START/INTSTA/RLCT, GPS IRQ pending bits) */
++static void
++n2gl_w10(int ms, const char *phase)
++{
++	uint32_t l[7] = { ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u };
++	int lines = 0;
++	for (int t = 0; t < ms && !n2gl_stop; t++) {
++		uint32_t v[7] = { n2gl_rd(N2G_USRT_STA(0)), n2gl_rd(N2G_USRT_D2AF(0)), n2gl_rd(N2G_USRT_MONF(0)), n2gl_rd(N2G_DMA_START(N2GL_RXCH)),
++		    n2gl_rd(N2G_DMA_INTSTA(N2GL_RXCH)), n2gl_rd(N2G_DMA_RLCT(N2GL_RXCH)), (n2gd_gicd_rd(0x230) >> 31) | ((n2gd_gicd_rd(0x234) & 0x3fu) << 1) };
++		if (n2gl_stop) { break; }
++		bool ch = false;
++		for (int i = 0; i < 7; i++) { if (v[i] != l[i]) { ch = true; } l[i] = v[i]; }
++		if (ch && lines < 40) {
++			lines++;
++			printf("NORD2 GNSS LAD %d: %s t=%dms sta=%#x%s%s d2af=%#x monf=%#x dma2 start=%#x intsta=%#x rlct=%#x gps_irq_pend(415..421)=%#x\n", n2gl_k, phase, t,
++			    v[0], (v[0] & 8u) ? " TX_IND(has data)" : "", (v[0] & 2u) ? " NODAINTB" : "", v[1], v[2], v[3], v[4], v[5], v[6]);
++		}
++		if (n2gl_rx_armed) { uint32_t g = n2gl_rx_service(true); if (g) { printf("NORD2 GNSS LAD %d: %s t=%dms +%u bytes\n", n2gl_k, phase, t, g); } }
++		else { n2gl_mcub_ack(true); }
++		delay(1000);
++	}
++}
++static void
++n2gl_s10_disarm(void)
++{
++	if (!n2gl_rx_armed && !n2gl_rx_started) { return; }
++	n2gl_pause("DISARM RX DMA2 (STR = 0, ACKINT)");
++	uint32_t w = n2gl_rx_armed ? n2gl_rx_written() : 0;
++	n2gl_dma_stop(N2GL_RXCH);
++	if (n2gl_rx_armed && w > n2gl_rx_cur) { n2gl_rx_total += w - n2gl_rx_cur; n2gl_rx.wr = (n2gl_rx_at + w) % N2GL_RING; }
++	n2gl_rx_armed = false;
++	printf("NORD2 GNSS LAD %d: RX DMA2 disarmed\n", n2gl_k);
++}
++static int
++n2gl_s10_tx(const uint8_t *b, uint32_t n, const char *what)
++{
++	n2gl_pause(what);
++	int e = n2gl_tx(b, n, true);
++	printf("NORD2 GNSS LAD %d: TX %s (%u bytes) %s\n", n2gl_k, what, n, e ? "FAILED" : "done");
++	return e;
++}
++/* S10 prep: MCUB RESET_DONE ack + EMI_REQ_GPS (as V9), RX ring filled with 0xA5; RX arming is per ladder */
++static int
++n2gl_s10(int k, bool done[32])
++{
++	n2gl_rx_cap = 64; n2gl_rx_norearm = true; n2gl_rx_armed = false; n2gl_rx_total = 0; n2gl_lines = 0;
++	n2gl_gic("start");
++	n2gl_show("USRT MONF", N2G_USRT_MONF(0)); n2gl_show("USRT INTEN", N2G_USRT_INTEN(0)); n2gl_show("USRT STA", N2G_USRT_STA(0));
++	n2gl_show("USRT D2AF", N2G_USRT_D2AF(0));
++	n2gl_pause("ack MCUB D2AF (W1C) and set EMI_REQ_GPS 0x18001c1c[0]");
++	n2gl_mcub_ack(true);
++	n2gl_o.emictl = n2gl_rd(N2G_CFG_EMI_CTL); done[25] = true;
++	if (!n2gl_field(N2G_CFG_EMI_CTL, 1u, 1u)) { return N2G_E_ARG; }
++	for (uint32_t i = 0; i < N2GL_RING; i++) { n2gl_ring_va[N2GL_RING + i] = N2GL_FILL; }
++	__builtin_arm_dsb(0xf);
++	n2gl_rx.rd = n2gl_rx.wr = 0;
++	int e = 0;
++	if (k == 25 || k == 26 || k == 29) {
++		n2gl_pause("ARM RX DMA2 for 16 words at bus 0x78002000 (phys 0xDFE02000)");
++		if (!n2gl_rx_arm(true)) { return N2G_E_ARG; }
++		n2gl_dma_regs("armed", N2GL_RXCH); n2gl_gic("armed");
++	}
++	if (k == 25) { n2gl_w10(3000, "S10a armed, no TX"); }
++	if (k == 26) {
++		e = n2gl_s10_tx(n2gl_bhdr, sizeof n2gl_bhdr, "TX boot header 0xFE08 with RX DMA2 armed (16 words)");
++		if (!e) { n2gl_w10(1000, "S10b after header"); }
++	}
++	if (k == 27 || k == 28) {
++		e = n2gl_s10_tx(n2gl_bhdr, sizeof n2gl_bhdr, "TX boot header 0xFE08, RX DMA2 idle");
++		if (!e) { n2gl_w10(1000, "S10c/d after header"); n2gl_gic("after header"); }
++		for (int i = 0; i < 3 && !e && !n2gl_stop; i++) { e = n2gl_s10_tx(n2gl_comd4, sizeof n2gl_comd4, "TX COMD4 0xFE05"); }
++		if (!e) { n2gl_w10(500, "S10c/d after COMD4 x3"); }
++		if (!e) { e = n2gl_s10_tx(n2gl_bhdr, sizeof n2gl_bhdr, "TX boot header 0xFE08 again"); }
++		if (!e) { n2gl_w10(1000, "S10c/d after header 2"); n2gl_gic("after header 2"); }
++	}
++	if (k == 29) {
++		n2gl_pause("RELEASE the GPS wake vote 0x180601ac[0] and wait 3 s WITHOUT any register access");
++		n2gl_field(N2G_CSR_WAKEPU_GPS, 1u, 0);
++		delay(3000000);
++		printf("NORD2 GNSS LAD %d: 3 s idle done, taking the vote back\n", k);
++		n2gl_field(N2G_CSR_WAKEPU_GPS, 1u, 1u);
++		n2gl_poll(N2G_CSR_SLP_PROT_CTRL, 1u << 5, 0, 10000, "on2off slp_prot ack clear");
++		n2gl_w10(200, "S10e after vote back");
++	}
++	n2gl_s10_disarm();
++	n2gl_v9_report("S10 end");
++	printf("NORD2 GNSS LAD %d: S10 RESULT: %s, RX %u bytes, e=%d\n", k, n2gl_name[k], n2gl_rx_total, e);
++	n2gl_rx_cap = 0; n2gl_rx_norearm = false;
++	return n2gl_stop ? N2G_E_ARG : e;
++}
++
+ static int
+ n2gl_do(int s, bool done[32])
+ {
+@@ -709,7 +833,8 @@
+ 		    !n2gl_field(N2G_USRT_A2DF(0), 1u << 3, 1u << 3)) { return N2G_E_ARG; }
+ 		/* 0362 (V9, K >= 23): vendor gps_dl_hw_usrt_ctrl also sets INTEN TXIEN [0] | NODAIEN [1]. The GIC lines (SPI 383..389 =
+ 		 * INTID 415..421) are not enabled by XNU (no handler), so this only raises the USRT-level status, as on Android. */
+-		if (n2gl_v9 && !n2gl_field(N2G_USRT_INTEN(0), 0x3u, 0x3u)) { return N2G_E_ARG; }
++		/* 0363: only K = 23, 24 (as built in q10jr9) and 28 (S10d) set INTEN; the other S10 ladders leave it 0 */
++		if (n2gl_v9 && (n2gl_k == 23 || n2gl_k == 24 || n2gl_k == 28) && !n2gl_field(N2G_USRT_INTEN(0), 0x3u, 0x3u)) { return N2G_E_ARG; }
+ 		bool rom = n2gl_poll(N2G_USRT_D2AF(0), 1u << 3, 1u << 3, 100000, "DSP ROM okay (USRT D2AF3)");
+ 		n2gl_show("USRT STA", N2G_USRT_STA(0));
+ 		if (n2gl_stop) { return N2G_E_ARG; }
+@@ -911,7 +1036,7 @@
+ 		printf("NORD2 GNSS LAD %d: step %d %s\n", k, s, rc ? "FAILED" : "done");
+ 	}
+ 	int failed = rc ? s - 1 : 0;
+-	if (!rc && k >= 23) {
++	if (!rc && (k == 23 || k == 24)) {
+ 		/* 0362: vendor-order data link prep (MCUB ack, EMI_REQ_GPS, RX ring fill, DMA2 armed) */
+ 		printf("NORD2 GNSS LAD %d: about to run NEW V9 phase (%s)\n", k, n2gl_name[k]); delay(2000000);
+ 		rc = n2gl_v9_prep(done);
+@@ -928,6 +1053,12 @@
+ 		printf("NORD2 GNSS LAD 24: V9 HOLD, GNSS powered, RX DMA2 armed, /dev/gpsdl0 read/write enabled (conn_infra %#x), NOT rolled back until reboot\n", n2gd.conn_hw_ver);
+ 		return 1;
+ 	}
++	if (!rc && k >= 25) {
++		printf("NORD2 GNSS LAD %d: about to run NEW S10 phase (%s)\n", k, n2gl_name[k]); delay(2000000);
++		rc = n2gl_s10(k, done);
++		if (n2gl_stop) { return 0x01000000u | ((uint32_t)k << 8); }
++		if (rc) { failed = k; }
++	}
+ 	if (!rc && k == 23) {
+ 		rc = n2gl_v9_capture();
+ 		if (n2gl_stop) { return 0x01000000u | 0x1700u; }
+@@ -1076,6 +1207,11 @@
+ 	case (uint32_t)N2GD_IOC(159):                            /* 0358: K=19 = steps 1..15 + read-only L1 probe */
+ 	case (uint32_t)N2GD_IOC(163):                            /* 0362: K=23 V9 vendor-order capture, K=24 V9 HOLD */
+ 	case (uint32_t)N2GD_IOC(164):
++	case (uint32_t)N2GD_IOC(165):                            /* 0363: S10a..e = K 25..29 */
++	case (uint32_t)N2GD_IOC(166):
++	case (uint32_t)N2GD_IOC(167):
++	case (uint32_t)N2GD_IOC(168):
++	case (uint32_t)N2GD_IOC(169):
+ 		lck_mtx_lock(&n2gd_lock);
+ 		v = n2gd_ladder((int)((uint32_t)cmd & 0xff) - 140);
+ 		lck_mtx_unlock(&n2gd_lock);
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -980,6 +980,12 @@
+ 	return ok && nwfn_native.gic_va && !(out[6] & ((1u << 23) | (1u << 26)));
+ }
+ static vm_offset_t n2gd_wifi_host(void) { return npa_native.host; }
++/* 0363: read-only GIC distributor word (ISENABLER/ISPENDR of the GPS INTIDs 415..421 = GIC SPI 383..389) */
++static uint32_t
++n2gd_gicd_rd(uint32_t off)
++{
++	return nwfn_native.gic_va ? *(volatile uint32_t *)(nwfn_native.gic_va + off) : 0xffffffffu;
++}
+ 
+ #define N2GD_NPAGES 8                                      /* 0357: + GPS RGU_ON 0x18c00000; 0359: + BGF_GPS_DMA 0x18c10000 */
+ static const uint32_t n2gd_pages[N2GD_NPAGES] = { 0x18000000u, 0x18001000u, 0x18005000u, 0x18060000u, 0x18c01000u, 0x18c73000u, 0x18c00000u, 0x18c10000u };

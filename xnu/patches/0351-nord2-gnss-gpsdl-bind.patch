@@ -1,0 +1,76 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -939,6 +939,65 @@
+ #include "nord2_vcodec_relay.inc"   /* 0310: /dev/redwood-vcodec-client and the datagram relay (IK) */
+ #include "nord2_vcodec.inc"   /* 0310: /dev/redwood-vcodec hardware part (K02) */
+ #include "nord2_jpegdev.inc"   /* 0310: /dev/redwood-jpeg (K01) */
++#include "nord2_gpsdl.inc"   /* 0350: /dev/gpsdl0,1 GNSS data-link nodes + MT6893 GNSS power core */
++/*
++ * 0351: GNSS binding to the Wi-Fi persistent conninfra owner. The GNSS block needs the shared connectivity hardware that
++ * ni_wifi_power_probe() powers and RETAINS (nord2wifi=2 nord2wifipersist=1, "retained=1 ... stage10"): rails, conn_infra
++ * on, A-die. Without that state no GNSS register is mapped or touched. The GNSS core then only uses its own votes
++ * (WAKEPU_GPS, GP_FUNCTION_EN, BGFSYS power, A-die top-clock GPS vote) and the 16 allow-listed registers of gnss_pwr.
++ */
++static bool
++n2gd_conninfra_ready(void)
++{
++	return npa_persistent_lifetime && !npa_native.state.fatal && npa_native.state.result.phase == 10;
++}
++
++#define N2GD_NPAGES 6
++static const uint32_t n2gd_pages[N2GD_NPAGES] = { 0x18000000u, 0x18001000u, 0x18005000u, 0x18060000u, 0x18c01000u, 0x18c73000u };
++static vm_offset_t n2gd_va[N2GD_NPAGES];
++
++static volatile uint32_t *
++n2gd_reg(uint32_t pa)
++{
++	if (!n2g_reg_allowed(pa)) { return NULL; }
++	for (int i = 0; i < N2GD_NPAGES; i++) {
++		if ((pa & ~0xfffu) == n2gd_pages[i] && n2gd_va[i]) { return (volatile uint32_t *)(n2gd_va[i] + (pa & 0xfffu)); }
++	}
++	return NULL;
++}
++static uint32_t
++n2gd_rd(__unused void *ctx, uint32_t pa)
++{
++	volatile uint32_t *r = n2gd_reg(pa);
++	if (r == NULL) { printf("NORD2 GNSS: refused read %#x\n", pa); return 0xffffffffu; }
++	return *r;
++}
++static void
++n2gd_wr(__unused void *ctx, uint32_t pa, uint32_t v)
++{
++	volatile uint32_t *r = n2gd_reg(pa);
++	if (r == NULL) { printf("NORD2 GNSS: refused write %#x\n", pa); return; }
++	*r = v;
++	__builtin_arm_dsb(0xf);
++}
++static void n2gd_delay(__unused void *ctx, unsigned us) { delay(us); }
++static void n2gd_note(__unused void *ctx, const char *step, uint32_t a, uint32_t b) { printf("NORD2 GNSS: %s %#x %#x\n", step, a, b); }
++
++/* GPS DMA buffers are milestone 2; until then the EMI remap points at the CONN EMI region the Wi-Fi owner already
++ * remaps (0x8a000000 in npa_persistent_window), which the GNSS DMA does not use yet (no DMA is started). */
++#define N2GD_EMI_BASE 0x8a000000u
++
++static int
++n2gd_hw(struct n2g_hw *hw)
++{
++	for (int i = 0; i < N2GD_NPAGES; i++) {
++		if (!n2gd_va[i]) { n2gd_va[i] = ml_io_map(n2gd_pages[i], 0x1000); }
++		if (!n2gd_va[i]) { printf("NORD2 GNSS: map %#x failed\n", n2gd_pages[i]); return ENOMEM; }
++	}
++	hw->ctx = NULL; hw->read32 = n2gd_rd; hw->write32 = n2gd_wr; hw->delay_us = n2gd_delay; hw->log = n2gd_note;
++	hw->emi_base_pa = N2GD_EMI_BASE;
++	return 0;
++}
+ #include "nord2_vcodec_at.inc"   /* 0311: VENC bring-up steps, autotest command 8 */
+ #include "nord2_autotest.inc"   /* 0296: synthetic touches/keys and panel pictures over the USB console */
+ 
+@@ -960,6 +1019,7 @@
+ 	nord2_autotest_start();   /* 0296 */
+ 	nord2_jpegdev_start();   /* 0310: /dev/redwood-jpeg */
+ 	nord2_vcodec_start();   /* 0310: /dev/redwood-vcodec + /dev/redwood-vcodec-client */
++	nord2_gpsdl_start();   /* 0350/0351: /dev/gpsdl0,1 (power path only with nord2gnss=1 and the retained Wi-Fi owner) */
+ }
+ #else /* original Sweet hardware */
+ /*

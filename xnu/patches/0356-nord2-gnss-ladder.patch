@@ -1,0 +1,275 @@
+--- a/bsd/dev/nord2_gpsdl.inc
++++ b/bsd/dev/nord2_gpsdl.inc
+@@ -159,6 +159,246 @@
+ 	return 1;
+ }
+ 
++/*
++ * 0356 (q10jr6): the GNSS power-on ladder. q10jr5 proved the host CSR block readable through Wi-Fi's mapping (0x180601a0 = 1,
++ * 0x18060184 = 0xe00, 0x180601ac = 0) and the GNSS pages mappable from kernel_map. Ioctl 140+K runs the proven steps 1..K-1
++ * and then the NEW step K (2 s console pause before it), prints every write as old -> new (readback), checks the Wi-Fi
++ * guard (six always-on predicates, GIC, Wi-Fi ap owned and awake) before EVERY access, and finally rolls back every step it
++ * did, restoring the saved original bits in the vendor off order (gps_dl_hw_gps_common_off: sleep protection on first).
++ * If the guard refuses, nothing more is accessed (not even the rollback) and the result carries bit 24.
++ *   1 GPS wake vote: 0x180601ac[0] = 1, poll 0x18060184[5] == 0 (10 ms)           rollback: [0] restored
++ *   2 read only: conn_infra cfg page (version 0x18001000, 878, c1c, 618, 61c, 900)
++ *   3 read only: conn_infra RGU page (0x18000008, 0x18000114)
++ *   4 read only: 0x18005008, 0x180601d0, 0x180600b0, 0x18060240
++ *   5 GPS EMI remap 0x180601d0[19:0] = 0x8a000000 >> 16                           rollback: restored
++ *   6 BGFSYS_ON_TOP power: 0x18000008 = key 0x4254 | [7]; ack 0x18000114 read     rollback: key | original [7]
++ *   7 GP_FUNCTION_EN 0x18001878[0] = 1; poll ack 0x18000114 [24] then [25]        rollback: [0] restored
++ *   8 GALS sleep protection off (conn2gps rx/tx, gps2conn rx/tx: EN = 0, RDY == 0)  rollback: EN restored, RDY polled
++ *   9 0x180600b0[7:0] = 0x80, poll 0x18060240[15:0] == 2 (gps_top_off ACTIVE)    rollback: sel restored
++ *  10 A-die top clock 0x18001900[1] = 1, poll 0x18005008[26] == 0                  rollback: [1] restored
++ *  11 read only, FIRST GPS-bus access: 0x18c0103c, 0x18c73108, USRT L1 0x18c73004/08/0c/20/24/34
++ *  12 GPS CLKGEN1 0x18c0103c[4] = 1                                                 rollback: [4] restored
++ *  13 L1 DSP on: 0x18c73108 [1:0] = 0, [3] = 0, [4] pulse; poll USRT D2AF 0x18c73024[3] (DSP ROM okay, 100 ms, info)
++ *                                                                                    rollback: [4:0] restored
++ *  14 HOLD: steps 1..13, then only the wake vote is released (as n2g_link_on does). NOT ROLLED BACK: GNSS stays powered
++ *     until the next reboot (needed for the data link; no power-off path exists in this image).
++ *  15 steps 1..13, 5 s powered with a status read every second, then the full rollback.
++ * Result: bit 0 = completed, bits 8..15 = failing step, bits 16..23 = n2g error code, bit 24 = guard refused (stopped,
++ * rollback incomplete), bit 25 = a rollback poll timed out.
++ */
++#ifndef N2G_USRT_BASE                                            /* gnss_dl.h (M2) is not in this image */
++#define N2G_USRT_BASE(l)        N2G_GPS_BUS((l) ? 0x80083000u : 0x80073000u)
++#define N2G_USRT_CTRL(l)        (N2G_USRT_BASE(l) + 0x04u)
++#define N2G_USRT_INTEN(l)       (N2G_USRT_BASE(l) + 0x08u)
++#define N2G_USRT_STA(l)         (N2G_USRT_BASE(l) + 0x0cu)
++#define N2G_USRT_A2DF(l)        (N2G_USRT_BASE(l) + 0x20u)
++#define N2G_USRT_D2AF(l)        (N2G_USRT_BASE(l) + 0x24u)
++#define N2G_USRT_A2D1(l)        (N2G_USRT_BASE(l) + 0x34u)
++#endif
++static struct n2g_hw n2gl_hw;
++static bool n2gl_stop;
++static int n2gl_k;
++static struct { uint32_t vote, emi, bgf, func, c2g, g2c, sel, adie, clk1, aon; } n2gl_o;
++static bool
++n2gl_guard(void)
++{
++	uint32_t g[9] = {0};
++	if (n2gl_stop) { return false; }
++	bool ok = n2gd_wifi_guard(g) && (g[7] >> 16) == 1 && (g[8] >> 16) == 0;
++	if (!ok) {
++		n2gl_stop = true;
++		printf("NORD2 GNSS LAD %d: GUARD REFUSES, nothing more is accessed: spm304=%#x gals504=%#x infra228=%#x infra724=%#x gic130=%#x ap=%u wf=%u asleep=%u stage=%u\n",
++		    n2gl_k, g[0], g[3], g[4], g[5], g[6], g[7] >> 16, g[7] & 0xffff, g[8] >> 16, g[8] & 0xffff);
++	}
++	return ok;
++}
++static uint32_t
++n2gl_rd(uint32_t pa)
++{
++	return n2gl_guard() ? n2gl_hw.read32(n2gl_hw.ctx, pa) : 0xffffffffu;
++}
++static void
++n2gl_show(const char *what, uint32_t pa)
++{
++	uint32_t v = n2gl_rd(pa);
++	if (!n2gl_stop) { printf("NORD2 GNSS LAD %d: %s %#x = %#x\n", n2gl_k, what, pa, v); }
++}
++/* read-modify-write of the masked bits, then readback */
++static bool
++n2gl_field(uint32_t pa, uint32_t mask, uint32_t val)
++{
++	uint32_t old = n2gl_rd(pa);
++	if (n2gl_stop || !n2gl_guard()) { return false; }
++	n2gl_hw.write32(n2gl_hw.ctx, pa, (old & ~mask) | (val & mask));
++	uint32_t rb = n2gl_rd(pa);
++	if (n2gl_stop) { return false; }
++	printf("NORD2 GNSS LAD %d: write %#x mask %#x: %#x -> %#x\n", n2gl_k, pa, mask, old, rb);
++	return true;
++}
++static bool
++n2gl_poll(uint32_t pa, uint32_t mask, uint32_t want, int max_us, const char *what)
++{
++	uint32_t v = 0;
++	for (int i = 0; i < max_us; i++) {
++		v = n2gl_rd(pa);
++		if (n2gl_stop) { return false; }
++		if ((v & mask) == want) { printf("NORD2 GNSS LAD %d: %s ok after %d polls (%#x = %#x)\n", n2gl_k, what, i, pa, v); return true; }
++		delay(1);
++	}
++	printf("NORD2 GNSS LAD %d: %s TIMEOUT (%#x = %#x)\n", n2gl_k, what, pa, v);
++	return false;
++}
++static const struct { uint32_t pa, en, rdy; } n2gl_slp_off[4] = {
++	{ N2G_CFG_GALS_CONN2GPS, 1u << 4, 1u << 7 }, { N2G_CFG_GALS_CONN2GPS, 1u << 0, 1u << 3 },
++	{ N2G_CFG_GALS_GPS2CONN, 1u << 4, 1u << 7 }, { N2G_CFG_GALS_GPS2CONN, 1u << 0, 1u << 3 },
++};
++static const char *const n2gl_name[16] = { "", "GPS wake vote", "read conn_infra cfg page", "read conn_infra RGU page",
++	"read WB_STA + GPS CSRs", "GPS EMI remap", "BGFSYS_ON_TOP power", "GP_FUNCTION_EN + BGF acks", "GALS sleep protection off",
++	"gps_top_off ACTIVE check", "A-die top clock", "read GPS bus (first)", "GPS CLKGEN1 DIGCK", "L1 DSP on", "HOLD", "5 s powered" };
++/* one ladder step; 0 or an n2g error code. done[] is set before the first write so a partial step is rolled back. */
++static int
++n2gl_do(int s, bool done[16])
++{
++	switch (s) {
++	case 1:
++		n2gl_o.vote = n2gl_rd(N2G_CSR_WAKEPU_GPS); done[1] = true;
++		if (!n2gl_field(N2G_CSR_WAKEPU_GPS, 1u, 1u)) { return N2G_E_ARG; }
++		if (!n2gl_poll(N2G_CSR_SLP_PROT_CTRL, 1u << 5, 0, 10000, "on2off slp_prot ack clear")) { return N2G_E_WAKE; }
++		n2gl_show("vote readback", N2G_CSR_WAKEPU_GPS);
++		return 0;
++	case 2:
++		n2gl_show("conn_infra version", N2G_CONN_HW_VER); n2gl_show("GPS_PWRCTRL0", N2G_CFG_GPS_PWRCTRL0);
++		n2gl_show("EMI_CTL", N2G_CFG_EMI_CTL); n2gl_show("GALS_CONN2GPS", N2G_CFG_GALS_CONN2GPS);
++		n2gl_show("GALS_GPS2CONN", N2G_CFG_GALS_GPS2CONN); n2gl_show("ADIE_CTL", N2G_CFG_ADIE_CTL);
++		return 0;
++	case 3:
++		n2gl_show("BGFSYS_PWR_CTL", N2G_RGU_BGFSYS_PWR_CTL); n2gl_show("BGFSYS_PWR_ACK", N2G_RGU_BGFSYS_PWR_ACK);
++		return 0;
++	case 4:
++		n2gl_show("WTSLP_WB_STA", N2G_WTSLP_WB_STA); n2gl_show("CONN2AP_GPS_EMI", N2G_CSR_CONN2AP_GPS_EMI);
++		n2gl_show("HOST2GPS_DBG_SEL", N2G_CSR_HOST2GPS_DBG_SEL); n2gl_show("GPS_CFG2HOST_DBG", N2G_CSR_GPS_CFG2HOST_DBG);
++		return 0;
++	case 5:
++		n2gl_o.emi = n2gl_rd(N2G_CSR_CONN2AP_GPS_EMI); done[5] = true;
++		return n2gl_field(N2G_CSR_CONN2AP_GPS_EMI, 0x000fffffu, n2gl_hw.emi_base_pa >> 16) ? 0 : N2G_E_ARG;
++	case 6:
++		n2gl_o.bgf = n2gl_rd(N2G_RGU_BGFSYS_PWR_CTL); done[6] = true;
++		if (!n2gl_field(N2G_RGU_BGFSYS_PWR_CTL, 0xffff0080u, N2G_RGU_BGFSYS_PWR_KEY | (1u << 7))) { return N2G_E_ARG; }
++		n2gl_show("BGFSYS_PWR_ACK", N2G_RGU_BGFSYS_PWR_ACK);
++		return 0;
++	case 7:
++		n2gl_o.func = n2gl_rd(N2G_CFG_GPS_PWRCTRL0); done[7] = true;
++		if (!n2gl_field(N2G_CFG_GPS_PWRCTRL0, 1u, 1u)) { return N2G_E_ARG; }
++		if (!n2gl_poll(N2G_RGU_BGFSYS_PWR_ACK, 1u << 24, 1u << 24, N2G_POLL_MAX, "BGF primary ack")) { return N2G_E_BGF_ACK1; }
++		if (!n2gl_poll(N2G_RGU_BGFSYS_PWR_ACK, 1u << 25, 1u << 25, N2G_POLL_MAX, "BGF secondary ack")) { return N2G_E_BGF_ACK2; }
++		return 0;
++	case 8:
++		delay(200);
++		n2gl_o.c2g = n2gl_rd(N2G_CFG_GALS_CONN2GPS); n2gl_o.g2c = n2gl_rd(N2G_CFG_GALS_GPS2CONN); done[8] = true;
++		for (int i = 0; i < 4; i++) {
++			if (!n2gl_field(n2gl_slp_off[i].pa, n2gl_slp_off[i].en, 0)) { return N2G_E_ARG; }
++			if (!n2gl_poll(n2gl_slp_off[i].pa, n2gl_slp_off[i].rdy, 0, N2G_POLL_MAX, "sleep protection RDY clear")) { return N2G_E_SLP_PROT; }
++		}
++		return 0;
++	case 9: {
++		n2gl_o.sel = n2gl_rd(N2G_CSR_HOST2GPS_DBG_SEL); done[9] = true;
++		if (!n2gl_field(N2G_CSR_HOST2GPS_DBG_SEL, 0xffu, 0x80u)) { return N2G_E_ARG; }
++		bool top = false;
++		for (int i = 0; i < 3 && !top && !n2gl_stop; i++) { top = n2gl_poll(N2G_CSR_GPS_CFG2HOST_DBG, 0xffffu, 2u, N2G_POLL_MAX, "gps_top_off ACTIVE"); }
++		return top ? 0 : N2G_E_GPS_TOP;
++	}
++	case 10:
++		n2gl_o.adie = n2gl_rd(N2G_CFG_ADIE_CTL); done[10] = true;
++		if (!n2gl_field(N2G_CFG_ADIE_CTL, 1u << 1, 1u << 1)) { return N2G_E_ARG; }
++		return n2gl_poll(N2G_WTSLP_WB_STA, 1u << 26, 0, N2G_POLL_MAX, "A-die WB_STA idle") ? 0 : N2G_E_ADIE_CLK;
++	case 11:
++		n2gl_show("GPS CLKGEN1", N2G_GPS_CLKGEN1_CTL); n2gl_show("GPS AON DSLEEP", N2G_GPS_AON_DSLEEP_CTL);
++		n2gl_show("USRT CTRL", N2G_USRT_CTRL(0)); n2gl_show("USRT INTEN", N2G_USRT_INTEN(0)); n2gl_show("USRT STA", N2G_USRT_STA(0));
++		n2gl_show("USRT A2DF", N2G_USRT_A2DF(0)); n2gl_show("USRT D2AF", N2G_USRT_D2AF(0)); n2gl_show("USRT A2D1", N2G_USRT_A2D1(0));
++		return 0;
++	case 12:
++		n2gl_o.clk1 = n2gl_rd(N2G_GPS_CLKGEN1_CTL); done[12] = true;
++		return n2gl_field(N2G_GPS_CLKGEN1_CTL, 1u << 4, 1u << 4) ? 0 : N2G_E_ARG;
++	case 13: {
++		n2gl_o.aon = n2gl_rd(N2G_GPS_AON_DSLEEP_CTL); done[13] = true;
++		if (!n2gl_field(N2G_GPS_AON_DSLEEP_CTL, 0x3u, 0) || !n2gl_field(N2G_GPS_AON_DSLEEP_CTL, 1u << 3, 0) ||
++		    !n2gl_field(N2G_GPS_AON_DSLEEP_CTL, 1u << 4, 1u << 4) || !n2gl_field(N2G_GPS_AON_DSLEEP_CTL, 1u << 4, 0)) { return N2G_E_ARG; }
++		bool rom = n2gl_poll(N2G_USRT_D2AF(0), 1u << 3, 1u << 3, 100000, "DSP ROM okay (USRT D2AF3)");
++		n2gl_show("USRT STA", N2G_USRT_STA(0));
++		printf("NORD2 GNSS LAD %d: L1 DSP %s\n", n2gl_k, rom ? "ROM answered" : "no D2AF3 within 100 ms (info only, needs USRT on)");
++		return n2gl_stop ? N2G_E_ARG : 0;
++	}
++	}
++	return 0;
++}
++/* rollback of the done steps, restoring the saved original bits; vendor off order (sleep protection first) */
++static bool
++n2gl_undo(bool done[16])
++{
++	bool clean = true;
++	if (done[13]) { n2gl_field(N2G_GPS_AON_DSLEEP_CTL, 0x1fu, n2gl_o.aon); }
++	if (done[8]) {
++		static const int order[4] = { 1, 0, 3, 2 };              /* conn2gps tx, conn2gps rx, gps2conn tx, gps2conn rx */
++		for (int j = 0; j < 4; j++) {
++			int i = order[j];
++			uint32_t orig = i < 2 ? n2gl_o.c2g : n2gl_o.g2c;
++			n2gl_field(n2gl_slp_off[i].pa, n2gl_slp_off[i].en, orig);
++			if ((orig & n2gl_slp_off[i].en) && !n2gl_poll(n2gl_slp_off[i].pa, n2gl_slp_off[i].rdy, n2gl_slp_off[i].rdy, N2G_POLL_MAX, "rollback sleep protection RDY set")) { clean = false; }
++		}
++	}
++	if (done[12]) { n2gl_field(N2G_GPS_CLKGEN1_CTL, 1u << 4, n2gl_o.clk1); }
++	if (done[10]) { n2gl_field(N2G_CFG_ADIE_CTL, 1u << 1, n2gl_o.adie); }
++	if (done[9]) { n2gl_field(N2G_CSR_HOST2GPS_DBG_SEL, 0xffu, n2gl_o.sel); }
++	if (done[7]) { n2gl_field(N2G_CFG_GPS_PWRCTRL0, 1u, n2gl_o.func); }
++	if (done[6]) { n2gl_field(N2G_RGU_BGFSYS_PWR_CTL, 0xffff0080u, N2G_RGU_BGFSYS_PWR_KEY | (n2gl_o.bgf & 0x80u)); n2gl_show("BGFSYS_PWR_ACK after", N2G_RGU_BGFSYS_PWR_ACK); }
++	if (done[5]) { n2gl_field(N2G_CSR_CONN2AP_GPS_EMI, 0x000fffffu, n2gl_o.emi); }
++	if (done[1]) { n2gl_field(N2G_CSR_WAKEPU_GPS, 1u, n2gl_o.vote); n2gl_show("ack after vote release", N2G_CSR_SLP_PROT_CTRL); }
++	return clean;
++}
++static uint32_t
++n2gd_ladder(int k)
++{
++	uint32_t g[9] = {0};
++	bool done[16] = {false};
++	n2gl_k = k; n2gl_stop = false;
++	bool ok = n2gd_wifi_guard(g) && (g[7] >> 16) == 1 && (g[8] >> 16) == 0;
++	printf("NORD2 GNSS LAD %d (%s): spm304=%#x gals504=%#x infra228=%#x infra724=%#x gic130=%#x wifi ap=%u wf=%u asleep=%u stage=%u -> %s\n",
++	    k, n2gl_name[k], g[0], g[3], g[4], g[5], g[6], g[7] >> 16, g[7] & 0xffff, g[8] >> 16, g[8] & 0xffff, ok ? "guard ok" : "GUARD REFUSES");
++	if (!ok) { return 0x01000000u; }
++	if (n2gd_hw(&n2gl_hw)) { return 0x0300u; }
++	if (k == 14 && n2gd.powered) { printf("NORD2 GNSS LAD 14: already held\n"); return 1; }
++	int last = k <= 13 ? k : 13, rc = 0, s;
++	for (s = 1; s <= last && !rc; s++) {
++		if (s == k || (k >= 14 && s == 13)) { printf("NORD2 GNSS LAD %d: about to run NEW step %d (%s)\n", k, s, n2gl_name[s]); delay(2000000); }
++		else { printf("NORD2 GNSS LAD %d: step %d (%s)\n", k, s, n2gl_name[s]); }
++		rc = n2gl_do(s, done);
++		if (n2gl_stop) { return ((uint32_t)s << 8) | 0x01000000u; }
++		printf("NORD2 GNSS LAD %d: step %d %s\n", k, s, rc ? "FAILED" : "done");
++	}
++	int failed = rc ? s - 1 : 0;
++	if (!rc && k == 14) {
++		/* HOLD: power stays on, only the GPS wake vote is released (n2g_link_on order). Not undoable in this image. */
++		n2gl_field(N2G_CSR_WAKEPU_GPS, 1u, n2gl_o.vote);
++		if (n2gl_stop) { return 0x01000000u | 0x0e00u; }
++		n2gd.powered = true; n2gd.hw_valid = true; n2gd.last_err = 0;
++		n2gd.conn_hw_ver = n2gl_rd(N2G_CONN_HW_VER);
++		printf("NORD2 GNSS LAD 14: HOLD, GNSS left powered (conn_infra %#x), NOT rolled back until reboot\n", n2gd.conn_hw_ver);
++		return 1;
++	}
++	if (!rc && k == 15) {
++		for (int t = 1; t <= 5 && !n2gl_stop; t++) {
++			delay(1000000);
++			uint32_t sta = n2gl_rd(N2G_USRT_STA(0)), d2a = n2gl_rd(N2G_USRT_D2AF(0)), top = n2gl_rd(N2G_CSR_GPS_CFG2HOST_DBG), ack = n2gl_rd(N2G_RGU_BGFSYS_PWR_ACK);
++			if (!n2gl_stop) { printf("NORD2 GNSS LAD 15: t=%ds usrt_sta=%#x d2af=%#x top=%#x bgf_ack=%#x\n", t, sta, d2a, top, ack); }
++		}
++		if (n2gl_stop) { return 0x01000000u | 0x0f00u; }
++	}
++	printf("NORD2 GNSS LAD %d: rolling back\n", k);
++	bool clean = n2gl_undo(done);
++	printf("NORD2 GNSS LAD %d: rollback %s%s\n", k, n2gl_stop ? "STOPPED BY GUARD" : "done", clean ? "" : " (a sleep-protection RDY did not come back)");
++	return (rc ? ((uint32_t)failed << 8) | ((uint32_t)rc << 16) : 1u) | (n2gl_stop ? 0x01000000u : 0) | (clean ? 0 : 0x02000000u);
++}
++
+ static uint32_t
+ n2gd_step(int step)
+ {
+@@ -248,6 +488,25 @@
+ 		v = n2gd_single((int)((uint32_t)cmd & 0xff) - 110);
+ 		lck_mtx_unlock(&n2gd_lock);
+ 		break;
++	case (uint32_t)N2GD_IOC(141):                            /* 0356 power-on ladder, one per boot */
++	case (uint32_t)N2GD_IOC(142):
++	case (uint32_t)N2GD_IOC(143):
++	case (uint32_t)N2GD_IOC(144):
++	case (uint32_t)N2GD_IOC(145):
++	case (uint32_t)N2GD_IOC(146):
++	case (uint32_t)N2GD_IOC(147):
++	case (uint32_t)N2GD_IOC(148):
++	case (uint32_t)N2GD_IOC(149):
++	case (uint32_t)N2GD_IOC(150):
++	case (uint32_t)N2GD_IOC(151):
++	case (uint32_t)N2GD_IOC(152):
++	case (uint32_t)N2GD_IOC(153):
++	case (uint32_t)N2GD_IOC(154):
++	case (uint32_t)N2GD_IOC(155):
++		lck_mtx_lock(&n2gd_lock);
++		v = n2gd_ladder((int)((uint32_t)cmd & 0xff) - 140);
++		lck_mtx_unlock(&n2gd_lock);
++		break;
+ 	case (uint32_t)N2GD_IOC(121):                            /* 0355 mapping bisection, one per boot */
+ 	case (uint32_t)N2GD_IOC(122):
+ 	case (uint32_t)N2GD_IOC(123):

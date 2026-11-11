@@ -1,0 +1,150 @@
+--- a/bsd/dev/nord2_cam.inc
++++ b/bsd/dev/nord2_cam.inc
+@@ -154,28 +154,69 @@
+ 
+ /* ---- FAN53870 camera LDOs (i2c8 @0x35) ---- */
+ #define N2C_FAN 0x35
+-static bool
+-n2c_fan_upd(uint8_t reg, uint8_t mask, uint8_t val)
+-{
+-	uint8_t cur = 0;
+-	n2c_bus_init(&n2c_i2c8);
+-	if (!n2c_rd(N2C_FAN, reg, 1, &cur, 1)) { return false; }
+-	return n2c_wr(N2C_FAN, reg, 1, (uint8_t)((cur & ~mask) | (val & mask)));
+-}
+ 
+ /*
+  * I2C8 is the audio amplifiers' bus too (audio_i2c8.c drives its hardware controller and refuses to run unless GPIO122/123
+  * are SCL8/SDA8; every refusal leaves the speaker offline). So the FAN53870 is set up ONCE, under the audio driver's own
+  * lease flag (audio_hw_native.inc nah_native_bus_owned, compare-and-swap 0 -> 2), all the camera LDOs at their voltages
+  * and on, the pins given back to function 1; the camera never touches I2C8 again (sensors are held in reset instead).
++ * 0331: the lease is taken for ONE transaction at a time (the longest, the 15-byte dump, is < 2 ms of bit-bang) and the
++ * pins are SCL8/SDA8 again before it is released, so a playback running meanwhile (its 20 ms amplifier status read,
++ * audio_hw_native.inc waits up to 4 ms for owner 2) is never refused; before the pins go back, a slave left holding SDA
++ * low is clocked free (9 SCL pulses + STOP), so the hardware controller never inherits a stuck bus.
+  */
+ static volatile unsigned nah_native_bus_owned;      /* tentative definition: audio_hw_native.inc defines it */
++static unsigned n2c_i2c8_clears, n2c_i2c8_busy;
+ static void
+ n2c_i2c_pins_back(const struct n2c_bus *b)
+ {
+ 	n2c_mode(b->scl, 1);
+ 	n2c_mode(b->sda, 1);
+ }
++static bool
++n2c_i2c8_take(void)
++{
++	for (unsigned tries = 0; tries < 2000; tries++) {        /* the audio worker holds it for whole amplifier sequences */
++		if (__sync_bool_compare_and_swap(&nah_native_bus_owned, 0, 2)) { n2c_bus_init(&n2c_i2c8); return true; }
++		n2c_sleep(1);
++	}
++	n2c_i2c8_busy++;
++	return false;
++}
++static void
++n2c_i2c8_give(void)
++{
++	if (!n2c_lvl(n2c_i2c8.sda)) {                             /* I2C bus clear (UM10204 3.1.16) */
++		n2c_i2c8_clears++;
++		for (unsigned i = 0; i < 9 && !n2c_lvl(n2c_i2c8.sda); i++) { n2c_line(n2c_i2c8.scl, false); (void)n2c_sclh(); }
++		(void)n2c_stop();
++	}
++	n2c_i2c_pins_back(&n2c_i2c8);
++	__sync_bool_compare_and_swap(&nah_native_bus_owned, 2, 0);
++}
++static bool
++n2c_fan_rd(uint8_t reg, uint8_t *data, unsigned n)
++{
++	if (!n2c_i2c8_take()) { return false; }
++	bool ok = n2c_rd(N2C_FAN, reg, 1, data, n);
++	n2c_i2c8_give();
++	return ok;
++}
++static bool
++n2c_fan_wr(uint8_t reg, uint8_t v)
++{
++	if (!n2c_i2c8_take()) { return false; }
++	bool ok = n2c_wr(N2C_FAN, reg, 1, v);
++	n2c_i2c8_give();
++	return ok;
++}
++static bool
++n2c_fan_upd(uint8_t reg, uint8_t mask, uint8_t val)
++{
++	uint8_t cur = 0;
++	if (!n2c_fan_rd(reg, &cur, 1)) { return false; }
++	return n2c_fan_wr(reg, (uint8_t)((cur & ~mask) | (val & mask)));
++}
+ static bool n2c_fan_ready;
+ static void n2c_fan_dump(void);
+ 
+@@ -303,7 +344,7 @@
+ static bool
+ n2c_ldo_raw(const struct n2c_ldo *l)
+ {
+-	bool ok = n2c_wr(N2C_FAN, l->vreg, 1, l->val) && n2c_fan_upd(l->seq, l->seqmask, 0) && n2c_fan_upd(0x03, l->en, l->en);
++	bool ok = n2c_fan_wr(l->vreg, l->val) && n2c_fan_upd(l->seq, l->seqmask, 0) && n2c_fan_upd(0x03, l->en, l->en);
+ 	printf("NORD2 CAM:   FAN %s %s\n", l->what, ok ? "on" : "FAILED");
+ 	return ok;
+ }
+@@ -311,25 +352,21 @@
+ n2c_fan_setup(void)
+ {
+ 	bool ok = true;
+-	for (unsigned tries = 0; tries < 200 && !__sync_bool_compare_and_swap(&nah_native_bus_owned, 0, 2); tries++) { n2c_sleep(10); }
+-	if (nah_native_bus_owned != 2) { printf("NORD2 CAM: I2C8 is the audio driver's now: FAN53870 not set up\n"); return false; }
+-	n2c_bus_init(&n2c_i2c8);
+-	printf("NORD2 CAM: FAN53870 (I2C8 leased from audio): all camera LDOs on\n");
++	printf("NORD2 CAM: FAN53870 (I2C8 leased from audio per transaction): all camera LDOs on\n");
+ 	n2c_fan_dump();
+ 	ok = n2c_ldo_raw(&n2c_ldo1_1v1) && ok; ok = n2c_ldo_raw(&n2c_ldo2_1v2) && ok; ok = n2c_ldo_raw(&n2c_ldo3_2v8) && ok;
+ 	ok = n2c_ldo_raw(&n2c_ldo4_2v8) && ok; ok = n2c_ldo_raw(&n2c_ldo6_2v8) && ok; ok = n2c_ldo_raw(&n2c_ldo7_2v9) && ok;
+ 	n2c_fan_dump();
+-	n2c_i2c_pins_back(&n2c_i2c8);
+-	__sync_bool_compare_and_swap(&nah_native_bus_owned, 2, 0);
++	printf("NORD2 CAM: FAN53870 %s: I2C8 pins %#x (SCL8/SDA8 = 0x1100 in bits 8-15), bus clears %u, lease timeouts %u\n",
++	    ok ? "ok" : "FAILED", ni_rd(ni_gpio, 0x3f0), n2c_i2c8_clears, n2c_i2c8_busy);
+ 	n2c_fan_ready = ok;
+ 	return ok;
+ }
+ static bool __attribute__((unused))
+ n2c_ldo(const struct n2c_ldo *l, bool on)
+ {
+-	n2c_bus_init(&n2c_i2c8);
+ 	if (!on) { return n2c_fan_upd(0x03, l->en, 0); }
+-	bool ok = n2c_wr(N2C_FAN, l->vreg, 1, l->val) && n2c_fan_upd(l->seq, l->seqmask, 0) && n2c_fan_upd(0x03, l->en, l->en);
++	bool ok = n2c_fan_wr(l->vreg, l->val) && n2c_fan_upd(l->seq, l->seqmask, 0) && n2c_fan_upd(0x03, l->en, l->en);
+ 	printf("NORD2 CAM:   FAN %s %s\n", l->what, ok ? "on" : "FAILED");
+ 	return ok;
+ }
+@@ -337,8 +374,7 @@
+ n2c_fan_dump(void)
+ {
+ 	uint8_t r[0x0f] = {0};
+-	n2c_bus_init(&n2c_i2c8);
+-	bool ok = n2c_rd(N2C_FAN, 0x00, 1, r, sizeof(r));
++	bool ok = n2c_fan_rd(0x00, r, sizeof(r));
+ 	printf("NORD2 CAM:   FAN %s: id %02x %02x %02x en %02x vout %02x %02x %02x %02x %02x %02x %02x seq %02x %02x %02x %02x\n", ok ? "ok" : "NO ACK",
+ 	    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14]);
+ }
+--- a/bsd/dev/audio_hw_native.inc
++++ b/bsd/dev/audio_hw_native.inc
+@@ -165,7 +165,17 @@
+ static int nah_native_bus_lease(unsigned acquire)
+ {
+  if (current_thread()!=nah_native.worker) return -1;
+- if (acquire) return __sync_bool_compare_and_swap(&nah_native_bus_owned,0,1)?0:-1;
++ /* 0331: the camera (nord2_cam.inc n2c_i2c8_take, owner 2) holds I2C8 for ONE FAN53870 transaction at a time
++  * (bit-banged, < 2 ms, pins given back to SCL8/SDA8 before it lets go). Wait that out (bounded 4 ms, well inside
++  * the DMA ring) instead of failing: a failed lease ends playback, and failing again at stop makes the path
++  * uncertain (sticky) for the rest of the boot. Any other owner value still fails at once. */
++ if (acquire) {
++  for (unsigned us=0;;us+=20) {
++   if (__sync_bool_compare_and_swap(&nah_native_bus_owned,0,1)) return 0;
++   if (nah_native_bus_owned!=2 || us>=4000) return -1;
++   delay(20);
++  }
++ }
+  return __sync_bool_compare_and_swap(&nah_native_bus_owned,1,0)?0:-1;
+ }
+ int nah_native_prepare(struct nah_io *out,void **cookie)

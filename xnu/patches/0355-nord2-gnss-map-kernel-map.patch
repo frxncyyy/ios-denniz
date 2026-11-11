@@ -1,0 +1,146 @@
+--- a/bsd/dev/nord2_gpsdl.inc
++++ b/bsd/dev/nord2_gpsdl.inc
+@@ -125,10 +125,15 @@
+  *   112: read 0x180601a0 (Wi-Fi's own HOST wake vote register; Wi-Fi reads it in nwfn wake/release)
+  *   113: read 0x18060184 (on2off sleep-protection ack; Wi-Fi polls it after its vote)
+  *   114: read 0x180601ac (GPS wake vote register from the vendor v010 headers; NOT one Wi-Fi ever touches)
+- *   115: ml_io_map of the 6 GNSS pages only, no access (tests the mapping step of q10jr3 step 2)
++ *   115: ml_io_map of the 6 GNSS pages only, no access (tests the mapping step of q10jr3 step 2); since 0355 it maps
++ *        lazily from kernel_map (n2gd_hw maps nothing; ONE 5 now only prints "mapped, rc=0")
+  */
+ static bool n2gd_wifi_guard(uint32_t out[9]);                    /* sweet_touch.c: predicates + GIC + Wi-Fi state */
+ static vm_offset_t n2gd_wifi_host(void);                         /* sweet_touch.c: npa_native.host (0x18060000 page) */
++/* 0355 (q10jr5): q10jr4 one5 showed the ml_io_map of the 6 pages itself resets the phone (io_submap is 8 MiB and
++ * KMA_NOFAIL: exhaustion = a panic the console never shows). GNSS pages now come from kernel_map, lazily, one action per
++ * boot in ioctls 121..130 (sweet_touch.c n2gd_mapone has the table). */
++static uint32_t n2gd_mapone(int k);
+ static uint32_t
+ n2gd_single(int k)
+ {
+@@ -243,6 +248,20 @@
+ 		v = n2gd_single((int)((uint32_t)cmd & 0xff) - 110);
+ 		lck_mtx_unlock(&n2gd_lock);
+ 		break;
++	case (uint32_t)N2GD_IOC(121):                            /* 0355 mapping bisection, one per boot */
++	case (uint32_t)N2GD_IOC(122):
++	case (uint32_t)N2GD_IOC(123):
++	case (uint32_t)N2GD_IOC(124):
++	case (uint32_t)N2GD_IOC(125):
++	case (uint32_t)N2GD_IOC(126):
++	case (uint32_t)N2GD_IOC(127):
++	case (uint32_t)N2GD_IOC(128):
++	case (uint32_t)N2GD_IOC(129):
++	case (uint32_t)N2GD_IOC(130):
++		lck_mtx_lock(&n2gd_lock);
++		v = n2gd_mapone((int)((uint32_t)cmd & 0xff) - 120);
++		lck_mtx_unlock(&n2gd_lock);
++		break;
+ 	case (uint32_t)N2GD_IOC(101):                            /* 0353 single steps, one per call, markers first */
+ 	case (uint32_t)N2GD_IOC(102):
+ 	case (uint32_t)N2GD_IOC(103):
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -985,12 +985,32 @@
+ static const uint32_t n2gd_pages[N2GD_NPAGES] = { 0x18000000u, 0x18001000u, 0x18005000u, 0x18060000u, 0x18c01000u, 0x18c73000u };
+ static vm_offset_t n2gd_va[N2GD_NPAGES];
+ 
++/*
++ * 0355 (q10jr5): q10jr4 one5 reset the phone inside the ml_io_map of these 6 pages, with no register access. ml_io_map
++ * allocates from XNU's 8 MiB io_submap with KMA_NOFAIL (osfmk/arm/io_map.c), so an exhausted io_submap is a panic, and a
++ * panic never reaches this console (debug_log_init: gPanicBase not initialized). The Wi-Fi ROM window alone takes
++ * 0x450000 of it, the stock FDT copy 0x100000, AMFI 0xd3000; pool_bind.inc already moved its 15 MiB claim to
++ * ml_io_map_unmappable(..., VM_WIMG_IO) for that reason. GNSS now does the same: each page is mapped from kernel_map with
++ * the same Device attributes, only when first used, and the host CSR page reuses Wi-Fi's own mapping (npa_native.host).
++ */
++static vm_offset_t
++n2gd_map_page(int i)
++{
++	if (n2gd_va[i]) { return n2gd_va[i]; }
++	if (n2gd_pages[i] == 0x18060000u) { n2gd_va[i] = npa_native.host; }                 /* no new mapping */
++	else { n2gd_va[i] = ml_io_map_unmappable(n2gd_pages[i], 0x1000, VM_WIMG_IO); }      /* kernel_map, Device */
++	return n2gd_va[i];
++}
++
+ static volatile uint32_t *
+ n2gd_reg(uint32_t pa)
+ {
+ 	if (!n2g_reg_allowed(pa)) { return NULL; }
+ 	for (int i = 0; i < N2GD_NPAGES; i++) {
+-		if ((pa & ~0xfffu) == n2gd_pages[i] && n2gd_va[i]) { return (volatile uint32_t *)(n2gd_va[i] + (pa & 0xfffu)); }
++		if ((pa & ~0xfffu) == n2gd_pages[i]) {
++			vm_offset_t va = n2gd_map_page(i);
++			return va ? (volatile uint32_t *)(va + (pa & 0xfffu)) : NULL;
++		}
+ 	}
+ 	return NULL;
+ }
+@@ -1019,14 +1039,65 @@
+ static int
+ n2gd_hw(struct n2g_hw *hw)
+ {
+-	for (int i = 0; i < N2GD_NPAGES; i++) {
+-		if (!n2gd_va[i]) { n2gd_va[i] = ml_io_map(n2gd_pages[i], 0x1000); }
+-		if (!n2gd_va[i]) { printf("NORD2 GNSS: map %#x failed\n", n2gd_pages[i]); return ENOMEM; }
+-	}
++	/* 0355: nothing is mapped here any more; n2gd_reg maps each page on its first access (n2gd_map_page) */
++	if (!npa_native.host) { printf("NORD2 GNSS: no Wi-Fi host mapping\n"); return ENODEV; }
+ 	hw->ctx = NULL; hw->read32 = n2gd_rd; hw->write32 = n2gd_wr; hw->delay_us = n2gd_delay; hw->log = n2gd_note;
+ 	hw->emi_base_pa = N2GD_EMI_BASE;
+ 	return 0;
+ }
++
++/*
++ * 0355 mapping bisection, one action per boot (ioctls 121..130), after the same read-only Wi-Fi guard as 0354, a console
++ * marker and a 2 s pause. No register of a newly mapped page is ever accessed here.
++ *   121 (k=1): inventory only: virtual addresses of the existing io_submap mappings and of Wi-Fi's kernel_map pool
++ *   122 (k=2): the fixed path: n2gd_map_page for all 6 pages (5 x ml_io_map_unmappable + Wi-Fi's host page)
++ *   123 (k=3): control: ml_io_map(0x10006000, 0x1000), one always-on SPM page through io_submap
++ *   124 (k=4): control: ml_io_map(0x10006000, 0x6000), the q10jr4 one5 request size through io_submap, non-GPS PA
++ *   125..130 (k=5..10): ml_io_map_unmappable of exactly one GNSS page: 0x18000000, 0x18001000, 0x18005000,
++ *                       0x18060000 (a fresh second mapping), 0x18c01000, 0x18c73000
++ */
++static uint32_t
++n2gd_mapone(int k)
++{
++	uint32_t g[9] = {0};
++	bool ok = n2gd_wifi_guard(g);
++	printf("NORD2 GNSS MAP %d: spm304=%#x gals504=%#x infra228=%#x infra724=%#x gic130=%#x wifi ap=%u wf=%u asleep=%u stage=%u -> %s\n",
++	    k, g[0], g[3], g[4], g[5], g[6], g[7] >> 16, g[7] & 0xffff, g[8] >> 16, g[8] & 0xffff, ok ? "guard ok" : "GUARD REFUSES");
++	printf("NORD2 GNSS MAP %d: io_submap VAs: ao_spm=%#lx ao_gals=%#lx ao_infra=%#lx host=%#lx sched=%#lx dummy=%#lx gic=%#lx wfdma=%#lx | kernel_map pool=%#lx\n",
++	    k, (unsigned long)n2gd_ao_spm, (unsigned long)n2gd_ao_gals, (unsigned long)n2gd_ao_infra, (unsigned long)npa_native.host,
++	    (unsigned long)nwfn_native.scheduler_va, (unsigned long)nwfn_native.dummy_va, (unsigned long)nwfn_native.gic_va,
++	    (unsigned long)nppa_native.wfdma, (unsigned long)nppa_native.pool);
++	if (k == 1) { return 1; }
++	if (!ok) { return 0x0100u; }
++	if (k == 2) {
++		printf("NORD2 GNSS MAP 2: about to map the 6 GNSS pages from kernel_map (ml_io_map_unmappable, host page = Wi-Fi's), no access\n");
++		delay(2000000);
++		for (int i = 0; i < N2GD_NPAGES; i++) {
++			vm_offset_t va = n2gd_map_page(i);
++			printf("NORD2 GNSS MAP 2: %#x -> %#lx\n", n2gd_pages[i], (unsigned long)va);
++			if (!va) { return 0x0300u; }
++		}
++		printf("NORD2 GNSS MAP 2: done\n");
++		return 1;
++	}
++	if (k == 3 || k == 4) {
++		vm_size_t sz = k == 3 ? 0x1000 : 0x6000;
++		printf("NORD2 GNSS MAP %d: about to ml_io_map(0x10006000, %#lx) through io_submap (control, no access)\n", k, (unsigned long)sz);
++		delay(2000000);
++		vm_offset_t va = ml_io_map(0x10006000, sz);
++		printf("NORD2 GNSS MAP %d: done -> %#lx\n", k, (unsigned long)va);
++		return va ? 1u : 0x0300u;
++	}
++	if (k >= 5 && k <= 10) {
++		uint32_t pa = n2gd_pages[k - 5];
++		printf("NORD2 GNSS MAP %d: about to ml_io_map_unmappable(%#x, 0x1000, VM_WIMG_IO) (no access)\n", k, pa);
++		delay(2000000);
++		vm_offset_t va = ml_io_map_unmappable(pa, 0x1000, VM_WIMG_IO);
++		printf("NORD2 GNSS MAP %d: done %#x -> %#lx\n", k, pa, (unsigned long)va);
++		return va ? 1u : 0x0300u;
++	}
++	return 0x0700u;
++}
+ #include "nord2_vcodec_at.inc"   /* 0311: VENC bring-up steps, autotest command 8 */
+ #include "nord2_autotest.inc"   /* 0296: synthetic touches/keys and panel pictures over the USB console */
+ 
