@@ -1,0 +1,88 @@
+--- a/gpu/hwcodec/vcu/n2vcu.c	2026-11-11 18:57:05.225515067 +0100
++++ b/gpu/hwcodec/vcu/n2vcu.c	2026-11-11 18:57:19.347211453 +0100
+@@ -563,6 +563,7 @@
+ 	uint32_t codec_type;
+ 	unsigned batch;
+ 	uint32_t spr;
++	uint8_t hevc_list;      /* the list wrote HEVC_VLD / LAT HEVC_VLD: events 8-10 are HEVC_VLD(37) conditions */
+ };
+ 
+ static int gce_flush(struct vcu_gce_run *g)
+@@ -661,6 +662,8 @@
+ 		g->v->stats.last_skipped_cmd_addr = addr;
+ 		return 0;
+ 	}
++	if ((addr >= 0x16028000ull && addr < 0x16028400ull) || (addr >= 0x16015000ull && addr < 0x16015400ull))
++		g->hevc_list = 1;
+ 	return gce_append(g, mask == 0xffffffffu ? RWVC_OP_WRITE : RWVC_OP_WRITE_MASK, win, off,
+ 			  (uint32_t)data, mask);
+ }
+@@ -679,6 +682,55 @@
+ 	return gce_append(g, RWVC_OP_POLL, win, off, (uint32_t)data, mask);
+ }
+ 
++/* VDEC events that are register conditions, not interrupts (mtk_vcu_controls.h:106-150 event text; the CMDQ hardware
++ * waits for the block's event signal, the model polls the condition).  Core events 5..11, LAT events 16+5..16+11 on
++ * the LAT instance of the same blocks (LAT_VLD 0x16011000, LAT_HEVC_VLD 0x16015000, LAT_MISC 0x16010000).
++ * Returns 1 when the event was handled here.  opus-hevcdec proposal (facts/HEVC_DEC_PROTOCOL.md section 5). */
++static int gce_vdec_cond_event(struct vcu_gce_run *g, uint64_t event, int *rc)
++{
++	static const struct { uint8_t ev; uint8_t hevc; uint32_t blk_core, blk_lat, reg, mask, value; } T[] = {
++		{ 6, 2, 0x16020000u, 0x16011000u, 0x0e8u, 0x00000001u, 0x00000001u },  /* ini_fetch_rdy VLD(58) bit0=1 */
++		{ 7, 2, 0x16020000u, 0x16011000u, 0x0f4u, 0x00008000u, 0x00000000u },  /* process_flag VLD(61) bit15=0 [the
++		                                                                            * "bit15=1 && bit0=0" alternative is not polled] */
++		{ 8, 1, 0x16028000u, 0x16015000u, 0x094u, 0x00000100u, 0x00000000u },  /* HEVC_VLD(37) bit8=0 */
++		{ 9, 1, 0x16028000u, 0x16015000u, 0x094u, 0x00000010u, 0x00000000u },  /* HEVC_VLD(37) bit4=0 */
++		{ 10, 1, 0x16028000u, 0x16015000u, 0x094u, 0x00000001u, 0x00000000u }, /* HEVC_VLD(37) bit0=0 */
++		{ 8, 0, 0x16022000u, 0x16012000u, 0x2d8u, 0x00000001u, 0x00000000u },  /* AVC_VLD(182) bit0=0 */
++		{ 9, 0, 0x16022000u, 0x16012000u, 0x22cu, 0x00000001u, 0x00000001u },  /* AVC_VLD(139) bit0=1 */
++		{ 10, 0, 0x16022000u, 0x16012000u, 0x230u, 0x00000001u, 0x00000001u }, /* AVC_VLD(140) bit0=1 */
++	};
++	unsigned ev = (unsigned)event, lat = 0, i, win = 0;
++	uint32_t off = 0;
++
++	if (ev >= (unsigned)VDEC_LAT_EVENT_0 && ev < (unsigned)VDEC_EVENT_COUNT) {
++		lat = 1;
++		ev -= (unsigned)VDEC_LAT_EVENT_0;
++	}
++	if (ev == 5u) {         /* all_dram_req & cnt_0 & bits_proc_nop: MISC(68..79) all 0 */
++		uint32_t base = lat ? 0x16010000u : 0x16025000u, r;
++		for (r = 0x110u; r <= 0x13cu; r += 4u) {
++			if (!vcu_reg_lookup(base + r, &win, &off))
++				return 0;
++			*rc = gce_append(g, RWVC_OP_POLL, win, off, 0, 0xffffffffu);
++			if (*rc)
++				return 1;
++		}
++		*rc = gce_flush(g);
++		return 1;
++	}
++	for (i = 0; i < sizeof(T) / sizeof(T[0]); i++) {
++		if (T[i].ev != ev || (T[i].hevc != 2 && T[i].hevc != g->hevc_list))
++			continue;
++		if (!vcu_reg_lookup((lat ? T[i].blk_lat : T[i].blk_core) + T[i].reg, &win, &off))
++			return 0;   /* window not mapped (needs RWVC_WIN_VDEC_ALL): keep the old IRQ path */
++		*rc = gce_append(g, RWVC_OP_POLL, win, off, T[i].value, T[i].mask);
++		if (!*rc)
++			*rc = gce_flush(g);
++		return 1;
++	}
++	return 0;
++}
++
+ static int gce_cmd_wait_event(struct vcu_gce_run *g, uint64_t event)
+ {
+ 	struct n2vcu *v = g->v;
+@@ -694,6 +746,12 @@
+ 	rc = gce_flush(g);
+ 	if (rc)
+ 		return rc;
++	if (event < (uint64_t)VDEC_EVENT_COUNT && gce_vdec_cond_event(g, event, &rc)) {
++		v->stats.gce_waits++;
++		if (rc)
++			v->stats.gce_errors++;
++		return rc;
++	}
+ 	irq = gce_event_irq(event, g->codec_type);
+ 	rc = v->hw.wait_irq(v->hw.ctx, irq, v->irq_timeout_ms, &status);
+ 	v->stats.gce_waits++;

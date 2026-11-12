@@ -1,0 +1,204 @@
+--- a/tests/hw/n2vc_hw_fake.h
++++ b/tests/hw/n2vc_hw_fake.h
+@@ -20,7 +20,9 @@
+  *
+  * WIN is one of VENC, VENC_C1, VDEC_SYS, VDEC_BASE, VDEC_VLD, VDEC_MC,
+  * VDEC_MV, VDEC_MISC, VDEC_LAT_MISC, VDEC_LAT_VLD, VDEC_RACING,
+- * VDEC_SOC_GCON (case-insensitive) or 0..11.  A rule without VALUE matches
++ * VDEC_SOC_GCON, VDEC_ALL (case-insensitive) or 0..12.  VDEC_ALL is 0x30000
++ * bytes and its power block is per 4 KiB page (ABI rev 3); its two larb pages
++ * accept a write only at offset 0x00c bit 0.  A rule without VALUE matches
+  * any write to the offset.  For a masked write the trigger value is
+  * (value & mask).  Rules may chain; a chain longer than 32 is an error
+  * (-ELOOP) and counts as a violation.  A "read" rule takes precedence over
+--- a/tests/hw/n2vc_hw_fake.c
++++ b/tests/hw/n2vc_hw_fake.c
+@@ -2,17 +2,20 @@
+ /*
+  * n2vc_hw_fake.c -- T02: the host fake of include/n2vc_hw.h.
+  *
+- * One fake instance models the four MT6893 power blocks and the twelve
+- * register windows of include/redwood_vcodec.h, records every operation as a
+- * text line, and executes rules from a small text file so that interpreted
+- * vendor code can make progress without a phone.  Everything is bounded and
+- * every error is returned, never printed or asserted.
++ * One fake instance models the four MT6893 power blocks and the thirteen
++ * register windows of include/redwood_vcodec.h (ABI rev 3 adds VDEC_ALL),
++ * records every operation as a text line, and executes rules from a small text
++ * file so that interpreted vendor code can make progress without a phone.
++ * Everything is bounded and every error is returned, never printed or asserted.
+  *
+  * The window -> power block mapping is the one K02 documented in
+  * gpu/hwcodec/kern/VCODEC_HW.md section 0 (from mt6893.dts and
+  * mtk_vcodec_dec_pm.c).  Power implications VENC_C1 -> VEN and
+  * VDEC_CORE -> VDEC_SOC are the hidden references of RWVC_POWER in that file
+- * (section 7).
++ * (section 7).  RWVC_WIN_VDEC_ALL is decided per 4 KiB page: 0x00-0x0c and
++ * 0x0e and 0x20-0x2f need VDEC_CORE, 0x0d and 0x0f-0x1f need VDEC_SOC, and the
++ * two kernel-owned larb pages (0x0d000 larb5, 0x2e000 larb4) accept a write
++ * only at offset 0x00c bit 0, the vendor's sleep-protect word.
+  */
+ #define _POSIX_C_SOURCE 200809L
+ #include <errno.h>
+@@ -34,6 +37,8 @@
+ #define N2VC_FAKE_CHAIN_MAX 32u
+ #define N2VC_FAKE_POLL_MAX  1000000u
+ #define N2VC_FAKE_LINE      512u
++#define N2VC_FAKE_BLK_PAGE  0xffu              /* win_desc.block: decided per 4 KiB page (VDEC_ALL) */
++#define N2VC_FAKE_ALL_BYTES 0x30000u           /* RWVC_WIN_VDEC_ALL */
+ 
+ struct fake_win {
+ 	uint32_t value[N2VC_FAKE_WIN_WORDS];
+@@ -74,6 +79,7 @@
+ 	unsigned user_refs[RWVC_BLK_COUNT];
+ 	unsigned hidden_refs[RWVC_BLK_COUNT];
+ 	struct fake_win win[RWVC_WIN_COUNT];
++	uint8_t *vdec_all;
+ 
+ 	uint32_t irq_status[RWVC_IRQ_COUNT];
+ 	unsigned irq_pending[RWVC_IRQ_COUNT];
+@@ -110,6 +116,7 @@
+ 	{ "VDEC_LAT_VLD", 0x0400, RWVC_BLK_VDEC_SOC },
+ 	{ "VDEC_RACING",  0x1000, RWVC_BLK_VDEC_CORE },
+ 	{ "VDEC_SOC_GCON", 0x1000, RWVC_BLK_VDEC_SOC },
++	{ "VDEC_ALL",     N2VC_FAKE_ALL_BYTES, N2VC_FAKE_BLK_PAGE },
+ };
+ 
+ static const char *const BLOCK_NAMES[RWVC_BLK_COUNT] = {
+@@ -170,14 +177,71 @@
+ 
+ static uint32_t read_word(const struct n2vc_hw_fake *f, unsigned win, uint32_t off)
+ {
++	if (win == RWVC_WIN_VDEC_ALL) {
++		uint32_t v;
++		memcpy(&v, f->vdec_all + off, 4);
++		return v;
++	}
+ 	return f->win[win].value[off / 4u];
+ }
+ 
+ static void write_word(struct n2vc_hw_fake *f, unsigned win, uint32_t off, uint32_t v)
+ {
++	if (win == RWVC_WIN_VDEC_ALL) {
++		memcpy(f->vdec_all + off, &v, 4);
++		return;
++	}
+ 	f->win[win].value[off / 4u] = v;
+ }
+ 
++/* RWVC_WIN_VDEC_ALL's page -> block map (ABI rev 3; facts/VDEC_PROTOCOL.md section 4 and K02's per-window table). */
++static unsigned vdec_all_page_block(uint32_t page)
++{
++	if (page < 0x0du)
++		return RWVC_BLK_VDEC_CORE;
++	if (page == 0x0du)
++		return RWVC_BLK_VDEC_SOC;      /* larb5 */
++	if (page == 0x0eu)
++		return RWVC_BLK_VDEC_CORE;     /* larb6 */
++	if (page < 0x20u)
++		return RWVC_BLK_VDEC_SOC;      /* SOC_GCON + LAT */
++	return RWVC_BLK_VDEC_CORE;         /* VLD .. VDEC_SYS + larb4 */
++}
++
++/* the block a window word belongs to; RWVC_BLK_COUNT for an unknown window */
++static unsigned win_block(unsigned win, uint32_t off)
++{
++	if (win >= RWVC_WIN_COUNT)
++		return RWVC_BLK_COUNT;
++	if (win == RWVC_WIN_VDEC_ALL)
++		return vdec_all_page_block(off >> 12);
++	return WINS[win].block;
++}
++
++/* The kernel owns the larb configuration.  Same allow-list as the kernel (n2vc_vdec_allow[]): larb5 0x1600d00c and
++ * larb4 0x1602e00c bit 0 (SMI_LARB_SLP_CON, the vendor's sleep-protect handshake; opus-dec1/opus-dec2 host traces).
++ * A write to a listed word may only change the bits in its mask; every other larb word refuses a write. */
++static const struct { uint8_t page; uint32_t off, wmask; } LARB_ALLOW[] = {
++	{ 0x0du, 0x00cu, 0x00000001u },
++	{ 0x2eu, 0x00cu, 0x00000001u },
++};
++
++static int larb_write_refused(unsigned win, uint32_t off, uint32_t bits)
++{
++	uint32_t page;
++	unsigned i;
++
++	if (win != RWVC_WIN_VDEC_ALL)
++		return 0;
++	page = off >> 12;
++	if (page != 0x0du && page != 0x2eu)
++		return 0;
++	for (i = 0; i < sizeof LARB_ALLOW / sizeof LARB_ALLOW[0]; i++)
++		if (LARB_ALLOW[i].page == page && LARB_ALLOW[i].off == (off & 0xfffu))
++			return (bits & ~LARB_ALLOW[i].wmask) != 0;
++	return 1;
++}
++
+ static int find_read_rule(struct n2vc_hw_fake *f, unsigned win, uint32_t off, uint32_t *v)
+ {
+ 	unsigned i;
+@@ -272,7 +336,14 @@
+ 			recf(f, "SCRIPT error %s", f->err);
+ 			return -EINVAL;
+ 		}
+-		if (!block_on(f, WINS[r->awin].block)) {
++		if (larb_write_refused(r->awin, r->aoff, r->aval)) {
++			f->stats.violations++;
++			snprintf(f->err, sizeof f->err, "set target %s 0x%04x is a read-only larb word",
++				 WINS[r->awin].name, r->aoff);
++			recf(f, "SCRIPT error %s", f->err);
++			return -EACCES;
++		}
++		if (!block_on(f, win_block(r->awin, r->aoff))) {
+ 			f->stats.violations++;
+ 			snprintf(f->err, sizeof f->err, "set target %s is not powered",
+ 				 WINS[r->awin].name);
+@@ -354,14 +425,23 @@
+ 		rc = check_reg(o->window, o->offset);
+ 		if (rc != 0)
+ 			break;
+-		if (!block_on(f, WINS[o->window].block)) {
++		opc = o->op == RWVC_OP_READ ? 'R' :
++		      (o->op == RWVC_OP_WRITE || o->op == RWVC_OP_WRITE_MASK) ? 'W' : 'P';
++		if (!block_on(f, win_block(o->window, o->offset))) {
+ 			f->stats.violations++;
+-			opc = o->op == RWVC_OP_READ ? 'R' :
+-			      (o->op == RWVC_OP_WRITE || o->op == RWVC_OP_WRITE_MASK) ? 'W' : 'P';
+ 			recf(f, "%c %s 0x%04x EACCES", opc, WINS[o->window].name, o->offset);
+ 			rc = -EACCES;
+ 			break;
+ 		}
++		if ((o->op == RWVC_OP_WRITE || o->op == RWVC_OP_WRITE_MASK) &&
++		    larb_write_refused(o->window, o->offset,
++				       o->op == RWVC_OP_WRITE_MASK ? (o->value & o->mask) : o->value)) {
++			f->stats.violations++;
++			recf(f, "%c %s 0x%04x EACCES (kernel-owned larb word)",
++			     opc, WINS[o->window].name, o->offset);
++			rc = -EACCES;
++			break;
++		}
+ 		switch (o->op) {
+ 		case RWVC_OP_READ:
+ 			if (find_read_rule(f, o->window, o->offset, &v))
+@@ -626,6 +706,7 @@
+ 			free(f->dma[i].host);
+ 	if (f->rec)
+ 		fclose(f->rec);
++	free(f->vdec_all);
+ 	pthread_mutex_destroy(&f->lock);
+ 	free(f);
+ }
+@@ -949,7 +1030,13 @@
+ 	f = calloc(1, sizeof *f);
+ 	if (!f)
+ 		return -ENOMEM;
++	f->vdec_all = calloc(1, N2VC_FAKE_ALL_BYTES);
++	if (!f->vdec_all) {
++		free(f);
++		return -ENOMEM;
++	}
+ 	if (pthread_mutex_init(&f->lock, NULL) != 0) {
++		free(f->vdec_all);
+ 		free(f);
+ 		return -ENOMEM;
+ 	}

@@ -1,0 +1,51 @@
+--- a/bsd/dev/nord2_autotest.inc
++++ b/bsd/dev/nord2_autotest.inc
+@@ -26,6 +26,10 @@
+  *   7 hwcodec  (0298, nord2_hwcodec.inc) arg = step: 0 status, 1 VEN power + clocks, 2 larb7 + reset, 3 JPEG encode (r0 width,
+  *              r1 height, r2 quality code; r0 = 0: 640x480 Q90), 4 off. Result 1 = done, 16.. = what stopped it. After a good
+  *              encode the JPEG is on the picture channel: status word 10 (snap_info[2]) = its size (the "front after" byte reads 0x4a).
++ *              0312: step 4 is refused with result 30 while /dev/redwood-vcodec, /dev/redwood-jpeg or command 8 hold VEN.
++ *   8 vcodec   (0312, nord2_vcodec.inc n2vc_at_command) arg bits 0-7 = step: 0 status (read only), 1 VENC power + clocks + larb,
++ *              2 larb read-back + interrupt status, 3 VENC registers (r0 offset, r1 = 1 write r2 + read back + restore),
++ *              4 off; arg bit 8 = VENC core 1 too. Result 1 = done, 16.. = what stopped it (host tool gpu/hwcodec/tools/hwv.py).
+  * Packed pictures: a byte c, then c < 128: c + 1 pixels as they are; c >= 128: one pixel shown c - 126 times.
+  * The USB side only stores words and copies bytes; everything else runs on the thread.
+  */
+@@ -37,7 +41,7 @@
+ #define NAT_MAGIC   0x5441324eu     /* "N2AT" */
+ #define NAT_VERSION 2u
+ enum { NAT_USB_STATUS = 0x70, NAT_USB_REG = 0x71, NAT_USB_CMD = 0x72, NAT_USB_DATA = 0x73 };
+-enum { NAT_CMD_GESTURE = 1, NAT_CMD_KEY = 2, NAT_CMD_SNAP = 3, NAT_CMD_ABORT = 4, NAT_CMD_RESET = 5, NAT_CMD_LOGREWIND = 6, NAT_CMD_HWCODEC = 7 };
++enum { NAT_CMD_GESTURE = 1, NAT_CMD_KEY = 2, NAT_CMD_SNAP = 3, NAT_CMD_ABORT = 4, NAT_CMD_RESET = 5, NAT_CMD_LOGREWIND = 6, NAT_CMD_HWCODEC = 7, NAT_CMD_VCODEC = 8 };
+ extern int sync_internal(void);         /* bsd/vfs/vfs_syscalls.c */
+ enum { NAT_FINGER = 8, NAT_REGS = 16 };
+ 
+@@ -237,6 +241,10 @@
+ 	const uint8_t *jpeg = NULL;
+ 	uint32_t bytes = 0;
+ 	nat_put(&nat.snap_ready, 0);
++	if (step == 4 && n2vc_ven_refs() != 0) {                 /* 0312: n2j_off() would pull VEN from under the vcodec driver */
++		printf("NORD2 JPG: step 4 refused: VEN is held by the vcodec/jpeg drivers (%u references)\n", n2vc_ven_refs());
++		return 30;
++	}
+ 	uint32_t result = n2j_command(step, nat.job, &jpeg, &bytes);
+ 	if (jpeg != NULL && bytes) {
+ 		const uint32_t info[8] = {nat.job[0] ? nat.job[0] : 640, nat.job[0] ? nat.job[1] : 480, bytes, 1, 0, 0x4a, 0, 0};
+@@ -268,6 +276,7 @@
+ 		case NAT_CMD_RESET: if (nat.arg == 0x4642) { nat_reset(); } break;
+ 		case NAT_CMD_LOGREWIND: result = nat_log_rewind(nat.arg | nat.job[15] << 16); break;
+ 		case NAT_CMD_HWCODEC: result = nat_hwcodec(nat.arg); break;
++		case NAT_CMD_VCODEC: result = n2vc_at_command(nat.arg, nat.job); break;   /* 0312 */
+ 		default: break;
+ 		}
+ 		nat_put(&nat.result, result);
+@@ -316,7 +325,8 @@
+ 		if (value == NAT_CMD_ABORT) {
+ 			nat_put(&nat.abort, 1);
+ 			accepted = 1;
+-		} else if (((value >= NAT_CMD_GESTURE && value <= NAT_CMD_SNAP) || value == NAT_CMD_RESET || value == NAT_CMD_LOGREWIND || value == NAT_CMD_HWCODEC) && !nat_get(&nat.pending)) {
++		} else if (((value >= NAT_CMD_GESTURE && value <= NAT_CMD_SNAP) || value == NAT_CMD_RESET || value == NAT_CMD_LOGREWIND || value == NAT_CMD_HWCODEC ||
++		            value == NAT_CMD_VCODEC) && !nat_get(&nat.pending)) {
+ 			for (unsigned i = 0; i < NAT_REGS; i++) { nat.job[i] = nat_get(&nat.reg[i]); }
+ 			nat.cmd = value; nat.arg = index;
+ 			nat.token++;

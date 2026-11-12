@@ -1,0 +1,168 @@
+--- a/kern/bsd/dev/nord2_vcodec.inc
++++ b/kern/bsd/dev/nord2_vcodec.inc
+@@ -115,6 +115,18 @@
+ 
+ #define N2VC_NONE 0xffu
+ 
++/* ABI rev 3 (2026-11-11, DEC07): RWVC_WIN_VDEC_ALL = 12, 0x16000000+0x30000, block per 4 KiB page.  The tree's
++ * include/redwood_vcodec.h is still rev 2 while this patch waits for hw-lead, so the constant and the window count are
++ * supplied here when it is absent; with rev 3 in place the two definitions collapse to the header's and only N2VC_WIN_N
++ * remains (then delete the #ifndef block and put RWVC_WIN_COUNT back). */
++#ifndef RWVC_WIN_VDEC_ALL
++#define RWVC_WIN_VDEC_ALL 12u
++#define N2VC_WIN_N 13u
++#else
++#define N2VC_WIN_N RWVC_WIN_COUNT
++#endif
++#define N2VC_BLK_PER_PAGE 0xfeu       /* n2vc_wins[].blk: the block comes from the per-page table, not the window */
++
+ /* ---- per-block tables ------------------------------------------------------------------------------------------ */
+ struct n2vc_win { uint32_t pa, bytes; uint8_t blk; };
+ struct n2vc_gate { uint16_t set_off, clr_off, sta_off; uint8_t bit; };
+@@ -133,7 +145,7 @@
+ 	uint8_t mdp_smi;              /* its larb hangs off the MDP SMI common (needs the MDP domain), else the DISP one */
+ };
+ 
+-static const struct n2vc_win n2vc_wins[RWVC_WIN_COUNT] = {
++static const struct n2vc_win n2vc_wins[N2VC_WIN_N] = {
+ 	[RWVC_WIN_VENC]          = { 0x17020000u, 0x3000u, RWVC_BLK_VENC },   /* vpud maps 0x3000; JPGENC starts at 0x17030000 */
+ 	[RWVC_WIN_VENC_C1]       = { 0x17820000u, 0x3000u, RWVC_BLK_VENC_C1 },
+ 	[RWVC_WIN_VDEC_SYS]      = { 0x1602f000u, 0x1000u, RWVC_BLK_VDEC_CORE },
+@@ -146,6 +158,7 @@
+ 	[RWVC_WIN_VDEC_LAT_VLD]  = { 0x16011000u, 0x0400u, RWVC_BLK_VDEC_SOC },
+ 	[RWVC_WIN_VDEC_RACING]   = { 0x16004000u, 0x1000u, RWVC_BLK_VDEC_CORE },
+ 	[RWVC_WIN_VDEC_SOC_GCON] = { 0x1600f000u, 0x1000u, RWVC_BLK_VDEC_SOC },
++	[RWVC_WIN_VDEC_ALL]      = { 0x16000000u, 0x30000u, N2VC_BLK_PER_PAGE },
+ };
+ 
+ /* smi_conf.h mt6885: smi_larb7_init_pair :247-276, smi_larb8_init_pair :277-305, smi_larb4 :220-232, smi_larb5 :234-243 */
+@@ -765,13 +778,103 @@
+ }
+ 
+ /* ---- ioctls ---------------------------------------------------------------------------------------------------- */
++/*
++ * RWVC_WIN_VDEC_ALL (ABI rev 3, DEC07): one 0x30000 window over the vendor decoder's mapping of 0x16000000, with the
++ * power block decided per 4 KiB page.  48 pages, from facts/VDEC_PROTOCOL.md section 4 and the sources it cites
++ * (mt6893.dts:6281-6292, mtk_vcodec_dec_pm.c:154-288, clk-mt6885-vde.c):
++ *
++ *   0x00-0x0c  VDEC_CORE  VDEC_BASE 0x16000000 (+0x800 UFO), the vendor's 0x16001000/0x16002000/0x16003800,
++ *                         VDEC_RACING_CTRL 0x16004000.  K02's separate VDEC_BASE/VDEC_RACING windows already require
++ *                         VDEC_CORE for these registers.
++ *   0x0d       VDEC_SOC   larb5 0x1600d000: kernel-owned, read-only (allow-list below).
++ *   0x0e       VDEC_CORE  larb6 0x1600e000 (mt6893.dts:6051, zero ports, never programmed here, so writable).
++ *   0x0f-0x1f  VDEC_SOC   VDEC_SOC_GCON 0x1600f000, VDEC_LAT_MISC 0x16010000, VDEC_LAT_VLD 0x16011000 and the vendor's
++ *                         LAT sub-blocks 0x16011800-0x16018800 (mt6893.dts:6283-6292; clk-mt6885-vde.c:214-232).
++ *   0x20-0x2d  VDEC_CORE  VDEC_VLD 0x16020000, VDEC_MC 0x16021000, AVC_VLD 0x16022000, VDEC_MV 0x16023000, PP
++ *                         0x16024000, VDEC_MISC 0x16025000-0x16028fff, 0x16029000 (mt6893.dts:6283-6292).
++ *   0x2e       VDEC_CORE  larb4 0x1602e000: kernel-owned, read-only (allow-list below).
++ *   0x2f       VDEC_CORE  VDEC_SYS 0x1602f000.
++ *
++ * The core's clock-on path enables MT_CG_SOC (the VDE gate block) and MT_CG_VDEC0 (mtk_vcodec_dec_pm.c:160-170), which
++ * n2vc_blocks[] expresses as VDEC_CORE's hidden reference on VDEC_SOC: a core page needs both domains, so mapping the
++ * base/racing/unknown low pages to the core cannot widen anything the separate windows allow today.
++ */
++#define N2VC_VDEC_PAGES (0x30000u / 4096u)
++static uint8_t
++n2vc_vdec_page_blk(uint32_t page)
++{
++	if (page < 0x0du) { return RWVC_BLK_VDEC_CORE; }
++	if (page == 0x0du) { return RWVC_BLK_VDEC_SOC; }     /* larb5 */
++	if (page == 0x0eu) { return RWVC_BLK_VDEC_CORE; }    /* larb6 */
++	if (page < 0x20u) { return RWVC_BLK_VDEC_SOC; }      /* SOC_GCON + LAT_* */
++	return RWVC_BLK_VDEC_CORE;                           /* VLD .. VDEC_SYS, larb4 */
++}
++
++/*
++ * Writes to the two kernel-owned larb pages are refused unless the exact word is listed here.  n2vc_larb_on() programs
++ * larb4/larb5 itself, so a client may only change the bits the vendor's sleep-protect handshake needs:
++ *   - larb5 0x1600d00c (page 0x0d, offset 0x00c) is SMI_LARB_SLP_CON; opus-dec1's host frame trace has the vendor
++ *     writing bit 0 there and polling bit 16 (vdec_hal_wait_larb_sleep_protect / release_larb_sleep_protect), so a flat
++ *     read-only rule would break the first frame.  A listed word accepts a write, but only the bits in `wmask` change
++ *     (the write is executed as a masked write); the other bits keep their hardware value, so a read-modify-write by the
++ *     client cannot clobber them.
++ *   - larb4 0x1602e000: no write seen yet (DEC02's facts/vdec_trace/PAGES.md is the measurement); nothing allowed.
++ * An unknown offset is refused, never silently allowed.
++ */
++struct n2vc_vdec_allow { uint8_t page; uint32_t off, wmask; };
++static const struct n2vc_vdec_allow n2vc_vdec_allow[] = {
++	{ 0x0du, 0x00cu, 0x00000001u },     /* larb5 SMI_LARB_SLP_CON bit 0 (sleep protect) */
++};
++static const unsigned n2vc_vdec_allow_n = sizeof(n2vc_vdec_allow) / sizeof(n2vc_vdec_allow[0]);
++
++/* the listed word for this page offset, or NULL; `off` is the offset inside the 4 KiB page */
++static const struct n2vc_vdec_allow *
++n2vc_vdec_allow_find(uint32_t page, uint32_t off)
++{
++	for (unsigned i = 0; i < n2vc_vdec_allow_n; i++) {
++		if (n2vc_vdec_allow[i].page == page && n2vc_vdec_allow[i].off == off) { return &n2vc_vdec_allow[i]; }
++	}
++	return NULL;
++}
++
++/* the bits a write may change at this window offset (0xffffffff = not a restricted larb word) */
++static uint32_t
++n2vc_vdec_op_wmask(const struct rwvc_reg_op *o)
++{
++	const struct n2vc_win *w = &n2vc_wins[o->window];
++	if (w->blk != N2VC_BLK_PER_PAGE) { return 0xffffffffu; }
++	uint32_t page = o->offset >> 12;
++	if (page != 0x0du && page != 0x2eu) { return 0xffffffffu; }
++	const struct n2vc_vdec_allow *a = n2vc_vdec_allow_find(page, o->offset & 0xfffu);
++	return a ? a->wmask : 0xffffffffu;
++}
++
++/* the block that must be powered for this op, and the read-only refusal of RWVC_WIN_VDEC_ALL's larb pages */
++static int
++n2vc_op_block(const struct rwvc_reg_op *o, unsigned *blk)
++{
++	const struct n2vc_win *w = &n2vc_wins[o->window];
++	if (w->blk != N2VC_BLK_PER_PAGE) { *blk = w->blk; return 0; }
++	uint32_t page = o->offset >> 12;
++	if (page >= N2VC_VDEC_PAGES) { return EINVAL; }      /* not reached: the window is 0x30000 bytes and 4-aligned */
++	*blk = n2vc_vdec_page_blk(page);
++	if ((o->op == RWVC_OP_WRITE || o->op == RWVC_OP_WRITE_MASK) &&
++	    (page == 0x0du || page == 0x2eu) &&
++	    !n2vc_vdec_allow_find(page, o->offset & 0xfffu)) {
++		return EACCES;
++	}
++	return 0;
++}
++
+ static int
+ n2vc_op_window(const struct rwvc_reg_op *o, unsigned *win, vm_offset_t *base, uint32_t *off)
+ {
+-	if (o->window >= RWVC_WIN_COUNT) { return EINVAL; }
++	if (o->window >= N2VC_WIN_N) { return EINVAL; }
+ 	if (o->offset & 3u) { return EINVAL; }
+ 	if (o->offset > n2vc_wins[o->window].bytes - 4u) { return EINVAL; }
+-	unsigned blk = n2vc_wins[o->window].blk;
++	unsigned blk = 0;
++	int err = n2vc_op_block(o, &blk);
++	if (err) { return err; }
+ 	if (!n2vc.on[blk]) { return EACCES; }
+ 	vm_offset_t va = n2vc_pa(n2vc_wins[o->window].pa, n2vc_wins[o->window].bytes, 1);
+ 	if (!va) { return ENXIO; }
+@@ -809,6 +912,13 @@
+ 				err = n2vc_op_window(o, &win, &base, &off);
+ 				if (err) { (void)n2vc_copyout(ops, uaddr, n * (uint32_t)sizeof(struct rwvc_reg_op)); b->out_done = done; return err; }
+ 				(void)win;
++				if (o->op == RWVC_OP_WRITE || o->op == RWVC_OP_WRITE_MASK) {
++					uint32_t wm = n2vc_vdec_op_wmask(o);
++					if (wm != 0xffffffffu) {       /* SMI_LARB_SLP_CON: only the allow-listed bits change */
++						o->mask = (o->op == RWVC_OP_WRITE_MASK ? o->mask : 0xffffffffu) & wm;
++						o->op = RWVC_OP_WRITE_MASK;
++					}
++				}
+ 				if (o->op == RWVC_OP_READ) { o->value = ni_rd(base, off); }
+ 				else if (o->op == RWVC_OP_WRITE) { ni_wr(base, off, o->value); }
+ 				else if (o->op == RWVC_OP_WRITE_MASK) { ni_mask(base, off, o->mask, o->value); }
+@@ -829,7 +939,8 @@
+ 							b->out_done = done;
+ 							return ENXIO;
+ 						}
+-						if (!n2vc.on[n2vc_wins[o->window].blk]) {
++						unsigned rblk = 0;
++						if (n2vc_op_block(o, &rblk) != 0 || !n2vc.on[rblk]) {
+ 							(void)n2vc_copyout(ops, uaddr, n * (uint32_t)sizeof(struct rwvc_reg_op));
+ 							b->out_done = done;
+ 							return EACCES;
