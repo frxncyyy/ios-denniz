@@ -1,0 +1,411 @@
+Only in camera-userland-20261112-ae2: ae2.diff
+diff -ru --exclude out camera-userland-20261112-gpuauto2/run_tests.sh camera-userland-20261112-ae2/run_tests.sh
+--- camera-userland-20261112-gpuauto2/run_tests.sh	2026-11-12 10:46:29.030388824 +0100
++++ camera-userland-20261112-ae2/run_tests.sh	2026-11-12 19:10:38.070129295 +0100
+@@ -42,3 +42,6 @@
+ FRAMEMEM=1 "$T/t_mode"
+ $CC -O1 -g -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined -fno-sanitize-recover=undefined -I "$HERE/src" -o "$T/t_zerocopy" "$HERE/test/t_zerocopy.c" "$HERE/src/rwcam_render.c" "$HERE/src/camera_isp.c" -lm -lpthread
+ "$T/t_zerocopy"
++# (ae2) AE against a simulated sensor (header/effect delays, the statistics' age, a lamp in and out of the top 1 %, the mains): no limit cycle
++$CC -O2 -g -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined -fno-sanitize-recover=undefined -I "$HERE/src" -o "$T/t_aesim" "$HERE/test/t_aesim.c" "$HERE/src/camera_isp.c" -lm
++"$T/t_aesim" -check | tail -1
+diff -ru --exclude out camera-userland-20261112-gpuauto2/src/camera_isp.c camera-userland-20261112-ae2/src/camera_isp.c
+--- camera-userland-20261112-gpuauto2/src/camera_isp.c	2026-11-11 12:53:45.729025147 +0100
++++ camera-userland-20261112-ae2/src/camera_isp.c	2026-11-12 19:12:16.988931922 +0100
+@@ -28,7 +28,7 @@
+ 	isp->flicker_ns = 10000000;     /* 50 Hz mains: a hundred half-waves a second */
+ 	isp->aim = isp->hidden_aim = 1;
+ 	isp->wb[0] = isp->wb[1] = isp->wb[2] = 1;
+-	isp->digital = 1;
++	isp->digital = isp->digital_next = 1;
+ 	/* a Sony phone sensor's gains in daylight and in a warm lamp's light, roughly (none of the three sensors' own are known: no calibration) */
+ 	isp->wb_day[0] = 2.0f; isp->wb_day[1] = 1.7f;
+ 	isp->wb_warm[0] = 1.3f; isp->wb_warm[1] = 2.9f;
+@@ -180,10 +180,29 @@
+ }
+ 
+ /*
+- * Green's mean towards 15 % of white, unless that would put 1 % of the picture into white. The
+- * exposure, longest first: the frame's lines at the shortest frame, then gain to 16x, then frames up
+- * to max_frame_lines, then gain to the most; beyond that, digital gain (up to 4x).
++ * (ae2) Green's mean towards 15 % of white (less, down to a half, when part of the picture is white: a lamp, a window). The exposure, longest
++ * first: the frame's lines at the shortest frame, then gain to ISP_AE_GAIN_FIRST, then frames up to max_frame_lines, then gain to the most;
++ * beyond that, digital gain (up to ISP_AE_DIGITAL_MOST).
++ *
++ * Run lm6 (a desk lamp, the camera moved a little; IMG_0065.MOV: luma 48..133, a new level every 3-4 frames, period 20-25 frames). Two
++ * causes (t_aesim reproduces both, test/t_aesim.c):
++ *   - the levels AE went by were older than the exposure it believed they had: the GPU's statistics are of a frame or two before (made after
++ *     AE has run on a frame), given with the NEWEST frame's header, so the frames "settled" after a change were often still the old exposure's
++ *     and AE corrected the same error twice (overshoot, then back: a staircase). The core now gives the statistics' own frame (sequence,
++ *     lines, gain); a frame AE has seen already is no news;
++ *   - the highlights' rule was all or nothing: the brightest 1 % at 95 % of white halved the target at once, under it the full target came
++ *     back; a lamp that is 1 % of the picture give or take (the camera moves) threw the exposure x2 / x0.5 to and fro.
++ * Now: the target's share by how much of the picture is white (0.2 % .. 2 %: 1 .. 0.5), smoothed over about a second; after a change and its settling, three
++ * frames' levels averaged when near (the mains' beat at 30 and 60 a second is 3 frames); a deadband (into it within 4 %, out of it at 10 %);
++ * steps of 60 % of the error in the log (85 % when far), x2.2 up and x0.45 down at the most.
+  */
++#define AE_IN           0.04    /* (ln) into "where it should be" within 4 % ... */
++#define AE_OUT          0.10    /* ... out of it only 10 % off */
++#define AE_FAR          0.47    /* (ln 1.6) further: a step at once, no averaging, 85 % of the error */
++#define AE_UP           0.79    /* (ln 2.2) the largest step up */
++#define AE_DOWN         (-0.80) /* (ln 0.45) and down */
++#define AE_FLICKER_HOLD 900     /* frames (30 s at 30 a second) the exposure keeps to the mains' period once their beat was seen under it */
++
+ bool isp_ae_again(const struct isp *isp, struct redwood_camera_command *c);
+ 
+ bool
+@@ -194,21 +213,17 @@
+ 	    f->exposure_lines == 0) {
+ 		return false;
+ 	}
+-	double now = (double)f->exposure_lines * f->gain / f->gain_unity * isp->digital, ratio, want;
+-	double target = 0.15 * white_of(f), mean = s->mean[1] * isp->digital > 0.5 ? s->mean[1] * isp->digital : 0.5;
+-	double bright = s->bright * isp->digital;
+-	uint32_t fast = f->frame_lines_min - f->margin, longest = isp->max_frame_lines ? isp->max_frame_lines : 2 * f->frame_lines_min;
+-	longest = f->frame_lines_max >= f->frame_lines_min && longest > f->frame_lines_max ? f->frame_lines_max : longest;
+-	uint32_t lines, gain, frame_lines = 0;
+-	double digital = 1;
+-
++	if (f->sequence != 0 && f->sequence <= isp->ae_seq && isp->ae_seq - f->sequence < 16) {
++		return false;                   /* (the levels of a frame seen already, or of one before it: the GPU's after the processor's) */
++	}
++	isp->ae_seq = f->sequence;
+ 	if (isp->asked && (f->exposure_lines != isp->asked_lines || f->gain != isp->asked_gain)) {
+ 		/*
+ 		 * The last change is not in the frames yet. That is two or three frames normally; but a kernel that started its session anew
+-		 * (run q10ha: after every "no frame for 3 s") has its sensor back at the exposure it starts with and will never show what was
+-		 * asked: waiting for ever left AE dead from the first restart on. So: asked again after 3 frames and after 6, and after 9
+-		 * forgotten -- AE goes on from what the frames do have.
++		 * (run q10ha) has its sensor back at the exposure it starts with and will never show what was asked: asked again after 3 frames
++		 * and after 6, and after 9 forgotten -- AE goes on from what the frames do have.
+ 		 */
++		isp->ae_n = 0;
+ 		isp->asked_waits++;
+ 		if (isp->asked_waits == 3 || isp->asked_waits == 6) {
+ 			return isp_ae_again(isp, c);
+@@ -216,78 +231,104 @@
+ 		if (isp->asked_waits < 9) {
+ 			return false;
+ 		}
+-		isp->settled = ISP_AE_SETTLE;   /* (forgotten: what the frames have is what there is) */
++		isp->settled = ISP_AE_SETTLE;
++		isp->digital = isp->digital_next;
+ 	} else if (isp->asked && isp->settled < ISP_AE_SETTLE) {
+-		/*
+-		 * Run q10ht: the exposure changed 40 to 110 times in 150 frames and the lights "flickered a lot". The kernel's header has the new
+-		 * exposure and gain as soon as it has written the sensor's registers (KERNEL_ABI_DUAL.md), and the sensor takes them a frame or
+-		 * two after that: the first frames that say the new exposure were taken with the old one, and AE, correcting again by them, went
+-		 * past the mark every time. Their levels are not believed until ISP_AE_SETTLE frames have had it.
+-		 */
++		/* (run q10ht) the first frames whose header has the new exposure were taken with the old one: not believed */
+ 		isp->settled++;
+ 		isp->asked_waits = 0;
++		isp->ae_n = 0;
++		isp->digital = isp->digital_next;       /* (the pictures' digital gain changes with the sensor's, not frames before) */
+ 		return false;
+ 	}
+ 	isp->asked_waits = 0;
+-	/* (the measured levels are the sensor's: digital gain is applied to the picture only) */
+-	ratio = target / mean;
+-	if (bright > 0) {
+-		/*
+-		 * The brightest 1 % kept under white, by up to half of the exposure. When they ARE white (a lamp, a window: how far over nobody
+-		 * knows) that is the half at once. Until run q10hw it was a tenth less at a time, which the wide camera, shown from the start,
+-		 * walked all the way down, and the ultra-wide one -- at its target from the levels of the kernel's headers while hidden, and
+-		 * "where it should be" within an eighth when shown -- never began: the same scene twice as bright at 0.5x.
+-		 */
+-		if (bright >= 0.95 * white_of(f)) {
+-			ratio = target / mean * 0.5;
+-		} else if (bright * ratio > 0.9 * white_of(f)) {
+-			ratio = 0.9 * white_of(f) / bright > target / mean * 0.5 ? 0.9 * white_of(f) / bright : target / mean * 0.5;
+-		}
+-		isp->aim = (float)(ratio * mean / target < 0.5 ? 0.5 : ratio * mean / target > 1 ? 1 : ratio * mean / target);
+-	} else if (isp->hidden_aim >= 0.5f && isp->hidden_aim < 1) {
+-		ratio *= isp->hidden_aim;
+-	}
+-	ratio = ratio < 0.25 ? 0.25 : ratio > 4 ? 4 : ratio;
+-	/* (once it is where it should be it stays until the light is an eighth off; on its way there, until it is a twentieth off) */
+-	if (ratio > (isp->steady ? 0.88 : 0.95) && ratio < (isp->steady ? 1.13 : 1.05)) {
++
++	double white = white_of(f), dig = isp->digital > 0 ? isp->digital : 1;
++	double now = (double)f->exposure_lines * f->gain / f->gain_unity * dig, target = 0.15 * white;
++	double period = isp->flicker_ns != 0 && f->line_ns != 0 ? (double)isp->flicker_ns / f->line_ns : 0;
++	double sum = 0, lo = 1e9, hi = 0, mean, want;
++	uint32_t k;
++
++	isp->ae_m[isp->ae_n % 3] = (float)s->mean[1];
++	isp->ae_n++;
++	k = isp->ae_n < 3 ? isp->ae_n : 3;
++	for (uint32_t i = 0; i < k; i++) {
++		sum += isp->ae_m[i];
++		lo = isp->ae_m[i] < lo ? isp->ae_m[i] : lo;
++		hi = isp->ae_m[i] > hi ? isp->ae_m[i] : hi;
++	}
++	mean = sum / k * dig;
++	mean = mean > 0.5 ? mean : 0.5;
++	/* the mains: under one period, the same exposure three frames, the level up and down by more than 6 % of it (moving a lot is that too) */
++	if (k == 3 && period >= 4 && f->exposure_lines + 2 < period && sum > 24 && (hi - lo) * 3 > 0.06 * sum) {
++		isp->flicker_hold = AE_FLICKER_HOLD;
++	} else if (isp->flicker_hold != 0) {
++		isp->flicker_hold--;
++	}
++
++	/* the target's share: by the share of the picture at white (0.2 % .. 2 % of the cells: 1 .. 0.5), and the brightest 1 % kept under 90 % */
++	if (s->bright > 0) {
++		uint32_t at_white = 0;
++		double aim;
++
++		for (int b = 63; b >= 0 && b * 16 + 8 >= 0.95 * white; b--) {
++			at_white += s->hist[b];
++		}
++		/* (levels without their histogram -- made up ones: by the brightest 1 % alone) */
++		double share = s->cells != 0 ? (double)at_white / s->cells : s->bright >= 0.95 * white ? 1 : 0;
++		aim = share <= 0.002 ? 1 : share >= 0.02 ? 0.5 : 1 - 0.5 * (share - 0.002) / 0.018;
++		if (s->bright < 0.95 * white) {
++			double cap = 0.9 * white / (s->bright * dig) * mean / target;       /* (the aim that puts the brightest 1 % at 90 %) */
++
++			aim = cap < aim ? cap : aim;
++		}
++		aim = aim < 0.5 ? 0.5 : aim;
++		isp->aim += 0.08f * ((float)aim - isp->aim);    /* (a lamp coming and going in the picture: no jumps; about a second) */
++	} else {
++		isp->aim = isp->hidden_aim >= 0.5f && isp->hidden_aim <= 1 ? isp->hidden_aim : 1;
++	}
++
++	bool white_out = mean >= 0.85 * white;                  /* (most of it white: how far over nobody knows) */
++	double e = log(target * isp->aim / mean), d;
++
++	if (!white_out && __builtin_fabs(e) < AE_FAR && k < 3) {
++		return false;                   /* (near: three frames' levels first) */
++	}
++	if (!white_out && __builtin_fabs(e) < (isp->steady ? AE_OUT : AE_IN)) {
+ 		isp->steady = true;
+ 		return false;
+ 	}
+ 	isp->steady = false;
+-	want = now * pow(ratio, mean < 2 ? 0.7 : 0.85);
++	d = white_out ? AE_DOWN : (__builtin_fabs(e) > AE_FAR ? 0.85 : 0.6) * e;
++	d = d > AE_UP ? AE_UP : d < AE_DOWN ? AE_DOWN : d;
++	want = now * exp(d);
++
++	uint32_t lines, gain, frame_lines = 0;
++	double digital = 1, floor_digital = 1;
+ 	{
+-		/*
+-		 * The exposure time first, the gain for the rest. A lamp on the mains is bright and dark a hundred times a second (50 Hz): an
+-		 * exposure that is not a whole number of those 10 ms catches another part of the wave in every frame (and, the sensor's shutter
+-		 * rolling, in every line: bands) -- the picture's level goes up and down and AE runs after it. So the time is a whole multiple of
+-		 * flicker_ns whenever what is wanted is at least one (under it, in strong light, it cannot be), and the gain makes up the rest.
+-		 */
+-		double period = isp->flicker_ns != 0 && f->line_ns != 0 ? (double)isp->flicker_ns / f->line_ns : 0, most = (double)f->gain_max / f->gain_unity;
+-		/*
+-		 * In the dark (run q10hz: "a great deal of noise ... I do not mind the viewfinder's frames a second going down"; the logs had
+-		 * 30 ms x 64 x 4): the time before the gain. One frame's time; then gain up to ISP_AE_GAIN_FIRST; then longer frames, as long as
+-		 * the caller lets them be (max_frame_lines: the frames a second go down); only then more gain, to ISP_AE_GAIN_MOST at the most (a
+-		 * sensor's last stops of gain are mostly noise), and a little digital gain (ISP_AE_DIGITAL_MOST). Darker than that is darker.
+-		 * Once the frames are long they stay so until a third less light than brought them there would do (no going to and fro).
+-		 */
++		double most = (double)f->gain_max / f->gain_unity;
++		uint32_t fast = f->frame_lines_min - f->margin, longest = isp->max_frame_lines ? isp->max_frame_lines : 2 * f->frame_lines_min;
++
++		longest = f->frame_lines_max >= f->frame_lines_min && longest > f->frame_lines_max ? f->frame_lines_max : longest;
++		/* (run q10hz) in the dark: one frame's time, gain to ISP_AE_GAIN_FIRST, longer frames, more gain to ISP_AE_GAIN_MOST, digital */
+ 		bool long_now = f->frame_lines > f->frame_lines_min + 8;
+ 		double long_gain = long_now ? ISP_AE_GAIN_FIRST * 0.7 : ISP_AE_GAIN_FIRST, limit = fast, time, g;
+ 
+ 		most = most > ISP_AE_GAIN_MOST ? ISP_AE_GAIN_MOST : most;
+ 		long_gain = long_gain > most ? most : long_gain;
+-
+ 		/*
+-		 * Run q10hv: "it flickers only when I point it straight at the lamp: dark bands that move" -- 0.3 ms x 1.0 in that run's log. The
+-		 * lamp's own brightness (the top 1 % of the levels) took the exposure far under one period of the mains, where every line catches
+-		 * another part of the lamp's wave. So one period is the least there is (the lamp itself is then white, as it is to any camera),
+-		 * unless the WHOLE picture would be more than half way to white with it -- daylight, which does not flicker; and once under the
+-		 * period it stays there until the picture would be a third of the way to white at most (no going to and fro between the two).
++		 * (run q10hv) the mains: one period at least, unless the whole picture would be more than half way to white with it (daylight; a
++		 * third once under it) -- or, once the mains' beat was seen under it, unless it would be all but white (then a little digital gain
++		 * under 1, to 0.75, takes the level down instead of a shorter time).
+ 		 */
+-		if (period >= 4 && want < period && f->exposure_lines != 0 && f->gain != 0) {
+-			double at_period = s->mean[1] * period * f->gain_unity / ((double)f->exposure_lines * f->gain);
++		if (period >= 4 && want < period) {
++			double at_period = mean * period / now;
+ 			bool under_now = (double)f->exposure_lines + 2 < period;
++			double most_at = isp->flicker_hold ? 0.85 : under_now ? 0.33 : 0.5;
+ 
+-			if (at_period <= (under_now ? 0.33 : 0.5) * white_of(f)) {
++			if (at_period <= most_at * white) {
++				floor_digital = isp->flicker_hold ? want / period : 1;
++				floor_digital = floor_digital < 0.75 ? 0.75 : floor_digital;
+ 				want = period;
+ 			}
+ 		}
+@@ -299,8 +340,7 @@
+ 		if (period >= 4 && want >= period) {
+ 			double n = (double)(uint64_t)(time / period);
+ 
+-
+-			time = n >= 1 ? n * period : time;
++			time = n >= 1 ? n * period : time;      /* (a whole number of the mains' periods; the gain makes up the rest) */
+ 		}
+ 		lines = time < 4 ? 4 : (uint32_t)(time + 0.5);
+ 		frame_lines = lines > fast ? lines + f->margin : 0;
+@@ -311,21 +351,28 @@
+ 			digital = digital > ISP_AE_DIGITAL_MOST ? ISP_AE_DIGITAL_MOST : digital;
+ 			g = most;
+ 		}
++		digital = floor_digital < 1 ? floor_digital : digital;
+ 		gain = (uint32_t)(g * f->gain_unity + 0.5);
+ 	}
+-	isp->digital = (float)digital;
+ 	if (isp->asked && lines == isp->asked_lines && gain == isp->asked_gain && frame_lines == isp->asked_frame_lines) {
++		isp->digital = isp->digital_next = (float)digital;     /* (nothing for the sensor: the digital gain alone, now) */
+ 		if (f->exposure_lines == lines && f->gain == gain) {
+-			return false;           /* (nothing the sensor does not have already) */
++			return false;
+ 		}
+ 		isp->settled = 0;
+ 		return isp_ae_again(isp, c);    /* (what was asked and never came: asked again) */
+ 	}
++	if (!isp->asked && lines == f->exposure_lines && gain == f->gain) {
++		isp->digital = isp->digital_next = (float)digital;
++		return false;
++	}
++	isp->digital_next = (float)digital;
+ 	isp->asked_lines = lines;
+ 	isp->asked_gain = gain;
+ 	isp->asked_frame_lines = frame_lines;
+ 	isp->asked = true;
+ 	isp->settled = 0;
++	isp->ae_n = 0;
+ 	memset(c, 0, sizeof(*c));
+ 	c->command = REDWOOD_CAMERA_EXPOSURE;
+ 	c->a = lines;
+diff -ru --exclude out camera-userland-20261112-gpuauto2/src/camera_isp.h camera-userland-20261112-ae2/src/camera_isp.h
+--- camera-userland-20261112-gpuauto2/src/camera_isp.h	2026-11-11 12:53:45.730454971 +0100
++++ camera-userland-20261112-ae2/src/camera_isp.h	2026-11-12 19:03:39.503476310 +0100
+@@ -127,6 +127,18 @@
+ 	 * come without their brightest 1 % (a hidden camera's, from the kernel's header): the other back camera's, which sees the same lamps.
+ 	 */
+ 	float           aim, hidden_aim;
++	/*
++	 * (ae2, run lm6: "the lights flicker badly in strong light" -- IMG_0065.MOV, luma 48..133 in steps every 3-4 frames, period 20-25 frames)
++	 * ae_seq: the frame whose levels AE had last (the GPU's statistics of a frame seen already are not news); ae_m: the levels of the last three
++	 * frames since the exposure settled (averaged: the mains' beat repeats every 3 frames at 30 and at 60 a second); flicker_hold: frames
++	 * left in which the exposure keeps to one period of the mains (their beat was seen under it); digital_next: the digital gain of the last
++	 * command, put into the pictures when the sensor has the command, not before.
++	 */
++	uint64_t        ae_seq;
++	float           ae_m[3];
++	uint32_t        ae_n;
++	uint32_t        flicker_hold;
++	float           digital_next;
+ };
+ #define ISP_AE_GAIN_FIRST       4.0     /* the gain at which frames get longer, when they may */
+ #define ISP_AE_GAIN_MOST        16.0    /* the most analog gain asked of a sensor, whatever it would take */
+diff -ru --exclude out camera-userland-20261112-gpuauto2/src/rwcam_core.c camera-userland-20261112-ae2/src/rwcam_core.c
+--- camera-userland-20261112-gpuauto2/src/rwcam_core.c	2026-11-12 14:18:01.580310789 +0100
++++ camera-userland-20261112-ae2/src/rwcam_core.c	2026-11-12 19:08:56.497289151 +0100
+@@ -271,6 +271,7 @@
+ struct gpu_stats {
+ 	uint64_t seq;                   /* the frame's number (0: none yet) */
+ 	uint32_t fw, fh, w, h, step;
++	uint32_t lines, gain, frame_lines;      /* (ae2) the exposure that frame's header had: AE goes by the levels WITH it */
+ 	struct isp_stats st;
+ 	float edges[GS_BLOCKS], light[GS_BLOCKS], n[GS_BLOCKS];
+ };
+@@ -332,6 +333,9 @@
+ 		}
+ 	}
+ 	g->seq = f->sequence;
++	g->lines = f->exposure_lines;
++	g->gain = f->gain;
++	g->frame_lines = f->frame_lines;
+ 	g->fw = f->width;
+ 	g->fh = f->height;
+ 	g->w = w;
+@@ -342,7 +346,7 @@
+ 
+ /* (q10jo) the GPU's statistics for frame f of camera cam, when there are recent ones of a frame of the same size: true and *st */
+ static bool
+-gs_take(int cam, const struct redwood_camera_frame *f, struct isp_stats *st)
++gs_take(int cam, const struct redwood_camera_frame *f, struct isp_stats *st, struct redwood_camera_frame *of)
+ {
+ 	bool ok = false;
+ 
+@@ -357,6 +361,12 @@
+ 
+ 	if (g != NULL && g->seq != 0 && g->seq <= f->sequence && f->sequence - g->seq <= 3 && g->fw == f->width && g->fh == f->height) {
+ 		*st = g->st;
++		/* (ae2) and the header of the frame they are of: its number and exposure, not the newest frame's (run lm6: the staircase) */
++		*of = *f;
++		of->sequence = g->seq;
++		of->exposure_lines = g->lines;
++		of->gain = g->gain;
++		of->frame_lines = g->frame_lines;
+ 		ok = true;
+ 	}
+ 	pthread_mutex_unlock(&gs_lock);
+@@ -1383,7 +1393,8 @@
+ 			hidden_count++;
+ 		}
+ 		/* (q10jo) the GPU's numbers of a frame or two before when its pictures make them, else the processor's measure */
+-		bool gpu_st = !hidden && gs_take(cam, f, &st);
++		struct redwood_camera_frame st_of;     /* (ae2) the frame the levels are of: f, or the GPU's frame of a frame or two before */
++		bool gpu_st = !hidden && gs_take(cam, f, &st, &st_of);
+ 
+ 		if (gpu_st) {
+ 			w.gpu_stats++;
+@@ -1450,7 +1461,8 @@
+ 				by = &spot;
+ 			}
+ 		}
+-		bool ae = !ae_locked && isp_ae(&C.isp[cam], f, by, &c);
++		/* (ae2) by the GPU's levels with THEIR frame's exposure; a spot is measured on this frame */
++		bool ae = !ae_locked && isp_ae(&C.isp[cam], gpu_st && by == &st ? &st_of : f, by, &c);
+ 
+ 		if (ae) {
+ 			(void)C.ops.write_dev(fd, &c, sizeof(c));
+diff -ru --exclude out camera-userland-20261112-gpuauto2/src/rwcam_device.c camera-userland-20261112-ae2/src/rwcam_device.c
+--- camera-userland-20261112-gpuauto2/src/rwcam_device.c	2026-11-12 14:18:01.572296260 +0100
++++ camera-userland-20261112-ae2/src/rwcam_device.c	2026-11-12 19:16:08.726432926 +0100
+@@ -1284,7 +1284,7 @@
+ 	struct rwcam_renderer render;           /* (the still thread's own: a GPU context is one thread's at a time) */
+ 	pthread_t       thread;
+ 	volatile bool   on_thread;
+-} still = { .render = { .name = "StillImage" } };
++} still;        /* (ae2: zero, in __bss -- its renderer's name is given before the first picture: the package's __data had crossed a page) */
+ 
+ #define PIECES_THREADS          4
+ static int pieces_all = -1;
+@@ -1454,6 +1454,7 @@
+ 	pthread_setname_np("redwood-camstill");
+ 	still.thread = pthread_self();
+ 	still.on_thread = true;
++	still.render.name = "StillImage";
+ 	(void)rwcam_render(&still.render, &still.isp, f, still.copy + f->header_bytes, &pic, STILL_PIECES);
+ 	still.on_thread = false;
+ 	if (!pic.mapped) {
+Only in camera-userland-20261112-ae2/test: t_aesim.c
+diff -ru --exclude out camera-userland-20261112-gpuauto2/test/t_isp.c camera-userland-20261112-ae2/test/t_isp.c
+--- camera-userland-20261112-gpuauto2/test/t_isp.c	2026-11-11 12:53:45.731653783 +0100
++++ camera-userland-20261112-ae2/test/t_isp.c	2026-11-12 19:09:34.815940391 +0100
+@@ -399,6 +399,7 @@
+ 		CHECK(isp_ae(&isp, f, &st, &first));
+ 		for (int n = 1; n <= 9; n++) {          /* the frames keep the exposure the sensor started with */
+ 			memset(&c, 0, sizeof(c));
++			f->sequence++;                  /* (ae2: a frame AE has seen already is no news; these are new frames) */
+ 			if (isp_ae(&isp, f, &st, &c)) {
+ 				if (n == 3 || n == 6) {
+ 					again += c.a == first.a && c.b == first.b && c.c == first.c;
+@@ -413,8 +414,10 @@
+ 		/* and frames that do have what was asked: AE goes on once ISP_AE_SETTLE of them have been seen (the first ones were taken with the old exposure) */
+ 		f->exposure_lines = isp.asked_lines; f->gain = isp.asked_gain;
+ 		for (int n = 0; n < ISP_AE_SETTLE; n++) {
++			f->sequence++;
+ 			CHECK(!isp_ae(&isp, f, &st, &c));
+ 		}
++		f->sequence++;
+ 		(void)isp_ae(&isp, f, &st, &c);         /* (a command if there is more to ask than the sensor's limits have given already) */
+ 		CHECK(isp.asked_waits == 0 && isp.settled <= ISP_AE_SETTLE);
+ 		free(f);
