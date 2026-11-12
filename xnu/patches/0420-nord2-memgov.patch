@@ -1,0 +1,446 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -182,6 +182,8 @@
+ 
+ #include "kern_exec_internal.h"
+ 
++static void nord2_memgov_start_once(void);      /* 0420 */
++
+ extern boolean_t vm_darkwake_mode;
+ 
+ /* enable crash reports on various exec failures */
+@@ -5100,6 +5102,7 @@
+ 	int err;
+ 
+ 	memoryshot(VM_EXECVE, DBG_FUNC_NONE);
++	nord2_memgov_start_once();      /* 0420: the first execve is launchd's (load_init_program) */
+ 
+ 	muap.fname = uap->fname;
+ 	muap.argp = uap->argp;
+@@ -8023,3 +8026,203 @@
+ }
+ 
+ EXPERIMENT_FACTOR_PROC(_kern, libmalloc_experiments, CTLTYPE_QUAD | CTLFLAG_RW, 0, 0, &sysctl_libmalloc_experiments, "A", "");
++
++/*
++ * ---------------------------------------------------------------- 0420 (memgov-20261113): NORD2 MEMGOV (policy: nord2_memgov.h)
++ * A kernel thread, started by the first execve (launchd), samples free + pageable external pages every 250 ms.  Under the low mark it
++ * kicks the SweetSurface purge pass (0417/0418); under the critical mark it picks the lowest-band victim and, in mode 2 only, kills it
++ * through memorystatus_kill_on_zone_map_exhaustion(pid) (the non-jetsam kern_memorystatus.c's one exported kill-by-pid path:
++ * memorystatus_kill_specific_process -> P_MEMSTAT_TERMINATED, snapshot, exit_with_reason(SIGKILL), compactor).  Mode 1 (default) logs
++ * "NORD2 MEMGOV would kill ..." instead.  The candidate walk holds proc_list_lock (memstat_bucket lists); the kill runs unlocked.
++ */
++#include "nord2_memgov.h"
++
++extern unsigned int vm_page_free_count, vm_page_pageable_external_count, vm_page_purgeable_count, vm_page_wire_count;
++extern unsigned long gPhysSize;
++extern void sweet_surface_purge_kick_memgov(void);      /* SweetSurface.cpp (0420) */
++
++static int n2mg_mode = N2MG_LOG;
++static int n2mg_low_pm = N2MG_DEF_LOW_PM;
++static int n2mg_crit_pm = N2MG_DEF_CRIT_PM;
++static int n2mg_maxband = N2MG_DEF_MAXBAND;
++static uint32_t n2mg_kills, n2mg_would, n2mg_kicks, n2mg_kill_failed;
++static uint32_t n2mg_started;
++SYSCTL_INT(_kern, OID_AUTO, n2memgov, CTLFLAG_RW | CTLFLAG_LOCKED, &n2mg_mode, 0, "NORD2 MEMGOV: 0 off, 1 log only, 2 kill");
++SYSCTL_INT(_kern, OID_AUTO, n2memgov_low, CTLFLAG_RW | CTLFLAG_LOCKED, &n2mg_low_pm, 0, "NORD2 MEMGOV: purge mark, permille of RAM");
++SYSCTL_INT(_kern, OID_AUTO, n2memgov_crit, CTLFLAG_RW | CTLFLAG_LOCKED, &n2mg_crit_pm, 0, "NORD2 MEMGOV: kill mark, permille of RAM");
++SYSCTL_INT(_kern, OID_AUTO, n2memgov_maxband, CTLFLAG_RW | CTLFLAG_LOCKED, &n2mg_maxband, 0, "NORD2 MEMGOV: highest victim band (< 100)");
++SYSCTL_UINT(_kern, OID_AUTO, n2memgov_kills, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mg_kills, 0, "NORD2 MEMGOV: processes killed");
++SYSCTL_UINT(_kern, OID_AUTO, n2memgov_would, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mg_would, 0, "NORD2 MEMGOV: victims chosen in log-only mode");
++
++struct n2mg_pick {
++	int32_t  pid, band;
++	uint64_t footprint;
++	uint32_t eligible, why[N2MG_NREASONS];
++	char     name[MAXCOMLEN * 2 + 1];
++};
++
++static uint64_t
++n2mg_now_ms(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000ull;
++}
++
++static uint32_t
++n2mg_sample(void)
++{
++	return n2mg_avail(vm_page_free_count, vm_page_pageable_external_count);
++}
++
++/* The best victim in bands 0..maxband (memstat_bucket order), under proc_list_lock.  pick->pid 0 = none. */
++static void
++n2mg_choose(int32_t maxband, struct n2mg_pick *pick)
++{
++	unsigned int b = 0;
++	struct n2mg_cand best = { .pid = 0 };
++	bzero(pick, sizeof(*pick));
++	proc_list_lock();
++	for (proc_t p = memorystatus_get_first_proc_locked(&b, TRUE); p != NULL; p = memorystatus_get_next_proc_locked(&b, p, TRUE)) {
++		if ((int32_t)b > maxband || b >= N2MG_BAND_FOREGROUND) {
++			break;
++		}
++		task_t t = proc_task(p);
++		struct n2mg_cand c = {
++			.pid = proc_getpid(p),
++			.band = p->p_memstat_effectivepriority,
++			.memstat_state = p->p_memstat_state,
++			.system_or_exiting = (p->p_flag & P_SYSTEM) != 0 || (p->p_lflag & (P_LEXIT | P_LPEXIT)) != 0 || t == TASK_NULL,
++			.footprint = 0,
++			.name = proc_best_name(p),
++		};
++		uint32_t v = n2mg_verdict(&c, maxband);
++		pick->why[v]++;
++		if (v != N2MG_OK) {
++			continue;
++		}
++		pick->eligible++;
++		c.footprint = get_task_phys_footprint(t);
++		if (best.pid == 0 || n2mg_better(&c, &best)) {
++			best = c;
++			strlcpy(pick->name, c.name, sizeof(pick->name));
++		}
++	}
++	proc_list_unlock();
++	pick->pid = best.pid;
++	pick->band = best.band;
++	pick->footprint = best.footprint;
++}
++
++/* Same pid, same name, still in an eligible band: the pid was not recycled between the walk and the kill. */
++static bool
++n2mg_still_same(const struct n2mg_pick *pick, int32_t maxband)
++{
++	bool same = false;
++	proc_t p = proc_find(pick->pid);
++	if (p != PROC_NULL) {
++		same = strncmp(proc_best_name(p), pick->name, sizeof(pick->name)) == 0 && p->p_memstat_effectivepriority <= maxband &&
++		    p->p_memstat_effectivepriority < N2MG_BAND_FOREGROUND && (p->p_memstat_state & N2MG_ST_EXCLUDE) == 0;
++		proc_rele(p);
++	}
++	return same;
++}
++
++static void
++n2mg_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	struct n2mg_limits lim;
++	struct n2mg_pick pick;
++	uint32_t crit_run = 0, last_low_pm = 0, last_crit_pm = 0;
++	uint64_t last_kill_ms = 0, last_kick_ms = 0, last_line_ms = 0, last_would_ms = 0;
++	int32_t last_would_pid = 0;
++	/* after a kill: A again 1 s later */
++	int32_t after_pid = 0;
++	uint32_t after_a = 0;
++	uint64_t after_ms = 0;
++	uint64_t ram = gPhysSize != 0 ? (uint64_t)gPhysSize : max_mem;
++	int chan = 0;
++
++	for (;;) {
++		int mode = n2mg_mode;
++		if ((uint32_t)n2mg_low_pm != last_low_pm || (uint32_t)n2mg_crit_pm != last_crit_pm || last_low_pm == 0) {
++			last_low_pm = (uint32_t)n2mg_low_pm;
++			last_crit_pm = (uint32_t)n2mg_crit_pm;
++			n2mg_limits_for(ram, (uint32_t)PAGE_SIZE, last_low_pm, last_crit_pm, &lim);
++			printf("NORD2 MEMGOV: mode %d (kern.n2memgov 0 off/1 log/2 kill), RAM %llu MiB = %u pages; purge kick under %u pages "
++			    "(kern.n2memgov_low %d permille), victim under %u pages (kern.n2memgov_crit %d permille), bands <= %d, one per %u ms\n",
++			    mode, ram >> 20, lim.pages, lim.low, n2mg_low_pm, lim.crit, n2mg_crit_pm, n2mg_maxband, N2MG_KILL_GAP_MS);
++		}
++		if (mode != N2MG_OFF) {
++			uint64_t now = n2mg_now_ms();
++			uint32_t a = n2mg_sample();
++			int level = n2mg_level(a, &lim);
++			int32_t maxband = n2mg_maxband;
++
++			if (after_pid != 0 && now - after_ms >= 1000) {
++				printf("NORD2 MEMGOV: after killing pid=%d: A %u -> %u pages (%+d)\n", after_pid, after_a, a, (int)(a - after_a));
++				after_pid = 0;
++			}
++			if (level != N2MG_LEVEL_OK && now - last_kick_ms >= 1000) {
++				last_kick_ms = now;
++				n2mg_kicks++;
++				sweet_surface_purge_kick_memgov();
++			}
++			if (level != N2MG_LEVEL_OK && now - last_line_ms >= 10000) {
++				last_line_ms = now;
++				printf("NORD2 MEMGOV: A=%u pages (free %u + pageable ext %u; purgeable %u, wired %u) level %s low %u crit %u; kicks %u "
++				    "would %u kills %u failed %u\n", a, vm_page_free_count, vm_page_pageable_external_count, vm_page_purgeable_count,
++				    vm_page_wire_count, level == N2MG_LEVEL_CRIT ? "CRIT" : "low", lim.low, lim.crit, n2mg_kicks, n2mg_would, n2mg_kills,
++				    n2mg_kill_failed);
++			}
++			if (n2mg_should_pick(level, &crit_run, now, last_kill_ms, (uint32_t)(now / 1000))) {
++				last_kill_ms = now;
++				n2mg_choose(maxband, &pick);
++				if (pick.pid == 0) {
++					printf("NORD2 MEMGOV: A=%u < crit %u but no victim in bands <= %d (skipped: pid %u band %u state %u system %u name %u)\n",
++					    a, lim.crit, maxband, pick.why[N2MG_NO_PID], pick.why[N2MG_NO_BAND], pick.why[N2MG_NO_STATE],
++					    pick.why[N2MG_NO_SYSTEM], pick.why[N2MG_NO_NAME]);
++				} else if (mode == N2MG_LOG) {
++					n2mg_would++;
++					if (pick.pid != last_would_pid || now - last_would_ms >= 30000) {
++						last_would_pid = pick.pid;
++						last_would_ms = now;
++						printf("NORD2 MEMGOV would kill band=%d pid=%d name=%s footprint=%llu MiB A=%u crit=%u (eligible %u; skipped: "
++						    "state %u system %u name %u) (kern.n2memgov=2 to act)\n", pick.band, pick.pid, pick.name, pick.footprint >> 20,
++						    a, lim.crit, pick.eligible, pick.why[N2MG_NO_STATE], pick.why[N2MG_NO_SYSTEM], pick.why[N2MG_NO_NAME]);
++					}
++				} else if (!n2mg_still_same(&pick, maxband)) {
++					printf("NORD2 MEMGOV: victim pid=%d name=%s changed before the kill; skipped\n", pick.pid, pick.name);
++				} else {
++					boolean_t ok = memorystatus_kill_on_zone_map_exhaustion(pick.pid);
++					if (ok) {
++						n2mg_kills++;
++						after_pid = pick.pid;
++						after_a = a;
++						after_ms = now;
++					} else {
++						n2mg_kill_failed++;
++					}
++					printf("NORD2 MEMGOV killed band=%d pid=%d name=%s footprint=%llu MiB A=%u crit=%u %s (kills %u)\n", pick.band, pick.pid,
++					    pick.name, pick.footprint >> 20, a, lim.crit, ok ? "ok" : "FAILED", n2mg_kills);
++				}
++			}
++		}
++		(void)tsleep((caddr_t)&chan, PVM, "n2memgov", (hz * (int)N2MG_PERIOD_MS + 999) / 1000);
++	}
++}
++
++static void
++nord2_memgov_start_once(void)
++{
++	thread_t th = THREAD_NULL;
++	if (!OSCompareAndSwap(0, 1, &n2mg_started)) {
++		return;
++	}
++	if (kernel_thread_start(n2mg_thread, NULL, &th) != KERN_SUCCESS) {
++		printf("NORD2 MEMGOV: thread not started\n");
++		return;
++	}
++	thread_set_thread_name(th, "nord2_memgov");
++	thread_deallocate(th);
++}
+--- /dev/null
++++ b/bsd/kern/nord2_memgov.h
+@@ -0,0 +1,165 @@
++/*
++ * 0420 (memgov-20261113): NORD2 MEMGOV, a low-memory governor for a kernel without jetsam.  SPDX-License-Identifier: MIT
++ *
++ * Why (Fable memory study, findings 1/2/4, plan step 1.2a): our XNU is built without CONFIG_JETSAM, so kern_memorystatus.c is the
++ * non-jetsam variant (max_kill_priority = IDLE, no memorystatus_pages_update, no page-shortage kills); the compressor runs mode 4
++ * (swap) but swap files cannot be created ("Failed to open swap file 2"), and pressure notes reach SpringBoard only.  Nothing frees
++ * memory when pages run out: the system thrashes on file-backed pages instead.  The memorystatus bands ARE kept (runningboardd's
++ * MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES is compiled in, memstat_bucket[] / p_memstat_effectivepriority are maintained), so a
++ * governor can pick victims the way jetsam would: lowest band first.
++ *
++ * Every 250 ms: A = free + pageable external pages (the jetsam formula with dynamic paging; speculative pages are already counted in
++ * vm_page_pageable_external_count, purgeable pages are logged but not counted, as in VM_CHECK_MEMORYSTATUS with the compressor on).
++ *   A < low  (kern.n2memgov_low  permille of RAM, default 200): kick the SweetSurface purge pass (0417/0418) now.
++ *   A < crit (kern.n2memgov_crit permille of RAM, default 120) for 2 samples in a row: one victim, at most every 2 s, from the lowest
++ *            band <= kern.n2memgov_maxband (default 30 = BACKGROUND), biggest footprint first in that band.  Never: pid <= 1,
++ *            P_MEMSTAT_INTERNAL / TERMINATED / LOCKED / ERROR / SKIP, P_SYSTEM, exiting procs, the protected names below.
++ * kern.n2memgov: 0 off, 1 log only ("NORD2 MEMGOV would kill band=.. pid=.. name=..") = default, 2 kill.
++ *
++ * Pure: no kernel headers; shared by kern_exec.c and memgov-20261113/test/memgov_host_test.c.
++ */
++#ifndef NORD2_MEMGOV_H
++#define NORD2_MEMGOV_H
++/* (uint*_t / int*_t / bool come from the includer) */
++
++enum { N2MG_OFF = 0, N2MG_LOG = 1, N2MG_ACT = 2 };
++enum { N2MG_LEVEL_OK = 0, N2MG_LEVEL_LOW = 1, N2MG_LEVEL_CRIT = 2 };
++
++#define N2MG_PERIOD_MS          250u
++#define N2MG_KILL_GAP_MS        2000u   /* one victim per 2 s at most */
++#define N2MG_CRIT_SAMPLES       2u      /* A under crit this many samples in a row before a victim is chosen */
++#define N2MG_BOOT_GRACE_S       90u     /* no victims in the first 90 s of uptime (boot surge, launchd still spawning) */
++#define N2MG_DEF_LOW_PM         200u
++#define N2MG_DEF_CRIT_PM        120u
++#define N2MG_DEF_MAXBAND        30      /* JETSAM_PRIORITY_BACKGROUND */
++#define N2MG_BAND_FOREGROUND    100     /* JETSAM_PRIORITY_FOREGROUND: never, whatever maxband says */
++
++/* p_memstat_state bits that exclude a process (kern_memorystatus.h values, repeated for the host test) */
++#define N2MG_ST_ERROR           0x00000008u     /* P_MEMSTAT_ERROR */
++#define N2MG_ST_LOCKED          0x00000010u     /* P_MEMSTAT_LOCKED */
++#define N2MG_ST_TERMINATED      0x00000020u     /* P_MEMSTAT_TERMINATED */
++#define N2MG_ST_INTERNAL        0x00001000u     /* P_MEMSTAT_INTERNAL (launchd, kernel: system critical) */
++#define N2MG_ST_SKIP            0x00080000u     /* P_MEMSTAT_SKIP */
++#define N2MG_ST_EXCLUDE         (N2MG_ST_ERROR | N2MG_ST_LOCKED | N2MG_ST_TERMINATED | N2MG_ST_INTERNAL | N2MG_ST_SKIP)
++
++enum {
++	N2MG_OK = 0,
++	N2MG_NO_PID,            /* pid <= 1 (kernel_task, launchd) */
++	N2MG_NO_BAND,           /* band over maxband, or >= FOREGROUND */
++	N2MG_NO_STATE,          /* memstat state excludes it (internal/critical, terminating, locked, error, skip) */
++	N2MG_NO_SYSTEM,         /* P_SYSTEM or exiting */
++	N2MG_NO_NAME,           /* protected name */
++	N2MG_NREASONS
++};
++
++/* Names never killed, whatever their band (p_name / p_comm, exact match). */
++static const char *const n2mg_protected[] = {
++	"kernel_task", "launchd", "SpringBoard", "backboardd", "mediaserverd", "runningboardd", "logd", "configd", "notifyd",
++	"securityd", "cfprefsd", "UserEventAgent", "powerd", "thermalmonitord", "lockdownd", "CommCenter", "wifid", "locationd",
++	"fseventsd", "containermanagerd", "keybagd", "audiomxd", "assertiond", "FrontBoard", "PineBoard", "watchdogd", "syslogd",
++	"aggregated", "mobileassetd",
++};
++
++static inline bool
++n2mg_streq(const char *a, const char *b)
++{
++	while (*a != 0 && *a == *b) {
++		a++;
++		b++;
++	}
++	return *a == *b;
++}
++
++static inline bool
++n2mg_name_protected(const char *name)
++{
++	if (name == 0 || name[0] == 0) {
++		return true;    /* unknown: keep */
++	}
++	for (unsigned i = 0; i < sizeof(n2mg_protected) / sizeof(n2mg_protected[0]); i++) {
++		if (n2mg_streq(name, n2mg_protected[i])) {
++			return true;
++		}
++	}
++	return false;
++}
++
++struct n2mg_limits {
++	uint32_t pages, low, crit;      /* RAM pages, thresholds in pages */
++};
++
++/* Thresholds from the RAM size (gPhysSize) and the permille sysctls; crit is clamped under low, both to [1, 900] permille. */
++static inline void
++n2mg_limits_for(uint64_t ram_bytes, uint32_t page_bytes, uint32_t low_pm, uint32_t crit_pm, struct n2mg_limits *l)
++{
++	uint64_t pages = page_bytes ? ram_bytes / page_bytes : 0;
++	if (low_pm == 0 || low_pm > 900) low_pm = N2MG_DEF_LOW_PM;
++	if (crit_pm == 0 || crit_pm > 900) crit_pm = N2MG_DEF_CRIT_PM;
++	if (crit_pm > low_pm) crit_pm = low_pm;
++	l->pages = (uint32_t)pages;
++	l->low = (uint32_t)(pages * low_pm / 1000);
++	l->crit = (uint32_t)(pages * crit_pm / 1000);
++}
++
++static inline uint32_t
++n2mg_avail(uint32_t free_pages, uint32_t pageable_ext)
++{
++	uint64_t a = (uint64_t)free_pages + pageable_ext;
++	return a > 0xffffffffu ? 0xffffffffu : (uint32_t)a;
++}
++
++static inline int
++n2mg_level(uint32_t avail, const struct n2mg_limits *l)
++{
++	if (avail < l->crit) return N2MG_LEVEL_CRIT;
++	if (avail < l->low) return N2MG_LEVEL_LOW;
++	return N2MG_LEVEL_OK;
++}
++
++struct n2mg_cand {
++	int32_t  pid, band;
++	uint32_t memstat_state;
++	bool     system_or_exiting;
++	uint64_t footprint;
++	const char *name;
++};
++
++static inline uint32_t
++n2mg_verdict(const struct n2mg_cand *c, int32_t maxband)
++{
++	if (c->pid <= 1) return N2MG_NO_PID;
++	if (maxband >= N2MG_BAND_FOREGROUND) maxband = N2MG_BAND_FOREGROUND - 1;
++	if (c->band < 0 || c->band > maxband) return N2MG_NO_BAND;
++	if (c->memstat_state & N2MG_ST_EXCLUDE) return N2MG_NO_STATE;
++	if (c->system_or_exiting) return N2MG_NO_SYSTEM;
++	if (n2mg_name_protected(c->name)) return N2MG_NO_NAME;
++	return N2MG_OK;
++}
++
++/* true = a is the better victim: lower band first, then the bigger footprint, then the higher pid (younger). */
++static inline bool
++n2mg_better(const struct n2mg_cand *a, const struct n2mg_cand *b)
++{
++	if (a->band != b->band) return a->band < b->band;
++	if (a->footprint != b->footprint) return a->footprint > b->footprint;
++	return a->pid > b->pid;
++}
++
++/*
++ * One 250 ms sample.  Returns true when a victim should be chosen now.  *crit_run counts consecutive samples under crit;
++ * last_kill_ms 0 = never.
++ */
++static inline bool
++n2mg_should_pick(int level, uint32_t *crit_run, uint64_t now_ms, uint64_t last_kill_ms, uint32_t uptime_s)
++{
++	if (level != N2MG_LEVEL_CRIT) {
++		*crit_run = 0;
++		return false;
++	}
++	if (*crit_run < 0xffffffffu) (*crit_run)++;
++	if (*crit_run < N2MG_CRIT_SAMPLES) return false;
++	if (uptime_s < N2MG_BOOT_GRACE_S) return false;
++	if (last_kill_ms != 0 && now_ms - last_kill_ms < N2MG_KILL_GAP_MS) return false;
++	return true;
++}
++#endif /* NORD2_MEMGOV_H */
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1254,6 +1254,9 @@
+ static IOBufferMemoryDescriptor *sweet_purge_sink;                              /* set once in IOCoreSurfaceRoot::start */
+ static uint64_t      sweet_purge_sink_len;
+ static thread_call_t sweet_purge_tc, sweet_purge_kick_tc;
++static thread_call_t sweet_purge_memgov_tc;                    /* 0420: kicked by NORD2 MEMGOV (kern_exec.c) */
++static uint32_t      sweet_purge_memgov_pending;
++extern "C" void sweet_surface_purge_kick_memgov(void);     /* 0420: called by kern_exec.c */
+ static uint32_t      sweet_purge_kick_pending;
+ static uint64_t      sweet_mem_create_pass_ns;
+ static uint32_t      sweet_mem_log_at, sweet_mem_told_refuse, sweet_mem_told_gpu, sweet_purge_told;
+@@ -1749,13 +1752,16 @@
+ sweet_purge_tick(thread_call_param_t p0, thread_call_param_t)
+ {
+ 	bool periodic = p0 == NULL;
+-	if (!periodic) {
++	bool memgov = p0 == (thread_call_param_t)2;    /* 0420 */
++	if (memgov) {
++		__atomic_store_n(&sweet_purge_memgov_pending, 0u, __ATOMIC_RELEASE);
++	} else if (!periodic) {
+ 		__atomic_store_n(&sweet_purge_kick_pending, 0u, __ATOMIC_RELEASE);
+ 	}
+ 	if (sweet_pool_evict_lock != NULL && sweet_surface_lock != NULL) {
+ 		uint64_t goal = sweet_mem_goal(0);
+ 		IOLockLock(sweet_pool_evict_lock);
+-		(void)sweet_purge_pass_locked(goal, 0, periodic ? "pressure" : "gpu budget");
++		(void)sweet_purge_pass_locked(goal, 0, periodic ? "pressure" : memgov ? "memgov" : "gpu budget");
+ 		IOLockUnlock(sweet_pool_evict_lock);
+ 	}
+ 	if (!periodic) {
+@@ -1771,6 +1777,15 @@
+ 	thread_call_enter_delayed(sweet_purge_tc, dl);
+ }
+ 
++/* 0420: NORD2 MEMGOV (kern_exec.c) under its low mark, at most once a second: one purge pass now (kern.n2surf_purge still decides). */
++extern "C" void
++sweet_surface_purge_kick_memgov(void)
++{
++	if (sweet_purge_memgov_tc != NULL && __atomic_exchange_n(&sweet_purge_memgov_pending, 1u, __ATOMIC_ACQ_REL) == 0) {
++		thread_call_enter(sweet_purge_memgov_tc);
++	}
++}
++
+ static void
+ sweet_purge_start(void)
+ {
+@@ -1808,6 +1823,7 @@
+ 	}
+ 	sweet_purge_tc = thread_call_allocate(sweet_purge_tick, NULL);
+ 	sweet_purge_kick_tc = thread_call_allocate(sweet_purge_tick, (thread_call_param_t)1);
++	sweet_purge_memgov_tc = thread_call_allocate(sweet_purge_tick, (thread_call_param_t)2);
+ 	IOLog("NORD2 MEM SURF: purge mode %d (kern.n2surf_purge / n2sp), sink %llu MiB, pressure: surfaces > %u MiB or available < %u pages, idle %u s; "
+ 	    "budgets: surfaces + GPU private %u MiB (kern.n2mem_budget_mib / n2mb), per process %u MiB, surfaces %llu MiB\n", sweet_purge_mode,
+ 	    sweet_purge_sink_len >> 20, sweet_purge_thr_mib, sweet_purge_avail_min, sweet_purge_idle_s, sweet_mem_budget_mib, sweet_surf_proc_mib,

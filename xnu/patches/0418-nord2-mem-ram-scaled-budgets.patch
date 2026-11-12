@@ -1,0 +1,290 @@
+--- a/bsd/dev/nord2_gpu_transport.h
++++ b/bsd/dev/nord2_gpu_transport.h
+@@ -225,16 +225,15 @@
+  * memory (kern.n2mem_budget, SweetSurface.cpp sweet_mem_gpu_private_ok), which also
+  * records the GPU's private total for the surface side and the NORD2 MEM SURF line. */
+ #if defined(KERNEL) && defined(__cplusplus)
+-extern "C" bool sweet_mem_gpu_private_ok(uint64_t total_private, uint64_t rounded);
++extern "C" bool sweet_mem_gpu_private_ok3(uint64_t total_private, uint64_t rounded, uint64_t limit);
+ #endif
+ static inline bool nord2_gpu_global_private_ok(uint64_t total_private,
+                                                uint64_t rounded,
+                                                uint64_t limit)
+ {
+ #if defined(KERNEL) && defined(__cplusplus)
+-        if (!(total_private <= limit && rounded <= limit - total_private))
+-                return false;
+-        return sweet_mem_gpu_private_ok(total_private, rounded);
++        /* 0418: the cap (max of this limit and 40 % of RAM) and the low-memory floor are decided there */
++        return sweet_mem_gpu_private_ok3(total_private, rounded, limit);
+ #else
+         return total_private <= limit && rounded <= limit - total_private;
+ #endif
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -94,7 +94,9 @@
+  * 1536 MiB was reached by the Photos application and the camera together (run user2: 1438 creations refused with
+  * kIOReturnNoMemory, of every size). 2048 MiB of the 3776 MiB the kernel is given; each refusal now says what is held, by whom.
+  */
+-#define SWEET_SURFACE_WIRED_MAX         (2048ull << 20)
++/* 0418: 55 % of the RAM window (2048 MiB = 54 % of 3776 before; 2798 MiB at 5088), set in IOCoreSurfaceRoot::start (sweet_purge_start) */
++static uint32_t      sweet_surf_cap_mib = 2048;
++#define SWEET_SURFACE_WIRED_MAX         ((uint64_t)__atomic_load_n(&sweet_surf_cap_mib, __ATOMIC_RELAXED) << 20)
+ static int32_t       sweet_surface_owner[SWEET_SURFACE_MAX_ID];     /* pid that put the surface in the table */
+ static uint32_t      sweet_surface_buffers;     /* buffer surfaces alive (in the table or only held by a port / the kernel) */
+ static uint64_t      sweet_surface_refused, sweet_surface_report_ns;
+@@ -221,6 +223,10 @@
+ static uint32_t      sweet_purge_idle_s = 3;                    /* not created / swapped for this long */
+ static uint32_t      sweet_mem_budget_mib = 2240;               /* kern.n2mem_budget_mib (boot-arg n2mb): surfaces + GPU private, 0 off */
+ static uint32_t      sweet_surf_proc_mib = 896;                 /* kern.n2surf_proc_mib: wired surface bytes one process may make, 0 off */
++/* 0418: every value above is now derived from the RAM window at start (sweet_mem_policy_for); n2mem_budget_mib is only a purge mark;
++ * refusals need available pages under kern.n2mem_floor (or a hard cap: surfaces 55 %, GPU 40 %, one process 60 % of RAM) */
++static uint32_t      sweet_mem_floor = 18000;                   /* kern.n2mem_floor: available pages under which allocations are refused */
++static uint32_t      sweet_gpu_cap_mib = 1536;                  /* kern.n2mem_gpu_cap_mib: GPU private cap (max with Nord2GPU's own limit) */
+ static uint32_t      sweet_purge_n, sweet_unpurge_n, sweet_purge_failed, sweet_unpurge_failed, sweet_purge_passes, sweet_purge_remap_bad;
+ static uint32_t      sweet_purged_live, sweet_purge_given, sweet_purge_npend;
+ static uint64_t      sweet_purged_bytes, sweet_purge_pend_bytes;
+@@ -235,6 +241,9 @@
+ SYSCTL_UINT(_kern, OID_AUTO, n2surf_purge_idle, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_purge_idle_s, 0, "0417: s without a swap before a volatile surface may go");
+ SYSCTL_UINT(_kern, OID_AUTO, n2mem_budget_mib, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_mem_budget_mib, 0, "0417: one budget for surfaces + GPU private (MiB, 0 off)");
+ SYSCTL_UINT(_kern, OID_AUTO, n2surf_proc_mib, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_surf_proc_mib, 0, "0417: surface MiB one process may make (0 off)");
++SYSCTL_UINT(_kern, OID_AUTO, n2mem_floor, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_mem_floor, 0, "0418: available pages under which allocations are refused");
++SYSCTL_UINT(_kern, OID_AUTO, n2mem_gpu_cap_mib, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_gpu_cap_mib, 0, "0418: GPU private cap MiB");
++SYSCTL_UINT(_kern, OID_AUTO, n2surf_cap_mib, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_surf_cap_mib, 0, "0418: surface wired cap MiB");
+ SYSCTL_UINT(_kern, OID_AUTO, n2surf_purged, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_purge_n, 0, "0417: surfaces purged");
+ SYSCTL_UINT(_kern, OID_AUTO, n2surf_unpurged, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_unpurge_n, 0, "0417: purged surfaces made non-volatile again");
+ static bool sweet_mem_admit(uint32_t size, int32_t pid);
+@@ -242,7 +251,7 @@
+ static void sweet_mem_proc_charge(int32_t pid, int64_t delta);
+ static uintptr_t sweet_purge_sink_kva(void);
+ static void sweet_purge_start(void);
+-extern "C" bool sweet_mem_gpu_private_ok(uint64_t total_private, uint64_t rounded);     /* called by nord2_gpu_transport.h */
++extern "C" bool sweet_mem_gpu_private_ok3(uint64_t total_private, uint64_t rounded, uint64_t limit);     /* called by nord2_gpu_transport.h */
+ 
+ static void
+ sweet_pool_args(void)
+@@ -1530,6 +1539,19 @@
+ 	return done;
+ }
+ 
++/* 0418: the live policy (sysctl-tunable values); caps of the surfaces are applied through SWEET_SURFACE_WIRED_MAX */
++static void
++sweet_mem_policy_now(struct sweet_mem_policy *p)
++{
++	p->surf_cap = SWEET_SURFACE_WIRED_MAX;
++	p->gpu_cap = (uint64_t)__atomic_load_n(&sweet_gpu_cap_mib, __ATOMIC_RELAXED) << 20;
++	p->proc_cap = (uint64_t)__atomic_load_n(&sweet_surf_proc_mib, __ATOMIC_RELAXED) << 20;
++	p->purge_thr = (uint64_t)__atomic_load_n(&sweet_purge_thr_mib, __ATOMIC_RELAXED) << 20;
++	p->combined_purge = (uint64_t)__atomic_load_n(&sweet_mem_budget_mib, __ATOMIC_RELAXED) << 20;
++	p->avail_high = __atomic_load_n(&sweet_purge_avail_min, __ATOMIC_RELAXED);
++	p->avail_floor = __atomic_load_n(&sweet_mem_floor, __ATOMIC_RELAXED);
++}
++
+ static uint64_t
+ sweet_mem_goal(uint64_t need)
+ {
+@@ -1550,11 +1572,9 @@
+ 		return true;
+ 	}
+ 	uint32_t size = s->allocSize;
+-	uint64_t limit = (uint64_t)__atomic_load_n(&sweet_mem_budget_mib, __ATOMIC_RELAXED) << 20;
+ 	for (int attempt = 0; attempt < 2; attempt++) {
+ 		bool fits = __atomic_load_n(&sweet_surface_wired, __ATOMIC_RELAXED) + size <= SWEET_SURFACE_WIRED_MAX &&
+-		    sweet_mem_combined_ok(__atomic_load_n(&sweet_surface_wired, __ATOMIC_RELAXED), __atomic_load_n(&sweet_mem_gpu_private, __ATOMIC_RELAXED),
+-		    size, limit);
++		    memorystatus_available_pages >= __atomic_load_n(&sweet_mem_floor, __ATOMIC_RELAXED);      /* 0418 */
+ 		if (fits || attempt == 1) {
+ 			break;
+ 		}
+@@ -1610,29 +1630,30 @@
+ 	if (sweet_pool_evict_lock == NULL) {
+ 		return true;
+ 	}
+-	uint64_t plim = (uint64_t)__atomic_load_n(&sweet_surf_proc_mib, __ATOMIC_RELAXED) << 20;
+-	uint64_t clim = (uint64_t)__atomic_load_n(&sweet_mem_budget_mib, __ATOMIC_RELAXED) << 20;
++	struct sweet_mem_policy pol;
++	sweet_mem_policy_now(&pol);
+ 	uint64_t goal = sweet_mem_goal(size), mine = sweet_mem_proc_bytes(pid);
+-	bool proc_over = !sweet_mem_proc_ok(mine, size, plim);
++	bool proc_over = !sweet_mem_proc_ok(mine, size, pol.proc_cap);
+ 	uint64_t now = sweet_mem_now_ns(), last = __atomic_load_n(&sweet_mem_create_pass_ns, __ATOMIC_RELAXED);
+-	if ((goal != 0 || proc_over) && __atomic_load_n(&sweet_purge_mode, __ATOMIC_RELAXED) >= SWEET_PURGE_ON && now - last >= 200000000ull) {
++	/* 0418: pressure purges (rate-limited to 5/s); a runaway process or memory under the floor purges at once */
++	bool urgent = proc_over || memorystatus_available_pages < pol.avail_floor;
++	if ((goal != 0 || proc_over) && __atomic_load_n(&sweet_purge_mode, __ATOMIC_RELAXED) >= SWEET_PURGE_ON && (urgent || now - last >= 200000000ull)) {
+ 		__atomic_store_n(&sweet_mem_create_pass_ns, now, __ATOMIC_RELAXED);
+ 		IOLockLock(sweet_pool_evict_lock);
+ 		if (proc_over) {
+-			(void)sweet_purge_pass_locked(mine + size - plim + SWEET_PURGE_HYST, pid, "process budget");
++			(void)sweet_purge_pass_locked(mine + size - pol.proc_cap + SWEET_PURGE_HYST, pid, "process guard");
+ 		}
+ 		if (goal != 0) {
+ 			(void)sweet_purge_pass_locked(goal, 0, "create");
+ 		}
+ 		IOLockUnlock(sweet_pool_evict_lock);
+ 		mine = sweet_mem_proc_bytes(pid);
+-		proc_over = !sweet_mem_proc_ok(mine, size, plim);
+ 	}
+-	bool comb_over = !sweet_mem_combined_ok(__atomic_load_n(&sweet_surface_wired, __ATOMIC_RELAXED), __atomic_load_n(&sweet_mem_gpu_private,
+-	    __ATOMIC_RELAXED), size, clim);
+-	if (!proc_over && !comb_over) {
++	uint32_t avail = memorystatus_available_pages;
++	if (sweet_mem_surface_rule(&pol, mine, size, avail)) {
+ 		return true;
+ 	}
++	proc_over = !sweet_mem_proc_ok(mine, size, pol.proc_cap);
+ 	if (sweet_mem_exempt_self()) {
+ 		OSIncrementAtomic((volatile SInt32 *)&sweet_mem_exempted);
+ 		return true;
+@@ -1642,32 +1663,36 @@
+ 	if (k < 16 || (k % 128) == 0) {
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+-		IOLog("NORD2 MEM SURF: %s[%d] %u KiB refused by the %s budget: process %llu of %llu MiB, surfaces %llu + GPU private %llu of %llu MiB "
+-		    "(refused: process %u, combined %u)\n", name, pid, size >> 10, proc_over ? "per-process" : "combined", mine >> 20, plim >> 20,
+-		    sweet_surface_wired >> 20, sweet_mem_gpu_private >> 20, clim >> 20, sweet_mem_refused_proc, sweet_mem_refused_combined);
++		IOLog("NORD2 MEM SURF: %s[%d] %u KiB refused: %s (process %llu of %llu MiB, available %u pages, floor %u; surfaces %llu + GPU private %llu MiB) "
++		    "(refused: process %u, low memory %u)\n", name, pid, size >> 10, proc_over ? "runaway process guard" : "memory under the floor after purging",
++		    mine >> 20, pol.proc_cap >> 20, avail, pol.avail_floor, sweet_surface_wired >> 20, sweet_mem_gpu_private >> 20, sweet_mem_refused_proc,
++		    sweet_mem_refused_combined);
+ 	}
+ 	return false;
+ }
+ 
+-/* GPU side of the combined budget (nord2_gpu_transport.h nord2_gpu_global_private_ok, under the GPU locks: never purges inline). */
++/*
++ * GPU side (nord2_gpu_transport.h nord2_gpu_global_private_ok, under the GPU locks: never purges inline).  0418: refused only over the cap
++ * (max of Nord2GPU's limit and 40 % of RAM) or with available pages under the floor; pressure only kicks the purge thread.
++ */
+ extern "C" bool
+-sweet_mem_gpu_private_ok(uint64_t total_private, uint64_t rounded)
++sweet_mem_gpu_private_ok3(uint64_t total_private, uint64_t rounded, uint64_t limit)
+ {
+ 	__atomic_store_n(&sweet_mem_gpu_private, total_private, __ATOMIC_RELAXED);
+-	uint64_t limit = (uint64_t)__atomic_load_n(&sweet_mem_budget_mib, __ATOMIC_RELAXED) << 20;
+-	int d = sweet_mem_gpu_decide(__atomic_load_n(&sweet_surface_wired, __ATOMIC_RELAXED), total_private, rounded, limit,
+-	    __atomic_load_n(&sweet_mem_idle_bytes, __ATOMIC_RELAXED));
+-	if (d == 1) {
+-		return true;
+-	}
+-	if (sweet_purge_kick_tc != NULL && __atomic_exchange_n(&sweet_purge_kick_pending, 1u, __ATOMIC_ACQ_REL) == 0) {
++	struct sweet_mem_policy pol;
++	sweet_mem_policy_now(&pol);
++	uint32_t avail = memorystatus_available_pages;
++	int d = sweet_mem_gpu_rule(&pol, total_private, rounded, limit, avail, sweet_mem_goal(rounded) != 0);
++	if (d != 1 && sweet_purge_kick_tc != NULL && __atomic_exchange_n(&sweet_purge_kick_pending, 1u, __ATOMIC_ACQ_REL) == 0) {
+ 		OSIncrementAtomic((volatile SInt32 *)&sweet_mem_gpu_kicks);
+ 		thread_call_enter(sweet_purge_kick_tc);
+ 	}
+-	if (d == 2) {
+-		return true;            /* fits once the idle volatile surfaces are purged (just kicked) */
++	if (d != 0) {
++		return true;
+ 	}
+-	if (sweet_mem_exempt_self()) {
++	bool over_cap = !(total_private <= (pol.gpu_cap > limit ? pol.gpu_cap : limit) &&
++	    rounded <= (pol.gpu_cap > limit ? pol.gpu_cap : limit) - total_private);
++	if (!over_cap && sweet_mem_exempt_self()) {
+ 		OSIncrementAtomic((volatile SInt32 *)&sweet_mem_exempted);
+ 		return true;
+ 	}
+@@ -1675,8 +1700,9 @@
+ 	if (sweet_mem_told_gpu++ < 16 || (k % 128) == 0) {
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+-		IOLog("NORD2 MEM SURF: GPU allocation of %llu KiB by %s[%d] refused by the combined budget: GPU private %llu + surfaces %llu of %llu MiB "
+-		    "(GPU refusals %u)\n", rounded >> 10, name, proc_selfpid(), total_private >> 20, sweet_surface_wired >> 20, limit >> 20, k + 1);
++		IOLog("NORD2 MEM SURF: GPU allocation of %llu KiB by %s[%d] refused: %s (GPU private %llu MiB, cap %llu MiB, available %u pages, floor %u) "
++		    "(GPU refusals %u)\n", rounded >> 10, name, proc_selfpid(), over_cap ? "over the GPU cap" : "memory under the floor",
++		    total_private >> 20, (pol.gpu_cap > limit ? pol.gpu_cap : limit) >> 20, avail, pol.avail_floor, k + 1);
+ 	}
+ 	return false;
+ }
+@@ -1705,11 +1731,11 @@
+ 	uint64_t gp = __atomic_load_n(&sweet_mem_gpu_private, __ATOMIC_RELAXED), sw = __atomic_load_n(&sweet_surface_wired, __ATOMIC_RELAXED);
+ 	IOLog("NORD2 MEM SURF: wired=%llu MiB bufs=%u (table %u) volatile=%u/%llu MiB idle=%u/%llu MiB iommu=%u MiB purged=%u/%llu MiB pend=%u/%llu MiB "
+ 	    "gpu_private=%llu MiB combined=%llu/%u MiB avail=%u wired_pages=%u purges=%u unpurges=%u fail=%u/%u remap_bad=%u refused=proc %u comb %u gpu %u "
+-	    "exempt %u kicks %u top=%s mode=%d\n", sw >> 20, sweet_surface_buffers, sweet_purge_st_bufs, sweet_purge_st_vol_n, sweet_purge_st_vol_b >> 20, sweet_purge_st_idle_n,
++	    "exempt %u kicks %u top=%s mode=%d floor=%u caps=surf %u gpu %u proc %u MiB\n", sw >> 20, sweet_surface_buffers, sweet_purge_st_bufs, sweet_purge_st_vol_n, sweet_purge_st_vol_b >> 20, sweet_purge_st_idle_n,
+ 	    sweet_purge_st_idle_b >> 20, (n2io_pt.mapped * 4096u) >> 20, sweet_purged_live, sweet_purged_bytes >> 20, sweet_purge_npend, sweet_purge_pend_bytes >> 20,
+ 	    gp >> 20, (sw + gp) >> 20, sweet_mem_budget_mib, memorystatus_available_pages, vm_page_wire_count, sweet_purge_n, sweet_unpurge_n, sweet_purge_failed,
+ 	    sweet_unpurge_failed, sweet_purge_remap_bad, sweet_mem_refused_proc, sweet_mem_refused_combined, sweet_mem_refused_gpu, sweet_mem_exempted,
+-	    sweet_mem_gpu_kicks, top, sweet_purge_mode);
++	    sweet_mem_gpu_kicks, top, sweet_purge_mode, sweet_mem_floor, sweet_surf_cap_mib, sweet_gpu_cap_mib, sweet_surf_proc_mib);
+ 	if (sweet_purge_st_vol_n != 0) {
+ 		uint32_t *y = sweet_purge_st_why;
+ 		IOLog("NORD2 MEM SURF: volatile kept because: young %u active %u in-use %u display %u gpu-job %u gpu-import %u gpu-busy %u iommu %u size %u mode %u\n",
+@@ -1749,6 +1775,20 @@
+ sweet_purge_start(void)
+ {
+ 	uint32_t v = 0;
++	{   /* 0418: every limit from the RAM window */
++		struct sweet_mem_policy pol;
++		sweet_mem_policy_for(max_mem, (uint32_t)page_size, &pol);
++		sweet_surf_cap_mib = (uint32_t)(pol.surf_cap >> 20);
++		sweet_gpu_cap_mib = (uint32_t)(pol.gpu_cap >> 20);
++		sweet_surf_proc_mib = (uint32_t)(pol.proc_cap >> 20);
++		sweet_purge_thr_mib = (uint32_t)(pol.purge_thr >> 20);
++		sweet_mem_budget_mib = (uint32_t)(pol.combined_purge >> 20);
++		sweet_purge_avail_min = pol.avail_high;
++		sweet_mem_floor = pol.avail_floor;
++		IOLog("NORD2 MEM SURF: 0418 policy for %llu MiB RAM: caps surfaces %u GPU %u process %u MiB; purge when surfaces > %u MiB, surfaces + GPU > %u MiB "
++		    "or available < %u pages; refuse only under %u available pages\n", max_mem >> 20, sweet_surf_cap_mib, sweet_gpu_cap_mib, sweet_surf_proc_mib,
++		    sweet_purge_thr_mib, sweet_mem_budget_mib, sweet_purge_avail_min, sweet_mem_floor);
++	}
+ 	if (PE_parse_boot_argn("n2sp", &v, sizeof(v)) && v <= SWEET_PURGE_ON) {
+ 		sweet_purge_mode = (int)v;
+ 	}
+--- a/iokit/Kernel/arm/sweet_surface_purge.h
++++ b/iokit/Kernel/arm/sweet_surface_purge.h
+@@ -197,4 +197,50 @@
+ 	*freed = got;
+ 	return k;
+ }
++/*
++ * 0418 (memfix-20261113b): limits scale with the RAM window and nothing is refused while memory is available.  r5b (q10jgr, 5088 MiB
++ * window): Photos crashed on refusals by 0417's static caps (combined 2240 MiB, per process 896 MiB) with avail = 156,673 pages free.
++ * Now: pressure (purge idle volatile surfaces) = available pages under avail_high, surfaces over purge_thr, or surfaces + GPU private
++ * over combined_purge; a refusal only when available pages stay under avail_floor (after a purge) or a hard cap is hit
++ * (surf_cap 55 % of RAM, gpu_cap 40 %, proc_cap 60 % = runaway guard).  Ratios fitted to 0417's 3776 MiB numbers (2048, 1228, 2240)
++ * and the coordinator's 5088 MiB marks (120k / 25k pages).
++ */
++struct sweet_mem_policy {
++	uint64_t surf_cap, gpu_cap, proc_cap, purge_thr, combined_purge;
++	uint32_t avail_high, avail_floor;
++};
++
++static inline void
++sweet_mem_policy_for(uint64_t ram_bytes, uint32_t page_bytes, struct sweet_mem_policy *p)
++{
++	uint64_t pages = page_bytes ? ram_bytes / page_bytes : 0;
++	p->surf_cap = ram_bytes / 100 * 55;
++	p->gpu_cap = ram_bytes / 100 * 40;
++	p->proc_cap = ram_bytes / 100 * 60;
++	p->purge_thr = ram_bytes / 1000 * 325;
++	p->combined_purge = ram_bytes / 1000 * 593;
++	p->avail_high = (uint32_t)(pages * 37 / 100);
++	p->avail_floor = (uint32_t)(pages * 77 / 1000);
++	if (p->avail_floor < 8192) p->avail_floor = 8192;
++	if (p->avail_high < p->avail_floor) p->avail_high = p->avail_floor;
++}
++
++/* GPU private allocation: 0 refuse, 1 go, 2 go and kick a purge.  static_limit = Nord2GPU's own global limit (kept as a floor of the cap). */
++static inline int
++sweet_mem_gpu_rule(const struct sweet_mem_policy *p, uint64_t total_private, uint64_t request, uint64_t static_limit, uint32_t avail,
++    bool pressure)
++{
++	uint64_t cap = p->gpu_cap > static_limit ? p->gpu_cap : static_limit;
++	if (!(total_private <= cap && request <= cap - total_private)) return 0;
++	if (avail < p->avail_floor) return 0;
++	return pressure ? 2 : 1;
++}
++
++/* Surface creation after the purge attempt: true = allowed (the hard surface cap is checked by the caller). */
++static inline bool
++sweet_mem_surface_rule(const struct sweet_mem_policy *p, uint64_t proc_bytes, uint64_t request, uint32_t avail)
++{
++	if (!sweet_mem_proc_ok(proc_bytes, request, p->proc_cap)) return false;
++	return avail >= p->avail_floor;
++}
+ #endif /* SWEET_SURFACE_PURGE_H */

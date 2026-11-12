@@ -1,0 +1,156 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -43,6 +43,19 @@
+ 
+ /* 0390: n2fbblend=0 copies the SwapEnd layers over each other as before 0390 (default 1: composite them). */
+ static uint32_t sweet_fb_blend_mode = 1;
++/* 0391 (fbdiag-20261112): run fbfix1 -- q10jfb composited the 2-layer swaps (layer 0 = Photos' drawable, layer 1 = backboardd's frame,
++ * 85% fully transparent) and the grid was still black: the CPU copy reads Photos' drawable as black while the GPU (backboardd's earlier
++ * composites) and the userland CPU probes read it in colour.  n2fbinval=1 (default) cleans+invalidates the CPU cache over every layer
++ * of a multi-layer present before it is read (stale CPU lines of a GPU-written surface); n2fbinval=0 = as 0390.  Diagnostics for the
++ * first 40 multi-layer presents, then one in 30: 5 pixels of each layer read before the GPU acquire, after it and after a CIVAC of
++ * the line, the surface seed / busy state, and the same points in the panel after the copy; the 60 swap records after the first
++ * multi-layer one. */
++extern "C" {
++#include <arm/caches_internal.h>
++}
++static uint32_t sweet_fb_inval_mode = 1;
++static uint64_t sweet_fb_multi_seen;
++static uint32_t sweet_fb_swaplog_n;
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void nord2_dvfs_ui_kick(void);   /* bsd/dev/nord2_cpufreq.c (0184): the UI is active, the CPU governor keeps its boost floor */
+@@ -365,6 +378,8 @@
+ 	fDiag.enabled = (diagnostics == 1);
+ #endif
+ 	{ uint32_t bl = 1; if (PE_parse_boot_argn("n2fbblend", &bl, sizeof(bl))) { sweet_fb_blend_mode = bl ? 1 : 0; } }   /* 0390 */
++	{ uint32_t iv = 1; if (PE_parse_boot_argn("n2fbinval", &iv, sizeof(iv))) { sweet_fb_inval_mode = iv ? 1 : 0; } }   /* 0391 */
++	IOLog("SWEET FB: multi-layer source cache clean+invalidate %s (0391)\n", sweet_fb_inval_mode ? "on" : "off (n2fbinval=0)");
+ 	IOLog("SWEET FB: layer composition %s (0390)\n", sweet_fb_blend_mode ? "on" : "off (n2fbblend=0)");
+ 	uint32_t hz = SWEET_FB_DEFAULT_HZ;
+ 	/* sweetfb_hz=<n> (0/60+ = every vsync); short alias n2fbhz for the full UI command line (600/607 characters). */
+@@ -1666,6 +1681,11 @@
+ 		/* Finite ABI evidence, outside fLock; never alter record interpretation. */
+ 		if (accepted <= 2) { sweet_fb_diag_record(rec, accepted); }
+ 	}
++	if (__atomic_load_n(&sweet_fb_multi_seen, __ATOMIC_RELAXED) != 0 && __atomic_load_n(&sweet_fb_swaplog_n, __ATOMIC_RELAXED) < 60 &&
++	    __atomic_add_fetch(&sweet_fb_swaplog_n, 1, __ATOMIC_RELAXED) <= 60) {          /* 0391 */
++		IOLog("NORD2 FB SWAPLOG: swap=%u mask=%#x ids=%u,%u,%u,%u multi_presents=%llu\n", get32(rec, 0x50), get32(rec, 0x104),
++		    get32(rec, 0x54), get32(rec, 0x58), get32(rec, 0x5c), get32(rec, 0x60), __atomic_load_n(&sweet_fb_multi_seen, __ATOMIC_RELAXED));
++	}
+ 	nord2_dvfs_ui_kick();
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+@@ -1715,6 +1735,18 @@
+ 	uint32_t lbpr[SWEET_FB_LAYERS], lidx[SWEET_FB_LAYERS];
+ 	struct sweet_fb_layer_geom lg[SWEET_FB_LAYERS];
+ 	unsigned nl = 0;
++	/* 0391 */
++	unsigned want = 0;
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		if ((mask & (1u << layer)) && get32(rec, 0x54 + 4 * layer)) { want++; }
++	}
++	uint64_t pdiagN = 0;
++	if (want > 1) {
++		pdiagN = __atomic_add_fetch(&sweet_fb_multi_seen, 1, __ATOMIC_RELAXED);
++		if (!(pdiagN <= 40 || (pdiagN % 30) == 0)) { pdiagN = 0; }
++	}
++	uint32_t lpt[SWEET_FB_LAYERS][5][2];
++	bool lptok[SWEET_FB_LAYERS];
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -1750,7 +1782,43 @@
+ 			if (ownRef) s->release();
+ 			continue;
+ 		}
++		/* 0391: the layer's pixels before the acquire, after it, after a CIVAC of the line */
++		uint32_t pt[5][2] = { { s->width / 2, s->height / 2 }, { s->width / 4, s->height / 4 }, { 3 * s->width / 4, s->height / 4 },
++		    { s->width / 4, 3 * s->height / 4 }, { 3 * s->width / 4, 3 * s->height / 4 } };
++		uint32_t pv[3][5] = { { 0 } };
++		uintptr_t pkva = pdiagN ? s->kernelAddress() : 0;
++		bool pxok = pkva != 0 && s->memory != NULL && s->elementWidth == 1 && s->elementHeight == 1 &&
++		    (s->bytesPerElement == 4 || s->bytesPerElement == 0) && s->width != 0 && s->height != 0 &&
++		    (uint64_t)s->offset + (uint64_t)s->height * s->bytesPerRow <= s->memory->getLength() && s->bytesPerRow >= s->width * 4;
++		bool pbusy = pdiagN ? nord2_gpu_surface_busy(s) : false;
++		if (pxok) {
++			for (int k = 0; k < 5; k++) {
++				pv[0][k] = *(volatile const uint32_t *)(pkva + s->offset + (uint64_t)pt[k][1] * s->bytesPerRow + (uint64_t)pt[k][0] * 4);
++			}
++		}
+ 		nord2_gpu_surface_cpu_acquire(s);   /* GPU-written pixels become visible to this CPU copy */
++		if (pxok) {
++			for (int k = 0; k < 5; k++) {
++				pv[1][k] = *(volatile const uint32_t *)(pkva + s->offset + (uint64_t)pt[k][1] * s->bytesPerRow + (uint64_t)pt[k][0] * 4);
++			}
++			for (int k = 0; k < 5; k++) {
++				uintptr_t pa = pkva + s->offset + (uint64_t)pt[k][1] * s->bytesPerRow + (uint64_t)pt[k][0] * 4;
++				FlushPoC_DcacheRegion((vm_offset_t)pa, 4);
++				pv[2][k] = *(volatile const uint32_t *)pa;
++			}
++		}
++		if (pdiagN) {
++			uint32_t seed = s->state != NULL ? *(volatile const uint32_t *)((const uint8_t *)s->state->getBytesNoCopy() + 0xc) : 0;
++			IOLog("NORD2 FB PX: multi=%llu swap=%u layer %u surface %u seed %u busy %u cache %u map %#x purg %u%s\n", pdiagN, get32(rec, 0x50),
++			    layer, id, seed, pbusy ? 1u : 0u, s->cacheMode, (unsigned)s->mapCache, s->purgeable, pxok ? "" : " (pixels not readable)");
++			if (pxok) {
++				static const char *const stage[3] = { "pre-acquire", "acquired", "civac" };
++				for (int st = 0; st < 3; st++) {
++					IOLog("NORD2 FB PX:   layer %u %s c=%08x tl=%08x tr=%08x bl=%08x br=%08x\n", layer, stage[st],
++					    pv[st][0], pv[st][1], pv[st][2], pv[st][3], pv[st][4]);
++				}
++			}
++		}
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		struct sweet_fb_layer_geom g;
+@@ -1766,9 +1834,19 @@
+ 			continue;
+ 		}
+ 		ls[nl] = s; lown[nl] = ownRef; lsrc[nl] = src + s->offset; lbpr[nl] = s->bytesPerRow; lidx[nl] = layer; lg[nl] = g;
++		memcpy(lpt[nl], pt, sizeof(pt)); lptok[nl] = pxok;
+ 		nl++;
+ 	}
+ 	uintptr_t dstBase = fCopyDst ? fCopyDst : fPixels;
++	/* 0391: no stale CPU line of a GPU-written layer may satisfy the copy (CIVAC = what the GPU driver's own maintenance does). */
++	uint64_t inval_us = 0;
++	if (nl > 1 && sweet_fb_inval_mode != 0) {
++		uint64_t t0 = mach_absolute_time();
++		for (unsigned i = 0; i < nl; i++) {
++			FlushPoC_DcacheRegion((vm_offset_t)(lsrc[i] + (uint64_t)lg[i].sy * lbpr[i]), (unsigned)((uint64_t)lg[i].h * lbpr[i]));
++		}
++		inval_us = sweet_fb_abs_to_us(mach_absolute_time() - t0);
++	}
+ 	uint32_t *rowBuf = NULL;
+ 	if (nl > 1 && sweet_fb_blend_mode != 0) {
+ 		rowBuf = (uint32_t *)IOMallocData((vm_size_t)fWidth * 4);
+@@ -1776,8 +1854,8 @@
+ 	if (nl > 1) {
+ 		uint64_t multi = __atomic_add_fetch(&sweet_fb_multi_presents, 1, __ATOMIC_RELAXED);
+ 		if (multi <= 24 || (multi % 600) == 0) {
+-			IOLog("NORD2 FB LAYERS: multi=%llu swap=%u mask=%#x n=%u blend=%u%s\n", multi, get32(rec, 0x50), mask, nl,
+-			    sweet_fb_blend_mode, (sweet_fb_blend_mode != 0 && rowBuf == NULL) ? " (row buffer alloc failed: copy)" : "");
++			IOLog("NORD2 FB LAYERS: multi=%llu swap=%u mask=%#x n=%u blend=%u inval=%u inval_us=%llu%s\n", multi, get32(rec, 0x50), mask, nl,
++			    sweet_fb_blend_mode, sweet_fb_inval_mode, inval_us, (sweet_fb_blend_mode != 0 && rowBuf == NULL) ? " (row buffer alloc failed: copy)" : "");
+ 			for (unsigned i = 0; i < nl && multi <= 24; i++) {
+ 				IOLog("NORD2 FB LAYERS:   layer %u surface %u %ux%u fmt 0x%x bpr %u src %d,%d -> panel %d,%d %dx%d\n", lidx[i],
+ 				    get32(rec, 0x54 + 4 * lidx[i]), ls[i]->width, ls[i]->height, ls[i]->pixelFormat, lbpr[i],
+@@ -1827,6 +1905,18 @@
+ 			}
+ 		}
+ 	}
++	if (pdiagN) {           /* 0391: the same points in the panel memory after the copy */
++		for (unsigned i = 0; i < nl; i++) {
++			if (!lptok[i]) { continue; }
++			uint32_t pp[5];
++			for (int k = 0; k < 5; k++) {
++				int32_t px = lg[i].dx + ((int32_t)lpt[i][k][0] - lg[i].sx), py = lg[i].dy + ((int32_t)lpt[i][k][1] - lg[i].sy);
++				pp[k] = (px >= 0 && py >= 0 && px < (int32_t)fWidth && py < (int32_t)fHeight) ?
++				    *(volatile const uint32_t *)(dstBase + (uint64_t)py * fRowBytes + (uint64_t)px * 4) : 0xdeadbeefu;
++			}
++			IOLog("NORD2 FB PX:   layer %u panel c=%08x tl=%08x tr=%08x bl=%08x br=%08x\n", lidx[i], pp[0], pp[1], pp[2], pp[3], pp[4]);
++		}
++	}
+ 	for (unsigned i = 0; i < nl; i++) {
+ 		if (lown[i]) ls[i]->release();
+ 	}

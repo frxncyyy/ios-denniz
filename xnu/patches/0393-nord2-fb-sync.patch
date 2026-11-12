@@ -1,0 +1,416 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -232,6 +232,18 @@
+ 	uint8_t            *fNextRec;
+ 	sweet_fb_pending_surfaces fNextSurfaces;
+ 	bool                fDbl, fPrepared, fTeObsSet;
++	/* 0393 (fbsync-20261112): frames with nothing composited keep the shown buffer; tear / source-race / long-present diagnostics */
++	bool                fCopyEmpty, fNextEmpty, fWorkEmpty, fPushSafe;
++	uint32_t            fSwNrId;                  /* SwapWait: id answered not-ready since fSwNrSinceMs (valve) */
++	uint64_t            fSwNrSinceMs;
++	struct {
++		uint64_t pushes, safe_pushes, te_none, te_ambig, te_margin_min_us, te_margin_sum_us, te_margin_n;
++		uint64_t src_race, busy_after, copy_mismatch, checked_layers, empty_frames, black_fill_rows;
++		uint64_t copy_gt4, copy_gt8, total_gt16, long_logged, tear_logged, race_logged;
++		uint64_t copy_max_us, total_max_us;
++	} fSync;
++	uint64_t            fPresentT0Us;             /* when the presenter took the frame (state 5/1 entry) */
++	uint32_t            fLastCopyLayers;
+ 	uint8_t             fFront, fNextState;      /* fFront: panel buffer the overlay reads (0 = fPixels, 1 = fPixelsB); fNextState 0 none, 1 taken / waiting for the GPU, 2 copied */
+ 	uint32_t            fCad[5];
+ 	uint8_t             fModeState;               /* 0 panel still at its boot mode, 1 switched to 90 Hz, 2 refused / failed */
+@@ -404,12 +416,15 @@
+ 	fTwMinUs = 6800; fCtlEmaUs = 0; fTickCorrUs = 0; fTickCorrSumUs = 0; fDzWaits = 0; fSafeStarts = 0; fPhBin[0] = fPhBin[1] = fPhBin[2] = 0; fHbPeriodUs = 0;
+ 	{ uint32_t lead = 0; if (PE_parse_boot_argn("n2telead", &lead, sizeof(lead)) && lead <= 4000) { fTeLeadUs = lead; } }
+ 	nanoseconds_to_absolutetime(fVsyncUs * 1000ULL, &fPeriodAbs);
+-	/* n2swait=<0|1|2>: SwapWait semantics (0 = as before: always success, calls logged). */
++	/* n2swait=<0|1|2>: SwapWait semantics (0 = always success, calls logged).  0393: default 1 = a swap retires when its copy ended
++	 * (or it was replaced unseen); CoreAnimation (can_update_, mode 0 no-block) then never redraws a surface the copy has not read. */
+ 	{
+-		uint32_t level = 0;
++		uint32_t level = 1;
+ 		if (!PE_parse_boot_argn("sweetfb_swapwait", &level, sizeof(level))) { (void)PE_parse_boot_argn("n2swait", &level, sizeof(level)); }
+ 		fSwapWaitLevel = level > 2 ? 2 : level;
+ 		bzero(&fRetire, sizeof(fRetire));
++		bzero(&fSync, sizeof(fSync)); fSwNrId = 0; fSwNrSinceMs = 0; fPresentT0Us = 0; fLastCopyLayers = 0;      /* 0393 */
++		fCopyEmpty = fNextEmpty = fWorkEmpty = fPushSafe = false;
+ 		for (unsigned i = 0; i < SWEET_FB_RETIRE_LATE_SLOTS; i++) { sweet_fb_pending_surfaces_init(&fLateSurfaces[i]); }
+ 	}
+ #if defined(NORD2)
+@@ -688,7 +703,13 @@
+ 	fNextState = 0;
+ 	bool requeued = false;
+ 	if (had && rec != NULL) { requeued = sweet_fb_swap_lifecycle_requeue(&fSwapLifecycle, fDirty, &s); if (requeued) { fDirty = true; } }
++	if (had) {      /* 0393 */
++		uint32_t pid = 0;
++		if (rec != NULL) { memcpy(&pid, rec + 0x50, 4); }
++		sweet_fb_retire_prep_drop(&fRetire, requeued, pid);
++	}
+ 	IOLockUnlock(fLock);
++	IOLockWakeup(fLock, &fRetireEvent, false);
+ 	if (rec != NULL) { IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE); }
+ 	sweet_fb_pending_surfaces_release(&s, sweet_fb_release_surface);
+ }
+@@ -769,6 +790,7 @@
+ 		sweet_fb_pending_surfaces_init(&s);
+ 		if (!sweet_fb_swap_lifecycle_take(&fSwapLifecycle, &s)) { IOLockUnlock(fLock); IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE); return; }
+ 		fDirty = false;
++		sweet_fb_retire_prep(&fRetire);      /* 0393: the retire state knows the prepare slot took this swap */
+ 		fNextRec = rec; fNextSurfaces = s; fNextState = 1;
+ 		fNextWaitUs = sweet_fb_abs_to_us(mach_absolute_time());
+ 		IOLockUnlock(fLock);
+@@ -788,6 +810,11 @@
+ 		fPrepCopyUs = sweet_fb_abs_to_us(mach_absolute_time() - t0);
+ 		fCopyDst = 0;
+ 		if (!shown) { dropNext(); return; }
++		fNextEmpty = fCopyEmpty;
++		IOLockLock(fLock);
++		sweet_fb_retire_prep_end(&fRetire, false);      /* 0393: copied: its surfaces are free for CoreAnimation */
++		IOLockUnlock(fLock);
++		IOLockWakeup(fLock, &fRetireEvent, false);
+ 		noteDistinct(fFront ? fPixels : fPixelsB);
+ 		fStats.dbl_preps++;
+ 		fNextState = 2;
+@@ -806,9 +833,10 @@
+ 		/* 0156: the frame prepared during the last transfer goes first */
+ 		fWorkRec = fNextRec; fWorkSurfaces = fNextSurfaces;
+ 		fNextRec = NULL; sweet_fb_pending_surfaces_init(&fNextSurfaces);
+-		sweet_fb_retire_take(&fRetire);
+-		if (fNextState == 2) { fPrepared = true; fPState = 1; fStats.dbl_hits++; }
+-		else { fWaitStartUs = fNextWaitUs; fPState = 5; }
++		/* 0393: was sweet_fb_retire_take(), which marked the NEWER pending swap as presenting */
++		fPresentT0Us = fNextWaitUs;
++		if (fNextState == 2) { fPrepared = true; fWorkEmpty = fNextEmpty; fPState = 1; fStats.dbl_hits++; sweet_fb_retire_prep_end(&fRetire, false); }
++		else { fWaitStartUs = fNextWaitUs; fPState = 5; sweet_fb_retire_prep_end(&fRetire, true); }
+ 		fNextState = 0;
+ 		IOLockUnlock(fLock);
+ 		IOLockWakeup(fLock, &fRetireEvent, false);
+@@ -836,6 +864,7 @@
+ 	fWorkRec = rec;
+ 	fWorkSurfaces = surfaces;
+ 	fWaitStartUs = sweet_fb_abs_to_us(mach_absolute_time());
++	fPresentT0Us = fWaitStartUs;
+ 	fPState = 5;
+ 	IOLockUnlock(fLock);
+ 	IOLockWakeup(fLock, &fRetireEvent, false);        /* mode 1/2 waiters: the swap is no longer waiting */
+@@ -921,19 +950,30 @@
+ 		else {
+ 			fb->fCopyDst = fb->fDbl ? (fb->fFront ? fb->fPixels : fb->fPixelsB) : fb->fPixels;
+ 			shown = fb->presentCopy(fb->fWorkRec, (SweetSurface *const *)fb->fWorkSurfaces.object);
++			fb->fWorkEmpty = fb->fCopyEmpty;
++			if (shown) {        /* 0393: the copy ended: the swap's surfaces are free (the transfer reads our own buffer) */
++				IOLockLock(fb->fLock);
++				sweet_fb_retire_copied(&fb->fRetire);
++				IOLockUnlock(fb->fLock);
++				IOLockWakeup(fb->fLock, &fb->fRetireEvent, false);
++			}
+ 		}
+ 		uint64_t t1 = mach_absolute_time();
+ 		fb->fCopyUs = wasPrepared ? fb->fPrepCopyUs : sweet_fb_abs_to_us(t1 - t0);
+ 		if (!shown) { fb->presentDone(false, false, false); return; }
+ 		if (!wasPrepared) { fb->noteDistinct(fb->fCopyDst ? fb->fCopyDst : fb->fPixels); }
+ 		fb->fCopyDst = 0;
++		/* 0156: the overlay reads the buffer that was just filled.  0393: before EVERY push path (the TE-less and blocking paths below used to
++		 * push the old front buffer while the frames went to the back one), and not when nothing was composited into it. */
++		if (fb->fWorkEmpty) { fb->fSync.empty_frames++; }
++		if (fb->fDbl && !fb->fWorkEmpty) {
++			uint8_t back = fb->fFront ? 0 : 1;
++			if (fb->ovlSelect(back)) { fb->fFront = back; }
++			else { IOLog("NORD2 FB DBL: overlay flip refused, back to one buffer\n"); fb->fDbl = false; (void)fb->ovlSelect(0); fb->fFront = 0; fb->dropNext(); }
++		}
++		fb->fPushSafe = false;
+ 		if (fb->fNbReady && fb->fDsi != NULL && sweet_fb_abs_to_us(t1) >= fb->fTeOffUntilUs && !(fb->fDsi[SWEET_FB_DSI_INTSTA / 4] & SWEET_FB_DSI_BUSY)) {
+ 			/* 0155: the transfer starts at the panel's next TE (the scan then stays behind the write: no tear lines) */
+-			if (fb->fDbl) {      /* 0156: the overlay reads the buffer that was just filled */
+-				uint8_t back = fb->fFront ? 0 : 1;
+-				if (fb->ovlSelect(back)) { fb->fFront = back; }
+-				else { IOLog("NORD2 FB DBL: overlay flip refused, back to one buffer\n"); fb->fDbl = false; (void)fb->ovlSelect(0); fb->fFront = 0; fb->dropNext(); }
+-			}
+ 			fb->fDsi[SWEET_FB_DSI_INTSTA / 4] = ~SWEET_FB_DSI_TE_RDY;
+ 			fb->fTeStartUs = sweet_fb_abs_to_us(mach_absolute_time());
+ 			{   /* 0190: where in the panel's refresh does this frame become pushable?  The vsync heartbeat (the clients' frame clock) is nudged so that this phase sits in the middle of the tear-free window */
+@@ -996,6 +1036,7 @@
+ 				nowUs = sweet_fb_abs_to_us(mach_absolute_time());
+ 			}
+ 			fb->fSafeStarts++;
++			fb->fPushSafe = true;      /* 0393: tear check at frame done */
+ 			fb->fStats.te_lead_starts++;
+ 			te = true;
+ 			fb->fDsi[SWEET_FB_DSI_INTSTA / 4] = ~SWEET_FB_DSI_TE_RDY;      /* the next TE seen is the one this push is ahead of */
+@@ -1046,6 +1087,40 @@
+ 		sender->setTimeoutUS(SWEET_FB_XFER_POLL_US);
+ 		return;
+ 	}
++#if defined(NORD2)
++	{   /* 0393: tear detector.  A safe-window push starts before the panel's TE and must still be running when that TE comes (the write stays
++		 * behind the scan of the old refresh, ahead of the new one).  Frame-done with no TE seen since the start = the push overtook the scan:
++		 * the bottom rows showed the new frame one refresh early (a tear line).  TE first seen in the same 250 us poll as frame-done = ambiguous. */
++		uint64_t nowUs = sweet_fb_abs_to_us(mach_absolute_time());
++		fb->fSync.pushes++;
++		if (fb->fPushSafe && fb->fDsi != NULL && st == SWEET_FB_XFER_DONE) {
++			fb->fSync.safe_pushes++;
++			if (fb->fTeObsSet && nowUs > fb->fTeObsUs + SWEET_FB_XFER_POLL_US) {
++				uint64_t m = nowUs - fb->fTeObsUs;
++				if (fb->fSync.te_margin_n == 0 || m < fb->fSync.te_margin_min_us) { fb->fSync.te_margin_min_us = m; }
++				fb->fSync.te_margin_sum_us += m; fb->fSync.te_margin_n++;
++			} else if (fb->fTeObsSet) {
++				fb->fSync.te_ambig++;
++			} else {
++				fb->fSync.te_none++;
++				if (fb->fSync.tear_logged < 16) {
++					fb->fSync.tear_logged++;
++					IOLog("NORD2 FB TEAR: push %llu done %llu us after start, no TE seen (te_period_us=%llu tw_min_us=%llu te_ref_age_us=%llu)\n",
++					    fb->fSync.pushes, elapsed, fb->fTePeriodUs, fb->fTwMinUs, fb->fTeLastUs ? nowUs - fb->fTeLastUs : 0ULL);
++				}
++			}
++		}
++		fb->fPushSafe = false;
++		uint64_t total = fb->fPresentT0Us && nowUs > fb->fPresentT0Us ? nowUs - fb->fPresentT0Us : 0;
++		if (total > fb->fSync.total_max_us) { fb->fSync.total_max_us = total; }
++		if (total > 16000) { fb->fSync.total_gt16++; }
++		if ((fb->fCopyUs > 8000 || total > 16000) && fb->fSync.long_logged < 32) {
++			fb->fSync.long_logged++;
++			IOLog("NORD2 FB LONG: push %llu total_us=%llu copy_us=%llu layers=%u xfer_us=%llu prepared=%u (first 32 presents with copy > 8 ms or take-to-done > 16 ms)\n",
++			    fb->fSync.pushes, total, fb->fCopyUs, fb->fLastCopyLayers, elapsed, fb->fDbl ? 1u : 0u);
++		}
++	}
++#endif
+ 	fb->presentDone(true, st == SWEET_FB_XFER_TIMEOUT, false);
+ }
+ 
+@@ -1366,6 +1441,14 @@
+ 				if (n == 0) { snprintf(ob[i], sizeof(ob[i]), "none"); }
+ 			}
+ 			IOLog("NORD2 FB OVL: frames=%u dsi_underrun=%u ovl0[%s] ovl1[%s]\n", fOvlFrames, fDsiUnd, ob[0], ob[1]);
++			/* 0393: cumulative since boot */
++			IOLog("NORD2 FB SYNC: pushes=%llu safe=%llu tear_none_te=%llu tear_ambig=%llu te_margin_min_us=%llu te_margin_avg_us=%llu src_race=%llu busy_after=%llu "
++			    "copy_mismatch=%llu checked=%llu empty=%llu black_rows=%llu copy_gt4=%llu copy_gt8=%llu copy_max_us=%llu total_gt16=%llu total_max_us=%llu "
++			    "swait_level=%u not_ready=%llu valve=%llu dropped=%llu\n",
++			    fSync.pushes, fSync.safe_pushes, fSync.te_none, fSync.te_ambig, fSync.te_margin_min_us,
++			    fSync.te_margin_n ? fSync.te_margin_sum_us / fSync.te_margin_n : 0ULL, fSync.src_race, fSync.busy_after, fSync.copy_mismatch,
++			    fSync.checked_layers, fSync.empty_frames, fSync.black_fill_rows, fSync.copy_gt4, fSync.copy_gt8, fSync.copy_max_us, fSync.total_gt16,
++			    fSync.total_max_us, fSwapWaitLevel, fRetire.not_ready, fRetire.valve, fRetire.dropped);
+ 			fOvlFrames = 0; fDsiUnd = 0; memset(fOvlBits, 0, sizeof(fOvlBits));
+ 		}
+ 		fSafeStarts = 0; fDzWaits = 0; fTickCorrSumUs = 0; fPhBin[0] = fPhBin[1] = fPhBin[2] = 0;
+@@ -1567,6 +1650,12 @@
+ 		IOLockLock(fLock);
+ 		uint64_t elapsed = sweet_fb_abs_to_us(mach_absolute_time()) / 1000 - start_ms;
+ 		bool ready = sweet_fb_swap_ready(&fRetire, id, options & 0x7fffffffu, fPowerOff, __atomic_load_n(&fSwapLifecycle.stopped, __ATOMIC_ACQUIRE));
++		{   /* 0393: a swap that stays not-ready for SWEET_FB_SWAPWAIT_VALVE_MS is answered ready (a wedged presenter must not freeze the UI) */
++			uint64_t now_ms = sweet_fb_abs_to_us(mach_absolute_time()) / 1000;
++			if (ready) { if (fSwNrId == id) { fSwNrId = 0; } }
++			else if (fSwNrId != id) { fSwNrId = id; fSwNrSinceMs = now_ms; }
++			else if (now_ms - fSwNrSinceMs >= SWEET_FB_SWAPWAIT_VALVE_MS) { ready = true; fRetire.valve++; fSwNrId = 0; }
++		}
+ 		int step = sweet_fb_swapwait_step(ready, options, timeout, elapsed);
+ 		fRetire.calls++;
+ 		if (step == SWEET_FB_WAIT_BUSY) { fRetire.not_ready++; }
+@@ -1718,6 +1807,39 @@
+ 	}
+ }
+ 
++/* 0393: FNV-1a over SWEET_FB_SYNC_ROWS rows spread over a layer's copied rect (source side): the same value before and after the copy
++ * proves those rows did not change while they were read; a different value = something (the GPU drawing the next frame into a surface
++ * whose swap was answered retired) rewrote the surface during the copy. */
++#define SWEET_FB_SYNC_ROWS 16
++static uint64_t
++sweet_fb_rows_hash(uintptr_t src, uint32_t bpr, const struct sweet_fb_layer_geom *g)
++{
++	uint64_t h = 1469598103934665603ULL;
++	for (int32_t r = 0; r < SWEET_FB_SYNC_ROWS; r++) {
++		int32_t y = g->sy + (int32_t)(((int64_t)g->h - 1) * r / (SWEET_FB_SYNC_ROWS - 1));
++		const uint32_t *p = (const uint32_t *)(src + (uint64_t)y * bpr + (uint64_t)g->sx * 4);
++		for (int32_t x = 0; x < g->w; x++) { h = (h ^ p[x]) * 1099511628211ULL; }
++	}
++	return h;
++}
++
++/* 0393: black over the panel area outside [x0,x1) x [y0,y1) (no layer there: what a display shows without a layer).  With two panel
++ * buffers an unwritten area would otherwise show the frame from two presents ago, alternating with the other buffer. */
++static uint64_t
++sweet_fb_black_outside(uintptr_t dst, uint32_t rowBytes, uint32_t fw, uint32_t fh, int32_t x0, int32_t y0, int32_t x1, int32_t y1)
++{
++	uint64_t rows = 0;
++	if (x0 <= 0 && y0 <= 0 && x1 >= (int32_t)fw && y1 >= (int32_t)fh) { return 0; }
++	for (int32_t y = 0; y < (int32_t)fh; y++) {
++		uint8_t *row = (uint8_t *)(dst + (uint64_t)y * rowBytes);
++		if (y < y0 || y >= y1) { bzero(row, (size_t)fw * 4); rows++; continue; }
++		if (x0 > 0) { bzero(row, (size_t)x0 * 4); }
++		if (x1 < (int32_t)fw) { bzero(row + (uint64_t)x1 * 4, (size_t)(fw - (uint32_t)x1) * 4); }
++		if (x0 > 0 || x1 < (int32_t)fw) { rows++; }
++	}
++	return rows;
++}
++
+ /* Copies the layers into the panel memory. Returns false only when the display could not be taken over
+  * (nothing shown); the panel transfer is started by the caller. */
+ bool
+@@ -1725,6 +1847,7 @@
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 	uint64_t diag_present = 0;
++	fCopyEmpty = false;      /* 0393 */
+ 	if (fDiag.enabled) {
+ 		diag_present = __atomic_add_fetch(&fDiag.presents, 1, __ATOMIC_RELAXED);
+ 		bool active = false;
+@@ -1864,6 +1987,12 @@
+ 		nl++;
+ 	}
+ 	uintptr_t dstBase = fCopyDst ? fCopyDst : fPixels;
++	/* 0393: nothing to composite (no enabled layer, or none of its surfaces readable): the caller keeps the shown buffer */
++	fLastCopyLayers = nl;
++	if (nl == 0) { fCopyEmpty = true; }
++	uint64_t syncHash[SWEET_FB_LAYERS];
++	for (unsigned i = 0; i < nl; i++) { syncHash[i] = sweet_fb_rows_hash(lsrc[i], lbpr[i], &lg[i]); }
++	uint64_t syncT0 = mach_absolute_time();
+ 	/* 0391: no stale CPU line of a GPU-written layer may satisfy the copy (CIVAC = what the GPU driver's own maintenance does). */
+ 	uint64_t inval_us = 0;
+ 	if (nl > 1 && sweet_fb_inval_mode != 0) {
+@@ -1903,6 +2032,10 @@
+ 			if (lg[i].dy + lg[i].h > y1) { y1 = lg[i].dy + lg[i].h; }
+ 		}
+ 		struct sweet_fb_blend_stats st = { 0, 0, 0 };
++		/* 0393: rows no layer covers are black (they kept the frame of two presents ago with two panel buffers) */
++		if (y0 > 0 || y1 < (int32_t)fHeight) {
++			fSync.black_fill_rows += sweet_fb_black_outside(dstBase, fRowBytes, fWidth, fHeight, 0, y0 < 0 ? 0 : y0, (int32_t)fWidth, y1);
++		}
+ 		for (int32_t y = y0; y < y1; y++) {
+ 			const uint32_t *rows[SWEET_FB_LAYERS];
+ 			for (unsigned i = 0; i < nl; i++) {
+@@ -1911,7 +2044,15 @@
+ 			}
+ 			uint32_t x0, x1;
+ 			if (sweet_fb_compose_row(rowBuf, rows, lg, nl, &x0, &x1, &st)) {
++				if (x0 > 0 || x1 < fWidth) {      /* 0393: the whole row, black outside the layers' span */
++					if (x0 > 0) { bzero(rowBuf, (size_t)x0 * 4); }
++					if (x1 < fWidth) { bzero(rowBuf + x1, (size_t)(fWidth - x1) * 4); }
++					x0 = 0; x1 = fWidth; fSync.black_fill_rows++;
++				}
+ 				memcpy((void *)(dstBase + (uint64_t)y * fRowBytes + (uint64_t)x0 * 4), (const void *)(rowBuf + x0), (size_t)(x1 - x0) * 4);
++			} else {
++				bzero((void *)(dstBase + (uint64_t)y * fRowBytes), (size_t)fWidth * 4);
++				fSync.black_fill_rows++;
+ 			}
+ 		}
+ 		if (fDiag.enabled) { __atomic_fetch_add(&fDiag.copied_layers, nl, __ATOMIC_RELAXED); }
+@@ -1922,6 +2063,16 @@
+ 		}
+ 		IOFreeData(rowBuf, (vm_size_t)fWidth * 4);
+ 	} else {
++		if (nl > 0) {       /* 0393: black outside the layers' bounding box */
++			int32_t bx0 = lg[0].dx, by0 = lg[0].dy, bx1 = lg[0].dx + lg[0].w, by1 = lg[0].dy + lg[0].h;
++			for (unsigned i = 1; i < nl; i++) {
++				if (lg[i].dx < bx0) { bx0 = lg[i].dx; }
++				if (lg[i].dy < by0) { by0 = lg[i].dy; }
++				if (lg[i].dx + lg[i].w > bx1) { bx1 = lg[i].dx + lg[i].w; }
++				if (lg[i].dy + lg[i].h > by1) { by1 = lg[i].dy + lg[i].h; }
++			}
++			fSync.black_fill_rows += sweet_fb_black_outside(dstBase, fRowBytes, fWidth, fHeight, bx0, by0, bx1, by1);
++		}
+ 		for (unsigned i = 0; i < nl; i++) {
+ 			if (fDiag.enabled) { __atomic_fetch_add(&fDiag.copied_layers, 1, __ATOMIC_RELAXED); }
+ 			for (int32_t y = 0; y < lg[i].h; y++) {
+@@ -1931,6 +2082,34 @@
+ 			}
+ 		}
+ 	}
++	{   /* 0393: copy duration, source rewritten during the copy, GPU writing a layer right after it, copy verification (one layer) */
++		uint64_t cus = sweet_fb_abs_to_us(mach_absolute_time() - syncT0);
++		if (cus > 4000) { fSync.copy_gt4++; }
++		if (cus > 8000) { fSync.copy_gt8++; }
++		if (cus > fSync.copy_max_us) { fSync.copy_max_us = cus; }
++		for (unsigned i = 0; i < nl; i++) {
++			fSync.checked_layers++;
++			bool raced = sweet_fb_rows_hash(lsrc[i], lbpr[i], &lg[i]) != syncHash[i];
++			bool busy = nord2_gpu_surface_busy(ls[i]);
++			if (raced) { fSync.src_race++; }
++			if (busy) { fSync.busy_after++; }
++			if ((raced || busy) && fSync.race_logged < 16) {
++				fSync.race_logged++;
++				IOLog("NORD2 FB RACE: swap=%u layer %u surface %u source %s%s during/after the copy (%llu us, %u layers)\n", get32(rec, 0x50), lidx[i],
++				    get32(rec, 0x54 + 4 * lidx[i]), raced ? "rewritten" : "unchanged", busy ? ", GPU job writing it" : "", cus, nl);
++			}
++			if (nl == 1 && rowBuf == NULL && !raced && (fSync.checked_layers & 7) == 0) {     /* panel memory is write-combined: slow to read back, 4 rows every 8th */
++				for (int32_t r = 0; r < SWEET_FB_SYNC_ROWS; r += 5) {
++					int32_t yy = (int32_t)(((int64_t)lg[i].h - 1) * r / (SWEET_FB_SYNC_ROWS - 1));
++					if (memcmp((const void *)(dstBase + (uint64_t)(lg[i].dy + yy) * fRowBytes + (uint64_t)lg[i].dx * 4),
++					    (const void *)(lsrc[i] + (uint64_t)(lg[i].sy + yy) * lbpr[i] + (uint64_t)lg[i].sx * 4), (size_t)lg[i].w * 4) != 0) {
++						fSync.copy_mismatch++;
++						break;
++					}
++				}
++			}
++		}
++	}
+ 	if (pdiagN) {           /* 0391: the same points in the panel memory after the copy */
+ 		for (unsigned i = 0; i < nl; i++) {
+ 			if (!lptok[i]) { continue; }
+--- a/iokit/Kernel/arm/sweet_fb_swapwait.h
++++ b/iokit/Kernel/arm/sweet_fb_swapwait.h
+@@ -32,6 +32,8 @@
+ struct sweet_fb_retire {
+ 	uint32_t pending;                               /* swap queued, not taken yet (0 none) */
+ 	uint32_t presenting;                            /* swap being copied/transferred (0 none) */
++	uint32_t preparing;                             /* 0393: swap taken by the double buffer's prepare slot, copy not finished (0 none) */
++	uint64_t valve;                                 /* 0393: not-ready answers turned into ready after SWEET_FB_SWAPWAIT_VALVE_MS */
+ 	uint32_t late_id[SWEET_FB_RETIRE_LATE_SLOTS];   /* replaced unseen, GPU may still write their surfaces (0 free) */
+ 	uint64_t late_since_ms[SWEET_FB_RETIRE_LATE_SLOTS];
+ 	uint64_t dropped, late, late_busy, late_forced;
+@@ -76,6 +78,47 @@
+ 	r->pending = 0;
+ }
+ 
++/*
++ * 0393 (fbsync-20261112): the double buffer (0156) takes the pending swap in prepNext() and copies it while the previous frame is
++ * transferred.  Before 0393 the retire state did not know: the taken swap stayed "pending", so the next SwapEnd counted it as
++ * replaced unseen (retired) although its copy had not run yet, and handOver() then marked the NEWER pending swap as presenting.
++ * A swap's surfaces are free as soon as its copy ended (the panel reads our own buffer), not only after the transfer.
++ */
++#define SWEET_FB_SWAPWAIT_VALVE_MS 250u
++static inline void
++sweet_fb_retire_prep(struct sweet_fb_retire *r)
++{
++	r->preparing = r->pending;
++	r->pending = 0;
++}
++
++/* The prepared swap's copy ended, or the prepare slot hands an uncopied swap to the presenter (to_presenting). */
++static inline void
++sweet_fb_retire_prep_end(struct sweet_fb_retire *r, bool to_presenting)
++{
++	if (to_presenting) {
++		r->presenting = r->preparing;
++	}
++	r->preparing = 0;
++}
++
++/* The prepare slot dropped its swap (id) without showing it: back to pending unless a newer swap is queued. */
++static inline void
++sweet_fb_retire_prep_drop(struct sweet_fb_retire *r, bool requeued, uint32_t id)
++{
++	if (requeued && r->pending == 0) {
++		r->pending = id;
++	}
++	r->preparing = 0;
++}
++
++/* The presenting swap's copy ended (the transfer of our own buffer may still run). */
++static inline void
++sweet_fb_retire_copied(struct sweet_fb_retire *r)
++{
++	r->presenting = 0;
++}
++
+ /* The present could not start: the swap goes back to pending unless a newer one replaced it meanwhile. */
+ static inline void
+ sweet_fb_retire_requeue(struct sweet_fb_retire *r, bool requeued)
+@@ -142,7 +185,7 @@
+ 	}
+ 	switch (mode) {
+ 	case 0:
+-		return id == 0 || (id != r->pending && id != r->presenting && !sweet_fb_retire_is_late(r, id));
++		return id == 0 || (id != r->pending && id != r->presenting && id != r->preparing && !sweet_fb_retire_is_late(r, id));
+ 	case 1:
+ 		return id == 0 || (id != r->pending && !sweet_fb_retire_is_late(r, id));
+ 	case 2:

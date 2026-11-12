@@ -1,0 +1,757 @@
+diff -ruN a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-12 22:30:14.932714537 +0100
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-12 22:39:32.924086322 +0100
+@@ -42,6 +42,18 @@
+ #include "sweet_fb_blend.h"           /* 0390 */
+ #include "sweet_fb_scene.h"           /* 0392 */
+ #include "sweet_fb_hw.h"              /* 0396 */
++#include "sweet_fb_pace.h"            /* 0397 */
++
++/*
++ * 0397 (fbpace-20261112): keep the panel at 90 Hz and measure the present pacing.
++ *   - the 90 Hz guard judges the real transfer (last not-done poll), keeps the DSI underrun bit of each transfer, reverts on a timeout or
++ *     on two faults, logs why (NORD2 FB PANEL line), retries an automatic revert (sweet_fb_pace.h);
++ *   - sysctl kern.n2panelhz: read = the panel rate now (90 / 60), write 90 / 60 = switch between two frames;
++ *   - at 60 Hz after a revert the clients' frame clock follows the 60 Hz TE (it stayed at 11.2 ms against a 16.8 ms panel);
++ *   - the 0190 safe-window width only learns from transfers whose FRAME_DONE was seen on time;
++ *   - a NORD2 FB PACE line per stat window, sysctl kern.n2fbpace (since boot or the last kern.n2fbpacereset=1);
++ *   - "rate_hz" in NORD2 FB PRESENT is the panel's measured refresh rate (it printed the constant 60 / present divisor).
++ */
+ 
+ /*
+  * 0396 (hwfb-20261112): the display controller composes the layers.  kern.n2fbhw (sysctl, default 0):
+@@ -76,6 +88,8 @@
+ static uint32_t sweet_fb_hw_test_req;           /* kern.n2fbhwtest: requested test, taken by handOver */
+ static uint32_t sweet_fb_hw_test_last;          /* last test run (read back by the sysctl) */
+ static uint32_t sweet_fb_hw_hold_ms = 3000;     /* kern.n2fbhwhold */
++static uint32_t sweet_fb_hw_mode_gen;           /* 0397: kern.n2fbhw writes (a manual setting cancels a fault backoff) */
++static uint32_t sweet_fb_pool_alias_mode = 1;   /* 0397: kern.n2fbpoolalias: CPU-path reads of WC pool surfaces via a read-only cacheable alias */
+ 
+ /* 0390: n2fbblend=0 copies the SwapEnd layers over each other as before 0390 (default 1: composite them). */
+ static uint32_t sweet_fb_blend_mode = 1;
+@@ -269,6 +283,22 @@
+ 	uint32_t            fDzWaits, fSafeStarts, fPhBin[3];
+ 	uint32_t            fOvlBits[SWEET_FB_SCAN_PIPES][32], fOvlFrames, fDsiUnd;      /* 0191: OVL INTSTA bits seen after each transfer */
+ 	uint64_t            fHbPeriodUs;              /* the heartbeat period: a slow filter of the TE period */
++	/* 0397: pacing (fPaceWin per stat window, fPaceCum since boot / kern.n2fbpacereset), 90 Hz guard, true transfer bounds */
++	struct sweet_fb_pace fPaceWin, fPaceCum;
++	struct sweet_fb_p90  fP90;
++	uint64_t            fXferWaitAbs;             /* last poll that saw the transfer still running (xferStart: its start) */
++	uint64_t            fWorkArrUs, fNextArrUs;   /* arrival of the swap being presented / prepared */
++	bool                fXferUnd;                 /* DSI underrun seen at the end of this transfer */
++	uint32_t            fPanelReq;                /* kern.n2panelhz request (0 none, 60, 90), taken between two frames */
++	uint32_t            fPaceResetReq;
++	void        paceOnPush(void);
++	void        panelTo60(void);
++	void        publishRefresh(uint32_t hz);
++public:
++	int         paceStat(char *buf, size_t len);
++	uint32_t    panelHzNow(void) const { return fModeState == 1 ? 90u : 60u; }
++	void        panelRequest(uint32_t hz) { __atomic_store_n(&fPanelReq, hz, __ATOMIC_RELEASE); }
++	void        paceResetRequest(void) { __atomic_store_n(&fPaceResetReq, 1u, __ATOMIC_RELEASE); }
+ 	SweetSurface       *fSurfaceB;
+ 	uintptr_t           fPixelsB, fCopyDst;
+ 	uint8_t            *fNextRec;
+@@ -374,6 +404,17 @@
+ 	bool        hwApply(const struct sweet_fb_hw_plan *p);
+ 	void        hwRestore(const char *why);
+ 	void        hwFault(int f, const char *where);
++	/* 0397: a hardware fault turns the HW path off for a backoff (2, 4, 8, 16 s), then back on; GPU races never fault */
++	uint32_t            fHwBackoffMode, fHwBackoffGen, fHwBackoffN, fHwRaceTotalRunMax;
++	uint64_t            fHwBackoffUntilUs;
++	void        hwBackoffPoll(void);
++	/* 0397: read-only cacheable alias of the display pool for CPU-path reads of WC pool surfaces */
++	IOMemoryDescriptor *fPoolAliasMem;
++	IOMemoryMap        *fPoolAliasMap;
++	uintptr_t           fPoolAliasVa;
++	bool                fPoolAliasTried;
++	uint64_t            fPoolAliasReads, fPoolAliasInvUs;
++	uintptr_t   poolAlias(SweetSurface *s);
+ 	bool        hwFenceBusy(void);
+ 	void        hwFrameEnd(bool shown, bool timeout, bool legacy);
+ 	void        hwTestPoll(IOTimerEventSource *sender);
+@@ -426,6 +467,7 @@
+ 	if (err != 0 || !changed) { return err; }
+ 	if (v < 0 || v > (int)SWEET_FB_HW_MODE_MAX) { return EINVAL; }
+ 	uint32_t old = __atomic_exchange_n(&sweet_fb_hw_mode, (uint32_t)v, __ATOMIC_RELAXED);
++	__atomic_fetch_add(&sweet_fb_hw_mode_gen, 1u, __ATOMIC_RELAXED);      /* 0397 */
+ 	IOLog("NORD2 FB HW: mode %u -> %d (sysctl kern.n2fbhw: 0 off, 1 dry run, 2 single layer, 3 two layers)\n", old, v);
+ 	return 0;
+ }
+@@ -484,6 +526,62 @@
+     "0396 test pattern hold, ms");
+ SYSCTL_PROC(_kern, OID_AUTO, n2fbhwstat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sweet_fb_hw_sysctl_stat, "A",
+     "0396 HW composition counters");
++/* 0397: panel refresh rate at runtime, pacing counters */
++static int
++sweet_fb_pace_sysctl_hz SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = gSweetFBSnapOwner != NULL ? (int)gSweetFBSnapOwner->panelHzNow() : 0, changed = 0;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (err != 0 || !changed) { return err; }
++	if (v != 60 && v != 90) { return EINVAL; }
++	if (gSweetFBSnapOwner == NULL) { return ENODEV; }
++	gSweetFBSnapOwner->panelRequest((uint32_t)v);
++	IOLog("NORD2 FB PANEL HZ: request %d Hz (sysctl kern.n2panelhz), applied after the next present\n", v);
++	return 0;
++}
++static int
++sweet_fb_pace_sysctl_stat SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[768];
++	buf[0] = 0;
++	if (gSweetFBSnapOwner != NULL) { (void)gSweetFBSnapOwner->paceStat(buf, sizeof(buf)); }
++	else { snprintf(buf, sizeof(buf), "no framebuffer"); }
++	return sysctl_io_string(req, buf, sizeof(buf), 0, NULL);
++}
++static int
++sweet_fb_pace_sysctl_reset SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = 0, changed = 0;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (err != 0 || !changed) { return err; }
++	if (v != 1) { return EINVAL; }
++	if (gSweetFBSnapOwner == NULL) { return ENODEV; }
++	gSweetFBSnapOwner->paceResetRequest();
++	return 0;
++}
++static int
++sweet_fb_pool_alias_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = (int)__atomic_load_n(&sweet_fb_pool_alias_mode, __ATOMIC_RELAXED), changed = 0;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (err != 0 || !changed) { return err; }
++	if (v < 0 || v > 1) { return EINVAL; }
++	__atomic_store_n(&sweet_fb_pool_alias_mode, (uint32_t)v, __ATOMIC_RELAXED);
++	IOLog("NORD2 FB POOLALIAS: %s (sysctl kern.n2fbpoolalias)\n", v ? "on" : "off");
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, n2fbpoolalias, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sweet_fb_pool_alias_sysctl, "I",
++    "0397 CPU-path reads of write-combined pool surfaces through a read-only cacheable alias (1, default) or the WC mapping (0)");
++SYSCTL_PROC(_kern, OID_AUTO, n2panelhz, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sweet_fb_pace_sysctl_hz, "I",
++    "0397 panel refresh: read the rate now, write 90 or 60 to switch");
++SYSCTL_PROC(_kern, OID_AUTO, n2fbpace, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sweet_fb_pace_sysctl_stat, "A",
++    "0397 present pacing since boot or kern.n2fbpacereset");
++SYSCTL_PROC(_kern, OID_AUTO, n2fbpacereset, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sweet_fb_pace_sysctl_reset, "I",
++    "0397 write 1: reset the kern.n2fbpace counters (at the next present)");
+ #endif
+ 
+ bool
+@@ -570,6 +668,13 @@
+ 	fTePeriodUs = SWEET_FB_VSYNC_US;      /* the panel boots at 60 Hz; set to 11111 when the 90 Hz switch is accepted */
+ 	fTeLeadUs = SWEET_FB_TE_LEAD_US_DEFAULT;
+ 	fTwMinUs = 6800; fCtlEmaUs = 0; fTickCorrUs = 0; fTickCorrSumUs = 0; fDzWaits = 0; fSafeStarts = 0; fPhBin[0] = fPhBin[1] = fPhBin[2] = 0; fHbPeriodUs = 0;
++	sweet_fb_pace_reset(&fPaceWin); sweet_fb_pace_reset(&fPaceCum); bzero(&fP90, sizeof(fP90));      /* 0397 */
++	fXferWaitAbs = 0; fWorkArrUs = fNextArrUs = 0; fXferUnd = false; fPanelReq = 0; fPaceResetReq = 0;
++	fHwBackoffMode = fHwBackoffGen = fHwBackoffN = fHwRaceTotalRunMax = 0; fHwBackoffUntilUs = 0;
++	fPoolAliasMem = NULL; fPoolAliasMap = NULL; fPoolAliasVa = 0; fPoolAliasTried = false; fPoolAliasReads = 0; fPoolAliasInvUs = 0;
++	IOLog("NORD2 FB PACE: 0397 pacing counters on (sysctl kern.n2fbpace, kern.n2fbpacereset=1, kern.n2panelhz 90/60); 90 Hz guard: "
++	    "timeout or %u faults (underrun / transfer > %u us at an on-time poll), %u retries after %u presents\n",
++	    SWEET_FB_P90_FAULTS, SWEET_FB_P90_SLOW_US, SWEET_FB_P90_RETRIES, SWEET_FB_P90_RETRY_PRESENTS);
+ 	{ uint32_t lead = 0; if (PE_parse_boot_argn("n2telead", &lead, sizeof(lead)) && lead <= 4000) { fTeLeadUs = lead; } }
+ 	nanoseconds_to_absolutetime(fVsyncUs * 1000ULL, &fPeriodAbs);
+ 	/* n2swait=<0|1|2>: SwapWait semantics (0 = always success, calls logged).  0393: default 1 = a swap retires when its copy ended
+@@ -954,7 +1059,7 @@
+ 		if (!sweet_fb_swap_lifecycle_take(&fSwapLifecycle, &s)) { IOLockUnlock(fLock); IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE); return; }
+ 		fDirty = false;
+ 		sweet_fb_retire_prep(&fRetire);      /* 0393: the retire state knows the prepare slot took this swap */
+-		fNextRec = rec; fNextSurfaces = s; fNextState = 1;
++		fNextRec = rec; fNextSurfaces = s; fNextState = 1; fNextArrUs = fSwapArrUs;      /* 0397 */
+ 		fNextWaitUs = sweet_fb_abs_to_us(mach_absolute_time());
+ 		IOLockUnlock(fLock);
+ 	}
+@@ -1008,7 +1113,7 @@
+ #endif
+ 	if (!fPowerOff && fPState == 0 && fNextState != 0) {
+ 		/* 0156: the frame prepared during the last transfer goes first */
+-		fWorkRec = fNextRec; fWorkSurfaces = fNextSurfaces;
++		fWorkRec = fNextRec; fWorkSurfaces = fNextSurfaces; fWorkArrUs = fNextArrUs;      /* 0397 */
+ 		fNextRec = NULL; sweet_fb_pending_surfaces_init(&fNextSurfaces);
+ 		/* 0393: was sweet_fb_retire_take(), which marked the NEWER pending swap as presenting */
+ 		fPresentT0Us = fNextWaitUs;
+@@ -1040,6 +1145,7 @@
+ 	sweet_fb_retire_take(&fRetire);
+ 	fWorkRec = rec;
+ 	fWorkSurfaces = surfaces;
++	fWorkArrUs = fSwapArrUs;      /* 0397: the newest swap is the one taken */
+ 	fWaitStartUs = sweet_fb_abs_to_us(mach_absolute_time());
+ 	fPresentT0Us = fWaitStartUs;
+ 	fPState = 5;
+@@ -1062,6 +1168,8 @@
+ 	fDsi[SWEET_FB_DSI_START / 4] = 0;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	fDsi[SWEET_FB_DSI_START / 4] = 1;
++	fXferWaitAbs = mach_absolute_time();      /* 0397: the transfer runs from here; lower bound of its end until a poll sees it running */
++	fXferUnd = false;
+ 	return true;
+ #else
+ 	return false;
+@@ -1139,7 +1247,7 @@
+ 		/* 0396: plan the frame for the overlay (counts only in modes 0/1); 1 = registers written, no copy; -1 = eligible but a GPU write
+ 		 * is in flight: requeued, never shown; 0 = CPU path for this frame */
+ 		fb->fWorkHw = false;
+-		if (!wasPrepared) { hw = fb->hwFrameTry(__atomic_load_n(&sweet_fb_hw_mode, __ATOMIC_RELAXED)); }
++		if (!wasPrepared) { fb->hwBackoffPoll(); hw = fb->hwFrameTry(__atomic_load_n(&sweet_fb_hw_mode, __ATOMIC_RELAXED)); }      /* 0397: backoff */
+ 		if (hw < 0) { fb->presentDone(false, false, false); return; }
+ 		if (hw > 0) {
+ 			fb->fWorkHw = true;
+@@ -1220,6 +1328,7 @@
+ #endif
+ 		if (fb->fNbReady && fb->xferStart()) {
+ 			fb->fXferStart = t1;
++			fb->paceOnPush();      /* 0397 */
+ 			fb->fPState = 2;
+ 			sender->setTimeoutUS(SWEET_FB_XFER_POLL_US);
+ 			return;
+@@ -1278,6 +1387,7 @@
+ 		}
+ 		if (fb->xferStart()) {
+ 			fb->fXferStart = mach_absolute_time();
++			fb->paceOnPush();      /* 0397 */
+ 			fb->fPState = 2;
+ 			sender->setTimeoutUS(SWEET_FB_XFER_POLL_US);
+ 			return;
+@@ -1295,6 +1405,7 @@
+ 		fb->fTeObsSet = true;
+ 	}
+ #endif
++	uint64_t pollAbs = mach_absolute_time();      /* 0397 */
+ 	int st = sweet_fb_xfer_state(fb->xferDone(), elapsed);
+ #if defined(NORD2)
+ 	if (st != SWEET_FB_XFER_WAIT && fb->fOvl[0] != NULL && fb->fOvl[1] != NULL) {
+@@ -1306,10 +1417,11 @@
+ 			fb->fOvl[i][SWEET_FB_OVL_INTSTA / 4] = 0;
+ 			fb->fHwOvlOr |= v;          /* 0396: judged in hwFrameEnd for a HW frame */
+ 		}
+-		if (fb->fDsi != NULL && (fb->fDsi[SWEET_FB_DSI_INTSTA / 4] & (1u << 12))) { fb->fDsiUnd++; fb->fDsi[SWEET_FB_DSI_INTSTA / 4] = ~(1u << 12); fb->fHwDsiSt |= 1u << 12; }
++		if (fb->fDsi != NULL && (fb->fDsi[SWEET_FB_DSI_INTSTA / 4] & (1u << 12))) { fb->fDsiUnd++; fb->fDsi[SWEET_FB_DSI_INTSTA / 4] = ~(1u << 12); fb->fHwDsiSt |= 1u << 12; fb->fXferUnd = true; }
+ 	}
+ #endif
+ 	if (st == SWEET_FB_XFER_WAIT) {
++		if (fb->fPState == 2) { fb->fXferWaitAbs = pollAbs; }      /* 0397: seen running at pollAbs (before any prepNext copy below) */
+ #if defined(NORD2)
+ 		if (fb->fPState == 2) { fb->prepNext(); }
+ #endif
+@@ -1381,6 +1493,14 @@
+ 		fHbPeriodUs = (uint64_t)h;
+ 		uint64_t pabs = 0; nanoseconds_to_absolutetime(fHbPeriodUs * 1000ULL, &pabs);
+ 		fPeriodAbs = pabs;      /* the clients' frame clock runs at the panel's real refresh rate (it ran at 11111 us against a 11226 us panel: a dropped frame every second) */
++	} else if (fModeState == 2 && obsLocked && fTePeriodUs > 15500 && fTePeriodUs < 18000) {
++		/* 0397: back at 60 Hz (revert / kern.n2panelhz=60): the clock follows the 60 Hz TE instead of staying at 11.2 ms (89 Hz frames on a 59.4 Hz panel) */
++		int64_t h = fHbPeriodUs ? (int64_t)fHbPeriodUs : (int64_t)fTePeriodUs;
++		h += ((int64_t)fTePeriodUs - h) / 16;
++		if (h < 16000) { h = 16000; } else if (h > 17500) { h = 17500; }
++		fHbPeriodUs = (uint64_t)h;
++		uint64_t pabs = 0; nanoseconds_to_absolutetime(fHbPeriodUs * 1000ULL, &pabs);
++		fPeriodAbs = pabs;
+ 	}
+ #else
+ 	(void)obsUs; (void)precise;
+@@ -1579,6 +1699,63 @@
+ 	return ok && locked;
+ }
+ 
++/* 0397: panel and link back to the boot configuration (60 Hz, 600 Mbps), between two frames; the clients' clock then follows the 60 Hz TE */
++void
++AppleCLCD::panelTo60(void)
++{
++	if (fModeState == 1) { (void)panelRefresh(false); }
++	fModeState = 2; fTePeriodUs = SWEET_FB_VSYNC_US; fTeLastUs = 0; fHbPeriodUs = 0;
++	if (fRetuneState == 1) { linkRetune(false); } else { fRetuneState = 2; }
++	publishRefresh(60);
++}
++
++/* 0397: the rate CoreAnimation reads (published at start() for 90 Hz); kept in step with the panel after a switch */
++void
++AppleCLCD::publishRefresh(uint32_t hz)
++{
++	uint32_t interval = (uint32_t)(((1ULL << 32) + hz / 2) / hz);
++	OSDictionary *refresh = OSDictionary::withCapacity(1);
++	OSNumber *num = OSNumber::withNumber((unsigned long long)interval, 32);
++	if (refresh != NULL && num != NULL) {
++		refresh->setObject("displayMinRefreshInterval", num);
++		setProperty("IOMFBDisplayRefresh", refresh);
++		IOLog("NORD2 FB PANEL: IOMFBDisplayRefresh.displayMinRefreshInterval %u (1/%u s) republished\n", interval, hz);
++	}
++	OSSafeReleaseNULL(num);
++	OSSafeReleaseNULL(refresh);
++}
++
++/* 0397: a panel transfer just started (present thread) */
++void
++AppleCLCD::paceOnPush(void)
++{
++	uint64_t nowUs = sweet_fb_abs_to_us(mach_absolute_time());
++	if (__atomic_exchange_n(&fPaceResetReq, 0u, __ATOMIC_ACQ_REL) != 0) {
++		IOLockLock(fLock);      /* the arrival side writes under fLock */
++		sweet_fb_pace_reset(&fPaceCum);
++		IOLockUnlock(fLock);
++		IOLog("NORD2 FB PACE: counters reset (kern.n2fbpacereset)\n");
++	}
++	uint64_t P = fTePeriodUs ? fTePeriodUs : SWEET_FB_VSYNC_US;
++	sweet_fb_pace_push(&fPaceWin, nowUs, P, fWorkArrUs);
++	sweet_fb_pace_push(&fPaceCum, nowUs, P, fWorkArrUs);
++}
++
++int
++AppleCLCD::paceStat(char *buf, size_t len)
++{
++	struct sweet_fb_pace c;
++	IOLockLock(fLock);
++	c = fPaceCum;
++	IOLockUnlock(fLock);
++	int n = sweet_fb_pace_format(&c, buf, len, fTePeriodUs, fHbPeriodUs ? fHbPeriodUs : sweet_fb_abs_to_us(fPeriodAbs), fModeState);
++	if (n > 0 && (size_t)n < len) {
++		n += snprintf(buf + n, len - (size_t)n, " p90_reverts=%u retries=%u last=%s spurious_slow=%llu",
++		    fP90.reverts, fP90.retries, sweet_fb_p90_reason_name(fP90.last_reason), fP90.spurious_slow);
++	}
++	return n;
++}
++
+ void
+ AppleCLCD::presentDone(bool shown, bool timeout, bool legacy)
+ {
+@@ -1591,7 +1768,11 @@
+ #if defined(NORD2)
+ 	/* 0154: the presenter still owns the engine here (fPState != 0), the link is idle */
+ 	if (shown && !legacy) {
+-		if (xfer > 3000 && xfer < 20000) {
++		/* 0397: the transfer ended between the last poll that saw it running (xlo) and now (xfer); only an on-time poll measures it */
++		uint64_t xlo = fXferWaitAbs > fXferStart ? sweet_fb_abs_to_us(fXferWaitAbs - fXferStart) : 0;
++		bool ontime = xfer >= xlo && xfer - xlo <= SWEET_FB_PACE_ONTIME_US;
++		sweet_fb_pace_xfer(&fPaceWin, xlo, xfer); sweet_fb_pace_xfer(&fPaceCum, xlo, xfer);
++		if (ontime && xfer > 3000 && xfer < 20000) {
+ 			uint64_t m = xfer > 300 ? xfer - 300 : xfer;      /* 0190: the safe-window width follows the fastest transfers */
+ 			if (m < fTwMinUs) { fTwMinUs = m; } else { fTwMinUs += (m - fTwMinUs) / 64; }
+ 			if (fTwMinUs < 4500) { fTwMinUs = 4500; }
+@@ -1604,14 +1785,40 @@
+ 			linkRetune(true);
+ 			if (fRetuneState == 1 && fPanelHz == 90 && fModeState == 0) {
+ 				fModeState = panelRefresh(true) ? 1 : 2;
+-				if (fModeState == 1) { fTePeriodUs = 11226; fTeLastUs = 0; }      /* re-acquire the TE at the new rate */
++				if (fModeState == 1) {
++					fTePeriodUs = 11226; fTeLastUs = 0; fHbPeriodUs = 0; fP90.faults = 0;      /* re-acquire the TE at the new rate */
++					publishRefresh(90);      /* 0397 */
++					IOLog("NORD2 FB PANEL: 90 Hz on at present %u (switch %u, retry %u/%u)\n", fPresents, fP90.reverts + 1, fP90.retries, SWEET_FB_P90_RETRIES);
++				}
+ 			}
+ 			if (!fDbl && fRetuneState == 1) { (void)dblEnable(); }
+ 		}
+-		else if (fRetuneState == 1 && fPresents - fRetunePresents < 40 && fDsi != NULL &&
+-		    (timeout || xfer > 30000 || (fDsi[SWEET_FB_DSI_INTSTA / 4] & (1u << 12)))) {
+-			if (fModeState == 1) { (void)panelRefresh(false); fModeState = 2; fTePeriodUs = SWEET_FB_VSYNC_US; fTeLastUs = 0; }
+-			linkRetune(false);
++		else if (fRetuneState == 1 && fPresents - fRetunePresents < 40 && fDsi != NULL) {
++			/* 0397: was timeout || xfer > 30000 (the poll latency: a prepNext copy of 50-110 ms in the poll loop) || bit 12 (already cleared) */
++			bool und = fXferUnd || (fDsi[SWEET_FB_DSI_INTSTA / 4] & (1u << 12)) != 0;
++			uint32_t why = SWEET_FB_P90_R_NONE;
++			bool revert = sweet_fb_p90_judge(&fP90, timeout, und, xlo, xfer, &why);
++			if (revert || why != SWEET_FB_P90_R_NONE) {
++				IOLog("NORD2 FB PANEL: 90 Hz %s: reason=%s xfer_lo_us=%llu xfer_hi_us=%llu underrun=%u faults=%u present %u of the guard window, retries %u/%u\n",
++				    revert ? "reverted" : "fault", sweet_fb_p90_reason_name(why), xlo, xfer, und ? 1u : 0u, fP90.faults, fPresents - fRetunePresents,
++				    fP90.retries, SWEET_FB_P90_RETRIES);
++			}
++			if (revert) { sweet_fb_p90_reverted(&fP90, why, fPresents); panelTo60(); }
++		}
++		/* 0397: kern.n2panelhz requests and the retry of an automatic revert (the presenter owns the engine, the link is idle) */
++		uint32_t req = __atomic_exchange_n(&fPanelReq, 0u, __ATOMIC_ACQ_REL);
++		if (req == 60 && fModeState != 2) {
++			sweet_fb_p90_reverted(&fP90, SWEET_FB_P90_R_MANUAL, fPresents);
++			IOLog("NORD2 FB PANEL: 60 Hz (sysctl kern.n2panelhz), no automatic retry\n");
++			panelTo60();
++		} else if (req == 90 && fModeState != 1 && fFlushTicks <= 1) {
++			if (fRetuneState == 1) { linkRetune(false); }
++			fPanelHz = 90; fP90.manual = false; fP90.faults = 0; fRetuneState = 0; fModeState = 0;
++			IOLog("NORD2 FB PANEL: 90 Hz requested (sysctl kern.n2panelhz): link retune and panel switch at the next present\n");
++		} else if (fModeState == 2 && fRetuneState == 2 && fPanelHz == 90 && sweet_fb_p90_retry_due(&fP90, fPresents)) {
++			fP90.retries++; fP90.faults = 0; fRetuneState = 0; fModeState = 0;
++			IOLog("NORD2 FB PANEL: 90 Hz retry %u/%u after the %s revert %u presents ago\n", fP90.retries, SWEET_FB_P90_RETRIES,
++			    sweet_fb_p90_reason_name(fP90.last_reason), fPresents - fP90.revert_at);
+ 		}
+ 	}
+ #endif
+@@ -1664,7 +1871,7 @@
+ 		IOLog("NORD2 FB PRESENT: n=%u avg_us=%llu max_us=%u copy_us=%llu/%u xfer_us=%llu/%u legacy=%u timeouts=%u busy_skips=%u busy_forced=%u late_ticks=%u rate_hz=%u resv_expired=%llu busy_same=%u busy_diff=%u busy_maxrun=%u\n",
+ 		    fStats.n, fStats.sum_us / n, fStats.max_us, fStats.sum_copy_us / n, fStats.max_copy_us,
+ 		    fStats.sum_xfer_us / n, fStats.max_xfer_us, fStats.legacy, fStats.timeouts, fStats.busy_skips,
+-		    fStats.busy_forced, fStats.late_ticks, 60 / fFlushTicks, nord2_gpu_resv_expired(),
++		    fStats.busy_forced, fStats.late_ticks, fTePeriodUs ? (uint32_t)((1000000ULL + fTePeriodUs / 2) / fTePeriodUs) : 0u, nord2_gpu_resv_expired(),      /* 0397: the panel's measured rate */
+ 		    fStats.busy_same, fStats.busy_diff, fStats.busy_maxrun);
+ 		IOLog("NORD2 FB ARRIVAL: swap_gaps_ms<=8/20/34/67/more=%u/%u/%u/%u/%u arrival_to_copy_ms<=8/16/25/33/more=%u/%u/%u/%u/%u\n",
+ 		    fArrBin[0], fArrBin[1], fArrBin[2], fArrBin[3], fArrBin[4], fLatBin[0], fLatBin[1], fLatBin[2], fLatBin[3], fLatBin[4]);
+@@ -1696,6 +1903,17 @@
+ 			    fSync.checked_layers, fSync.empty_frames, fSync.black_fill_rows, fSync.copy_gt4, fSync.copy_gt8, fSync.copy_max_us, fSync.total_gt16,
+ 			    fSync.total_max_us, fSwapWaitLevel, fRetire.not_ready, fRetire.valve, fRetire.dropped);
+ 			fOvlFrames = 0; fDsiUnd = 0; memset(fOvlBits, 0, sizeof(fOvlBits));
++			{   /* 0397: pacing of this window (the cumulative counters: sysctl kern.n2fbpace) */
++				static char pb[640];      /* present thread only */
++				(void)sweet_fb_pace_format(&fPaceWin, pb, sizeof(pb), fTePeriodUs, sweet_fb_abs_to_us(fPeriodAbs), fModeState);
++				IOLog("NORD2 FB PACE: %s p90_reverts=%u retries=%u spurious_slow=%llu | hw_backoffs=%u race_run_max=%u alias_reads=%llu alias_inv_us=%llu\n", pb,
++				    fP90.reverts, fP90.retries, fP90.spurious_slow, fHwBackoffN, fHwRaceTotalRunMax, fPoolAliasReads, fPoolAliasInvUs);
++				uint64_t lp = fPaceWin.last_push_us, la = fPaceWin.last_arr_us;
++				IOLockLock(fLock);
++				sweet_fb_pace_reset(&fPaceWin);
++				fPaceWin.last_push_us = lp; fPaceWin.last_arr_us = la;      /* intervals across the window edge still count */
++				IOLockUnlock(fLock);
++			}
+ 			{   /* 0396 (cumulative since boot) */
+ 				char hb[768];
+ 				(void)hwStat(hb, sizeof(hb));
+@@ -1908,9 +2126,63 @@
+ 	uint32_t old = __atomic_exchange_n(&sweet_fb_hw_mode, 0, __ATOMIC_RELAXED);
+ 	IOLog("NORD2 FB HW: AUTO-DISABLE %s (%s): kern.n2fbhw %u -> 0, hw_frames=%llu ovl_int=%08x dsi=%08x race_run=%u\n", sweet_fb_hw_fault_name(f),
+ 	    where, old, fHwSt.frames, fHwOvlOr, fHwDsiSt, fHwRaceRun);
++	/* 0397: temporary: back on after 2, 4, 8, 16 s (4 times per boot), unless kern.n2fbhw is set by hand meanwhile */
++	if (old >= SWEET_FB_HW_SINGLE && fHwBackoffN < 4) {
++		uint64_t ms = 2000ull << fHwBackoffN;
++		fHwBackoffMode = old; fHwBackoffGen = __atomic_load_n(&sweet_fb_hw_mode_gen, __ATOMIC_RELAXED); fHwBackoffN++;
++		fHwBackoffUntilUs = sweet_fb_abs_to_us(mach_absolute_time()) + ms * 1000ull;
++		IOLog("NORD2 FB HW: BACKOFF mode %u back on in %llu ms (backoff %u/4)\n", old, ms, fHwBackoffN);
++	} else if (old >= SWEET_FB_HW_SINGLE) {
++		fHwBackoffMode = 0;
++		IOLog("NORD2 FB HW: BACKOFF exhausted (4 faults): HW composition stays off (kern.n2fbhw=%u turns it on again)\n", old);
++	}
+ 	hwRestore("auto-disable");
+ }
+ 
++/* 0397: present thread, before a frame is planned */
++void
++AppleCLCD::hwBackoffPoll(void)
++{
++	if (fHwBackoffMode == 0) { return; }
++	if (__atomic_load_n(&sweet_fb_hw_mode_gen, __ATOMIC_RELAXED) != fHwBackoffGen || __atomic_load_n(&sweet_fb_hw_mode, __ATOMIC_RELAXED) != 0 ||
++	    (fHwInitDone && !fHwInitOk)) {
++		fHwBackoffMode = 0;      /* set by hand meanwhile, or the overlay is unusable for this boot */
++		return;
++	}
++	if (sweet_fb_abs_to_us(mach_absolute_time()) < fHwBackoffUntilUs) { return; }
++	(void)__atomic_exchange_n(&sweet_fb_hw_mode, fHwBackoffMode, __ATOMIC_RELAXED);
++	IOLog("NORD2 FB HW: BACKOFF over: kern.n2fbhw 0 -> %u after the %s fault (backoff %u/4)\n", fHwBackoffMode, sweet_fb_hw_fault_name(fHwSt.last_fault), fHwBackoffN);
++	fHwBackoffMode = 0;
++}
++
++/* 0397: CPU-path source address of a write-combined pool surface through one read-only copy-back mapping of the whole pool (created on first
++ * use).  0394 maps the pool WC everywhere (uncached reads: an 11 MB layer took 80-110 ms, 300 ms for a 3-layer frame).  The alias is never
++ * written, so it never holds dirty lines (nothing can be written back over GPU data); presentCopy cleans+invalidates the rows it reads right
++ * before reading them, so no stale line from an earlier frame or a speculative fill is used.  0 = use the surface's own mapping. */
++uintptr_t
++AppleCLCD::poolAlias(SweetSurface *s)
++{
++	if (s == NULL || __atomic_load_n(&sweet_fb_pool_alias_mode, __ATOMIC_RELAXED) == 0) { return 0; }
++	if (sweet_surface_pool_cache_obj(s) != SWEET_FB_HW_POOL_CACHE_WC) { return 0; }
++	uint64_t pa = sweet_surface_pool_pa_obj(s), sz = sweet_surface_pool_size_obj(s);
++	if (!sweet_fb_hw_pool_contains(pa, sz)) { return 0; }
++	if (fPoolAliasVa == 0) {
++		if (fPoolAliasTried) { return 0; }
++		fPoolAliasTried = true;
++		fPoolAliasMem = IOMemoryDescriptor::withPhysicalAddress(SWEET_FB_HW_POOL_BASE, SWEET_FB_HW_POOL_SIZE, kIODirectionIn);
++		fPoolAliasMap = fPoolAliasMem != NULL ? fPoolAliasMem->map(kIOMapCopybackCache | kIOMapReadOnly) : NULL;
++		if (fPoolAliasMap == NULL) {
++			OSSafeReleaseNULL(fPoolAliasMem);
++			IOLog("NORD2 FB POOLALIAS: refused (pool not mappable copy-back): CPU-path reads stay on the WC mappings\n");
++			return 0;
++		}
++		fPoolAliasVa = (uintptr_t)fPoolAliasMap->getVirtualAddress();
++		IOLog("NORD2 FB POOLALIAS: read-only copy-back alias of the pool 0x%llx+0x%llx at %p for CPU-path reads (kern.n2fbpoolalias=0: off)\n",
++		    SWEET_FB_HW_POOL_BASE, SWEET_FB_HW_POOL_SIZE, (void *)fPoolAliasVa);
++	}
++	return fPoolAliasVa + (uintptr_t)(pa - SWEET_FB_HW_POOL_BASE);
++}
++
+ /* the GPU fence: a write job on a layer surface queued or running, a 0112 reservation, or 0395's write-pending */
+ bool
+ AppleCLCD::hwFenceBusy(void)
+@@ -1993,7 +2265,13 @@
+ 		IOLog("NORD2 FB HW: frame %llu shown by the overlay (%u layers, no CPU copy), ovl_int %08x dsi %08x timeout %u\n", fHwSt.frames, fHwN, ovl, dsi, timeout ? 1u : 0u);
+ 	}
+ 	fHwOvlOr = ovl; fHwDsiSt = dsi;
+-	int f = sweet_fb_hw_frame_fault(ovl, dsi, timeout, raced, &fHwRaceRun);
++	/* 0397: a GPU write that started on a shown layer before FRAME_DONE is the client reusing its buffer early: at worst this one frame
++	 * mixes two pictures.  It is counted, never a fault (16 in a row turned HW composition off for the boot and left the UI on 80-ms CPU
++	 * copies of WC pool surfaces).  Only underflow / DSI underrun / timeout fault (with a backoff, hwFault). */
++	uint32_t norace = 0;
++	int f = sweet_fb_hw_frame_fault(ovl, dsi, timeout, false, &norace);
++	fHwRaceRun = raced ? fHwRaceRun + 1 : 0;
++	if (fHwRaceRun > fHwRaceTotalRunMax) { fHwRaceTotalRunMax = fHwRaceRun; }
+ 	if (f != SWEET_FB_HW_F_NONE) { hwFault(f, "frame"); }
+ 	fHwOvlOr = 0; fHwDsiSt = 0;
+ }
+@@ -2456,6 +2734,7 @@
+ 		uint64_t nu = sweet_fb_abs_to_us(mach_absolute_time());
+ 		if (fSwapLastUs) { uint64_t g = nu - fSwapLastUs; fArrBin[g <= 8000 ? 0 : g <= 20000 ? 1 : g <= 34000 ? 2 : g <= 67000 ? 3 : 4]++; }
+ 		fSwapLastUs = nu; fSwapArrUs = nu;
++		sweet_fb_pace_arrival(&fPaceWin, nu); sweet_fb_pace_arrival(&fPaceCum, nu);      /* 0397 (fLock) */
+ 	}
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	if (sweet_fb_swap_lifecycle_queue(&fSwapLifecycle, &incoming, &replaced)) {
+@@ -2571,6 +2850,7 @@
+ 	SweetSurface *ls[SWEET_FB_LAYERS];
+ 	bool lown[SWEET_FB_LAYERS];
+ 	uintptr_t lsrc[SWEET_FB_LAYERS];
++	bool lalias[SWEET_FB_LAYERS] = { false, false, false, false };      /* 0397: read through the pool's copy-back alias */
+ 	uint32_t lbpr[SWEET_FB_LAYERS], lidx[SWEET_FB_LAYERS];
+ 	struct sweet_fb_layer_geom lg[SWEET_FB_LAYERS];
+ 	unsigned nl = 0;
+@@ -2672,6 +2952,12 @@
+ 			if (ownRef) s->release();
+ 			continue;
+ 		}
++#if defined(NORD2)
++		if (s->offset == 0 && last <= sweet_surface_pool_size_obj(s)) {      /* 0397 */
++			uintptr_t a = poolAlias(s);
++			if (a != 0) { src = a; lalias[nl] = true; }
++		}
++#endif
+ 		ls[nl] = s; lown[nl] = ownRef; lsrc[nl] = src + s->offset; lbpr[nl] = s->bytesPerRow; lidx[nl] = layer; lg[nl] = g;
+ 		memcpy(lpt[nl], pt, sizeof(pt)); lptok[nl] = pxok;
+ 		nl++;
+@@ -2681,6 +2967,17 @@
+ 	fLastCopyLayers = nl;
+ 	if (nl == 0) { fCopyEmpty = true; }
+ 	uint64_t syncHash[SWEET_FB_LAYERS];
++	{   /* 0397: alias rows: clean+invalidate (CIVAC, allowed on a read-only mapping) right before they are read: memory, not an old line */
++		uint64_t t0 = mach_absolute_time();
++		bool any = false;
++		for (unsigned i = 0; i < nl; i++) {
++			if (!lalias[i]) { continue; }
++			any = true;
++			FlushPoC_DcacheRegion((vm_offset_t)(lsrc[i] + (uint64_t)lg[i].sy * lbpr[i]), (unsigned)((uint64_t)lg[i].h * lbpr[i]));
++			fPoolAliasReads++;
++		}
++		if (any) { fPoolAliasInvUs += sweet_fb_abs_to_us(mach_absolute_time() - t0); }
++	}
+ 	for (unsigned i = 0; i < nl; i++) { syncHash[i] = sweet_fb_rows_hash(lsrc[i], lbpr[i], &lg[i]); }
+ 	uint64_t syncT0 = mach_absolute_time();
+ 	/* 0391: no stale CPU line of a GPU-written layer may satisfy the copy (CIVAC = what the GPU driver's own maintenance does). */
+@@ -2688,6 +2985,7 @@
+ 	if (nl > 1 && sweet_fb_inval_mode != 0) {
+ 		uint64_t t0 = mach_absolute_time();
+ 		for (unsigned i = 0; i < nl; i++) {
++			if (lalias[i]) { continue; }      /* 0397: done above */
+ 			FlushPoC_DcacheRegion((vm_offset_t)(lsrc[i] + (uint64_t)lg[i].sy * lbpr[i]), (unsigned)((uint64_t)lg[i].h * lbpr[i]));
+ 		}
+ 		inval_us = sweet_fb_abs_to_us(mach_absolute_time() - t0);
+diff -ruN a/iokit/Kernel/arm/sweet_fb_pace.h b/iokit/Kernel/arm/sweet_fb_pace.h
+--- a/iokit/Kernel/arm/sweet_fb_pace.h	1970-01-01 01:00:00.000000000 +0100
++++ b/iokit/Kernel/arm/sweet_fb_pace.h	2026-11-12 22:40:15.999196776 +0100
+@@ -0,0 +1,216 @@
++#ifndef SWEET_FB_PACE_H
++#define SWEET_FB_PACE_H
++/*
++ * 0397 (fbpace-20261112): present pacing measurement and the 90 Hz panel guard, pure and host-testable (never touches IOKit).
++ *
++ * Pacing.  Every push (start of a panel transfer from the present thread) is one present.  Between two pushes the panel refreshed
++ * k = round(dt / P) times (P = the measured TE period); k - 1 refreshes showed the old picture again (dropped refreshes).  A gap above
++ * SWEET_FB_PACE_IDLE_US is the UI being idle, not a drop.  "Fixed 90 fps" = panel at ~89 Hz (P 11.1..11.35 ms), every active interval
++ * k == 1 (refreshes_per_present 1 = 100 %), active_fps ~ 89.  A dropped refresh is classified by the arrival time of the swap that
++ * was finally pushed: it had arrived at least half a period before the missed slot ("ready": the presenter, the GPU wait or the TE
++ * window lost it) or not ("nosw": CoreAnimation delivered late).  Busy seconds (1 s buckets fully inside activity) are histogrammed
++ * by presents per second.
++ *
++ * 90 Hz guard.  The panel goes to 90 Hz (and the link to 750 Mbps) after the first 30 presents; during the next 40 presents a bad
++ * transfer reverts both.  Before 0397 "bad" was timeout || measured xfer > 30 ms || DSI INTSTA bit 12, where the measured xfer was
++ * taken at the first present-thread poll that saw FRAME_DONE: a 50-110 ms CPU copy of the next frame done inside that poll loop
++ * (prepNext, slow WC pool sources since 0394) made a 9 ms transfer look like 80 ms and reverted the panel to 60 Hz for the whole boot
++ * (q10jfi fbhwlive), and bit 12 was already cleared by the per-transfer status read.  Now: a timeout reverts at once; an underrun or a
++ * transfer still not done at a poll more than 30 ms after its start (the lower bound, not the poll latency) is a fault, two faults
++ * revert.  A late-poll "slow" transfer is only counted (spurious_slow).  An automatic revert is retried up to SWEET_FB_P90_RETRIES
++ * times, SWEET_FB_P90_RETRY_PRESENTS presents later; a manual 60 (sysctl kern.n2panelhz=60) is never retried.
++ */
++#include <stdbool.h>
++#include <stdint.h>
++#if defined(KERNEL)
++#include <libkern/libkern.h>      /* snprintf */
++#else
++#include <stdio.h>
++#endif
++
++#define SWEET_FB_PACE_IDLE_US        100000u
++#define SWEET_FB_PACE_SEC_US         1000000u
++#define SWEET_FB_PACE_ONTIME_US      1000u        /* a FRAME_DONE seen within this of the previous not-done poll: the transfer time is known */
++#define SWEET_FB_P90_SLOW_US         30000u
++#define SWEET_FB_P90_FAULTS          2u
++#define SWEET_FB_P90_RETRIES         2u
++#define SWEET_FB_P90_RETRY_PRESENTS  600u
++
++struct sweet_fb_pace {
++	uint64_t last_push_us, last_arr_us;
++	uint64_t active_us;                 /* sum of the active push intervals */
++	uint64_t dropped, drop_ready, drop_nosw;
++	uint32_t pushes, active, idle;
++	uint32_t k[5];                      /* refreshes per present: 1, 2, 3, 4, 5+ */
++	uint32_t ivl[6];                    /* push intervals, ms: <=12.5 <=18 <=24 <=35 <=50 <=100 */
++	uint32_t arr[7];                    /* swap arrival gaps, same bins + >100 */
++	uint32_t run, best_run;             /* consecutive k == 1 intervals */
++	uint64_t sec_start_us, sec_first_us, sec_last_us;
++	uint32_t sec_pushes;
++	bool     sec_broken;
++	uint32_t rate[7];                   /* busy seconds by presents: <30 <45 <62 <75 <85 <88 >=88 */
++	uint32_t busy_secs;
++	uint64_t xfer_sum_us;
++	uint32_t xfer_n, xfer_max_us, poll_late;
++};
++
++static inline uint32_t
++sweet_fb_pace_ms_bin(uint64_t dt_us)
++{
++	return dt_us <= 12500 ? 0 : dt_us <= 18000 ? 1 : dt_us <= 24000 ? 2 : dt_us <= 35000 ? 3 : dt_us <= 50000 ? 4 : dt_us <= 100000 ? 5 : 6;
++}
++
++static inline uint32_t
++sweet_fb_pace_periods(uint64_t dt_us, uint64_t period_us)
++{
++	if (period_us == 0) { return 1; }
++	uint64_t k = (dt_us + period_us / 2) / period_us;
++	return k < 1 ? 1 : (k > 0xffffu ? 0xffffu : (uint32_t)k);
++}
++
++static inline uint32_t
++sweet_fb_pace_rate_bin(uint32_t n)
++{
++	return n < 30 ? 0 : n < 45 ? 1 : n < 62 ? 2 : n < 75 ? 3 : n < 85 ? 4 : n < 88 ? 5 : 6;
++}
++
++static inline void
++sweet_fb_pace_reset(struct sweet_fb_pace *p)
++{
++	__builtin_memset(p, 0, sizeof(*p));
++}
++
++/* close every 1 s bucket that ended before now; a bucket counts only if activity covered it (first push within IDLE of its start,
++ * last push within IDLE of its end, no idle gap inside) */
++static inline void
++sweet_fb_pace_sec_roll(struct sweet_fb_pace *p, uint64_t now_us)
++{
++	if (p->sec_start_us == 0) { p->sec_start_us = now_us; return; }
++	while (now_us >= p->sec_start_us + SWEET_FB_PACE_SEC_US) {
++		uint64_t s = p->sec_start_us, e = s + SWEET_FB_PACE_SEC_US;
++		if (!p->sec_broken && p->sec_pushes != 0 && p->sec_first_us <= s + SWEET_FB_PACE_IDLE_US && p->sec_last_us + SWEET_FB_PACE_IDLE_US >= e) {
++			p->rate[sweet_fb_pace_rate_bin(p->sec_pushes)]++;
++			p->busy_secs++;
++		}
++		p->sec_pushes = 0; p->sec_broken = false; p->sec_first_us = 0; p->sec_last_us = 0;
++		p->sec_start_us = e;
++		if (now_us - p->sec_start_us > 4 * (uint64_t)SWEET_FB_PACE_SEC_US) { p->sec_start_us = now_us; }      /* long idle: restart the grid */
++	}
++}
++
++/* one push at now_us; period_us = the panel's TE period; arr_us = when the pushed swap arrived (0 = unknown) */
++static inline void
++sweet_fb_pace_push(struct sweet_fb_pace *p, uint64_t now_us, uint64_t period_us, uint64_t arr_us)
++{
++	sweet_fb_pace_sec_roll(p, now_us);
++	if (p->last_push_us != 0 && now_us > p->last_push_us) {
++		uint64_t dt = now_us - p->last_push_us;
++		if (dt > SWEET_FB_PACE_IDLE_US) {
++			p->idle++; p->run = 0; p->sec_broken = true;
++		} else {
++			uint32_t k = sweet_fb_pace_periods(dt, period_us);
++			p->active++; p->active_us += dt;
++			p->ivl[sweet_fb_pace_ms_bin(dt)]++;
++			p->k[k >= 5 ? 4 : k - 1]++;
++			if (k == 1) {
++				if (++p->run > p->best_run) { p->best_run = p->run; }
++			} else {
++				p->run = 0;
++				p->dropped += k - 1;
++				if (arr_us != 0 && arr_us + period_us / 2 <= p->last_push_us + period_us) { p->drop_ready += k - 1; }
++				else { p->drop_nosw += k - 1; }
++			}
++		}
++	}
++	if (p->sec_pushes == 0) { p->sec_first_us = now_us; }
++	p->sec_pushes++; p->sec_last_us = now_us;
++	p->pushes++;
++	p->last_push_us = now_us;
++}
++
++static inline void
++sweet_fb_pace_arrival(struct sweet_fb_pace *p, uint64_t now_us)
++{
++	if (p->last_arr_us != 0 && now_us > p->last_arr_us) { p->arr[sweet_fb_pace_ms_bin(now_us - p->last_arr_us)]++; }
++	p->last_arr_us = now_us;
++}
++
++/* one finished transfer: lo = last poll that saw it running, hi = the poll that saw FRAME_DONE (both since the start) */
++static inline void
++sweet_fb_pace_xfer(struct sweet_fb_pace *p, uint64_t lo_us, uint64_t hi_us)
++{
++	if (hi_us < lo_us || hi_us - lo_us > SWEET_FB_PACE_ONTIME_US) { p->poll_late++; return; }
++	uint64_t t = (lo_us + hi_us) / 2;
++	p->xfer_sum_us += t; p->xfer_n++;
++	if (t > p->xfer_max_us) { p->xfer_max_us = (uint32_t)t; }
++}
++
++/* active presents per second x10 (one decimal) */
++static inline uint32_t
++sweet_fb_pace_fps10(const struct sweet_fb_pace *p)
++{
++	return p->active_us ? (uint32_t)(((uint64_t)p->active * 10000000ull + p->active_us / 2) / p->active_us) : 0;
++}
++
++static inline int
++sweet_fb_pace_format(const struct sweet_fb_pace *p, char *buf, size_t len, uint64_t te_us, uint64_t hb_us, uint32_t mode)
++{
++	uint32_t f = sweet_fb_pace_fps10(p);
++	uint32_t hz10 = te_us ? (uint32_t)((10000000ull + te_us / 2) / te_us) : 0;
++	uint32_t k1pm = p->active ? (uint32_t)((uint64_t)p->k[0] * 1000u / p->active) : 0;
++	return snprintf(buf, len,
++	    "panel_hz=%u.%u te_us=%llu hb_us=%llu mode=%u pushes=%u active=%u idle_gaps=%u active_fps=%u.%u k1_permille=%u "
++	    "refresh_per_present_1/2/3/4/5+=%u/%u/%u/%u/%u dropped=%llu (ready %llu nosw %llu) best_run=%u "
++	    "ivl_ms<=12.5/18/24/35/50/100=%u/%u/%u/%u/%u/%u arr_ms<=12.5/18/24/35/50/100/more=%u/%u/%u/%u/%u/%u/%u "
++	    "busy_s=%u rate_s<30/45/62/75/85/88/88+=%u/%u/%u/%u/%u/%u/%u xfer_true_avg_us=%llu max=%u n=%u poll_late=%u",
++	    hz10 / 10, hz10 % 10, (unsigned long long)te_us, (unsigned long long)hb_us, mode, p->pushes, p->active, p->idle, f / 10, f % 10, k1pm,
++	    p->k[0], p->k[1], p->k[2], p->k[3], p->k[4], (unsigned long long)p->dropped, (unsigned long long)p->drop_ready,
++	    (unsigned long long)p->drop_nosw, p->best_run,
++	    p->ivl[0], p->ivl[1], p->ivl[2], p->ivl[3], p->ivl[4], p->ivl[5],
++	    p->arr[0], p->arr[1], p->arr[2], p->arr[3], p->arr[4], p->arr[5], p->arr[6],
++	    p->busy_secs, p->rate[0], p->rate[1], p->rate[2], p->rate[3], p->rate[4], p->rate[5], p->rate[6],
++	    (unsigned long long)(p->xfer_n ? p->xfer_sum_us / p->xfer_n : 0), p->xfer_max_us, p->xfer_n, p->poll_late);
++}
++
++/* ---- 90 Hz guard ---- */
++enum { SWEET_FB_P90_R_NONE = 0, SWEET_FB_P90_R_TIMEOUT = 1, SWEET_FB_P90_R_UNDERRUN = 2, SWEET_FB_P90_R_SLOW = 3, SWEET_FB_P90_R_MANUAL = 4 };
++
++struct sweet_fb_p90 {
++	uint32_t faults;            /* in the current guard window */
++	uint32_t reverts, retries, last_reason, revert_at;
++	bool     manual;            /* kern.n2panelhz=60: no automatic retry */
++	uint64_t spurious_slow;     /* measured > 30 ms only because the poll was late (not a fault) */
++};
++
++static inline const char *
++sweet_fb_p90_reason_name(uint32_t r)
++{
++	return r == SWEET_FB_P90_R_TIMEOUT ? "timeout" : r == SWEET_FB_P90_R_UNDERRUN ? "underrun" : r == SWEET_FB_P90_R_SLOW ? "slow" :
++	    r == SWEET_FB_P90_R_MANUAL ? "manual" : "none";
++}
++
++/* one transfer inside the guard window.  Returns true when the panel must go back to 60 Hz (*reason set). */
++static inline bool
++sweet_fb_p90_judge(struct sweet_fb_p90 *g, bool timeout, bool underrun, uint64_t lo_us, uint64_t hi_us, uint32_t *reason)
++{
++	*reason = SWEET_FB_P90_R_NONE;
++	if (timeout) { *reason = SWEET_FB_P90_R_TIMEOUT; return true; }
++	if (underrun) { g->faults++; *reason = SWEET_FB_P90_R_UNDERRUN; }
++	else if (lo_us > SWEET_FB_P90_SLOW_US) { g->faults++; *reason = SWEET_FB_P90_R_SLOW; }
++	else if (hi_us > SWEET_FB_P90_SLOW_US) { g->spurious_slow++; }
++	return g->faults >= SWEET_FB_P90_FAULTS;
++}
++
++static inline void
++sweet_fb_p90_reverted(struct sweet_fb_p90 *g, uint32_t reason, uint32_t presents)
++{
++	g->reverts++; g->last_reason = reason; g->revert_at = presents; g->faults = 0;
++	g->manual = reason == SWEET_FB_P90_R_MANUAL;
++}
++
++static inline bool
++sweet_fb_p90_retry_due(const struct sweet_fb_p90 *g, uint32_t presents)
++{
++	return g->reverts != 0 && !g->manual && g->retries < SWEET_FB_P90_RETRIES && presents - g->revert_at >= SWEET_FB_P90_RETRY_PRESENTS;
++}
++#endif

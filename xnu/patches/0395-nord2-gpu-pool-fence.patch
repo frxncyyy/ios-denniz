@@ -1,0 +1,320 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -26,6 +26,8 @@
+ #include <kern/cpu_data.h>
+ #include <sys/proc.h>
+ #include "SweetSurface.h"
++#define NORD2_GPU_FENCE_IMPL
++#include "nord2_gpu_fence.h"   /* 0395: per-surface write fences + display-pool import range */
+ extern "C" {
+ extern unsigned long gPhysBase, gPhysSize;
+ extern int PE_parse_boot_argn(const char *, void *, int);
+@@ -147,6 +149,29 @@
+         OSSafeReleaseNULL(o->surface);
+         IOFree(o, sizeof(*o));
+ }
++/* 0395: write fences.  gFence is guarded by Nord2GPU::lock; the job view reads core->jobs[] (same predicate as surfaceBusy). */
++static struct n2gf_table gFence;
++static bool gFencePool = true;          /* boot-arg n2gpool=0: imports of display-pool pages refused again */
++static uint32_t fence_sid(const struct n2c_bo *b) {
++        return b && (b->flags & N2C_BO_IMPORTED) && b->cookie && ((BufferOwner *)b->cookie)->surface ? ((BufferOwner *)b->cookie)->surface->id : 0;
++}
++static bool fence_unfinished(void *ctx, unsigned i, uint64_t *id) {
++        const struct n2c_job *j = &((struct n2c_core *)ctx)->jobs[i];
++        if (j->state != N2C_JOB_QUEUED && j->state != N2C_JOB_RUNNING && j->state != N2C_JOB_STOPPING) return false;
++        *id = j->id; return true;
++}
++static bool fence_writes(void *ctx, unsigned i, uint32_t sid) {
++        const struct n2c_job *j = &((struct n2c_core *)ctx)->jobs[i];
++        for (unsigned k = 0; k < j->nr_bos && k < N2C_JOB_BOS; k++) if (((j->write_mask >> k) & 1u) && fence_sid(j->bos[k]) == sid) return true;
++        return false;
++}
++static struct n2gf_jobs fence_jobs(struct n2c_core *c) { struct n2gf_jobs v = { c, N2C_MAX_JOBS, fence_unfinished, fence_writes }; return v; }
++/* After a successful submit (caller holds Nord2GPU::lock): every write-masked handle that is an IOSurface import. */
++static void fence_record(struct n2c_core *c, unsigned ctx, const struct n2c_submit *sub, uint64_t id) {
++        struct n2gf_jobs v = fence_jobs(c);
++        for (unsigned k = 0; k < sub->nr_handles && k < N2C_JOB_BOS; k++)
++                if ((sub->write_mask >> k) & 1u) n2gf_record(&gFence, &v, c->next_job_id, fence_sid(n2c_bo_lookup(c, ctx, sub->handles[k])), id);
++}
+ static bool alloc_host(void *, size_t bytes, void **p) {
+         *p = IOMallocZero(bytes); return *p != NULL;
+ }
+@@ -497,6 +522,8 @@
+         int irq = 1; PE_parse_boot_argn("nord2_gpu_irq", &irq, sizeof(irq)); irqWanted = irq == 1;   /* 0132: on by default (confirmed on the phone: SPI 364 / intid 396 asserts with the job line); nord2_gpu_irq=0 turns it off, which also frees the 16 characters the boot line needed for it */
+         int spi = 0; if (PE_parse_boot_argn("nord2_gpu_irq_spi", &spi, sizeof(spi)) && spi >= 32 && spi <= 900) irqSpi = (uint32_t)spi;
+         if (irqWanted) IOLog("NORD2 GPU: job interrupt requested (spi %u), polling remains the fallback\n", irqSpi);
++        { int gp = 1; PE_parse_boot_argn("n2gpool", &gp, sizeof(gp)); gFencePool = gp != 0;    /* 0395 */
++          IOLog("NORD2 GPU FENCE: write fences on (%u slots), display-pool import 0x%llx+0x%llx %s\n", N2GF_SLOTS, (unsigned long long)N2GF_POOL_BASE, (unsigned long long)N2GF_POOL_SIZE, gFencePool ? "accepted" : "refused (n2gpool=0)"); }
+         int mib = 0; PE_parse_boot_argn("nord2_gpu_priv_mb", &mib, sizeof(mib));
+         /* patch 0125: the 160/256 MiB defaults were sized for the 992 MiB window; with 1.5 GiB or more backboardd hit the per-client cap (GPU BUDGET rejections), so the boot-arg ceilings become the defaults */
+         bool bigRam = gPhysSize >= (1536ull << 20);
+@@ -668,6 +695,35 @@
+ extern "C" uint64_t nord2_gpu_resv_expired(void) { return gSurfaceGpu && gSurfaceGpu->core ? gSurfaceGpu->core->stats.resv_expired : 0; }
+ extern "C" void nord2_gpu_surface_cpu_acquire(void *surface) { if (gSurfaceGpu) gSurfaceGpu->surfaceHook(surface, true); }
+ extern "C" void nord2_gpu_surface_cpu_release(void *surface) { if (gSurfaceGpu) gSurfaceGpu->surfaceHook(surface, false); }
++/* 0395: write-fence API (nord2_gpu_fence.h).  Each call holds the driver lock for one scan of the 128 job records at most. */
++enum { N2GF_Q_SEQ, N2GF_Q_PEND, N2GF_Q_DONE, N2GF_Q_LOW };
++static uint64_t fence_query(int q, uint32_t sid, uint64_t upto) {
++        Nord2GPU *g = gSurfaceGpu; uint64_t r = 0;
++        if (!g || !g->lock) return 0;
++        IOLockLock(g->lock);
++        if (g->ready && !g->stopping && g->core) {
++                struct n2gf_jobs v = fence_jobs(g->core);
++                if (q == N2GF_Q_SEQ) r = n2gf_write_seq(&gFence, &v, sid);
++                else if (q == N2GF_Q_LOW) r = n2gf_low_water(&gFence, &v, g->core->next_job_id);
++                else { r = sid && n2gf_pending(&v, sid, q == N2GF_Q_PEND ? ~0ull : upto, NULL);
++                       if (q == N2GF_Q_PEND) { gFence.st.q_pend++; gFence.st.q_pend_true += r; } else { gFence.st.q_done++; gFence.st.q_done_false += r; } }
++        }
++        IOLockUnlock(g->lock);
++        return r;
++}
++extern "C" uint64_t nord2_gpu_surface_write_seq(uint32_t sid) { return fence_query(N2GF_Q_SEQ, sid, 0); }
++extern "C" bool nord2_gpu_surface_write_pending(uint32_t sid) { return fence_query(N2GF_Q_PEND, sid, 0) != 0; }
++extern "C" bool nord2_gpu_surface_writes_done(uint32_t sid, uint64_t upto) { return fence_query(N2GF_Q_DONE, sid, upto) == 0; }
++extern "C" uint64_t nord2_gpu_completed_seq(void) { return fence_query(N2GF_Q_LOW, 0, 0); }
++static bool fence_wait_pending(void *ctx) { return nord2_gpu_surface_write_pending((uint32_t)(uintptr_t)ctx); }
++static void fence_wait_sleep(void *, uint32_t us) { IODelay(us); }
++extern "C" bool nord2_gpu_surface_wait_idle(uint32_t sid, uint32_t timeout_us) {
++        struct n2gf_wait_ops o = { (void *)(uintptr_t)sid, now_us, fence_wait_sleep, fence_wait_pending };
++        uint32_t el = 0; bool idle = n2gf_wait(&o, timeout_us, &el);
++        Nord2GPU *g = gSurfaceGpu;
++        if (g && g->lock) { IOLockLock(g->lock); n2gf_wait_account(&gFence, idle, el); IOLockUnlock(g->lock); }
++        return idle;
++}
+ static uint32_t gic_rd32(void *c, uint32_t off) { return read_bank(c, off); }
+ static void gic_wr32(void *c, uint32_t off, uint32_t v) { write_bank(c, off, v); }
+ static uint64_t gic_rd64(void *c, uint32_t off) {
+@@ -880,6 +936,14 @@
+               (unsigned)core->track_level, core->stats.cache_skip_clean_pages * 4, core->stats.cache_skip_inval_pages * 4,
+               core->stats.cache_deferred_pages * 4, core->stats.cache_acquire_pages * 4, core->stats.cache_skip_wmask_pages * 4,
+               core->stats.resv_reserves, core->stats.resv_retires, core->stats.resv_cancels, core->stats.resv_expired);
++        { struct n2gf_stats &f = gFence.st; struct n2gf_jobs v = fence_jobs(core); unsigned live = 0;    /* 0395 */
++          for (unsigned i = 0; i < N2GF_SLOTS; i++) live += gFence.s[i].seq != 0;
++          if (f.records || f.q_seq || f.q_pend || f.q_done || f.waits || f.pool_imports || f.pool_refused)
++                IOLog("NORD2 GPU FENCE: rec=%llu hit=%llu fill=%llu ev=%llu/%llu live=%u miss=%llu q=%llu/%llu:%llu/%llu:%llu wait=%llu/%llu/%llu us=%llu/%u done=%llu next=%llu pool=%llu/%llu/%llu\n",
++                      f.records, f.hits, f.fills, f.evict_done, f.evict_pending, live, f.miss_scans, f.q_seq, f.q_pend, f.q_pend_true, f.q_done, f.q_done_false,
++                      f.waits, f.wait_ok, f.wait_timeout, f.waits ? f.wait_sum_us / f.waits : 0ull, f.wait_max_us, n2gf_low_water(&gFence, &v, core->next_job_id),
++                      core->next_job_id, f.pool_imports, f.pool_pages, f.pool_refused);
++          f.wait_max_us = 0; }
+         waitN = waitGapMax = waitDurMax = waitRetMax = 0; waitGapSum = waitDurSum = waitRetSum = 0;
+         seqWaits = seqJobs = seqDurMax = 0; seqDurSum = 0;
+         if (pfMode > 0) prfcntSample();
+@@ -1124,14 +1188,25 @@
+         unsigned count = (unsigned)(mapped / 4096); n2c_page *pages = (n2c_page *)IOMallocZero(count * sizeof(*pages));
+         if (!owner || !pages) { if (owner) IOFree(owner, sizeof(*owner)); if (pages) IOFree(pages,count*sizeof(*pages)); s->release(); return kIOReturnNoMemory; }
+         owner->surface = s; bool valid = true;
++        unsigned inPool = 0, inRam = 0, nearPool = 0;    /* 0395: display-pool pages (sweet_fb_hw_pool) are normal DRAM below XNU's RAM */
+         for (unsigned i=0; i<count; i++) {
+                 IOByteCount length; pages[i].pa = s->memory->getPhysicalSegment((uint64_t)s->offset+offset+(uint64_t)i*4096, &length, kIOMemoryMapperNone);
+                 pages[i].cpu = (void *)(s->kernelAddress()+base+(uint64_t)i*4096);
+-                if (!valid_ram(pages[i].pa) || length < 4096) valid = false;
++                bool ram = valid_ram(pages[i].pa), pool = !ram && gFencePool && n2gf_pool_page(pages[i].pa);
++                inRam += ram; inPool += pool; nearPool += !ram && pages[i].pa - N2GF_POOL_BASE < N2GF_POOL_SIZE;
++                if (!(ram || pool) || length < 4096) valid = false;
+         }
++        if (inPool && inRam) valid = false;              /* a pool surface is one physical range: never mixed with XNU pages */
+         bool adopted = false;
+         enum n2c_error e = valid ? n2c_bo_map(core,c,pages,count,N2C_BO_GPU_READ|N2C_BO_GPU_WRITE|N2C_BO_IMPORTED,
+                                              owner,charged,h,va,&adopted) : N2C_E_ARGS;
++        if (inPool || nearPool) {
++                static unsigned poolLogs;
++                if (e == N2C_OK) { gFence.st.pool_imports++; gFence.st.pool_pages += count; } else gFence.st.pool_refused++;
++                if (poolLogs < 16) { poolLogs++;
++                        IOLog("NORD2 GPU FENCE: pool import ctx=%u sid=%u pa=0x%llx pages=%u pool=%u ram=%u e=%d%s\n", c, id, pages[0].pa, count, inPool, inRam, (int)e,
++                              gFencePool ? "" : " (n2gpool=0)"); }
++        }
+         IOFree(pages,count*sizeof(*pages)); if (!adopted) free_owner(this,owner);
+         /* Level 2: the surface's CPU access is bracketed by IOSurfaceLock/Unlock (see surfaceHook). */
+         if (e==N2C_OK && core->track_level>=N2C_TRACK_EXPLICIT) (void)n2c_bo_track(core,c,*h);
+@@ -1172,6 +1247,7 @@
+                 }
+                 sub.write_mask=(1u<<sub.nr_handles)-1;
+                 result=io_error(n2c_submit(core,c,&sub,id));
++                if(result==kIOReturnSuccess)fence_record(core,c,&sub,*id);   /* 0395 */
+         }
+         (void)n2c_bo_release(core,c,h); return result;
+ }
+@@ -1368,7 +1444,7 @@
+                 nord2_gpu_submit_request r;memcpy(&r,a->structureInput,sizeof(r));if(r.version!=2){result=kIOReturnBadArgument;break;}
+                 struct n2c_submit sub={};sub.kind=r.kind;sub.nr_handles=r.nr_handles;sub.heads[0]=r.heads[0];sub.heads[1]=r.heads[1];
+                 sub.write_mask=r.write_mask;memcpy(sub.handles,r.handles,sizeof(sub.handles));uint64_t id;
+-                result=io_error(n2c_submit(gpu->core,context,&sub,&id));if(result==kIOReturnSuccess){a->scalarOutput[0]=id;a->scalarOutputCount=1;if(gpu->irqState==NORD2_IRQ_ACTIVE)gpu->irqArm();}break;
++                result=io_error(n2c_submit(gpu->core,context,&sub,&id));if(result==kIOReturnSuccess){fence_record(gpu->core,context,&sub,id);a->scalarOutput[0]=id;a->scalarOutputCount=1;if(gpu->irqState==NORD2_IRQ_ACTIVE)gpu->irqArm();}break;
+         }
+         case NORD2_GPU_SEL_WAIT: {
+                 if(a->scalarInput[1]>5000){result=kIOReturnBadArgument;break;}
+--- /dev/null
++++ b/iokit/Kernel/arm/nord2_gpu_fence.h
+@@ -0,0 +1,172 @@
++/* 0395: per-surface GPU write fences for the display (Nord2GPU -> SweetFramebuffer), and the display-pool range the GPU import accepts.
++ * SPDX-License-Identifier: MIT
++ *
++ * Sequence numbers are the GPU core's job ids: one counter for the whole device (all contexts), starting at 1 and strictly increasing.
++ * A job "writes" a surface when its submit listed an import of that IOSurface with the handle's write_mask bit set (the same rule as
++ * nord2_gpu_surface_busy).  A job "completed" when it left QUEUED/RUNNING/STOPPING (DONE, FAULTED, CANCELLED or RESET: a faulted job's
++ * pixels are not trustworthy, but the GPU no longer writes them).
++ *
++ *   nord2_gpu_surface_write_seq(id)    seq of the newest job submitted that writes the surface, 0 if none is known.
++ *   nord2_gpu_surface_write_pending(id) some unfinished job writes the surface.
++ *   nord2_gpu_completed_seq()          every job with seq <= this value has completed (low-water mark; monotonic).
++ *   nord2_gpu_surface_writes_done(id, s) no unfinished job with seq <= s writes the surface: the exact fence for a seq snapshot
++ *                                      taken at SwapEnd (a newer job on the same surface does not hold an older swap back).
++ *                                      completed_seq() >= s implies it, but one long job of another client can delay that one.
++ *   nord2_gpu_surface_wait_idle(id, t) polls write_pending every <= 100 us for at most t us (clamped to 100 ms); true = idle.
++ *                                      Sleeps (IODelay), never holds a lock while waiting; do not call with a spinlock held.
++ * All functions take the GPU driver's IOLock briefly; they return 0/false/true(idle) while the GPU driver is not ready.
++ * They do not include 0112 reservations (promised, not yet submitted frames): nord2_gpu_surface_busy() still reports those.
++ * Jobs that reach buffers they did not list (legacy compute ABI, full handle lists) are not seen, as in nord2_gpu_surface_busy(). */
++#ifndef NORD2_GPU_FENCE_H
++#define NORD2_GPU_FENCE_H
++#ifndef KERNEL
++#include <stdint.h>
++#include <stdbool.h>
++#include <stddef.h>
++#endif
++#ifdef __cplusplus
++extern "C" {
++#endif
++uint64_t nord2_gpu_surface_write_seq(uint32_t surface_id);
++bool nord2_gpu_surface_write_pending(uint32_t surface_id);
++uint64_t nord2_gpu_completed_seq(void);
++bool nord2_gpu_surface_writes_done(uint32_t surface_id, uint64_t upto_seq);
++bool nord2_gpu_surface_wait_idle(uint32_t surface_id, uint32_t timeout_us);
++#ifdef __cplusplus
++}
++#endif
++
++#ifdef NORD2_GPU_FENCE_IMPL
++/* ---- pure logic, shared by Nord2GPU.cpp and the host test (no allocation, fixed table) ---- */
++
++/* Display pool (Track A, sweet_fb_hw_pool.h): normal DRAM outside XNU's RAM, physically contiguous. */
++#if defined(KERNEL) && defined(__has_include)
++#if __has_include("sweet_fb_hw_pool.h")
++#include "sweet_fb_hw_pool.h"
++#endif
++#endif
++#ifdef SWEET_FB_HW_POOL_BASE
++#define N2GF_POOL_BASE ((uint64_t)(SWEET_FB_HW_POOL_BASE))
++#define N2GF_POOL_SIZE ((uint64_t)(SWEET_FB_HW_POOL_SIZE))
++#else
++#define N2GF_POOL_BASE 0xC0000000ull
++#define N2GF_POOL_SIZE 0x10000000ull
++#endif
++/* One 4 KiB GPU page entirely inside the pool. */
++static inline bool n2gf_pool_page(uint64_t pa)
++{
++        return !(pa & 4095u) && N2GF_POOL_SIZE >= 4096 && pa >= N2GF_POOL_BASE && pa - N2GF_POOL_BASE <= N2GF_POOL_SIZE - 4096;
++}
++
++#define N2GF_SLOTS 64u
++#define N2GF_WAIT_STEP_US 100u
++#define N2GF_WAIT_MAX_US 100000u
++
++struct n2gf_slot { uint64_t seq; uint32_t sid; uint32_t writes; };   /* seq 0 = free slot */
++struct n2gf_stats {
++        uint64_t records, hits, fills, evict_done, evict_pending, miss_scans;
++        uint64_t q_seq, q_pend, q_pend_true, q_done, q_done_false;
++        uint64_t waits, wait_ok, wait_timeout, wait_sum_us; uint32_t wait_max_us;
++        uint64_t pool_imports, pool_pages, pool_refused;
++};
++struct n2gf_table { struct n2gf_slot s[N2GF_SLOTS]; uint64_t completed; struct n2gf_stats st; };
++
++/* View of the core's job records: `unfinished` gives the id of record i if it is queued/running/stopping;
++ * `writes` says whether record i writes surface sid. */
++struct n2gf_jobs {
++        void *ctx;
++        unsigned count;
++        bool (*unfinished)(void *ctx, unsigned i, uint64_t *id);
++        bool (*writes)(void *ctx, unsigned i, uint32_t sid);
++};
++
++/* Low-water mark: (smallest unfinished id) - 1, or the last id handed out when nothing is unfinished.  next_id is the core's
++ * next_job_id (0 only after a wrap, which the core refuses to continue past). */
++static inline uint64_t n2gf_low_water(struct n2gf_table *t, const struct n2gf_jobs *j, uint64_t next_id)
++{
++        uint64_t lo = next_id ? next_id - 1 : ~0ull;
++        for (unsigned i = 0; i < j->count; i++) {
++                uint64_t id;
++                if (j->unfinished(j->ctx, i, &id) && id && id - 1 < lo) lo = id - 1;
++        }
++        if (lo > t->completed) t->completed = lo;
++        return t->completed;
++}
++
++/* Any unfinished job with id <= upto writes sid?  *max_id (optional) gets the newest such id. */
++static inline bool n2gf_pending(const struct n2gf_jobs *j, uint32_t sid, uint64_t upto, uint64_t *max_id)
++{
++        bool any = false; uint64_t m = 0;
++        for (unsigned i = 0; i < j->count; i++) {
++                uint64_t id;
++                if (!j->unfinished(j->ctx, i, &id) || id > upto || !j->writes(j->ctx, i, sid)) continue;
++                any = true; if (id > m) m = id;
++        }
++        if (max_id) *max_id = m;
++        return any;
++}
++
++static inline struct n2gf_slot *n2gf_find(struct n2gf_table *t, uint32_t sid)
++{
++        for (unsigned i = 0; i < N2GF_SLOTS; i++) if (t->s[i].seq && t->s[i].sid == sid) return &t->s[i];
++        return NULL;
++}
++
++/* Record that job `seq` writes surface sid.  Replacement when full: the slot with the oldest seq (counted as evict_pending
++ * when that job may still run; write_seq then falls back to the job scan, so no pending write is ever lost). */
++static inline void n2gf_record(struct n2gf_table *t, const struct n2gf_jobs *j, uint64_t next_id, uint32_t sid, uint64_t seq)
++{
++        if (!sid || !seq) return;
++        t->st.records++;
++        struct n2gf_slot *s = n2gf_find(t, sid);
++        if (s) { t->st.hits++; if (seq > s->seq) s->seq = seq; s->writes++; return; }
++        struct n2gf_slot *v = NULL;
++        for (unsigned i = 0; i < N2GF_SLOTS && !v; i++) if (!t->s[i].seq) v = &t->s[i];
++        if (v) t->st.fills++;
++        else {
++                v = &t->s[0];
++                for (unsigned i = 1; i < N2GF_SLOTS; i++) if (t->s[i].seq < v->seq) v = &t->s[i];
++                if (v->seq <= n2gf_low_water(t, j, next_id)) t->st.evict_done++; else t->st.evict_pending++;
++        }
++        v->sid = sid; v->seq = seq; v->writes = 1;
++}
++
++static inline uint64_t n2gf_write_seq(struct n2gf_table *t, const struct n2gf_jobs *j, uint32_t sid)
++{
++        t->st.q_seq++;
++        if (!sid) return 0;
++        struct n2gf_slot *s = n2gf_find(t, sid);
++        if (s) return s->seq;
++        uint64_t m = 0; t->st.miss_scans++;
++        (void)n2gf_pending(j, sid, ~0ull, &m);    /* evicted entry or a surface written before tracking started */
++        return m;
++}
++
++/* Bounded poll.  pending() is called without any lock held by the caller; sleep_us may block. */
++struct n2gf_wait_ops {
++        void *ctx;
++        uint64_t (*now_us)(void *ctx);
++        void (*sleep_us)(void *ctx, uint32_t us);
++        bool (*pending)(void *ctx);
++};
++static inline bool n2gf_wait(const struct n2gf_wait_ops *o, uint32_t timeout_us, uint32_t *elapsed_out)
++{
++        if (timeout_us > N2GF_WAIT_MAX_US) timeout_us = N2GF_WAIT_MAX_US;
++        uint64_t t0 = o->now_us(o->ctx), el = 0; bool idle;
++        for (;;) {
++                idle = !o->pending(o->ctx);
++                el = o->now_us(o->ctx) - t0;
++                if (idle || el >= timeout_us) break;
++                uint64_t left = timeout_us - el;
++                o->sleep_us(o->ctx, (uint32_t)(left < N2GF_WAIT_STEP_US ? left : N2GF_WAIT_STEP_US));
++        }
++        if (elapsed_out) *elapsed_out = (uint32_t)el;
++        return idle;
++}
++static inline void n2gf_wait_account(struct n2gf_table *t, bool idle, uint32_t el)
++{
++        t->st.waits++; if (idle) t->st.wait_ok++; else t->st.wait_timeout++;
++        t->st.wait_sum_us += el; if (el > t->st.wait_max_us) t->st.wait_max_us = el;
++}
++#endif /* NORD2_GPU_FENCE_IMPL */
++#endif /* NORD2_GPU_FENCE_H */

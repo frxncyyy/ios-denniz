@@ -1,0 +1,120 @@
+--- a/iokit/Kernel/arm/sweet_fb_iommu.h
++++ b/iokit/Kernel/arm/sweet_fb_iommu.h
+@@ -292,6 +292,14 @@
+ 	return true;
+ }
+ 
++/* 0411: boot default of kern.n2fbiommu: 3 (every eligible layer through an IOVA) unless the boot-arg n2fbiommu=0..3 says otherwise. */
++static inline int
++sweet_fb_iommu_boot_mode(bool bootarg_present, int bootarg)
++{
++	if (!bootarg_present) { return 3; }
++	return bootarg < 0 ? 0 : (bootarg > 3 ? 3 : bootarg);
++}
++
+ /* ---------------------------------------------------------------- kernel API (SweetSurface.cpp, 0401) */
+ #ifdef __cplusplus
+ extern "C" {
+@@ -309,6 +317,8 @@
+ uint64_t sweet_fb_iommu_test_slot(uint64_t slot_pa, const void *slot_va, uint64_t bytes);
+ /* 0408: OVL*_2L ports whose MMU_EN the armed display IOMMU set (bit0 larb0 p6, bit1 larb1 p6); 0 when not armed. */
+ unsigned sweet_fb_iommu_owned_ports(void);
++/* 0411: called once by the framebuffer's start: the display IOMMU is armed by a thread_call n2fbiommu_delay s later (default 20). */
++void sweet_fb_iommu_boot(void);
+ #ifdef __cplusplus
+ }
+ 
+--- a/iokit/Kernel/arm/sweet_fb_iommu_hw.h
++++ b/iokit/Kernel/arm/sweet_fb_iommu_hw.h
+@@ -63,7 +63,8 @@
+ #define N2IO_OVL_PORT           6u              /* larb1 p6 = OVL0_2L (pipe 0), larb0 p6 = OVL1_2L (pipe 1) */
+ #define N2IO_LARB_PORTS         15u
+ 
+-static int           n2io_mode;                 /* kern.n2fbiommu (effective; 0 after an auto-disable) */
++static int           n2io_mode = 3;             /* kern.n2fbiommu (effective; 0 after an auto-disable).  0411: default on (boot-arg n2fbiommu) */
++static volatile bool n2io_boot_pending;         /* 0411: boot arming scheduled, not run yet: no lazy arming from the display path */
+ static int           n2io_test;                 /* kern.n2fbiommutest */
+ static int           n2io_probe_last;
+ static IOLock       *n2io_lock;
+@@ -391,6 +392,7 @@
+ sweet_fb_iommu_layer(void *surface, uint64_t *iova, uint64_t *len)
+ {
+ 	SweetSurface *s = (SweetSurface *)surface;
++	if (n2io_boot_pending) { return false; }      /* 0411: the boot thread_call arms (stepwise, logged), never the present thread */
+ 	int mode = __atomic_load_n(&n2io_mode, __ATOMIC_RELAXED);
+ 	if (mode < 1 || s == NULL || s->memory == NULL || n2io_state == 2 || !n2io_lock_init()) { return false; }
+ 	IOLockLock(n2io_lock);
+@@ -787,6 +789,52 @@
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, n2fbiommu_sub, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, n2io_sysctl_sub, "I", "0409: stage-1 sub-steps 1 prep 2 PT_BASE 4 TFRP 8 TLB 16 dump 128 undo");
+ 
++/* ---------------------------------------------------------------- 0411 default-on: armed at boot by a thread_call
++ * Arming = the 0401/0403/0410 sequence (pool table block, 0x10 check of the other M4U0 larbs, PT_BASE, TFRP, fault interrupt status bits
++ * in INT_MAIN with the GIC line masked = latched + polled per frame, TLB invalidate), every write logged first + 200 ms (stepwise).  Ports:
++ * switched by the 0401 gate between transfers when a frame programs an IOVA (after overlay init; 0408 lets init accept them).  Failure =
++ * REFUSED for the boot, kern.n2fbiommu 0: the pool (0394, default on since 0411) keeps the overlay composing physically. */
++static thread_call_t n2io_boot_tc;
++static uint32_t      n2io_boot_delay_s = 20;
++static void
++n2io_boot_fire(thread_call_param_t, thread_call_param_t)
++{
++	IOLog("NORD2 FB IOMMU: BOOT ARM begin (kern.n2fbiommu %d): each M4U0/larb step below is logged before it runs\n", n2io_mode);
++	IOSleep(200);
++	IOLockLock(n2io_lock);
++	bool ok = false;
++	if (n2io_mode > 0 && n2io_state == 0) {
++		n2io_stepwise = true;
++		ok = n2io_arm_locked();
++		n2io_stepwise = false;
++	}
++	if (!ok) { n2io_mode = 0; }
++	n2io_boot_pending = false;
++	IOLog("NORD2 FB IOMMU: BOOT ARM %s (%s): kern.n2fbiommu %d, irq_status %u; %s\n", ok ? "done" : "REFUSED", n2io_why, n2io_mode, n2io_irq_on,
++	    ok ? "IOVA layers from the next frame" : "pool-only overlay composition continues (no CPU copy)");
++	IOLockUnlock(n2io_lock);
++}
++
++extern "C" void
++sweet_fb_iommu_boot(void)
++{
++	static bool once;
++	if (once) { return; }
++	once = true;
++	int v = 0; uint32_t d = 0;
++	bool have = PE_parse_boot_argn("n2fbiommu", &v, sizeof(v));
++	n2io_mode = sweet_fb_iommu_boot_mode(have, v);
++	if (PE_parse_boot_argn("n2fbiommu_delay", &d, sizeof(d)) && d <= 600) { n2io_boot_delay_s = d; }
++	if (n2io_mode == 0 || !n2io_lock_init()) { n2io_mode = 0; IOLog("NORD2 FB IOMMU: BOOT ARM off (kern.n2fbiommu 0)\n"); return; }
++	n2io_boot_tc = thread_call_allocate(n2io_boot_fire, NULL);
++	if (n2io_boot_tc == NULL) { n2io_mode = 0; IOLog("NORD2 FB IOMMU: BOOT ARM off (no thread_call)\n"); return; }
++	n2io_boot_pending = true;
++	uint64_t dl = 0;
++	clock_interval_to_deadline(n2io_boot_delay_s, kSecondScale, &dl);
++	thread_call_enter_delayed(n2io_boot_tc, dl);
++	IOLog("NORD2 FB IOMMU: BOOT ARM scheduled in %u s (kern.n2fbiommu %d; boot-args n2fbiommu=0 off, n2fbiommu_delay=S)\n", n2io_boot_delay_s, n2io_mode);
++}
++
+ SYSCTL_INT(_kern, OID_AUTO, n2fbiommutest, CTLFLAG_RW | CTLFLAG_LOCKED, &n2io_test, 0, "0401: 1 = kern.n2fbhwtest reads a scattered copy through the IOMMU");
+ 
+ #endif /* SWEET_FB_IOMMU_HW_H */
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -698,6 +698,7 @@
+ 	sweet_fb_pending_surfaces_init(&fHwHeld);       /* 0396 */
+ 	bzero(&fHwSt, sizeof(fHwSt)); fHwInitDone = fHwInitOk = fHwOn = fWorkHw = false; fHwN = 0; fHwTestMem = NULL; fHwTestMap = NULL;
+ 	bzero(&fFps, sizeof(fFps)); fFpsWinUs = 0;      /* 0407 */
++	sweet_fb_iommu_boot();      /* 0411: display IOMMU default on, armed by a thread_call later */
+ 	IOLog("NORD2 FB HW: overlay composition (0396) mode %u at boot (sysctl kern.n2fbhw 0 off / 1 dry / 2 single / 3 two layers; kern.n2fbhwtest 1..6, kern.n2fbhwcsw)\n",
+ 	    sweet_fb_hw_mode);
+ 	uint32_t hz = SWEET_FB_DEFAULT_HZ;
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -161,7 +161,7 @@
+ _Static_assert(SWEET_FB_HW_POOL_BASE + SWEET_FB_HW_POOL_SIZE <= 0x100000000ull, "OVL Ln_ADDR is 32 bits");
+ _Static_assert((SWEET_FB_HW_POOL_BASE % SWEET_FB_HW_POOL_GRANULE) == 0 && (SWEET_FB_HW_POOL_GRANULE % 16384) == 0, "granule");
+ 
+-static int           sweet_pool_enabled;        /* kern.n2fbhw_pool (boot-arg n2fbhw_pool), default 0 */
++static int           sweet_pool_enabled = 1;    /* kern.n2fbhw_pool (boot-arg n2fbhw_pool).  0411: default 1 = the physical fallback if the IOMMU is refused */
+ static uint32_t      sweet_pool_copyback;       /* boot-arg n2fbpoolc: fixed at the first pool use */
+ static uint32_t      sweet_pool_state;          /* 0 not set up, 1 ready, 2 off for this boot */
+ static bool          sweet_pool_args_done;

@@ -1,0 +1,1316 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -41,6 +41,41 @@
+ #include "sweet_fb_swapwait.h"
+ #include "sweet_fb_blend.h"           /* 0390 */
+ #include "sweet_fb_scene.h"           /* 0392 */
++#include "sweet_fb_hw.h"              /* 0396 */
++
++/*
++ * 0396 (hwfb-20261112): the display controller composes the layers.  kern.n2fbhw (sysctl, default 0):
++ *   0 = CPU path for every swap (as 0393); the planner still counts what would be eligible (NORD2 FB HW lines)
++ *   1 = dry run: every swap planned, the first plans logged, no register written
++ *   2 = H3: a swap whose only visible layer covers the panel and lies in the display pool (0394) is shown by OVL*_2L layer 0
++ *       reading the surface itself (no copy); anything else takes the CPU path for that frame (counted by reason)
++ *   3 = H4: up to two layers (bottom opaque, upper with per-pixel alpha in the CON variant kern.n2fbhwpm, default 2)
++ * kern.n2fbhwtest = 1..5 runs an H2 test pattern through the overlay (1 pattern, 2/3/4 + gradient tile across the seam with CON
++ * pm 0/2/1, 5 = 1..4 in a row), each held kern.n2fbhwhold ms (default 3000), then the previous picture is put back.
++ * kern.n2fbhwstat (read only) = the counters.  Any underflow / DSI underrun / frame-done timeout / register read-back mismatch on
++ * a HW frame (or SWEET_FB_HW_RACE_LIMIT consecutive GPU-write races) sets kern.n2fbhw back to 0 and restores the CPU path.
++ * GPU fence rule: a HW frame is never shown while a GPU write job on one of its surfaces is in flight (never forced).
++ */
++#if __has_include("sweet_fb_hw_pool.h")
++#include "sweet_fb_hw_pool.h"         /* 0394 (Track A) */
++#else       /* the 0394 contract (hwcomp-20261112/sweet_fb_hw_pool.h), for a stand-alone compile check only */
++#define SWEET_FB_HW_POOL_CACHE_WC 1u
++static inline bool  sweet_fb_hw_pool_contains(uint64_t pa, uint64_t len) { return len != 0 && pa >= 0xC0000000ull && len <= 0x10000000ull && pa - 0xC0000000ull <= 0x10000000ull - len; }
++extern "C" uint64_t sweet_surface_pool_pa_obj(const void *surface);
++extern "C" uint64_t sweet_surface_pool_size_obj(const void *surface);
++extern "C" uint32_t sweet_surface_pool_cache_obj(const void *surface);
++#endif
++#if __has_include("nord2_gpu_fence.h")
++#include "nord2_gpu_fence.h"          /* 0395 (Track B) */
++#else
++extern "C" uint64_t nord2_gpu_surface_write_seq(uint32_t surface_id);
++extern "C" bool     nord2_gpu_surface_write_pending(uint32_t surface_id);
++#endif
++static uint32_t sweet_fb_hw_mode;               /* kern.n2fbhw */
++static uint32_t sweet_fb_hw_pm = 2;             /* kern.n2fbhwpm */
++static uint32_t sweet_fb_hw_test_req;           /* kern.n2fbhwtest: requested test, taken by handOver */
++static uint32_t sweet_fb_hw_test_last;          /* last test run (read back by the sysctl) */
++static uint32_t sweet_fb_hw_hold_ms = 3000;     /* kern.n2fbhwhold */
+ 
+ /* 0390: n2fbblend=0 copies the SwapEnd layers over each other as before 0390 (default 1: composite them). */
+ static uint32_t sweet_fb_blend_mode = 1;
+@@ -77,6 +112,8 @@
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++#include <sys/sysctl.h>               /* 0396: kern.n2fbhw* */
++#include <sys/errno.h>
+ #if defined(NORD2)
+ extern "C" {
+ #include <arm64/sweet_early.h>
+@@ -100,6 +137,11 @@
+ #define SWEET_FB_OVL_SIZE          0x38u
+ #define SWEET_FB_OVL_PITCH         0x44u
+ #define SWEET_FB_OVL_ADDR          0xf40u
++/* 0396: larb0/larb1 NON_SEC_CON of the OVL ports (larb0 p5 OVL_RDMA0, p6 OVL_2L_RDMA1; larb1 p5 OVL_RDMA1, p6 OVL_2L_RDMA0): bit 0 MMU_EN
++ * must be 0 (physical addresses) for the HW path (mt6885-larb-port.h, mtk-smi.c). */
++#define SWEET_FB_LARB0             0x14118000UL
++#define SWEET_FB_LARB1             0x14119000UL
++#define SWEET_FB_LARB_NONSEC(p)    (0x380u + 4u * (p))
+ #endif
+ 
+ enum {
+@@ -299,6 +341,45 @@
+ 	void        scanRestoreRegs(void);
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	/* 0396: HW composition (sweet_fb_hw.h).  Present thread only, except hwRestore from the power-off fade (present thread idle). */
++	struct sweet_fb_hw_base fHwBase[SWEET_FB_HW_PIPES];
++	bool                fHwInitDone, fHwInitOk;
++	bool                fHwOn;               /* the OVL*_2L registers hold a HW plan (not the CPU path's panel buffer) */
++	bool                fWorkHw;             /* the frame being presented is a HW frame */
++	struct sweet_fb_hw_plan fHwPlan, fHwShownPlan;
++	sweet_fb_pending_surfaces fHwHeld;       /* surfaces of the shown HW frame: held until the overlay stops reading them */
++	SweetSurface       *fHwLayerS[SWEET_FB_HW_SLOTS];
++	uint32_t            fHwLayerId[SWEET_FB_HW_SLOTS];
++	uint64_t            fHwSeq[SWEET_FB_HW_SLOTS];
++	bool                fHwIdOk[SWEET_FB_HW_SLOTS];
++	unsigned            fHwN;
++	uint32_t            fHwRaceRun, fHwOvlOr, fHwDsiSt;
++	uint8_t             fHwTestPhase;
++	bool                fHwTestReapply, fHwPatternDrawn;
++	uint32_t            fHwTestStep, fHwTestEnd, fHwTestId;
++	uint64_t            fHwTestT0;
++	IOMemoryDescriptor *fHwTestMem;
++	IOMemoryMap        *fHwTestMap;
++	struct {
++		uint64_t frames, cpu_frames, planned, dry_single, dry_dual, why[SWEET_FB_HW_W_COUNT_ENUM];
++		uint64_t fence_skip, late_write, race, restores, faults, empty_kept, reg_us_max, reg_us_sum, tests, plans_logged;
++		int last_fault;
++	} fHwSt;
++	bool        hwInit(void);
++	unsigned    hwInputs(const uint8_t *rec, SweetSurface *const surfaces[SWEET_FB_LAYERS], struct sweet_fb_hw_in in[SWEET_FB_HW_MAX_IN],
++	    SweetSurface *ss[SWEET_FB_HW_MAX_IN], uint32_t ids[SWEET_FB_HW_MAX_IN], int *why);
++	bool        hwCandidate(const uint8_t *rec, SweetSurface *const surfaces[SWEET_FB_LAYERS]);
++	int         hwFrameTry(uint32_t mode);
++	bool        hwWriteRegs(unsigned k, const struct sweet_fb_hw_reg *r, unsigned n, uint32_t *badOff);
++	bool        hwApply(const struct sweet_fb_hw_plan *p);
++	void        hwRestore(const char *why);
++	void        hwFault(int f, const char *where);
++	bool        hwFenceBusy(void);
++	void        hwFrameEnd(bool shown, bool timeout, bool legacy);
++	void        hwTestPoll(IOTimerEventSource *sender);
++	void        hwTestFinish(const char *how);
++	int         hwStat(char *buf, size_t len);
++	void        hwLogSurface(SweetSurface *s, uint32_t id);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -334,6 +415,77 @@
+ 
+ static AppleCLCD *gSweetFBSnapOwner;   /* 0296 */
+ 
++#if defined(NORD2)
++/* 0396: runtime control (no boot-arg: the UI command line is at its 607-character limit) */
++static int
++sweet_fb_hw_sysctl_mode SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = (int)__atomic_load_n(&sweet_fb_hw_mode, __ATOMIC_RELAXED), changed = 0;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (err != 0 || !changed) { return err; }
++	if (v < 0 || v > (int)SWEET_FB_HW_MODE_MAX) { return EINVAL; }
++	uint32_t old = __atomic_exchange_n(&sweet_fb_hw_mode, (uint32_t)v, __ATOMIC_RELAXED);
++	IOLog("NORD2 FB HW: mode %u -> %d (sysctl kern.n2fbhw: 0 off, 1 dry run, 2 single layer, 3 two layers)\n", old, v);
++	return 0;
++}
++static int
++sweet_fb_hw_sysctl_pm SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = (int)__atomic_load_n(&sweet_fb_hw_pm, __ATOMIC_RELAXED), changed = 0;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (err != 0 || !changed) { return err; }
++	if (v < 0 || v > 2) { return EINVAL; }
++	__atomic_store_n(&sweet_fb_hw_pm, (uint32_t)v, __ATOMIC_RELAXED);
++	IOLog("NORD2 FB HW: upper-layer CON variant pm %d = %08x (sysctl kern.n2fbhwpm)\n", v, sweet_fb_hw_con_upper((uint32_t)v));
++	return 0;
++}
++static int
++sweet_fb_hw_sysctl_test SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = (int)__atomic_load_n(&sweet_fb_hw_test_last, __ATOMIC_RELAXED), changed = 0;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (err != 0 || !changed) { return err; }
++	if (v < 1 || v > 5) { return EINVAL; }
++	__atomic_store_n(&sweet_fb_hw_test_req, (uint32_t)v, __ATOMIC_RELEASE);
++	IOLog("NORD2 FB HW: test %d requested (sysctl kern.n2fbhwtest), starts at the next idle present slot\n", v);
++	return 0;
++}
++static int
++sweet_fb_hw_sysctl_hold SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = (int)__atomic_load_n(&sweet_fb_hw_hold_ms, __ATOMIC_RELAXED), changed = 0;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (err != 0 || !changed) { return err; }
++	if (v < 100 || v > 20000) { return EINVAL; }
++	__atomic_store_n(&sweet_fb_hw_hold_ms, (uint32_t)v, __ATOMIC_RELAXED);
++	return 0;
++}
++static int
++sweet_fb_hw_sysctl_stat SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[768];
++	buf[0] = 0;
++	if (gSweetFBSnapOwner != NULL) { (void)gSweetFBSnapOwner->hwStat(buf, sizeof(buf)); }
++	else { snprintf(buf, sizeof(buf), "no framebuffer"); }
++	return sysctl_io_string(req, buf, sizeof(buf), 0, NULL);
++}
++SYSCTL_PROC(_kern, OID_AUTO, n2fbhw, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sweet_fb_hw_sysctl_mode, "I",
++    "0396 HW composition: 0 off, 1 dry run, 2 single layer (H3), 3 two layers (H4)");
++SYSCTL_PROC(_kern, OID_AUTO, n2fbhwpm, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sweet_fb_hw_sysctl_pm, "I",
++    "0396 upper-layer CON: 0 straight 0x21ff, 1 legacy 0x008031ff, 2 DRM premultiplied 0x038031ff");
++SYSCTL_PROC(_kern, OID_AUTO, n2fbhwtest, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sweet_fb_hw_sysctl_test, "I",
++    "0396 H2 test pattern: 1 pattern, 2/3/4 + alpha gradient with pm 0/2/1, 5 = 1..4");
++SYSCTL_PROC(_kern, OID_AUTO, n2fbhwhold, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sweet_fb_hw_sysctl_hold, "I",
++    "0396 test pattern hold, ms");
++SYSCTL_PROC(_kern, OID_AUTO, n2fbhwstat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sweet_fb_hw_sysctl_stat, "A",
++    "0396 HW composition counters");
++#endif
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -400,6 +552,10 @@
+ 	IOLog("SWEET FB: layers outside a swap's mask kept %s (0392)\n", sweet_fb_retain_mode ? "on" : "off (n2fbretain=0)");
+ 	IOLog("SWEET FB: multi-layer source cache clean+invalidate %s (0391)\n", sweet_fb_inval_mode ? "on" : "off (n2fbinval=0)");
+ 	IOLog("SWEET FB: layer composition %s (0390)\n", sweet_fb_blend_mode ? "on" : "off (n2fbblend=0)");
++	sweet_fb_pending_surfaces_init(&fHwHeld);       /* 0396 */
++	bzero(&fHwSt, sizeof(fHwSt)); fHwInitDone = fHwInitOk = fHwOn = fWorkHw = false; fHwN = 0; fHwTestMem = NULL; fHwTestMap = NULL;
++	IOLog("NORD2 FB HW: overlay composition (0396) mode %u at boot (sysctl kern.n2fbhw 0 off / 1 dry / 2 single / 3 two layers; kern.n2fbhwtest 1..5)\n",
++	    sweet_fb_hw_mode);
+ 	uint32_t hz = SWEET_FB_DEFAULT_HZ;
+ 	/* sweetfb_hz=<n> (0/60+ = every vsync); short alias n2fbhz for the full UI command line (600/607 characters). */
+ 	if (!PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz))) { (void)PE_parse_boot_argn("n2fbhz", &hz, sizeof(hz)); }
+@@ -643,6 +799,11 @@
+ 		}
+ 		IOLockUnlock(fb->fLock);
+ #if defined(NORD2)
++		if (fb->fHwOn && fb->fPState == 0) {
++			/* 0396: the overlay reads a HW frame's surfaces; panel buffer 0 holds an older CPU frame: back to the CPU path, straight to black */
++			fb->hwRestore("power off");
++			if (step < 6) { step = 6; fb->fFadeStep = 7; }
++		}
+ 		if (fb->fDbl && fb->fFront != 0 && fb->fPState == 0) { (void)fb->ovlSelect(0); fb->fFront = 0; }      /* the fade draws into buffer 0 */
+ 		fb->dropNext();
+ #endif
+@@ -780,6 +941,8 @@
+ {
+ #if defined(NORD2)
+ 	if (!fDbl) { return; }
++	/* 0396: in the HW modes the next swap is not copied ahead: it is planned (and, if eligible, shown without any copy) when it is presented */
++	if (fNextState == 0 && __atomic_load_n(&sweet_fb_hw_mode, __ATOMIC_RELAXED) >= SWEET_FB_HW_SINGLE) { return; }
+ 	if (fNextState == 0) {
+ 		IOLockLock(fLock);
+ 		if (fPowerOff || !fDirty || fNextState != 0) { IOLockUnlock(fLock); return; }
+@@ -829,6 +992,20 @@
+ 	(void)count;
+ 	if (fPresentTimer == NULL) { return; }
+ 	IOLockLock(fLock);
++#if defined(NORD2)
++	/* 0396: an H2 test pattern requested by sysctl runs on the present thread while it is idle (swaps wait meanwhile; SwapWait valve) */
++	if (!fPowerOff && fPState == 0 && fNextState == 0 && fNbReady && __atomic_load_n(&sweet_fb_hw_test_req, __ATOMIC_ACQUIRE) != 0) {
++		uint32_t t = __atomic_exchange_n(&sweet_fb_hw_test_req, 0, __ATOMIC_ACQ_REL);
++		if (t >= 1 && t <= 5) {
++			fHwTestId = t; fHwTestStep = t == 5 ? 1 : t; fHwTestEnd = t == 5 ? 4 : t; fHwTestPhase = 0; fHwTestReapply = fHwOn;
++			fHwTestT0 = sweet_fb_abs_to_us(mach_absolute_time());
++			fPState = 7;
++			IOLockUnlock(fLock);
++			fPresentTimer->setTimeoutUS(1);
++			return;
++		}
++	}
++#endif
+ 	if (!fPowerOff && fPState == 0 && fNextState != 0) {
+ 		/* 0156: the frame prepared during the last transfer goes first */
+ 		fWorkRec = fNextRec; fWorkSurfaces = fNextSurfaces;
+@@ -912,6 +1089,7 @@
+ 	if (fb->fPState == 0) { return; }
+ 	if (__atomic_load_n(&fb->fSwapLifecycle.stopped, __ATOMIC_ACQUIRE)) {
+ #if defined(NORD2)
++		if (fb->fPState == 7) { fb->hwTestFinish("stopped"); return; }      /* 0396 */
+ 		if (fb->fPState == 3 || fb->fPState == 4) { fb->scanStep(SWEET_FB_SCAN_EV_STOP); }
+ 		fb->dropNext();
+ #endif
+@@ -919,6 +1097,7 @@
+ 		return;
+ 	}
+ #if defined(NORD2)
++	if (fb->fPState == 7) { fb->hwTestPoll(sender); return; }      /* 0396: H2 test pattern */
+ 	if (fb->fPState == 5) {
+ 		/* 0155: the swap is presented when the GPU is done with it (polled here, not on the vsync thread); after SWEET_FB_BUSY_WAIT_US anyway */
+ 		bool busy = false;
+@@ -927,6 +1106,15 @@
+ 		}
+ 		uint64_t waited = sweet_fb_abs_to_us(mach_absolute_time()) - fb->fWaitStartUs;
+ 		if (busy && waited < SWEET_FB_BUSY_WAIT_US) { sender->setTimeoutUS(100); return; }
++		if (busy && __atomic_load_n(&sweet_fb_hw_mode, __ATOMIC_RELAXED) >= SWEET_FB_HW_SINGLE &&
++		    fb->hwCandidate(fb->fWorkRec, (SweetSurface *const *)fb->fWorkSurfaces.object)) {
++			/* 0396 fence rule: a frame the overlay would read is never forced while a GPU write job on it is in flight.  It goes back
++			 * to the queue (a newer swap replaces it; otherwise it is retried at the next tick) and the panel keeps its picture. */
++			fb->fHwSt.fence_skip++;
++			fb->fHwSt.why[SWEET_FB_HW_W_FENCE]++;
++			fb->presentDone(false, false, false);
++			return;
++		}
+ 		fb->fStats.busy_waits++; fb->fStats.busy_wait_us += waited;
+ 		if (!busy) { fb->fStats.busy_wait_ok++; } else { __atomic_fetch_add(&fb->fStats.busy_forced, 1, __ATOMIC_RELAXED); }
+ 		fb->fPState = 1;
+@@ -946,7 +1134,23 @@
+ 		}
+ 		bool wasPrepared = fb->fPrepared;
+ 		bool shown = true;
++		int hw = 0;
++#if defined(NORD2)
++		/* 0396: plan the frame for the overlay (counts only in modes 0/1); 1 = registers written, no copy; -1 = eligible but a GPU write
++		 * is in flight: requeued, never shown; 0 = CPU path for this frame */
++		fb->fWorkHw = false;
++		if (!wasPrepared) { hw = fb->hwFrameTry(__atomic_load_n(&sweet_fb_hw_mode, __ATOMIC_RELAXED)); }
++		if (hw < 0) { fb->presentDone(false, false, false); return; }
++		if (hw > 0) {
++			fb->fWorkHw = true;
++			fb->fWorkEmpty = false;
++			fb->fCopyUs = 0;
++			fb->fLastCopyLayers = fb->fHwN;
++			/* the swap retires at FRAME_DONE (presentDone), not at a copy end: the overlay reads its surfaces until then */
++		}
++#endif
+ 		if (wasPrepared) { fb->fPrepared = false; }
++		else if (hw > 0) { }
+ 		else {
+ 			fb->fCopyDst = fb->fDbl ? (fb->fFront ? fb->fPixels : fb->fPixelsB) : fb->fPixels;
+ 			shown = fb->presentCopy(fb->fWorkRec, (SweetSurface *const *)fb->fWorkSurfaces.object);
+@@ -959,14 +1163,26 @@
+ 			}
+ 		}
+ 		uint64_t t1 = mach_absolute_time();
+-		fb->fCopyUs = wasPrepared ? fb->fPrepCopyUs : sweet_fb_abs_to_us(t1 - t0);
++		fb->fCopyUs = wasPrepared ? fb->fPrepCopyUs : (hw > 0 ? 0 : sweet_fb_abs_to_us(t1 - t0));
+ 		if (!shown) { fb->presentDone(false, false, false); return; }
+-		if (!wasPrepared) { fb->noteDistinct(fb->fCopyDst ? fb->fCopyDst : fb->fPixels); }
++		if (!wasPrepared && hw == 0) { fb->noteDistinct(fb->fCopyDst ? fb->fCopyDst : fb->fPixels); }
+ 		fb->fCopyDst = 0;
++#if defined(NORD2)
++		if (hw == 0 && fb->fHwOn) {
++			if (fb->fWorkEmpty) {
++				/* 0396: nothing composited and the panel shows a HW frame: its GRAM keeps the picture, nothing is pushed */
++				fb->fHwSt.empty_kept++;
++				fb->fXferStart = mach_absolute_time();
++				fb->presentDone(true, false, true);
++				return;
++			}
++			fb->hwRestore("cpu frame");      /* the CPU frame below flips the overlay to the buffer it was copied into */
++		}
++#endif
+ 		/* 0156: the overlay reads the buffer that was just filled.  0393: before EVERY push path (the TE-less and blocking paths below used to
+ 		 * push the old front buffer while the frames went to the back one), and not when nothing was composited into it. */
+ 		if (fb->fWorkEmpty) { fb->fSync.empty_frames++; }
+-		if (fb->fDbl && !fb->fWorkEmpty) {
++		if (fb->fDbl && !fb->fWorkEmpty && hw == 0) {
+ 			uint8_t back = fb->fFront ? 0 : 1;
+ 			if (fb->ovlSelect(back)) { fb->fFront = back; }
+ 			else { IOLog("NORD2 FB DBL: overlay flip refused, back to one buffer\n"); fb->fDbl = false; (void)fb->ovlSelect(0); fb->fFront = 0; fb->dropNext(); }
+@@ -995,6 +1211,13 @@
+ 			sender->setTimeoutUS(200);
+ 			return;
+ 		}
++#if defined(NORD2)
++		if (fb->fWorkHw && fb->hwFenceBusy()) {      /* 0396: a GPU write started on a layer since the plan: not shown */
++			fb->fHwSt.late_write++;
++			fb->presentDone(false, false, false);
++			return;
++		}
++#endif
+ 		if (fb->fNbReady && fb->xferStart()) {
+ 			fb->fXferStart = t1;
+ 			fb->fPState = 2;
+@@ -1048,6 +1271,11 @@
+ 		if (!te) { fb->fStats.te_miss++; fb->fTeOffUntilUs = nowUs + 1000000; }
+ 		fb->fStats.te_waits++; fb->fStats.te_wait_us += waited;
+ 		if (waited > fb->fStats.te_wait_max) { fb->fStats.te_wait_max = (uint32_t)waited; }
++		if (fb->fWorkHw && fb->hwFenceBusy()) {      /* 0396: a GPU write started on a layer during the TE wait: not shown */
++			fb->fHwSt.late_write++;
++			fb->presentDone(false, false, false);
++			return;
++		}
+ 		if (fb->xferStart()) {
+ 			fb->fXferStart = mach_absolute_time();
+ 			fb->fPState = 2;
+@@ -1076,8 +1304,9 @@
+ 			uint32_t v = fb->fOvl[i][SWEET_FB_OVL_INTSTA / 4];
+ 			for (uint32_t b = 0; b < 32; b++) { if (v & (1u << b)) { fb->fOvlBits[i][b]++; } }
+ 			fb->fOvl[i][SWEET_FB_OVL_INTSTA / 4] = 0;
++			fb->fHwOvlOr |= v;          /* 0396: judged in hwFrameEnd for a HW frame */
+ 		}
+-		if (fb->fDsi != NULL && (fb->fDsi[SWEET_FB_DSI_INTSTA / 4] & (1u << 12))) { fb->fDsiUnd++; fb->fDsi[SWEET_FB_DSI_INTSTA / 4] = ~(1u << 12); }
++		if (fb->fDsi != NULL && (fb->fDsi[SWEET_FB_DSI_INTSTA / 4] & (1u << 12))) { fb->fDsiUnd++; fb->fDsi[SWEET_FB_DSI_INTSTA / 4] = ~(1u << 12); fb->fHwDsiSt |= 1u << 12; }
+ 	}
+ #endif
+ 	if (st == SWEET_FB_XFER_WAIT) {
+@@ -1354,6 +1583,11 @@
+ AppleCLCD::presentDone(bool shown, bool timeout, bool legacy)
+ {
+ 	uint64_t xfer = shown ? sweet_fb_abs_to_us(mach_absolute_time() - fXferStart) : 0;
++	bool wasHw = fWorkHw;      /* 0396 */
++	fWorkHw = false;
++#if defined(NORD2)
++	if (wasHw) { hwFrameEnd(shown, timeout, legacy); }
++#endif
+ #if defined(NORD2)
+ 	/* 0154: the presenter still owns the engine here (fPState != 0), the link is idle */
+ 	if (shown && !legacy) {
+@@ -1396,9 +1630,21 @@
+ 		}
+ 	}
+ 	if (shown) { sweet_fb_retire_done(&fRetire); } else { sweet_fb_retire_requeue(&fRetire, requeued); }
++	/* 0396: the overlay may read a shown HW frame's surfaces again on any later push until it is re-programmed: they are held until
++	 * then (the previous HW frame's surfaces are let go).  The swap itself is retired (FRAME_DONE): the panel GRAM holds the picture.
++	 * Swapped under fLock (hwRestore may run on the vsync thread once fPState is 0). */
++	sweet_fb_pending_surfaces hwOld;
++	sweet_fb_pending_surfaces_init(&hwOld);
++	if (wasHw && shown && fHwOn) {
++		hwOld = fHwHeld;
++		fHwHeld = surfaces;
++		sweet_fb_pending_surfaces_init(&surfaces);
++		fHwShownPlan = fHwPlan;
++	}
+ 	fPState = 0;
+ 	IOLockUnlock(fLock);
+ 	IOLockWakeup(fLock, &fRetireEvent, false);                   /* SwapWait: the copy is over, its surfaces are free */
++	sweet_fb_pending_surfaces_release(&hwOld, sweet_fb_release_surface);      /* 0396 */
+ 	if (rec != NULL) { IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE); }
+ 	/* Safe to release only after the layer copy and the panel transfer are done. */
+ 	sweet_fb_pending_surfaces_release(&surfaces, sweet_fb_release_surface);
+@@ -1450,6 +1696,11 @@
+ 			    fSync.checked_layers, fSync.empty_frames, fSync.black_fill_rows, fSync.copy_gt4, fSync.copy_gt8, fSync.copy_max_us, fSync.total_gt16,
+ 			    fSync.total_max_us, fSwapWaitLevel, fRetire.not_ready, fRetire.valve, fRetire.dropped);
+ 			fOvlFrames = 0; fDsiUnd = 0; memset(fOvlBits, 0, sizeof(fOvlBits));
++			{   /* 0396 (cumulative since boot) */
++				char hb[768];
++				(void)hwStat(hb, sizeof(hb));
++				IOLog("NORD2 FB HW: %s\n", hb);
++			}
+ 		}
+ 		fSafeStarts = 0; fDzWaits = 0; fTickCorrSumUs = 0; fPhBin[0] = fPhBin[1] = fPhBin[2] = 0;
+ 		for (unsigned i = 0; i < 5; i++) { fCad[i] = 0; }
+@@ -1464,6 +1715,440 @@
+ }
+ 
+ #if defined(NORD2)
++/* ---- 0396: HW composition (present thread; sweet_fb_hw.h for the plan, the register lists and the policies) ---- */
++static uint32_t get32(const uint8_t *p, uint32_t off);       /* below */
++
++static void
++sweet_fb_hw_log_plan(const char *what, uint32_t swap, const struct sweet_fb_hw_plan *p)
++{
++	IOLog("NORD2 FB HW: plan %s swap %u layers %u: pipe0 src_con %x L0 %08x pitch %u size %08x off %08x con %08x L1 %08x size %08x off %08x con %08x | "
++	    "pipe1 src_con %x L0 %08x pitch %u size %08x off %08x con %08x L1 %08x size %08x off %08x con %08x\n", what, swap, p->nlayers,
++	    p->src_con[0], p->slot[0][0].addr, p->slot[0][0].pitch, p->slot[0][0].size, p->slot[0][0].offset, p->slot[0][0].con,
++	    p->slot[0][1].addr, p->slot[0][1].size, p->slot[0][1].offset, p->slot[0][1].con,
++	    p->src_con[1], p->slot[1][0].addr, p->slot[1][0].pitch, p->slot[1][0].size, p->slot[1][0].offset, p->slot[1][0].con,
++	    p->slot[1][1].addr, p->slot[1][1].size, p->slot[1][1].offset, p->slot[1][1].con);
++}
++
++/* Once, before the first HW frame / test: the overlay must be in the CPU path's verified layout and the OVL ports' M4U off. */
++bool
++AppleCLCD::hwInit(void)
++{
++	if (fHwInitDone) { return fHwInitOk; }
++	if (!fNbReady || fDsi == NULL) { return false; }       /* not latched: tried again once the panel link runs */
++	fHwInitDone = true;
++	const char *why = NULL;
++	if (fOvl[0] == NULL) { fOvl[0] = (volatile uint32_t *)ml_io_map(SWEET_FB_OVL0_2L, 0x1000); }
++	if (fOvl[1] == NULL) { fOvl[1] = (volatile uint32_t *)ml_io_map(SWEET_FB_OVL1_2L, 0x1000); }
++	if (fOvl[0] == NULL || fOvl[1] == NULL) { why = "overlay not mappable"; }
++	uint64_t front = (fDbl && fFront) ? fPhysB : fPhys;
++	for (uint32_t k = 0; why == NULL && k < SWEET_FB_HW_PIPES; k++) {
++		volatile uint32_t *o = fOvl[k];
++		struct sweet_fb_hw_base *b = &fHwBase[k];
++		b->src_con = o[SWEET_FB_HW_R_SRC_CON / 4];
++		b->bgclr = o[SWEET_FB_HW_R_ROI_BGCLR / 4];
++		for (uint32_t i = 0; i < SWEET_FB_HW_SLOTS; i++) {
++			b->con[i] = o[SWEET_FB_HW_R_CON(i) / 4];
++			b->size[i] = o[SWEET_FB_HW_R_SRC_SIZE(i) / 4];
++			b->offset[i] = o[SWEET_FB_HW_R_OFFSET(i) / 4];
++			b->pitch[i] = o[SWEET_FB_HW_R_PITCH(i) / 4];
++			b->pitch_msb[i] = o[SWEET_FB_HW_R_PITCH_MSB(i) / 4];
++			b->clip[i] = o[SWEET_FB_HW_R_CLIP(i) / 4];
++			b->rdma_ctrl[i] = o[SWEET_FB_HW_R_RDMA_CTRL(i) / 4];
++			b->gmc[i] = o[SWEET_FB_HW_R_RDMA_GMC(i) / 4];
++			b->fifo[i] = o[SWEET_FB_HW_R_RDMA_FIFO(i) / 4];
++			b->addr[i] = o[SWEET_FB_HW_R_ADDR(i) / 4];
++		}
++		IOLog("NORD2 FB HW: init pipe%u base src_con %08x bgclr %08x roi %08x | L0 con %08x size %08x off %08x pitch %08x msb %08x clip %08x rdma %08x gmc %08x fifo %08x addr %08x | "
++		    "L1 con %08x size %08x off %08x pitch %08x msb %08x clip %08x rdma %08x gmc %08x fifo %08x addr %08x\n", k, b->src_con, b->bgclr,
++		    o[SWEET_FB_HW_R_ROI_SIZE / 4], b->con[0], b->size[0], b->offset[0], b->pitch[0], b->pitch_msb[0], b->clip[0], b->rdma_ctrl[0],
++		    b->gmc[0], b->fifo[0], b->addr[0], b->con[1], b->size[1], b->offset[1], b->pitch[1], b->pitch_msb[1], b->clip[1],
++		    b->rdma_ctrl[1], b->gmc[1], b->fifo[1], b->addr[1]);
++		if (!sweet_fb_hw_base_ok(b, sweet_fb_scan_base_addr(front, fWidth, k), fRowBytes, fWidth / SWEET_FB_HW_PIPES, fHeight)) {
++			why = "overlay not in the CPU-path layout (layer 0 = panel buffer, panel pitch, half panel, only layer 0 on)";
++		}
++	}
++	if (why == NULL) {      /* R11: physical addressing on the four OVL ports */
++		volatile uint32_t *l0 = (volatile uint32_t *)ml_io_map(SWEET_FB_LARB0, 0x1000);
++		volatile uint32_t *l1 = (volatile uint32_t *)ml_io_map(SWEET_FB_LARB1, 0x1000);
++		if (l0 == NULL || l1 == NULL) { why = "larb registers not mappable"; }
++		else {
++			uint32_t v[4] = { l0[SWEET_FB_LARB_NONSEC(5) / 4], l0[SWEET_FB_LARB_NONSEC(6) / 4], l1[SWEET_FB_LARB_NONSEC(5) / 4], l1[SWEET_FB_LARB_NONSEC(6) / 4] };
++			IOLog("NORD2 FB HW: init larb0 p5 %08x p6 %08x larb1 p5 %08x p6 %08x (bit0 MMU_EN must be 0)\n", v[0], v[1], v[2], v[3]);
++			if ((v[0] | v[1] | v[2] | v[3]) & 1u) { why = "display M4U enabled on an OVL port (addresses would be IOVAs)"; }
++		}
++	}
++	fHwInitOk = (why == NULL);
++	IOLog("NORD2 FB HW: init %s%s%s\n", fHwInitOk ? "ok: overlay layers usable" : "REFUSED: ", fHwInitOk ? "" : why,
++	    fHwInitOk ? " (OVL0_2L/OVL1_2L layers 0/1, physical addresses)" : "");
++	if (!fHwInitOk) { fHwSt.last_fault = SWEET_FB_HW_F_BASE; (void)__atomic_exchange_n(&sweet_fb_hw_mode, 0, __ATOMIC_RELAXED); }
++	return fHwInitOk;
++}
++
++/* The visible layers of a swap as planner inputs (bottom first): the same selection and clipping as presentCopy. */
++unsigned
++AppleCLCD::hwInputs(const uint8_t *rec, SweetSurface *const surfaces[SWEET_FB_LAYERS], struct sweet_fb_hw_in in[SWEET_FB_HW_MAX_IN],
++    SweetSurface *ss[SWEET_FB_HW_MAX_IN], uint32_t ids[SWEET_FB_HW_MAX_IN], int *why)
++{
++	unsigned n = 0;
++	*why = SWEET_FB_HW_OK;
++	if (rec == NULL) { *why = SWEET_FB_HW_W_NONE; return 0; }
++	uint32_t mask = get32(rec, 0x104);
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		uint32_t id = get32(rec, 0x54 + 4 * layer);
++		if (!(mask & (1u << layer)) || id == 0) { continue; }
++		SweetSurface *s = surfaces[layer];
++		if (s == NULL) { *why = SWEET_FB_HW_W_MISSING; return n; }
++		if (s == fSurface) { continue; }                 /* the CPU path skips the panel surface too */
++		const uint8_t *a = rec + 0x64 + 16 * layer;
++		const uint8_t *b = rec + 0xc4 + 16 * layer;
++		struct sweet_fb_layer_geom g;
++		if (!sweet_fb_layer_clip(&g, (int32_t)get32(a, 0), (int32_t)get32(a, 4), (int32_t)get32(b, 0), (int32_t)get32(b, 4),
++		    (int32_t)get32(b, 8), (int32_t)get32(b, 12), s->width, s->height, fOffX, fOffY, fWidth, fHeight)) { continue; }
++		if (n >= SWEET_FB_HW_MAX_IN) { *why = SWEET_FB_HW_W_COUNT; return n; }
++		struct sweet_fb_hw_in l;
++		bzero(&l, sizeof(l));
++		l.format_ok = (s->pixelFormat == SWEET_FB_FORMAT_BGRA && s->planeCount == 0 && (s->bytesPerElement == 4 || s->bytesPerElement == 0) &&
++		    s->elementWidth == 1 && s->elementHeight == 1) ? 1u : 0u;
++		{   /* display reachable only as a pool surface (0394: one contiguous range below 4 GiB), by the object we hold (not by id), and
++			 * only with write-combined CPU mappings (the overlay does not snoop CPU caches; n2fbpoolc=1 copy-back pools stay on the CPU path) */
++			uint64_t pa = sweet_surface_pool_pa_obj(s), len = sweet_surface_pool_size_obj(s);
++			if (pa != 0 && sweet_fb_hw_pool_contains(pa, len) && sweet_surface_pool_cache_obj(s) == SWEET_FB_HW_POOL_CACHE_WC) { l.pa = pa; l.len = len; }
++		}
++		l.offset = s->offset; l.pitch = s->bytesPerRow;
++		l.sx = g.sx; l.sy = g.sy; l.dx = g.dx; l.dy = g.dy; l.w = g.w; l.h = g.h;
++		in[n] = l; ss[n] = s; ids[n] = id; n++;
++	}
++	return n;
++}
++
++bool
++AppleCLCD::hwCandidate(const uint8_t *rec, SweetSurface *const surfaces[SWEET_FB_LAYERS])
++{
++	struct sweet_fb_hw_in in[SWEET_FB_HW_MAX_IN];
++	SweetSurface *ss[SWEET_FB_HW_MAX_IN];
++	uint32_t ids[SWEET_FB_HW_MAX_IN];
++	int why;
++	unsigned n = hwInputs(rec, surfaces, in, ss, ids, &why);
++	if (why != SWEET_FB_HW_OK) { return false; }
++	struct sweet_fb_hw_plan p;
++	return sweet_fb_hw_plan_make(&p, in, n, __atomic_load_n(&sweet_fb_hw_mode, __ATOMIC_RELAXED), __atomic_load_n(&sweet_fb_hw_pm, __ATOMIC_RELAXED),
++	           fWidth, fHeight) == SWEET_FB_HW_OK;
++}
++
++/* State 1 of a frame that was not prepared: 1 = HW frame programmed (no copy), -1 = eligible but a GPU write is in flight (requeue,
++ * never shown), 0 = CPU path. */
++bool
++AppleCLCD::hwWriteRegs(unsigned k, const struct sweet_fb_hw_reg *r, unsigned n, uint32_t *badOff)
++{
++	volatile uint32_t *o = fOvl[k];
++	if (o == NULL || n > SWEET_FB_HW_MAX_REGS) { *badOff = 0xffffffffu; return false; }
++	for (unsigned i = 0; i < n; i++) { o[r[i].off / 4] = r[i].val; }
++	__asm__ volatile("dsb sy" ::: "memory");
++	for (unsigned i = 0; i < n; i++) {
++		if ((o[r[i].off / 4] ^ r[i].val) & r[i].mask) { *badOff = r[i].off | (k << 16); return false; }
++	}
++	return true;
++}
++
++bool
++AppleCLCD::hwApply(const struct sweet_fb_hw_plan *p)
++{
++	struct sweet_fb_hw_reg r[SWEET_FB_HW_MAX_REGS];
++	uint64_t t0 = mach_absolute_time();
++	uint32_t bad = 0;
++	fHwOvlOr = 0; fHwDsiSt = 0;
++	for (unsigned k = 0; k < SWEET_FB_HW_PIPES; k++) {
++		unsigned n = sweet_fb_hw_regs(r, p, k, &fHwBase[k]);
++		fHwOn = true;                                     /* from the first write on the registers are not the CPU path's */
++		if (!hwWriteRegs(k, r, n, &bad)) {
++			IOLog("NORD2 FB HW: register read-back mismatch pipe %u reg +0x%x (wrote %u registers)\n", bad >> 16, bad & 0xffffu, n);
++			hwFault(SWEET_FB_HW_F_READBACK, "apply");
++			return false;
++		}
++	}
++	uint64_t us = sweet_fb_abs_to_us(mach_absolute_time() - t0);
++	fHwSt.reg_us_sum += us;
++	if (us > fHwSt.reg_us_max) { fHwSt.reg_us_max = us; }
++	return true;
++}
++
++/* Back to the CPU path's registers (layer 0 = the shown panel buffer, layer 1 off, LK's background).  Between transfers only. */
++void
++AppleCLCD::hwRestore(const char *why)
++{
++	IOLockLock(fLock);
++	sweet_fb_pending_surfaces held = fHwHeld;
++	sweet_fb_pending_surfaces_init(&fHwHeld);
++	IOLockUnlock(fLock);
++	if (fHwInitOk) {
++		struct sweet_fb_hw_reg r[SWEET_FB_HW_MAX_REGS];
++		uint64_t front = (fDbl && fFront) ? fPhysB : fPhys;
++		uint32_t bad = 0;
++		bool ok = true;
++		for (unsigned k = 0; k < SWEET_FB_HW_PIPES && ok; k++) {
++			unsigned n = sweet_fb_hw_regs_base(r, k, &fHwBase[k], sweet_fb_scan_base_addr(front, fWidth, k));
++			ok = hwWriteRegs(k, r, n, &bad);
++		}
++		fHwSt.restores++;
++		if (!ok || fHwSt.restores <= 8) {
++			IOLog("NORD2 FB HW: restored the CPU path (%s)%s, layer 0 -> %08x/%08x\n", why, ok ? "" : " READBACK MISMATCH: HW composition off for this boot",
++			    sweet_fb_scan_base_addr(front, fWidth, 0), sweet_fb_scan_base_addr(front, fWidth, 1));
++		}
++		if (!ok) { fHwInitOk = false; (void)__atomic_exchange_n(&sweet_fb_hw_mode, 0, __ATOMIC_RELAXED); }
++	}
++	fHwOn = false;
++	sweet_fb_pending_surfaces_release(&held, sweet_fb_release_surface);
++}
++
++void
++AppleCLCD::hwFault(int f, const char *where)
++{
++	fHwSt.faults++;
++	fHwSt.last_fault = f;
++	uint32_t old = __atomic_exchange_n(&sweet_fb_hw_mode, 0, __ATOMIC_RELAXED);
++	IOLog("NORD2 FB HW: AUTO-DISABLE %s (%s): kern.n2fbhw %u -> 0, hw_frames=%llu ovl_int=%08x dsi=%08x race_run=%u\n", sweet_fb_hw_fault_name(f),
++	    where, old, fHwSt.frames, fHwOvlOr, fHwDsiSt, fHwRaceRun);
++	hwRestore("auto-disable");
++}
++
++/* the GPU fence: a write job on a layer surface queued or running, a 0112 reservation, or 0395's write-pending */
++bool
++AppleCLCD::hwFenceBusy(void)
++{
++	for (unsigned i = 0; i < fHwN; i++) {
++		if (nord2_gpu_surface_busy(fHwLayerS[i]) || (fHwIdOk[i] && nord2_gpu_surface_write_pending(fHwLayerId[i]))) { return true; }
++	}
++	return false;
++}
++
++int
++AppleCLCD::hwFrameTry(uint32_t mode)
++{
++	struct sweet_fb_hw_in in[SWEET_FB_HW_MAX_IN];
++	SweetSurface *ss[SWEET_FB_HW_MAX_IN];
++	uint32_t ids[SWEET_FB_HW_MAX_IN];
++	int why;
++	uint32_t pm = __atomic_load_n(&sweet_fb_hw_pm, __ATOMIC_RELAXED);
++	unsigned n = hwInputs(fWorkRec, (SweetSurface *const *)fWorkSurfaces.object, in, ss, ids, &why);
++	struct sweet_fb_hw_plan p;
++	if (why == SWEET_FB_HW_OK) {        /* H0/H1: what would go through the overlay, whatever the mode */
++		if (sweet_fb_hw_plan_make(&p, in, n, SWEET_FB_HW_SINGLE, pm, fWidth, fHeight) == SWEET_FB_HW_OK) { fHwSt.dry_single++; }
++		if (sweet_fb_hw_plan_make(&p, in, n, SWEET_FB_HW_DUAL, pm, fWidth, fHeight) == SWEET_FB_HW_OK) { fHwSt.dry_dual++; }
++	}
++	if (mode < SWEET_FB_HW_SINGLE) {
++		if (mode == SWEET_FB_HW_DRY) {
++			int r = why != SWEET_FB_HW_OK ? why : sweet_fb_hw_plan_make(&p, in, n, SWEET_FB_HW_DUAL, pm, fWidth, fHeight);
++			fHwSt.why[r]++;
++			if (r == SWEET_FB_HW_OK && fHwSt.plans_logged < 8) { fHwSt.plans_logged++; sweet_fb_hw_log_plan("dry", get32(fWorkRec, 0x50), &p); }
++		}
++		return 0;
++	}
++	int r = why != SWEET_FB_HW_OK ? why : sweet_fb_hw_plan_make(&p, in, n, mode, pm, fWidth, fHeight);
++	if (r == SWEET_FB_HW_OK && (fPowerOff || !fNbReady || !hwInit())) { r = SWEET_FB_HW_W_STATE; }
++	for (unsigned i = 0; r == SWEET_FB_HW_OK && i < n; i++) {
++		/* 0394/0395 look surfaces up by id: the id must still name this very surface, and its pool address be the one planned */
++		SweetSurface *t = sweet_surface_copy(ids[i]);
++		bool same = (t == ss[i]);
++		if (t != NULL) { t->release(); }
++		if (!same) { r = SWEET_FB_HW_W_MISSING; }      /* 0395's fences are by id */
++	}
++	if (r != SWEET_FB_HW_OK) { fHwSt.why[r]++; fHwSt.cpu_frames++; return 0; }
++	bool busy[SWEET_FB_HW_MAX_IN], pend[SWEET_FB_HW_MAX_IN];
++	for (unsigned i = 0; i < n; i++) { busy[i] = nord2_gpu_surface_busy(ss[i]); pend[i] = nord2_gpu_surface_write_pending(ids[i]); }
++	if (!sweet_fb_hw_fence_ok(busy, pend, n)) { fHwSt.why[SWEET_FB_HW_W_FENCE]++; fHwSt.fence_skip++; return -1; }
++	for (unsigned i = 0; i < n && i < SWEET_FB_HW_SLOTS; i++) {
++		fHwLayerS[i] = ss[i]; fHwLayerId[i] = ids[i]; fHwIdOk[i] = true; fHwSeq[i] = nord2_gpu_surface_write_seq(ids[i]);
++	}
++	fHwN = n;
++	if (!hwApply(&p)) { fHwN = 0; fHwSt.cpu_frames++; return 0; }      /* faulted: mode 0, CPU path restored; this frame by CPU */
++	fHwPlan = p;
++	fHwSt.planned++;
++	if (fHwSt.plans_logged < 8) { fHwSt.plans_logged++; sweet_fb_hw_log_plan(mode == SWEET_FB_HW_SINGLE ? "single" : "dual", get32(fWorkRec, 0x50), &p); }
++	return 1;
++}
++
++/* A HW frame's transfer finished (or was dropped): underflow / underrun / timeout / GPU race -> auto-disable. */
++void
++AppleCLCD::hwFrameEnd(bool shown, bool timeout, bool legacy)
++{
++	if (!shown) { return; }
++	uint32_t ovl = fHwOvlOr, dsi = fHwDsiSt;
++	if (legacy && fOvl[0] != NULL && fOvl[1] != NULL) {      /* blocking push: the polled status read did not run */
++		for (uint32_t k = 0; k < SWEET_FB_HW_PIPES; k++) { ovl |= fOvl[k][SWEET_FB_OVL_INTSTA / 4]; fOvl[k][SWEET_FB_OVL_INTSTA / 4] = 0; }
++		if (fDsi != NULL && (fDsi[SWEET_FB_DSI_INTSTA / 4] & SWEET_FB_HW_DSI_UNDERRUN)) { dsi |= SWEET_FB_HW_DSI_UNDERRUN; fDsi[SWEET_FB_DSI_INTSTA / 4] = ~SWEET_FB_HW_DSI_UNDERRUN; }
++	}
++	bool raced = false;
++	for (unsigned i = 0; i < fHwN; i++) {
++		if (nord2_gpu_surface_busy(fHwLayerS[i]) || nord2_gpu_surface_write_seq(fHwLayerId[i]) != fHwSeq[i]) { raced = true; }
++	}
++	fHwSt.frames++;
++	if (raced) {
++		fHwSt.race++;
++		if (fHwSt.race <= 16) {
++			IOLog("NORD2 FB HW: race: a GPU write to a shown layer started before FRAME_DONE (hw frame %llu, surface %u seq %llu -> %llu)\n", fHwSt.frames,
++			    fHwLayerId[0], fHwSeq[0], nord2_gpu_surface_write_seq(fHwLayerId[0]));
++		}
++	}
++	if (fHwSt.frames <= 4 || (fHwSt.frames % 1000) == 0) {
++		IOLog("NORD2 FB HW: frame %llu shown by the overlay (%u layers, no CPU copy), ovl_int %08x dsi %08x timeout %u\n", fHwSt.frames, fHwN, ovl, dsi, timeout ? 1u : 0u);
++	}
++	fHwOvlOr = ovl; fHwDsiSt = dsi;
++	int f = sweet_fb_hw_frame_fault(ovl, dsi, timeout, raced, &fHwRaceRun);
++	if (f != SWEET_FB_HW_F_NONE) { hwFault(f, "frame"); }
++	fHwOvlOr = 0; fHwDsiSt = 0;
++}
++
++/* H2: test pattern (carve-out slot 3) through the overlay, one step per call of phase 0, held, then the previous picture back. */
++void
++AppleCLCD::hwTestPoll(IOTimerEventSource *sender)
++{
++	uint64_t nowUs = sweet_fb_abs_to_us(mach_absolute_time());
++	if (fHwTestPhase == 0) {
++		if (!hwInit()) { hwTestFinish("refused: overlay not usable (see the init line)"); return; }
++		uint64_t bytes = (uint64_t)fRowBytes * fHeight, slot = fPhys + 2 * bytes;
++		if (slot + bytes > SWEET_FB_HW_FB_END || slot + bytes > 0x100000000ull) { hwTestFinish("refused: no free slot in the carve-out"); return; }
++		if (fHwTestMap == NULL) {
++			fHwTestMem = IOMemoryDescriptor::withPhysicalAddress(slot, bytes, kIODirectionInOut);
++			fHwTestMap = fHwTestMem != NULL ? fHwTestMem->map(kIOMapWriteCombineCache) : NULL;
++			if (fHwTestMap == NULL) { OSSafeReleaseNULL(fHwTestMem); hwTestFinish("refused: test slot not mappable"); return; }
++		}
++		if (!fHwPatternDrawn) {      /* the test pattern itself is drawn by the CPU once (it is the reference, not the UI) */
++			uintptr_t base = (uintptr_t)fHwTestMap->getVirtualAddress();
++			for (uint32_t y = 0; y < fHeight; y++) {
++				volatile uint32_t *row = (volatile uint32_t *)(base + (uint64_t)y * fRowBytes);
++				for (uint32_t x = 0; x < fWidth; x++) { row[x] = sweet_fb_hw_pattern_px(x, y, fWidth, fHeight); }
++			}
++			__asm__ volatile("dsb sy" ::: "memory");
++			fHwPatternDrawn = true;
++			fHwTestT0 = nowUs;
++		}
++		if (fDsi[SWEET_FB_DSI_INTSTA / 4] & SWEET_FB_DSI_BUSY) {
++			if (nowUs - fHwTestT0 > 100000) { hwTestFinish("aborted: panel link busy"); return; }
++			sender->setTimeoutUS(500);
++			return;
++		}
++		struct sweet_fb_hw_in in[2];
++		uint32_t pm = 0;
++		unsigned n = sweet_fb_hw_test_layers(in, fHwTestStep, slot, fRowBytes, fWidth, fHeight, &pm);
++		struct sweet_fb_hw_plan p;
++		int r = sweet_fb_hw_plan_make(&p, in, n, SWEET_FB_HW_DUAL, pm, fWidth, fHeight);
++		if (r != SWEET_FB_HW_OK) { IOLog("NORD2 FB HW: test plan refused: %s\n", sweet_fb_hw_why_name(r)); hwTestFinish("refused: plan"); return; }
++		if (!hwApply(&p)) { hwTestFinish("aborted: register read-back mismatch (auto-disabled)"); return; }
++		IOLog("NORD2 FB HW: test %u step %u (%s) regs written and read back ok, slot %#llx pitch %u, upper CON %08x (pm %u)\n", fHwTestId, fHwTestStep,
++		    fHwTestStep == 1 ? "pattern only" : "pattern + premultiplied gradient tile at 390,1000 across the seam", slot, fRowBytes,
++		    n > 1 ? sweet_fb_hw_con_upper(pm) : 0u, pm);
++		sweet_fb_hw_log_plan("test", fHwTestStep, &p);
++		if (!xferStart()) { hwTestFinish("aborted: transfer not started"); return; }
++		fXferStart = mach_absolute_time();
++		fHwTestPhase = 1;
++		sender->setTimeoutUS(SWEET_FB_XFER_POLL_US);
++		return;
++	}
++	if (fHwTestPhase == 1) {
++		uint64_t elapsed = sweet_fb_abs_to_us(mach_absolute_time() - fXferStart);
++		int st = sweet_fb_xfer_state(xferDone(), elapsed);
++		if (st == SWEET_FB_XFER_WAIT) { sender->setTimeoutUS(SWEET_FB_XFER_POLL_US); return; }
++		uint32_t v0 = fOvl[0][SWEET_FB_OVL_INTSTA / 4], v1 = fOvl[1][SWEET_FB_OVL_INTSTA / 4];
++		fOvl[0][SWEET_FB_OVL_INTSTA / 4] = 0; fOvl[1][SWEET_FB_OVL_INTSTA / 4] = 0;
++		uint32_t dsi = fDsi[SWEET_FB_DSI_INTSTA / 4] & SWEET_FB_HW_DSI_UNDERRUN;
++		if (dsi) { fDsi[SWEET_FB_DSI_INTSTA / 4] = ~SWEET_FB_HW_DSI_UNDERRUN; }
++		fHwOvlOr = v0 | v1; fHwDsiSt = dsi;
++		uint32_t race = 0;
++		int f = sweet_fb_hw_frame_fault(v0 | v1, dsi, st == SWEET_FB_XFER_TIMEOUT, false, &race);
++		IOLog("NORD2 FB HW: test %u step %u frame %s in %llu us, ovl0 int %08x ovl1 int %08x dsi_underrun %u -> %s; holding %u ms (photo now)\n", fHwTestId,
++		    fHwTestStep, st == SWEET_FB_XFER_TIMEOUT ? "TIMED OUT" : "done", elapsed, v0, v1, dsi ? 1u : 0u, sweet_fb_hw_fault_name(f),
++		    f == SWEET_FB_HW_F_NONE ? __atomic_load_n(&sweet_fb_hw_hold_ms, __ATOMIC_RELAXED) : 0u);
++		if (f != SWEET_FB_HW_F_NONE) { hwFault(f, "test"); hwTestFinish("aborted: fault"); return; }
++		fHwTestPhase = 2;
++		sender->setTimeoutUS(__atomic_load_n(&sweet_fb_hw_hold_ms, __ATOMIC_RELAXED) * 1000u);
++		return;
++	}
++	/* phase 2: hold over */
++	if (fHwTestStep < fHwTestEnd) { fHwTestStep++; fHwTestPhase = 0; fHwTestT0 = nowUs; sender->setTimeoutUS(1); return; }
++	fHwTestPhase = 3;       /* finishing: the registers below are the final ones */
++	bool busy = false;
++	for (unsigned i = 0; i < SWEET_FB_PENDING_SURFACE_COUNT; i++) { if (fHwHeld.object[i] != NULL && nord2_gpu_surface_busy(fHwHeld.object[i])) { busy = true; } }
++	if (fHwTestReapply && !busy && sweet_fb_pending_surfaces_any(&fHwHeld) && __atomic_load_n(&sweet_fb_hw_mode, __ATOMIC_RELAXED) >= SWEET_FB_HW_SINGLE) {
++		if (!hwApply(&fHwShownPlan)) { hwTestFinish("aborted: read-back mismatch putting the HW frame back"); return; }
++		hwTestFinish("finished, previous HW frame back");
++	} else {
++		hwRestore("test end");
++		hwTestFinish("finished, previous picture back");
++	}
++}
++
++void
++AppleCLCD::hwTestFinish(const char *how)
++{
++	if (fHwTestPhase < 3 && fHwOn) { hwRestore("test abort"); }
++	bool pushed = false;
++	if (fNbReady && !panic_active()) { pushed = nord2_display_refresh() != 0; }       /* the restored picture onto the panel (blocking, <= 20 ms) */
++	if (fOvl[0] != NULL && fOvl[1] != NULL) { fOvl[0][SWEET_FB_OVL_INTSTA / 4] = 0; fOvl[1][SWEET_FB_OVL_INTSTA / 4] = 0; }
++	IOLog("NORD2 FB HW: test %u %s (pushed %u, overlay %s)\n", fHwTestId, how, pushed ? 1u : 0u, fHwOn ? "HW frame" : "CPU path");
++	__atomic_store_n(&sweet_fb_hw_test_last, fHwTestId, __ATOMIC_RELAXED);
++	fHwSt.tests++;
++	fHwTestPhase = 0;
++	IOLockLock(fLock);
++	fPState = 0;
++	bool dirty = fDirty;
++	IOLockUnlock(fLock);
++	if (dirty) { handOver(0); }
++}
++
++int
++AppleCLCD::hwStat(char *buf, size_t len)
++{
++	const uint64_t *w = fHwSt.why;
++	return snprintf(buf, len, "mode=%u pm=%u init=%u/%u on=%u hw_frames=%llu cpu_frames=%llu planned=%llu would_single=%llu would_dual=%llu "
++	           "why[mode/none/count/cover/format/memory/pitch/range/missing/fence/state]=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu "
++	           "fence_skip=%llu late_write=%llu race=%llu empty_kept=%llu restores=%llu faults=%llu last_fault=%s reg_us_avg=%llu reg_us_max=%llu tests=%llu",
++	           __atomic_load_n(&sweet_fb_hw_mode, __ATOMIC_RELAXED), __atomic_load_n(&sweet_fb_hw_pm, __ATOMIC_RELAXED), fHwInitDone ? 1u : 0u,
++	           fHwInitOk ? 1u : 0u, fHwOn ? 1u : 0u, fHwSt.frames, fHwSt.cpu_frames, fHwSt.planned, fHwSt.dry_single, fHwSt.dry_dual,
++	           w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], fHwSt.fence_skip, fHwSt.late_write, fHwSt.race,
++	           fHwSt.empty_kept, fHwSt.restores, fHwSt.faults, sweet_fb_hw_fault_name(fHwSt.last_fault),
++	           fHwSt.planned ? fHwSt.reg_us_sum / fHwSt.planned : 0ULL, fHwSt.reg_us_max, fHwSt.tests);
++}
++
++/* H0: what CoreAnimation / the apps present: size, format, memory kind, contiguity, physical range, 32-bit reachability, pool.
++ * First sight of each (surface, id), at most 160 lines per boot.  SwapEnd thread. */
++void
++AppleCLCD::hwLogSurface(SweetSurface *s, uint32_t id)
++{
++	static void *seen[64];
++	static uint32_t seenId[64], seenN, logged;
++	for (unsigned i = 0; i < 64; i++) { if (seen[i] == (void *)s && seenId[i] == id) { return; } }
++	unsigned slot = __atomic_fetch_add(&seenN, 1, __ATOMIC_RELAXED) % 64;
++	seen[slot] = s; seenId[slot] = id;
++	if (__atomic_add_fetch(&logged, 1, __ATOMIC_RELAXED) > 160) { return; }
++	bool buffer = s->memory != NULL && OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL;
++	uint64_t len = s->memory != NULL ? s->memory->getLength() : 0, off = 0, lo = ~0ULL, hi = 0, prevEnd = 0;
++	uint32_t segs = 0;
++	while (s->memory != NULL && off < len && segs < 100000) {
++		IOByteCount sl = 0;
++		uint64_t pa = s->memory->getPhysicalSegment(off, &sl, kIOMemoryMapperNone);
++		if (pa == 0 || sl == 0) { break; }
++		if (pa != prevEnd) { segs++; }
++		if (pa < lo) { lo = pa; }
++		if (pa + sl > hi) { hi = pa + sl; }
++		prevEnd = pa + sl;
++		off += sl;
++	}
++	if (lo == ~0ULL) { lo = 0; }
++	uint64_t ppa = sweet_surface_pool_pa_obj(s);
++	uint32_t pcache = sweet_surface_pool_cache_obj(s);
++	bool pool = ppa != 0 && sweet_fb_hw_pool_contains(ppa, sweet_surface_pool_size_obj(s)) && pcache == SWEET_FB_HW_POOL_CACHE_WC;
++	uint32_t f = s->pixelFormat;
++	char cc[5] = { (char)(f >> 24), (char)(f >> 16), (char)(f >> 8), (char)f, 0 };
++	for (unsigned i = 0; i < 4; i++) { if (cc[i] < 32 || cc[i] > 126) { cc[i] = '?'; } }
++	bool full = s->width >= fWidth && s->height >= fHeight;
++	bool fmt = f == SWEET_FB_FORMAT_BGRA && s->planeCount == 0 && (s->bytesPerElement == 4 || s->bytesPerElement == 0) && s->elementWidth == 1 && s->elementHeight == 1;
++	IOLog("NORD2 FB HW: surface id %u %ux%u fmt '%s' (0x%x) bpe %u el %ux%u bpr %u offset %u planes %u alloc %u cache %u map %#x mem %s len %llu segs %u "
++	    "pa %#llx..%#llx contiguous %u below_4g %u pool %u pool_pa %#llx pool_cache %u -> %s\n", id, s->width, s->height, cc, f, s->bytesPerElement, s->elementWidth,
++	    s->elementHeight, s->bytesPerRow, s->offset, s->planeCount, s->allocSize, s->cacheMode, (unsigned)s->mapCache, buffer ? "buffer" : "physical",
++	    len, segs, lo, hi, segs == 1 ? 1u : 0u, (hi != 0 && hi <= 0x100000000ull) ? 1u : 0u, pool ? 1u : 0u, ppa, pcache,
++	    !fmt ? "not HW: format" : (!pool ? "not HW: memory not in the display pool" : (full ? "HW eligible (full screen)" : "HW eligible (two-layer modes)")));
++}
++
+ /* ---- scan-address probe (present thread; see sweet_fb_scan.h for why and for the safety model) ---- */
+ void
+ AppleCLCD::scanRestoreRegs(void)
+@@ -1760,6 +2445,11 @@
+ 	}
+ 	sweet_fb_pending_surfaces_capture(&incoming, ids, get32(rec, 0x104),
+ 	    sweet_fb_retain_surface);
++#if defined(NORD2)
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {      /* 0396 H0: properties of every surface presented, first sight */
++		if (incoming.object[layer] != NULL) { hwLogSurface((SweetSurface *)incoming.object[layer], ids[layer]); }
++	}
++#endif
+ 	sweet_fb_pending_surfaces_init(&replaced);
+ 	IOLockLock(fLock);
+ 	{
+@@ -2162,6 +2852,10 @@
+ 	}
+ #if defined(NORD2)
+ 	if (sweet_fb_scan_owns_panel(fScanState)) { scanStep(SWEET_FB_SCAN_EV_STOP); }
++	if (fHwOn && fPState == 0) { hwRestore("stop"); }        /* 0396 */
++	sweet_fb_pending_surfaces_release(&fHwHeld, sweet_fb_release_surface);
++	OSSafeReleaseNULL(fHwTestMap);
++	OSSafeReleaseNULL(fHwTestMem);
+ #endif
+ 	retireStop();
+ 	sweet_fb_pending_surfaces_release(&pending, sweet_fb_release_surface);
+--- a/iokit/Kernel/arm/sweet_fb_hw.h
++++ b/iokit/Kernel/arm/sweet_fb_hw.h
+@@ -0,0 +1,438 @@
++#ifndef SWEET_FB_HW_H
++#define SWEET_FB_HW_H
++/*
++ * 0396 (hwfb-20261112): hardware composition of the SwapEnd layers by the display's overlay engines (Track C of the HW
++ * composition work; 0394 = display pool in SweetSurface.cpp, 0395 = GPU acceptance of pool pages + write fences in Nord2GPU.cpp).
++ * Pure and host-testable: no IOKit, no registers.  The driver (SweetFramebuffer.cpp) turns a swap into layer inputs, asks for a
++ * plan here, turns the plan into register writes (sweet_fb_hw_regs), writes and reads them back on OVL0_2L (pipe 0, panel x
++ * 0..539) and OVL1_2L (pipe 1, x 540..1079) and pushes the panel as before.  The CPU never reads or writes a pixel of a HW frame.
++ * Starting point: the planner left by agent a647a03b in hwcomp-20261112 (reviewed: geometry kept, register list, test patterns,
++ * reasons and the fault/race policy added).
++ *
++ * Hardware (gpu/hwcodec/DISPLAY_HW_COMPOSE.md section 1; MT6893 Android DRM driver mtk_disp_ovl.c):
++ *   per layer n (stride 0x20): CON 0x30 ([7:0] plane alpha, 8 AEN, [15:12] CFMT, 23 CLRFMT_MAN, 24 BTSW, 25 RGB_SWAP), SRC_SIZE
++ *   0x38 (h<<16|w), OFFSET 0x3c (y<<16|x inside the 540-wide ROI), PITCH_MSB 0x40, PITCH 0x44 ([15:0]), CLIP 0x4c, RDMA_CTRL 0xc0
++ *   (bit 0), RDMA_GMC 0xc8, RDMA_FIFO 0xd0, ADDR 0xf40 (32 bit physical: the larb ports run with MMU_EN = 0 as LK left them);
++ *   SRC_CON 0x2c bits 0/1 = layer 0/1 enable; ROI_BGCLR 0x28.  Layer 0 is the bottom one.  No shadow registers on this SoC:
++ *   written while no transfer runs (between FRAME_DONE and the next DSI_START), which makes a frame's update atomic.
++ *   Memory byte order B,G,R,A (CoreAnimation 'BGRA', = the panel buffers): CFMT 2.
++ *
++ * Semantics = the CPU path (sweet_fb_blend.h): the lowest visible layer is copied (its alpha ignored), every higher layer is
++ * premultiplied source-over, panel pixels no layer covers are black.  So the bottom HW layer runs with AEN = 0 (opaque) over a
++ * black background, the upper one with per-pixel alpha in the CON variant chosen at run time (kern.n2fbhwpm; H2 settles it):
++ *   pm 0: CFMT 2 + AEN                               straight alpha (exact for opaque and fully clear pixels, darker edges otherwise)
++ *   pm 1: CFMT 3 + MAN + AEN                         "legacy" 0x00803000 (not in either local tree; kept as a test variant)
++ *   pm 2: CFMT 3 + MAN + BTSW + RGB_SWAP + AEN       DRM ARGB8888 premultiplied 0x03803000 (both local trees)
++ *
++ * Every address a plan lets the OVL read lies inside the layer's own surface memory AND inside a display-reachable window
++ * (the display pool or the framebuffer carve-out, both below 4 GiB); otherwise the swap is not planned (CPU path).
++ */
++#include <stdbool.h>
++#include <stdint.h>
++
++#define SWEET_FB_HW_PIPES           2u
++#define SWEET_FB_HW_SLOTS           2u          /* OVL*_2L layers 0 and 1 */
++#define SWEET_FB_HW_MAX_IN          4u          /* SwapEnd layers */
++
++/* display pool (0394): low DRAM 0xC0000000..0xD0000000, no FDT carve-out, no driver claim (DISPLAY_HW_COMPOSE.md 2.1 item 5) */
++#ifndef SWEET_FB_HW_POOL_BASE      /* = sweet_fb_hw_pool.h (0394), same spelling */
++#define SWEET_FB_HW_POOL_BASE           0xC0000000ull
++#define SWEET_FB_HW_POOL_SIZE           0x10000000ull   /* 256 MiB */
++#endif
++/* framebuffer carve-out (mblock framebuffer; = SWEET_FB_SCAN_CARVE_END) */
++#define SWEET_FB_HW_FB_BASE         0x76e10000ull
++#define SWEET_FB_HW_FB_END          0x78c00000ull
++
++/* OVL register offsets (bytes) */
++#define SWEET_FB_HW_R_INTSTA        0x008u
++#define SWEET_FB_HW_R_ROI_SIZE      0x020u
++#define SWEET_FB_HW_R_ROI_BGCLR     0x028u
++#define SWEET_FB_HW_R_SRC_CON       0x02cu
++#define SWEET_FB_HW_R_CON(n)        (0x030u + 0x20u * (n))
++#define SWEET_FB_HW_R_SRC_SIZE(n)   (0x038u + 0x20u * (n))
++#define SWEET_FB_HW_R_OFFSET(n)     (0x03cu + 0x20u * (n))
++#define SWEET_FB_HW_R_PITCH_MSB(n)  (0x040u + 0x20u * (n))
++#define SWEET_FB_HW_R_PITCH(n)      (0x044u + 0x20u * (n))
++#define SWEET_FB_HW_R_CLIP(n)       (0x04cu + 0x20u * (n))
++#define SWEET_FB_HW_R_RDMA_CTRL(n)  (0x0c0u + 0x20u * (n))
++#define SWEET_FB_HW_R_RDMA_GMC(n)   (0x0c8u + 0x20u * (n))
++#define SWEET_FB_HW_R_RDMA_FIFO(n)  (0x0d0u + 0x20u * (n))
++#define SWEET_FB_HW_R_ADDR(n)       (0xf40u + 0x20u * (n))
++#define SWEET_FB_HW_INT_UNDERFLOW   ((1u << 2) | (0xfu << 5) | (0xfu << 9) | (1u << 13))  /* FME_UND, RDMAn EOF abnormal, RDMAn SMI underflow, abnormal SOF */
++#define SWEET_FB_HW_DSI_UNDERRUN    (1u << 12)
++
++#define SWEET_FB_HW_CON_OPAQUE      0x000020ffu     /* CFMT 2, AEN 0, plane alpha 255 */
++#define SWEET_FB_HW_BGCLR_BLACK     0xff000000u
++#define SWEET_FB_HW_PITCH_MAX       0xffffu
++
++/* kern.n2fbhw */
++enum sweet_fb_hw_mode {
++	SWEET_FB_HW_OFF = 0,        /* CPU path for every swap (as 0393); the planner still counts what would be eligible */
++	SWEET_FB_HW_DRY = 1,        /* plan every swap, count and log, never write a register (H0/H1 observation) */
++	SWEET_FB_HW_SINGLE = 2,     /* H3: swaps whose only visible layer covers the whole panel go through the OVL */
++	SWEET_FB_HW_DUAL = 3,       /* H4: up to two visible layers, any geometry inside the panel, alpha on the upper one */
++	SWEET_FB_HW_MODE_MAX = 3
++};
++
++/* why a swap was not planned (counters in the driver, NORD2 FB HW lines) */
++enum sweet_fb_hw_why {
++	SWEET_FB_HW_OK = 0,
++	SWEET_FB_HW_W_MODE,         /* mode off / dry */
++	SWEET_FB_HW_W_NONE,         /* no visible layer */
++	SWEET_FB_HW_W_COUNT,        /* more visible layers than the mode allows */
++	SWEET_FB_HW_W_COVER,        /* SINGLE: the layer does not cover the panel */
++	SWEET_FB_HW_W_FORMAT,       /* not 32 bpp BGRA single plane */
++	SWEET_FB_HW_W_MEMORY,       /* not in display-reachable memory (an ordinary IOSurface) */
++	SWEET_FB_HW_W_PITCH,        /* pitch not usable */
++	SWEET_FB_HW_W_RANGE,        /* a read would leave the surface or the reachable window */
++	SWEET_FB_HW_W_MISSING,      /* (driver) a layer's surface is gone / its id names another surface now */
++	SWEET_FB_HW_W_FENCE,        /* (driver) a GPU write job on a layer is still in flight: never shown, the swap waits */
++	SWEET_FB_HW_W_STATE,        /* (driver) power off, link not ready, overlay not as expected, fault latched */
++	SWEET_FB_HW_W_COUNT_ENUM
++};
++
++static inline const char *
++sweet_fb_hw_why_name(int w)
++{
++	static const char *const n[SWEET_FB_HW_W_COUNT_ENUM] = { "ok", "mode", "none", "count", "cover", "format", "memory", "pitch",
++		                                                 "range", "missing", "fence", "state" };
++	return (w >= 0 && w < (int)SWEET_FB_HW_W_COUNT_ENUM) ? n[w] : "?";
++}
++
++struct sweet_fb_hw_in {
++	uint64_t pa;                /* physical start of the surface memory (0 = not display reachable) */
++	uint64_t len;               /* bytes of surface memory from pa */
++	uint32_t offset;            /* first pixel's byte offset in that memory (IOSurface offset) */
++	uint32_t pitch;             /* bytes per row */
++	uint32_t format_ok;         /* 32 bpp BGRA, one plane, 1x1 elements */
++	int32_t sx, sy, dx, dy, w, h;   /* panel geometry after sweet_fb_layer_clip (dx,dy in panel pixels) */
++};
++
++struct sweet_fb_hw_slot {
++	uint32_t en, addr, pitch, size, offset, con;
++};
++
++struct sweet_fb_hw_plan {
++	uint32_t nlayers;
++	struct sweet_fb_hw_slot slot[SWEET_FB_HW_PIPES][SWEET_FB_HW_SLOTS];
++	uint32_t src_con[SWEET_FB_HW_PIPES];       /* layer enable bits 0/1 (other SRC_CON bits are kept by the driver) */
++};
++
++static inline uint32_t
++sweet_fb_hw_con_upper(uint32_t pm)
++{
++	switch (pm) {
++	case 1: return 0x00803000u | 0x100u | 0xffu;
++	case 2: return 0x03803000u | 0x100u | 0xffu;
++	default: return 0x00002000u | 0x100u | 0xffu;
++	}
++}
++
++static inline bool
++sweet_fb_hw_reachable(uint64_t a, uint64_t end)
++{
++	if (end <= a) { return false; }
++	if (a >= SWEET_FB_HW_POOL_BASE && end <= SWEET_FB_HW_POOL_BASE + SWEET_FB_HW_POOL_SIZE) { return true; }
++	if (a >= SWEET_FB_HW_FB_BASE && end <= SWEET_FB_HW_FB_END) { return true; }
++	return false;
++}
++
++/*
++ * Plan for the visible layers in[0..n) (bottom first) on a fw x fh panel split into SWEET_FB_HW_PIPES equal column ranges.
++ * mode: SWEET_FB_HW_SINGLE or SWEET_FB_HW_DUAL (anything else = W_MODE).  Returns SWEET_FB_HW_OK and fills *p, or the reason.
++ */
++static inline int
++sweet_fb_hw_plan_make(struct sweet_fb_hw_plan *p, const struct sweet_fb_hw_in *in, unsigned n, uint32_t mode, uint32_t pm,
++    uint32_t fw, uint32_t fh)
++{
++	unsigned i, k;
++	uint32_t pw = fw / SWEET_FB_HW_PIPES;
++	for (k = 0; k < SWEET_FB_HW_PIPES; k++) {
++		p->src_con[k] = 0;
++		for (i = 0; i < SWEET_FB_HW_SLOTS; i++) {
++			struct sweet_fb_hw_slot z = { 0, 0, 0, 0, 0, 0 };
++			p->slot[k][i] = z;
++		}
++	}
++	p->nlayers = n;
++	if (mode != SWEET_FB_HW_SINGLE && mode != SWEET_FB_HW_DUAL) { return SWEET_FB_HW_W_MODE; }
++	if (n == 0) { return SWEET_FB_HW_W_NONE; }
++	if (n > (mode == SWEET_FB_HW_SINGLE ? 1u : SWEET_FB_HW_SLOTS) || n > SWEET_FB_HW_MAX_IN) { return SWEET_FB_HW_W_COUNT; }
++	if (fw == 0 || fh == 0 || (fw % SWEET_FB_HW_PIPES) != 0 || fh > 0xffffu || pw > 0xffffu) { return SWEET_FB_HW_W_COVER; }
++	for (i = 0; i < n; i++) {
++		const struct sweet_fb_hw_in *l = &in[i];
++		if (!l->format_ok) { return SWEET_FB_HW_W_FORMAT; }
++		if (l->pa == 0) { return SWEET_FB_HW_W_MEMORY; }
++		if (l->w <= 0 || l->h <= 0 || l->sx < 0 || l->sy < 0 || l->dx < 0 || l->dy < 0 ||
++		    (uint32_t)l->dx + (uint32_t)l->w > fw || (uint32_t)l->dy + (uint32_t)l->h > fh) { return SWEET_FB_HW_W_RANGE; }
++		if (l->pitch == 0 || (l->pitch & 3u) || l->pitch > SWEET_FB_HW_PITCH_MAX || l->pitch < ((uint32_t)l->sx + (uint32_t)l->w) * 4u) {
++			return SWEET_FB_HW_W_PITCH;
++		}
++		/* the whole rectangle read by both pipes together: [first, last) bytes from pa */
++		uint64_t first = (uint64_t)l->offset + (uint64_t)l->sy * l->pitch + (uint64_t)l->sx * 4u;
++		uint64_t last = (uint64_t)l->offset + (uint64_t)(l->sy + l->h - 1) * l->pitch + (uint64_t)(l->sx + l->w) * 4u;
++		if (last > l->len || !sweet_fb_hw_reachable(l->pa + first, l->pa + last) || l->pa + last > 0x100000000ull) {
++			return SWEET_FB_HW_W_RANGE;
++		}
++		if (mode == SWEET_FB_HW_SINGLE && (l->dx != 0 || l->dy != 0 || (uint32_t)l->w != fw || (uint32_t)l->h != fh)) {
++			return SWEET_FB_HW_W_COVER;
++		}
++	}
++	for (k = 0; k < SWEET_FB_HW_PIPES; k++) {
++		int32_t c0 = (int32_t)(k * pw), c1 = c0 + (int32_t)pw;
++		for (i = 0; i < n; i++) {
++			const struct sweet_fb_hw_in *l = &in[i];
++			int32_t x0 = l->dx > c0 ? l->dx : c0, x1 = l->dx + l->w < c1 ? l->dx + l->w : c1;
++			if (x1 <= x0) { continue; }                              /* not in this pipe */
++			struct sweet_fb_hw_slot *s = &p->slot[k][i];
++			int32_t sx = l->sx + (x0 - l->dx);
++			s->en = 1;
++			s->addr = (uint32_t)(l->pa + l->offset + (uint64_t)l->sy * l->pitch + (uint64_t)sx * 4u);
++			s->pitch = l->pitch;
++			s->size = ((uint32_t)l->h << 16) | (uint32_t)(x1 - x0);
++			s->offset = ((uint32_t)l->dy << 16) | (uint32_t)(x0 - c0);
++			s->con = i == 0 ? SWEET_FB_HW_CON_OPAQUE : sweet_fb_hw_con_upper(pm);
++			p->src_con[k] |= 1u << i;
++		}
++	}
++	return SWEET_FB_HW_OK;
++}
++
++/*
++ * The base (CPU path) state of one pipe's OVL*_2L, read once before the first HW frame; every HW frame is written relative to it
++ * and sweet_fb_hw_regs_base() puts it back.  l0_addr is the panel buffer the CPU path shows (it changes with the 0156 flip).
++ */
++struct sweet_fb_hw_base {
++	uint32_t src_con, bgclr;
++	uint32_t con[SWEET_FB_HW_SLOTS], size[SWEET_FB_HW_SLOTS], offset[SWEET_FB_HW_SLOTS], pitch[SWEET_FB_HW_SLOTS];
++	uint32_t pitch_msb[SWEET_FB_HW_SLOTS], clip[SWEET_FB_HW_SLOTS], rdma_ctrl[SWEET_FB_HW_SLOTS], gmc[SWEET_FB_HW_SLOTS], fifo[SWEET_FB_HW_SLOTS];
++	uint32_t addr[SWEET_FB_HW_SLOTS];
++};
++
++/* one register write: offset, value, and the bits that must read back equal */
++struct sweet_fb_hw_reg { uint32_t off, val, mask; };
++#define SWEET_FB_HW_MAX_REGS 32u
++
++static inline unsigned
++sweet_fb_hw_put(struct sweet_fb_hw_reg *r, unsigned n, uint32_t off, uint32_t val, uint32_t mask)
++{
++	if (n < SWEET_FB_HW_MAX_REGS) { r[n].off = off; r[n].val = val; r[n].mask = mask; }
++	return n + 1;
++}
++
++/*
++ * Register writes for pipe k of a plan, in the order they are written (layer registers first, then the enables, then the
++ * background).  A disabled slot keeps its base values except RDMA_CTRL bit 0 cleared (layer 1) / its SRC_CON bit.  Layer 1's
++ * RDMA GMC / FIFO are the base values, or layer 0's when the base value is 0 (LK only configured layer 0).  Returns the count.
++ */
++static inline unsigned
++sweet_fb_hw_regs(struct sweet_fb_hw_reg *r, const struct sweet_fb_hw_plan *p, unsigned k, const struct sweet_fb_hw_base *b)
++{
++	unsigned n = 0, i;
++	for (i = 0; i < SWEET_FB_HW_SLOTS; i++) {
++		const struct sweet_fb_hw_slot *s = &p->slot[k][i];
++		if (!s->en) {
++			if (i > 0) { n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_RDMA_CTRL(i), b->rdma_ctrl[i] & ~1u, 1u); }
++			continue;
++		}
++		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_ADDR(i), s->addr, 0xffffffffu);
++		/* pitch [15:0]; layer 0 keeps its base upper bits (LK's), layer 1 writes 0 there as the Linux driver does */
++		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_PITCH(i), (i == 0 ? (b->pitch[0] & 0xffff0000u) : 0u) | (s->pitch & 0xffffu), 0xffffffffu);
++		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_PITCH_MSB(i), (b->pitch_msb[i] & ~0xfu) | ((s->pitch >> 16) & 0xfu), 0xfu);
++		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_SRC_SIZE(i), s->size, 0xffffffffu);
++		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_OFFSET(i), s->offset, 0xffffffffu);
++		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_CLIP(i), 0u, 0xffffffffu);
++		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_CON(i), s->con, 0x03fff1ffu);
++		if (i > 0) {
++			n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_RDMA_GMC(i), b->gmc[i] ? b->gmc[i] : b->gmc[0], 0xffffffffu);
++			n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_RDMA_FIFO(i), b->fifo[i] ? b->fifo[i] : b->fifo[0], 0xffffffffu);
++		}
++		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_RDMA_CTRL(i), b->rdma_ctrl[i] | 1u, 1u);
++	}
++	n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_SRC_CON, (b->src_con & ~3u) | (p->src_con[k] & 3u), 3u);
++	n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_ROI_BGCLR, SWEET_FB_HW_BGCLR_BLACK, 0xffffffffu);
++	return n;
++}
++
++/* Register writes that put pipe k back to its base (CPU path) state, layer 0 reading l0_addr. */
++static inline unsigned
++sweet_fb_hw_regs_base(struct sweet_fb_hw_reg *r, unsigned k, const struct sweet_fb_hw_base *b, uint32_t l0_addr)
++{
++	unsigned n = 0, i;
++	(void)k;
++	n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_SRC_CON, b->src_con, 3u);          /* layer 1 off first */
++	for (i = 0; i < SWEET_FB_HW_SLOTS; i++) {
++		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_ADDR(i), i == 0 ? l0_addr : b->addr[i], 0xffffffffu);
++		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_PITCH(i), b->pitch[i], 0xffffffffu);
++		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_PITCH_MSB(i), b->pitch_msb[i], 0xfu);
++		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_SRC_SIZE(i), b->size[i], 0xffffffffu);
++		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_OFFSET(i), b->offset[i], 0xffffffffu);
++		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_CLIP(i), b->clip[i], 0xffffffffu);
++		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_CON(i), b->con[i], 0x03fff1ffu);
++		if (i > 0) {
++			n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_RDMA_GMC(i), b->gmc[i], 0xffffffffu);
++			n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_RDMA_FIFO(i), b->fifo[i], 0xffffffffu);
++		}
++		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_RDMA_CTRL(i), b->rdma_ctrl[i], 1u);
++	}
++	n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_ROI_BGCLR, b->bgclr, 0xffffffffu);
++	return n;
++}
++
++/*
++ * The base state must be the one the early code and 0156 verified (layer 0 = the panel buffer, panel pitch, half panel, only
++ * layer 0 enabled).  Anything else = refuse HW composition (somebody else programs the overlay).
++ */
++static inline bool
++sweet_fb_hw_base_ok(const struct sweet_fb_hw_base *b, uint32_t l0_addr, uint32_t pitch, uint32_t half_w, uint32_t h)
++{
++	return b->addr[0] == l0_addr && (b->pitch[0] & 0xffffu) == pitch && b->size[0] == ((h << 16) | half_w) &&
++	       (b->src_con & 3u) == 1u && b->offset[0] == 0u;
++}
++
++/* ---- H2 test patterns ----------------------------------------------------------------------------------------------------- */
++/*
++ * The pattern (fw x fh, B,G,R,A words) lives in the free third slot of the framebuffer carve-out (behind the two 0156 panel
++ * buffers; the n2scan probe slot, unused unless n2scan is set).  Layer 1 of the gradient tests reads the gradient tile out of
++ * the same buffer (rows TILE_Y.., x 0..TILE-1) and puts it at (GRAD_X, GRAD_Y), across the pipe seam at x = 540.  Below the HW
++ * gradient the pattern carries two CPU-computed references over the same blue: REF_PM = what correct premultiplied
++ * source-over gives, REF_ST = what the OVL gives if it treats the premultiplied tile as straight alpha.  A photo settles the
++ * CON value: the HW gradient row must look like REF_PM (exact) for the variant to be usable for H4.
++ * Lower half of the tile: 10x10 checkers of opaque white / fully clear = identical under every variant (geometry, seam).
++ */
++#define SWEET_FB_HW_TILE            300
++#define SWEET_FB_HW_TILE_Y          2000        /* the tile's rows in the pattern buffer (shown raw by layer 0 too) */
++#define SWEET_FB_HW_GRAD_X          390         /* destination of layer 1: x 390..689 crosses the seam at 540 */
++#define SWEET_FB_HW_GRAD_Y          1000
++#define SWEET_FB_HW_BAND_Y0         900         /* blue band behind the gradient and the references */
++#define SWEET_FB_HW_BAND_Y1         1700
++#define SWEET_FB_HW_REF_PM_Y        1320        /* 150 rows: premultiplied reference */
++#define SWEET_FB_HW_REF_ST_Y        1480        /* 150 rows: straight-interpretation reference */
++#define SWEET_FB_HW_BLUE            0xff2060c0u /* A=ff R=20 G=60 B=c0 as a 32-bit word = memory bytes B,G,R,A c0 60 20 ff */
++
++static inline uint32_t
++sweet_fb_hw_px(uint32_t r, uint32_t g, uint32_t b, uint32_t a)
++{
++	return (a << 24) | (r << 16) | (g << 8) | b;      /* little endian word: bytes B,G,R,A */
++}
++
++/* the gradient tile at (tx, ty), premultiplied: orange (255,128,0) with alpha tx*255/299 (upper half), checkers (lower half) */
++static inline uint32_t
++sweet_fb_hw_tile_px(uint32_t tx, uint32_t ty)
++{
++	if (ty < SWEET_FB_HW_TILE / 2) {
++		uint32_t a = tx * 255u / (SWEET_FB_HW_TILE - 1);
++		return sweet_fb_hw_px(a, (128u * a + 127u) / 255u, 0u, a);
++	}
++	return (((tx / 10) + (ty / 10)) & 1u) ? sweet_fb_hw_px(255, 255, 255, 255) : 0u;
++}
++
++/* premultiplied source-over (what sweet_fb_blend.h does, rounded the same way per channel) */
++static inline uint32_t
++sweet_fb_hw_over_pm(uint32_t s, uint32_t d)
++{
++	uint32_t a = s >> 24, out = 0;
++	for (unsigned c = 0; c < 32; c += 8) {
++		uint32_t sc = (s >> c) & 0xffu, dc = (d >> c) & 0xffu;
++		uint32_t v = sc + (dc * (255u - a) + 127u) / 255u;
++		out |= (v > 255u ? 255u : v) << c;
++	}
++	return out;
++}
++
++/* the same tile pixel taken as straight alpha (colour multiplied by alpha a second time) */
++static inline uint32_t
++sweet_fb_hw_over_straight(uint32_t s, uint32_t d)
++{
++	uint32_t a = s >> 24, out = 0;
++	for (unsigned c = 0; c < 24; c += 8) {
++		uint32_t sc = (s >> c) & 0xffu, dc = (d >> c) & 0xffu;
++		uint32_t v = (sc * a + dc * (255u - a) + 127u) / 255u;
++		out |= (v > 255u ? 255u : v) << c;
++	}
++	return out | 0xff000000u;
++}
++
++/* the whole pattern at panel (x, y) */
++static inline uint32_t
++sweet_fb_hw_pattern_px(uint32_t x, uint32_t y, uint32_t fw, uint32_t fh)
++{
++	uint32_t half = fw / 2;
++	if (y >= SWEET_FB_HW_TILE_Y && y < SWEET_FB_HW_TILE_Y + SWEET_FB_HW_TILE && x < SWEET_FB_HW_TILE) {
++		return sweet_fb_hw_tile_px(x, y - SWEET_FB_HW_TILE_Y);
++	}      /* the tile source (read by layer 1) comes first: exact */
++	bool band = y >= SWEET_FB_HW_BAND_Y0 && y < SWEET_FB_HW_BAND_Y1;
++	if (!band && x == half - 1) { return sweet_fb_hw_px(255, 0, 0, 255); }          /* seam markers: red at 539, green at 540 (not in the band) */
++	if (!band && x == half) { return sweet_fb_hw_px(0, 255, 0, 255); }
++	if (x < 4 || y < 4 || x >= fw - 4 || y >= fh - 4) { return sweet_fb_hw_px(255, 255, 255, 255); }   /* white frame */
++	if (y < 200) { uint32_t v = x * 255u / (fw - 1); return sweet_fb_hw_px(v, v, v, 255); }           /* grey ramp */
++	if (y < 600) {                                                                                     /* 8 colour bars */
++		static const uint32_t bars[8] = { 0xffffffffu, 0xffffff00u, 0xff00ffffu, 0xff00ff00u, 0xffff00ffu, 0xffff0000u, 0xff0000ffu, 0xff000000u };
++		uint32_t i = x * 8u / fw;
++		return bars[i > 7 ? 7 : i];
++	}
++	if (y >= SWEET_FB_HW_BAND_Y0 && y < SWEET_FB_HW_BAND_Y1) {
++		uint32_t gx0 = SWEET_FB_HW_GRAD_X, gx1 = SWEET_FB_HW_GRAD_X + SWEET_FB_HW_TILE;
++		if (x >= gx0 && x < gx1 && y >= SWEET_FB_HW_REF_PM_Y && y < SWEET_FB_HW_REF_PM_Y + SWEET_FB_HW_TILE / 2) {
++			return sweet_fb_hw_over_pm(sweet_fb_hw_tile_px(x - gx0, 0), SWEET_FB_HW_BLUE);
++		}
++		if (x >= gx0 && x < gx1 && y >= SWEET_FB_HW_REF_ST_Y && y < SWEET_FB_HW_REF_ST_Y + SWEET_FB_HW_TILE / 2) {
++			return sweet_fb_hw_over_straight(sweet_fb_hw_tile_px(x - gx0, 0), SWEET_FB_HW_BLUE);
++		}
++		return SWEET_FB_HW_BLUE;
++	}
++	return ((x % 100) == 0 || (y % 100) == 0) ? sweet_fb_hw_px(64, 64, 64, 255) : sweet_fb_hw_px(24, 24, 24, 255);
++}
++
++/*
++ * Layer inputs of test step t (1: pattern only, 2/3/4: pattern + gradient tile, CON pm 0/2/1) on the pattern buffer at slot_pa
++ * with pitch.  Returns the layer count and the pm to plan with.
++ */
++static inline unsigned
++sweet_fb_hw_test_layers(struct sweet_fb_hw_in in[2], uint32_t t, uint64_t slot_pa, uint32_t pitch, uint32_t fw, uint32_t fh, uint32_t *pm)
++{
++	uint64_t len = (uint64_t)pitch * fh;
++	struct sweet_fb_hw_in l0 = { slot_pa, len, 0, pitch, 1, 0, 0, 0, 0, (int32_t)fw, (int32_t)fh };
++	struct sweet_fb_hw_in l1 = { slot_pa, len, 0, pitch, 1, 0, SWEET_FB_HW_TILE_Y, SWEET_FB_HW_GRAD_X, SWEET_FB_HW_GRAD_Y,
++		                     SWEET_FB_HW_TILE, SWEET_FB_HW_TILE };
++	in[0] = l0; in[1] = l1;
++	*pm = t == 2 ? 0u : (t == 3 ? 2u : (t == 4 ? 1u : 0u));
++	return t >= 2 && t <= 4 ? 2u : 1u;
++}
++
++/* ---- fault / race policy ------------------------------------------------------------------------------------------------- */
++/* Any OVL underflow / abnormal bit, DSI underrun, transfer timeout or register read-back mismatch on a HW frame turns HW
++ * composition off (mode 0) at once.  hw_race (a GPU write to a shown layer surface started between the plan and FRAME_DONE)
++ * turns it off after SWEET_FB_HW_RACE_LIMIT consecutive HW frames with a race. */
++#define SWEET_FB_HW_RACE_LIMIT      16u
++enum sweet_fb_hw_fault { SWEET_FB_HW_F_NONE = 0, SWEET_FB_HW_F_UNDERFLOW, SWEET_FB_HW_F_DSI, SWEET_FB_HW_F_TIMEOUT, SWEET_FB_HW_F_READBACK,
++	                 SWEET_FB_HW_F_RACE, SWEET_FB_HW_F_BASE };
++static inline const char *
++sweet_fb_hw_fault_name(int f)
++{
++	static const char *const n[] = { "none", "ovl-underflow", "dsi-underrun", "frame-done-timeout", "readback-mismatch", "hw-race", "overlay-base" };
++	return (f >= 0 && f <= (int)SWEET_FB_HW_F_BASE) ? n[f] : "?";
++}
++/* fault of a finished HW frame from the OVL INTSTA of both pipes, the DSI INTSTA and the transfer result; race_run is updated */
++static inline int
++sweet_fb_hw_frame_fault(uint32_t ovl_or, uint32_t dsi, bool timeout, bool raced, uint32_t *race_run)
++{
++	*race_run = raced ? *race_run + 1 : 0;
++	if (timeout) { return SWEET_FB_HW_F_TIMEOUT; }
++	if (ovl_or & SWEET_FB_HW_INT_UNDERFLOW) { return SWEET_FB_HW_F_UNDERFLOW; }
++	if (dsi & SWEET_FB_HW_DSI_UNDERRUN) { return SWEET_FB_HW_F_DSI; }
++	if (*race_run >= SWEET_FB_HW_RACE_LIMIT) { return SWEET_FB_HW_F_RACE; }
++	return SWEET_FB_HW_F_NONE;
++}
++
++/* GPU fence rule for a HW frame: shown only when no write job on any layer is in flight (busy = queued/running write job or a
++ * 0112 reservation; pending = 0395's per-surface write-pending).  Never forced: after the bounded wait the swap is requeued
++ * (a newer swap replaces it) and the panel keeps its picture. */
++static inline bool
++sweet_fb_hw_fence_ok(const bool busy[], const bool pending[], unsigned n)
++{
++	for (unsigned i = 0; i < n; i++) { if (busy[i] || pending[i]) { return false; } }
++	return true;
++}
++
++#endif /* SWEET_FB_HW_H */

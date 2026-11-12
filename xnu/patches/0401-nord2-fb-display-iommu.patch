@@ -1,0 +1,931 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -366,11 +366,14 @@
+ 	return (uint32_t)(ns / 1000000000ull);
+ }
+ 
++#include "sweet_fb_iommu_hw.h"        /* 0401 IOMMU: display IOMMU (uses the pool code above for its page tables) */
++
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
+ void
+ SweetSurface::free()
+ {
++	sweet_fb_iommu_surface_gone(this);      /* 0401 IOMMU: unmap before the pages can go */
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 		OSDecrementAtomic((volatile SInt32 *)&sweet_surface_buffers);
+@@ -1849,6 +1852,7 @@
+ 	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
+ 	if (!((uintptr_t)options & kIOSurfaceLockReadOnly)) {
+ 		nord2_gpu_surface_cpu_release(s);       /* the CPU wrote it: clean before the GPU's next read */
++		sweet_fb_iommu_cpu_wrote(s);            /* 0401 IOMMU: and before the next overlay scan through the IOMMU */
+ 	}
+ 	s->release();
+ 	return ret;
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -43,6 +43,7 @@
+ #include "sweet_fb_scene.h"           /* 0392 */
+ #include "sweet_fb_hw.h"              /* 0396 */
+ #include "sweet_fb_pace.h"            /* 0397 */
++#include "sweet_fb_iommu.h"           /* 0401 IOMMU */
+ 
+ /*
+  * 0397 (fbpace-20261112): keep the panel at 90 Hz and measure the present pacing.
+@@ -2071,10 +2072,14 @@
+ 			uint64_t pa = sweet_surface_pool_pa_obj(s), len = sweet_surface_pool_size_obj(s);
+ 			if (pa != 0 && sweet_fb_hw_pool_contains(pa, len) && sweet_surface_pool_cache_obj(s) == SWEET_FB_HW_POOL_CACHE_WC) { l.pa = pa; l.len = len; }
+ 		}
++		if (l.pa == 0 && l.format_ok) { (void)sweet_fb_iommu_layer(s, &l.pa, &l.len); }      /* 0401 IOMMU: any DRAM surface through an IOVA */
+ 		l.offset = s->offset; l.pitch = s->bytesPerRow;
+ 		l.sx = g.sx; l.sy = g.sy; l.dx = g.dx; l.dy = g.dy; l.w = g.w; l.h = g.h;
+ 		in[n] = l; ss[n] = s; ids[n] = id; n++;
+ 	}
++	for (unsigned i = 0; n > 1 && sweet_fb_iommu_mode() == 2 && i < n; i++) {      /* 0401 IOMMU: mode 2 = IOVA layers in single-layer frames only */
++		if (sweet_fb_iommu_in_window(in[i].pa, in[i].pa + 1u)) { in[i].pa = 0; in[i].len = 0; }
++	}
+ 	return n;
+ }
+ 
+@@ -2099,6 +2104,7 @@
+ {
+ 	volatile uint32_t *o = fOvl[k];
+ 	if (o == NULL || n > SWEET_FB_HW_MAX_REGS) { *badOff = 0xffffffffu; return false; }
++	if (!sweet_fb_iommu_gate_list(k, r, n)) { *badOff = 0xfffffffeu; return false; }      /* 0401 IOMMU: OVL port MMU_EN, between transfers */
+ 	for (unsigned i = 0; i < n; i++) { o[r[i].off / 4] = r[i].val; }
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	for (unsigned i = 0; i < n; i++) {
+@@ -2324,6 +2330,7 @@
+ 	 * copies of WC pool surfaces).  Only underflow / DSI underrun / timeout fault (with a backoff, hwFault). */
+ 	uint32_t norace = 0;
+ 	int f = sweet_fb_hw_frame_fault(ovl, dsi, timeout, false, &norace);
++	if (sweet_fb_iommu_frame_done() && f == SWEET_FB_HW_F_NONE) { f = SWEET_FB_HW_F_READBACK; }      /* 0401 IOMMU: M4U fault -> restore */
+ 	fHwRaceRun = raced ? fHwRaceRun + 1 : 0;
+ 	if (fHwRaceRun > fHwRaceTotalRunMax) { fHwRaceTotalRunMax = fHwRaceRun; }
+ 	if (f != SWEET_FB_HW_F_NONE) { hwFault(f, "frame"); }
+@@ -2359,6 +2366,7 @@
+ 			sender->setTimeoutUS(500);
+ 			return;
+ 		}
++		slot = sweet_fb_iommu_test_slot(slot, (const void *)fHwTestMap->getVirtualAddress(), bytes);      /* 0401 IOMMU: kern.n2fbiommutest */
+ 		struct sweet_fb_hw_in in[2];
+ 		uint32_t pm = 0;
+ 		unsigned n = sweet_fb_hw_test_layers(in, fHwTestStep, slot, fRowBytes, fWidth, fHeight, __atomic_load_n(&sweet_fb_hw_pm, __ATOMIC_RELAXED), &pm);
+--- a/iokit/Kernel/arm/sweet_fb_hw.h
++++ b/iokit/Kernel/arm/sweet_fb_hw.h
+@@ -186,6 +186,7 @@
+ 	if (end <= a) { return false; }
+ 	if (a >= SWEET_FB_HW_POOL_BASE && end <= SWEET_FB_HW_POOL_BASE + SWEET_FB_HW_POOL_SIZE) { return true; }
+ 	if (a >= SWEET_FB_HW_FB_BASE && end <= SWEET_FB_HW_FB_END) { return true; }
++	if (a >= 0x90000000ull && end <= 0xB0000000ull) { return true; }      /* 0401 IOMMU: IOVA window (sweet_fb_iommu.h), handed out only while armed */
+ 	return false;
+ }
+ 
+--- a/iokit/Kernel/arm/sweet_fb_iommu.h
++++ b/iokit/Kernel/arm/sweet_fb_iommu.h
+@@ -0,0 +1,313 @@
++/*
++ * 0401: display IOMMU (MTK M4U0, v7s short-descriptor tables) for the OVL layers -- PURE part (stdint only, host-tested).
++ *
++ * The OVL ADDR registers are 32 bits and, with the larb port's MMU_EN = 0 (how LK leaves them), physical: only the display pool
++ * (0394, 0xC0000000+256 MiB) and the framebuffer carve-out are readable.  With MMU_EN = 1 on the OVL*_2L ports every address the
++ * port issues is an IOVA translated by M4U0 through ONE page table (domain 0).  This header builds that table:
++ *
++ *   IOVA 0x76e00000..0x78c00000  identity 1 MiB sections  (framebuffer carve-out: panel buffers, test slot)     -> mode A unchanged
++ *   IOVA 0xC0000000..0xE0000000  identity 1 MiB sections  (display pool 0394 + camera/JPEG/GNSS buffers)        -> mode A unchanged
++ *   IOVA 0x90000000..0xB0000000  the WINDOW: 4 KiB pages of any IOSurface (scattered, PA up to 34 bits)        -> mode B
++ *   anything else                invalid (translation fault -> IVRP page + fault status -> auto-disable)
++ *
++ * so turning translation on or off never changes what a physically-programmed layer shows, and the ports can be switched while
++ * a pool/panel layer is programmed.  Tables (L1 64 KiB = 16384 entries because Linux runs this M4U with 34-bit IOVAs, mt6893_defconfig
++ * CONFIG_MTK_IOMMU_PGTABLE_EXT=34; the 4 GiB we use are its first 4096 entries) and the L2 tables of the window live in ONE block of
++ * the display pool: below 4 GiB (v7s L1 table pointers carry no PA[33:32]; Linux puts L2 in DMA32 too) and write-combined (the walker
++ * needs no cache maintenance).
++ *
++ * PTE layout = drivers/iommu/io-pgtable-arm-v7s.c with CONFIG_MTK_IOMMU_V2, quirks ARM_NS | NO_PERMS | ARM_MTK_4GB [V-code; quirk set
++ * mtk_iommu_v2.c:1745-1760, work/NOTES.md "0401 display IOMMU"]:
++ *   small page  PA[31:12] | PA32<<9 | PA33<<4 | nG(bit 11) | TEX=1(bit 6, normal non-cacheable) | 0b10
++ *   section     PA[31:20] | NS(bit 19) | nG(bit 17) | TEX=1(bit 12) | 0b10
++ *   L1 -> L2    L2PA[31:10] | NS_TABLE(bit 3) | 0b01
++ */
++#ifndef SWEET_FB_IOMMU_H
++#define SWEET_FB_IOMMU_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++/* ---------------------------------------------------------------- address plan */
++#define SWEET_FB_IOMMU_WIN_BASE         0x90000000u
++#define SWEET_FB_IOMMU_WIN_SIZE         0x20000000u     /* 512 MiB: ~46 full-screen surfaces + guards */
++#define SWEET_FB_IOMMU_ID_FB_BASE       0x76e00000u     /* 1 MiB aligned cover of 0x76e10000..0x78c00000 */
++#define SWEET_FB_IOMMU_ID_FB_END        0x78c00000u
++#define SWEET_FB_IOMMU_ID_LOW_BASE      0xC0000000u     /* pool (0394) + 0xD0000000.. camera/JPEG/GNSS: a non-display port that had */
++#define SWEET_FB_IOMMU_ID_LOW_END       0xE0000000u     /* MMU_EN set would still reach its physical buffers through this table */
++#define SWEET_FB_IOMMU_GRANULE          0x10000u        /* IOVA allocation unit */
++#define SWEET_FB_IOMMU_NGRAN            (SWEET_FB_IOMMU_WIN_SIZE / SWEET_FB_IOMMU_GRANULE)      /* 8192 */
++#define SWEET_FB_IOMMU_GUARD_GRAN       1u              /* unmapped granule after each mapping: an overrun faults, never reads a neighbour */
++#define SWEET_FB_IOMMU_PA_LIMIT         (1ull << 34)
++
++/* ---------------------------------------------------------------- v7s geometry */
++#define SWEET_FB_IOMMU_L1_ENTRIES       16384u          /* 34-bit IOVA: IOVA[33:20] */
++#define SWEET_FB_IOMMU_L1_BYTES         (SWEET_FB_IOMMU_L1_ENTRIES * 4u)        /* 64 KiB, 64 KiB aligned (pool granule) */
++#define SWEET_FB_IOMMU_L2_ENTRIES       256u
++#define SWEET_FB_IOMMU_L2_BYTES         1024u
++#define SWEET_FB_IOMMU_NL2              (SWEET_FB_IOMMU_WIN_SIZE >> 20)         /* 512 */
++#define SWEET_FB_IOMMU_OFF_L2           SWEET_FB_IOMMU_L1_BYTES
++#define SWEET_FB_IOMMU_OFF_SCRATCH      (SWEET_FB_IOMMU_OFF_L2 + SWEET_FB_IOMMU_NL2 * SWEET_FB_IOMMU_L2_BYTES)    /* IVRP / dummy page */
++#define SWEET_FB_IOMMU_BLOCK_BYTES      (SWEET_FB_IOMMU_OFF_SCRATCH + 0x1000u)  /* 580 KiB of pool */
++
++#define SWEET_FB_IOMMU_T_FAULT          0u
++#define SWEET_FB_IOMMU_T_TABLE          1u
++#define SWEET_FB_IOMMU_T_PAGE           2u              /* small page (L2) / section (L1) */
++#define SWEET_FB_IOMMU_PG_PA32          (1u << 9)
++#define SWEET_FB_IOMMU_PG_PA33          (1u << 4)
++#define SWEET_FB_IOMMU_PG_ATTR          ((1u << 11) | (1u << 6))                /* nG | TEX=1 (attr block << 4) */
++#define SWEET_FB_IOMMU_SEC_ATTR         ((1u << 19) | (1u << 17) | (1u << 12))  /* NS | nG | TEX=1 (attr block << 10) */
++#define SWEET_FB_IOMMU_TBL_ATTR         (1u << 3)                               /* NS_TABLE */
++#define SWEET_FB_IOMMU_BAD_PA           (~0ull)
++
++static inline uint32_t
++sweet_fb_iommu_pte_page(uint64_t pa)
++{
++	return (uint32_t)(pa & 0xfffff000u) | ((pa >> 32) & 1u ? SWEET_FB_IOMMU_PG_PA32 : 0u) | ((pa >> 33) & 1u ? SWEET_FB_IOMMU_PG_PA33 : 0u) |
++	       SWEET_FB_IOMMU_PG_ATTR | SWEET_FB_IOMMU_T_PAGE;
++}
++
++static inline uint32_t
++sweet_fb_iommu_pte_section(uint32_t pa)
++{
++	return (pa & 0xfff00000u) | SWEET_FB_IOMMU_SEC_ATTR | SWEET_FB_IOMMU_T_PAGE;
++}
++
++static inline uint32_t
++sweet_fb_iommu_pte_table(uint32_t l2pa)
++{
++	return (l2pa & 0xfffffc00u) | SWEET_FB_IOMMU_TBL_ATTR | SWEET_FB_IOMMU_T_TABLE;
++}
++
++static inline bool
++sweet_fb_iommu_in_window(uint64_t a, uint64_t end)
++{
++	return end > a && a >= SWEET_FB_IOMMU_WIN_BASE && end <= (uint64_t)SWEET_FB_IOMMU_WIN_BASE + SWEET_FB_IOMMU_WIN_SIZE;
++}
++
++/* ---------------------------------------------------------------- tables */
++struct sweet_fb_iommu_pt {
++	volatile uint32_t *l1;          /* SWEET_FB_IOMMU_L1_ENTRIES */
++	volatile uint32_t *l2;          /* SWEET_FB_IOMMU_NL2 tables of 256, contiguous after l1 */
++	uint64_t l1_pa, l2_pa;          /* both < 4 GiB */
++	uint32_t mapped;                /* window pages valid now */
++};
++
++/* Lay the tables over one block (va/pa of SWEET_FB_IOMMU_BLOCK_BYTES, pa 64 KiB aligned, < 4 GiB) and fill them: identity sections,
++ * window L1 entries pointing at the (zeroed) L2 tables, everything else invalid.  false = block unusable. */
++static inline bool
++sweet_fb_iommu_pt_init(struct sweet_fb_iommu_pt *pt, volatile void *va, uint64_t pa)
++{
++	if (!va || (pa & 0xffffu) != 0 || pa + SWEET_FB_IOMMU_BLOCK_BYTES > 0x100000000ull) { return false; }
++	pt->l1 = (volatile uint32_t *)va;
++	pt->l2 = (volatile uint32_t *)(volatile void *)((volatile uint8_t *)va + SWEET_FB_IOMMU_OFF_L2);
++	pt->l1_pa = pa; pt->l2_pa = pa + SWEET_FB_IOMMU_OFF_L2; pt->mapped = 0;
++	for (uint32_t i = 0; i < SWEET_FB_IOMMU_NL2 * SWEET_FB_IOMMU_L2_ENTRIES; i++) { pt->l2[i] = 0; }
++	for (uint32_t i = 0; i < SWEET_FB_IOMMU_L1_ENTRIES; i++) {
++		uint32_t a = i << 20, e = 0;
++		if (i < 4096u && ((a >= SWEET_FB_IOMMU_ID_FB_BASE && a < SWEET_FB_IOMMU_ID_FB_END) || (a >= SWEET_FB_IOMMU_ID_LOW_BASE && a < SWEET_FB_IOMMU_ID_LOW_END))) {
++			e = sweet_fb_iommu_pte_section(a);
++		} else if (i < 4096u && a >= SWEET_FB_IOMMU_WIN_BASE && a - SWEET_FB_IOMMU_WIN_BASE < SWEET_FB_IOMMU_WIN_SIZE) {
++			e = sweet_fb_iommu_pte_table((uint32_t)(pt->l2_pa + ((a - SWEET_FB_IOMMU_WIN_BASE) >> 20) * SWEET_FB_IOMMU_L2_BYTES));
++		}
++		pt->l1[i] = e;
++	}
++	return true;
++}
++
++static inline volatile uint32_t *
++sweet_fb_iommu_l2e(struct sweet_fb_iommu_pt *pt, uint32_t iova)
++{
++	return &pt->l2[(iova - SWEET_FB_IOMMU_WIN_BASE) >> 12];
++}
++
++/* One window page.  false (nothing written) = iova outside the window / unaligned, pa unaligned or >= 2^34, or already mapped. */
++static inline bool
++sweet_fb_iommu_map_page(struct sweet_fb_iommu_pt *pt, uint32_t iova, uint64_t pa)
++{
++	if ((iova & 0xfffu) != 0 || (pa & 0xfffu) != 0 || pa >= SWEET_FB_IOMMU_PA_LIMIT || !sweet_fb_iommu_in_window(iova, (uint64_t)iova + 0x1000u)) { return false; }
++	volatile uint32_t *e = sweet_fb_iommu_l2e(pt, iova);
++	if (*e != 0) { return false; }
++	*e = sweet_fb_iommu_pte_page(pa);
++	pt->mapped++;
++	return true;
++}
++
++static inline void
++sweet_fb_iommu_unmap(struct sweet_fb_iommu_pt *pt, uint32_t iova, uint32_t pages)
++{
++	for (uint32_t i = 0; i < pages; i++) {
++		uint64_t a = (uint64_t)iova + (uint64_t)i * 0x1000u;
++		if (!sweet_fb_iommu_in_window(a, a + 0x1000u)) { break; }
++		volatile uint32_t *e = sweet_fb_iommu_l2e(pt, (uint32_t)a);
++		if (*e != 0) { *e = 0; pt->mapped--; }
++	}
++}
++
++/* What the hardware would do for iova: the PA, or SWEET_FB_IOMMU_BAD_PA (translation fault).  Follows table pointers by PA (only the
++ * L2 block of this pt is reachable; any other pointer is reported as a fault: a corrupted table). */
++static inline uint64_t
++sweet_fb_iommu_walk(const struct sweet_fb_iommu_pt *pt, uint64_t iova)
++{
++	if (iova >= (1ull << 34)) { return SWEET_FB_IOMMU_BAD_PA; }
++	uint32_t e1 = pt->l1[(iova >> 20) & (SWEET_FB_IOMMU_L1_ENTRIES - 1u)];
++	switch (e1 & 3u) {
++	case SWEET_FB_IOMMU_T_PAGE: {
++		if (e1 & (1u << 18)) { return SWEET_FB_IOMMU_BAD_PA; }          /* supersection: never written */
++		uint64_t pa = (e1 & 0xfff00000u) | (iova & 0xfffffu);
++		if (e1 & SWEET_FB_IOMMU_PG_PA32) { pa |= 1ull << 32; }
++		if (e1 & SWEET_FB_IOMMU_PG_PA33) { pa |= 1ull << 33; }
++		return pa;
++	}
++	case SWEET_FB_IOMMU_T_TABLE: {
++		uint64_t l2pa = e1 & 0xfffffc00u;
++		if (l2pa < pt->l2_pa || l2pa >= pt->l2_pa + (uint64_t)SWEET_FB_IOMMU_NL2 * SWEET_FB_IOMMU_L2_BYTES) { return SWEET_FB_IOMMU_BAD_PA; }
++		uint32_t e2 = pt->l2[(l2pa - pt->l2_pa) / 4u + ((iova >> 12) & 0xffu)];
++		if ((e2 & 2u) == 0) { return SWEET_FB_IOMMU_BAD_PA; }           /* invalid or large page (never written) */
++		uint64_t pa = (e2 & 0xfffff000u) | (iova & 0xfffu);
++		if (e2 & SWEET_FB_IOMMU_PG_PA32) { pa |= 1ull << 32; }
++		if (e2 & SWEET_FB_IOMMU_PG_PA33) { pa |= 1ull << 33; }
++		return pa;
++	}
++	default:
++		return SWEET_FB_IOMMU_BAD_PA;
++	}
++}
++
++/* ---------------------------------------------------------------- IOVA allocator (window granules, first fit, guard after each) */
++#define SWEET_FB_IOVA_FAIL              0xffffffffu
++struct sweet_fb_iova {
++	uint64_t used[SWEET_FB_IOMMU_NGRAN / 64];       /* granule taken (incl. guards) */
++	uint64_t head[SWEET_FB_IOMMU_NGRAN / 64];       /* first granule of an allocation */
++	uint32_t live, granules, fails, bad_free;
++};
++
++static inline bool sweet_fb_iova_bit(const uint64_t *m, uint32_t g) { return (m[g >> 6] >> (g & 63u)) & 1u; }
++static inline void sweet_fb_iova_set(uint64_t *m, uint32_t g, bool v) { if (v) { m[g >> 6] |= 1ull << (g & 63u); } else { m[g >> 6] &= ~(1ull << (g & 63u)); } }
++static inline uint32_t sweet_fb_iova_ngran(uint64_t bytes) { return (uint32_t)((bytes + SWEET_FB_IOMMU_GRANULE - 1u) / SWEET_FB_IOMMU_GRANULE) + SWEET_FB_IOMMU_GUARD_GRAN; }
++
++static inline void
++sweet_fb_iova_init(struct sweet_fb_iova *a)
++{
++	for (uint32_t i = 0; i < SWEET_FB_IOMMU_NGRAN / 64; i++) { a->used[i] = 0; a->head[i] = 0; }
++	a->live = a->granules = a->fails = a->bad_free = 0;
++}
++
++/* IOVA of bytes (> 0), or SWEET_FB_IOVA_FAIL. */
++static inline uint32_t
++sweet_fb_iova_alloc(struct sweet_fb_iova *a, uint64_t bytes)
++{
++	if (bytes == 0 || bytes > SWEET_FB_IOMMU_WIN_SIZE) { a->fails++; return SWEET_FB_IOVA_FAIL; }
++	uint32_t n = sweet_fb_iova_ngran(bytes), run = 0;
++	for (uint32_t g = 0; g < SWEET_FB_IOMMU_NGRAN; g++) {
++		if (sweet_fb_iova_bit(a->used, g)) { run = 0; continue; }
++		if (++run == n) {
++			uint32_t g0 = g + 1u - n;
++			for (uint32_t k = g0; k <= g; k++) { sweet_fb_iova_set(a->used, k, true); }
++			sweet_fb_iova_set(a->head, g0, true);
++			a->live++; a->granules += n;
++			return SWEET_FB_IOMMU_WIN_BASE + g0 * SWEET_FB_IOMMU_GRANULE;
++		}
++	}
++	a->fails++;
++	return SWEET_FB_IOVA_FAIL;
++}
++
++/* false (nothing changed, bad_free counted) unless [iova, bytes) is exactly one live allocation. */
++static inline bool
++sweet_fb_iova_free(struct sweet_fb_iova *a, uint32_t iova, uint64_t bytes)
++{
++	uint32_t n = sweet_fb_iova_ngran(bytes);
++	if (bytes == 0 || iova < SWEET_FB_IOMMU_WIN_BASE || ((iova - SWEET_FB_IOMMU_WIN_BASE) % SWEET_FB_IOMMU_GRANULE) != 0) { a->bad_free++; return false; }
++	uint32_t g0 = (iova - SWEET_FB_IOMMU_WIN_BASE) / SWEET_FB_IOMMU_GRANULE;
++	if (g0 + n > SWEET_FB_IOMMU_NGRAN || !sweet_fb_iova_bit(a->head, g0)) { a->bad_free++; return false; }
++	for (uint32_t k = g0; k < g0 + n; k++) {
++		if (!sweet_fb_iova_bit(a->used, k) || (k > g0 && sweet_fb_iova_bit(a->head, k))) { a->bad_free++; return false; }
++	}
++	if (g0 + n < SWEET_FB_IOMMU_NGRAN && sweet_fb_iova_bit(a->used, g0 + n) && !sweet_fb_iova_bit(a->head, g0 + n)) { a->bad_free++; return false; }  /* longer allocation */
++	for (uint32_t k = g0; k < g0 + n; k++) { sweet_fb_iova_set(a->used, k, false); }
++	sweet_fb_iova_set(a->head, g0, false);
++	a->live--; a->granules -= n;
++	return true;
++}
++
++/* ---------------------------------------------------------------- per-surface mapping cache */
++#define SWEET_FB_IOMMU_CACHE            48u
++struct sweet_fb_iommu_ent {
++	const void *obj;                /* SweetSurface (no retain: SweetSurface::free unmaps) */
++	uint32_t id, iova, bytes, pages;
++	uint32_t cpu_seq;               /* CPU-write count (IOSurfaceUnlock) at the last cache clean of the pixels */
++	uint64_t stamp;                 /* planning generation of the last lookup */
++};
++
++/* The OVL ADDR values programmed now (2 pipes x 2 layers), from the register lists the framebuffer writes between transfers. */
++struct sweet_fb_iommu_prog { uint32_t addr[2][2]; };
++
++static inline bool
++sweet_fb_iommu_ent_programmed(const struct sweet_fb_iommu_ent *e, const struct sweet_fb_iommu_prog *p)
++{
++	for (unsigned k = 0; k < 2; k++) {
++		for (unsigned i = 0; i < 2; i++) {
++			uint32_t a = p->addr[k][i];
++			if (e->obj && a >= e->iova && (uint64_t)a < (uint64_t)e->iova + e->bytes) { return true; }
++		}
++	}
++	return false;
++}
++
++/* Entry to evict to make room: the least recently looked-up one that the OVL cannot read (no programmed ADDR inside it) and that was
++ * not looked up in the current planning generation (a frame being planned may still use it).  -1 = none may go. */
++static inline int
++sweet_fb_iommu_victim(const struct sweet_fb_iommu_ent *e, unsigned n, const struct sweet_fb_iommu_prog *p, uint64_t gen)
++{
++	int best = -1;
++	for (unsigned i = 0; i < n; i++) {
++		if (!e[i].obj || e[i].stamp >= gen || sweet_fb_iommu_ent_programmed(&e[i], p)) { continue; }
++		if (best < 0 || e[i].stamp < e[best].stamp) { best = (int)i; }
++	}
++	return best;
++}
++
++/* Gate decision before a register list is written (between transfers).  has_iova: the list programs a window address. */
++enum { SWEET_FB_IOMMU_G_KEEP = 0, SWEET_FB_IOMMU_G_ENABLE, SWEET_FB_IOMMU_G_DISABLE, SWEET_FB_IOMMU_G_REFUSE };
++static inline int
++sweet_fb_iommu_gate_decide(bool has_iova, bool ports_on, bool armed, bool other_pipe_iova)
++{
++	if (has_iova) { return !armed ? SWEET_FB_IOMMU_G_REFUSE : (ports_on ? SWEET_FB_IOMMU_G_KEEP : SWEET_FB_IOMMU_G_ENABLE); }
++	if (ports_on && !armed && !other_pipe_iova) { return SWEET_FB_IOMMU_G_DISABLE; }     /* identity maps: safe with panel/pool layers */
++	return SWEET_FB_IOMMU_G_KEEP;
++}
++
++/* ---------------------------------------------------------------- kernel API (SweetSurface.cpp, 0401) */
++#ifdef __cplusplus
++extern "C" {
++#endif
++/* kern.n2fbiommu: 0 off (pool only), 1 map-only dry run, 2 IOVA layers in single-layer frames, 3 all frames */
++uint32_t sweet_fb_iommu_mode(void);
++/* IOVA/length of a surface for the overlay planner (pa/len of struct sweet_fb_hw_in); false = not through the IOMMU (CPU path). */
++bool sweet_fb_iommu_layer(void *surface, uint64_t *iova, uint64_t *len);
++/* Before an OVL register list of pipe k is written (between transfers): addr0/addr1 = the layer 0/1 ADDR values in the list
++ * (0xffffffff = not in the list).  Switches the OVL ports' MMU_EN as needed; false = the list must not be written. */
++bool sweet_fb_iommu_gate(unsigned pipe, uint32_t addr0, uint32_t addr1);
++/* After a HW frame (FRAME_DONE or timeout): true = an M4U translation fault was seen (logged, IOMMU auto-disabled). */
++bool sweet_fb_iommu_frame_done(void);
++/* H2 test through the IOMMU (kern.n2fbiommutest=1): a scattered copy of the slot's pixels, its IOVA; else slot_pa unchanged. */
++uint64_t sweet_fb_iommu_test_slot(uint64_t slot_pa, const void *slot_va, uint64_t bytes);
++#ifdef __cplusplus
++}
++
++/* The ADDR values of a framebuffer register list (struct sweet_fb_hw_reg: off, val, mask). */
++template <typename R>
++static inline bool
++sweet_fb_iommu_gate_list(unsigned pipe, const R *r, unsigned n)
++{
++	uint32_t a[2] = { 0xffffffffu, 0xffffffffu };
++	for (unsigned i = 0; i < n; i++) {
++		if (r[i].off == 0xf40u) { a[0] = r[i].val; }
++		if (r[i].off == 0xf60u) { a[1] = r[i].val; }
++	}
++	return sweet_fb_iommu_gate(pipe, a[0], a[1]);
++}
++#endif
++
++#endif /* SWEET_FB_IOMMU_H */
+--- a/iokit/Kernel/arm/sweet_fb_iommu_hw.h
++++ b/iokit/Kernel/arm/sweet_fb_iommu_hw.h
+@@ -0,0 +1,528 @@
++/*
++ * 0401: display IOMMU, KERNEL part.  Included ONCE, by SweetSurface.cpp after the 0394 pool code (it uses sweet_pool_take /
++ * sweet_pool_kva / sweet_pool_flush for its page tables).  Pure logic: sweet_fb_iommu.h.  Design + bring-up: work/NOTES.md "0401 display IOMMU".
++ *
++ * Hardware [V-code, Linux mtk_iommu_v2.c / mt6885 mt_iommu_plat.h / pseudo_m4u_v2.c / clk-mt6885-mm.c, live.dts]:
++ *   M4U0 0x1411a000 (bank 0 = normal domain; MMU0 serves larb0/larb1), SPI 300.  Display larbs: larb0 0x14118000, larb1 0x14119000;
++ *   per-port NON_SEC_CON 0x380+4p: bit0 MMU_EN, bits[15:8] IOVA[33:32] extension (must stay 0), non-secure writable (no ATF call).
++ *   OVL0_2L (pipe 0) reads through larb1 port 6, OVL1_2L (pipe 1) through larb0 port 6 (one data port for all layers of an OVL).
++ *   MMSYS_CG_CON1 0x14116110 (status) / 0x14116118 (clear = ungate): bit19 SMI_COMMON, 23 SMI_GALS, 27 SMI_INFRA, 31 SMI_IOMMU.
++ * Only the two OVL*_2L data ports are ever switched; every other port of every larb is left as it is (physical).
++ */
++#ifndef SWEET_FB_IOMMU_HW_H
++#define SWEET_FB_IOMMU_HW_H
++#include "sweet_fb_iommu.h"
++
++extern "C" {
++extern unsigned long gPhysBase, gPhysSize;
++vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++}
++
++#define N2IO_M4U0               0x1411a000UL
++#define N2IO_LARB0              0x14118000UL
++#define N2IO_LARB1              0x14119000UL
++#define N2IO_MMSYS_CG1          0x14116110UL    /* +8 = clear (ungate) */
++#define N2IO_CG_BITS            ((1u << 19) | (1u << 23) | (1u << 27) | (1u << 31))
++#define N2IO_GICD               0x0c000000UL
++#define N2IO_GICD_ISEN_M4U0     (0x100u + 4u * (332u / 32u))    /* SPI 300 = INTID 332 */
++#define N2IO_GICD_BIT_M4U0      (1u << (332u % 32u))
++/* M4U0 register offsets */
++#define N2IO_PT_BASE            0x000u
++#define N2IO_INVLDT             0x020u
++#define N2IO_INVLD_START        0x024u
++#define N2IO_INVLD_END          0x028u
++#define N2IO_INVLD_SEL          0x02cu
++#define N2IO_CTRL               0x110u
++#define N2IO_TFRP               0x114u
++#define N2IO_INT_CTRL0          0x120u
++#define N2IO_INT_MAIN           0x124u
++#define N2IO_CPE_DONE           0x12cu
++#define N2IO_L2_FAULT_ST        0x130u
++#define N2IO_FAULT_ST1          0x134u
++#define N2IO_FAULT_VA0          0x13cu
++#define N2IO_FAULT_PA0          0x140u
++#define N2IO_INT_ID0            0x150u
++#define N2IO_INT_MAIN_MMU0      0x7u            /* translation fault, multi-hit, invalid PA (not TLB miss) */
++#define N2IO_PORT_EXT_MASK      0xff00u
++#define N2IO_PORT(p)            (0x380u + 4u * (p))
++#define N2IO_OVL_PORT           6u              /* larb1 p6 = OVL0_2L (pipe 0), larb0 p6 = OVL1_2L (pipe 1) */
++#define N2IO_LARB_PORTS         15u
++
++static int           n2io_mode;                 /* kern.n2fbiommu (effective; 0 after an auto-disable) */
++static int           n2io_test;                 /* kern.n2fbiommutest */
++static int           n2io_probe_last;
++static IOLock       *n2io_lock;
++static uint32_t      n2io_state;                /* 0 unarmed, 1 armed, 2 refused for this boot */
++static const char   *n2io_why = "not armed";
++static bool          n2io_ports_on, n2io_irq_on;
++static volatile uint32_t *n2io_m4u, *n2io_larb[2], *n2io_cg, *n2io_gicd;   /* n2io_larb[pipe]: pipe 0 = larb1, pipe 1 = larb0 */
++static struct sweet_fb_iommu_pt n2io_pt;
++static struct sweet_fb_iova n2io_iova;
++static struct sweet_fb_iommu_ent n2io_ent[SWEET_FB_IOMMU_CACHE];
++static struct sweet_fb_iommu_prog n2io_prog;
++static uint64_t      n2io_gen = 1;
++static uint64_t      n2io_scratch_pa;
++static uint32_t      n2io_ptbase_val;
++static IOBufferMemoryDescriptor *n2io_test_buf;
++static uint32_t      n2io_test_iova;
++static uint64_t      n2io_log_at;
++static uint32_t      n2io_cpu_seq[SWEET_SURFACE_MAX_ID];        /* write-unlocks per surface id (IOSurfaceUnlock without ReadOnly) */
++static struct {
++	uint64_t maps, hits, unmaps, evicts, map_fail, verify_bad, refused, layers, dry, cleans;
++	uint32_t enables, disables, faults, tlb_timeouts, logged;
++} n2io_st;
++
++static inline uint32_t n2io_rd(volatile uint32_t *b, uint32_t off) { uint32_t v = b[off / 4]; __asm__ volatile("dmb oshld" ::: "memory"); return v; }
++static inline void n2io_wr(volatile uint32_t *b, uint32_t off, uint32_t v) { __asm__ volatile("dmb oshst" ::: "memory"); b[off / 4] = v; __asm__ volatile("dsb osh" ::: "memory"); }
++
++static uint64_t
++n2io_now_ms(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000ull;
++}
++
++/* Register blocks (display power domain: up while the panel runs; LK configured it). */
++static bool
++n2io_map_regs(void)
++{
++	if (n2io_larb[0] == NULL) {
++		n2io_cg = (volatile uint32_t *)ml_io_map(N2IO_MMSYS_CG1 & ~0xfffUL, 0x1000);
++		n2io_larb[0] = (volatile uint32_t *)ml_io_map(N2IO_LARB1, 0x1000);
++		n2io_larb[1] = (volatile uint32_t *)ml_io_map(N2IO_LARB0, 0x1000);
++		n2io_m4u = (volatile uint32_t *)ml_io_map(N2IO_M4U0, 0x1000);
++		n2io_gicd = (volatile uint32_t *)ml_io_map(N2IO_GICD, 0x1000);
++	}
++	return n2io_cg != NULL && n2io_larb[0] != NULL && n2io_larb[1] != NULL && n2io_m4u != NULL && n2io_gicd != NULL;
++}
++
++static uint32_t n2io_cg_gated(void) { return n2io_rd(n2io_cg, N2IO_MMSYS_CG1 & 0xfffu) & N2IO_CG_BITS; }
++
++/* kern.n2fbiommu_probe=1: READ-ONLY dump (log only).  Touches M4U0 only if its clocks are ungated (a gated MMSYS block can hang the bus). */
++static void
++n2io_probe(void)
++{
++	if (!n2io_map_regs()) { IOLog("NORD2 FB IOMMU: probe: register blocks not mappable\n"); return; }
++	uint32_t cg = n2io_rd(n2io_cg, N2IO_MMSYS_CG1 & 0xfffu), gic = n2io_rd(n2io_gicd, N2IO_GICD_ISEN_M4U0);
++	IOLog("NORD2 FB IOMMU: probe: MMSYS_CG_CON1 %08x (gated of smi_common/gals/infra/iommu: %08x) GICD_ISENABLER10 %08x (spi300 m4u0 %s)\n", cg,
++	    cg & N2IO_CG_BITS, gic, (gic & N2IO_GICD_BIT_M4U0) ? "ENABLED" : "masked");
++	for (unsigned l = 0; l < 2; l++) {
++		volatile uint32_t *b = n2io_larb[l == 0 ? 1 : 0];
++		uint32_t v[N2IO_LARB_PORTS];
++		for (unsigned p = 0; p < N2IO_LARB_PORTS; p++) { v[p] = n2io_rd(b, N2IO_PORT(p)); }
++		IOLog("NORD2 FB IOMMU: probe: larb%u 0x380.. %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x\n", l, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
++		    v[8], v[9], v[10], v[11], v[12], v[13], v[14]);
++	}
++	if ((cg & ((1u << 27) | (1u << 31))) != 0) { IOLog("NORD2 FB IOMMU: probe: M4U0 clock gated: M4U0 registers NOT read\n"); return; }
++	static const uint16_t off[] = { 0x000, 0x020, 0x024, 0x028, 0x02c, 0x048, 0x050, 0x054, 0x110, 0x114, 0x120, 0x124, 0x12c, 0x130, 0x134,
++		                        0x138, 0x13c, 0x140, 0x144, 0x148, 0x150, 0x154 };
++	uint32_t m[sizeof(off) / sizeof(off[0])];
++	for (unsigned i = 0; i < sizeof(off) / sizeof(off[0]); i++) { m[i] = n2io_rd(n2io_m4u, off[i]); }
++	IOLog("NORD2 FB IOMMU: probe: m4u0 pt_base %08x inv %08x %08x %08x %08x misc %08x dcm %08x wrlen %08x ctrl %08x (4gb bit17 %u) tfrp %08x int0 %08x "
++	    "int_main %08x cpe %08x l2f %08x fst1 %08x twva %08x fva0 %08x fpa0 %08x fva1 %08x fpa1 %08x id0 %08x id1 %08x\n", m[0], m[1], m[2], m[3], m[4], m[5],
++	    m[6], m[7], m[8], (m[8] >> 17) & 1u, m[9], m[10], m[11], m[12], m[13], m[14], m[15], m[16], m[17], m[18], m[19], m[20], m[21]);
++	IOLog("NORD2 FB IOMMU: mode=%d state=%u (%s) ports=%u irq=%u maps=%llu hits=%llu unmaps=%llu evicts=%llu live=%u pages=%u iova_kib=%u map_fail=%llu "
++	    "verify_bad=%llu refused=%llu layers=%llu dry=%llu enables=%u disables=%u faults=%u tlb_to=%u\n", n2io_mode, n2io_state, n2io_why, n2io_ports_on,
++	    n2io_irq_on, n2io_st.maps, n2io_st.hits, n2io_st.unmaps, n2io_st.evicts, n2io_iova.live, n2io_pt.mapped, n2io_iova.granules * 64u, n2io_st.map_fail,
++	    n2io_st.verify_bad, n2io_st.refused, n2io_st.layers, n2io_st.dry, n2io_st.enables, n2io_st.disables, n2io_st.faults, n2io_st.tlb_timeouts);
++}
++
++static void
++n2io_tlb_all(void)
++{
++	n2io_wr(n2io_m4u, N2IO_INVLD_SEL, 3u);
++	n2io_wr(n2io_m4u, N2IO_INVLDT, 2u);
++}
++
++/* Range invalidate (Linux mtk_iommu_tlb_flush_range_sync); CPE_DONE timeout (5 ms) -> invalidate all. */
++static void
++n2io_tlb_range(uint32_t iova, uint32_t bytes)
++{
++	if (bytes == 0) { return; }
++	n2io_wr(n2io_m4u, N2IO_INVLD_SEL, 3u);
++	n2io_wr(n2io_m4u, N2IO_INVLD_START, iova & ~0xfffu);
++	n2io_wr(n2io_m4u, N2IO_INVLD_END, (iova + bytes - 1u) & ~0xfffu);
++	n2io_wr(n2io_m4u, N2IO_INVLDT, 1u);
++	unsigned i = 0;
++	while (n2io_rd(n2io_m4u, N2IO_CPE_DONE) == 0 && i++ < 500) { IODelay(10); }
++	if (i > 500) { n2io_st.tlb_timeouts++; n2io_tlb_all(); }
++	n2io_wr(n2io_m4u, N2IO_INVLD_START, 0); n2io_wr(n2io_m4u, N2IO_INVLD_END, 0); n2io_wr(n2io_m4u, N2IO_CPE_DONE, 0);
++}
++
++static void
++n2io_refuse(const char *why)
++{
++	n2io_state = 2; n2io_why = why; n2io_mode = 0;
++	IOLog("NORD2 FB IOMMU: REFUSED for this boot: %s\n", why);
++}
++
++/* Global M4U0 setup (lock held, thread context).  Never touches a port. */
++static bool
++n2io_arm_locked(void)
++{
++	if (n2io_state != 0) { return n2io_state == 1; }
++	if (!n2io_map_regs()) { n2io_refuse("register blocks not mappable"); return false; }
++	uint32_t g = n2io_cg_gated();
++	if (g != 0) {      /* Linux only ever ungates these ("dummy" gates); MMSYS is powered while the panel runs */
++		n2io_wr(n2io_cg, (N2IO_MMSYS_CG1 & 0xfffu) + 8u, g);
++		IOLog("NORD2 FB IOMMU: ungated MMSYS clocks %08x -> gated now %08x\n", g, n2io_cg_gated());
++		if (n2io_cg_gated() != 0) { n2io_refuse("SMI/IOMMU clocks stay gated"); return false; }
++	}
++	for (unsigned k = 0; k < 2; k++) {
++		for (unsigned p = 0; p < N2IO_LARB_PORTS; p++) {
++			uint32_t v = n2io_rd(n2io_larb[k], N2IO_PORT(p));
++			if (v & (1u | N2IO_PORT_EXT_MASK)) {      /* someone translates on a display larb: its table is the current PT_BASE */
++				IOLog("NORD2 FB IOMMU: larb%u port %u NON_SEC_CON %08x (MMU_EN/ext set)\n", k == 0 ? 1u : 0u, p, v);
++				n2io_refuse("a display larb port already translates (MMU_EN or IOVA extension set)");
++				return false;
++			}
++		}
++	}
++	uint64_t pa = sweet_pool_take(SWEET_FB_IOMMU_BLOCK_BYTES);
++	if (pa == 0) { n2io_refuse("no display-pool block for the page tables (pool off/full/disabled)"); return false; }
++	volatile uint8_t *va = sweet_pool_kva + (pa - SWEET_FB_HW_POOL_BASE);
++	if (!sweet_fb_iommu_pt_init(&n2io_pt, va, pa)) { sweet_pool_give(pa, SWEET_FB_IOMMU_BLOCK_BYTES); n2io_refuse("page-table block misplaced"); return false; }
++	sweet_pool_flush((vm_offset_t)va, SWEET_FB_IOMMU_BLOCK_BYTES);
++	sweet_fb_iova_init(&n2io_iova);
++	n2io_scratch_pa = pa + SWEET_FB_IOMMU_OFF_SCRATCH;
++	uint32_t old_pt = n2io_rd(n2io_m4u, N2IO_PT_BASE), old_tfrp = n2io_rd(n2io_m4u, N2IO_TFRP), ctrl = n2io_rd(n2io_m4u, N2IO_CTRL);
++	uint32_t old_int = n2io_rd(n2io_m4u, N2IO_INT_MAIN), gic = n2io_rd(n2io_gicd, N2IO_GICD_ISEN_M4U0);
++	n2io_ptbase_val = (uint32_t)(n2io_pt.l1_pa & 0xffffff80u) | (uint32_t)((n2io_pt.l1_pa >> 32) & 7u);
++	n2io_wr(n2io_m4u, N2IO_PT_BASE, n2io_ptbase_val);
++	n2io_wr(n2io_m4u, N2IO_TFRP, (uint32_t)(n2io_scratch_pa & 0xffffff80u));     /* faulting reads land on a zero page in the pool */
++	n2io_irq_on = false;
++	if (!(gic & N2IO_GICD_BIT_M4U0)) {      /* line masked at the GIC: the fault status latches, no unhandled interrupt can reach XNU */
++		n2io_wr(n2io_m4u, N2IO_INT_MAIN, old_int | N2IO_INT_MAIN_MMU0);
++		n2io_irq_on = true;
++	}
++	n2io_tlb_all();
++	uint32_t rb = n2io_rd(n2io_m4u, N2IO_PT_BASE);
++	IOLog("NORD2 FB IOMMU: armed: tables pa %#llx (l1 64 KiB, %u l2, window %#x+%u MiB, identity fb %#x-%#x low %#x-%#x), PT_BASE %08x -> %08x (read %08x), "
++	    "TFRP %08x -> %08llx, CTRL %08x (4gb bit17 %u), INT_MAIN %08x -> %08x (gic spi300 %s)\n", pa, SWEET_FB_IOMMU_NL2, SWEET_FB_IOMMU_WIN_BASE,
++	    SWEET_FB_IOMMU_WIN_SIZE >> 20, SWEET_FB_IOMMU_ID_FB_BASE, SWEET_FB_IOMMU_ID_FB_END, SWEET_FB_IOMMU_ID_LOW_BASE, SWEET_FB_IOMMU_ID_LOW_END, old_pt,
++	    n2io_ptbase_val, rb, old_tfrp, n2io_scratch_pa & 0xffffff80u, ctrl, (ctrl >> 17) & 1u, old_int, n2io_rd(n2io_m4u, N2IO_INT_MAIN),
++	    (gic & N2IO_GICD_BIT_M4U0) ? "ENABLED: fault interrupts left off, status polled" : "masked");
++	if (rb != n2io_ptbase_val) { n2io_refuse("PT_BASE does not read back"); return false; }
++	n2io_state = 1; n2io_why = "armed";
++	return true;
++}
++
++static void
++n2io_ports(bool on)
++{
++	for (unsigned k = 0; k < 2; k++) {
++		uint32_t v = n2io_rd(n2io_larb[k], N2IO_PORT(N2IO_OVL_PORT));
++		n2io_wr(n2io_larb[k], N2IO_PORT(N2IO_OVL_PORT), on ? (v | 1u) : (v & ~1u));
++	}
++	n2io_ports_on = on;
++	if (on) { n2io_st.enables++; } else { n2io_st.disables++; }
++	if (n2io_st.enables + n2io_st.disables <= 16) {
++		IOLog("NORD2 FB IOMMU: OVL ports MMU_EN %s: larb1 p6 %08x larb0 p6 %08x\n", on ? "ON" : "off", n2io_rd(n2io_larb[0], N2IO_PORT(N2IO_OVL_PORT)),
++		    n2io_rd(n2io_larb[1], N2IO_PORT(N2IO_OVL_PORT)));
++	}
++}
++
++static void
++n2io_unmap_ent(struct sweet_fb_iommu_ent *e)
++{
++	sweet_fb_iommu_unmap(&n2io_pt, e->iova, e->pages);
++	sweet_pool_flush((vm_offset_t)sweet_fb_iommu_l2e(&n2io_pt, e->iova), (size_t)e->pages * 4u);
++	n2io_tlb_range(e->iova, e->pages * 0x1000u);
++	(void)sweet_fb_iova_free(&n2io_iova, e->iova, (uint64_t)e->pages * 0x1000u);
++	n2io_st.unmaps++;
++	e->obj = NULL;
++}
++
++static bool
++n2io_ram(uint64_t pa)
++{
++	return !(pa & 0xfffu) && ((pa >= gPhysBase && pa + 0x1000u <= (uint64_t)gPhysBase + gPhysSize) || sweet_fb_hw_pool_contains(pa, 0x1000u));
++}
++
++/* Map desc (len bytes) for obj/id; lock held.  NULL = not mappable. */
++static struct sweet_fb_iommu_ent *
++n2io_map_locked(const void *obj, uint32_t id, IOMemoryDescriptor *desc, uint64_t len)
++{
++	uint32_t pages = (uint32_t)((len + 0xfffu) >> 12);
++	if (desc == NULL || len == 0 || len > SWEET_FB_IOMMU_WIN_SIZE / 2) { return NULL; }
++	int slot = -1;
++	for (unsigned i = 0; i < SWEET_FB_IOMMU_CACHE; i++) { if (n2io_ent[i].obj == NULL) { slot = (int)i; break; } }
++	uint32_t iova = slot >= 0 ? sweet_fb_iova_alloc(&n2io_iova, (uint64_t)pages << 12) : SWEET_FB_IOVA_FAIL;
++	while (slot < 0 || iova == SWEET_FB_IOVA_FAIL) {
++		int v = sweet_fb_iommu_victim(n2io_ent, SWEET_FB_IOMMU_CACHE, &n2io_prog, n2io_gen);
++		if (v < 0) {
++			if (iova != SWEET_FB_IOVA_FAIL) { (void)sweet_fb_iova_free(&n2io_iova, iova, (uint64_t)pages << 12); }
++			n2io_st.map_fail++;
++			if (n2io_st.map_fail <= 8) { IOLog("NORD2 FB IOMMU: map id %u refused at page 0 of %u: cache/window full of programmed or current mappings\n", id, pages); }
++			return NULL;
++		}
++		n2io_unmap_ent(&n2io_ent[v]); n2io_st.evicts++;
++		if (slot < 0) { slot = v; }
++		if (iova == SWEET_FB_IOVA_FAIL) { iova = sweet_fb_iova_alloc(&n2io_iova, (uint64_t)pages << 12); }
++	}
++	uint64_t lo = ~0ull, hi = 0, prev = ~0ull;
++	uint32_t segs = 0, i = 0;
++	for (; i < pages; i++) {
++		IOByteCount sl = 0;
++		uint64_t pa = desc->getPhysicalSegment((IOByteCount)i << 12, &sl, kIOMemoryMapperNone);
++		if (!n2io_ram(pa) || !sweet_fb_iommu_map_page(&n2io_pt, iova + (i << 12), pa)) { break; }
++		if (pa != prev + 0x1000u) { segs++; }
++		prev = pa; if (pa < lo) { lo = pa; } if (pa > hi) { hi = pa; }
++	}
++	if (i < pages) {      /* the i pages written go again; the whole allocation goes back */
++		sweet_fb_iommu_unmap(&n2io_pt, iova, i);
++		sweet_pool_flush((vm_offset_t)sweet_fb_iommu_l2e(&n2io_pt, iova), (size_t)pages * 4u);
++		n2io_tlb_range(iova, pages << 12);
++		(void)sweet_fb_iova_free(&n2io_iova, iova, (uint64_t)pages << 12);
++		n2io_st.map_fail++;
++		if (n2io_st.map_fail <= 8) { IOLog("NORD2 FB IOMMU: map id %u refused at page %u of %u (not DRAM or bad PA)\n", id, i, pages); }
++		return NULL;
++	}
++	struct sweet_fb_iommu_ent *e = &n2io_ent[slot];
++	e->obj = obj; e->id = id; e->iova = iova; e->pages = pages; e->bytes = (uint32_t)len; e->stamp = n2io_gen; e->cpu_seq = ~0u;
++	sweet_pool_flush((vm_offset_t)sweet_fb_iommu_l2e(&n2io_pt, iova), (size_t)pages * 4u);
++	n2io_tlb_range(iova, pages << 12);      /* TLBI_ON_MAP, as Linux */
++	uint32_t bad = 0;      /* CPU walk of the table against the descriptor, every page */
++	for (i = 0; i < pages; i++) {
++		IOByteCount sl = 0;
++		uint64_t pa = desc->getPhysicalSegment((IOByteCount)i << 12, &sl, kIOMemoryMapperNone);
++		if (sweet_fb_iommu_walk(&n2io_pt, (uint64_t)iova + ((uint64_t)i << 12) + 0x7c4u) != pa + 0x7c4u) { bad++; }
++	}
++	n2io_st.maps++;
++	if (bad != 0) { n2io_st.verify_bad++; }
++	if (n2io_st.logged < 32 || bad != 0 || (n2io_st.maps % 256) == 0) {
++		n2io_st.logged++;
++		IOLog("NORD2 FB IOMMU: map id %u %llu bytes -> iova %#x pages %u segs %u pa %#llx..%#llx above_4g %u walk %s (live %u, window %u KiB used)\n", id, len,
++		    iova, pages, segs, lo, hi + 0xfffu, lo >= 0x100000000ull ? 1u : 0u, bad ? "BAD" : "ok", n2io_iova.live, n2io_iova.granules * 64u);
++	}
++	if (bad != 0) { n2io_unmap_ent(e); return NULL; }
++	return e;
++}
++
++static void
++n2io_auto_disable(const char *why)
++{
++	int old = n2io_mode;
++	n2io_mode = 0;
++	IOLog("NORD2 FB IOMMU: AUTO-DISABLE (%s): kern.n2fbiommu %d -> 0; pool layers continue physically (identity map), ports off at the next restore\n", why, old);
++}
++
++/* Fault status (lock held).  true = a fault was latched (logged, cleared, IOMMU auto-disabled). */
++static bool
++n2io_poll_fault_locked(const char *where)
++{
++	if (n2io_state != 1) { return false; }
++	uint32_t st = n2io_rd(n2io_m4u, N2IO_FAULT_ST1), l2 = n2io_rd(n2io_m4u, N2IO_L2_FAULT_ST);
++	if ((st & 0x7fu) == 0) { return false; }
++	uint32_t va = n2io_rd(n2io_m4u, N2IO_FAULT_VA0), fpa = n2io_rd(n2io_m4u, N2IO_FAULT_PA0), id = n2io_rd(n2io_m4u, N2IO_INT_ID0);
++	n2io_st.faults++;
++	IOLog("NORD2 FB IOMMU: fault (%s): fault_st1 %08x l2 %08x va %08x (iova %#x%s) pa %08x int_id %08x (larb axi %u port %u) ports %u prog %08x %08x | %08x %08x\n",
++	    where, st, l2, va, va & 0xfffff000u, (va & 0x10u) ? " translation fault" : ((va & 0x20u) ? " invalid pa" : ""), fpa, id, (id >> 7) & 0x1fu,
++	    (id >> 2) & 0x1fu, n2io_ports_on, n2io_prog.addr[0][0], n2io_prog.addr[0][1], n2io_prog.addr[1][0], n2io_prog.addr[1][1]);
++	n2io_wr(n2io_m4u, N2IO_INT_CTRL0, n2io_rd(n2io_m4u, N2IO_INT_CTRL0) | (1u << 12));
++	n2io_tlb_all();
++	n2io_auto_disable("M4U fault");
++	return true;
++}
++
++static void
++n2io_stats_maybe(void)
++{
++	uint64_t now = n2io_now_ms();
++	if (now - n2io_log_at < 10000) { return; }
++	n2io_log_at = now;
++	IOLog("NORD2 FB IOMMU: mode=%d state=%u ports=%u maps=%llu hits=%llu unmaps=%llu evicts=%llu live=%u pages=%u map_fail=%llu verify_bad=%llu refused=%llu "
++	    "layers=%llu dry=%llu enables=%u disables=%u faults=%u tlb_to=%u cleans=%llu\n", n2io_mode, n2io_state, n2io_ports_on, n2io_st.maps, n2io_st.hits, n2io_st.unmaps,
++	    n2io_st.evicts, n2io_iova.live, n2io_pt.mapped, n2io_st.map_fail, n2io_st.verify_bad, n2io_st.refused, n2io_st.layers, n2io_st.dry, n2io_st.enables,
++	    n2io_st.disables, n2io_st.faults, n2io_st.tlb_timeouts, n2io_st.cleans);
++}
++
++static bool
++n2io_lock_init(void)
++{
++	if (n2io_lock == NULL) {
++		IOLock *l = IOLockAlloc();
++		if (l != NULL && !OSCompareAndSwapPtr(NULL, l, (void * volatile *)&n2io_lock)) { IOLockFree(l); }
++	}
++	return n2io_lock != NULL;
++}
++
++/* ---------------------------------------------------------------- API (sweet_fb_iommu.h) */
++extern "C" uint32_t
++sweet_fb_iommu_mode(void)
++{
++	return (uint32_t)__atomic_load_n(&n2io_mode, __ATOMIC_RELAXED);
++}
++
++extern "C" bool
++sweet_fb_iommu_layer(void *surface, uint64_t *iova, uint64_t *len)
++{
++	SweetSurface *s = (SweetSurface *)surface;
++	int mode = __atomic_load_n(&n2io_mode, __ATOMIC_RELAXED);
++	if (mode < 1 || s == NULL || s->memory == NULL || n2io_state == 2 || !n2io_lock_init()) { return false; }
++	IOLockLock(n2io_lock);
++	bool ok = false;
++	struct sweet_fb_iommu_ent *e = NULL;
++	if (n2io_arm_locked()) {
++		for (unsigned i = 0; i < SWEET_FB_IOMMU_CACHE; i++) { if (n2io_ent[i].obj == s && n2io_ent[i].id == s->id) { e = &n2io_ent[i]; break; } }
++		if (e != NULL) { n2io_st.hits++; e->stamp = n2io_gen; }
++		else { e = n2io_map_locked(s, s->id, s->memory, s->memory->getLength()); }
++		/* The OVL does not snoop: pixels the CPU wrote (IOSurfaceUnlock only marks GPU imports dirty; zero-fill, kernel copy-in) may sit dirty
++		 * in the cache.  Clean to PoC at the first map and after every CPU write-unlock; GPU-written frames cost nothing (lines already clean). */
++		uint32_t cs = s->id < SWEET_SURFACE_MAX_ID ? __atomic_load_n(&n2io_cpu_seq[s->id], __ATOMIC_ACQUIRE) : 0u;
++		IOBufferMemoryDescriptor *buf = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
++		if (e != NULL && e->cpu_seq != cs && buf != NULL) {
++			CleanPoC_DcacheRegion((vm_offset_t)buf->getBytesNoCopy(), (size_t)e->bytes);
++			e->cpu_seq = cs; n2io_st.cleans++;
++		}
++		if (e != NULL && mode >= 2 && n2io_mode >= 2) { *iova = e->iova; *len = e->bytes; ok = true; n2io_st.layers++; }
++		else if (e != NULL) { n2io_st.dry++; }
++		if (mode < 2) { n2io_gen++; }      /* dry run: nothing is planned with these, so no lookup has to stay "current" */
++	}
++	n2io_stats_maybe();
++	IOLockUnlock(n2io_lock);
++	return ok;
++}
++
++extern "C" bool
++sweet_fb_iommu_gate(unsigned pipe, uint32_t addr0, uint32_t addr1)
++{
++	if (pipe > 1) { return false; }
++	bool has = (addr0 != 0xffffffffu && sweet_fb_iommu_in_window(addr0, (uint64_t)addr0 + 1u)) ||
++	           (addr1 != 0xffffffffu && sweet_fb_iommu_in_window(addr1, (uint64_t)addr1 + 1u));
++	if (!has && n2io_state != 1) { return true; }      /* never armed: nothing to do (the 0396 path, untouched) */
++	if (!n2io_lock_init()) { return !has; }
++	IOLockLock(n2io_lock);
++	(void)n2io_poll_fault_locked("before regs");
++	bool armed = n2io_state == 1 && n2io_mode >= 2;
++	unsigned o = pipe ^ 1u;
++	bool other = sweet_fb_iommu_in_window(n2io_prog.addr[o][0], (uint64_t)n2io_prog.addr[o][0] + 1u) ||
++	             sweet_fb_iommu_in_window(n2io_prog.addr[o][1], (uint64_t)n2io_prog.addr[o][1] + 1u);
++	int d = sweet_fb_iommu_gate_decide(has, n2io_ports_on, armed, other);
++	if (d == SWEET_FB_IOMMU_G_KEEP && has && n2io_ports_on &&
++	    !((n2io_rd(n2io_larb[0], N2IO_PORT(N2IO_OVL_PORT)) & n2io_rd(n2io_larb[1], N2IO_PORT(N2IO_OVL_PORT))) & 1u)) {
++		IOLog("NORD2 FB IOMMU: OVL port MMU_EN lost (display power cycle?): enabling again\n");      /* else an IOVA would be read as a PA */
++		n2io_ports_on = false; d = SWEET_FB_IOMMU_G_ENABLE;
++	}
++	if (d == SWEET_FB_IOMMU_G_ENABLE && n2io_rd(n2io_m4u, N2IO_PT_BASE) != n2io_ptbase_val) {      /* M4U state lost (power gating): re-arm */
++		IOLog("NORD2 FB IOMMU: PT_BASE lost (%08x): rewriting PT_BASE/TFRP\n", n2io_rd(n2io_m4u, N2IO_PT_BASE));
++		n2io_wr(n2io_m4u, N2IO_PT_BASE, n2io_ptbase_val);
++		n2io_wr(n2io_m4u, N2IO_TFRP, (uint32_t)(n2io_scratch_pa & 0xffffff80u));
++		n2io_tlb_all();
++		if (n2io_rd(n2io_m4u, N2IO_PT_BASE) != n2io_ptbase_val) { n2io_auto_disable("PT_BASE does not stick"); d = SWEET_FB_IOMMU_G_REFUSE; }
++	}
++	bool ok = true;
++	if (d == SWEET_FB_IOMMU_G_REFUSE) { n2io_st.refused++; ok = false; }
++	else if (d == SWEET_FB_IOMMU_G_ENABLE) { n2io_ports(true); }
++	else if (d == SWEET_FB_IOMMU_G_DISABLE) { n2io_ports(false); }
++	if (ok) {
++		if (addr0 != 0xffffffffu) { n2io_prog.addr[pipe][0] = addr0; }
++		if (addr1 != 0xffffffffu) { n2io_prog.addr[pipe][1] = addr1; }
++		n2io_gen++;      /* lookups before this write are no longer "being planned" */
++	}
++	IOLockUnlock(n2io_lock);
++	return ok;
++}
++
++extern "C" bool
++sweet_fb_iommu_frame_done(void)
++{
++	if (n2io_state != 1 || n2io_lock == NULL) { return false; }
++	IOLockLock(n2io_lock);
++	bool f = n2io_poll_fault_locked("frame done");
++	n2io_stats_maybe();
++	IOLockUnlock(n2io_lock);
++	return f;
++}
++
++extern "C" uint64_t
++sweet_fb_iommu_test_slot(uint64_t slot_pa, const void *slot_va, uint64_t bytes)
++{
++	if (__atomic_load_n(&n2io_test, __ATOMIC_RELAXED) == 0 || __atomic_load_n(&n2io_mode, __ATOMIC_RELAXED) < 2 || slot_va == NULL || !n2io_lock_init()) {
++		return slot_pa;
++	}
++	IOLockLock(n2io_lock);
++	uint64_t r = slot_pa;
++	if (n2io_arm_locked()) {
++		struct sweet_fb_iommu_ent *e = NULL;
++		for (unsigned i = 0; n2io_test_buf != NULL && i < SWEET_FB_IOMMU_CACHE; i++) { if (n2io_ent[i].obj == n2io_test_buf) { e = &n2io_ent[i]; break; } }
++		if (n2io_test_buf == NULL) {      /* ordinary wired kernel pages: scattered, above 4 GiB (logged by the map line) */
++			n2io_test_buf = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, (vm_size_t)bytes, page_size);
++			if (n2io_test_buf != NULL) {
++				void *p = n2io_test_buf->getBytesNoCopy();
++				memcpy(p, slot_va, (size_t)bytes);
++				FlushPoC_DcacheRegion((vm_offset_t)p, (unsigned)bytes);      /* the OVL does not snoop */
++			}
++		}
++		if (e == NULL && n2io_test_buf != NULL) { e = n2io_map_locked(n2io_test_buf, 0, n2io_test_buf, bytes); }
++		if (e != NULL) { e->stamp = n2io_gen; n2io_test_iova = e->iova; r = e->iova; }
++		IOLog("NORD2 FB IOMMU: test slot: %s (pattern copy %p -> scattered buffer, iova %#llx)\n", e != NULL ? "through the IOMMU" : "REFUSED, carve-out slot used",
++		    slot_va, r);
++	}
++	IOLockUnlock(n2io_lock);
++	return r;
++}
++
++/* IOSurfaceUnlock (write): the next IOMMU scan of this surface cleans its pixels first. */
++static void
++sweet_fb_iommu_cpu_wrote(const SweetSurface *s)
++{
++	if (s != NULL && s->id < SWEET_SURFACE_MAX_ID) { (void)__atomic_add_fetch(&n2io_cpu_seq[s->id], 1u, __ATOMIC_RELEASE); }
++}
++
++/* SweetSurface::free: the display no longer holds it (it would hold a retain), so its mapping goes. */
++static void
++sweet_fb_iommu_surface_gone(const void *obj)
++{
++	if (n2io_state != 1 || n2io_lock == NULL) { return; }
++	IOLockLock(n2io_lock);
++	for (unsigned i = 0; i < SWEET_FB_IOMMU_CACHE; i++) {
++		if (n2io_ent[i].obj != obj) { continue; }
++		if (sweet_fb_iommu_ent_programmed(&n2io_ent[i], &n2io_prog)) { IOLog("NORD2 FB IOMMU: surface %u freed while its IOVA %#x is programmed\n", n2io_ent[i].id, n2io_ent[i].iova); }
++		n2io_unmap_ent(&n2io_ent[i]);
++	}
++	IOLockUnlock(n2io_lock);
++}
++
++/* ---------------------------------------------------------------- sysctls */
++static int
++n2io_sysctl_mode SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = n2io_mode, changed = 0;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (err != 0 || !changed) { return err; }
++	if (v < 0 || v > 3) { return EINVAL; }
++	if (!n2io_lock_init()) { return ENOMEM; }
++	IOLockLock(n2io_lock);
++	int old = n2io_mode;
++	if (v > 0 && n2io_state == 2) { err = EPERM; }
++	else {
++		n2io_mode = v;
++		if (v > 0 && !n2io_arm_locked()) { err = EPERM; }      /* arm = tables + PT_BASE only; ports switch at the next HW frame */
++	}
++	IOLog("NORD2 FB IOMMU: MODE old=%d new=%d why=sysctl state=%u (%s)%s\n", old, n2io_mode, n2io_state, n2io_why, err ? " REFUSED" : "");
++	IOLockUnlock(n2io_lock);
++	return err;
++}
++static int
++n2io_sysctl_probe SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = n2io_probe_last, changed = 0;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (err != 0 || !changed) { return err; }
++	n2io_probe_last = v;
++	if (v == 1) {
++		if (n2io_lock_init()) { IOLockLock(n2io_lock); }
++		n2io_probe();
++		if (n2io_lock != NULL) { IOLockUnlock(n2io_lock); }
++	}
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, n2fbiommu, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, n2io_sysctl_mode, "I", "0401: display IOMMU 0 off 1 map-only 2 single 3 all");
++SYSCTL_PROC(_kern, OID_AUTO, n2fbiommu_probe, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, n2io_sysctl_probe, "I", "0401: 1 = log M4U0/larb/clock registers (read-only)");
++SYSCTL_INT(_kern, OID_AUTO, n2fbiommutest, CTLFLAG_RW | CTLFLAG_LOCKED, &n2io_test, 0, "0401: 1 = kern.n2fbhwtest reads a scattered copy through the IOMMU");
++
++#endif /* SWEET_FB_IOMMU_HW_H */

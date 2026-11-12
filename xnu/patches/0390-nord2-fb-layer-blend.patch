@@ -1,0 +1,290 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -39,6 +39,10 @@
+ #include "sweet_fb_present.h"
+ #include "sweet_fb_scan.h"
+ #include "sweet_fb_swapwait.h"
++#include "sweet_fb_blend.h"           /* 0390 */
++
++/* 0390: n2fbblend=0 copies the SwapEnd layers over each other as before 0390 (default 1: composite them). */
++static uint32_t sweet_fb_blend_mode = 1;
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void nord2_dvfs_ui_kick(void);   /* bsd/dev/nord2_cpufreq.c (0184): the UI is active, the CPU governor keeps its boost floor */
+@@ -360,6 +364,8 @@
+ 	PE_parse_boot_argn("nord2fbdiag", &diagnostics, sizeof(diagnostics));
+ 	fDiag.enabled = (diagnostics == 1);
+ #endif
++	{ uint32_t bl = 1; if (PE_parse_boot_argn("n2fbblend", &bl, sizeof(bl))) { sweet_fb_blend_mode = bl ? 1 : 0; } }   /* 0390 */
++	IOLog("SWEET FB: layer composition %s (0390)\n", sweet_fb_blend_mode ? "on" : "off (n2fbblend=0)");
+ 	uint32_t hz = SWEET_FB_DEFAULT_HZ;
+ 	/* sweetfb_hz=<n> (0/60+ = every vsync); short alias n2fbhz for the full UI command line (600/607 characters). */
+ 	if (!PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz))) { (void)PE_parse_boot_argn("n2fbhz", &hz, sizeof(hz)); }
+@@ -1603,6 +1609,7 @@
+ }
+ 
+ static uint32_t sweet_fb_swaps_logged;
++static uint64_t sweet_fb_multi_presents;     /* 0390: presents with more than one shown layer */
+ static uint64_t sweet_fb_swap_count;
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+@@ -1701,6 +1708,13 @@
+ 		}
+ 	}
+ 
++	/* 0390: collect the valid layers first, then copy (one layer, or n2fbblend=0) or composite them (sweet_fb_blend.h). */
++	SweetSurface *ls[SWEET_FB_LAYERS];
++	bool lown[SWEET_FB_LAYERS];
++	uintptr_t lsrc[SWEET_FB_LAYERS];
++	uint32_t lbpr[SWEET_FB_LAYERS], lidx[SWEET_FB_LAYERS];
++	struct sweet_fb_layer_geom lg[SWEET_FB_LAYERS];
++	unsigned nl = 0;
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -1739,56 +1753,82 @@
+ 		nord2_gpu_surface_cpu_acquire(s);   /* GPU-written pixels become visible to this CPU copy */
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+-		if (w <= 0 || h <= 0) {
+-			w = (int32_t)s->width;
+-			h = (int32_t)s->height;
+-		}
+-		if (sx < 0 || sy < 0) {
+-			sx = sy = 0;
+-		}
+-		if (dx < 0 || dy < 0) {
+-			dx = dy = 0;
+-		}
+-		/* Logical (presented) display coordinates -> panel coordinates. */
+-		dx -= fOffX;
+-		dy -= fOffY;
+-		if (dx < 0) {
+-			sx -= dx;
+-			w += dx;
+-			dx = 0;
+-		}
+-		if (dy < 0) {
+-			sy -= dy;
+-			h += dy;
+-			dy = 0;
+-		}
+-		if (w > (int32_t)s->width - sx) {
+-			w = (int32_t)s->width - sx;
+-		}
+-		if (h > (int32_t)s->height - sy) {
+-			h = (int32_t)s->height - sy;
+-		}
+-		if (w > (int32_t)fWidth - dx) {
+-			w = (int32_t)fWidth - dx;
+-		}
+-		if (h > (int32_t)fHeight - dy) {
+-			h = (int32_t)fHeight - dy;
+-		}
+-		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+-		    (uint64_t)(sx + w) * 4;
+-		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+-		    s->memory == NULL || last > s->memory->getLength()) {
++		struct sweet_fb_layer_geom g;
++		/* Logical (presented) display coordinates -> panel coordinates, clipped to the surface and the panel. */
++		bool vis = sweet_fb_layer_clip(&g, sx, sy, dx, dy, w, h, s->width, s->height, fOffX, fOffY, fWidth, fHeight);
++		uint64_t last = vis ? (uint64_t)s->offset + (uint64_t)(g.sy + g.h - 1) * s->bytesPerRow + (uint64_t)(g.sx + g.w) * 4 : 0;
++		if (!vis || s->elementWidth != 1 || s->elementHeight != 1 ||
++		    s->memory == NULL || last > s->memory->getLength() || bpe != 4) {
+ 			src = 0;
+ 		}
+-		if (src != 0 && bpe == 4) {
++		if (src == 0) {
++			if (ownRef) s->release();
++			continue;
++		}
++		ls[nl] = s; lown[nl] = ownRef; lsrc[nl] = src + s->offset; lbpr[nl] = s->bytesPerRow; lidx[nl] = layer; lg[nl] = g;
++		nl++;
++	}
++	uintptr_t dstBase = fCopyDst ? fCopyDst : fPixels;
++	uint32_t *rowBuf = NULL;
++	if (nl > 1 && sweet_fb_blend_mode != 0) {
++		rowBuf = (uint32_t *)IOMallocData((vm_size_t)fWidth * 4);
++	}
++	if (nl > 1) {
++		uint64_t multi = __atomic_add_fetch(&sweet_fb_multi_presents, 1, __ATOMIC_RELAXED);
++		if (multi <= 24 || (multi % 600) == 0) {
++			IOLog("NORD2 FB LAYERS: multi=%llu swap=%u mask=%#x n=%u blend=%u%s\n", multi, get32(rec, 0x50), mask, nl,
++			    sweet_fb_blend_mode, (sweet_fb_blend_mode != 0 && rowBuf == NULL) ? " (row buffer alloc failed: copy)" : "");
++			for (unsigned i = 0; i < nl && multi <= 24; i++) {
++				IOLog("NORD2 FB LAYERS:   layer %u surface %u %ux%u fmt 0x%x bpr %u src %d,%d -> panel %d,%d %dx%d\n", lidx[i],
++				    get32(rec, 0x54 + 4 * lidx[i]), ls[i]->width, ls[i]->height, ls[i]->pixelFormat, lbpr[i],
++				    lg[i].sx, lg[i].sy, lg[i].dx, lg[i].dy, lg[i].w, lg[i].h);
++			}
++			if (multi <= 2) {
++				for (uint32_t off = 0x40; off < 0x110; off += 32) {
++					IOLog("NORD2 FB LAYERS:   rec+%#x %08x %08x %08x %08x %08x %08x %08x %08x\n", off, get32(rec, off), get32(rec, off + 4),
++					    get32(rec, off + 8), get32(rec, off + 12), get32(rec, off + 16), get32(rec, off + 20), get32(rec, off + 24),
++					    get32(rec, off + 28));
++				}
++			}
++		}
++	}
++	if (rowBuf != NULL) {
++		int32_t y0 = lg[0].dy, y1 = lg[0].dy + lg[0].h;
++		for (unsigned i = 1; i < nl; i++) {
++			if (lg[i].dy < y0) { y0 = lg[i].dy; }
++			if (lg[i].dy + lg[i].h > y1) { y1 = lg[i].dy + lg[i].h; }
++		}
++		struct sweet_fb_blend_stats st = { 0, 0, 0 };
++		for (int32_t y = y0; y < y1; y++) {
++			const uint32_t *rows[SWEET_FB_LAYERS];
++			for (unsigned i = 0; i < nl; i++) {
++				rows[i] = (y >= lg[i].dy && y < lg[i].dy + lg[i].h) ?
++				    (const uint32_t *)(lsrc[i] + (uint64_t)(lg[i].sy + (y - lg[i].dy)) * lbpr[i] + (uint64_t)lg[i].sx * 4) : NULL;
++			}
++			uint32_t x0, x1;
++			if (sweet_fb_compose_row(rowBuf, rows, lg, nl, &x0, &x1, &st)) {
++				memcpy((void *)(dstBase + (uint64_t)y * fRowBytes + (uint64_t)x0 * 4), (const void *)(rowBuf + x0), (size_t)(x1 - x0) * 4);
++			}
++		}
++		if (fDiag.enabled) { __atomic_fetch_add(&fDiag.copied_layers, nl, __ATOMIC_RELAXED); }
++		uint64_t multi = __atomic_load_n(&sweet_fb_multi_presents, __ATOMIC_RELAXED);
++		if (multi <= 24 || (multi % 600) == 0) {
++			IOLog("NORD2 FB BLEND: multi=%llu rows=%d..%d upper-layer px opaque=%llu clear=%llu mixed=%llu\n", multi, y0, y1,
++			    st.opaque, st.clear, st.mixed);
++		}
++		IOFreeData(rowBuf, (vm_size_t)fWidth * 4);
++	} else {
++		for (unsigned i = 0; i < nl; i++) {
+ 			if (fDiag.enabled) { __atomic_fetch_add(&fDiag.copied_layers, 1, __ATOMIC_RELAXED); }
+-			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)((fCopyDst ? fCopyDst : fPixels) + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
++			for (int32_t y = 0; y < lg[i].h; y++) {
++				memcpy((void *)(dstBase + (uint64_t)(lg[i].dy + y) * fRowBytes + (uint64_t)lg[i].dx * 4),
++				    (const void *)(lsrc[i] + (uint64_t)(lg[i].sy + y) * lbpr[i] + (uint64_t)lg[i].sx * 4),
++				    (size_t)lg[i].w * 4);
+ 			}
+ 		}
+-		if (ownRef) s->release();
++	}
++	for (unsigned i = 0; i < nl; i++) {
++		if (lown[i]) ls[i]->release();
+ 	}
+ 	if (diag_present && diag_present == __atomic_load_n(&fDiag.begin_failed, __ATOMIC_RELAXED) + 1) {
+ 		reportDiagnostics("first-present");
+--- /dev/null
++++ b/iokit/Kernel/arm/sweet_fb_blend.h
+@@ -0,0 +1,115 @@
++#ifndef SWEET_FB_BLEND_H
++#define SWEET_FB_BLEND_H
++/*
++ * 0390 (fbblend-20261112): the SwapEnd layers are composited, not copied over each other.  Pure and host-testable.
++ *
++ * Why: CoreAnimation (backboardd) detaches a static, opaque, full-screen app drawable (MobileSlideShow's CAMetalLayer, run
++ * thumbcomp5 bbdiag-60: from composite n=2001 on, backboardd no longer draws Photos' surface s112/s119 into its own frame, only
++ * the 95x40 / 289x50 blur sources of the "Select" / "..." pills, and its own frame is 00000000 = transparent where the grid is)
++ * and hands it to the display as a separate SwapEnd layer under the UI layer.  presentCopy memcpy'd every enabled layer in
++ * index order, so the transparent UI layer replaced the grid with black: status bar, pills and tab bar stayed, the grid
++ * (and the "Dec 31, 1969" title, drawn by Photos) vanished ~1.5 s after the launch, exactly as on screen.
++ *
++ * Layers are composited in index order (0 = bottom): the lowest layer that covers a row is copied, every higher layer is
++ * blended over it with premultiplied source-over (CoreAnimation's surfaces are premultiplied BGRA), in a cached row buffer,
++ * then the row is written once to the (write-combined) panel memory.  A single layer is still a plain copy.
++ */
++#include <stdbool.h>
++#include <stdint.h>
++
++struct sweet_fb_blend_stats {
++	uint64_t opaque, clear, mixed;          /* pixels of the blended (non-bottom) layers */
++};
++
++/* d = s + d * (255 - a(s)) / 255 per channel (exact rounding of x/255 for x <= 255*255). */
++static inline uint32_t
++sweet_fb_blend_px(uint32_t s, uint32_t d)
++{
++	uint32_t ia = 255u - (s >> 24);
++	uint32_t rb = (d & 0x00ff00ffu) * ia + 0x00800080u;
++	uint32_t ag = ((d >> 8) & 0x00ff00ffu) * ia + 0x00800080u;
++	rb = ((rb + ((rb >> 8) & 0x00ff00ffu)) >> 8) & 0x00ff00ffu;
++	ag = (ag + ((ag >> 8) & 0x00ff00ffu)) & 0xff00ff00u;
++	uint32_t o = rb | ag;
++	/* per channel saturating add (a premultiplied source never overflows, a non-premultiplied one must not wrap) */
++	uint32_t sum_rb = (s & 0x00ff00ffu) + (o & 0x00ff00ffu);
++	uint32_t sum_ag = ((s >> 8) & 0x00ff00ffu) + ((o >> 8) & 0x00ff00ffu);
++	sum_rb |= ((sum_rb & 0x01000100u) >> 8) * 0xffu;
++	sum_ag |= ((sum_ag & 0x01000100u) >> 8) * 0xffu;
++	return (sum_rb & 0x00ff00ffu) | ((sum_ag & 0x00ff00ffu) << 8);
++}
++
++static inline void
++sweet_fb_blend_row(uint32_t *dst, const uint32_t *src, uint32_t n, struct sweet_fb_blend_stats *st)
++{
++	uint64_t op = 0, cl = 0, mx = 0;
++	for (uint32_t i = 0; i < n; i++) {
++		uint32_t s = src[i], a = s >> 24;
++		if (a == 0xffu) { dst[i] = s; op++; }
++		else if (s == 0) { cl++; }
++		else { dst[i] = sweet_fb_blend_px(s, dst[i]); mx++; }
++	}
++	if (st != 0) { st->opaque += op; st->clear += cl; st->mixed += mx; }
++}
++
++struct sweet_fb_layer_geom {
++	int32_t sx, sy, dx, dy, w, h;
++};
++
++/*
++ * The clipping presentCopy always did (no scaling): rect a gives the source origin, rect b the logical destination and size
++ * (the surface size when empty), the logical display is shifted by (offx, offy) onto the fw x fh panel.  Returns false when
++ * nothing is left to show.
++ */
++static inline bool
++sweet_fb_layer_clip(struct sweet_fb_layer_geom *g, int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w, int32_t h,
++    uint32_t sw, uint32_t sh, int32_t offx, int32_t offy, uint32_t fw, uint32_t fh)
++{
++	if (w <= 0 || h <= 0) { w = (int32_t)sw; h = (int32_t)sh; }
++	if (sx < 0 || sy < 0) { sx = sy = 0; }
++	if (dx < 0 || dy < 0) { dx = dy = 0; }
++	dx -= offx;
++	dy -= offy;
++	if (dx < 0) { sx -= dx; w += dx; dx = 0; }
++	if (dy < 0) { sy -= dy; h += dy; dy = 0; }
++	if (w > (int32_t)sw - sx) { w = (int32_t)sw - sx; }
++	if (h > (int32_t)sh - sy) { h = (int32_t)sh - sy; }
++	if (w > (int32_t)fw - dx) { w = (int32_t)fw - dx; }
++	if (h > (int32_t)fh - dy) { h = (int32_t)fh - dy; }
++	g->sx = sx; g->sy = sy; g->dx = dx; g->dy = dy; g->w = w; g->h = h;
++	return w > 0 && h > 0;
++}
++
++/* One panel row of the composition.  rows[i] points at layer i's source pixel for panel x = geom[i].dx on this row, or is 0
++ * when layer i does not cover the row.  row is a cached buffer of fw pixels.  Returns the written span [*x0, *x1); pixels of
++ * the span that no layer covers are black. */
++static inline bool
++sweet_fb_compose_row(uint32_t *row, const uint32_t *const rows[], const struct sweet_fb_layer_geom geom[], unsigned n,
++    uint32_t *x0, uint32_t *x1, struct sweet_fb_blend_stats *st)
++{
++	int first = -1;
++	int32_t lo = 0, hi = 0;
++	for (unsigned i = 0; i < n; i++) {
++		if (rows[i] == 0) { continue; }
++		if (first < 0) { first = (int)i; lo = geom[i].dx; hi = geom[i].dx + geom[i].w; }
++		else {
++			if (geom[i].dx < lo) { lo = geom[i].dx; }
++			if (geom[i].dx + geom[i].w > hi) { hi = geom[i].dx + geom[i].w; }
++		}
++	}
++	if (first < 0) { return false; }
++	const struct sweet_fb_layer_geom *b = &geom[first];
++	if (b->dx != lo || b->dx + b->w != hi) {
++		for (int32_t x = lo; x < hi; x++) { row[x] = 0; }
++	}
++	for (int32_t x = 0; x < b->w; x++) { row[b->dx + x] = rows[first][x]; }
++	for (unsigned i = (unsigned)first + 1; i < n; i++) {
++		if (rows[i] == 0) { continue; }
++		sweet_fb_blend_row(row + geom[i].dx, rows[i], (uint32_t)geom[i].w, st);
++	}
++	*x0 = (uint32_t)lo;
++	*x1 = (uint32_t)hi;
++	return true;
++}
++
++#endif /* SWEET_FB_BLEND_H */

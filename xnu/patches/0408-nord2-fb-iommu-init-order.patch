@@ -1,0 +1,68 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2075,8 +2075,10 @@
+ 		if (l0 == NULL || l1 == NULL) { why = "larb registers not mappable"; }
+ 		else {
+ 			uint32_t v[4] = { l0[SWEET_FB_LARB_NONSEC(5) / 4], l0[SWEET_FB_LARB_NONSEC(6) / 4], l1[SWEET_FB_LARB_NONSEC(5) / 4], l1[SWEET_FB_LARB_NONSEC(6) / 4] };
+-			IOLog("NORD2 FB HW: init larb0 p5 %08x p6 %08x larb1 p5 %08x p6 %08x (bit0 MMU_EN must be 0)\n", v[0], v[1], v[2], v[3]);
+-			if ((v[0] | v[1] | v[2] | v[3]) & 1u) { why = "display M4U enabled on an OVL port (addresses would be IOVAs)"; }
++			unsigned own = sweet_fb_iommu_owned_ports();      /* 0408 IOMMU: OVL*_2L MMU_EN set by the armed display IOMMU is accepted */
++			IOLog("NORD2 FB HW: init larb0 p5 %08x p6 %08x larb1 p5 %08x p6 %08x (bit0 MMU_EN must be 0 unless set by the armed display IOMMU: owned %x)\n",
++			    v[0], v[1], v[2], v[3], own);
++			if (!sweet_fb_iommu_init_ports_ok(v, own)) { why = "display M4U enabled on an OVL port (addresses would be IOVAs)"; }
+ 		}
+ 	}
+ 	fHwInitOk = (why == NULL);
+--- a/iokit/Kernel/arm/sweet_fb_iommu.h
++++ b/iokit/Kernel/arm/sweet_fb_iommu.h
+@@ -278,6 +278,20 @@
+ 	return SWEET_FB_IOMMU_G_KEEP;
+ }
+ 
++/* 0408: overlay init check R11 with the display IOMMU.  v = NON_SEC_CON of larb0 p5, larb0 p6, larb1 p5, larb1 p6 (OVL1, OVL1_2L,
++ * OVL0, OVL0_2L data ports); owned = OVL*_2L ports whose MMU_EN the armed display IOMMU itself set (bit0 larb0 p6, bit1 larb1 p6; 0 when
++ * not armed).  Accepted: every port physical, or an OVL*_2L port translated by the armed IOMMU (its table maps the panel buffers and the
++ * pool 1:1, so the CPU-path base state reads the same pixels).  Refused: MMU_EN on a 4L port (p5), any IOVA extension bits [15:8], or an
++ * MMU_EN the IOMMU code did not set (someone else's table: the addresses would be foreign IOVAs). */
++static inline bool
++sweet_fb_iommu_init_ports_ok(const uint32_t v[4], unsigned owned)
++{
++	if (((v[0] | v[1] | v[2] | v[3]) & 0xff00u) != 0 || ((v[0] | v[2]) & 1u) != 0) { return false; }
++	if ((v[1] & 1u) && !(owned & 1u)) { return false; }
++	if ((v[3] & 1u) && !(owned & 2u)) { return false; }
++	return true;
++}
++
+ /* ---------------------------------------------------------------- kernel API (SweetSurface.cpp, 0401) */
+ #ifdef __cplusplus
+ extern "C" {
+@@ -293,6 +307,8 @@
+ bool sweet_fb_iommu_frame_done(void);
+ /* H2 test through the IOMMU (kern.n2fbiommutest=1): a scattered copy of the slot's pixels, its IOVA; else slot_pa unchanged. */
+ uint64_t sweet_fb_iommu_test_slot(uint64_t slot_pa, const void *slot_va, uint64_t bytes);
++/* 0408: OVL*_2L ports whose MMU_EN the armed display IOMMU set (bit0 larb0 p6, bit1 larb1 p6); 0 when not armed. */
++unsigned sweet_fb_iommu_owned_ports(void);
+ #ifdef __cplusplus
+ }
+ 
+--- a/iokit/Kernel/arm/sweet_fb_iommu_hw.h
++++ b/iokit/Kernel/arm/sweet_fb_iommu_hw.h
+@@ -439,6 +439,18 @@
+ 	return ok;
+ }
+ 
++/* 0408: for the overlay init check (SweetFramebuffer.cpp hwInit R11).  n2io_larb[0] = larb1, n2io_larb[1] = larb0; stage bit k = n2io_larb[k]. */
++extern "C" unsigned
++sweet_fb_iommu_owned_ports(void)
++{
++	if (__atomic_load_n(&n2io_state, __ATOMIC_ACQUIRE) != 1) { return 0; }
++	unsigned st = __atomic_load_n(&n2io_stage_ports, __ATOMIC_RELAXED), m = 0;
++	if (__atomic_load_n(&n2io_ports_on, __ATOMIC_RELAXED)) { st |= 3u; }
++	if (st & 2u) { m |= 1u; }      /* larb0 p6 */
++	if (st & 1u) { m |= 2u; }      /* larb1 p6 */
++	return m;
++}
++
+ extern "C" bool
+ sweet_fb_iommu_frame_done(void)
+ {

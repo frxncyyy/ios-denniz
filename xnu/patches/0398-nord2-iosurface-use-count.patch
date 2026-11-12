@@ -1,0 +1,892 @@
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -40,6 +40,12 @@
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+ 	uint32_t                  purgeable;    /* IOSurfaceSetPurgeable state (0 = non-volatile) */
++	volatile uint32_t         useKern[2];   /* 0398: use-count holds of the display / the GPU (sweet_surface_use.h) */
++	uint32_t                  shownAt;      /* 0398: uptime second a swap last named it (0 = never) */
++	uint32_t                  shownCount;   /* 0398: swaps that named it */
++	int32_t                   creator;      /* 0398: pid of the creating process (0 = kernel) */
++	uint32_t                  bornAt;       /* 0398: uptime second of the creation */
++	volatile uint32_t         gpuImports;   /* 0398: Nord2GPU import buffers holding a reference (BufferOwner) */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -74,6 +80,15 @@
+ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 
++/*
++ * 0398: the IOSurface use count (IOSurfaceIsInUse) for kernel holders.  kind 0 = display (a swap holds the surface), 1 = GPU (a job
++ * lists it).  delta +1 takes a hold (false: not taken -- kern.n2surfuse < 2 or saturated -- and the caller must not give it back),
++ * -1 gives one back.  Lock-free (atomics only): callable with any lock held, never from interrupt context.
++ */
++#define SWEET_SURFACE_USE_DISPLAY       0
++#define SWEET_SURFACE_USE_GPU           1
++extern "C" bool sweet_surface_use_kernel(void *surface, uint32_t kind, int delta);
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
+--- a/iokit/Kernel/arm/sweet_surface_use.h
++++ b/iokit/Kernel/arm/sweet_surface_use.h
+@@ -0,0 +1,278 @@
++/*
++ * 0398 (usecount-20261112): the IOSurface use count, shared across processes.
++ * SPDX-License-Identifier: MIT
++ *
++ * IOSurface.framework (iOS 16.7, disassembled from the shared cache, usecount-20261112/README):
++ *   - every process keeps its own two counters per surface (IOSurfaceClient + 0x8: u32 category 0, u32 category 1, saturating);
++ *     IOSurfaceGetUseCount() returns only their sum (the local count);
++ *   - IOSurfaceIncrementUseCountForCategory(c) calls trap 0 (surface id, c) only on that process's 0 -> 1 step of category c,
++ *     IOSurfaceDecrementUseCountForCategory(c) calls trap 1 (id, c) only on the 1 -> 0 step; c >= 2 raises before any trap;
++ *     IOSurfaceIncrement/DecrementUseCount() are category 0;
++ *   - IOSurfaceIsInUse() reads the u64 at shared state page + 0x18 (!= 0), IsInUseForCategory(c) the u32 at +0x18 (c == 0) or
++ *     +0x1c (c == 1), IsInUseForAnyOtherCategory(c) the other one.  Nothing else of the use count goes through the kernel.
++ * So the kernel keeps, per surface, the number of (client connection, category) pairs that hold it plus its own holders, in the
++ * two state-page words.  The words are the truth (atomic read-modify-write on kernel memory that users map read-only).
++ *
++ * Holders:
++ *   user      one bit per category per client mapping (SweetSurfaceRef): trap 0 sets it, trap 1 clears it, the mapping's release
++ *             (trap 4/5, client close, process death) clears what is left ("dropped at release");
++ *   display   SweetFramebuffer: every surface reference a swap holds (SwapEnd capture -> copy end / FRAME_DONE replacement);
++ *   GPU       Nord2GPU: every IOSurface import listed by a job, from submit until the job left QUEUED/RUNNING/STOPPING.
++ * Kernel holders count in category 0 (what IOSurfaceIsInUse and the pools read).
++ *
++ * Pure: no IOKit, no allocation; kernel and host test (test/usecount_host_test.c) share it.
++ */
++#ifndef SWEET_SURFACE_USE_H
++#define SWEET_SURFACE_USE_H
++#include <stdint.h>
++#include <stdbool.h>
++
++#define SWEET_USE_STATE_WORDS   0x18u           /* state page offset of the two u32 global counts */
++#define SWEET_USE_CATEGORIES    2u
++#define SWEET_USE_SATURATE      0x00ffffffu     /* a word never goes above this (a runaway holder is counted, not wrapped) */
++
++enum { SWEET_USE_DISPLAY = 0, SWEET_USE_GPU = 1, SWEET_USE_KINDS = 2 };
++
++/* kern.n2surfuse (boot-arg n2su): 0 = the old no-op traps (holds that exist still drain), 1 = user traps, 2 = + display/GPU */
++enum { SWEET_USE_MODE_OFF = 0, SWEET_USE_MODE_USER = 1, SWEET_USE_MODE_ALL = 2 };
++
++struct sweet_use_stats {
++	uint64_t user_inc, user_dec;            /* traps that changed a word */
++	uint64_t user_inc_dup, user_dec_unmatched;      /* trap 0 for a category this mapping already holds; trap 1 for one it does not */
++	uint64_t dropped, dropped_maps;         /* holds cleared by a mapping's release (process gone or surface released while in use) */
++	uint64_t kern_inc[SWEET_USE_KINDS], kern_dec[SWEET_USE_KINDS], kern_unmatched[SWEET_USE_KINDS];
++	uint64_t saturated, refused_off;        /* increments refused: word at SWEET_USE_SATURATE; mode too low */
++	uint64_t not_found;                     /* trap for an id this client has no mapping of */
++	uint64_t free_nonzero;                  /* surfaces freed with a word or kernel hold left (accounting bug: must stay 0) */
++	int64_t  live;                          /* holds now (all kinds) */
++	int64_t  live_kind[SWEET_USE_KINDS];    /* ... of the display / the GPU */
++	int64_t  max_live;
++	uint32_t max_word;                      /* highest value one word reached */
++};
++
++static inline uint32_t sweet_use_load(const volatile uint32_t *w) { return __atomic_load_n(w, __ATOMIC_ACQUIRE); }
++
++static inline void sweet_use_max64(int64_t *m, int64_t v)
++{
++	int64_t o = __atomic_load_n(m, __ATOMIC_RELAXED);
++	while (v > o && !__atomic_compare_exchange_n(m, &o, v, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
++}
++
++static inline void sweet_use_max32(uint32_t *m, uint32_t v)
++{
++	uint32_t o = __atomic_load_n(m, __ATOMIC_RELAXED);
++	while (v > o && !__atomic_compare_exchange_n(m, &o, v, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
++}
++
++/* +1 on a word unless saturated; returns the new value, 0 when refused. */
++static inline uint32_t sweet_use_word_inc(volatile uint32_t *w)
++{
++	uint32_t o = __atomic_load_n(w, __ATOMIC_RELAXED);
++	do {
++		if (o >= SWEET_USE_SATURATE) return 0;
++	} while (!__atomic_compare_exchange_n(w, &o, o + 1, true, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED));
++	return o + 1;
++}
++
++/* -1 on a word unless it is 0; returns false when it was 0. */
++static inline bool sweet_use_word_dec(volatile uint32_t *w)
++{
++	uint32_t o = __atomic_load_n(w, __ATOMIC_RELAXED);
++	do {
++		if (o == 0) return false;
++	} while (!__atomic_compare_exchange_n(w, &o, o - 1, true, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED));
++	return true;
++}
++
++static inline void sweet_use_live(struct sweet_use_stats *st, int kind, int d)
++{
++	int64_t v = __atomic_add_fetch(&st->live, d, __ATOMIC_RELAXED);
++	if (kind >= 0) __atomic_add_fetch(&st->live_kind[kind], d, __ATOMIC_RELAXED);
++	if (d > 0) sweet_use_max64(&st->max_live, v);
++}
++
++/*
++ * Trap 0 / 1 of one client mapping.  *held = the mapping's bits (bit c = holds category c), changed under the client's lock;
++ * words = the surface's two state-page counts.  Returns true when a word changed.
++ */
++static inline bool sweet_use_user(uint8_t *held, volatile uint32_t *words, uint32_t cat, bool inc, int mode, struct sweet_use_stats *st)
++{
++	if (cat >= SWEET_USE_CATEGORIES) return false;
++	uint8_t bit = (uint8_t)(1u << cat);
++	if (inc) {
++		if (mode < SWEET_USE_MODE_USER) { __atomic_add_fetch(&st->refused_off, 1, __ATOMIC_RELAXED); return false; }
++		if (*held & bit) { __atomic_add_fetch(&st->user_inc_dup, 1, __ATOMIC_RELAXED); return false; }
++		uint32_t v = sweet_use_word_inc(&words[cat]);
++		if (v == 0) { __atomic_add_fetch(&st->saturated, 1, __ATOMIC_RELAXED); return false; }
++		*held |= bit;
++		sweet_use_max32(&st->max_word, v);
++		__atomic_add_fetch(&st->user_inc, 1, __ATOMIC_RELAXED);
++		sweet_use_live(st, -1, 1);
++		return true;
++	}
++	if (!(*held & bit)) {
++		if (mode >= SWEET_USE_MODE_USER) __atomic_add_fetch(&st->user_dec_unmatched, 1, __ATOMIC_RELAXED);
++		return false;
++	}
++	*held &= (uint8_t)~bit;
++	if (!sweet_use_word_dec(&words[cat])) { __atomic_add_fetch(&st->user_dec_unmatched, 1, __ATOMIC_RELAXED); return false; }
++	__atomic_add_fetch(&st->user_dec, 1, __ATOMIC_RELAXED);
++	sweet_use_live(st, -1, -1);
++	return true;
++}
++
++/* A mapping goes away: what it still holds is let go.  Returns the holds dropped. */
++static inline unsigned sweet_use_user_drop(uint8_t *held, volatile uint32_t *words, struct sweet_use_stats *st)
++{
++	unsigned n = 0;
++	for (uint32_t c = 0; c < SWEET_USE_CATEGORIES; c++) {
++		if (!(*held & (1u << c))) continue;
++		if (sweet_use_word_dec(&words[c])) { n++; sweet_use_live(st, -1, -1); }
++		else __atomic_add_fetch(&st->user_dec_unmatched, 1, __ATOMIC_RELAXED);
++	}
++	*held = 0;
++	if (n) { __atomic_add_fetch(&st->dropped, n, __ATOMIC_RELAXED); __atomic_add_fetch(&st->dropped_maps, 1, __ATOMIC_RELAXED); }
++	return n;
++}
++
++/*
++ * A kernel holder (display / GPU) takes (+1) or gives back (-1) one hold, in category 0.  kern[kind] = the surface's kernel holds
++ * of that kind (a give-back with none is refused and counted: the caller's references and the holds are paired, a mode change in
++ * between is the only legal source).  Returns true when the word changed.
++ */
++static inline bool sweet_use_kern(volatile uint32_t *kern, volatile uint32_t *words, int kind, int delta, int mode, struct sweet_use_stats *st)
++{
++	if (kind < 0 || kind >= SWEET_USE_KINDS) return false;
++	if (delta > 0) {
++		if (mode < SWEET_USE_MODE_ALL) { __atomic_add_fetch(&st->refused_off, 1, __ATOMIC_RELAXED); return false; }
++		uint32_t v = sweet_use_word_inc(&words[0]);
++		if (v == 0) { __atomic_add_fetch(&st->saturated, 1, __ATOMIC_RELAXED); return false; }
++		__atomic_add_fetch(&kern[kind], 1, __ATOMIC_ACQ_REL);
++		sweet_use_max32(&st->max_word, v);
++		__atomic_add_fetch(&st->kern_inc[kind], 1, __ATOMIC_RELAXED);
++		sweet_use_live(st, kind, 1);
++		return true;
++	}
++	if (!sweet_use_word_dec(&kern[kind])) {
++		/* below mode 2 the holder's give-backs find no hold by design (its takes were refused): not an imbalance */
++		if (mode >= SWEET_USE_MODE_ALL) __atomic_add_fetch(&st->kern_unmatched[kind], 1, __ATOMIC_RELAXED);
++		return false;
++	}
++	if (!sweet_use_word_dec(&words[0])) { __atomic_add_fetch(&st->kern_unmatched[kind], 1, __ATOMIC_RELAXED); return false; }
++	__atomic_add_fetch(&st->kern_dec[kind], 1, __ATOMIC_RELAXED);
++	sweet_use_live(st, kind, -1);
++	return true;
++}
++
++/* At SweetSurface::free(): every mapping and kernel holder is gone, so both words and the kernel holds must be 0. */
++static inline bool sweet_use_free_check(const volatile uint32_t *words, const volatile uint32_t *kern, struct sweet_use_stats *st)
++{
++	bool bad = sweet_use_load(&words[0]) || sweet_use_load(&words[1]) || sweet_use_load(&kern[0]) || sweet_use_load(&kern[1]);
++	if (bad) __atomic_add_fetch(&st->free_nonzero, 1, __ATOMIC_RELAXED);
++	return !bad;
++}
++
++/*
++ * GPU holds by job (Nord2GPU): a fixed table of (job id, surface) recorded at submit and reaped when the job is no longer
++ * unfinished.  The surface pointer is opaque here; the caller retains it while it is in the table.
++ */
++#define SWEET_USE_GPU_SLOTS 256u
++struct sweet_use_gpu_slot { uint64_t job; void *surface; };
++struct sweet_use_gpu_table {
++	struct sweet_use_gpu_slot s[SWEET_USE_GPU_SLOTS];
++	uint32_t used;
++	uint64_t recorded, reaped, full, dup;
++	uint32_t max_used;
++};
++
++/* Is surface already held for this job (a submit lists one import per handle; two handles of one surface hold once)? */
++static inline bool sweet_use_gpu_has(const struct sweet_use_gpu_table *t, uint64_t job, const void *surface)
++{
++	for (unsigned i = 0; i < SWEET_USE_GPU_SLOTS; i++) if (t->s[i].surface == surface && t->s[i].job == job) return true;
++	return false;
++}
++
++/* A free slot for (job, surface): its index, or -1 when full (the hold is then not taken; counted). */
++static inline int sweet_use_gpu_put(struct sweet_use_gpu_table *t, uint64_t job, void *surface)
++{
++	if (job == 0 || surface == NULL) return -1;
++	for (unsigned i = 0; i < SWEET_USE_GPU_SLOTS; i++) {
++		if (t->s[i].surface != NULL) continue;
++		t->s[i].job = job; t->s[i].surface = surface; t->used++; t->recorded++;
++		if (t->used > t->max_used) t->max_used = t->used;
++		return (int)i;
++	}
++	t->full++;
++	return -1;
++}
++
++/*
++ * Reap: every slot whose job is not in unfinished[0..n) is emptied and its surface handed to out[] (at most out_cap; what does not
++ * fit stays for the next reap).  Returns the number handed out.
++ */
++static inline unsigned sweet_use_gpu_reap(struct sweet_use_gpu_table *t, const uint64_t *unfinished, unsigned n, void **out, unsigned out_cap)
++{
++	unsigned k = 0;
++	for (unsigned i = 0; i < SWEET_USE_GPU_SLOTS && k < out_cap; i++) {
++		if (t->s[i].surface == NULL) continue;
++		bool live = false;
++		for (unsigned j = 0; j < n && !live; j++) live = unfinished[j] == t->s[i].job;
++		if (live) continue;
++		out[k++] = t->s[i].surface;
++		t->s[i].surface = NULL; t->s[i].job = 0; t->used--; t->reaped++;
++	}
++	return k;
++}
++/*
++ * Display pool (0394) leak report and admission (0398).  Run fbhwlive (q10jfi, 8 rounds home/photos/cc/switch): the pool filled to
++ * 23 surfaces / 247 MiB in round 1 and never freed one; only 7 of the 23 were ever named in a swap (backboardd 2/3/15/51, MobileSlideShow
++ * 59/60, 74); 16 (ids 97..124, made in one burst while the app switcher ran) never were -- while SpringBoard alone kept 104 surfaces of
++ * 1125x2436 BGRA (1114 MiB, oldest 367 s) alive and mapped by itself.  So the pool is taken by long-lived full-screen surfaces that are
++ * never scanned out (switcher snapshots [I]), not by references the kernel forgot.
++ *
++ * Registry: every live pool surface (not retained; added at attach, removed in SweetSurface::free under the table lock).
++ * Classification for the report: young (< age limit old), active (named in a swap within the limit), stale (named before, not since),
++ * never (never named in a swap).  Leak candidates = stale + never.
++ */
++#define SWEET_POOL_REG_MAX 128u
++struct sweet_pool_reg { void *s[SWEET_POOL_REG_MAX]; uint32_t n, overflow; };
++
++static inline bool sweet_pool_reg_add(struct sweet_pool_reg *r, void *p)
++{
++	for (unsigned i = 0; i < SWEET_POOL_REG_MAX; i++) if (r->s[i] == NULL) { r->s[i] = p; r->n++; return true; }
++	r->overflow++;
++	return false;
++}
++
++static inline bool sweet_pool_reg_remove(struct sweet_pool_reg *r, const void *p)
++{
++	for (unsigned i = 0; i < SWEET_POOL_REG_MAX; i++) if (r->s[i] == p) { r->s[i] = NULL; r->n--; return true; }
++	return false;
++}
++
++enum { SWEET_POOL_YOUNG = 0, SWEET_POOL_ACTIVE = 1, SWEET_POOL_STALE = 2, SWEET_POOL_NEVER = 3, SWEET_POOL_CLASSES = 4 };
++
++static inline int sweet_pool_classify(uint32_t now, uint32_t born, uint32_t shown_at, uint32_t limit)
++{
++	if (now - born < limit) return SWEET_POOL_YOUNG;
++	if (shown_at == 0) return SWEET_POOL_NEVER;
++	return now - shown_at < limit ? SWEET_POOL_ACTIVE : SWEET_POOL_STALE;
++}
++
++/* kern.n2fbhw_pool_policy: 0 any creator (0394), 1 not SpringBoard (default: its full-screen surfaces are switcher snapshots that
++ * stay alive and are never scanned out), 2 backboardd only (its own framebuffers). */
++enum { SWEET_POOL_POLICY_ANY = 0, SWEET_POOL_POLICY_NO_SPRINGBOARD = 1, SWEET_POOL_POLICY_BACKBOARDD = 2 };
++
++static inline bool sweet_pool_name_is(const char *a, const char *b)
++{
++	while (*a && *a == *b) { a++; b++; }
++	return *a == 0 && *b == 0;
++}
++
++static inline bool sweet_pool_admit(int policy, const char *proc)
++{
++	if (policy == SWEET_POOL_POLICY_NO_SPRINGBOARD) return !sweet_pool_name_is(proc, "SpringBoard");
++	if (policy == SWEET_POOL_POLICY_BACKBOARDD) return sweet_pool_name_is(proc, "backboardd");
++	return true;
++}
++#endif /* SWEET_SURFACE_USE_H */
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -14,6 +14,9 @@
+  *   sel 35  create mach port: scalars [id, options], scalar out [port name]
+  *   traps   0/1 use count +/- (id, category), 2 lock / 3 unlock
+  *           (id, options, &seed), 4/5 release (id)
++ *           0398: the use count is real (sweet_surface_use.h): state page
++ *           +0x18/+0x1c = holders of category 0/1 across all processes and
++ *           the kernel (display swaps, GPU jobs), read by IOSurfaceIsInUse
+  *
+  * The lock result tells the library where the surface lives in the
+  * caller's address space: +0 pixels, +8 shared state page (registry id,
+@@ -43,6 +46,7 @@
+ #include <sys/sysctl.h>
+ #include <pexpert/pexpert.h>
+ #include "sweet_fb_hw_pool_alloc.h"     /* 0394 */
++#include "sweet_surface_use.h"          /* 0398 */
+ extern "C" {
+ #include <arm/caches_internal.h>
+ vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+@@ -91,6 +95,45 @@
+ static uint32_t      sweet_surface_buffers;     /* buffer surfaces alive (in the table or only held by a port / the kernel) */
+ static uint64_t      sweet_surface_refused, sweet_surface_report_ns;
+ 
++/*
++ * 0398 (usecount-20261112): the IOSurface use count.  Before, traps 0/1 answered success and did nothing, so IOSurfaceIsInUse was
++ * always false: CVPixelBufferPool (CVPixelBufferBacking::okToReuse), CABackingStore (buffer_is_unused) and the render server's
++ * holds (CA::Render::Surface, CAImageQueue) never protected a buffer that was still shown or read, and pools handed out surfaces
++ * that textures, layers and the display still used (vanishing icons, black Photos thumbnails).  Protocol and holders:
++ * sweet_surface_use.h.  kern.n2surfuse (boot-arg n2su) 0/1/2, default 2; kern.n2surfuse_report=1 logs a report with the
++ * surfaces in use at the next trap.  Logs "NORD2 SURF USE:" (boot+30 s, every 60 s while traps come, on request).
++ */
++static int           sweet_use_mode = SWEET_USE_MODE_ALL;
++static int           sweet_use_report_req;
++static bool          sweet_use_args_done;
++static struct sweet_use_stats sweet_use_st;
++static uint32_t      sweet_use_report_at, sweet_use_reporting, sweet_use_reports;
++static uint32_t      sweet_use_told_dup, sweet_use_told_unmatched, sweet_use_told_found, sweet_use_told_drop, sweet_use_told_free;
++SYSCTL_INT(_kern, OID_AUTO, n2surfuse, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_use_mode, 0, "0398: IOSurface use count: 0 off, 1 user traps, 2 + display/GPU holds");
++SYSCTL_INT(_kern, OID_AUTO, n2surfuse_report, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_use_report_req, 0, "0398: 1 = log the use-count report at the next trap");
++SYSCTL_QUAD(_kern, OID_AUTO, n2surfuse_live, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_use_st.live, "0398: use-count holds now");
++SYSCTL_QUAD(_kern, OID_AUTO, n2surfuse_inc, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_use_st.user_inc, "0398: user increments");
++SYSCTL_QUAD(_kern, OID_AUTO, n2surfuse_dec, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_use_st.user_dec, "0398: user decrements");
++
++static void
++sweet_use_args(void)
++{
++	if (sweet_use_args_done) {
++		return;
++	}
++	int v = 0;
++	if (PE_parse_boot_argn("n2su", &v, sizeof(v)) && v >= SWEET_USE_MODE_OFF && v <= SWEET_USE_MODE_ALL) {
++		sweet_use_mode = v;
++	}
++	sweet_use_args_done = true;
++}
++
++static int
++sweet_use_mode_now(void)
++{
++	return __atomic_load_n(&sweet_use_mode, __ATOMIC_RELAXED);
++}
++
+ static uint32_t      sweet_surface_seq[SWEET_SURFACE_MAX_ID];       /* 0300: creation number of the surface in the slot */
+ static uint32_t      sweet_surface_born[SWEET_SURFACE_MAX_ID];      /* 0300: second of uptime it was put there */
+ static uint32_t      sweet_surface_created;     /* buffer surfaces ever made (released = created - alive) */
+@@ -132,6 +175,14 @@
+ SYSCTL_UINT(_kern, OID_AUTO, n2fbhw_pool_used_kib, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_pool_used_kib, 0, "");
+ SYSCTL_UINT(_kern, OID_AUTO, n2fbhw_pool_full, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_pool_full, 0, "");
+ SYSCTL_UINT(_kern, OID_AUTO, n2fbhw_pool_foreign, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_pool_foreign, 0, "");
++/* 0398: admission by creator, the live-surface registry and the leak report (sweet_surface_use.h, "Display pool") */
++static int           sweet_pool_policy = SWEET_POOL_POLICY_NO_SPRINGBOARD;
++static uint32_t      sweet_pool_age = 30;       /* s: older and not named in a swap for this long = leak candidate */
++static uint32_t      sweet_pool_denied, sweet_pool_told_denied, sweet_pool_report_full, sweet_pool_report_at;
++static struct sweet_pool_reg sweet_pool_reg;    /* under sweet_surface_lock */
++SYSCTL_INT(_kern, OID_AUTO, n2fbhw_pool_policy, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_pool_policy, 0, "0398: pool admission 0 any, 1 not SpringBoard, 2 backboardd only");
++SYSCTL_UINT(_kern, OID_AUTO, n2fbhw_pool_age, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_pool_age, 0, "0398: leak-candidate age (s)");
++SYSCTL_UINT(_kern, OID_AUTO, n2fbhw_pool_denied, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_pool_denied, 0, "0398: eligible creations kept out by the policy");
+ 
+ static void
+ sweet_pool_args(void)
+@@ -290,6 +341,9 @@
+ 		return false;
+ 	}
+ 	s->mapCache = sweet_pool_copyback ? kIOMapCopybackCache : kIOMapWriteCombineCache;
++	IOLockLock(sweet_surface_lock);         /* 0398: the leak report finds it here until SweetSurface::free */
++	(void)sweet_pool_reg_add(&sweet_pool_reg, s);
++	IOLockUnlock(sweet_surface_lock);
+ 	return true;
+ }
+ 
+@@ -324,6 +378,19 @@
+ 	/* 0394: a pool surface gives its range back once nothing else holds the descriptor (a holder could still map it). */
+ 	uint64_t poolPa = sweet_pool_surface_pa(this), poolLen = poolPa != 0 ? memory->getLength() : 0;
+ 	bool poolHeld = poolPa != 0 && memory->getRetainCount() > 1;
++	/* 0398: nobody maps or holds this surface any more, so its use counts must be 0 (else the accounting lost a give-back) */
++	if (state != NULL) {
++		volatile uint32_t *w = (volatile uint32_t *)((uintptr_t)state->getBytesNoCopy() + SWEET_USE_STATE_WORDS);
++		if (!sweet_use_free_check(w, useKern, &sweet_use_st) && sweet_use_told_free++ < 16) {
++			IOLog("NORD2 SURF USE: LEAK at free: surface %u %ux%u fmt 0x%x freed with counts %u/%u, display %u, gpu %u (free-nonzero %llu)\n",
++			    id, width, height, pixelFormat, w[0], w[1], useKern[0], useKern[1], sweet_use_st.free_nonzero);
++		}
++	}
++	if (poolPa != 0 && sweet_surface_lock != NULL) {
++		IOLockLock(sweet_surface_lock);         /* 0398: out of the registry before the fields go */
++		(void)sweet_pool_reg_remove(&sweet_pool_reg, this);
++		IOLockUnlock(sweet_surface_lock);
++	}
+ 	OSSafeReleaseNULL(kernelMap);
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+@@ -362,6 +429,28 @@
+ 	return (uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED);
+ }
+ 
++/* 0398: the two global use counts in the shared state page (IOSurfaceIsInUse reads them in every process). */
++static volatile uint32_t *
++sweet_use_words(SweetSurface *s)
++{
++	return (volatile uint32_t *)((uintptr_t)s->state->getBytesNoCopy() + SWEET_USE_STATE_WORDS);
++}
++
++extern "C" bool
++sweet_surface_use_kernel(void *surface, uint32_t kind, int delta)
++{
++	SweetSurface *s = (SweetSurface *)surface;
++	if (s == NULL || s->state == NULL || kind >= SWEET_USE_KINDS || delta == 0) {
++		return false;
++	}
++	sweet_use_args();
++	if (kind == SWEET_USE_DISPLAY && delta > 0) {   /* pool leak report: when a swap last named it (whatever the mode) */
++		s->shownAt = sweet_surface_uptime();
++		s->shownCount++;
++	}
++	return sweet_use_kern(s->useKern, sweet_use_words(s), (int)kind, delta > 0 ? 1 : -1, sweet_use_mode_now(), &sweet_use_st);
++}
++
+ /*
+  * Give the surface an id and a table slot; the table holds one retain and a
+  * user count (creators, client mappings, kernel holders). Lock held.
+@@ -466,6 +555,7 @@
+ 		return NULL;
+ 	}
+ 	bzero(s->state->getBytesNoCopy(), page_size);
++	s->bornAt = sweet_surface_uptime();     /* 0398 */
+ 	return s;
+ }
+ 
+@@ -682,6 +772,8 @@
+ 	IOMemoryMap  *data;
+ 	IOMemoryMap  *state;
+ 	uint32_t      count;
++	uint8_t       useHeld;      /* 0398: bit c = this client holds use-count category c of the surface (traps 0/1) */
++	int32_t       pid;          /* 0398: the client's process (logs) */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -694,6 +786,15 @@
+ {
+ 	OSSafeReleaseNULL(data);
+ 	OSSafeReleaseNULL(state);
++	if (surface != NULL && useHeld != 0 && surface->state != NULL) {
++		/* 0398: released (trap 4/5, close, process death) while in use: the process can no longer give its holds back */
++		uint8_t had = useHeld;
++		unsigned n = sweet_use_user_drop(&useHeld, sweet_use_words(surface), &sweet_use_st);
++		if (n != 0 && sweet_use_told_drop++ < 12) {
++			IOLog("NORD2 SURF USE: pid %d let surface %u go with use count held (categories %#x): %u hold(s) dropped (dropped %llu)\n",
++			    pid, surface->id, had, n, sweet_use_st.dropped);
++		}
++	}
+ 	if (surface != NULL) {
+ 		sweet_surface_put(surface);
+ 		surface->release();
+@@ -719,6 +820,9 @@
+ 	}
+ 	sweet_surface_init_lock();
+ 	sweet_pool_args();      /* 0394: kern.n2fbhw_pool's boot default; the pool itself is mapped at its first use */
++	sweet_use_args();       /* 0398 */
++	IOLog("NORD2 SURF USE: IOSurface use count mode %d (kern.n2surfuse / n2su: 0 off, 1 user traps, 2 + display/GPU holds), counts at state page +0x%x\n",
++	    sweet_use_mode, SWEET_USE_STATE_WORDS);
+ 	IOLog("NORD2 FB POOL: kern.n2fbhw_pool %d, cache %s (n2fbhw_pool / n2fbpoolc)\n", sweet_pool_enabled,
+ 	    sweet_pool_copyback ? "write-back" : "write-combined");
+ 	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
+@@ -750,7 +854,9 @@
+ 	    void *reference) APPLE_KEXT_OVERRIDE;
+ 	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+ 
+-	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapUseCount(void *id, void *category, bool inc);
++	IOReturn trapIncrementUse(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapDecrementUse(void *id, void *category, void *, void *, void *, void *);
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
+@@ -1084,6 +1190,7 @@
+ 	s->retain();
+ 	ref->surface = s;
+ 	ref->count = 1;
++	ref->pid = fPid;        /* 0398 */
+ 	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
+ 	ref->state = s->state->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly);
+ 	if (ref->data == NULL || ref->state == NULL) {
+@@ -1244,7 +1351,21 @@
+ 			why = SWEET_FB_POOL_NO_OFF;     /* "off" = would have gone to the pool (H0 data with the pool off) */
+ 		}
+ 		OSIncrementAtomic((volatile SInt32 *)&sweet_pool_why[why]);
+-		pooled = why == SWEET_FB_POOL_OK && sweet_pool_attach(s);
++		bool admit = true;
++		if (why == SWEET_FB_POOL_OK) {  /* 0398: who makes it decides too (snapshots are never scanned out) */
++			char pname[32];
++			proc_selfname(pname, sizeof(pname));
++			admit = sweet_pool_admit(__atomic_load_n(&sweet_pool_policy, __ATOMIC_RELAXED), pname);
++			if (!admit) {
++				OSIncrementAtomic((volatile SInt32 *)&sweet_pool_denied);
++				if (sweet_pool_told_denied++ < 8) {
++					IOLog("NORD2 FB POOL: %s[%d] %ux%u kept out of the pool by kern.n2fbhw_pool_policy %d (denied %u)\n", pname, fPid,
++					    s->width, s->height, sweet_pool_policy, sweet_pool_denied);
++				}
++			}
++		}
++		s->creator = fPid;
++		pooled = why == SWEET_FB_POOL_OK && admit && sweet_pool_attach(s);
+ 	}
+ 	if (pooled) {
+ 		OSNumber *client = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
+@@ -1464,13 +1585,210 @@
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * 0398: "NORD2 SURF USE:" report.  Counters, then the surfaces in use now (table scan): how many, by holder, and (dump) up to 10 of
++ * them with their counts.  Leak rule: user holds return to 0 when the apps that took them are gone (a closed app's holds are dropped
++ * at its mappings' release and show up as "dropped"); display holds stay <= the layers of the swaps in flight (<= 16); GPU holds are
++ * 0 whenever the GPU is idle; free-nonzero and unmatched stay 0.  Called from trap context only (no lock held).
++ */
++struct sweet_use_row { uint32_t id, width, height, format, size, age, w0, w1, kd, kg; int32_t owner; };
++
++static void
++sweet_use_report(const char *why, bool dump)
++{
++	static struct sweet_use_row rows[10];     /* under sweet_use_reporting */
++	uint32_t in_use = 0, by_user = 0, by_display = 0, by_gpu = 0, only_kernel = 0, nrows = 0, now = sweet_surface_uptime();
++	uint64_t bytes = 0;
++	IOLockLock(sweet_surface_lock);
++	for (uint32_t id = 1; id < SWEET_SURFACE_MAX_ID; id++) {
++		SweetSurface *t = sweet_surface_table[id];
++		if (t == NULL || t->state == NULL) {
++			continue;
++		}
++		volatile uint32_t *w = sweet_use_words(t);
++		uint32_t w0 = sweet_use_load(&w[0]), w1 = sweet_use_load(&w[1]), kd = t->useKern[0], kg = t->useKern[1];
++		if (w0 == 0 && w1 == 0) {
++			continue;
++		}
++		in_use++;
++		bytes += t->allocSize;
++		uint32_t user = w0 + w1 - (kd + kg <= w0 ? kd + kg : w0);
++		by_user += user != 0;
++		by_display += kd != 0;
++		by_gpu += kg != 0;
++		only_kernel += user == 0;
++		if (dump && nrows < 10) {
++			struct sweet_use_row r = { id, t->width, t->height, t->pixelFormat, t->allocSize, now - sweet_surface_born[id], w0, w1, kd, kg,
++				                   sweet_surface_owner[id] };
++			rows[nrows++] = r;
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	struct sweet_use_stats *st = &sweet_use_st;
++	IOLog("NORD2 SURF USE: %s t=%us mode %d: incs %llu decs %llu (user %llu/%llu, display %llu/%llu, gpu %llu/%llu), live %lld "
++	    "(display %lld, gpu %lld) max-live %lld max-count %u; imbalance: unmatched-dec %llu dup-inc %llu kernel-unmatched %llu/%llu "
++	    "not-found %llu; dropped-at-release %llu (%llu mappings), free-nonzero %llu, saturated %llu, refused-off %llu\n",
++	    why, now, sweet_use_mode_now(), st->user_inc + st->kern_inc[0] + st->kern_inc[1], st->user_dec + st->kern_dec[0] + st->kern_dec[1],
++	    st->user_inc, st->user_dec, st->kern_inc[0], st->kern_dec[0], st->kern_inc[1], st->kern_dec[1], st->live, st->live_kind[0],
++	    st->live_kind[1], st->max_live, st->max_word, st->user_dec_unmatched, st->user_inc_dup, st->kern_unmatched[0],
++	    st->kern_unmatched[1], st->not_found, st->dropped, st->dropped_maps, st->free_nonzero, st->saturated, st->refused_off);
++	IOLog("NORD2 SURF USE: %s in use now: %u surfaces (%llu MiB): held by processes %u, by the display %u, by the GPU %u, only by the kernel %u%s\n",
++	    why, in_use, bytes >> 20, by_user, by_display, by_gpu, only_kernel,
++	    (st->free_nonzero || st->kern_unmatched[0] || st->kern_unmatched[1] || st->live_kind[0] > 16) ? " -- LEAK SUSPECT" : "");
++	for (uint32_t i = 0; i < nrows; i++) {
++		char name[32] = "?";
++		proc_name(rows[i].owner, name, sizeof(name));
++		IOLog("NORD2 SURF USE:   surface %u %ux%u fmt 0x%x %u KiB made by %s[%d] %u s ago: counts %u/%u (display %u, gpu %u)\n", rows[i].id,
++		    rows[i].width, rows[i].height, rows[i].format, rows[i].size >> 10, name, rows[i].owner, rows[i].age, rows[i].w0, rows[i].w1,
++		    rows[i].kd, rows[i].kg);
++	}
++}
++
++/*
++ * 0398: "NORD2 FB POOL: leak candidates" -- every live pool surface (registry), classified (sweet_pool_classify), with who still holds it:
++ * mappings (client connections: creator and lookups), whether it is still in the id table (out of it = only kernel references left:
++ * framebuffer swap sets, GPU import buffers, GPU job holds), the descriptor's retain count, use counts.  Expected after closing apps:
++ * pool used MiB back to backboardd's own framebuffers (3-4 x 10.7 MiB) plus the drawables of the app on screen.
++ */
++struct sweet_pool_row { uint32_t id, age, shown_ago, shown, users, retains, w0, w1, kd, kg, imports; int32_t creator; int cls; bool table; };
++
++static void
++sweet_pool_leak_report(const char *why, bool dump)
++{
++	static struct sweet_pool_row rows[16];    /* under sweet_use_reporting */
++	static const char *cls_name[SWEET_POOL_CLASSES] = { "young", "active", "stale", "NEVER shown" };
++	uint32_t n = 0, cls[SWEET_POOL_CLASSES] = { 0 }, cls_mib[SWEET_POOL_CLASSES] = { 0 }, kernel_only = 0, gpu_held = 0, now = sweet_surface_uptime();
++	uint32_t limit = __atomic_load_n(&sweet_pool_age, __ATOMIC_RELAXED);
++	IOLockLock(sweet_surface_lock);
++	for (uint32_t i = 0; i < SWEET_POOL_REG_MAX; i++) {
++		SweetSurface *t = (SweetSurface *)sweet_pool_reg.s[i];
++		if (t == NULL || t->state == NULL) {
++			continue;
++		}
++		int c = sweet_pool_classify(now, t->bornAt, t->shownAt, limit ? limit : 1);
++		bool table = t->id < SWEET_SURFACE_MAX_ID && sweet_surface_table[t->id] == t;
++		cls[c]++;
++		cls_mib[c] += t->allocSize >> 20;
++		kernel_only += !table;
++		gpu_held += t->gpuImports != 0;
++		if ((dump || c >= SWEET_POOL_STALE || !table) && n < 16) {
++			volatile uint32_t *w = sweet_use_words(t);
++			struct sweet_pool_row r = { t->id, now - t->bornAt, t->shownAt ? now - t->shownAt : 0, t->shownCount,
++				                    table ? sweet_surface_users[t->id] : 0, t->memory ? (uint32_t)t->memory->getRetainCount() : 0,
++				                    w[0], w[1], t->useKern[0], t->useKern[1], t->gpuImports, t->creator, c, table };
++			rows[n++] = r;
++		}
++	}
++	uint32_t reg_n = sweet_pool_reg.n, reg_over = sweet_pool_reg.overflow;
++	IOLockUnlock(sweet_surface_lock);
++	IOLog("NORD2 FB POOL: leak candidates (%s, age limit %u s): live %u (registry %u%s), used %u of %llu MiB, full %u, denied by policy %d: %u; "
++	    "young %u (%u MiB), active %u (%u MiB), stale %u (%u MiB), never shown %u (%u MiB); only kernel holders %u, with GPU imports %u\n",
++	    why, limit, sweet_pool_live, reg_n, reg_over ? " OVERFLOW" : "", sweet_pool_used_kib >> 10, SWEET_FB_HW_POOL_SIZE >> 20, sweet_pool_full,
++	    sweet_pool_policy, sweet_pool_denied, cls[0], cls_mib[0], cls[1], cls_mib[1], cls[2], cls_mib[2], cls[3], cls_mib[3], kernel_only, gpu_held);
++	for (uint32_t i = 0; i < n; i++) {
++		char name[32] = "kernel";
++		if (rows[i].creator > 0) {
++			proc_name(rows[i].creator, name, sizeof(name));
++		}
++		char shown[24];
++		if (rows[i].shown) {
++			snprintf(shown, sizeof(shown), "%u s ago", rows[i].shown_ago);
++		} else {
++			snprintf(shown, sizeof(shown), "never");
++		}
++		IOLog("NORD2 FB POOL:   id %u by %s[%d] %s: age %u s, last swap %s (%u swaps); holders: mappings %u%s, descriptor retains %u, "
++		    "use %u/%u, display %u, gpu jobs %u, gpu imports %u\n", rows[i].id, name, rows[i].creator, cls_name[rows[i].cls], rows[i].age,
++		    shown, rows[i].shown, rows[i].users, rows[i].table ? "" : " (OUT OF THE ID TABLE: kernel references only)", rows[i].retains,
++		    rows[i].w0, rows[i].w1, rows[i].kd, rows[i].kg, rows[i].imports);
++	}
++}
++
++/* At boot+30 s, every 60 s while traps come, and when kern.n2surfuse_report is set (then with the surface list). */
++static void
++sweet_use_maybe_report(void)
++{
++	uint32_t now = sweet_surface_uptime(), at = __atomic_load_n(&sweet_use_report_at, __ATOMIC_RELAXED);
++	int req = __atomic_load_n(&sweet_use_report_req, __ATOMIC_RELAXED);
++	const char *why = NULL;
++	if (req != 0) {
++		why = "asked";
++	} else if (at == 0 && now >= 30) {
++		why = "boot+30s";
++	} else if (at != 0 && now - at >= 60) {
++		why = "periodic";
++	}
++	/* the pool report also when the pool refused a creation since the last one (at most every 15 s) */
++	bool pool_full = sweet_pool_state == 1 && sweet_pool_full != sweet_pool_report_full && now - sweet_pool_report_at >= 15;
++	if ((why == NULL && !pool_full) || !OSCompareAndSwap(0, 1, &sweet_use_reporting)) {
++		return;
++	}
++	if (why != NULL) {
++		__atomic_store_n(&sweet_use_report_req, 0, __ATOMIC_RELAXED);
++		__atomic_store_n(&sweet_use_report_at, now ? now : 1, __ATOMIC_RELAXED);
++		sweet_use_report(why, true);    /* the in-use list every time (at most 10 lines a minute): leak checks need it */
++		sweet_use_reports++;
++	}
++	if (sweet_pool_state == 1) {
++		sweet_pool_report_full = sweet_pool_full;
++		sweet_pool_report_at = now;
++		sweet_pool_leak_report(why != NULL ? why : "pool full", req != 0);
++	}
++	__atomic_store_n(&sweet_use_reporting, 0, __ATOMIC_RELEASE);
++}
++
++/* Trap 0 / 1 (IOSurface.framework calls them on this process's 0 -> 1 / 1 -> 0 step of a category: sweet_surface_use.h). */
+ IOReturn
+-IOSurfaceRootUserClient::trapUseCount(__unused void *id, __unused void *category,
+-    void *, void *, void *, void *)
++IOSurfaceRootUserClient::trapUseCount(void *id, void *category, bool inc)
+ {
++	uint32_t sid = (uint32_t)(uintptr_t)id, cat = (uint32_t)(uintptr_t)category;
++	sweet_use_args();
++	int mode = sweet_use_mode_now();
++	if (mode == SWEET_USE_MODE_OFF && inc) {
++		__atomic_add_fetch(&sweet_use_st.refused_off, 1, __ATOMIC_RELAXED);
++		return kIOReturnSuccess;        /* the old no-op */
++	}
++	if (cat >= SWEET_USE_CATEGORIES) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(fLock);
++	SweetSurfaceRef *ref = findRef(sid, NULL);
++	if (ref == NULL || ref->surface->state == NULL) {
++		IOLockUnlock(fLock);
++		__atomic_add_fetch(&sweet_use_st.not_found, 1, __ATOMIC_RELAXED);
++		if (sweet_use_told_found++ < 8) {
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("NORD2 SURF USE: %s[%d] %s use count of surface %u (category %u) it has no mapping of -> not found\n", name, fPid,
++			    inc ? "increments" : "decrements", sid, cat);
++		}
++		return kIOReturnNotFound;
++	}
++	uint8_t before = ref->useHeld;
++	uint64_t dup = sweet_use_st.user_inc_dup, unm = sweet_use_st.user_dec_unmatched;
++	(void)sweet_use_user(&ref->useHeld, sweet_use_words(ref->surface), cat, inc, mode, &sweet_use_st);
++	IOLockUnlock(fLock);
++	if (sweet_use_st.user_inc_dup != dup && sweet_use_told_dup++ < 8) {
++		IOLog("NORD2 SURF USE: pid %d increments surface %u category %u twice (held %#x): kept one hold\n", fPid, sid, cat, before);
++	}
++	if (sweet_use_st.user_dec_unmatched != unm && mode != SWEET_USE_MODE_OFF && sweet_use_told_unmatched++ < 8) {
++		IOLog("NORD2 SURF USE: pid %d decrements surface %u category %u it does not hold (held %#x): ignored\n", fPid, sid, cat, before);
++	}
++	sweet_use_maybe_report();
+ 	return kIOReturnSuccess;
+ }
+ 
++IOReturn
++IOSurfaceRootUserClient::trapIncrementUse(void *id, void *category, void *, void *, void *, void *)
++{
++	return trapUseCount(id, category, true);
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapDecrementUse(void *id, void *category, void *, void *, void *, void *)
++{
++	return trapUseCount(id, category, false);
++}
++
+ static IOReturn
+ sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump)
+ {
+@@ -1550,8 +1868,8 @@
+ }
+ 
+ static IOExternalTrap sweet_surface_traps[] = {
+-	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+-	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapIncrementUse },     /* 0398: were one no-op */
++	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDecrementUse },
+ 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
+ 	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -189,15 +189,25 @@
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
++/*
++ * 0398: every surface reference a swap holds comes from here and goes back through sweet_fb_release_surface (pending, prepared,
++ * work, late slots, the shown HW frame's fHwHeld), so the pair is also the display's IOSurface use-count hold: CoreAnimation and
++ * the pools see the surface in use from SwapEnd until the copy ended (CPU path) or the overlay stopped reading it (HW path).
++ */
+ static void *
+ sweet_fb_retain_surface(uint32_t id)
+ {
+-	return sweet_surface_copy(id);          /* retained, or NULL */
++	SweetSurface *s = sweet_surface_copy(id);       /* retained, or NULL */
++	if (s != NULL) {
++		(void)sweet_surface_use_kernel(s, SWEET_SURFACE_USE_DISPLAY, 1);
++	}
++	return s;
+ }
+ 
+ static void
+ sweet_fb_release_surface(void *p)
+ {
++	(void)sweet_surface_use_kernel(p, SWEET_SURFACE_USE_DISPLAY, -1);      /* 0398 (refused, not counted twice, if none was taken) */
+ 	((SweetSurface *)p)->release();
+ }
+ 
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -28,6 +28,7 @@
+ #include "SweetSurface.h"
+ #define NORD2_GPU_FENCE_IMPL
+ #include "nord2_gpu_fence.h"   /* 0395: per-surface write fences + display-pool import range */
++#include "sweet_surface_use.h" /* 0398: GPU use-count holds by job */
+ extern "C" {
+ extern unsigned long gPhysBase, gPhysSize;
+ extern int PE_parse_boot_argn(const char *, void *, int);
+@@ -145,6 +146,7 @@
+         BufferOwner *o = (BufferOwner *)cookie;
+         if (!o) return;
+         if (o->md && o->prepared) o->md->complete(kIODirectionInOut);
++        if (o->surface) OSDecrementAtomic((volatile SInt32 *)&o->surface->gpuImports);    /* 0398: pool leak attribution */
+         OSSafeReleaseNULL(o->md);
+         OSSafeReleaseNULL(o->surface);
+         IOFree(o, sizeof(*o));
+@@ -166,11 +168,47 @@
+         return false;
+ }
+ static struct n2gf_jobs fence_jobs(struct n2c_core *c) { struct n2gf_jobs v = { c, N2C_MAX_JOBS, fence_unfinished, fence_writes }; return v; }
++/*
++ * 0398 (usecount-20261112): IOSurface use-count holds of the GPU.  Every IOSurface import a job lists (read or written) is held
++ * (category 0, IOSurfaceIsInUse) from the submit until the job is no longer QUEUED/RUNNING/STOPPING; the tick reaps.  gUseGpu is
++ * guarded by Nord2GPU::lock; each slot keeps a retain on its surface, dropped after the lock is let go.  A full table takes no hold
++ * (counted; the surface is then protected as before 0398 only).
++ */
++static struct sweet_use_gpu_table gUseGpu;
++static void *gUseGpuOut[SWEET_USE_GPU_SLOTS];          /* the tick's reaped surfaces (tick only: one workloop thread) */
++static void usehold_record(struct n2c_core *c, unsigned ctx, const struct n2c_submit *sub, uint64_t id) {
++        for (unsigned k = 0; k < sub->nr_handles && k < N2C_JOB_BOS; k++) {
++                const struct n2c_bo *b = n2c_bo_lookup(c, ctx, sub->handles[k]);
++                SweetSurface *s = b && (b->flags & N2C_BO_IMPORTED) && b->cookie ? ((BufferOwner *)b->cookie)->surface : NULL;
++                if (!s) continue;
++                if (sweet_use_gpu_has(&gUseGpu, id, s)) { gUseGpu.dup++; continue; }
++                int slot = sweet_use_gpu_put(&gUseGpu, id, s);
++                if (slot < 0) continue;
++                if (!sweet_surface_use_kernel(s, SWEET_SURFACE_USE_GPU, 1)) {   /* kern.n2surfuse < 2: no hold, no slot */
++                        gUseGpu.s[slot].surface = NULL; gUseGpu.s[slot].job = 0; gUseGpu.used--; gUseGpu.recorded--;
++                        continue;
++                }
++                s->retain();
++        }
++}
++/* Tick, Nord2GPU::lock held: holds of jobs that left the unfinished states are given back; returns the surfaces to release. */
++static unsigned usehold_reap(struct n2c_core *c) {
++        if (gUseGpu.used == 0) return 0;
++        uint64_t live[N2C_MAX_JOBS]; unsigned n = 0;
++        for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
++                const struct n2c_job *j = &c->jobs[i];
++                if (j->state == N2C_JOB_QUEUED || j->state == N2C_JOB_RUNNING || j->state == N2C_JOB_STOPPING) live[n++] = j->id;
++        }
++        unsigned k = sweet_use_gpu_reap(&gUseGpu, live, n, gUseGpuOut, SWEET_USE_GPU_SLOTS);
++        for (unsigned i = 0; i < k; i++) (void)sweet_surface_use_kernel(gUseGpuOut[i], SWEET_SURFACE_USE_GPU, -1);
++        return k;
++}
+ /* After a successful submit (caller holds Nord2GPU::lock): every write-masked handle that is an IOSurface import. */
+ static void fence_record(struct n2c_core *c, unsigned ctx, const struct n2c_submit *sub, uint64_t id) {
+         struct n2gf_jobs v = fence_jobs(c);
+         for (unsigned k = 0; k < sub->nr_handles && k < N2C_JOB_BOS; k++)
+                 if ((sub->write_mask >> k) & 1u) n2gf_record(&gFence, &v, c->next_job_id, fence_sid(n2c_bo_lookup(c, ctx, sub->handles[k])), id);
++        usehold_record(c, ctx, sub, id);        /* 0398 */
+ }
+ static bool alloc_host(void *, size_t bytes, void **p) {
+         *p = IOMallocZero(bytes); return *p != NULL;
+@@ -507,7 +545,17 @@
+         /* 0131: with unfinished jobs the poll that notices a completion and starts the next job runs every 150 us (was 1 ms): a job takes ~0.7 ms of GPU time but used to cost ~2.5 ms of turnaround. */
+         if (d->ready && unfinished && d->irqState == NORD2_IRQ_ACTIVE) d->irqArm();   /* 0140: completion interrupts for asynchronous clients */
+         if (d->ready && unfinished) sender->setTimeout(150, kMicrosecondScale); else sender->setTimeoutMS(d->ready ? 5 : 1000);
++        /* 0398: use-count holds of finished jobs (a core that is no longer ready finishes nothing: all of them are given back) */
++        unsigned reaped = 0;
++        if (gUseGpu.used) {
++                if (d->ready) reaped = usehold_reap(d->core);
++                else {
++                        reaped = sweet_use_gpu_reap(&gUseGpu, NULL, 0, gUseGpuOut, SWEET_USE_GPU_SLOTS);
++                        for (unsigned i = 0; i < reaped; i++) (void)sweet_surface_use_kernel(gUseGpuOut[i], SWEET_SURFACE_USE_GPU, -1);
++                }
++        }
+         IOLockUnlock(d->lock);
++        for (unsigned i = 0; i < reaped; i++) { ((SweetSurface *)gUseGpuOut[i])->release(); gUseGpuOut[i] = NULL; }
+ }
+ bool Nord2GPU::start(IOService *provider) {
+         if (!IOAcceleratorES::start(provider)) return false;
+@@ -944,6 +992,9 @@
+                       f.waits, f.wait_ok, f.wait_timeout, f.waits ? f.wait_sum_us / f.waits : 0ull, f.wait_max_us, n2gf_low_water(&gFence, &v, core->next_job_id),
+                       core->next_job_id, f.pool_imports, f.pool_pages, f.pool_refused);
+           f.wait_max_us = 0; }
++        if (gUseGpu.recorded || gUseGpu.full)    /* 0398: GPU use-count holds (used must come back to 0 when the GPU is idle) */
++                IOLog("NORD2 SURF USE: gpu holds used=%u max=%u recorded=%llu reaped=%llu same-job=%llu table-full=%llu\n",
++                      gUseGpu.used, gUseGpu.max_used, gUseGpu.recorded, gUseGpu.reaped, gUseGpu.dup, gUseGpu.full);
+         waitN = waitGapMax = waitDurMax = waitRetMax = 0; waitGapSum = waitDurSum = waitRetSum = 0;
+         seqWaits = seqJobs = seqDurMax = 0; seqDurSum = 0;
+         if (pfMode > 0) prfcntSample();
+@@ -1188,6 +1239,7 @@
+         unsigned count = (unsigned)(mapped / 4096); n2c_page *pages = (n2c_page *)IOMallocZero(count * sizeof(*pages));
+         if (!owner || !pages) { if (owner) IOFree(owner, sizeof(*owner)); if (pages) IOFree(pages,count*sizeof(*pages)); s->release(); return kIOReturnNoMemory; }
+         owner->surface = s; bool valid = true;
++        OSIncrementAtomic((volatile SInt32 *)&s->gpuImports);     /* 0398: given back in free_owner */
+         unsigned inPool = 0, inRam = 0, nearPool = 0;    /* 0395: display-pool pages (sweet_fb_hw_pool) are normal DRAM below XNU's RAM */
+         for (unsigned i=0; i<count; i++) {
+                 IOByteCount length; pages[i].pa = s->memory->getPhysicalSegment((uint64_t)s->offset+offset+(uint64_t)i*4096, &length, kIOMemoryMapperNone);

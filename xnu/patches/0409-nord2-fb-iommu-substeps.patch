@@ -1,0 +1,140 @@
+--- a/iokit/Kernel/arm/sweet_fb_iommu_hw.h
++++ b/iokit/Kernel/arm/sweet_fb_iommu_hw.h
+@@ -617,6 +617,137 @@
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, n2fbiommu_stage, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, n2io_sysctl_stage, "I", "0403: staged arming 1 arm 2 one port 3 both (watchdog)");
+ SYSCTL_UINT(_kern, OID_AUTO, n2fbiommu_wdms, CTLFLAG_RW | CTLFLAG_LOCKED, &n2io_wd_ms, 0, "0403: stage 2/3 watchdog ms");
++/* ---------------------------------------------------------------- 0409 stage-1 sub-steps (kern.n2fbiommu_sub, bisect of the T1 lockup)
++ * Bits: 0x01 prep (map the display pool, take + fill the 580 KiB table block: no M4U write), 0x02 PT_BASE write, 0x04 TFRP write,
++ * 0x08 TLB invalidate all (INVLID_SEL 3 + INVLDT 2), 0x10 read-only dump of the NON_SEC_CON ports of the other M4U0 larbs (5 VDEC,
++ * 7 VENC/JPEG, 11 ISP2, 14 CAM, 17 CAM_RAWB, 19/20 IPE) -- only larbs whose SPM power domain reads ON in PWR_STATUS and PWR_STATUS_2ND,
++ * 0x80 undo (PT_BASE 0, TFRP 0, TLB invalidate all).  0x02/0x04/0x08 imply 0x01 if not prepared yet.  Never touches CTRL, INT_MAIN, a
++ * clock gate or any larb port; refused (EBUSY) once armed by kern.n2fbiommu / kern.n2fbiommu_stage (only 0x10 allowed then); undo
++ * combined with a write bit = EINVAL.  Every write logged first + 200 ms console drain; "SUB 0x.. done" line with a register readback.
++ * Unset (default) = no code runs: the 0401/0403 paths are unchanged.  The pure order/refusal rule is host-tested (test/iommusub_host_test.c
++ * extracts the block between the PURE markers). */
++/* 0409-PURE-BEGIN */
++enum { N2IO_SUB_PREP = 0x01, N2IO_SUB_PTBASE = 0x02, N2IO_SUB_TFRP = 0x04, N2IO_SUB_TLB = 0x08, N2IO_SUB_DUMP = 0x10, N2IO_SUB_UNDO = 0x80,
++       N2IO_SUB_ALL = 0x9f };
++/* Ordered actions for value v; returns their number (0..6) or -22 (EINVAL) / -16 (EBUSY). */
++static inline int
++n2io_sub_plan(uint32_t v, bool armed, bool prepped, uint8_t act[6])
++{
++	int n = 0;
++	if (v & ~(uint32_t)N2IO_SUB_ALL) { return -22; }
++	if ((v & N2IO_SUB_UNDO) && (v & (N2IO_SUB_PREP | N2IO_SUB_PTBASE | N2IO_SUB_TFRP | N2IO_SUB_TLB))) { return -22; }
++	if (armed && (v & ~(uint32_t)N2IO_SUB_DUMP)) { return -16; }
++	if (v & N2IO_SUB_DUMP) { act[n++] = N2IO_SUB_DUMP; }                 /* read-only, before anything is written */
++	if ((v & N2IO_SUB_PREP) || ((v & (N2IO_SUB_PTBASE | N2IO_SUB_TFRP | N2IO_SUB_TLB)) && !prepped)) { act[n++] = N2IO_SUB_PREP; }
++	if (v & N2IO_SUB_PTBASE) { act[n++] = N2IO_SUB_PTBASE; }
++	if (v & N2IO_SUB_TFRP) { act[n++] = N2IO_SUB_TFRP; }
++	if (v & N2IO_SUB_TLB) { act[n++] = N2IO_SUB_TLB; }
++	if (v & N2IO_SUB_UNDO) { act[n++] = N2IO_SUB_UNDO; }
++	return n;
++}
++/* 0409-PURE-END */
++static int  n2io_sub_last;
++static bool n2io_sub_prepped;
++
++/* prep: everything n2io_arm_locked does before its first M4U0 write, nothing written to M4U0 (lock held). */
++static bool
++n2io_sub_prep_locked(void)
++{
++	if (n2io_sub_prepped) { return true; }
++	if (!n2io_map_regs()) { IOLog("NORD2 FB IOMMU: SUB prep: register blocks not mappable\n"); return false; }
++	uint32_t g = n2io_cg_gated();
++	if (g != 0) { IOLog("NORD2 FB IOMMU: SUB prep: SMI/IOMMU clocks gated (%08x): not ungated by a sub-step\n", g); return false; }
++	for (unsigned k = 0; k < 2; k++) {
++		for (unsigned p = 0; p < N2IO_LARB_PORTS; p++) {
++			uint32_t v = n2io_rd(n2io_larb[k], N2IO_PORT(p));
++			if (v & (1u | N2IO_PORT_EXT_MASK)) { IOLog("NORD2 FB IOMMU: SUB prep: larb%u port %u NON_SEC_CON %08x: refused\n", k == 0 ? 1u : 0u, p, v); return false; }
++		}
++	}
++	n2io_step("SUB prep: map the display pool + take the table block (no M4U write)");
++	uint64_t pa = sweet_pool_take(SWEET_FB_IOMMU_BLOCK_BYTES);
++	if (pa == 0) { IOLog("NORD2 FB IOMMU: SUB prep: no display-pool block for the page tables\n"); return false; }
++	volatile uint8_t *va = sweet_pool_kva + (pa - SWEET_FB_HW_POOL_BASE);
++	if (!sweet_fb_iommu_pt_init(&n2io_pt, va, pa)) { sweet_pool_give(pa, SWEET_FB_IOMMU_BLOCK_BYTES); IOLog("NORD2 FB IOMMU: SUB prep: block misplaced\n"); return false; }
++	sweet_pool_flush((vm_offset_t)va, SWEET_FB_IOMMU_BLOCK_BYTES);
++	sweet_fb_iova_init(&n2io_iova);
++	n2io_scratch_pa = pa + SWEET_FB_IOMMU_OFF_SCRATCH;
++	n2io_ptbase_val = (uint32_t)(n2io_pt.l1_pa & 0xffffff80u) | (uint32_t)((n2io_pt.l1_pa >> 32) & 7u);
++	n2io_sub_prepped = true;
++	IOLog("NORD2 FB IOMMU: SUB prep: tables pa %#llx PT_BASE value %08x TFRP value %08x (pool mapped, M4U0 untouched)\n", pa, n2io_ptbase_val,
++	    (uint32_t)(n2io_scratch_pa & 0xffffff80u));
++	return true;
++}
++
++/* 0x10: other M4U0 larbs, read only if their power domain is on (a powered-off larb can hang the bus).  SPM 0x10006000: PWR_STATUS
++ * 0x16c / PWR_STATUS_2ND 0x170 (clk-mt6885-pg.c); larb bases + domains from mt6885.dts. */
++static void
++n2io_sub_dump(void)
++{
++	static const struct { uint8_t larb, bit; uint32_t base; } L[] = {
++		{ 5, 15, 0x1600d000u }, { 7, 17, 0x17010000u }, { 11, 13, 0x1582e000u }, { 14, 23, 0x1a002000u }, { 17, 25, 0x1a010000u },
++		{ 19, 14, 0x1b10f000u }, { 20, 14, 0x1b00f000u } };
++	volatile uint32_t *spm = (volatile uint32_t *)ml_io_map(0x10006000UL, 0x1000);
++	if (spm == NULL) { IOLog("NORD2 FB IOMMU: SUB dump: SPM not mappable\n"); return; }
++	uint32_t s1 = n2io_rd(spm, 0x16c), s2 = n2io_rd(spm, 0x170);
++	IOLog("NORD2 FB IOMMU: SUB dump: PWR_STATUS %08x PWR_STATUS_2ND %08x\n", s1, s2);
++	for (unsigned i = 0; i < sizeof(L) / sizeof(L[0]); i++) {
++		if (!((s1 >> L[i].bit) & (s2 >> L[i].bit) & 1u)) { IOLog("NORD2 FB IOMMU: SUB dump: larb%u power domain off: not read\n", L[i].larb); continue; }
++		volatile uint32_t *b = (volatile uint32_t *)ml_io_map(L[i].base, 0x1000);
++		if (b == NULL) { continue; }
++		uint32_t v[32], en = 0;
++		for (unsigned p = 0; p < 32; p++) { v[p] = n2io_rd(b, N2IO_PORT(p)); if (v[p] & 1u) { en |= 1u << p; } }
++		IOLog("NORD2 FB IOMMU: SUB dump: larb%u MMU_EN ports %08x | p0-7 %x %x %x %x %x %x %x %x p8-15 %x %x %x %x %x %x %x %x\n", L[i].larb, en,
++		    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]);
++	}
++}
++
++static int
++n2io_sysctl_sub SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = n2io_sub_last, changed = 0;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (err != 0 || !changed) { return err; }
++	if (!n2io_lock_init()) { return ENOMEM; }
++	IOLog("NORD2 FB IOMMU: SUB %#x requested (state %u, mode %d, prepped %u)\n", (unsigned)v, n2io_state, n2io_mode, n2io_sub_prepped);
++	IOSleep(200);
++	IOLockLock(n2io_lock);
++	n2io_sub_last = v;
++	uint8_t act[6];
++	int n = v < 0 ? -22 : n2io_sub_plan((uint32_t)v, n2io_state != 0, n2io_sub_prepped, act);
++	if (n < 0) { err = -n; IOLog("NORD2 FB IOMMU: SUB %#x REFUSED (%s)\n", (unsigned)v, n == -16 ? "already armed" : "bad bits"); }
++	n2io_stepwise = true;
++	for (int i = 0; err == 0 && i < n; i++) {
++		switch (act[i]) {
++		case N2IO_SUB_DUMP: n2io_sub_dump(); break;
++		case N2IO_SUB_PREP: if (!n2io_sub_prep_locked()) { err = EPERM; } break;
++		case N2IO_SUB_PTBASE:
++			n2io_step("SUB write M4U0 PT_BASE");
++			n2io_wr(n2io_m4u, N2IO_PT_BASE, n2io_ptbase_val); break;
++		case N2IO_SUB_TFRP:
++			n2io_step("SUB write M4U0 TFRP");
++			n2io_wr(n2io_m4u, N2IO_TFRP, (uint32_t)(n2io_scratch_pa & 0xffffff80u)); break;
++		case N2IO_SUB_TLB:
++			n2io_step("SUB M4U0 TLB invalidate all");
++			n2io_tlb_all(); break;
++		case N2IO_SUB_UNDO:
++			if (!n2io_map_regs()) { err = EPERM; break; }
++			n2io_step("SUB undo: M4U0 PT_BASE 0, TFRP 0, TLB invalidate all");
++			n2io_wr(n2io_m4u, N2IO_PT_BASE, 0); n2io_wr(n2io_m4u, N2IO_TFRP, 0); n2io_tlb_all(); break;
++		}
++	}
++	n2io_stepwise = false;
++	if (n >= 0) {
++		bool m = n2io_m4u != NULL;
++		IOLog("NORD2 FB IOMMU: SUB %#x %s: PT_BASE %08x TFRP %08x INVLID_SEL %08x fault_st1 %08x l2 %08x\n", (unsigned)v, err ? "FAILED" : "done",
++		    m ? n2io_rd(n2io_m4u, N2IO_PT_BASE) : 0u, m ? n2io_rd(n2io_m4u, N2IO_TFRP) : 0u, m ? n2io_rd(n2io_m4u, N2IO_INVLD_SEL) : 0u,
++		    m ? n2io_rd(n2io_m4u, N2IO_FAULT_ST1) : 0u, m ? n2io_rd(n2io_m4u, N2IO_L2_FAULT_ST) : 0u);
++	}
++	IOLockUnlock(n2io_lock);
++	return err;
++}
++SYSCTL_PROC(_kern, OID_AUTO, n2fbiommu_sub, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, n2io_sysctl_sub, "I", "0409: stage-1 sub-steps 1 prep 2 PT_BASE 4 TFRP 8 TLB 16 dump 128 undo");
++
+ SYSCTL_INT(_kern, OID_AUTO, n2fbiommutest, CTLFLAG_RW | CTLFLAG_LOCKED, &n2io_test, 0, "0401: 1 = kern.n2fbhwtest reads a scattered copy through the IOMMU");
+ 
+ #endif /* SWEET_FB_IOMMU_HW_H */

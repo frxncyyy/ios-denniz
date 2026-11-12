@@ -1,0 +1,627 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -47,6 +47,7 @@
+ #include <pexpert/pexpert.h>
+ #include "sweet_fb_hw_pool_alloc.h"     /* 0394 */
+ #include "sweet_surface_use.h"          /* 0398 */
++#include "sweet_fb_pool_reclaim.h"     /* 0406 */
+ extern "C" {
+ #include <arm/caches_internal.h>
+ vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+@@ -183,6 +184,25 @@
+ SYSCTL_INT(_kern, OID_AUTO, n2fbhw_pool_policy, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_pool_policy, 0, "0398: pool admission 0 any, 1 not SpringBoard, 2 backboardd only");
+ SYSCTL_UINT(_kern, OID_AUTO, n2fbhw_pool_age, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_pool_age, 0, "0398: leak-candidate age (s)");
+ SYSCTL_UINT(_kern, OID_AUTO, n2fbhw_pool_denied, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_pool_denied, 0, "0398: eligible creations kept out by the policy");
++/*
++ * 0406 (poolreclaim-20261114): eviction of idle VOLATILE pool surfaces when the pool is full (sweet_fb_pool_reclaim.h).  Mode 1 (default)
++ * only decides and logs "NORD2 FB POOL RECLAIM:" (what mode 2 would evict, why the others stay); mode 2 evicts.  Lock order:
++ * sweet_pool_evict_lock, then sweet_clients_lock, a client's fLock, sweet_surface_lock.  The IOSurfaceSetPurgeable selector takes
++ * sweet_pool_evict_lock too, so a surface cannot turn non-volatile between the decision and the end of the remap.
++ */
++static int           sweet_pool_reclaim_mode = SWEET_POOL_RECLAIM_REPORT;
++static uint32_t      sweet_pool_reclaim_grace_s = 2;    /* s between the swap and the old range's return (and after any later swap) */
++static uint32_t      sweet_pool_evicted, sweet_pool_reclaim_given, sweet_pool_remap_failed, sweet_pool_reclaim_passes;
++static uint32_t      sweet_pool_reclaim_at, sweet_pool_reclaim_told;
++static uint32_t      sweet_pool_reclaim_npend;          /* pending old ranges (read without the lock as a hint) */
++static IOLock       *sweet_pool_evict_lock;
++SYSCTL_INT(_kern, OID_AUTO, n2fbhw_pool_reclaim, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_pool_reclaim_mode, 0, "0406: full pool: 0 off, 1 log what would be evicted, 2 evict idle volatile surfaces");
++SYSCTL_UINT(_kern, OID_AUTO, n2fbhw_pool_reclaim_grace, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_pool_reclaim_grace_s, 0, "0406: s before an evicted range goes back");
++SYSCTL_UINT(_kern, OID_AUTO, n2fbhw_pool_evicted, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_pool_evicted, 0, "0406: surfaces moved out of the pool");
++SYSCTL_UINT(_kern, OID_AUTO, n2fbhw_pool_reclaim_given, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_pool_reclaim_given, 0, "0406: evicted ranges given back to the pool");
++SYSCTL_UINT(_kern, OID_AUTO, n2fbhw_pool_remap_failed, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_pool_remap_failed, 0, "0406: client mappings left on the old range");
++static void sweet_pool_reclaim(uint64_t bytes);
++static void sweet_pool_reclaim_drain(void);
+ 
+ static void
+ sweet_pool_args(void)
+@@ -327,12 +347,23 @@
+ 	}
+ }
+ 
+-/* Put s (geometry set, allocSize final) into the pool: memory + mapCache; false = pool off or full. */
++/*
++ * Put s (geometry set, allocSize final) into the pool: memory + mapCache; false = pool off or full.
++ * 0406: from a client's create (user = true, no lock held) evicted ranges whose grace is over come back first, and a full pool runs
++ * the reclaim decision (mode 2: evictions whose ranges come back after the grace, i.e. for the next creations).  Kernel-made pool
++ * surfaces (H2 test patterns, possibly under framebuffer locks) never reclaim.
++ */
+ static bool
+-sweet_pool_attach(SweetSurface *s)
++sweet_pool_attach(SweetSurface *s, bool user)
+ {
++	if (user && __atomic_load_n(&sweet_pool_reclaim_npend, __ATOMIC_RELAXED) != 0) {
++		sweet_pool_reclaim_drain();
++	}
+ 	uint64_t pa = sweet_pool_take(s->allocSize);
+ 	if (pa == 0) {
++		if (user) {
++			sweet_pool_reclaim(s->allocSize);
++		}
+ 		return false;
+ 	}
+ 	s->memory = IOMemoryDescriptor::withPhysicalAddress(pa, s->allocSize, kIODirectionInOut);
+@@ -616,7 +647,7 @@
+ 	s->elementWidth = s->elementHeight = 1;
+ 	s->pixelFormat = SWEET_FB_POOL_BGRA;
+ 	s->allocSize = (uint32_t)round_page(bpr * height);
+-	if (!sweet_pool_attach(s) || !sweet_surface_publish(s)) {
++	if (!sweet_pool_attach(s, false) || !sweet_surface_publish(s)) {
+ 		s->release();           /* gives the range back if it got one */
+ 		return NULL;
+ 	}
+@@ -823,6 +854,9 @@
+ 	}
+ 	sweet_surface_init_lock();
+ 	sweet_pool_args();      /* 0394: kern.n2fbhw_pool's boot default; the pool itself is mapped at its first use */
++	if (sweet_pool_evict_lock == NULL) {
++		sweet_pool_evict_lock = IOLockAlloc();  /* 0406 */
++	}
+ 	sweet_use_args();       /* 0398 */
+ 	IOLog("NORD2 SURF USE: IOSurface use count mode %d (kern.n2surfuse / n2su: 0 off, 1 user traps, 2 + display/GPU holds), counts at state page +0x%x\n",
+ 	    sweet_use_mode, SWEET_USE_STATE_WORDS);
+@@ -842,6 +876,7 @@
+ 	OSArray *fRefs;
+ 	int32_t  fPid;          /* 0300 */
+ 	friend void sweet_surface_report(const char *why, uint32_t asked);
++	friend void sweet_pool_evict_remap(SweetSurface *s, IOMemoryDescriptor *old, IOMemoryDescriptor *buf, uint32_t *ok, uint32_t *bad);
+ 
+ 	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index);
+ 	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
+@@ -879,6 +914,266 @@
+ static IOSurfaceRootUserClient *sweet_clients[SWEET_CLIENTS_MAX];
+ static IOLock *sweet_clients_lock;
+ 
++/*
++ * 0406 (poolreclaim-20261114): pool eviction (sweet_fb_pool_reclaim.h).  An evicted surface keeps its id, its state page and every
++ * client address: each client mapping of the old pool range is replaced in place by a mapping of new zeroed normal memory
++ * (createMappingInTask(kIOMapOverwrite) at the same address = vm_map_enter overwrite of the old entry; the new IOMemoryMap then owns the
++ * range, the old one is released without unmapping it), the surface's purgeable state becomes Empty and its old descriptor (with the
++ * pool range) waits in sweet_reclaim_pend until sweet_reclaim_grace() says nothing can reach it any more.
++ */
++#define SWEET_RECLAIM_PEND_MAX  16u
++struct sweet_reclaim_pend_ent { SweetSurface *s; IOMemoryDescriptor *old; uint64_t pa, len; uint32_t armed_at, shown_at; };
++static struct sweet_reclaim_pend_ent sweet_reclaim_pend[SWEET_RECLAIM_PEND_MAX];        /* under sweet_pool_evict_lock */
++
++/* Every client mapping of s that still shows old: remapped onto buf at the same address.  Holds sweet_clients_lock and each fLock. */
++void
++sweet_pool_evict_remap(SweetSurface *s, IOMemoryDescriptor *old, IOMemoryDescriptor *buf, uint32_t *ok, uint32_t *bad)
++{
++	if (sweet_clients_lock == NULL) {
++		return;
++	}
++	IOLockLock(sweet_clients_lock);
++	for (uint32_t i = 0; i < SWEET_CLIENTS_MAX; i++) {
++		IOSurfaceRootUserClient *c = sweet_clients[i];
++		if (c == NULL || c->fLock == NULL || c->fRefs == NULL) {
++			continue;
++		}
++		IOLockLock(c->fLock);
++		for (unsigned int k = 0; k < c->fRefs->getCount(); k++) {
++			SweetSurfaceRef *ref = (SweetSurfaceRef *)c->fRefs->getObject(k);
++			IOMemoryMap *om = ref != NULL && ref->surface == s ? ref->data : NULL;
++			if (om == NULL || om->getMemoryDescriptor() != old) {
++				continue;
++			}
++			IOMemoryMap *nm = buf->createMappingInTask(om->getAddressTask(), om->getAddress(), kIOMapOverwrite | kIOMapDefaultCache,
++			    0, om->getLength());
++			if (nm == NULL || nm->getAddress() != om->getAddress()) {
++				OSSafeReleaseNULL(nm);  /* (an overwrite map never deallocates on release) */
++				(*bad)++;
++				continue;
++			}
++			nm->fOptions &= ~(IOOptionBits)kIOMapOverwrite;  /* the new map owns the range: its release unmaps it */
++			om->fOptions |= kIOMapOverwrite;                  /* the old one must not unmap what is now nm's */
++			ref->data = nm;
++			om->release();
++			(*ok)++;
++		}
++		IOLockUnlock(c->fLock);
++	}
++	IOLockUnlock(sweet_clients_lock);
++}
++
++/* The decision inputs of a registry surface.  sweet_surface_lock held (gpu_busy filled by the caller, outside the lock). */
++static void
++sweet_reclaim_fill(SweetSurface *t, struct sweet_reclaim_cand *c)
++{
++	uint64_t pa = sweet_pool_surface_pa(t);
++	volatile uint32_t *w = sweet_use_words(t);
++	bzero(c, sizeof(*c));
++	c->pool = pa != 0 && t->kernelMap == NULL;
++	c->g0 = pa != 0 ? (uint32_t)((pa - SWEET_FB_HW_POOL_BASE) / SWEET_FB_HW_POOL_GRANULE) : 0;
++	c->ngran = pa != 0 ? sweet_fb_pool_granules(t->memory->getLength()) : 0;
++	c->born_at = t->bornAt;
++	c->shown_at = t->shownAt;
++	c->purgeable = t->purgeable;
++	c->w0 = w[0];
++	c->w1 = w[1];
++	c->kd = t->useKern[0];
++	c->kg = t->useKern[1];
++	c->imports = t->gpuImports;
++	c->creator = t->creator;
++}
++
++static uint32_t
++sweet_reclaim_verdict_now(const struct sweet_reclaim_cand *c, uint32_t now)
++{
++	return sweet_reclaim_verdict(c, now, __atomic_load_n(&sweet_pool_age, __ATOMIC_RELAXED), sweet_use_mode_now() == SWEET_USE_MODE_ALL,
++	           n2io_state == 1);
++}
++
++/* Evicted ranges whose grace is over go back to the pool.  sweet_pool_evict_lock held. */
++static void
++sweet_pool_reclaim_drain_locked(uint32_t now)
++{
++	for (uint32_t i = 0; i < SWEET_RECLAIM_PEND_MAX; i++) {
++		struct sweet_reclaim_pend_ent *e = &sweet_reclaim_pend[i];
++		if (e->s == NULL) {
++			continue;
++		}
++		int v = sweet_reclaim_grace(now, e->armed_at, __atomic_load_n(&sweet_pool_reclaim_grace_s, __ATOMIC_RELAXED), e->shown_at,
++		    e->s->shownAt, e->s->useKern[0], e->s->useKern[1], e->s->gpuImports, (uint32_t)e->old->getRetainCount());
++		if (v == SWEET_RECLAIM_REARM) {
++			e->armed_at = now;
++			e->shown_at = e->s->shownAt;
++		} else if (v == SWEET_RECLAIM_GIVE) {
++			OSSafeReleaseNULL(e->old);
++			sweet_pool_give(e->pa, e->len);
++			OSIncrementAtomic((volatile SInt32 *)&sweet_pool_reclaim_given);
++			IOLog("NORD2 FB POOL RECLAIM: surface %u: old range pa %#llx (%llu MiB) back in the pool (given %u)\n", e->s->id, e->pa,
++			    e->len >> 20, sweet_pool_reclaim_given);
++			OSSafeReleaseNULL(e->s);
++			__atomic_sub_fetch(&sweet_pool_reclaim_npend, 1, __ATOMIC_RELAXED);
++		}
++	}
++}
++
++static void
++sweet_pool_reclaim_drain(void)
++{
++	if (sweet_pool_evict_lock == NULL) {
++		return;
++	}
++	IOLockLock(sweet_pool_evict_lock);
++	sweet_pool_reclaim_drain_locked(sweet_surface_uptime());
++	IOLockUnlock(sweet_pool_evict_lock);
++}
++
++/* Move s out of the pool (verdict re-checked under sweet_surface_lock).  sweet_pool_evict_lock held. */
++static bool
++sweet_pool_evict_one(SweetSurface *s, uint32_t now)
++{
++	uint32_t slot = SWEET_RECLAIM_PEND_MAX;
++	for (uint32_t i = 0; i < SWEET_RECLAIM_PEND_MAX && slot == SWEET_RECLAIM_PEND_MAX; i++) {
++		slot = sweet_reclaim_pend[i].s == NULL ? i : slot;
++	}
++	if (slot == SWEET_RECLAIM_PEND_MAX || s->state == NULL) {
++		return false;
++	}
++	uint32_t size = s->allocSize;
++	if ((uint64_t)OSAddAtomic64(size, (volatile SInt64 *)&sweet_surface_wired) + size > SWEET_SURFACE_WIRED_MAX) {
++		OSAddAtomic64(-(SInt64)size, (volatile SInt64 *)&sweet_surface_wired);
++		return false;
++	}
++	IOBufferMemoryDescriptor *buf = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, size, page_size);
++	if (buf == NULL || buf->getLength() < size) {
++		OSSafeReleaseNULL(buf);
++		OSAddAtomic64(-(SInt64)size, (volatile SInt64 *)&sweet_surface_wired);
++		return false;
++	}
++	bzero(buf->getBytesNoCopy(), size);
++	bool busy = nord2_gpu_surface_busy(s);
++	struct sweet_reclaim_cand c;
++	IOLockLock(sweet_surface_lock);
++	sweet_reclaim_fill(s, &c);
++	c.gpu_busy = busy;
++	uint32_t v = sweet_reclaim_verdict_now(&c, now);
++	IOMemoryDescriptor *old = s->memory;
++	uint64_t pa = sweet_pool_surface_pa(s), len = old != NULL ? old->getLength() : 0;
++	if (v != SWEET_RECLAIM_OK || pa == 0 || len < size) {
++		IOLockUnlock(sweet_surface_lock);
++		buf->release();
++		OSAddAtomic64(-(SInt64)size, (volatile SInt64 *)&sweet_surface_wired);
++		return false;
++	}
++	s->memory = buf;                        /* the reference moves from buf to s; old's moves to the pending record */
++	s->mapCache = kIOMapDefaultCache;       /* as every normal-memory surface */
++	s->purgeable = SWEET_PURGEABLE_EMPTY;   /* the next IOSurfaceSetPurgeable answers Empty: the client redraws */
++	(void)sweet_pool_reg_remove(&sweet_pool_reg, s);
++	IOLockUnlock(sweet_surface_lock);
++	OSIncrementAtomic((volatile SInt32 *)&sweet_surface_buffers);
++	s->retain();
++	struct sweet_reclaim_pend_ent e = { s, old, pa, len, now, s->shownAt };
++	sweet_reclaim_pend[slot] = e;
++	__atomic_add_fetch(&sweet_pool_reclaim_npend, 1, __ATOMIC_RELAXED);
++	uint32_t ok = 0, bad = 0;
++	sweet_pool_evict_remap(s, old, buf, &ok, &bad);
++	OSIncrementAtomic((volatile SInt32 *)&sweet_pool_evicted);
++	if (bad != 0) {
++		OSAddAtomic((SInt32)bad, (volatile SInt32 *)&sweet_pool_remap_failed);
++	}
++	char name[32] = "kernel";
++	if (s->creator > 0) {
++		proc_name(s->creator, name, sizeof(name));
++	}
++	IOLog("NORD2 FB POOL RECLAIM: evicted surface %u by %s[%d] (volatile, idle, last swap %s%u s ago): pa %#llx %u MiB -> normal memory, "
++	    "%u client mapping(s) remapped%s%u, range back after %u s grace (evicted %u)\n", s->id, name, s->creator, s->shownAt ? "" : "never; made ",
++	    now - (s->shownAt ? s->shownAt : s->bornAt), pa, size >> 20, ok, bad ? ", LEFT ON THE OLD RANGE (kept out of the pool): " : ", failed ",
++	    bad, sweet_pool_reclaim_grace_s, sweet_pool_evicted);
++	return true;
++}
++
++/* Pool full for bytes (client create, no lock held): decide (mode 1: log only), evict (mode 2).  At most one pass a second. */
++static void
++sweet_pool_reclaim(uint64_t bytes)
++{
++	static SweetSurface *cs[SWEET_POOL_REG_MAX];
++	static struct sweet_reclaim_cand cand[SWEET_POOL_REG_MAX];
++	static uint32_t verdict[SWEET_POOL_REG_MAX], victims[8];
++	static struct sweet_fb_pool sim;
++	static const char *why_name[SWEET_RECLAIM_NREASONS] = { "evictable", "not pool", "kernel", "use mode < 2", "iommu", "young", "active",
++		                                                "non-volatile", "in use", "display", "gpu job", "gpu import", "gpu busy", "pending" };
++	int mode = __atomic_load_n(&sweet_pool_reclaim_mode, __ATOMIC_RELAXED);
++	uint32_t now = sweet_surface_uptime();
++	if (mode <= SWEET_POOL_RECLAIM_OFF || sweet_pool_evict_lock == NULL || sweet_pool_state != 1 || sweet_surface_lock == NULL ||
++	    now == __atomic_load_n(&sweet_pool_reclaim_at, __ATOMIC_RELAXED)) {
++		return;
++	}
++	IOLockLock(sweet_pool_evict_lock);
++	__atomic_store_n(&sweet_pool_reclaim_at, now, __ATOMIC_RELAXED);
++	sweet_pool_reclaim_passes++;
++	sweet_pool_reclaim_drain_locked(now);
++	uint32_t n = 0, counts[SWEET_RECLAIM_NREASONS] = { 0 }, mib[SWEET_RECLAIM_NREASONS] = { 0 };
++	IOLockLock(sweet_surface_lock);
++	for (uint32_t i = 0; i < SWEET_POOL_REG_MAX && n < SWEET_POOL_REG_MAX; i++) {
++		SweetSurface *t = (SweetSurface *)sweet_pool_reg.s[i];
++		if (t == NULL || t->state == NULL || t->memory == NULL) {
++			continue;
++		}
++		t->retain();
++		cs[n] = t;
++		sweet_reclaim_fill(t, &cand[n]);
++		n++;
++	}
++	IOLockUnlock(sweet_surface_lock);
++	for (uint32_t i = 0; i < n; i++) {
++		cand[i].gpu_busy = nord2_gpu_surface_busy(cs[i]);
++		verdict[i] = sweet_reclaim_verdict_now(&cand[i], now);
++		counts[verdict[i]]++;
++		mib[verdict[i]] += cs[i]->allocSize >> 20;
++	}
++	IOSimpleLockLock(sweet_pool_spin);
++	sim = sweet_pool;
++	IOSimpleLockUnlock(sweet_pool_spin);
++	uint32_t pend_mib = 0;
++	for (uint32_t i = 0; i < SWEET_RECLAIM_PEND_MAX; i++) {
++		if (sweet_reclaim_pend[i].s != NULL) {
++			sweet_reclaim_clear(&sim, (uint32_t)((sweet_reclaim_pend[i].pa - SWEET_FB_HW_POOL_BASE) / SWEET_FB_HW_POOL_GRANULE),
++			    sweet_fb_pool_granules(sweet_reclaim_pend[i].len));
++			pend_mib += (uint32_t)(sweet_reclaim_pend[i].len >> 20);
++		}
++	}
++	bool fits_now = false;
++	uint32_t k = sweet_reclaim_pick(&sim, cand, verdict, n, bytes, victims, 8, &fits_now);
++	uint32_t told = sweet_pool_reclaim_told++;
++	if (told < 16 || (told % 32) == 0) {
++		char line[400];
++		int off = 0;
++		for (uint32_t r = 0; r < SWEET_RECLAIM_NREASONS && off < (int)sizeof(line) - 40; r++) {
++			if (counts[r] != 0) {
++				off += snprintf(line + off, sizeof(line) - (size_t)off, "%s%s %u (%u MiB)", off ? ", " : "", why_name[r], counts[r], mib[r]);
++			}
++		}
++		IOLog("NORD2 FB POOL RECLAIM: pool full for %llu bytes (mode %d, pass %u): %u pool surfaces: %s; pending %u MiB; %s\n", bytes, mode,
++		    sweet_pool_reclaim_passes, n, off ? line : "none", pend_mib,
++		    fits_now ? "fits once the pending ranges are back" : k ? (mode >= SWEET_POOL_RECLAIM_EVICT ? "evicting" : "would evict (mode 1)") :
++		    "no eviction makes it fit");
++	}
++	for (uint32_t i = 0; i < k; i++) {
++		if (mode >= SWEET_POOL_RECLAIM_EVICT) {
++			(void)sweet_pool_evict_one(cs[victims[i]], now);
++		} else if (told < 16) {
++			IOLog("NORD2 FB POOL RECLAIM:   would evict surface %u (%u MiB, last swap %s%u s ago)\n", cs[victims[i]]->id,
++			    cs[victims[i]]->allocSize >> 20, cand[victims[i]].shown_at ? "" : "never; made ",
++			    now - sweet_reclaim_last_use(&cand[victims[i]]));
++		}
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		cs[i]->release();
++	}
++	IOLockUnlock(sweet_pool_evict_lock);
++}
++
+ static void
+ sweet_clients_init_lock(void)
+ {
+@@ -1194,7 +1489,31 @@
+ 	ref->surface = s;
+ 	ref->count = 1;
+ 	ref->pid = fPid;        /* 0398 */
+-	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
++	/*
++	 * 0406: s->memory can be swapped by an eviction (under sweet_surface_lock): map a retained snapshot and map again if it changed
++	 * meanwhile.  A mapping of the old range that still slips through only keeps that range out of the pool (the old descriptor's
++	 * retain count gates its return), it never aliases another surface.
++	 */
++	for (uint32_t tries = 0; ref->data == NULL && tries < 3; tries++) {
++		IOLockLock(sweet_surface_lock);
++		IOMemoryDescriptor *mem = s->memory;
++		IOOptionBits cache = s->mapCache;
++		if (mem != NULL) {
++			mem->retain();
++		}
++		IOLockUnlock(sweet_surface_lock);
++		if (mem == NULL) {
++			break;
++		}
++		ref->data = mem->createMappingInTask(fTask, 0, kIOMapAnywhere | cache);
++		IOLockLock(sweet_surface_lock);
++		bool moved = s->memory != mem;
++		IOLockUnlock(sweet_surface_lock);
++		mem->release();
++		if (moved && tries < 2) {
++			OSSafeReleaseNULL(ref->data);
++		}
++	}
+ 	ref->state = s->state->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly);
+ 	if (ref->data == NULL || ref->state == NULL) {
+ 		ref->release();
+@@ -1368,7 +1687,7 @@
+ 			}
+ 		}
+ 		s->creator = fPid;
+-		pooled = why == SWEET_FB_POOL_OK && admit && sweet_pool_attach(s);
++		pooled = why == SWEET_FB_POOL_OK && admit && sweet_pool_attach(s, true);
+ 	}
+ 	if (pooled) {
+ 		OSNumber *client = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
+@@ -1553,9 +1872,15 @@
+ 		if (s == NULL) {
+ 			return args->scalarInputCount >= 2 ? kIOReturnNotFound : kIOReturnBadArgument;
+ 		}
++		if (sweet_pool_evict_lock != NULL) {
++			IOLockLock(sweet_pool_evict_lock);     /* 0406: not in the middle of an eviction of s */
++		}
+ 		IOLockLock(sweet_surface_lock);
+ 		uint32_t old = sweet_purgeable_update(&s->purgeable, (uint32_t)args->scalarInput[1]);
+ 		IOLockUnlock(sweet_surface_lock);
++		if (sweet_pool_evict_lock != NULL) {
++			IOLockUnlock(sweet_pool_evict_lock);
++		}
+ 		if (args->scalarOutputCount >= 1) {
+ 			args->scalarOutput[0] = old;
+ 			args->scalarOutputCount = 1;
+@@ -1653,7 +1978,7 @@
+  * framebuffer swap sets, GPU import buffers, GPU job holds), the descriptor's retain count, use counts.  Expected after closing apps:
+  * pool used MiB back to backboardd's own framebuffers (3-4 x 10.7 MiB) plus the drawables of the app on screen.
+  */
+-struct sweet_pool_row { uint32_t id, age, shown_ago, shown, users, retains, w0, w1, kd, kg, imports; int32_t creator; int cls; bool table; };
++struct sweet_pool_row { uint32_t id, age, shown_ago, shown, users, retains, w0, w1, kd, kg, imports, purgeable, verdict; int32_t creator; int cls; bool table; };
+ 
+ static void
+ sweet_pool_leak_report(const char *why, bool dump)
+@@ -1676,9 +2001,12 @@
+ 		gpu_held += t->gpuImports != 0;
+ 		if ((dump || c >= SWEET_POOL_STALE || !table) && n < 16) {
+ 			volatile uint32_t *w = sweet_use_words(t);
++			struct sweet_reclaim_cand rc;   /* 0406: the eviction verdict (GPU busy not asked here) */
++			sweet_reclaim_fill(t, &rc);
+ 			struct sweet_pool_row r = { t->id, now - t->bornAt, t->shownAt ? now - t->shownAt : 0, t->shownCount,
+ 				                    table ? sweet_surface_users[t->id] : 0, t->memory ? (uint32_t)t->memory->getRetainCount() : 0,
+-				                    w[0], w[1], t->useKern[0], t->useKern[1], t->gpuImports, t->creator, c, table };
++				                    w[0], w[1], t->useKern[0], t->useKern[1], t->gpuImports, t->purgeable,
++				                    sweet_reclaim_verdict_now(&rc, now), t->creator, c, table };
+ 			rows[n++] = r;
+ 		}
+ 	}
+@@ -1700,9 +2028,10 @@
+ 			snprintf(shown, sizeof(shown), "never");
+ 		}
+ 		IOLog("NORD2 FB POOL:   id %u by %s[%d] %s: age %u s, last swap %s (%u swaps); holders: mappings %u%s, descriptor retains %u, "
+-		    "use %u/%u, display %u, gpu jobs %u, gpu imports %u\n", rows[i].id, name, rows[i].creator, cls_name[rows[i].cls], rows[i].age,
++		    "use %u/%u, display %u, gpu jobs %u, gpu imports %u; purgeable %u, reclaim verdict %u (0 = evictable)\n", rows[i].id, name,
++		    rows[i].creator, cls_name[rows[i].cls], rows[i].age,
+ 		    shown, rows[i].shown, rows[i].users, rows[i].table ? "" : " (OUT OF THE ID TABLE: kernel references only)", rows[i].retains,
+-		    rows[i].w0, rows[i].w1, rows[i].kd, rows[i].kg, rows[i].imports);
++		    rows[i].w0, rows[i].w1, rows[i].kd, rows[i].kg, rows[i].imports, rows[i].purgeable, rows[i].verdict);
+ 	}
+ }
+ 
+@@ -1722,6 +2051,9 @@
+ 	}
+ 	/* the pool report also when the pool refused a creation since the last one (at most every 15 s) */
+ 	bool pool_full = sweet_pool_state == 1 && sweet_pool_full != sweet_pool_report_full && now - sweet_pool_report_at >= 15;
++	if (__atomic_load_n(&sweet_pool_reclaim_npend, __ATOMIC_RELAXED) != 0) {
++		sweet_pool_reclaim_drain();     /* 0406: evicted ranges come back even when nothing is being created (trap context, no lock) */
++	}
+ 	if ((why == NULL && !pool_full) || !OSCompareAndSwap(0, 1, &sweet_use_reporting)) {
+ 		return;
+ 	}
+--- /dev/null
++++ b/iokit/Kernel/arm/sweet_fb_pool_reclaim.h
+@@ -0,0 +1,164 @@
++/*
++ * 0406 (poolreclaim-20261114): give display-pool ranges of idle, VOLATILE pool surfaces back while their holders keep them.
++ * SPDX-License-Identifier: MIT
++ *
++ * Why the pool stays full (night18, q10jgb mode 3, 23 surfaces / 247 of 256 MiB for an hour, not one "free pa"): a pool range goes
++ * back only in SweetSurface::free(), at the last retain.  Every leak candidate still has a CLIENT MAPPING (SweetSurfaceRef in some
++ * process's fRefs: "mappings 1-2"; "descriptor retains" = the surface's own reference + one IOMemoryMap per mapping).  The holders are
++ * backboardd (its own never-shown 1125x2436 surfaces, and lookups of app drawables: SubwaySurf ids 161..163 are still mapped 40 min
++ * after SubwaySurf died) and MobileSlideShow.  These are not kernel leaks: those processes can still read or write the pixels at the
++ * address the lock result gave them, so the range cannot be freed or handed to another surface, and the kernel may not copy it.
++ *
++ * What IOSurface allows: a surface marked kIOSurfacePurgeableVolatile (IOSurfaceSetPurgeable, sweet_surface_abi.h) has contents the
++ * holders said may be thrown away; the next SetPurgeable answers kIOSurfacePurgeableEmpty and the client redraws.  So 0406 EVICTS
++ * only such surfaces: same user addresses, new zeroed normal memory behind them (kIOMapOverwrite remap of every client mapping), state
++ * Empty, and the old pool range goes back after a grace period once nothing can still reach it.  No pixel is copied.
++ *
++ * Pure: no IOKit; the kernel (SweetSurface.cpp) and the host test (poolreclaim-20261114/test/reclaim_host_test.c) share it.
++ */
++#ifndef SWEET_FB_POOL_RECLAIM_H
++#define SWEET_FB_POOL_RECLAIM_H
++#include "sweet_fb_hw_pool_alloc.h"
++
++/* kern.n2fbhw_pool_reclaim: 0 off, 1 decide and log only (default: same behaviour as q10jgb), 2 evict volatile idle surfaces */
++enum { SWEET_POOL_RECLAIM_OFF = 0, SWEET_POOL_RECLAIM_REPORT = 1, SWEET_POOL_RECLAIM_EVICT = 2 };
++
++#define SWEET_PURGEABLE_NONVOLATILE     0u      /* kIOSurfacePurgeableNonVolatile */
++#define SWEET_PURGEABLE_VOLATILE        1u      /* kIOSurfacePurgeableVolatile */
++#define SWEET_PURGEABLE_EMPTY           2u      /* kIOSurfacePurgeableEmpty: what the next SetPurgeable answers after an eviction */
++
++/* Why a pool surface may (0) or may not be evicted now; first matching reason wins (index into the per-reason counters). */
++enum {
++	SWEET_RECLAIM_OK = 0,
++	SWEET_RECLAIM_NO_POOL,          /* not (or no longer) a pool surface */
++	SWEET_RECLAIM_NO_KERNEL,        /* made by the kernel (H2 test patterns, panel): never */
++	SWEET_RECLAIM_NO_MODE,          /* kern.n2surfuse < 2: display / GPU holds are not counted, idleness cannot be proven */
++	SWEET_RECLAIM_NO_IOMMU,         /* display IOMMU active (0401): it may hold a translation of the old pages */
++	SWEET_RECLAIM_NO_YOUNG,         /* younger than the age limit */
++	SWEET_RECLAIM_NO_ACTIVE,        /* named in a swap within the age limit */
++	SWEET_RECLAIM_NO_NONVOLATILE,   /* contents still wanted (purgeable state != volatile) */
++	SWEET_RECLAIM_NO_USE,           /* IOSurfaceIsInUse: a use-count word != 0 (user holds, or the display / GPU in category 0) */
++	SWEET_RECLAIM_NO_DISPLAY,       /* a swap holds it (scanout until FRAME_DONE) */
++	SWEET_RECLAIM_NO_GPU_JOB,       /* a GPU job lists it */
++	SWEET_RECLAIM_NO_GPU_IMPORT,    /* a GPU import buffer maps its pages (GPU MMU) */
++	SWEET_RECLAIM_NO_GPU_BUSY,      /* nord2_gpu_surface_busy: a job that writes it has not finished */
++	SWEET_RECLAIM_NO_PENDING,       /* already evicted, old range waiting for its grace */
++	SWEET_RECLAIM_NREASONS
++};
++
++struct sweet_reclaim_cand {
++	uint32_t born_at, shown_at;     /* uptime seconds; shown_at 0 = never named in a swap */
++	uint32_t purgeable;             /* SWEET_PURGEABLE_* */
++	uint32_t w0, w1;                /* use-count words (state page +0x18 / +0x1c) */
++	uint32_t kd, kg, imports;       /* display holds, GPU job holds, GPU import buffers */
++	int32_t  creator;               /* pid, 0 = kernel */
++	bool     pool, gpu_busy, pending;
++	uint32_t g0, ngran;             /* its granules in the pool bitmap */
++};
++
++static inline uint32_t
++sweet_reclaim_verdict(const struct sweet_reclaim_cand *c, uint32_t now, uint32_t age_limit, bool use_mode_all, bool iommu_on)
++{
++	if (!c->pool || c->ngran == 0) return SWEET_RECLAIM_NO_POOL;
++	if (c->pending) return SWEET_RECLAIM_NO_PENDING;
++	if (c->creator <= 0) return SWEET_RECLAIM_NO_KERNEL;
++	if (!use_mode_all) return SWEET_RECLAIM_NO_MODE;
++	if (iommu_on) return SWEET_RECLAIM_NO_IOMMU;
++	if (age_limit == 0) age_limit = 1;
++	if (now - c->born_at < age_limit) return SWEET_RECLAIM_NO_YOUNG;
++	if (c->shown_at != 0 && now - c->shown_at < age_limit) return SWEET_RECLAIM_NO_ACTIVE;
++	if (c->purgeable != SWEET_PURGEABLE_VOLATILE) return SWEET_RECLAIM_NO_NONVOLATILE;
++	if (c->w0 != 0 || c->w1 != 0) return SWEET_RECLAIM_NO_USE;
++	if (c->kd != 0) return SWEET_RECLAIM_NO_DISPLAY;
++	if (c->kg != 0) return SWEET_RECLAIM_NO_GPU_JOB;
++	if (c->imports != 0) return SWEET_RECLAIM_NO_GPU_IMPORT;
++	if (c->gpu_busy) return SWEET_RECLAIM_NO_GPU_BUSY;
++	return SWEET_RECLAIM_OK;
++}
++
++/* Least recently used first: last swap, or the creation for a never-shown surface. */
++static inline uint32_t
++sweet_reclaim_last_use(const struct sweet_reclaim_cand *c)
++{
++	return c->shown_at != 0 ? c->shown_at : c->born_at;
++}
++
++static inline void
++sweet_reclaim_clear(struct sweet_fb_pool *p, uint32_t g0, uint32_t n)
++{
++	for (uint32_t k = g0; k < g0 + n && k < SWEET_FB_POOL_NGRAN; k++) {
++		p->bits[k >> 6] &= ~(1ull << (k & 63));
++	}
++}
++
++/* Is there a first-fit run of n free granules (what sweet_fb_pool_alloc would find)? */
++static inline bool
++sweet_reclaim_fits(const struct sweet_fb_pool *p, uint32_t n)
++{
++	uint32_t run = 0;
++	for (uint32_t g = 0; g < SWEET_FB_POOL_NGRAN; g++) {
++		run = sweet_fb_pool_test(p, g) ? 0 : run + 1;
++		if (run >= n) return true;
++	}
++	return false;
++}
++
++/*
++ * Pick LRU victims (oldest first, then the ones the fit does not need are dropped again) among the candidates with verdict[i] == SWEET_RECLAIM_OK so that an allocation of need_bytes fits.
++ * sim = a copy of the pool bitmap, already with the ranges of pending evictions cleared (they come back after their grace); it is
++ * modified.  out[] receives candidate indices (at most out_cap).  Returns the number of victims; 0 when it already fits OR when even
++ * evicting every allowed candidate would not make it fit (then nothing is evicted for nothing).  *fits_now tells the two apart.
++ */
++static inline uint32_t
++sweet_reclaim_pick(struct sweet_fb_pool *sim, const struct sweet_reclaim_cand *c, const uint32_t *verdict, uint32_t n,
++    uint64_t need_bytes, uint32_t *out, uint32_t out_cap, bool *fits_now)
++{
++	uint32_t need = sweet_fb_pool_granules(need_bytes), k = 0;
++	*fits_now = need != 0 && need <= SWEET_FB_POOL_NGRAN && sweet_reclaim_fits(sim, need);
++	if (*fits_now || need == 0 || need > SWEET_FB_POOL_NGRAN) return 0;
++	uint8_t taken[256] = { 0 };
++	if (n > 256) n = 256;
++	while (k < out_cap) {
++		int best = -1;
++		for (uint32_t i = 0; i < n; i++) {
++			if (verdict[i] != SWEET_RECLAIM_OK || taken[i]) continue;
++			if (best < 0 || sweet_reclaim_last_use(&c[i]) < sweet_reclaim_last_use(&c[best])) best = (int)i;
++		}
++		if (best < 0) return 0;         /* ran out of victims without a fit: evict none */
++		taken[best] = 1;
++		out[k++] = (uint32_t)best;
++		sweet_reclaim_clear(sim, c[best].g0, c[best].ngran);
++		if (sweet_reclaim_fits(sim, need)) {
++			/* prune: an earlier (older) victim whose range the fit does not need stays (its granules set again) */
++			uint32_t kept = 0;
++			for (uint32_t i = 0; i < k; i++) {
++				uint32_t g0 = c[out[i]].g0, ng = c[out[i]].ngran;
++				for (uint32_t g = g0; g < g0 + ng && g < SWEET_FB_POOL_NGRAN; g++) sim->bits[g >> 6] |= 1ull << (g & 63);
++				if (i + 1 < k && sweet_reclaim_fits(sim, need)) continue;       /* not needed: dropped */
++				sweet_reclaim_clear(sim, g0, ng);
++				out[kept++] = out[i];
++			}
++			return kept;
++		}
++	}
++	return 0;
++}
++
++/*
++ * An evicted surface's OLD pool range (kept, with its descriptor, after the swap) may go back to the pool when: the grace has passed
++ * since the eviction (or since the last re-arm), no display hold, GPU job hold or GPU import is left on the surface, no swap named it
++ * since (a swap that resolved the old address just before the swap would show up here), and the old descriptor is held by nobody but
++ * the eviction record (old_retains == 1: no IOMemoryMap of the old range is left in any task, no reader holds it).
++ */
++enum { SWEET_RECLAIM_WAIT = 0, SWEET_RECLAIM_REARM = 1, SWEET_RECLAIM_GIVE = 2 };
++
++static inline int
++sweet_reclaim_grace(uint32_t now, uint32_t armed_at, uint32_t grace, uint32_t shown_at_armed, uint32_t shown_at_now,
++    uint32_t kd, uint32_t kg, uint32_t imports, uint32_t old_retains)
++{
++	if (shown_at_now != shown_at_armed) return SWEET_RECLAIM_REARM;
++	if (kd != 0 || kg != 0 || imports != 0 || old_retains != 1) return SWEET_RECLAIM_WAIT;
++	if (grace == 0) grace = 1;
++	return now - armed_at >= grace ? SWEET_RECLAIM_GIVE : SWEET_RECLAIM_WAIT;
++}
++#endif /* SWEET_FB_POOL_RECLAIM_H */

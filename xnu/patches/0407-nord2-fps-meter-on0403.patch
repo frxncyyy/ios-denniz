@@ -1,0 +1,372 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -44,6 +44,7 @@
+ #include "sweet_fb_hw.h"              /* 0396 */
+ #include "sweet_fb_pace.h"            /* 0397 */
+ #include "sweet_fb_iommu.h"           /* 0401 IOMMU */
++#include "sweet_fb_fpsmeter.h"         /* 0407: HW-frame content clock (measurement only) */
+ 
+ /*
+  * 0397 (fbpace-20261112): keep the panel at 90 Hz and measure the present pacing.
+@@ -343,6 +344,8 @@
+ 	uint64_t            fHashLast, fDistinctLastUs, fDistinctGapMaxUs;
+ 	uint32_t            fDistinct, fSame, fGapBin[5];
+ 	bool                fHashHave;
++	struct sweet_fb_fps fFps;                 /* 0407: content clock of HW frames + per-client fresh frames (present thread) */
++	uint64_t            fFpsWinUs;
+ 	volatile uint32_t  *fDsi, *fMutex;       /* panel transfer registers (NORD2) */
+ 	bool                fNbReady;            /* the blocking path has run once: overlay removed, ownership taken */
+ 	struct sweet_fb_present_stats fStats;
+@@ -361,6 +364,7 @@
+ 	void        prepNext(void);
+ 	void        dropNext(void);
+ 	void        noteDistinct(uintptr_t dst);
++	void        noteHwGen(int cls);      /* 0407 */
+ 	bool        xferStart(void);
+ 	bool        xferDone(void);
+ 	/* SwapWait / swap retirement (boot-arg n2swait, sweet_fb_swapwait.h).  fRetire, fLateSurfaces: fLock. */
+@@ -692,6 +696,7 @@
+ 	IOLog("SWEET FB: layer composition %s (0390)\n", sweet_fb_blend_mode ? "on" : "off (n2fbblend=0)");
+ 	sweet_fb_pending_surfaces_init(&fHwHeld);       /* 0396 */
+ 	bzero(&fHwSt, sizeof(fHwSt)); fHwInitDone = fHwInitOk = fHwOn = fWorkHw = false; fHwN = 0; fHwTestMem = NULL; fHwTestMap = NULL;
++	bzero(&fFps, sizeof(fFps)); fFpsWinUs = 0;      /* 0407 */
+ 	IOLog("NORD2 FB HW: overlay composition (0396) mode %u at boot (sysctl kern.n2fbhw 0 off / 1 dry / 2 single / 3 two layers; kern.n2fbhwtest 1..6, kern.n2fbhwcsw)\n",
+ 	    sweet_fb_hw_mode);
+ 	uint32_t hz = SWEET_FB_DEFAULT_HZ;
+@@ -1003,6 +1008,22 @@
+ 	fHashLast = h; fHashHave = true;
+ }
+ 
++/* 0407: a HW frame that shows re-rendered (or older) GPU content is a picture change for the FB SEEN / FB CADENCE gap histograms,
++ * which the CPU-copy hash (noteDistinct) cannot feed in modes 2/3.  The different/same counts stay CPU-copy only. */
++void
++AppleCLCD::noteHwGen(int cls)
++{
++	if (cls != SWEET_FB_FPS_NEW && cls != SWEET_FB_FPS_BACK) { return; }
++	uint64_t nowUs = sweet_fb_abs_to_us(mach_absolute_time());
++	if (fDistinctLastUs) {
++		uint64_t gap = nowUs - fDistinctLastUs;
++		if (gap > fDistinctGapMaxUs) { fDistinctGapMaxUs = gap; }
++		fGapBin[gap <= 20000 ? 0 : gap <= 34000 ? 1 : gap <= 67000 ? 2 : gap <= 100000 ? 3 : 4]++;
++		fCad[gap <= 12500 ? 0 : gap <= 15000 ? 1 : gap <= 19000 ? 2 : gap <= 28000 ? 3 : 4]++;
++	}
++	fDistinctLastUs = nowUs;
++}
++
+ /* 0156: drop a taken-but-unpresented frame (power off, stop). */
+ void
+ AppleCLCD::dropNext(void)
+@@ -1320,6 +1341,7 @@
+ 		fb->fCopyUs = wasPrepared ? fb->fPrepCopyUs : (hw > 0 ? 0 : sweet_fb_abs_to_us(t1 - t0));
+ 		if (!shown) { fb->presentDone(false, false, false); return; }
+ 		if (!wasPrepared && hw == 0) { fb->noteDistinct(fb->fCopyDst ? fb->fCopyDst : fb->fPixels); }
++		if (hw == 0) { sweet_fb_fps_break(&fb->fFps); }      /* 0407: a CPU frame in between: the next HW frame is not compared with an older one */
+ 		fb->fCopyDst = 0;
+ #if defined(NORD2)
+ 		if (hw == 0 && fb->fHwOn) {
+@@ -1926,8 +1948,24 @@
+ 		IOLog("NORD2 FB WAITS: gpu_waits=%u ok=%u avg_us=%llu te_waits=%u te_miss=%u te_avg_us=%llu te_max_us=%u panel_hz=%u mode=%u link=%u\n", fStats.busy_waits, fStats.busy_wait_ok,
+ 		    fStats.busy_waits ? fStats.busy_wait_us / fStats.busy_waits : 0ULL, fStats.te_waits, fStats.te_miss,
+ 		    fStats.te_waits ? fStats.te_wait_us / fStats.te_waits : 0ULL, fStats.te_wait_max, fPanelHz, fModeState, fRetuneState);
+-		IOLog("NORD2 FB SEEN: presents=%u different=%u same=%u gaps_ms<=20/34/67/100/more=%u/%u/%u/%u/%u max_gap_ms=%llu\n", fStats.n, fDistinct, fSame,
+-		    fGapBin[0], fGapBin[1], fGapBin[2], fGapBin[3], fGapBin[4], fDistinctGapMaxUs / 1000);
++		{   /* 0407: different/same = CPU-copy hash; hw_* = overlay frames by content clock; the gaps include both */
++			static char fs[96], fc[400];      /* present thread only */
++			(void)sweet_fb_fps_format_seen(&fFps, fs, sizeof(fs));
++			IOLog("NORD2 FB SEEN: presents=%u different=%u same=%u gaps_ms<=20/34/67/100/more=%u/%u/%u/%u/%u max_gap_ms=%llu %s\n", fStats.n, fDistinct, fSame,
++			    fGapBin[0], fGapBin[1], fGapBin[2], fGapBin[3], fGapBin[4], fDistinctGapMaxUs / 1000, fs);
++			uint64_t win = fFpsWinUs && now_us > fFpsWinUs ? now_us - fFpsWinUs : 0;
++			size_t o = 0; fc[0] = 0;
++			for (unsigned k = 0; k < SWEET_FB_FPS_CLIENTS && fFps.cl[k].shown != 0 && o < sizeof(fc) - 80; k++) {
++				char name[24] = "kernel";
++				if (fFps.cl[k].pid > 0) { proc_name(fFps.cl[k].pid, name, sizeof(name)); }
++				int w = sweet_fb_fps_format_client(&fFps.cl[k], name, win, fc + o, sizeof(fc) - o);
++				if (w > 0) { o += (size_t)w; if (o < sizeof(fc) - 3) { fc[o++] = ' '; fc[o++] = '|'; fc[o++] = ' '; fc[o] = 0; } }
++			}
++			if (fFps.cl[0].shown != 0 && win != 0) {
++				IOLog("NORD2 FB CLIENT: win_ms=%llu %sother shown=%u fresh=%u\n", win / 1000, fc, fFps.other_shown, fFps.other_fresh);
++			}
++			sweet_fb_fps_window_reset(&fFps); fFpsWinUs = now_us;
++		}
+ 		IOLog("NORD2 FB CADENCE: distinct_gaps_ms<=12.5/15/19/28/more=%u/%u/%u/%u/%u dbl=%u preps=%u hits=%u te_lead_starts=%u te_period_us=%llu\n", fCad[0], fCad[1], fCad[2], fCad[3], fCad[4],
+ 		    fDbl ? 1u : 0u, fStats.dbl_preps, fStats.dbl_hits, fStats.te_lead_starts, fTePeriodUs);
+ 		IOLog("NORD2 FB LOCK: te_period_us=%llu tw_min_us=%llu safe_starts=%u deferred=%u ready_phase_early/in/late=%u/%u/%u ctl_err_ema_us=%lld tick_shift_us=%lld period_abs_us=%llu\n", fTePeriodUs, fTwMinUs, fSafeStarts, fDzWaits,
+@@ -2302,6 +2340,12 @@
+ 	fHwPlan = p;
+ 	fHwSt.planned++;
+ 	if (fHwSt.plans_logged < 8) { fHwSt.plans_logged++; sweet_fb_hw_log_plan(mode == SWEET_FB_HW_SINGLE ? "single" : "dual", get32(fWorkRec, 0x50), &p); }
++	{   /* 0407: content clock of this HW frame (measurement only: the seqs were read above, no extra GPU-driver call) */
++		int32_t cpid[SWEET_FB_HW_MAX_IN];
++		unsigned m = n < SWEET_FB_HW_SLOTS ? n : SWEET_FB_HW_SLOTS;      /* 0407-on0403: fHwSeq has SWEET_FB_HW_SLOTS entries without 0402 */
++		for (unsigned i = 0; i < m; i++) { cpid[i] = ss[i] != NULL ? ss[i]->creator : 0; }
++		noteHwGen(sweet_fb_fps_note(&fFps, m, ids, fHwSeq, cpid));
++	}
+ 	return 1;
+ }
+ 
+--- a/iokit/Kernel/arm/sweet_fb_fpsmeter.h
++++ b/iokit/Kernel/arm/sweet_fb_fpsmeter.h
+@@ -0,0 +1,107 @@
++/* 0407 (fpsmeter-20261114): what the panel really shows when the overlay composes (mode 2/3), measurement only.
++ * SPDX-License-Identifier: MIT
++ *
++ * The overlay path never copies pixels, so the CPU-copy hash of FB SEEN (noteDistinct) does not run there.  Instead every HW frame
++ * is classified by a content clock: Nord2GPU job ids are one device-wide, strictly increasing counter, and
++ * nord2_gpu_surface_write_seq(id) is the id of the newest job that wrote the surface.  Per planner slot i (layer order of the plan)
++ * the pair (surface id, write seq) of this frame is compared with the previous HW frame's pair in the same slot:
++ *   back  some slot shows OLDER GPU content than the slot showed before (seq lower): the picture goes back in time;
++ *   new   otherwise, some slot shows a newer seq (a GPU job wrote the shown pixels since the last frame);
++ *   unk   otherwise, some slot changed surface but no GPU write is known for it (seq 0: CPU-drawn surface): cannot tell;
++ *   same  nothing changed in any slot: the same pixels are scanned out again.
++ * A different slot count (layout change) counts as new.  "new" means "re-rendered", not "visibly different": an app that draws the
++ * same picture again still counts as new (the per-client figure below says WHO re-rendered).
++ * Per client (creator pid of the shown surface): frames on which that client's layer was shown and on which it was fresh (its slot
++ * changed id or seq) -- the game's own visible frame rate next to backboardd's.  Pure logic, no locks: present thread only. */
++#ifndef SWEET_FB_FPSMETER_H
++#define SWEET_FB_FPSMETER_H
++#ifndef KERNEL
++#include <stdint.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdio.h>
++#endif
++
++#define SWEET_FB_FPS_SLOTS      6u          /* = SWEET_FB_HW_MAX_IN */
++#define SWEET_FB_FPS_CLIENTS    4u          /* distinct creator pids kept per window; more go to "other" */
++
++enum { SWEET_FB_FPS_SAME = 0, SWEET_FB_FPS_NEW = 1, SWEET_FB_FPS_UNK = 2, SWEET_FB_FPS_BACK = 3 };
++
++struct sweet_fb_fps_client { int32_t pid; uint32_t shown, fresh; };
++
++struct sweet_fb_fps {
++	/* previous HW frame (kept across windows) */
++	uint32_t last_n, last_id[SWEET_FB_FPS_SLOTS];
++	uint64_t last_seq[SWEET_FB_FPS_SLOTS];
++	/* this window */
++	uint32_t n_new, n_same, n_back, n_unk;
++	struct sweet_fb_fps_client cl[SWEET_FB_FPS_CLIENTS];
++	uint32_t other_shown, other_fresh;
++};
++
++static inline void
++sweet_fb_fps_client_note(struct sweet_fb_fps *f, int32_t pid, int fresh)
++{
++	for (unsigned k = 0; k < SWEET_FB_FPS_CLIENTS; k++) {
++		struct sweet_fb_fps_client *c = &f->cl[k];
++		if (c->shown == 0) { c->pid = pid; }
++		if (c->pid == pid) { c->shown++; c->fresh += fresh ? 1u : 0u; return; }
++	}
++	f->other_shown++; f->other_fresh += fresh ? 1u : 0u;
++}
++
++/* One HW frame: n slots, surface ids, write seqs, creator pids (pid may be NULL). Returns the class. */
++static inline int
++sweet_fb_fps_note(struct sweet_fb_fps *f, unsigned n, const uint32_t *id, const uint64_t *seq, const int32_t *pid)
++{
++	if (n > SWEET_FB_FPS_SLOTS) { n = SWEET_FB_FPS_SLOTS; }
++	bool layout = (n != f->last_n), back = false, newer = false, unk = false;
++	for (unsigned i = 0; i < n; i++) {
++		bool fresh = layout || id[i] != f->last_id[i] || seq[i] != f->last_seq[i];
++		if (!layout) {
++			if (seq[i] != 0 && f->last_seq[i] != 0 && seq[i] < f->last_seq[i]) { back = true; }
++			else if (seq[i] != 0 && seq[i] > f->last_seq[i]) { newer = true; }
++			else if (id[i] != f->last_id[i]) { if (seq[i] == 0) { unk = true; } else { newer = true; } }
++		}
++		if (pid != NULL) { sweet_fb_fps_client_note(f, pid[i], fresh); }
++		f->last_id[i] = id[i]; f->last_seq[i] = seq[i];
++	}
++	f->last_n = n;
++	int r = back ? SWEET_FB_FPS_BACK : (layout || newer) ? SWEET_FB_FPS_NEW : unk ? SWEET_FB_FPS_UNK : SWEET_FB_FPS_SAME;
++	if (r == SWEET_FB_FPS_BACK) { f->n_back++; } else if (r == SWEET_FB_FPS_NEW) { f->n_new++; }
++	else if (r == SWEET_FB_FPS_UNK) { f->n_unk++; } else { f->n_same++; }
++	return r;
++}
++
++/* A CPU-path frame between HW frames: the next HW frame is compared against nothing (counts as new, not as back). */
++static inline void
++sweet_fb_fps_break(struct sweet_fb_fps *f)
++{
++	f->last_n = 0;
++}
++
++static inline void
++sweet_fb_fps_window_reset(struct sweet_fb_fps *f)
++{
++	f->n_new = f->n_same = f->n_back = f->n_unk = 0;
++	for (unsigned k = 0; k < SWEET_FB_FPS_CLIENTS; k++) { f->cl[k].pid = 0; f->cl[k].shown = f->cl[k].fresh = 0; }
++	f->other_shown = f->other_fresh = 0;
++}
++
++/* " hw_new=.. hw_same=.. hw_back=.. hw_unk=.." appended to FB SEEN. */
++static inline int
++sweet_fb_fps_format_seen(const struct sweet_fb_fps *f, char *buf, size_t len)
++{
++	return snprintf(buf, len, "hw_new=%u hw_same=%u hw_back=%u hw_unk=%u", f->n_new, f->n_same, f->n_back, f->n_unk);
++}
++
++/* "pid 59 shown=430 fresh=86.0/s | ..." -- names are added by the caller (proc_name is a kernel call). fresh/s over win_us. */
++static inline int
++sweet_fb_fps_format_client(const struct sweet_fb_fps_client *c, const char *name, uint64_t win_us, char *buf, size_t len)
++{
++	uint64_t w = win_us ? win_us : 1;
++	uint64_t r10 = ((uint64_t)c->fresh * 10000000ULL + w / 2) / w;      /* tenths of a frame a second */
++	return snprintf(buf, len, "%s[%d] shown=%u fresh=%u (%llu.%llu/s)", name, (int)c->pid, c->shown, c->fresh,
++	           (unsigned long long)(r10 / 10), (unsigned long long)(r10 % 10));
++}
++#endif
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -22,6 +22,7 @@
+ #include <pexpert/pexpert.h>
+ #include "audio_native.h"
+ #include "audio_call.h"
++#include "nord2_input_rate.h"   /* 0407: touch sampling rate (measurement only) */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int, int);
+@@ -36,6 +37,16 @@
+ static uint32_t ni_active;
+ static int ni_x[10], ni_y[10];
+ static unsigned ni_events;
++static struct n2ir ni_rate;      /* 0407: input thread only */
++static uint32_t ni_moves;        /* 0407: HID events of the last ni_report */
++
++static uint64_t
++ni_now_us(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
+ static struct {
+ 	unsigned pin, mux, dir, dout;
+ } ni_pins[] = {{NI_SCL,0,0,0}, {NI_SDA,0,0,0}, {NI_RESET,0,0,0},
+@@ -334,6 +345,7 @@
+ 				    i, down, ni_x[i], ni_y[i]);
+ 			}
+ 			sweet_hid_touch((int)i, down, ni_x[i], ni_y[i]);
++			ni_moves++;      /* 0407 */
+ 		}
+ 	}
+ 	ni_active = mask;
+@@ -343,6 +355,7 @@
+ ni_touch(void)
+ {
+ 	uint8_t b[62], ack;
++	uint64_t t0 = ni_now_us();      /* 0407 */
+ 	memset(b, 0xff, sizeof(b));
+ 	if (!ni_read(0x01, b, 15)) { return false; }
+ 	if (b[0] == 0xff && b[1] == 0 && b[2] == 0xff) { return true; }
+@@ -356,7 +369,9 @@
+ 	uint32_t active;
+ 	int x[10] = {0}, y[10] = {0};
+ 	if (!ni_decode(b, &active, x, y)) { return false; }
++	ni_moves = 0;
+ 	ni_report(active, x, y);
++	{ uint64_t t1 = ni_now_us(); n2ir_report(&ni_rate, t1, active, ni_moves, t1 - t0); }      /* 0407 */
+ 	return true;
+ }
+ 
+@@ -919,6 +934,7 @@
+ 		}
+ 		if (touch_ok && (ni_active || !ni_level(NI_IRQ) || (++ticks % 10) == 0)) {
+ 			if (!ni_touch()) {
++				n2ir_error(&ni_rate);      /* 0407 */
+ 				if ((errors++ % 100) == 0) {
+ 					printf("NORD2 INPUT: touch report error irq=%d scl=%d sda=%d\n",
+ 					    ni_level(NI_IRQ), ni_level(NI_SCL), ni_level(NI_SDA));
+@@ -926,6 +942,13 @@
+ 				if (errors >= 3) { ni_report(0, ni_x, ni_y); }
+ 			} else { errors = 0; }
+ 		}
++		if (touch_ok) {      /* 0407: one line per 5 s window with finger activity */
++			uint64_t nu = ni_now_us();
++			if (ni_rate.win_start_us == 0) { n2ir_reset(&ni_rate, nu); }
++			int due = n2ir_due(&ni_rate, nu);
++			if (due > 0) { char rb[256]; (void)n2ir_format(&ni_rate, nu, rb, sizeof(rb)); printf("NORD2 INPUT RATE: %s\n", rb); }
++			if (due != 0) { n2ir_reset(&ni_rate, nu); }
++		}
+ 		if ((++slider_ticks % 10) == 0) { ns_poll(); }
+ 		n2scp_pmic_service(); n2c_pmic_service();   /* 0284: VIBR on/off requests from the SCP thread */
+ 		ni_wait(10);
+--- a/bsd/dev/nord2_input_rate.h
++++ b/bsd/dev/nord2_input_rate.h
+@@ -0,0 +1,78 @@
++/* 0407 (fpsmeter-20261114): touch sampling rate as the HID stack sees it, measurement only (no extra I2C traffic).
++ * SPDX-License-Identifier: MIT
++ *
++ * The NORD2 input thread polls the FT3518 over bit-banged I2C0 and then sleeps 10 ms; a finger's position reaches the HID stack at
++ * the rate of that loop.  While a finger is down every decoded report is counted and the gap since the previous one is binned;
++ * the I2C read time of each report (start of the first read -> decode) is summed.  One line per window with finger activity:
++ *   NORD2 INPUT RATE: win_ms= reports= (r/s) moves= errors= gap_ms<=10/12/16/20/25/33/50/more=.. gap_avg_us= gap_max_us= read_avg_us= read_max_us=
++ * Pure logic; the caller owns the struct (input thread only, no lock). */
++#ifndef NORD2_INPUT_RATE_H
++#define NORD2_INPUT_RATE_H
++#ifndef KERNEL
++#include <stdint.h>
++#include <stddef.h>
++#include <stdio.h>
++#endif
++
++#define N2IR_WINDOW_US  5000000ull
++
++struct n2ir {
++	uint64_t win_start_us, last_us, gap_sum_us, read_sum_us;
++	uint32_t reports, moves, errors, gaps, gap_max_us, read_max_us, gap[8];
++};
++
++static inline unsigned
++n2ir_bin(uint64_t gap_us)
++{
++	static const uint32_t lim[7] = { 10000, 12000, 16000, 20000, 25000, 33000, 50000 };
++	unsigned b = 0;
++	while (b < 7 && gap_us > lim[b]) { b++; }
++	return b;
++}
++
++/* A decoded report: active = fingers down after it, moves = HID events it produced, read_us = its I2C time. */
++static inline void
++n2ir_report(struct n2ir *r, uint64_t now_us, uint32_t active, uint32_t moves, uint64_t read_us)
++{
++	if (active == 0) { r->last_us = 0; r->moves += moves; return; }      /* lift: the next touch starts a new gap chain */
++	r->reports++; r->moves += moves;
++	r->read_sum_us += read_us; if (read_us > r->read_max_us) { r->read_max_us = (uint32_t)read_us; }
++	if (r->last_us != 0 && now_us > r->last_us) {
++		uint64_t g = now_us - r->last_us;
++		r->gap[n2ir_bin(g)]++; r->gaps++; r->gap_sum_us += g;
++		if (g > r->gap_max_us) { r->gap_max_us = (uint32_t)(g > 0xffffffffull ? 0xffffffffull : g); }
++	}
++	r->last_us = now_us;
++}
++
++static inline void n2ir_error(struct n2ir *r) { r->errors++; }
++
++/* 1 = the window is over and had finger activity: format it (then n2ir_reset).  -1 = over, nothing to say (reset silently). 0 = not yet. */
++static inline int
++n2ir_due(const struct n2ir *r, uint64_t now_us)
++{
++	if (r->win_start_us == 0 || now_us - r->win_start_us < N2IR_WINDOW_US) { return 0; }
++	return (r->reports || r->moves || r->errors) ? 1 : -1;
++}
++
++static inline void
++n2ir_reset(struct n2ir *r, uint64_t now_us)
++{
++	uint64_t last = r->last_us;
++	*r = (struct n2ir){ 0 };
++	r->win_start_us = now_us; r->last_us = last;      /* a finger held across the edge keeps its gap chain */
++}
++
++static inline int
++n2ir_format(const struct n2ir *r, uint64_t now_us, char *buf, size_t len)
++{
++	uint64_t win = now_us > r->win_start_us ? now_us - r->win_start_us : 1;
++	uint64_t r10 = ((uint64_t)r->reports * 10000000ull + win / 2) / win;
++	return snprintf(buf, len, "win_ms=%llu reports=%u (%llu.%llu/s) moves=%u errors=%u gap_ms<=10/12/16/20/25/33/50/more=%u/%u/%u/%u/%u/%u/%u/%u "
++	    "gap_avg_us=%llu gap_max_us=%u read_avg_us=%llu read_max_us=%u",
++	    (unsigned long long)(win / 1000), r->reports, (unsigned long long)(r10 / 10), (unsigned long long)(r10 % 10), r->moves, r->errors,
++	    r->gap[0], r->gap[1], r->gap[2], r->gap[3], r->gap[4], r->gap[5], r->gap[6], r->gap[7],
++	    (unsigned long long)(r->gaps ? r->gap_sum_us / r->gaps : 0), r->gap_max_us,
++	    (unsigned long long)(r->reports ? r->read_sum_us / r->reports : 0), r->read_max_us);
++}
++#endif

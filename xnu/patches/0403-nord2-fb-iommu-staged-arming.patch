@@ -1,0 +1,127 @@
+--- a/iokit/Kernel/arm/sweet_fb_iommu_hw.h
++++ b/iokit/Kernel/arm/sweet_fb_iommu_hw.h
+@@ -12,6 +12,8 @@
+ #ifndef SWEET_FB_IOMMU_HW_H
+ #define SWEET_FB_IOMMU_HW_H
+ #include "sweet_fb_iommu.h"
++#include <kern/thread_call.h>      /* 0403: stage watchdog */
++#include <kern/clock.h>
+ 
+ extern "C" {
+ extern unsigned long gPhysBase, gPhysSize;
+@@ -66,6 +68,14 @@
+ static IOBufferMemoryDescriptor *n2io_test_buf;
+ static uint32_t      n2io_test_iova;
+ static uint64_t      n2io_log_at;
++/* 0403 staged arming (kern.n2fbiommu_stage): every risky write is logged first and followed by a 200 ms pause so the console shows the last
++ * step reached; stage 2/3 port enables are switched off by a thread_call watchdog after n2io_wd_ms, independent of the display thread. */
++static bool          n2io_stepwise, n2io_no_irq;
++static int           n2io_stage_last;
++static uint32_t      n2io_wd_ms = 2000;
++static uint32_t      n2io_stage_ports;          /* bit k: stage-enabled port of n2io_larb[k] (0 = larb1 p6 / OVL0_2L, 1 = larb0 p6 / OVL1_2L) */
++static thread_call_t n2io_wd_tc;
++static void n2io_step(const char *what) { if (n2io_stepwise) { IOLog("NORD2 FB IOMMU: stage step: %s\n", what); IOSleep(200); } }
+ static uint32_t      n2io_cpu_seq[SWEET_SURFACE_MAX_ID];        /* write-unlocks per surface id (IOSurfaceUnlock without ReadOnly) */
+ static struct {
+ 	uint64_t maps, hits, unmaps, evicts, map_fail, verify_bad, refused, layers, dry, cleans;
+@@ -164,6 +174,7 @@
+ 	if (n2io_state != 0) { return n2io_state == 1; }
+ 	if (!n2io_map_regs()) { n2io_refuse("register blocks not mappable"); return false; }
+ 	uint32_t g = n2io_cg_gated();
++	if (g != 0) { n2io_step("ungate MMSYS SMI/IOMMU clocks (write CG_CON1 clear)"); }
+ 	if (g != 0) {      /* Linux only ever ungates these ("dummy" gates); MMSYS is powered while the panel runs */
+ 		n2io_wr(n2io_cg, (N2IO_MMSYS_CG1 & 0xfffu) + 8u, g);
+ 		IOLog("NORD2 FB IOMMU: ungated MMSYS clocks %08x -> gated now %08x\n", g, n2io_cg_gated());
+@@ -189,13 +200,16 @@
+ 	uint32_t old_pt = n2io_rd(n2io_m4u, N2IO_PT_BASE), old_tfrp = n2io_rd(n2io_m4u, N2IO_TFRP), ctrl = n2io_rd(n2io_m4u, N2IO_CTRL);
+ 	uint32_t old_int = n2io_rd(n2io_m4u, N2IO_INT_MAIN), gic = n2io_rd(n2io_gicd, N2IO_GICD_ISEN_M4U0);
+ 	n2io_ptbase_val = (uint32_t)(n2io_pt.l1_pa & 0xffffff80u) | (uint32_t)((n2io_pt.l1_pa >> 32) & 7u);
++	n2io_step("write M4U0 PT_BASE (no port translates yet)");
+ 	n2io_wr(n2io_m4u, N2IO_PT_BASE, n2io_ptbase_val);
++	n2io_step("write M4U0 TFRP");
+ 	n2io_wr(n2io_m4u, N2IO_TFRP, (uint32_t)(n2io_scratch_pa & 0xffffff80u));     /* faulting reads land on a zero page in the pool */
+ 	n2io_irq_on = false;
+-	if (!(gic & N2IO_GICD_BIT_M4U0)) {      /* line masked at the GIC: the fault status latches, no unhandled interrupt can reach XNU */
++	if (!(gic & N2IO_GICD_BIT_M4U0) && !n2io_no_irq) {      /* line masked at the GIC: the fault status latches, no unhandled interrupt can reach XNU */
+ 		n2io_wr(n2io_m4u, N2IO_INT_MAIN, old_int | N2IO_INT_MAIN_MMU0);
+ 		n2io_irq_on = true;
+ 	}
++	n2io_step("M4U0 TLB invalidate all");
+ 	n2io_tlb_all();
+ 	uint32_t rb = n2io_rd(n2io_m4u, N2IO_PT_BASE);
+ 	IOLog("NORD2 FB IOMMU: armed: tables pa %#llx (l1 64 KiB, %u l2, window %#x+%u MiB, identity fb %#x-%#x low %#x-%#x), PT_BASE %08x -> %08x (read %08x), "
+@@ -523,6 +537,74 @@
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, n2fbiommu, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, n2io_sysctl_mode, "I", "0401: display IOMMU 0 off 1 map-only 2 single 3 all");
+ SYSCTL_PROC(_kern, OID_AUTO, n2fbiommu_probe, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, n2io_sysctl_probe, "I", "0401: 1 = log M4U0/larb/clock registers (read-only)");
++/* ---------------------------------------------------------------- 0403 staged arming */
++static void
++n2io_stage_port(unsigned k, bool on)
++{
++	uint32_t v = n2io_rd(n2io_larb[k], N2IO_PORT(N2IO_OVL_PORT));
++	n2io_wr(n2io_larb[k], N2IO_PORT(N2IO_OVL_PORT), on ? (v | 1u) : (v & ~1u));
++	if (on) { n2io_stage_ports |= 1u << k; } else { n2io_stage_ports &= ~(1u << k); }
++	IOLog("NORD2 FB IOMMU: stage port %s p6 MMU_EN %s: %08x -> %08x\n", k == 0 ? "larb1 (OVL0_2L, left half)" : "larb0 (OVL1_2L, right half)", on ? "ON" : "off", v,
++	    n2io_rd(n2io_larb[k], N2IO_PORT(N2IO_OVL_PORT)));
++}
++
++static void
++n2io_wd_fire(thread_call_param_t, thread_call_param_t)
++{
++	IOLockLock(n2io_lock);
++	uint32_t was = n2io_stage_ports, st = n2io_state == 1 ? n2io_rd(n2io_m4u, N2IO_FAULT_ST1) : 0;
++	bool f = n2io_poll_fault_locked("stage watchdog");
++	for (unsigned k = 0; k < 2; k++) { if (was & (1u << k)) { n2io_stage_port(k, false); } }
++	IOLog("NORD2 FB IOMMU: stage watchdog after %u ms: ports 0x%x off, fault_st1 %08x%s; display survived identity translation\n", n2io_wd_ms, was, st,
++	    f ? " (FAULT logged above)" : "");
++	IOLockUnlock(n2io_lock);
++}
++
++/* kern.n2fbiommu_stage: 1 = arm (PT_BASE, TFRP, TLB; no interrupt enable; no port), logged step by step;
++ * 2 = MMU_EN on larb0 p6 only (OVL1_2L, right half; panel buffers identity-mapped) for kern.n2fbiommu_wdms; 3 = both ports for that time;
++ * 0 = stage ports off now.  Only while kern.n2fbiommu < 2 (never mixes with IOVA frames). */
++static int
++n2io_sysctl_stage SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = n2io_stage_last, changed = 0;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (err != 0 || !changed) { return err; }
++	if (v < 0 || v > 3) { return EINVAL; }
++	if (!n2io_lock_init()) { return ENOMEM; }
++	if (n2io_wd_tc == NULL) { n2io_wd_tc = thread_call_allocate(n2io_wd_fire, NULL); }
++	IOLog("NORD2 FB IOMMU: STAGE %d requested (state %u, mode %d, stage ports 0x%x, watchdog %u ms)\n", v, n2io_state, n2io_mode, n2io_stage_ports, n2io_wd_ms);
++	IOSleep(200);
++	IOLockLock(n2io_lock);
++	n2io_stage_last = v;
++	if (n2io_mode >= 2 || n2io_ports_on) { err = EBUSY; }
++	else if (v == 1) {
++		n2io_stepwise = true; n2io_no_irq = true;
++		bool ok = n2io_arm_locked();
++		n2io_stepwise = false;
++		IOLog("NORD2 FB IOMMU: STAGE 1 %s: PT_BASE read %08x fault_st1 %08x\n", ok ? "done" : "REFUSED", n2io_m4u ? n2io_rd(n2io_m4u, N2IO_PT_BASE) : 0u,
++		    (ok && n2io_m4u) ? n2io_rd(n2io_m4u, N2IO_FAULT_ST1) : 0u);
++		if (!ok) { err = EPERM; }
++	} else if (v >= 2) {
++		if (n2io_state != 1 || n2io_wd_tc == NULL) { err = EPERM; }
++		else {
++			n2io_stepwise = true;
++			n2io_step(v == 2 ? "MMU_EN on larb0 p6 (OVL1_2L) with identity map, watchdog armed" : "MMU_EN on larb1 p6 + larb0 p6 with identity map, watchdog armed");
++			n2io_stepwise = false;
++			uint64_t dl = 0;
++			clock_interval_to_deadline(n2io_wd_ms, kMillisecondScale, &dl);
++			thread_call_enter_delayed(n2io_wd_tc, dl);      /* armed BEFORE the enable: it fires even if this thread stalls */
++			n2io_stage_port(1, true);
++			if (v == 3) { n2io_stage_port(0, true); }
++		}
++	} else {
++		for (unsigned k = 0; k < 2; k++) { if (n2io_stage_ports & (1u << k)) { n2io_stage_port(k, false); } }
++	}
++	IOLockUnlock(n2io_lock);
++	return err;
++}
++SYSCTL_PROC(_kern, OID_AUTO, n2fbiommu_stage, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, n2io_sysctl_stage, "I", "0403: staged arming 1 arm 2 one port 3 both (watchdog)");
++SYSCTL_UINT(_kern, OID_AUTO, n2fbiommu_wdms, CTLFLAG_RW | CTLFLAG_LOCKED, &n2io_wd_ms, 0, "0403: stage 2/3 watchdog ms");
+ SYSCTL_INT(_kern, OID_AUTO, n2fbiommutest, CTLFLAG_RW | CTLFLAG_LOCKED, &n2io_test, 0, "0401: 1 = kern.n2fbhwtest reads a scattered copy through the IOMMU");
+ 
+ #endif /* SWEET_FB_IOMMU_HW_H */

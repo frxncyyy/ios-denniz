@@ -1,0 +1,200 @@
+--- a/iokit/Kernel/arm/sweet_fb_iommu_hw.h
++++ b/iokit/Kernel/arm/sweet_fb_iommu_hw.h
+@@ -18,6 +18,19 @@
+ extern "C" {
+ extern unsigned long gPhysBase, gPhysSize;
+ vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
++}
++/* 0410: every IOMMU-side register map is made ONCE with ml_io_map_unmappable (kernel_map), never from the 8 MiB io_submap: 0401's five
++ * permanent ml_io_map calls (80 KiB of 16 KiB pages) left the nearly full io_submap without room for the SCP thread's delayed maps at
++ * ~108 s uptime (the iot1/iosub hangs).  Each map is logged ("NORD2 FB IOMAP:") and followed by a 200 ms console drain. */
++#define N2IO_WIMG_IO            0x7u            /* VM_WIMG_IO (osfmk/arm/memory_types.h) */
++static volatile uint32_t *
++n2io_iomap(uint64_t pa, uint32_t size, const char *what)
++{
++	vm_offset_t va = ml_io_map_unmappable((vm_offset_t)pa, (vm_size_t)size, N2IO_WIMG_IO);
++	IOLog("NORD2 FB IOMAP: %s pa %#llx +%#x -> %#lx (ml_io_map_unmappable, outside io_submap)%s\n", what, pa, size, (unsigned long)va, va ? "" : " FAILED");
++	IOSleep(200);
++	return (volatile uint32_t *)va;
+ }
+ 
+ #define N2IO_M4U0               0x1411a000UL
+@@ -72,6 +85,7 @@
+  * step reached; stage 2/3 port enables are switched off by a thread_call watchdog after n2io_wd_ms, independent of the display thread. */
+ static bool          n2io_stepwise, n2io_no_irq;
+ static int           n2io_stage_last;
++static int n2io_sub_dump(void);      /* 0410: used by n2io_arm_locked before PT_BASE */
+ static uint32_t      n2io_wd_ms = 2000;
+ static uint32_t      n2io_stage_ports;          /* bit k: stage-enabled port of n2io_larb[k] (0 = larb1 p6 / OVL0_2L, 1 = larb0 p6 / OVL1_2L) */
+ static thread_call_t n2io_wd_tc;
+@@ -98,11 +112,11 @@
+ n2io_map_regs(void)
+ {
+ 	if (n2io_larb[0] == NULL) {
+-		n2io_cg = (volatile uint32_t *)ml_io_map(N2IO_MMSYS_CG1 & ~0xfffUL, 0x1000);
+-		n2io_larb[0] = (volatile uint32_t *)ml_io_map(N2IO_LARB1, 0x1000);
+-		n2io_larb[1] = (volatile uint32_t *)ml_io_map(N2IO_LARB0, 0x1000);
+-		n2io_m4u = (volatile uint32_t *)ml_io_map(N2IO_M4U0, 0x1000);
+-		n2io_gicd = (volatile uint32_t *)ml_io_map(N2IO_GICD, 0x1000);
++		n2io_cg = n2io_iomap(N2IO_MMSYS_CG1 & ~0xfffUL, 0x1000, "MMSYS config");      /* 0410: kernel_map, once */
++		n2io_larb[0] = n2io_iomap(N2IO_LARB1, 0x1000, "larb1");
++		n2io_larb[1] = n2io_iomap(N2IO_LARB0, 0x1000, "larb0");
++		n2io_m4u = n2io_iomap(N2IO_M4U0, 0x1000, "M4U0");
++		n2io_gicd = n2io_iomap(N2IO_GICD, 0x1000, "GICD");
+ 	}
+ 	return n2io_cg != NULL && n2io_larb[0] != NULL && n2io_larb[1] != NULL && n2io_m4u != NULL && n2io_gicd != NULL;
+ }
+@@ -200,6 +214,10 @@
+ 	uint32_t old_pt = n2io_rd(n2io_m4u, N2IO_PT_BASE), old_tfrp = n2io_rd(n2io_m4u, N2IO_TFRP), ctrl = n2io_rd(n2io_m4u, N2IO_CTRL);
+ 	uint32_t old_int = n2io_rd(n2io_m4u, N2IO_INT_MAIN), gic = n2io_rd(n2io_gicd, N2IO_GICD_ISEN_M4U0);
+ 	n2io_ptbase_val = (uint32_t)(n2io_pt.l1_pa & 0xffffff80u) | (uint32_t)((n2io_pt.l1_pa >> 32) & 7u);
++	{   /* 0410: never point PT_BASE at our table while another powered M4U0 master translates through the current one */
++		int f = n2io_sub_dump();
++		if (f != 0) { n2io_refuse(f < 0 ? "SPM/larb registers not mappable for the M4U0 port check" : "a powered M4U0 larb (5/7/11/14/17/19/20) has an MMU_EN port"); return false; }
++	}
+ 	n2io_step("write M4U0 PT_BASE (no port translates yet)");
+ 	n2io_wr(n2io_m4u, N2IO_PT_BASE, n2io_ptbase_val);
+ 	n2io_step("write M4U0 TFRP");
+@@ -645,6 +663,16 @@
+ 	if (v & N2IO_SUB_UNDO) { act[n++] = N2IO_SUB_UNDO; }
+ 	return n;
+ }
++/* 0410: the other M4U0 larbs' ports, read only when the SPM reports their domain on in PWR_STATUS and PWR_STATUS_2ND. */
++static inline bool n2io_larb_powered(uint32_t s1, uint32_t s2, unsigned bit) { return ((s1 & s2) >> bit) & 1u; }
++/* number of powered larbs with an MMU_EN port (en[i] = MMU_EN bit mask of larb i, read only if powered[i]) */
++static inline int
++n2io_foreign_count(const uint32_t *en, const bool *powered, unsigned n)
++{
++	int c = 0;
++	for (unsigned i = 0; i < n; i++) { if (powered[i] && en[i] != 0) { c++; } }
++	return c;
++}
+ /* 0409-PURE-END */
+ static int  n2io_sub_last;
+ static bool n2io_sub_prepped;
+@@ -680,25 +708,35 @@
+ 
+ /* 0x10: other M4U0 larbs, read only if their power domain is on (a powered-off larb can hang the bus).  SPM 0x10006000: PWR_STATUS
+  * 0x16c / PWR_STATUS_2ND 0x170 (clk-mt6885-pg.c); larb bases + domains from mt6885.dts. */
+-static void
++/* returns the number of powered larbs with an MMU_EN port (0 = PT_BASE redirects nobody else), -1 = SPM/larb not mappable.
++ * 0410: SPM and larb maps cached (kernel_map, once), no more leaked ml_io_map per call. */
++static int
+ n2io_sub_dump(void)
+ {
+ 	static const struct { uint8_t larb, bit; uint32_t base; } L[] = {
+ 		{ 5, 15, 0x1600d000u }, { 7, 17, 0x17010000u }, { 11, 13, 0x1582e000u }, { 14, 23, 0x1a002000u }, { 17, 25, 0x1a010000u },
+ 		{ 19, 14, 0x1b10f000u }, { 20, 14, 0x1b00f000u } };
+-	volatile uint32_t *spm = (volatile uint32_t *)ml_io_map(0x10006000UL, 0x1000);
+-	if (spm == NULL) { IOLog("NORD2 FB IOMMU: SUB dump: SPM not mappable\n"); return; }
+-	uint32_t s1 = n2io_rd(spm, 0x16c), s2 = n2io_rd(spm, 0x170);
++	static volatile uint32_t *spm, *lb[7];
++	enum { NL = sizeof(L) / sizeof(L[0]) };
++	if (spm == NULL) { spm = n2io_iomap(0x10006000UL, 0x1000, "SPM"); }
++	if (spm == NULL) { IOLog("NORD2 FB IOMMU: SUB dump: SPM not mappable\n"); return -1; }
++	uint32_t s1 = n2io_rd(spm, 0x16c), s2 = n2io_rd(spm, 0x170), en[NL] = { 0 };
++	bool pw[NL] = { false };
+ 	IOLog("NORD2 FB IOMMU: SUB dump: PWR_STATUS %08x PWR_STATUS_2ND %08x\n", s1, s2);
+-	for (unsigned i = 0; i < sizeof(L) / sizeof(L[0]); i++) {
+-		if (!((s1 >> L[i].bit) & (s2 >> L[i].bit) & 1u)) { IOLog("NORD2 FB IOMMU: SUB dump: larb%u power domain off: not read\n", L[i].larb); continue; }
+-		volatile uint32_t *b = (volatile uint32_t *)ml_io_map(L[i].base, 0x1000);
+-		if (b == NULL) { continue; }
+-		uint32_t v[32], en = 0;
+-		for (unsigned p = 0; p < 32; p++) { v[p] = n2io_rd(b, N2IO_PORT(p)); if (v[p] & 1u) { en |= 1u << p; } }
+-		IOLog("NORD2 FB IOMMU: SUB dump: larb%u MMU_EN ports %08x | p0-7 %x %x %x %x %x %x %x %x p8-15 %x %x %x %x %x %x %x %x\n", L[i].larb, en,
++	for (unsigned i = 0; i < NL; i++) {
++		if (!n2io_larb_powered(s1, s2, L[i].bit)) { IOLog("NORD2 FB IOMMU: SUB dump: larb%u power domain off: not read\n", L[i].larb); continue; }
++		if (lb[i] == NULL) { lb[i] = n2io_iomap(L[i].base, 0x1000, "other M4U0 larb"); }
++		if (lb[i] == NULL) { return -1; }
++		pw[i] = true;
++		volatile uint32_t *b = lb[i];
++		uint32_t v[32];
++		for (unsigned p = 0; p < 32; p++) { v[p] = n2io_rd(b, N2IO_PORT(p)); if (v[p] & 1u) { en[i] |= 1u << p; } }
++		IOLog("NORD2 FB IOMMU: SUB dump: larb%u MMU_EN ports %08x | p0-7 %x %x %x %x %x %x %x %x p8-15 %x %x %x %x %x %x %x %x\n", L[i].larb, en[i],
+ 		    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]);
+ 	}
++	int f = n2io_foreign_count(en, pw, NL);
++	IOLog("NORD2 FB IOMMU: SUB dump: %d powered larb(s) with MMU_EN ports%s\n", f, f ? ": PT_BASE refused" : "");
++	return f;
+ }
+ 
+ static int
+@@ -722,6 +760,7 @@
+ 		case N2IO_SUB_DUMP: n2io_sub_dump(); break;
+ 		case N2IO_SUB_PREP: if (!n2io_sub_prep_locked()) { err = EPERM; } break;
+ 		case N2IO_SUB_PTBASE:
++			if (n2io_sub_dump() != 0) { err = EPERM; IOLog("NORD2 FB IOMMU: SUB PT_BASE refused: another M4U0 master translates or its larb is not readable\n"); break; }      /* 0410 */
+ 			n2io_step("SUB write M4U0 PT_BASE");
+ 			n2io_wr(n2io_m4u, N2IO_PT_BASE, n2io_ptbase_val); break;
+ 		case N2IO_SUB_TFRP:
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -138,6 +138,7 @@
+ extern "C" {
+ #include <arm64/sweet_early.h>
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);      /* 0410 */
+ }
+ /* Panel transfer registers, the same constants as osfmk/arm64/sweet_early.c (NORD2_DSI0, NORD2_DISP_MUTEX, ...). */
+ #define SWEET_FB_DSI0              0x1400e000UL
+@@ -2070,8 +2071,9 @@
+ 		}
+ 	}
+ 	if (why == NULL) {      /* R11: physical addressing on the four OVL ports */
+-		volatile uint32_t *l0 = (volatile uint32_t *)ml_io_map(SWEET_FB_LARB0, 0x1000);
+-		volatile uint32_t *l1 = (volatile uint32_t *)ml_io_map(SWEET_FB_LARB1, 0x1000);
++		static volatile uint32_t *l0, *l1;      /* 0410: once, kernel_map (ml_io_map_unmappable, VM_WIMG_IO), not the io_submap */
++		if (l0 == NULL) { l0 = (volatile uint32_t *)ml_io_map_unmappable(SWEET_FB_LARB0, 0x1000, 0x7u); IOLog("NORD2 FB IOMAP: hwInit larb0 -> %p\n", l0); IOSleep(200); }
++		if (l1 == NULL) { l1 = (volatile uint32_t *)ml_io_map_unmappable(SWEET_FB_LARB1, 0x1000, 0x7u); IOLog("NORD2 FB IOMAP: hwInit larb1 -> %p\n", l1); IOSleep(200); }
+ 		if (l0 == NULL || l1 == NULL) { why = "larb registers not mappable"; }
+ 		else {
+ 			uint32_t v[4] = { l0[SWEET_FB_LARB_NONSEC(5) / 4], l0[SWEET_FB_LARB_NONSEC(6) / 4], l1[SWEET_FB_LARB_NONSEC(5) / 4], l1[SWEET_FB_LARB_NONSEC(6) / 4] };
+--- a/bsd/dev/nord2_scp.inc
++++ b/bsd/dev/nord2_scp.inc
+@@ -138,17 +138,30 @@
+ static inline void n2scp_wr(vm_offset_t b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; __asm__ volatile("dsb sy" ::: "memory"); }
+ 
+ /* -------- step 1: what LK left (read only) -------- */
++/* 0410: every SCP io_submap map logged BEFORE (with a 200 ms drain: an exhausted io_submap panics inside the call, invisible on the
++ * polled console) and after, so the console names the map that ran out. */
++static vm_offset_t
++n2scp_iomap(vm_offset_t pa, vm_size_t sz, const char *what)
++{
++	printf("NORD2 SCP: IOMAP %s pa %#lx +%#lx: mapping (io_submap)\n", what, (unsigned long)pa, (unsigned long)sz);
++	n2scp_sleep(200);
++	vm_offset_t va = ml_io_map(pa, sz);
++	printf("NORD2 SCP: IOMAP %s -> %#lx%s\n", what, (unsigned long)va, va ? "" : " FAILED");
++	n2scp_sleep(200);
++	return va;
++}
++
+ static bool
+ n2scp_map(void)
+ {
+-	n2scp_tcm = ml_io_map(N2SCP_TCM, 0x1000);
+-	n2scp_cfg = ml_io_map(N2SCP_CFG, 0x1000);
+-	n2scp_c0 = ml_io_map(N2SCP_CORE0, 0x1000);
+-	n2scp_c1 = ml_io_map(N2SCP_CORE1, 0x1000);
++	n2scp_tcm = n2scp_iomap(N2SCP_TCM, 0x1000, "TCM");
++	n2scp_cfg = n2scp_iomap(N2SCP_CFG, 0x1000, "CFG");
++	n2scp_c0 = n2scp_iomap(N2SCP_CORE0, 0x1000, "CORE0");
++	n2scp_c1 = n2scp_iomap(N2SCP_CORE1, 0x1000, "CORE1");
+ 	/* XNU's I/O map (8 MB) is nearly full on this kernel: every map is 16 KB pages, so neighbours share one map */
+-	n2scp_topck = ml_io_map(N2SCP_TOPCK, 0x2000);
++	n2scp_topck = n2scp_iomap(N2SCP_TOPCK, 0x2000, "TOPCK+INFRA");
+ 	n2scp_infra = n2scp_topck ? n2scp_topck + 0x1000 : 0;
+-	n2scp_mb[0] = ml_io_map(N2SCP_MBOX(0), 0x5000);
++	n2scp_mb[0] = n2scp_iomap(N2SCP_MBOX(0), 0x5000, "MBOX0-4");
+ 	for (int i = 1; i < 5; i++) { n2scp_mb[i] = n2scp_mb[0] ? n2scp_mb[0] + 0x1000u * (uint32_t)i : 0; }
+ 	return n2scp_tcm && n2scp_cfg && n2scp_c0 && n2scp_c1 && n2scp_infra && n2scp_topck && n2scp_mb[1] && n2scp_mb[2];
+ }
+@@ -431,7 +444,7 @@
+ 	if (!n2scp_map()) { printf("NORD2 SCP: map failed\n"); goto out; }
+ 	/* the FIFO window now, while the I/O map has room; n2scp_dram points N2SCP_FIFO_OFF before it so offsets stay those of the region */
+ 	{
+-		vm_offset_t fifo = ml_io_map(N2SCP_DRAM_PHYS + N2SCP_FIFO_OFF, N2SCP_FIFO_SIZE); (void)N2SCP_FIFO_PHYS_TEST;
++		vm_offset_t fifo = n2scp_iomap(N2SCP_DRAM_PHYS + N2SCP_FIFO_OFF, N2SCP_FIFO_SIZE, "FIFO"); (void)N2SCP_FIFO_PHYS_TEST;
+ 		n2scp_dram = fifo ? fifo - N2SCP_FIFO_OFF : 0;
+ 		printf("NORD2 SCP: FIFO (test location) %#x+%#x mapped %s\n", N2SCP_FIFO_PHYS_TEST, N2SCP_FIFO_SIZE, fifo ? "ok" : "FAILED");
+ 	}

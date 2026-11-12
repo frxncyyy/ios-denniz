@@ -1,0 +1,499 @@
+--- a/bsd/dev/nord2_gpu_core.h
++++ b/bsd/dev/nord2_gpu_core.h
+@@ -215,6 +215,7 @@
+         uint32_t status;          /* JS_STATUS of the failing phase */
+         uint64_t head_at_fault;
+         bool released;            /* references dropped */
++        bool release_due;         /* 0400: terminal in this n2c_poll, references dropped after try_start */
+ };
+ 
+ struct n2c_submit {
+@@ -283,6 +284,21 @@
+         const void *tok[N2C_RESV_MAX];
+ };
+ 
++/* 0400 latency accounting, read and reset with n2c_lat_take() (all us, n2c ops.now_us):
++ *  irq   = job interrupt top half (n2c_lat_irq) -> the poll that consumed the completion;
++ *  hand  = the job's predecessor in its context finished (or, for a job submitted later, its submission) -> its first phase started;
++ *  phase = vertex/tiler phase finished -> fragment phase of the same job started;
++ *  depth = unfinished jobs of the context at submit (including the new one);
++ *  busy  = time with at least one job slot owned by a job (start -> completion noticed);
++ *  rel   = time spent dropping completed jobs' references (buffer teardown) per poll, now after try_start;
++ *  same  = starts on the slot the context's previous phase just left (what a JS_*_NEXT queue could hide). */
++struct n2c_lat {
++        uint32_t irq_n, irq_max, hand_n, hand_max, phase_n, phase_max, depth_max, rel_n, rel_max;
++        uint64_t irq_sum, hand_sum, phase_sum, depth_sum, rel_sum, busy_us, submits;
++        uint32_t kind[4], same_slot, deferred;
++        uint64_t window_start_us;
++};
++
+ struct n2c_core {
+         struct n2c_ops ops;
+         void *ctx;
+@@ -315,6 +331,15 @@
+         void *wa_cpu;
+         bool wa_as_live;
+ 
++        /* 0400: the completion handler releases buffers AFTER starting the next job (false = old order: release, then start). */
++        bool lat_release_late;
++        bool lat_in_irq;                  /* inside handle_job_irqs (completions defer their release) */
++        volatile uint64_t lat_irq_us;     /* set by the interrupt top half, consumed by the poll */
++        uint64_t lat_done_us[N2C_MAX_CTX];  /* last phase completion of each context (0 = none since its last start) */
++        uint8_t lat_done_slot[N2C_MAX_CTX];
++        uint64_t lat_busy_since;          /* first slot taken while all were free */
++        unsigned lat_slots_busy;
++        struct n2c_lat lat;
+ };
+ 
+ bool n2c_init(struct n2c_core *c, const struct n2c_ops *ops, void *ctx,
+@@ -394,6 +419,10 @@
+                      uint64_t min_window_us);
+ enum n2c_error n2c_job_get_times(struct n2c_core *c, unsigned ctx, uint64_t id,
+                              struct n2c_job_times *out);
++/* 0400: interrupt top half timestamp (any context, no lock: one aligned store). */
++static inline void n2c_lat_irq(struct n2c_core *c, uint64_t now_us) { if (c && !c->lat_irq_us) c->lat_irq_us = now_us; }
++/* 0400: copy and reset the latency window; false while it is younger than min_window_us or empty. */
++bool n2c_lat_take(struct n2c_core *c, struct n2c_lat *out, uint64_t min_window_us);
+ enum n2c_error n2c_job_state(struct n2c_core *c, unsigned ctx, uint64_t id,
+                              bool reap, uint32_t *state, uint32_t *status);
+ /* Verified GPU reset and recovery (all contexts' AS reprogrammed). */
+--- a/bsd/dev/nord2_gpu_core.c
++++ b/bsd/dev/nord2_gpu_core.c
+@@ -256,6 +256,7 @@
+         c->next_job_id = 1;
+         c->next_handle = 1;
+         c->state = N2C_CORE_OFF;
++        c->lat_release_late = true;     /* 0400 */
+         return true;
+ }
+ 
+@@ -529,6 +530,13 @@
+         } else if (state == N2C_JOB_CANCELLED) {
+                 c->stats.cancelled++;
+         }
++        /* 0400: a completion seen by handle_job_irqs keeps its references until n2c_poll started the next job (job_release_due);
++         * every other caller (MMU fault, reset, close, start failure) releases at once as before. */
++        if (c->lat_in_irq && c->lat_release_late) {
++                j->release_due = true;
++                c->lat.deferred++;
++                return;
++        }
+         job_release(c, j);
+ }
+ 
+@@ -1144,6 +1152,13 @@
+         x->jobs++;
+         j->state = N2C_JOB_QUEUED;
+         c->stats.submitted++;
++        if (!c->lat.submits)
++                c->lat.window_start_us = j->t_submit_us;     /* 0400 */
++        c->lat.submits++;
++        c->lat.kind[r->kind & 3u]++;
++        c->lat.depth_sum += x->jobs;
++        if (x->jobs > c->lat.depth_max)
++                c->lat.depth_max = x->jobs;
+         *id_out = j->id;
+         n2c_poll(c);
+         return N2C_OK;
+@@ -1157,6 +1172,59 @@
+                                           : c->hw->slot_vertex_tiler;
+ }
+ 
++/* 0400 latency accounting (see struct n2c_lat). */
++#define N2C_LAT_ACC(n, sum, max, v) do { uint64_t v_ = (v); c->lat.n++; c->lat.sum += v_; if (v_ > c->lat.max) c->lat.max = (uint32_t)(v_ > 0xffffffffull ? 0xffffffffull : v_); } while (0)
++static void lat_busy(struct n2c_core *c, uint64_t t)
++{
++        bool any = false;
++        for (unsigned s = 0; s < 16; s++)
++                any |= c->running[s] != 0;
++        if (any && !c->lat_slots_busy) {
++                c->lat_slots_busy = 1;
++                c->lat_busy_since = t;
++        } else if (!any && c->lat_slots_busy) {
++                c->lat_slots_busy = 0;
++                c->lat.busy_us += t >= c->lat_busy_since ? t - c->lat_busy_since : 0;
++        }
++}
++
++static void lat_started(struct n2c_core *c, struct n2c_job *j, unsigned slot)
++{
++        uint64_t t = n2c_now_us(c);
++        bool second = j->kind == N2C_JOB_RENDER && j->phase == 1;
++        uint64_t base = second ? 0 : j->t_submit_us;
++        bool done = c->lat_done_us[j->ctx] != 0;
++        if (done && c->lat_done_us[j->ctx] > base)
++                base = c->lat_done_us[j->ctx];
++        if (done && c->lat_done_slot[j->ctx] == slot)
++                c->lat.same_slot++;
++        c->lat_done_us[j->ctx] = 0;
++        if (second) {
++                if (done)
++                        N2C_LAT_ACC(phase_n, phase_sum, phase_max, t >= base ? t - base : 0);
++        } else {
++                N2C_LAT_ACC(hand_n, hand_sum, hand_max, t >= base ? t - base : 0);
++        }
++        lat_busy(c, t);
++}
++
++bool n2c_lat_take(struct n2c_core *c, struct n2c_lat *out, uint64_t min_window_us)
++{
++        if (!c || !out || !c->lat.submits)
++                return false;
++        uint64_t t = n2c_now_us(c);
++        if (t - c->lat.window_start_us < min_window_us)
++                return false;
++        if (c->lat_slots_busy) {        /* split a busy period at the window edge */
++                c->lat.busy_us += t >= c->lat_busy_since ? t - c->lat_busy_since : 0;
++                c->lat_busy_since = t;
++        }
++        *out = c->lat;
++        memset(&c->lat, 0, sizeof(c->lat));
++        out->window_start_us = t - out->window_start_us; /* window length */
++        return true;
++}
++
+ static void try_start(struct n2c_core *c)
+ {
+         if (c->state != N2C_CORE_READY || c->reset_pending)
+@@ -1249,6 +1317,7 @@
+                 pick->state = N2C_JOB_RUNNING;
+                 pick->started_ms = now(c);
+                 c->running[slot] = pick->id;
++                lat_started(c, pick, slot);
+         }
+ }
+ 
+@@ -1266,6 +1335,13 @@
+ {
+         struct n2hw_job_event ev[16];
+         unsigned n = n2hw_job_irq(c->hw, ev, 16);
++        /* 0400: hardware completion time = the interrupt top half's stamp when there is one, else now (polling) */
++        uint64_t t = n ? n2c_now_us(c) : 0, irq = c->lat_irq_us, t_hw = t;
++        c->lat_irq_us = 0;
++        if (n && irq && irq <= t) {
++                N2C_LAT_ACC(irq_n, irq_sum, irq_max, t - irq);
++                t_hw = irq;
++        }
+         for (unsigned i = 0; i < n; i++) {
+                 if (ev[i].slot >= 16)
+                         continue;
+@@ -1275,6 +1351,10 @@
+                         note(c, "Nord2 GPU core: job IRQ without a job");
+                         continue;
+                 }
++                if (j->ctx < N2C_MAX_CTX) {
++                        c->lat_done_us[j->ctx] = t_hw ? t_hw : 1;
++                        c->lat_done_slot[j->ctx] = (uint8_t)ev[i].slot;
++                }
+                 if (!ev[i].failed && j->state == N2C_JOB_RUNNING) {
+                         if (j->kind == N2C_JOB_RENDER && j->phase == 0) {
+                                 j->phase = 1;
+@@ -1294,6 +1374,8 @@
+                         c->reset_pending = true; /* corrupt state: reset */
+                 job_finish(c, j, N2C_JOB_FAULTED);
+         }
++        if (n)
++                lat_busy(c, t);
+ }
+ 
+ static void handle_mmu_irqs(struct n2c_core *c)
+@@ -1352,12 +1434,35 @@
+ {
+         if (!c || c->state != N2C_CORE_READY)
+                 return;
++        c->lat_in_irq = true;
+         handle_job_irqs(c);
++        c->lat_in_irq = false;
+         handle_mmu_irqs(c);
+         check_deadlines(c);
+         if (c->reset_pending)
+                 (void)n2c_reset(c);
+         try_start(c);
++        /* 0400: the jobs completed above drop their buffer references only now, with the next job already on the GPU: the teardown of
++         * released buffers (MMU unmap, AS flush, owner release) used to run between a completion and the start of its successor. */
++        bool due = false;
++        for (unsigned i = 0; i < N2C_MAX_JOBS && !due; i++)
++                due = c->jobs[i].release_due;
++        if (!due)
++                return;
++        uint64_t t0 = n2c_now_us(c);
++        for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
++                struct n2c_job *j = &c->jobs[i];
++                if (!j->release_due)
++                        continue;
++                j->release_due = false;
++                job_release(c, j);
++        }
++        uint64_t t1 = n2c_now_us(c);
++        N2C_LAT_ACC(rel_n, rel_sum, rel_max, t1 >= t0 ? t1 - t0 : 0);
++        if (c->state == N2C_CORE_READY && c->reset_pending) {
++                (void)n2c_reset(c);     /* a release flush that failed: same poll as before 0400 */
++                try_start(c);
++        }
+ }
+ 
+ enum n2c_error n2c_seq_state(struct n2c_core *c, unsigned idx, uint64_t seq,
+@@ -1460,6 +1565,7 @@
+         /* The completed reset stopped every bus master: running work is
+          * over and every TLB/walk cache is gone. */
+         memset(c->running, 0, sizeof(c->running));
++        lat_busy(c, n2c_now_us(c));     /* 0400 */
+         for (unsigned i = 0; i < N2C_MAX_CTX; i++)
+                 c->ctxs[i].as_live = false;
+         for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -29,6 +29,9 @@
+ #define NORD2_GPU_FENCE_IMPL
+ #include "nord2_gpu_fence.h"   /* 0395: per-surface write fences + display-pool import range */
+ #include "sweet_surface_use.h" /* 0398: GPU use-count holds by job */
++#include <sys/sysctl.h>        /* 0400: kern.n2gpu_lat */
++#include <kern/thread_call.h>   /* 0400: buffer owners released off the GPU lock */
++extern "C" kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);   /* 0400: osfmk/kern/thread.c (MACH_KERNEL_PRIVATE header) */
+ extern "C" {
+ extern unsigned long gPhysBase, gPhysSize;
+ extern int PE_parse_boot_argn(const char *, void *, int);
+@@ -139,6 +142,7 @@
+         IOBufferMemoryDescriptor *md;
+         SweetSurface *surface;
+         bool prepared;      /* 0137: pageable write-combine memory, wired by prepare(), unwired by complete() */
++        BufferOwner *next;  /* 0400: deferred-release list */
+ };
+ /* 0112: the display surface behind an imported buffer (NULL for any other buffer); only compared, never dereferenced, by the core. */
+ static const void *resv_token(void *, void *cookie) { return cookie ? (const void *)((BufferOwner *)cookie)->surface : NULL; }
+@@ -151,6 +155,46 @@
+         OSSafeReleaseNULL(o->surface);
+         IOFree(o, sizeof(*o));
+ }
++/* 0400 (gpulat-20261112): GPU job latency.  kern.n2gpu_lat (boot-arg n2lat) = bit mask of the OLD behaviours, 0 = every 0400 change on:
++ *   1 no bottom-half thread (the interrupt kicks the workloop timer as in 0140)    2 buffers released before the next job starts (pre-0400 order)
++ *   4 every pageable allocation zeroed again after prepare() (pre-0400)            8 buffer owners released inline under the GPU lock (pre-0400) */
++static int gLatMode = 0;
++SYSCTL_INT(_kern, OID_AUTO, n2gpu_lat, CTLFLAG_RW | CTLFLAG_LOCKED, &gLatMode, 0, "0400: GPU latency changes off-mask: 1 BH thread, 2 late release, 4 zero skip, 8 deferred owner free");
++/* Owners of torn-down buffers (unwire + release of up to 32 MiB, ms) are pushed here by the core's free_owner and released by a thread call,
++ * after the GPU pages were unmapped and flushed: nothing the GPU can reach is freed later than before, only the CPU-side release moves. */
++static BufferOwner *volatile gOwnerList;
++static thread_call_t gOwnerCall;
++static volatile uint32_t gOwnerQueued;
++static uint32_t gOwnerFreed, gOwnerDrainMaxUs, gOwnerKiB;
++static void owner_drain(thread_call_param_t, thread_call_param_t) {
++        BufferOwner *o = __atomic_exchange_n(&gOwnerList, (BufferOwner *)NULL, __ATOMIC_ACQ_REL);
++        if (!o) return;
++        uint64_t ns0 = 0, ns1 = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns0);
++        uint32_t n = 0, kib = 0;
++        while (o) { BufferOwner *nx = o->next; if (o->md) kib += (uint32_t)(o->md->getLength() >> 10); free_owner(NULL, o); o = nx; n++; }
++        absolutetime_to_nanoseconds(mach_absolute_time(), &ns1);
++        uint32_t us = (uint32_t)((ns1 - ns0) / 1000ull);
++        __atomic_fetch_add(&gOwnerFreed, n, __ATOMIC_RELAXED); __atomic_fetch_add(&gOwnerKiB, kib, __ATOMIC_RELAXED);
++        if (us > gOwnerDrainMaxUs) gOwnerDrainMaxUs = us;
++}
++static void free_owner_deferred(void *ctx, void *cookie) {
++        BufferOwner *o = (BufferOwner *)cookie;
++        if (!o) return;
++        if (!gOwnerCall || (gLatMode & 8)) { free_owner(ctx, o); return; }
++        BufferOwner *h = __atomic_load_n(&gOwnerList, __ATOMIC_ACQUIRE);
++        do { o->next = h; } while (!__atomic_compare_exchange_n(&gOwnerList, &h, o, true, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE));
++        __atomic_fetch_add(&gOwnerQueued, 1u, __ATOMIC_RELAXED);
++        (void)thread_call_enter(gOwnerCall);
++}
++/* Bottom half: a kernel thread at BASEPRI_PREEMPT (92) woken by the job interrupt runs n2c_poll (complete, start the next job) at once, instead of
++ * timer -> thread call -> workloop gate.  The 150 us tick and the waiters' own polls stay as they were (fallbacks). */
++static volatile uint32_t gBhPending, gBhExit;
++static bool gBhOn;
++static uint32_t gBhRuns, gBhWaitMaxUs, gBhPollMaxUs;
++static volatile uint64_t gBhKickUs;
++/* externalMethod: time to get both locks, and the longest hold (WAIT, WAIT_SEQ and ALLOC drop the GPU lock and are not counted) */
++static uint32_t gLockWaitMaxUs, gLockHoldMaxUs, gLockHoldSel, gLockCalls;
++static uint32_t gZeroSkip, gZeroSkipMiB, gZeroVerifyFail, gZeroFull;
+ /* 0395: write fences.  gFence is guarded by Nord2GPU::lock; the job view reads core->jobs[] (same predicate as surfaceBusy). */
+ static struct n2gf_table gFence;
+ static bool gFencePool = true;          /* boot-arg n2gpool=0: imports of display-pool pages refused again */
+@@ -327,6 +371,7 @@
+         void irqSetup();
+         void irqLearnCheck();
+         void irqArm();
++        void irqRearm();     /* 0400: unmask only */
+         void irqTop();
+         void waitStep(uint64_t elapsed_us);
+         static void irqDispatch(void *, void *, void *, int);
+@@ -431,7 +476,7 @@
+         n2clk_ops co = { clockRead, clockWrite, delay_us, log_msg };
+         n2hw_ops ho = { read_bank, write_bank, delay_us, log_msg };
+         nord2_scpsys_ops so = { spmRead, spmWrite, infraRead, infraWrite, delay_us, log_msg };
+-        n2c_ops mo = { allocTable, freeTable, flushTable, alloc_host, free_host, sync_page, free_owner, now_ms, log_msg, now_us, resv_token };
++        n2c_ops mo = { allocTable, freeTable, flushTable, alloc_host, free_host, sync_page, free_owner_deferred, now_ms, log_msg, now_us, resv_token };   /* 0400: deferred owner release */
+         core = (n2c_core *)IOMallocZero(sizeof(*core));
+         return core && n2pmif_init(&pm15, N2PMIF_SPMI, &po, &spmi) &&
+                n2pmif_init(&pm59, N2PMIF_PWRAP, &po, &pwrap) &&
+@@ -511,6 +556,52 @@
+         return on ? 0 : -1;
+ }
+ int Nord2GPU::powerOff(void *p) { return nord2_gpu_board_power_off(&((Nord2GPU *)p)->board) ? 0 : -1; }
++/* 0400 bottom half and LAT lines */
++static bool core_unfinished(struct n2c_core *c) {
++        for (unsigned i = 0; i < N2C_MAX_CTX; i++) if (c->ctxs[i].state != N2C_CTX_FREE && c->ctxs[i].jobs) return true;
++        return false;
++}
++static void bh_main(void *p, wait_result_t) {
++        Nord2GPU *d = (Nord2GPU *)p;
++        for (;;) {
++                assert_wait((event_t)&gBhPending, THREAD_UNINT);
++                if (__atomic_load_n(&gBhPending, __ATOMIC_ACQUIRE) || gBhExit) clear_wait(current_thread(), THREAD_AWAKENED);
++                else (void)thread_block(THREAD_CONTINUE_NULL);
++                if (gBhExit) break;
++                __atomic_store_n(&gBhPending, 0u, __ATOMIC_RELEASE);
++                uint64_t t0 = now_us(NULL), kick = gBhKickUs; gBhKickUs = 0;
++                IOLockLock(d->lock);
++                uint64_t t1 = now_us(NULL);
++                if (d->ready && !d->stopping && d->core && d->core->state == N2C_CORE_READY) {
++                        d->core->lat_release_late = !(gLatMode & 2);
++                        n2c_poll(d->core);
++                        /* re-arm the job interrupt (mask only: irqFlag belongs to the waiters' protocol, see waitStep) */
++                        if (d->irqState == NORD2_IRQ_ACTIVE && core_unfinished(d->core)) d->irqRearm();
++                        gBhRuns++;
++                }
++                uint64_t t2 = now_us(NULL);
++                IOLockUnlock(d->lock);
++                if (kick && t0 >= kick && t0 - kick > gBhWaitMaxUs) gBhWaitMaxUs = (uint32_t)(t0 - kick);
++                if (t2 - t1 > gBhPollMaxUs) gBhPollMaxUs = (uint32_t)(t2 - t1);
++        }
++        d->release();
++        thread_terminate(current_thread());
++}
++static void lat_emit(Nord2GPU *d) {
++        n2c_lat l;
++        if (!d->core || !n2c_lat_take(d->core, &l, 2000000ull)) return;
++        uint64_t w = l.window_start_us ? l.window_start_us : 1;
++        IOLog("NORD2 GPU LAT: n=%llu win_ms=%llu irq_us=%llu/%u hand_us=%llu/%u phase_us=%llu/%u(%u) depth=%llu/%u busy_pm=%llu kinds=c%u/r%u/f%u same=%u rel_us=%llu/%u(%u) def=%u\n",
++              l.submits, w / 1000, l.irq_n ? l.irq_sum / l.irq_n : 0ull, l.irq_max, l.hand_n ? l.hand_sum / l.hand_n : 0ull, l.hand_max,
++              l.phase_n ? l.phase_sum / l.phase_n : 0ull, l.phase_max, l.phase_n, l.submits ? l.depth_sum / l.submits : 0ull, l.depth_max,
++              l.busy_us * 1000 / w, l.kind[N2C_JOB_COMPUTE], l.kind[N2C_JOB_RENDER], l.kind[N2C_JOB_FRAGMENT], l.same_slot,
++              l.rel_n ? l.rel_sum / l.rel_n : 0ull, l.rel_max, l.rel_n, l.deferred);
++        IOLog("NORD2 GPU LAT2: mode=%d bh=%u runs=%u wake_max_us=%u poll_max_us=%u lock calls=%u wait_max_us=%u hold_max_us=%u sel=%u owners q=%u freed=%u KiB=%u drain_max_us=%u zero skip=%u MiB=%u vfail=%u full=%u\n",
++              gLatMode, (unsigned)gBhOn, gBhRuns, gBhWaitMaxUs, gBhPollMaxUs, gLockCalls, gLockWaitMaxUs, gLockHoldMaxUs, gLockHoldSel,
++              gOwnerQueued, gOwnerFreed, gOwnerKiB, gOwnerDrainMaxUs, gZeroSkip, gZeroSkipMiB, gZeroVerifyFail, gZeroFull);
++        gBhRuns = gBhWaitMaxUs = gBhPollMaxUs = 0; gLockCalls = gLockWaitMaxUs = gLockHoldMaxUs = gLockHoldSel = 0;
++        gOwnerDrainMaxUs = 0;
++}
+ void Nord2GPU::tick(OSObject *owner, IOTimerEventSource *sender) {
+         Nord2GPU *d = OSDynamicCast(Nord2GPU, owner); if (!d) return;
+         IOLockLock(d->lock);
+@@ -532,8 +623,10 @@
+         }
+         n2_sys_telemetry(now_us(NULL));
+         if (d->ready) {
++                d->core->lat_release_late = !(gLatMode & 2);   /* 0400 */
+                 n2c_poll(d->core);
+                 d->emitJobStats();
++                lat_emit(d);
+                 if (d->core->state == N2C_CORE_BROKEN) {
+                         d->ready = false; d->setProperty("Nord2GPUState", "fault-memory-pinned");
+                 }
+@@ -588,6 +681,14 @@
+                 timer = IOTimerEventSource::timerEventSource(this, tick);
+                 if (loop && timer && loop->addEventSource(timer) == kIOReturnSuccess) {
+                         setProperty("Nord2GPUState", "waiting-pmic-owner"); timer->setTimeoutMS(1);
++                        /* 0400 */
++                        int lm = 0; if (PE_parse_boot_argn("n2lat", &lm, sizeof(lm))) gLatMode = lm & 15;
++                        gOwnerCall = thread_call_allocate_with_priority(owner_drain, NULL, THREAD_CALL_PRIORITY_KERNEL);
++                        thread_t th = THREAD_NULL; retain();
++                        if (kernel_thread_start_priority(bh_main, this, 92 /* BASEPRI_PREEMPT */, &th) == KERN_SUCCESS) { gBhOn = true; thread_deallocate(th); }
++                        else release();
++                        IOLog("NORD2 GPU LAT: 0400 bottom-half thread %s, owner release %s, mode n2lat=%d (1 BH off, 2 early release, 4 zero again, 8 inline owner free)\n",
++                              gBhOn ? "on" : "FAILED", gOwnerCall ? "deferred" : "inline", gLatMode);
+                 }
+         }
+         int metal = 0;
+@@ -619,6 +720,8 @@
+                 }
+         }
+         if (lock) IOLockUnlock(lock);
++        if (gBhOn) { gBhOn = false; __atomic_store_n(&gBhExit, 1u, __ATOMIC_RELEASE); thread_wakeup((event_t)&gBhPending); }   /* 0400 */
++        owner_drain(NULL, NULL);
+         IOAcceleratorES::stop(provider);
+ }
+ void Nord2GPU::free() {
+@@ -808,6 +911,10 @@
+         irqFlag = 0;
+         write_bank(&gpu, N2HW_JOB_IRQ_MASK, NORD2_GPU_JOB_IRQ_ALL); irqArmed = true;
+ }
++void Nord2GPU::irqRearm() {
++        if (core->state != N2C_CORE_READY || !core->gpu_powered) return;
++        write_bank(&gpu, N2HW_JOB_IRQ_MASK, NORD2_GPU_JOB_IRQ_ALL); irqArmed = true;
++}
+ void Nord2GPU::irqTop() {   /* interrupt context: MMIO + wakeup only */
+         uint32_t st = read_bank(&gpu, N2HW_JOB_IRQ_STATUS);
+         write_bank(&gpu, N2HW_JOB_IRQ_MASK, 0); irqArmed = false;
+@@ -817,7 +924,10 @@
+                 nord2_gic_spi_enable(&g, irqIntid, false);
+         }
+         irqFlag = 1; thread_wakeup((event_t)&irqFlag);
+-        if (timer) timer->setTimeout(1, kMicrosecondScale);   /* 0140: the bottom half (n2c_poll: complete this job, start the next) runs now, not at the next tick */
++        uint64_t tnow = now_us(NULL);
++        if (core) n2c_lat_irq(core, tnow);                     /* 0400: completion time for NORD2 GPU LAT */
++        if (gBhOn && !(gLatMode & 1)) { if (!gBhKickUs) gBhKickUs = tnow; __atomic_store_n(&gBhPending, 1u, __ATOMIC_RELEASE); thread_wakeup((event_t)&gBhPending); }
++        else if (timer) timer->setTimeout(1, kMicrosecondScale);   /* 0140: the bottom half (n2c_poll: complete this job, start the next) runs now, not at the next tick */
+ }
+ void Nord2GPU::irqDispatch(void *, void *, void *, int source) {
+         Nord2GPU *d = irqOwner;
+@@ -1179,8 +1289,38 @@
+                 owner->prepared = true;
+                 t2 = now_us(NULL);
+                 if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=prepared\n", flags); }
+-                static uint8_t zeros[65536];   /* 0141: 64 KiB per call, not 4 KiB */
+-                for (uint64_t off = 0; off < bytes; off += sizeof(zeros)) { uint64_t n = bytes - off < sizeof(zeros) ? bytes - off : sizeof(zeros); md->writeBytes(off, zeros, (IOByteCount)n); }
++                /* 0400: fresh pageable kernel memory is anonymous VM: prepare() wired it by zero-fill faults, so the second zero pass (1-10 ms for
++                 * 3-32 MiB, write-combined copies) is skipped.  Safety net: 65 sampled 16-byte reads must be zero, otherwise the full pass runs. */
++                bool zskip = !(gLatMode & 4);
++                for (unsigned k = 0; zskip && k <= 64; k++) {
++                        uint64_t pg = (uint64_t)count * k / 64; if (pg >= count) pg = count - 1;
++                        uint64_t v[2] = { 1, 1 };
++                        if (md->readBytes(pg * 4096 + ((k * 1360u) & 4080u), v, sizeof(v)) != sizeof(v) || v[0] || v[1]) {
++                                zskip = false; gZeroVerifyFail++;
++                                static unsigned vlogs; if (vlogs < 4) { vlogs++; IOLog("NORD2 GPU LAT: pageable allocation not zero after prepare (bytes=%llu page=%llu): full zero pass\n", bytes, pg); }
++                        }
++                }
++                static unsigned fullChecks;     /* the first 4 skipped buffers are read back completely */
++                if (zskip && __atomic_fetch_add(&fullChecks, 1u, __ATOMIC_RELAXED) < 4) {
++                        uint64_t *chk = (uint64_t *)IOMallocData(16384);
++                        if (!chk) zskip = false;         /* cannot check: zero it (not a verification failure) */
++                        else {
++                                for (uint64_t off = 0; zskip && off < bytes; off += 16384) {
++                                        IOByteCount n = (IOByteCount)(bytes - off < 16384 ? bytes - off : 16384);
++                                        if (md->readBytes(off, chk, n) != n) { zskip = false; break; }
++                                        for (unsigned i = 0; i < n / 8; i++) if (chk[i]) { zskip = false; break; }
++                                }
++                                IOFreeData(chk, 16384);
++                                if (!zskip) { gZeroVerifyFail++; IOLog("NORD2 GPU LAT: full read-back of a pageable allocation not zero (bytes=%llu): full zero pass\n", bytes); }
++                        }
++                }
++                if (!zskip && !(gLatMode & 4) && gZeroVerifyFail) gLatMode |= 4;   /* one failure turns the skip off for the rest of the boot */
++                if (zskip) { gZeroSkip++; gZeroSkipMiB += (uint32_t)(bytes >> 20); }
++                else {
++                        gZeroFull++;
++                        static uint8_t zeros[65536];   /* 0141: 64 KiB per call, not 4 KiB */
++                        for (uint64_t off = 0; off < bytes; off += sizeof(zeros)) { uint64_t n = bytes - off < sizeof(zeros) ? bytes - off : sizeof(zeros); md->writeBytes(off, zeros, (IOByteCount)n); }
++                }
+         } else {
+                 if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=bzero\n", flags); }
+                 bzero(md->getBytesNoCopy(), (size_t)bytes);
+@@ -1458,7 +1598,7 @@
+         if(!nord2_gpu_call_valid(sel,a->scalarInputCount,a->scalarOutputCount,a->structureInputSize,a->structureOutputSize,
+                                  a->scalarInput,a->scalarOutput,a->structureInput,a->structureOutput) ||
+            a->structureInputDescriptor || a->structureOutputDescriptor || a->asyncWakePort!=MACH_PORT_NULL)return kIOReturnBadArgument;
+-        IOLockLock(lock);IOLockLock(gpu->lock);IOReturn result=kIOReturnUnsupported;bool clientHeld=true;
++        uint64_t lk0=now_us(NULL);IOLockLock(lock);IOLockLock(gpu->lock);uint64_t lk1=now_us(NULL);IOReturn result=kIOReturnUnsupported;bool clientHeld=true;
+         if(closed || gpu->stopping){result=kIOReturnNotOpen;goto out;}
+         if(sel==NORD2_GPU_SEL_STATUS){gpu->status((nord2_gpu_status *)a->structureOutput);a->structureOutputSize=sizeof(nord2_gpu_status);result=kIOReturnSuccess;goto out;}
+         if(sel==NORD2_GPU_SEL_HWINFO){
+@@ -1583,5 +1723,10 @@
+         default: break;
+         }
+  out:
++        if(sel!=NORD2_GPU_SEL_WAIT && sel!=NORD2_GPU_SEL_WAIT_SEQ && sel!=NORD2_GPU_SEL_ALLOC){   /* 0400: lock wait / hold (these three drop the GPU lock) */
++                uint64_t lk2=now_us(NULL);gLockCalls++;
++                if(lk1-lk0>gLockWaitMaxUs)gLockWaitMaxUs=(uint32_t)(lk1-lk0);
++                if(lk2-lk1>gLockHoldMaxUs){gLockHoldMaxUs=(uint32_t)(lk2-lk1);gLockHoldSel=sel;}
++        }
+         IOLockUnlock(gpu->lock);if(clientHeld)IOLockUnlock(lock);return result;
+ }

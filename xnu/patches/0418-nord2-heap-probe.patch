@@ -1,0 +1,472 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -244,6 +244,8 @@
+ static void sweet_purge_start(void);
+ extern "C" bool sweet_mem_gpu_private_ok(uint64_t total_private, uint64_t rounded);     /* called by nord2_gpu_transport.h */
+ 
++#include "sweet_fb_heap_probe.inc"           /* 0418: low-bank heap probe (kern.n2heap_probe) */
++
+ static void
+ sweet_pool_args(void)
+ {
+@@ -911,6 +913,7 @@
+ 		sweet_pool_evict_lock = IOLockAlloc();  /* 0406 */
+ 	}
+ 	sweet_purge_start();    /* 0417: sink, 2 s pressure scan, NORD2 MEM SURF line */
++	sweet_heap_probe_arm();  /* 0418 */
+ 	sweet_use_args();       /* 0398 */
+ 	IOLog("NORD2 SURF USE: IOSurface use count mode %d (kern.n2surfuse / n2su: 0 off, 1 user traps, 2 + display/GPU holds), counts at state page +0x%x\n",
+ 	    sweet_use_mode, SWEET_USE_STATE_WORDS);
+--- /dev/null
++++ b/iokit/Kernel/arm/sweet_fb_heap.h
+@@ -0,0 +1,138 @@
++/*
++ * 0418 (heapprobe-20261113): the low-bank graphics heap -- region table and pure helpers (no kernel calls; host test
++ * heapprobe-20261113/test/heap_host_test.c runs exactly this code).  Used by the 0418 probe (sweet_fb_heap_probe.inc) and meant for
++ * the heap itself (0419: displayed BGRA surfaces + GPU-only BOs out of these ranges so XNU's window keeps its pages).
++ *
++ * Every region is (a) inside one free block of LK's mblock_info (live.dts, 20 blocks, 7055 MiB), (b) outside every reserved-memory
++ * node of the live FDT, (c) outside every fixed claim of our own code:
++ *   loader/stock kernel/ramdisk/payload/LK DTB 0x40000000..0x55100000 (dtb 0x47c80000, payload 0x43744000 in the loader logs),
++ *   N2D_SHARE_PA 0x70000000 + 2 MiB (nord2_dvfs.h, mcupm share), N2SCP_DRAM_PHYS 0x89000000 + 0x320000 (nord2_scp.inc),
++ *   Wi-Fi CONN 0x8fb00000 + 0x450000 and DMA pool 0x90000000 + 0xf20000 (wifi_main_fw_place.c, dma_pool_contract.h),
++ *   RWVC 0xa0000000 + 384 MiB (redwood_vcodec.h), display pool 0xc0000000 + 256 MiB (sweet_fb_hw_pool.h),
++ *   cameras/hwcodec/JPEG 0xd0000000..0xdfe70000 (nord2_camdev.inc, nord2_hwcodec.inc, redwood_jpegdec.h),
++ *   XNU's window (>= 0x1_00000000 for both the 3776 and the 5088 MiB loaders).
++ * What none of that proves: that no master left running by the bootloaders (DRAMC dummy read -- Linux puts dram_r0_dummy_read
++ * in exactly 0x55100000..0x5ff00000 --, SSPM/MCUPM/ADSP/SCP shares Linux would allocate at boot, the modem) writes there, and
++ * that no EMI MPU region set by ATF/TEE covers it (the EMI MPU read SMCs return 2 / -1 on this phone, emi-abi notes).  The probe
++ * answers that at run time; class CHECK = next to a claim whose real extent is not known (SCP firmware, Wi-Fi).
++ */
++#ifndef SWEET_FB_HEAP_H
++#define SWEET_FB_HEAP_H
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#define SWEET_FB_HEAP_GRANULE   0x10000ull      /* 64 KiB, = SWEET_FB_HW_POOL_GRANULE */
++#define SWEET_FB_HEAP_NREG      9u
++#define SWEET_FB_HEAP_SAFE      0u              /* inside an LK free block, no claim nearby */
++#define SWEET_FB_HEAP_CHECK     1u              /* inside an LK free block but next to a claim of unknown real extent */
++#define SWEET_FB_HEAP_F_NOPHYS  1u              /* never program as a physical OVL address: inside the IOVA window's numbers 0x90000000..0xB0000000 */
++
++struct sweet_fb_heap_region {
++	uint64_t    base, size;
++	uint32_t    cls, flags;
++	const char *name;
++};
++
++static const struct sweet_fb_heap_region sweet_fb_heap_regions[SWEET_FB_HEAP_NREG] = {
++	{ 0x55100000ull, 0x0ae00000ull, SWEET_FB_HEAP_SAFE,  0,                       "mb5"   },    /* 174 MiB  (Linux: dram_r0_dummy_read) */
++	{ 0x5ff80000ull, 0x10080000ull, SWEET_FB_HEAP_SAFE,  0,                       "mb6a"  },    /* 256.5 MiB, PICACHU end .. DVFS share */
++	{ 0x70200000ull, 0x03e00000ull, SWEET_FB_HEAP_SAFE,  0,                       "mb6b"  },    /* 62 MiB, DVFS share end .. adsp */
++	{ 0x74e30000ull, 0x00fd0000ull, SWEET_FB_HEAP_SAFE,  0,                       "mb7"   },    /* 15.8 MiB, adsp end .. SPM */
++	{ 0x80000000ull, 0x09000000ull, SWEET_FB_HEAP_SAFE,  0,                       "mb11a" },    /* 144 MiB, .. SCP DRAM */
++	{ 0x89320000ull, 0x00ce0000ull, SWEET_FB_HEAP_CHECK, 0,                       "mb11b" },    /* 12.9 MiB, SCP DRAM end .. ccci */
++	{ 0x8d560000ull, 0x00aa0000ull, SWEET_FB_HEAP_CHECK, 0,                       "mb12"  },    /* 10.6 MiB, ccci end .. ap_md_nc_smem */
++	{ 0x91000000ull, 0x0ea00000ull, SWEET_FB_HEAP_CHECK, SWEET_FB_HEAP_F_NOPHYS,  "mb13b" },    /* 234 MiB, Wi-Fi pool end (16 MiB up) .. SCP-reserved */
++	{ 0xb8000000ull, 0x056c0000ull, SWEET_FB_HEAP_SAFE,  0,                       "mb14b" },    /* 86.75 MiB, RWVC end .. vpu_binary */
++};
++
++static inline uint32_t
++sweet_fb_heap_ngran(unsigned r)
++{
++	return (uint32_t)(sweet_fb_heap_regions[r].size / SWEET_FB_HEAP_GRANULE);
++}
++
++/* Index of the region holding all of [pa, pa + len), or -1. */
++static inline int
++sweet_fb_heap_region_of(uint64_t pa, uint64_t len)
++{
++	if (len == 0) {
++		return -1;
++	}
++	for (unsigned r = 0; r < SWEET_FB_HEAP_NREG; r++) {
++		const struct sweet_fb_heap_region *g = &sweet_fb_heap_regions[r];
++		if (pa >= g->base && len <= g->size && pa - g->base <= g->size - len) {
++			return (int)r;
++		}
++	}
++	return -1;
++}
++
++static inline bool
++sweet_fb_heap_contains(uint64_t pa, uint64_t len)
++{
++	return sweet_fb_heap_region_of(pa, len) >= 0;
++}
++
++/* Global granule number (regions concatenated in table order) -> PA; ~0 past the end.  The 0419 bitmap uses this numbering and
++ * resets its first-fit run at every region start so no allocation spans two regions. */
++static inline uint64_t
++sweet_fb_heap_gran_pa(uint32_t g)
++{
++	for (unsigned r = 0; r < SWEET_FB_HEAP_NREG; r++) {
++		uint32_t n = sweet_fb_heap_ngran(r);
++		if (g < n) {
++			return sweet_fb_heap_regions[r].base + (uint64_t)g * SWEET_FB_HEAP_GRANULE;
++		}
++		g -= n;
++	}
++	return ~0ull;
++}
++
++static inline uint32_t
++sweet_fb_heap_total_gran(void)
++{
++	uint32_t t = 0;
++	for (unsigned r = 0; r < SWEET_FB_HEAP_NREG; r++) {
++		t += sweet_fb_heap_ngran(r);
++	}
++	return t;
++}
++
++/* Canary words of a granule: PA-derived, so a write that lands on another granule (address aliasing) never matches. */
++static inline uint64_t
++sweet_fb_heap_canary(uint64_t pa, unsigned k)
++{
++	uint64_t x = pa ^ (0x4e32484541500000ull + k) ^ ((uint64_t)k << 59);
++	x ^= x >> 31; x *= 0x9e3779b97f4a7c15ull; x ^= x >> 29;
++	return x;
++}
++
++/* FNV-1a over 64-bit words (the probe's change detector). */
++static inline uint32_t
++sweet_fb_heap_hash(uint32_t h, uint64_t w)
++{
++	for (unsigned i = 0; i < 8; i++) {
++		h = (h ^ (uint32_t)((w >> (8 * i)) & 0xffu)) * 16777619u;
++	}
++	return h;
++}
++
++/* Probe verdict of one region. */
++enum { SWEET_FB_HEAP_V_NONE = 0, SWEET_FB_HEAP_V_FREE, SWEET_FB_HEAP_V_ACTIVE, SWEET_FB_HEAP_V_BLOCKED, SWEET_FB_HEAP_V_UNMAPPED };
++static inline unsigned
++sweet_fb_heap_verdict(bool mapped, uint32_t changed, uint32_t canary_bad, uint32_t restore_bad, uint32_t changed_late)
++{
++	if (!mapped) {
++		return SWEET_FB_HEAP_V_UNMAPPED;
++	}
++	if (canary_bad || restore_bad) {
++		return SWEET_FB_HEAP_V_BLOCKED;
++	}
++	if (changed || changed_late) {
++		return SWEET_FB_HEAP_V_ACTIVE;
++	}
++	return SWEET_FB_HEAP_V_FREE;
++}
++
++#endif /* SWEET_FB_HEAP_H */
+--- /dev/null
++++ b/iokit/Kernel/arm/sweet_fb_heap_probe.inc
+@@ -0,0 +1,309 @@
++/*
++ * 0418 (heapprobe-20261113): run-time check of the low-bank heap regions (sweet_fb_heap.h).  Included by SweetSurface.cpp.
++ *
++ * kern.n2heap_probe (boot-arg n2hp; compiled default SWEET_FB_HEAP_PROBE_DEFAULT): 0 off, 1 read only, 2 read + canary.
++ * One thread call, three steps, each logs "NORD2 HEAP PROBE:" lines:
++ *   T1 boot+60 s   map every region once (write-combined, the pool's attribute; outside XNU's physmap so no alias), hash 4 x 64 B per
++ *                  64 KiB granule (offsets 0, 16K, 32K, 48K), count non-zero granules; EMI MPU violation words (emimpu 0x10226000
++ *                  +0x1f0/+0x1f8/+0x1fc, the words Linux's violation handler reads; read only, never cleared).
++ *   T2 boot+180 s  hash again: granules whose hash moved = some master writes there ("changed").  Mode 2, only on granules that did
++ *                  not move: per 256-granule chunk save 2 x 64 B (offsets 0 and 32K), write PA-derived canaries, DSB, read all back,
++ *                  restore the saved bytes, DSB, verify the restore.  Canaries live for one chunk only (microseconds).
++ *                  EMI MPU words again (a blocked write latches a violation; slverr = 0 in the live FDT: no bus error, data dropped).
++ *   T3 boot+600 s  hash a third time: changes after T2 ("late") = a master that started later (camera, Wi-Fi, modem use in between).
++ * Verdict per region: FREE / ACTIVE / BLOCKED / UNMAPPED, plus a final summary line.  Nothing is allocated from the regions and every
++ * mapping stays (the 0419 heap reuses it).  A region overlapping XNU's window or the display pool is refused, never touched.
++ */
++#include "sweet_fb_heap.h"
++
++#ifndef SWEET_FB_HEAP_PROBE_DEFAULT
++#define SWEET_FB_HEAP_PROBE_DEFAULT     2
++#endif
++#define SWEET_FB_HEAP_PROBE_CHUNK       256u
++#define SWEET_FB_HEAP_EMIMPU_PA         0x10226000ull
++
++#define SWEET_FB_HEAP_WIMG_IO           0x7u    /* osfmk/arm/memory_types.h VM_WIMG_IO (Device) */
++extern "C" {
++extern unsigned long gPhysBase, gPhysSize;     /* = sweet_fb_iommu_hw.h */
++}
++
++static int           sweet_heap_probe_mode = SWEET_FB_HEAP_PROBE_DEFAULT;
++static uint32_t      sweet_heap_probe_step, sweet_heap_probe_free_mib, sweet_heap_probe_bad_regions;
++SYSCTL_INT(_kern, OID_AUTO, n2heap_probe, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_heap_probe_mode, 0, "0418: low-bank heap probe: 0 off, 1 read only, 2 + canary (read at boot+60/180/600 s)");
++SYSCTL_UINT(_kern, OID_AUTO, n2heap_probe_step, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_heap_probe_step, 0, "0418: last probe step done (3 = finished)");
++SYSCTL_UINT(_kern, OID_AUTO, n2heap_probe_free_mib, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_heap_probe_free_mib, 0, "0418: MiB of regions found FREE");
++SYSCTL_UINT(_kern, OID_AUTO, n2heap_probe_bad, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_heap_probe_bad_regions, 0, "0418: regions not FREE");
++
++struct sweet_heap_probe_reg {
++	vm_offset_t va;
++	uint32_t    nonzero, changed, tested, canary_bad, restore_bad, late;
++	uint64_t    first_bad_pa, first_bad_got;
++};
++static struct sweet_heap_probe_reg sweet_heap_pr[SWEET_FB_HEAP_NREG];
++static uint32_t     *sweet_heap_hash;           /* one per granule, global numbering */
++static uint8_t      *sweet_heap_moved;          /* 1 = changed between T1 and T2: not canaried */
++static thread_call_t sweet_heap_probe_tc;
++static vm_offset_t   sweet_heap_emimpu;
++
++static void
++sweet_heap_probe_emi(const char *when)
++{
++	if (sweet_heap_emimpu == 0) {
++		sweet_heap_emimpu = ml_io_map_unmappable((vm_offset_t)SWEET_FB_HEAP_EMIMPU_PA, 0x1000, SWEET_FB_HEAP_WIMG_IO);
++	}
++	if (sweet_heap_emimpu == 0) {
++		IOLog("NORD2 HEAP PROBE: %s: EMI MPU registers not mapped\n", when);
++		return;
++	}
++	volatile uint32_t *m = (volatile uint32_t *)sweet_heap_emimpu;
++	IOLog("NORD2 HEAP PROBE: %s: EMI MPU violation words +1f0 %08x +1f8 %08x +1fc %08x\n", when, m[0x1f0 / 4], m[0x1f8 / 4], m[0x1fc / 4]);
++}
++
++static uint32_t
++sweet_heap_probe_gran_hash(volatile const uint64_t *p)
++{
++	uint32_t h = 2166136261u;
++	for (unsigned s = 0; s < 4; s++) {
++		volatile const uint64_t *q = p + (s * 0x4000u) / 8;
++		for (unsigned k = 0; k < 8; k++) {
++			h = sweet_fb_heap_hash(h, q[k]);
++		}
++	}
++	return h;
++}
++
++/* Hash every granule; step 1 stores, steps 2/3 compare (2 marks moved granules, 3 counts late changes). */
++static void
++sweet_heap_probe_scan(unsigned step)
++{
++	uint32_t g = 0;
++	for (unsigned r = 0; r < SWEET_FB_HEAP_NREG; r++) {
++		struct sweet_heap_probe_reg *pr = &sweet_heap_pr[r];
++		uint32_t n = sweet_fb_heap_ngran(r);
++		if (pr->va == 0) {
++			g += n;
++			continue;
++		}
++		for (uint32_t i = 0; i < n; i++, g++) {
++			volatile const uint64_t *p = (volatile const uint64_t *)(pr->va + (uint64_t)i * SWEET_FB_HEAP_GRANULE);
++			uint32_t h = sweet_heap_probe_gran_hash(p);
++			if (step == 1) {
++				sweet_heap_hash[g] = h;
++				bool nz = false;
++				for (unsigned k = 0; k < 8 && !nz; k++) {
++					nz = p[k] != 0;
++				}
++				pr->nonzero += nz;
++			} else if (h != sweet_heap_hash[g]) {
++				if (step == 2) {
++					sweet_heap_moved[g] = 1;
++					pr->changed++;
++				} else {
++					pr->late++;
++				}
++				sweet_heap_hash[g] = h;
++			}
++		}
++	}
++}
++
++static void
++sweet_heap_probe_canary(void)
++{
++	static uint64_t save[SWEET_FB_HEAP_PROBE_CHUNK][2][8];
++	uint32_t g = 0;
++	for (unsigned r = 0; r < SWEET_FB_HEAP_NREG; r++) {
++		struct sweet_heap_probe_reg *pr = &sweet_heap_pr[r];
++		const uint64_t base = sweet_fb_heap_regions[r].base;
++		uint32_t n = sweet_fb_heap_ngran(r);
++		if (pr->va == 0) {
++			g += n;
++			continue;
++		}
++		for (uint32_t c0 = 0; c0 < n; c0 += SWEET_FB_HEAP_PROBE_CHUNK) {
++			uint32_t cn = n - c0 < SWEET_FB_HEAP_PROBE_CHUNK ? n - c0 : SWEET_FB_HEAP_PROBE_CHUNK;
++			for (uint32_t j = 0; j < cn; j++) {
++				if (sweet_heap_moved[g + c0 + j]) {
++					continue;
++				}
++				for (unsigned s = 0; s < 2; s++) {
++					volatile uint64_t *p = (volatile uint64_t *)(pr->va + (uint64_t)(c0 + j) * SWEET_FB_HEAP_GRANULE + s * 0x8000u);
++					uint64_t pa = base + (uint64_t)(c0 + j) * SWEET_FB_HEAP_GRANULE + s * 0x8000u;
++					for (unsigned k = 0; k < 8; k++) {
++						save[j][s][k] = p[k];
++					}
++					for (unsigned k = 0; k < 8; k++) {
++						p[k] = sweet_fb_heap_canary(pa, k);
++					}
++				}
++			}
++			__builtin_arm_dsb(0xf);
++			for (uint32_t j = 0; j < cn; j++) {
++				if (sweet_heap_moved[g + c0 + j]) {
++					continue;
++				}
++				pr->tested++;
++				for (unsigned s = 0; s < 2; s++) {
++					volatile uint64_t *p = (volatile uint64_t *)(pr->va + (uint64_t)(c0 + j) * SWEET_FB_HEAP_GRANULE + s * 0x8000u);
++					uint64_t pa = base + (uint64_t)(c0 + j) * SWEET_FB_HEAP_GRANULE + s * 0x8000u;
++					bool bad = false;
++					for (unsigned k = 0; k < 8; k++) {
++						uint64_t got = p[k];
++						if (got != sweet_fb_heap_canary(pa, k) && !bad) {
++							bad = true;
++							if (pr->canary_bad == 0) {
++								pr->first_bad_pa = pa + 8 * k;
++								pr->first_bad_got = got;
++							}
++						}
++					}
++					pr->canary_bad += bad;
++				}
++			}
++			for (uint32_t j = 0; j < cn; j++) {         /* restore, also where the canary did not stick */
++				if (sweet_heap_moved[g + c0 + j]) {
++					continue;
++				}
++				for (unsigned s = 0; s < 2; s++) {
++					volatile uint64_t *p = (volatile uint64_t *)(pr->va + (uint64_t)(c0 + j) * SWEET_FB_HEAP_GRANULE + s * 0x8000u);
++					for (unsigned k = 0; k < 8; k++) {
++						p[k] = save[j][s][k];
++					}
++				}
++			}
++			__builtin_arm_dsb(0xf);
++			for (uint32_t j = 0; j < cn; j++) {
++				if (sweet_heap_moved[g + c0 + j]) {
++					continue;
++				}
++				bool bad = false;
++				for (unsigned s = 0; s < 2 && !bad; s++) {
++					volatile uint64_t *p = (volatile uint64_t *)(pr->va + (uint64_t)(c0 + j) * SWEET_FB_HEAP_GRANULE + s * 0x8000u);
++					for (unsigned k = 0; k < 8 && !bad; k++) {
++						bad = p[k] != save[j][s][k];
++					}
++				}
++				pr->restore_bad += bad;
++			}
++		}
++		g += n;
++	}
++	/* the restored words are the T3 baseline: rehash */
++	g = 0;
++	for (unsigned r = 0; r < SWEET_FB_HEAP_NREG; r++) {
++		uint32_t n = sweet_fb_heap_ngran(r);
++		for (uint32_t i = 0; sweet_heap_pr[r].va != 0 && i < n; i++) {
++			sweet_heap_hash[g + i] = sweet_heap_probe_gran_hash((volatile const uint64_t *)(sweet_heap_pr[r].va + (uint64_t)i * SWEET_FB_HEAP_GRANULE));
++		}
++		g += n;
++	}
++}
++
++static bool
++sweet_heap_probe_map(void)
++{
++	uint32_t total = sweet_fb_heap_total_gran();
++	sweet_heap_hash = (uint32_t *)IOMallocZero(total * sizeof(uint32_t));
++	sweet_heap_moved = (uint8_t *)IOMallocZero(total);
++	if (sweet_heap_hash == NULL || sweet_heap_moved == NULL) {
++		IOLog("NORD2 HEAP PROBE: no memory for %u granule records\n", total);
++		return false;
++	}
++	for (unsigned r = 0; r < SWEET_FB_HEAP_NREG; r++) {
++		const struct sweet_fb_heap_region *g = &sweet_fb_heap_regions[r];
++		bool xnu = g->base < (uint64_t)gPhysBase + gPhysSize && (uint64_t)gPhysBase < g->base + g->size;
++		bool pool = g->base < SWEET_FB_HW_POOL_BASE + SWEET_FB_HW_POOL_SIZE && SWEET_FB_HW_POOL_BASE < g->base + g->size;
++		if (xnu || pool || g->base + g->size > 0x100000000ull) {
++			IOLog("NORD2 HEAP PROBE: region %s %#llx+%#llx refused (%s)\n", g->name, g->base, g->size, xnu ? "XNU RAM" : pool ? "display pool" : "above 4 GiB");
++			continue;
++		}
++		sweet_heap_pr[r].va = ml_io_map_unmappable((vm_offset_t)g->base, (vm_size_t)g->size, SWEET_POOL_WIMG_WCOMB);
++	}
++	return true;
++}
++
++static void
++sweet_heap_probe_report(void)
++{
++	uint32_t free_mib = 0, bad = 0;
++	for (unsigned r = 0; r < SWEET_FB_HEAP_NREG; r++) {
++		const struct sweet_fb_heap_region *g = &sweet_fb_heap_regions[r];
++		struct sweet_heap_probe_reg *pr = &sweet_heap_pr[r];
++		unsigned v = sweet_fb_heap_verdict(pr->va != 0, pr->changed, pr->canary_bad, pr->restore_bad, pr->late);
++		static const char *const vn[] = { "none", "FREE", "ACTIVE", "BLOCKED", "UNMAPPED" };
++		IOLog("NORD2 HEAP PROBE: region %s pa %#llx..%#llx %llu KiB %s: granules %u nonzero %u changed %u tested %u canary_bad %u "
++		    "(first pa %#llx got %#llx) restore_bad %u late %u -> %s%s\n", g->name, g->base, g->base + g->size, g->size >> 10,
++		    g->cls ? "CHECK" : "SAFE", sweet_fb_heap_ngran(r), pr->nonzero, pr->changed, pr->tested, pr->canary_bad, pr->first_bad_pa,
++		    pr->first_bad_got, pr->restore_bad, pr->late, vn[v], sweet_heap_probe_mode >= 2 ? "" : " (read only)");
++		if (v == SWEET_FB_HEAP_V_FREE) {
++			free_mib += (uint32_t)(g->size >> 20);
++		} else {
++			bad++;
++		}
++	}
++	sweet_heap_probe_free_mib = free_mib;
++	sweet_heap_probe_bad_regions = bad;
++	IOLog("NORD2 HEAP PROBE: summary mode %d: %u MiB FREE, %u region(s) not FREE\n", sweet_heap_probe_mode, free_mib, bad);
++}
++
++static void
++sweet_heap_probe_tick(thread_call_param_t, thread_call_param_t)
++{
++	int mode = __atomic_load_n(&sweet_heap_probe_mode, __ATOMIC_RELAXED);
++	uint32_t next_s = 0;
++	if (mode <= 0) {
++		IOLog("NORD2 HEAP PROBE: off (kern.n2heap_probe 0) at step %u\n", sweet_heap_probe_step);
++		return;
++	}
++	switch (sweet_heap_probe_step) {
++	case 0:
++		if (!sweet_heap_probe_map()) {
++			return;
++		}
++		sweet_heap_probe_emi("T1");
++		sweet_heap_probe_scan(1);
++		IOLog("NORD2 HEAP PROBE: T1 snapshot done (mode %d, %u granules)\n", mode, sweet_fb_heap_total_gran());
++		next_s = 120;
++		break;
++	case 1:
++		sweet_heap_probe_scan(2);
++		if (mode >= 2) {
++			sweet_heap_probe_canary();
++		}
++		sweet_heap_probe_emi("T2");
++		IOLog("NORD2 HEAP PROBE: T2 done (%s)\n", mode >= 2 ? "changes + canary" : "changes only");
++		next_s = 420;
++		break;
++	default:
++		sweet_heap_probe_scan(3);
++		sweet_heap_probe_emi("T3");
++		sweet_heap_probe_report();
++		sweet_heap_probe_step = 3;
++		return;
++	}
++	sweet_heap_probe_step++;
++	uint64_t dl = 0;
++	clock_interval_to_deadline(next_s, kSecondScale, &dl);
++	thread_call_enter_delayed(sweet_heap_probe_tc, dl);
++}
++
++static void
++sweet_heap_probe_arm(void)
++{
++	int v = 0;
++	if (PE_parse_boot_argn("n2hp", &v, sizeof(v)) && v >= 0 && v <= 2) {
++		sweet_heap_probe_mode = v;
++	}
++	if (sweet_heap_probe_mode <= 0 || sweet_heap_probe_tc != NULL) {
++		return;
++	}
++	sweet_heap_probe_tc = thread_call_allocate(sweet_heap_probe_tick, NULL);
++	if (sweet_heap_probe_tc == NULL) {
++		return;
++	}
++	uint64_t dl = 0;
++	clock_interval_to_deadline(60, kSecondScale, &dl);
++	thread_call_enter_delayed(sweet_heap_probe_tc, dl);
++	IOLog("NORD2 HEAP PROBE: armed, mode %d (kern.n2heap_probe / n2hp), %u regions %u granules, steps at boot+60/180/600 s\n",
++	    sweet_heap_probe_mode, SWEET_FB_HEAP_NREG, sweet_fb_heap_total_gran());
++}

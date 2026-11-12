@@ -1,0 +1,121 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -40,6 +40,7 @@
+ #include "sweet_fb_scan.h"
+ #include "sweet_fb_swapwait.h"
+ #include "sweet_fb_blend.h"           /* 0390 */
++#include "sweet_fb_scene.h"           /* 0392 */
+ 
+ /* 0390: n2fbblend=0 copies the SwapEnd layers over each other as before 0390 (default 1: composite them). */
+ static uint32_t sweet_fb_blend_mode = 1;
+@@ -56,6 +57,10 @@
+ static uint32_t sweet_fb_inval_mode = 1;
+ static uint64_t sweet_fb_multi_seen;
+ static uint32_t sweet_fb_swaplog_n;
++/* 0392: the layers a swap leaves out of its mask keep their surface (sweet_fb_scene.h); n2fbretain=0 = every record is the whole scene. */
++static uint32_t sweet_fb_retain_mode = 1;
++static struct sweet_fb_scene sweet_fb_scene_state;
++static uint32_t sweet_fb_retain_logged;
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void nord2_dvfs_ui_kick(void);   /* bsd/dev/nord2_cpufreq.c (0184): the UI is active, the CPU governor keeps its boost floor */
+@@ -379,6 +384,8 @@
+ #endif
+ 	{ uint32_t bl = 1; if (PE_parse_boot_argn("n2fbblend", &bl, sizeof(bl))) { sweet_fb_blend_mode = bl ? 1 : 0; } }   /* 0390 */
+ 	{ uint32_t iv = 1; if (PE_parse_boot_argn("n2fbinval", &iv, sizeof(iv))) { sweet_fb_inval_mode = iv ? 1 : 0; } }   /* 0391 */
++	{ uint32_t rt = 1; if (PE_parse_boot_argn("n2fbretain", &rt, sizeof(rt))) { sweet_fb_retain_mode = rt ? 1 : 0; } }   /* 0392 */
++	IOLog("SWEET FB: layers outside a swap's mask kept %s (0392)\n", sweet_fb_retain_mode ? "on" : "off (n2fbretain=0)");
+ 	IOLog("SWEET FB: multi-layer source cache clean+invalidate %s (0391)\n", sweet_fb_inval_mode ? "on" : "off (n2fbinval=0)");
+ 	IOLog("SWEET FB: layer composition %s (0390)\n", sweet_fb_blend_mode ? "on" : "off (n2fbblend=0)");
+ 	uint32_t hz = SWEET_FB_DEFAULT_HZ;
+@@ -1640,6 +1647,24 @@
+ 	/* Pin the surfaces now: present() runs up to a flush interval (100 ms at
+ 	 * the default 10 Hz) later, when the ids may have been recycled/destroyed. */
+ 	sweet_fb_pending_surfaces incoming, replaced;
++	/* 0392: the record becomes the whole scene (layers outside its mask keep their surface) before anything uses it */
++	uint8_t scene[SWEET_FB_SWAP_REC_SIZE];
++	uint32_t rawMask = get32(rec, 0x104), rawIds[SWEET_FB_LAYERS];
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		rawIds[layer] = get32(rec, 0x54 + 4 * layer);
++	}
++	if (sweet_fb_retain_mode != 0) {
++		memcpy(scene, rec, sizeof(scene));
++		IOLockLock(fLock);
++		uint32_t eff = sweet_fb_scene_apply(&sweet_fb_scene_state, scene);
++		IOLockUnlock(fLock);
++		rec = scene;
++		if ((eff & ~rawMask) != 0 && __atomic_load_n(&sweet_fb_retain_logged, __ATOMIC_RELAXED) < 24 &&
++		    __atomic_add_fetch(&sweet_fb_retain_logged, 1, __ATOMIC_RELAXED) <= 24) {
++			IOLog("NORD2 FB RETAIN: swap=%u mask %#x ids=%u,%u,%u,%u -> scene mask %#x ids=%u,%u,%u,%u\n", get32(rec, 0x50), rawMask,
++			    rawIds[0], rawIds[1], rawIds[2], rawIds[3], eff, get32(rec, 0x54), get32(rec, 0x58), get32(rec, 0x5c), get32(rec, 0x60));
++		}
++	}
+ 	uint32_t ids[SWEET_FB_LAYERS];
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		ids[layer] = get32(rec, 0x54 + 4 * layer);
+@@ -1683,7 +1708,8 @@
+ 	}
+ 	if (__atomic_load_n(&sweet_fb_multi_seen, __ATOMIC_RELAXED) != 0 && __atomic_load_n(&sweet_fb_swaplog_n, __ATOMIC_RELAXED) < 60 &&
+ 	    __atomic_add_fetch(&sweet_fb_swaplog_n, 1, __ATOMIC_RELAXED) <= 60) {          /* 0391 */
+-		IOLog("NORD2 FB SWAPLOG: swap=%u mask=%#x ids=%u,%u,%u,%u multi_presents=%llu\n", get32(rec, 0x50), get32(rec, 0x104),
++		IOLog("NORD2 FB SWAPLOG: swap=%u mask=%#x ids=%u,%u,%u,%u scene mask=%#x ids=%u,%u,%u,%u multi_presents=%llu\n", get32(rec, 0x50), rawMask,
++		    rawIds[0], rawIds[1], rawIds[2], rawIds[3], get32(rec, 0x104),
+ 		    get32(rec, 0x54), get32(rec, 0x58), get32(rec, 0x5c), get32(rec, 0x60), __atomic_load_n(&sweet_fb_multi_seen, __ATOMIC_RELAXED));
+ 	}
+ 	nord2_dvfs_ui_kick();
+--- /dev/null
++++ b/iokit/Kernel/arm/sweet_fb_scene.h
+@@ -0,0 +1,53 @@
++#ifndef SWEET_FB_SCENE_H
++#define SWEET_FB_SCENE_H
++/*
++ * 0392 (fbretain-20261112): a SwapEnd record updates only the layers in its mask (+0x104); the others keep what the previous
++ * swaps put there.  Pure and host-testable.
++ *
++ * Why (run fbd1, q10jfd): backboardd detached Photos' drawable to layer 0 with two full swaps (mask 0x7, ids 52/61 + its own
++ * frame 2/3 on layer 1, layer 2 = 0 = off), then sent its UI-only updates as mask 0x2 ids 0,3,0,0: layer 1 changed, layer 0 NOT
++ * in the mask = unchanged.  The framebuffer read every record as the whole scene, so those swaps showed backboardd's transparent
++ * frame alone: black grid from the first UI-only swap on (the kernel's copy of the full swaps was verified good: layer 0 pixels
++ * ff34201b... reached the panel).  A selection animation makes backboardd composite Photos into its own frame again (one layer):
++ * the photo shows until the next detach + partial swap.
++ *
++ * The scene keeps per layer the surface id and the two rects (+0x54 id, +0x64 rect a, +0xc4 rect b); a layer in the mask takes
++ * the record's values (id 0 = layer off), a layer outside it keeps its own.  The record handed on is rewritten to the whole scene
++ * and its mask to the layers that have a surface.
++ */
++#include <stdbool.h>
++#include <stdint.h>
++
++#define SWEET_FB_SCENE_LAYERS 4u
++
++struct sweet_fb_scene {
++	uint32_t id[SWEET_FB_SCENE_LAYERS];
++	uint8_t  a[SWEET_FB_SCENE_LAYERS][16], b[SWEET_FB_SCENE_LAYERS][16];
++};
++
++static inline uint32_t sweet_fb_scene_rd(const uint8_t *p) { uint32_t v; __builtin_memcpy(&v, p, 4); return v; }
++static inline void sweet_fb_scene_wr(uint8_t *p, uint32_t v) { __builtin_memcpy(p, &v, 4); }
++
++/* rec: a full SwapEnd record (>= 0x108 bytes), rewritten in place.  Returns the effective mask. */
++static inline uint32_t
++sweet_fb_scene_apply(struct sweet_fb_scene *sc, uint8_t *rec)
++{
++	uint32_t mask = sweet_fb_scene_rd(rec + 0x104), eff = 0;
++	for (uint32_t l = 0; l < SWEET_FB_SCENE_LAYERS; l++) {
++		if (mask & (1u << l)) {
++			sc->id[l] = sweet_fb_scene_rd(rec + 0x54 + 4 * l);
++			__builtin_memcpy(sc->a[l], rec + 0x64 + 16 * l, 16);
++			__builtin_memcpy(sc->b[l], rec + 0xc4 + 16 * l, 16);
++		}
++	}
++	for (uint32_t l = 0; l < SWEET_FB_SCENE_LAYERS; l++) {
++		sweet_fb_scene_wr(rec + 0x54 + 4 * l, sc->id[l]);
++		__builtin_memcpy(rec + 0x64 + 16 * l, sc->a[l], 16);
++		__builtin_memcpy(rec + 0xc4 + 16 * l, sc->b[l], 16);
++		if (sc->id[l] != 0) { eff |= 1u << l; }
++	}
++	sweet_fb_scene_wr(rec + 0x104, eff);
++	return eff;
++}
++
++#endif /* SWEET_FB_SCENE_H */

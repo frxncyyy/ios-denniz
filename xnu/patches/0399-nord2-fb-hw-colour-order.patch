@@ -1,0 +1,372 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -88,6 +88,10 @@
+ static uint32_t sweet_fb_hw_test_req;           /* kern.n2fbhwtest: requested test, taken by handOver */
+ static uint32_t sweet_fb_hw_test_last;          /* last test run (read back by the sysctl) */
+ static uint32_t sweet_fb_hw_hold_ms = 3000;     /* kern.n2fbhwhold */
++/* 0399 (hwcolor-20261112): colour order.  kern.n2fbhwcsw bit 0 flips CON BYTE_SWAP (R<->B) on layer 1, bit 1 on layer 0, for every HW
++ * frame and test; kern.n2fbhwselftest (default 1): the first switch to mode 2/3 of a boot runs the colour test (test 6) first. */
++static uint32_t sweet_fb_hw_csw;
++static uint32_t sweet_fb_hw_selftest = 1, sweet_fb_hw_selftest_done;
+ static uint32_t sweet_fb_hw_mode_gen;           /* 0397: kern.n2fbhw writes (a manual setting cancels a fault backoff) */
+ static uint32_t sweet_fb_pool_alias_mode = 1;   /* 0397: kern.n2fbpoolalias: CPU-path reads of WC pool surfaces via a read-only cacheable alias */
+ 
+@@ -387,6 +391,7 @@
+ 	bool                fHwOn;               /* the OVL*_2L registers hold a HW plan (not the CPU path's panel buffer) */
+ 	bool                fWorkHw;             /* the frame being presented is a HW frame */
+ 	struct sweet_fb_hw_plan fHwPlan, fHwShownPlan;
++	uint32_t            fHwLastCon[SWEET_FB_HW_SLOTS];      /* 0399: CON of layer 0 / layer 1 last written */
+ 	sweet_fb_pending_surfaces fHwHeld;       /* surfaces of the shown HW frame: held until the overlay stops reading them */
+ 	SweetSurface       *fHwLayerS[SWEET_FB_HW_SLOTS];
+ 	uint32_t            fHwLayerId[SWEET_FB_HW_SLOTS];
+@@ -479,6 +484,12 @@
+ 	uint32_t old = __atomic_exchange_n(&sweet_fb_hw_mode, (uint32_t)v, __ATOMIC_RELAXED);
+ 	__atomic_fetch_add(&sweet_fb_hw_mode_gen, 1u, __ATOMIC_RELAXED);      /* 0397 */
+ 	IOLog("NORD2 FB HW: mode %u -> %d (sysctl kern.n2fbhw: 0 off, 1 dry run, 2 single layer, 3 two layers)\n", old, v);
++	if (v >= (int)SWEET_FB_HW_SINGLE && __atomic_load_n(&sweet_fb_hw_selftest, __ATOMIC_RELAXED) != 0 &&
++	    __atomic_exchange_n(&sweet_fb_hw_selftest_done, 1u, __ATOMIC_RELAXED) == 0) {
++		uint32_t none = 0;
++		(void)__atomic_compare_exchange_n(&sweet_fb_hw_test_req, &none, 6u, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
++		IOLog("NORD2 FB HW: colour self-test (test 6) queued before the first HW frame of this boot (kern.n2fbhwselftest=0 skips it)\n");
++	}
+ 	return 0;
+ }
+ static int
+@@ -488,7 +499,7 @@
+ 	int v = (int)__atomic_load_n(&sweet_fb_hw_pm, __ATOMIC_RELAXED), changed = 0;
+ 	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
+ 	if (err != 0 || !changed) { return err; }
+-	if (v < 0 || v > 2) { return EINVAL; }
++	if (v < 0 || v > 3) { return EINVAL; }
+ 	__atomic_store_n(&sweet_fb_hw_pm, (uint32_t)v, __ATOMIC_RELAXED);
+ 	IOLog("NORD2 FB HW: upper-layer CON variant pm %d = %08x (sysctl kern.n2fbhwpm)\n", v, sweet_fb_hw_con_upper((uint32_t)v));
+ 	return 0;
+@@ -500,12 +511,26 @@
+ 	int v = (int)__atomic_load_n(&sweet_fb_hw_test_last, __ATOMIC_RELAXED), changed = 0;
+ 	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
+ 	if (err != 0 || !changed) { return err; }
+-	if (v < 1 || v > 5) { return EINVAL; }
++	if (v < 1 || v > 6) { return EINVAL; }
+ 	__atomic_store_n(&sweet_fb_hw_test_req, (uint32_t)v, __ATOMIC_RELEASE);
+ 	IOLog("NORD2 FB HW: test %d requested (sysctl kern.n2fbhwtest), starts at the next idle present slot\n", v);
+ 	return 0;
+ }
+ static int
++sweet_fb_hw_sysctl_csw SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = (int)__atomic_load_n(&sweet_fb_hw_csw, __ATOMIC_RELAXED), changed = 0;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (err != 0 || !changed) { return err; }
++	if (v < 0 || v > 3) { return EINVAL; }
++	__atomic_store_n(&sweet_fb_hw_csw, (uint32_t)v, __ATOMIC_RELAXED);
++	uint32_t pm = __atomic_load_n(&sweet_fb_hw_pm, __ATOMIC_RELAXED);
++	IOLog("NORD2 FB HW: colour swap kern.n2fbhwcsw=%d: layer 0 CON %08x, layer 1 CON %08x (pm %u) from the next HW frame / test\n", v,
++	    SWEET_FB_HW_CON_OPAQUE ^ ((v & 2) ? SWEET_FB_HW_CON_BYTE_SWAP : 0u), sweet_fb_hw_con_upper(pm) ^ ((v & 1) ? SWEET_FB_HW_CON_BYTE_SWAP : 0u), pm);
++	return 0;
++}
++static int
+ sweet_fb_hw_sysctl_hold SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(oidp, arg1, arg2)
+@@ -529,9 +554,13 @@
+ SYSCTL_PROC(_kern, OID_AUTO, n2fbhw, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sweet_fb_hw_sysctl_mode, "I",
+     "0396 HW composition: 0 off, 1 dry run, 2 single layer (H3), 3 two layers (H4)");
+ SYSCTL_PROC(_kern, OID_AUTO, n2fbhwpm, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sweet_fb_hw_sysctl_pm, "I",
+-    "0396 upper-layer CON: 0 straight 0x21ff, 1 legacy 0x008031ff, 2 DRM premultiplied 0x038031ff");
++    "0396/0399 upper-layer CON: 0 straight 0x21ff, 1 legacy 0x008031ff, 2 premultiplied BGRA 0x028031ff, 3 DRM-table 0x038031ff");
+ SYSCTL_PROC(_kern, OID_AUTO, n2fbhwtest, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sweet_fb_hw_sysctl_test, "I",
+-    "0396 H2 test pattern: 1 pattern, 2/3/4 + alpha gradient with pm 0/2/1, 5 = 1..4");
++    "0396/0399 H2 test: 1 pattern, 2/3/4 + alpha gradient with pm 0/2/3, 6 colour test (R|G|B on both layers), 5 = 1,2,3,4,6");
++SYSCTL_PROC(_kern, OID_AUTO, n2fbhwcsw, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sweet_fb_hw_sysctl_csw, "I",
++    "0399 flip CON BYTE_SWAP (R<->B): bit 0 layer 1, bit 1 layer 0");
++SYSCTL_UINT(_kern, OID_AUTO, n2fbhwselftest, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_hw_selftest, 0,
++    "0399 1: colour test 6 before the first HW frame of a boot");
+ SYSCTL_PROC(_kern, OID_AUTO, n2fbhwhold, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sweet_fb_hw_sysctl_hold, "I",
+     "0396 test pattern hold, ms");
+ SYSCTL_PROC(_kern, OID_AUTO, n2fbhwstat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sweet_fb_hw_sysctl_stat, "A",
+@@ -662,7 +691,7 @@
+ 	IOLog("SWEET FB: layer composition %s (0390)\n", sweet_fb_blend_mode ? "on" : "off (n2fbblend=0)");
+ 	sweet_fb_pending_surfaces_init(&fHwHeld);       /* 0396 */
+ 	bzero(&fHwSt, sizeof(fHwSt)); fHwInitDone = fHwInitOk = fHwOn = fWorkHw = false; fHwN = 0; fHwTestMem = NULL; fHwTestMap = NULL;
+-	IOLog("NORD2 FB HW: overlay composition (0396) mode %u at boot (sysctl kern.n2fbhw 0 off / 1 dry / 2 single / 3 two layers; kern.n2fbhwtest 1..5)\n",
++	IOLog("NORD2 FB HW: overlay composition (0396) mode %u at boot (sysctl kern.n2fbhw 0 off / 1 dry / 2 single / 3 two layers; kern.n2fbhwtest 1..6, kern.n2fbhwcsw)\n",
+ 	    sweet_fb_hw_mode);
+ 	uint32_t hz = SWEET_FB_DEFAULT_HZ;
+ 	/* sweetfb_hz=<n> (0/60+ = every vsync); short alias n2fbhz for the full UI command line (600/607 characters). */
+@@ -1111,8 +1140,8 @@
+ 	/* 0396: an H2 test pattern requested by sysctl runs on the present thread while it is idle (swaps wait meanwhile; SwapWait valve) */
+ 	if (!fPowerOff && fPState == 0 && fNextState == 0 && fNbReady && __atomic_load_n(&sweet_fb_hw_test_req, __ATOMIC_ACQUIRE) != 0) {
+ 		uint32_t t = __atomic_exchange_n(&sweet_fb_hw_test_req, 0, __ATOMIC_ACQ_REL);
+-		if (t >= 1 && t <= 5) {
+-			fHwTestId = t; fHwTestStep = t == 5 ? 1 : t; fHwTestEnd = t == 5 ? 4 : t; fHwTestPhase = 0; fHwTestReapply = fHwOn;
++		if (t >= 1 && t <= 6) {
++			fHwTestId = t; fHwTestStep = t == 5 ? 1 : t; fHwTestEnd = t == 5 ? 6 : t; fHwTestPhase = 0; fHwTestReapply = fHwOn;
+ 			fHwTestT0 = sweet_fb_abs_to_us(mach_absolute_time());
+ 			fPState = 7;
+ 			IOLockUnlock(fLock);
+@@ -1951,10 +1980,10 @@
+ {
+ 	IOLog("NORD2 FB HW: plan %s swap %u layers %u: pipe0 src_con %x L0 %08x pitch %u size %08x off %08x con %08x L1 %08x size %08x off %08x con %08x | "
+ 	    "pipe1 src_con %x L0 %08x pitch %u size %08x off %08x con %08x L1 %08x size %08x off %08x con %08x\n", what, swap, p->nlayers,
+-	    p->src_con[0], p->slot[0][0].addr, p->slot[0][0].pitch, p->slot[0][0].size, p->slot[0][0].offset, p->slot[0][0].con,
+-	    p->slot[0][1].addr, p->slot[0][1].size, p->slot[0][1].offset, p->slot[0][1].con,
+-	    p->src_con[1], p->slot[1][0].addr, p->slot[1][0].pitch, p->slot[1][0].size, p->slot[1][0].offset, p->slot[1][0].con,
+-	    p->slot[1][1].addr, p->slot[1][1].size, p->slot[1][1].offset, p->slot[1][1].con);
++	    p->src_con[0], p->slot[0][0].addr, p->slot[0][0].pitch, p->slot[0][0].size, p->slot[0][0].offset, sweet_fb_hw_con_final(p, 0, 0),
++	    p->slot[0][1].addr, p->slot[0][1].size, p->slot[0][1].offset, sweet_fb_hw_con_final(p, 0, 1),
++	    p->src_con[1], p->slot[1][0].addr, p->slot[1][0].pitch, p->slot[1][0].size, p->slot[1][0].offset, sweet_fb_hw_con_final(p, 1, 0),
++	    p->slot[1][1].addr, p->slot[1][1].size, p->slot[1][1].offset, sweet_fb_hw_con_final(p, 1, 1));
+ }
+ 
+ /* Once, before the first HW frame / test: the overlay must be in the CPU path's verified layout and the OVL ports' M4U off. */
+@@ -2094,6 +2123,20 @@
+ 			return false;
+ 		}
+ 	}
++	{   /* 0399: the CON values actually written, whenever they change (and the first 4 applies) */
++		static uint32_t lastCon[2][2], conLogs;
++		uint32_t c[2][2];
++		for (unsigned k = 0; k < SWEET_FB_HW_PIPES; k++) {
++			for (unsigned i = 0; i < SWEET_FB_HW_SLOTS; i++) { c[k][i] = p->slot[k][i].en ? sweet_fb_hw_con_final(p, k, i) : 0u; }
++		}
++		if (conLogs < 4 || memcmp(c, lastCon, sizeof(c)) != 0) {
++			conLogs++;
++			memcpy(lastCon, c, sizeof(c));
++			IOLog("NORD2 FB HW: CON written pipe0 L0 %08x L1 %08x | pipe1 L0 %08x L1 %08x (pm %u, csw %u; BYTE_SWAP=R<->B bit 24, RGB_SWAP bit 25, MAN bit 23)\n",
++			    c[0][0], c[0][1], c[1][0], c[1][1], __atomic_load_n(&sweet_fb_hw_pm, __ATOMIC_RELAXED), __atomic_load_n(&sweet_fb_hw_csw, __ATOMIC_RELAXED));
++		}
++		fHwLastCon[0] = c[0][0] ? c[0][0] : c[1][0]; fHwLastCon[1] = c[0][1] ? c[0][1] : c[1][1];
++	}
+ 	uint64_t us = sweet_fb_abs_to_us(mach_absolute_time() - t0);
+ 	fHwSt.reg_us_sum += us;
+ 	if (us > fHwSt.reg_us_max) { fHwSt.reg_us_max = us; }
+@@ -2242,6 +2285,7 @@
+ 		fHwLayerS[i] = ss[i]; fHwLayerId[i] = ids[i]; fHwIdOk[i] = true; fHwSeq[i] = nord2_gpu_surface_write_seq(ids[i]);
+ 	}
+ 	fHwN = n;
++	sweet_fb_hw_plan_csw(&p, __atomic_load_n(&sweet_fb_hw_csw, __ATOMIC_RELAXED));      /* 0399 */
+ 	if (!hwApply(&p)) { fHwN = 0; fHwSt.cpu_frames++; return 0; }      /* faulted: mode 0, CPU path restored; this frame by CPU */
+ 	fHwPlan = p;
+ 	fHwSt.planned++;
+@@ -2317,14 +2361,15 @@
+ 		}
+ 		struct sweet_fb_hw_in in[2];
+ 		uint32_t pm = 0;
+-		unsigned n = sweet_fb_hw_test_layers(in, fHwTestStep, slot, fRowBytes, fWidth, fHeight, &pm);
++		unsigned n = sweet_fb_hw_test_layers(in, fHwTestStep, slot, fRowBytes, fWidth, fHeight, __atomic_load_n(&sweet_fb_hw_pm, __ATOMIC_RELAXED), &pm);
+ 		struct sweet_fb_hw_plan p;
+ 		int r = sweet_fb_hw_plan_make(&p, in, n, SWEET_FB_HW_DUAL, pm, fWidth, fHeight);
+ 		if (r != SWEET_FB_HW_OK) { IOLog("NORD2 FB HW: test plan refused: %s\n", sweet_fb_hw_why_name(r)); hwTestFinish("refused: plan"); return; }
++		sweet_fb_hw_plan_csw(&p, __atomic_load_n(&sweet_fb_hw_csw, __ATOMIC_RELAXED));      /* 0399 */
+ 		if (!hwApply(&p)) { hwTestFinish("aborted: register read-back mismatch (auto-disabled)"); return; }
+ 		IOLog("NORD2 FB HW: test %u step %u (%s) regs written and read back ok, slot %#llx pitch %u, upper CON %08x (pm %u)\n", fHwTestId, fHwTestStep,
+-		    fHwTestStep == 1 ? "pattern only" : "pattern + premultiplied gradient tile at 390,1000 across the seam", slot, fRowBytes,
+-		    n > 1 ? sweet_fb_hw_con_upper(pm) : 0u, pm);
++		    fHwTestStep == 1 ? "pattern only" : (fHwTestStep == 6 ? "COLOUR TEST: R|G|B by layer 0 at rows 620-699, by layer 1 at rows 710-789, x 390-689: both must read red, green, blue left to right" :
++		    "pattern + premultiplied gradient tile at 390,1000 across the seam"), slot, fRowBytes, n > 1 ? sweet_fb_hw_con_final(&p, 0, 1) : 0u, pm);
+ 		sweet_fb_hw_log_plan("test", fHwTestStep, &p);
+ 		if (!xferStart()) { hwTestFinish("aborted: transfer not started"); return; }
+ 		fXferStart = mach_absolute_time();
+@@ -2352,7 +2397,7 @@
+ 		return;
+ 	}
+ 	/* phase 2: hold over */
+-	if (fHwTestStep < fHwTestEnd) { fHwTestStep++; fHwTestPhase = 0; fHwTestT0 = nowUs; sender->setTimeoutUS(1); return; }
++	if (fHwTestStep < fHwTestEnd) { fHwTestStep = fHwTestStep == 4 ? 6 : fHwTestStep + 1; fHwTestPhase = 0; fHwTestT0 = nowUs; sender->setTimeoutUS(1); return; }
+ 	fHwTestPhase = 3;       /* finishing: the registers below are the final ones */
+ 	bool busy = false;
+ 	for (unsigned i = 0; i < SWEET_FB_PENDING_SURFACE_COUNT; i++) { if (fHwHeld.object[i] != NULL && nord2_gpu_surface_busy(fHwHeld.object[i])) { busy = true; } }
+@@ -2389,12 +2434,14 @@
+ 	const uint64_t *w = fHwSt.why;
+ 	return snprintf(buf, len, "mode=%u pm=%u init=%u/%u on=%u hw_frames=%llu cpu_frames=%llu planned=%llu would_single=%llu would_dual=%llu "
+ 	           "why[mode/none/count/cover/format/memory/pitch/range/missing/fence/state]=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu "
+-	           "fence_skip=%llu late_write=%llu race=%llu empty_kept=%llu restores=%llu faults=%llu last_fault=%s reg_us_avg=%llu reg_us_max=%llu tests=%llu",
++	           "fence_skip=%llu late_write=%llu race=%llu empty_kept=%llu restores=%llu faults=%llu last_fault=%s reg_us_avg=%llu reg_us_max=%llu tests=%llu "
++	           "csw=%u con_l0=%08x con_l1=%08x",
+ 	           __atomic_load_n(&sweet_fb_hw_mode, __ATOMIC_RELAXED), __atomic_load_n(&sweet_fb_hw_pm, __ATOMIC_RELAXED), fHwInitDone ? 1u : 0u,
+ 	           fHwInitOk ? 1u : 0u, fHwOn ? 1u : 0u, fHwSt.frames, fHwSt.cpu_frames, fHwSt.planned, fHwSt.dry_single, fHwSt.dry_dual,
+ 	           w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], fHwSt.fence_skip, fHwSt.late_write, fHwSt.race,
+ 	           fHwSt.empty_kept, fHwSt.restores, fHwSt.faults, sweet_fb_hw_fault_name(fHwSt.last_fault),
+-	           fHwSt.planned ? fHwSt.reg_us_sum / fHwSt.planned : 0ULL, fHwSt.reg_us_max, fHwSt.tests);
++	           fHwSt.planned ? fHwSt.reg_us_sum / fHwSt.planned : 0ULL, fHwSt.reg_us_max, fHwSt.tests,
++	           __atomic_load_n(&sweet_fb_hw_csw, __ATOMIC_RELAXED), fHwLastCon[0], fHwLastCon[1]);
+ }
+ 
+ /* H0: what CoreAnimation / the apps present: size, format, memory kind, contiguity, physical range, 32-bit reachability, pool.
+--- a/iokit/Kernel/arm/sweet_fb_hw.h
++++ b/iokit/Kernel/arm/sweet_fb_hw.h
+@@ -21,8 +21,19 @@
+  * premultiplied source-over, panel pixels no layer covers are black.  So the bottom HW layer runs with AEN = 0 (opaque) over a
+  * black background, the upper one with per-pixel alpha in the CON variant chosen at run time (kern.n2fbhwpm; H2 settles it):
+  *   pm 0: CFMT 2 + AEN                               straight alpha (exact for opaque and fully clear pixels, darker edges otherwise)
+- *   pm 1: CFMT 3 + MAN + AEN                         "legacy" 0x00803000 (not in either local tree; kept as a test variant)
+- *   pm 2: CFMT 3 + MAN + BTSW + RGB_SWAP + AEN       DRM ARGB8888 premultiplied 0x03803000 (both local trees)
++ *   pm 1: CFMT 3 + MAN + AEN                         "legacy" 0x00803000 (alpha first: wrong layout for 'BGRA'; test variant only)
++ *   pm 2: CFMT 3 + MAN + RGB_SWAP + AEN              0x028031ff: premultiplied, memory B,G,R,A  (0399: the default)
++ *   pm 3: CFMT 3 + MAN + BYTE_SWAP + RGB_SWAP + AEN  0x038031ff: the DRM table's "ARGB8888 premultiplied" (0396's pm 2)
++ *
++ * 0399 (hwcolor-20261112) COLOUR ORDER.  CON bits (mtk_disp_ovl.c 296-313, identical in oneplus-mt6893 and nord2-current-kernel):
++ * [15:12] CFMT (2 = "RGBA8888", 3 = "ARGB8888"), 23 CLRFMT_MAN (premultiplied), 24 BYTE_SWAP, 25 RGB_SWAP, 8 AEN, [7:0] alpha.
++ * ovl_fmt_convert() (869-925) maps DRM_FORMAT_ARGB8888 (memory B,G,R,A = CoreAnimation 'BGRA') to CFMT 2 (straight; = LK's
++ * panel layer 0x21ff and our layer 0: colours right on the phone [V-dev]) and to CFMT 3 | MAN | BYTE_SWAP | RGB_SWAP when
++ * premultiplied.  On the phone (q10jfi..k, mode 3, Photos) that value (0x038031ff, 0396's default) showed layer 1 with RED AND
++ * BLUE SWAPPED (iOS blue 0,122,255 -> 255,122,0) while layer 0 (0x20ff) was right [V-dev, coordinator's photos].  So on this OVL
++ * BYTE_SWAP must be CLEAR for memory B,G,R,A in the premultiplied format as well: 0x028031ff ([I] until the 0399 photo test;
++ * kern.n2fbhwcsw flips bit 24 per layer at run time to settle it in one boot).  sweet_fb_hw_con_decode() below is this model,
++ * written out so the host test checks every layer's CON against it instead of silently assuming the colour order.
+  *
+  * Every address a plan lets the OVL read lies inside the layer's own surface memory AND inside a display-reachable window
+  * (the display pool or the framebuffer carve-out, both below 4 GiB); otherwise the swap is not planned (CPU path).
+@@ -62,6 +73,11 @@
+ #define SWEET_FB_HW_DSI_UNDERRUN    (1u << 12)
+ 
+ #define SWEET_FB_HW_CON_OPAQUE      0x000020ffu     /* CFMT 2, AEN 0, plane alpha 255 */
++#define SWEET_FB_HW_CON_AEN         (1u << 8)
++#define SWEET_FB_HW_CON_CFMT(c)     (((c) >> 12) & 0xfu)
++#define SWEET_FB_HW_CON_MAN         (1u << 23)      /* CLRFMT_MAN: premultiplied */
++#define SWEET_FB_HW_CON_BYTE_SWAP   (1u << 24)      /* swaps R and B (see the colour order note above) */
++#define SWEET_FB_HW_CON_RGB_SWAP    (1u << 25)      /* CFMT 3: alpha in the last byte instead of the first */
+ #define SWEET_FB_HW_BGCLR_BLACK     0xff000000u
+ #define SWEET_FB_HW_PITCH_MAX       0xffffu
+ 
+@@ -116,14 +132,50 @@
+ 	uint32_t nlayers;
+ 	struct sweet_fb_hw_slot slot[SWEET_FB_HW_PIPES][SWEET_FB_HW_SLOTS];
+ 	uint32_t src_con[SWEET_FB_HW_PIPES];       /* layer enable bits 0/1 (other SRC_CON bits are kept by the driver) */
++	uint32_t con_xor[SWEET_FB_HW_SLOTS];       /* 0399: bits flipped in slot i's CON when written (kern.n2fbhwcsw); 0 from plan_make */
+ };
+ 
++/* 0399: kern.n2fbhwcsw bit 0 flips BYTE_SWAP on layer 1 (upper), bit 1 on layer 0 (bottom) */
++static inline void
++sweet_fb_hw_plan_csw(struct sweet_fb_hw_plan *p, uint32_t csw)
++{
++	p->con_xor[0] = (csw & 2u) ? SWEET_FB_HW_CON_BYTE_SWAP : 0u;
++	p->con_xor[1] = (csw & 1u) ? SWEET_FB_HW_CON_BYTE_SWAP : 0u;
++}
++
++/* the CON value slot i of pipe k is written with */
++static inline uint32_t
++sweet_fb_hw_con_final(const struct sweet_fb_hw_plan *p, unsigned k, unsigned i)
++{
++	return p->slot[k][i].con ^ p->con_xor[i];
++}
++
++/*
++ * 0399: what the OVL makes of one memory word under a CON value (the model above): returns 0xAARRGGBB, the CPU path's own
++ * reading of a CoreAnimation 'BGRA' word.  A correct CON for our surfaces decodes every word to itself.
++ *   CFMT 2: alpha in byte 3, colour bytes 0,1,2 = B,G,R; BYTE_SWAP -> R,G,B.            [V-dev: 0x20ff/0x21ff right]
++ *   CFMT 3 + RGB_SWAP: alpha in byte 3, colour bytes 0,1,2 = B,G,R; BYTE_SWAP -> R,G,B.  [V-dev: 0x038031ff = R/B swapped]
++ *   CFMT 3 without RGB_SWAP: alpha in byte 0, colour bytes 1,2,3 = B,G,R; BYTE_SWAP -> R,G,B.  [from the DRM table only]
++ */
++static inline uint32_t
++sweet_fb_hw_con_decode(uint32_t con, uint32_t w)
++{
++	uint32_t b0 = w & 0xffu, b1 = (w >> 8) & 0xffu, b2 = (w >> 16) & 0xffu, b3 = w >> 24;
++	uint32_t a, c0, c1, c2;
++	if (SWEET_FB_HW_CON_CFMT(con) == 3u && !(con & SWEET_FB_HW_CON_RGB_SWAP)) { a = b0; c0 = b1; c1 = b2; c2 = b3; }
++	else { a = b3; c0 = b0; c1 = b1; c2 = b2; }
++	uint32_t r = c2, b = c0;
++	if (con & SWEET_FB_HW_CON_BYTE_SWAP) { r = c0; b = c2; }
++	return (a << 24) | (r << 16) | (c1 << 8) | b;
++}
++
+ static inline uint32_t
+ sweet_fb_hw_con_upper(uint32_t pm)
+ {
+ 	switch (pm) {
+ 	case 1: return 0x00803000u | 0x100u | 0xffu;
+-	case 2: return 0x03803000u | 0x100u | 0xffu;
++	case 2: return 0x02803000u | 0x100u | 0xffu;     /* 0399 */
++	case 3: return 0x03803000u | 0x100u | 0xffu;
+ 	default: return 0x00002000u | 0x100u | 0xffu;
+ 	}
+ }
+@@ -155,6 +207,7 @@
+ 		}
+ 	}
+ 	p->nlayers = n;
++	p->con_xor[0] = p->con_xor[1] = 0;
+ 	if (mode != SWEET_FB_HW_SINGLE && mode != SWEET_FB_HW_DUAL) { return SWEET_FB_HW_W_MODE; }
+ 	if (n == 0) { return SWEET_FB_HW_W_NONE; }
+ 	if (n > (mode == SWEET_FB_HW_SINGLE ? 1u : SWEET_FB_HW_SLOTS) || n > SWEET_FB_HW_MAX_IN) { return SWEET_FB_HW_W_COUNT; }
+@@ -242,8 +295,8 @@
+ 		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_SRC_SIZE(i), s->size, 0xffffffffu);
+ 		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_OFFSET(i), s->offset, 0xffffffffu);
+ 		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_CLIP(i), 0u, 0xffffffffu);
+-		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_CON(i), s->con, 0x03fff1ffu);
+-		if (i > 0) {
++		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_CON(i), s->con ^ p->con_xor[i], 0x03fff1ffu);
++		if (i > 0) {      /* RDMA GMC/FIFO = bandwidth only (no colour bits) */
+ 			n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_RDMA_GMC(i), b->gmc[i] ? b->gmc[i] : b->gmc[0], 0xffffffffu);
+ 			n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_RDMA_FIFO(i), b->fifo[i] ? b->fifo[i] : b->fifo[0], 0xffffffffu);
+ 		}
+@@ -308,6 +361,10 @@
+ #define SWEET_FB_HW_BAND_Y1         1700
+ #define SWEET_FB_HW_REF_PM_Y        1320        /* 150 rows: premultiplied reference */
+ #define SWEET_FB_HW_REF_ST_Y        1480        /* 150 rows: straight-interpretation reference */
++#define SWEET_FB_HW_RGB_Y0          620         /* 0399: layer-0 colour strip R | G | B (100 px each) at x 390..689, rows 620..699 */
++#define SWEET_FB_HW_RGB_ROWS        80
++#define SWEET_FB_HW_RGB_L1_Y        710         /* 0399: layer 1 puts the same strip (source rows 2310.., x 0..299) at rows 710..789 */
++#define SWEET_FB_HW_RGB_SRC_Y       2310
+ #define SWEET_FB_HW_BLUE            0xff2060c0u /* A=ff R=20 G=60 B=c0 as a 32-bit word = memory bytes B,G,R,A c0 60 20 ff */
+ 
+ static inline uint32_t
+@@ -353,10 +410,23 @@
+ 	return out | 0xff000000u;
+ }
+ 
++/* 0399: pure, opaque red | green | blue, 100 px each (tx = 0..299) */
++static inline uint32_t
++sweet_fb_hw_rgb_px(uint32_t tx)
++{
++	return tx < 100 ? sweet_fb_hw_px(255, 0, 0, 255) : (tx < 200 ? sweet_fb_hw_px(0, 255, 0, 255) : sweet_fb_hw_px(0, 0, 255, 255));
++}
++
+ /* the whole pattern at panel (x, y) */
+ static inline uint32_t
+ sweet_fb_hw_pattern_px(uint32_t x, uint32_t y, uint32_t fw, uint32_t fh)
+ {
++	if (y >= SWEET_FB_HW_RGB_SRC_Y && y < SWEET_FB_HW_RGB_SRC_Y + SWEET_FB_HW_RGB_ROWS && x < SWEET_FB_HW_TILE) {
++		return sweet_fb_hw_rgb_px(x);      /* layer 1's colour strip source (first: exact) */
++	}
++	if (y >= SWEET_FB_HW_RGB_Y0 && y < SWEET_FB_HW_RGB_Y0 + SWEET_FB_HW_RGB_ROWS && x >= SWEET_FB_HW_GRAD_X && x < SWEET_FB_HW_GRAD_X + SWEET_FB_HW_TILE) {
++		return sweet_fb_hw_rgb_px(x - SWEET_FB_HW_GRAD_X);      /* layer 0's colour strip */
++	}
+ 	uint32_t half = fw / 2;
+ 	if (y >= SWEET_FB_HW_TILE_Y && y < SWEET_FB_HW_TILE_Y + SWEET_FB_HW_TILE && x < SWEET_FB_HW_TILE) {
+ 		return sweet_fb_hw_tile_px(x, y - SWEET_FB_HW_TILE_Y);
+@@ -385,18 +455,29 @@
+ }
+ 
+ /*
+- * Layer inputs of test step t (1: pattern only, 2/3/4: pattern + gradient tile, CON pm 0/2/1) on the pattern buffer at slot_pa
+- * with pitch.  Returns the layer count and the pm to plan with.
++ * Layer inputs of test step t on the pattern buffer at slot_pa with pitch: 1 pattern only; 2/3/4 pattern + gradient tile with
++ * CON pm 0/2/3; 6 (0399 colour test) pattern + layer 1 = the R|G|B strip at rows 710..789 under layer 0's own strip, with cur_pm.
++ * Returns the layer count and the pm to plan with.
+  */
+ static inline unsigned
+-sweet_fb_hw_test_layers(struct sweet_fb_hw_in in[2], uint32_t t, uint64_t slot_pa, uint32_t pitch, uint32_t fw, uint32_t fh, uint32_t *pm)
++sweet_fb_hw_test_layers(struct sweet_fb_hw_in in[2], uint32_t t, uint64_t slot_pa, uint32_t pitch, uint32_t fw, uint32_t fh, uint32_t cur_pm,
++    uint32_t *pm)
+ {
++	if (t == 6) {
++		uint64_t len6 = (uint64_t)pitch * fh;
++		struct sweet_fb_hw_in a = { slot_pa, len6, 0, pitch, 1, 0, 0, 0, 0, (int32_t)fw, (int32_t)fh };
++		struct sweet_fb_hw_in b = { slot_pa, len6, 0, pitch, 1, 0, SWEET_FB_HW_RGB_SRC_Y, SWEET_FB_HW_GRAD_X, SWEET_FB_HW_RGB_L1_Y,
++			                    SWEET_FB_HW_TILE, SWEET_FB_HW_RGB_ROWS };
++		in[0] = a; in[1] = b;
++		*pm = cur_pm;
++		return 2u;
++	}
+ 	uint64_t len = (uint64_t)pitch * fh;
+ 	struct sweet_fb_hw_in l0 = { slot_pa, len, 0, pitch, 1, 0, 0, 0, 0, (int32_t)fw, (int32_t)fh };
+ 	struct sweet_fb_hw_in l1 = { slot_pa, len, 0, pitch, 1, 0, SWEET_FB_HW_TILE_Y, SWEET_FB_HW_GRAD_X, SWEET_FB_HW_GRAD_Y,
+ 		                     SWEET_FB_HW_TILE, SWEET_FB_HW_TILE };
+ 	in[0] = l0; in[1] = l1;
+-	*pm = t == 2 ? 0u : (t == 3 ? 2u : (t == 4 ? 1u : 0u));
++	*pm = t == 2 ? 0u : (t == 3 ? 2u : (t == 4 ? 3u : 0u));
+ 	return t >= 2 && t <= 4 ? 2u : 1u;
+ }
+ 

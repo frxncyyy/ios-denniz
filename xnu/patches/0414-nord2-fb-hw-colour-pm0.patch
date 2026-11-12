@@ -1,0 +1,149 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -63,7 +63,7 @@
+  *   1 = dry run: every swap planned, the first plans logged, no register written
+  *   2 = H3: a swap whose only visible layer covers the panel and lies in the display pool (0394) is shown by OVL*_2L layer 0
+  *       reading the surface itself (no copy); anything else takes the CPU path for that frame (counted by reason)
+- *   3 = H4: up to two layers (bottom opaque, upper with per-pixel alpha in the CON variant kern.n2fbhwpm, default 2)
++ *   3 = H4: up to two layers (bottom opaque, upper with per-pixel alpha in the CON variant kern.n2fbhwpm, default 0 since 0414 = 0x21ff)
+  * kern.n2fbhwtest = 1..5 runs an H2 test pattern through the overlay (1 pattern, 2/3/4 + gradient tile across the seam with CON
+  * pm 0/2/1, 5 = 1..4 in a row), each held kern.n2fbhwhold ms (default 3000), then the previous picture is put back.
+  * kern.n2fbhwstat (read only) = the counters.  Any underflow / DSI underrun / frame-done timeout / register read-back mismatch on
+@@ -87,7 +87,8 @@
+ #endif
+ static uint32_t sweet_fb_hw_mode = 3;           /* kern.n2fbhw.  0413: default 3 (overlay composition is the only frame source; 0/1 = debug CPU path) */
+ static uint32_t sweet_fb_cpu_emerg = 1;         /* 0413: kern.n2fbcpuemerg: CPU copy only if the overlay is unusable for the whole boot (0 = hold even then) */
+-static uint32_t sweet_fb_hw_pm = 2;             /* kern.n2fbhwpm */
++static uint32_t sweet_fb_hw_pm = SWEET_FB_HW_PM_DEFAULT;     /* kern.n2fbhwpm.  0414: default 0 (CFMT 2 straight 0x21ff; 0x028031ff showed R/B swapped) */
++static uint32_t sweet_fb_hw_bootargs_done;      /* 0414: boot-args n2fbhwpm / n2fbhwcsw read once */
+ static uint32_t sweet_fb_hw_test_req;           /* kern.n2fbhwtest: requested test, taken by handOver */
+ static uint32_t sweet_fb_hw_test_last;          /* last test run (read back by the sysctl) */
+ static uint32_t sweet_fb_hw_hold_ms = 3000;     /* kern.n2fbhwhold */
+@@ -428,7 +429,7 @@
+ 	bool        hwCandidate(const uint8_t *rec, SweetSurface *const surfaces[SWEET_FB_LAYERS]);
+ 	int         hwFrameTry(uint32_t mode);
+ 	bool        hwWriteRegs(unsigned k, const struct sweet_fb_hw_reg *r, unsigned n, uint32_t *badOff);
+-	bool        hwApply(const struct sweet_fb_hw_plan *p);
++	bool        hwApply(const struct sweet_fb_hw_plan *p, const uint32_t *ids = NULL, const int32_t *pids = NULL, unsigned nids = 0);   /* 0414: layer ids / producer pids for the CON log */
+ 	void        hwRestore(const char *why);
+ 	void        hwFault(int f, const char *where);
+ 	/* 0397: a hardware fault turns the HW path off for a backoff (2, 4, 8, 16 s), then back on; GPU races never fault */
+@@ -2127,9 +2128,27 @@
+ }
+ 
+ /* Once, before the first HW frame / test: the overlay must be in the CPU path's verified layout and the OVL ports' M4U off. */
++/* 0414: boot-args n2fbhwpm=0..3 / n2fbhwcsw=0..3 override the defaults once (colour variants by a plain image repack); the sysctls
++ * still change them at run time afterwards. */
++static void
++sweet_fb_hw_bootargs(void)
++{
++	if (__atomic_exchange_n(&sweet_fb_hw_bootargs_done, 1u, __ATOMIC_RELAXED) != 0) { return; }
++	uint32_t v = 0;
++	if (PE_parse_boot_argn("n2fbhwpm", &v, sizeof(v)) && v <= 3) { __atomic_store_n(&sweet_fb_hw_pm, v, __ATOMIC_RELAXED); }
++	v = 0;
++	if (PE_parse_boot_argn("n2fbhwcsw", &v, sizeof(v)) && v <= 3) { __atomic_store_n(&sweet_fb_hw_csw, v, __ATOMIC_RELAXED); }
++	uint32_t pm = __atomic_load_n(&sweet_fb_hw_pm, __ATOMIC_RELAXED), csw = __atomic_load_n(&sweet_fb_hw_csw, __ATOMIC_RELAXED);
++	IOLog("NORD2 FB HW COLOR: pm %u csw %u (0414 default pm %u; boot-args n2fbhwpm / n2fbhwcsw): layer 0 CON %08x, layer 1 CON %08x%s\n", pm, csw,
++	    SWEET_FB_HW_PM_DEFAULT, SWEET_FB_HW_CON_OPAQUE ^ ((csw & 2u) ? SWEET_FB_HW_CON_BYTE_SWAP : 0u),
++	    sweet_fb_hw_con_upper(pm) ^ ((csw & 1u) ? SWEET_FB_HW_CON_BYTE_SWAP : 0u),
++	    sweet_fb_hw_con_verified(sweet_fb_hw_con_upper(pm) ^ ((csw & 1u) ? SWEET_FB_HW_CON_BYTE_SWAP : 0u)) ? " (verified layout)" : " (UNVERIFIED layout)");
++}
++
+ bool
+ AppleCLCD::hwInit(void)
+ {
++	sweet_fb_hw_bootargs();      /* 0414 */
+ 	if (fHwInitDone) { return fHwInitOk; }
+ 	if (!fNbReady || fDsi == NULL) { return false; }       /* not latched: tried again once the panel link runs */
+ 	fHwInitDone = true;
+@@ -2256,7 +2275,7 @@
+ }
+ 
+ bool
+-AppleCLCD::hwApply(const struct sweet_fb_hw_plan *p)
++AppleCLCD::hwApply(const struct sweet_fb_hw_plan *p, const uint32_t *ids, const int32_t *pids, unsigned nids)
+ {
+ 	struct sweet_fb_hw_reg r[SWEET_FB_HW_MAX_REGS];
+ 	uint64_t t0 = mach_absolute_time();
+@@ -2280,8 +2299,17 @@
+ 		if (conLogs < 4 || memcmp(c, lastCon, sizeof(c)) != 0) {
+ 			conLogs++;
+ 			memcpy(lastCon, c, sizeof(c));
+-			IOLog("NORD2 FB HW: CON written pipe0 L0 %08x L1 %08x | pipe1 L0 %08x L1 %08x (pm %u, csw %u; BYTE_SWAP=R<->B bit 24, RGB_SWAP bit 25, MAN bit 23)\n",
+-			    c[0][0], c[0][1], c[1][0], c[1][1], __atomic_load_n(&sweet_fb_hw_pm, __ATOMIC_RELAXED), __atomic_load_n(&sweet_fb_hw_csw, __ATOMIC_RELAXED));
++			/* 0414: + each layer's surface id and producer (creator) pid/name; "test" when called by an H2 test / re-apply */
++			uint32_t lid[2] = { 0, 0 }; int32_t lpid[2] = { 0, 0 };
++			char ln[2][20] = { "-", "-" };
++			for (unsigned i = 0; i < 2 && ids != NULL && i < nids; i++) {
++				lid[i] = ids[i]; lpid[i] = pids != NULL ? pids[i] : 0;
++				if (lpid[i] > 0) { proc_name(lpid[i], ln[i], sizeof(ln[i])); }
++			}
++			IOLog("NORD2 FB HW: CON written pipe0 L0 %08x L1 %08x | pipe1 L0 %08x L1 %08x (pm %u, csw %u; BYTE_SWAP=R<->B bit 24, RGB_SWAP bit 25, MAN bit 23)"
++			    " layers %u: L0 id %u pid %d %s | L1 id %u pid %d %s%s\n",
++			    c[0][0], c[0][1], c[1][0], c[1][1], __atomic_load_n(&sweet_fb_hw_pm, __ATOMIC_RELAXED), __atomic_load_n(&sweet_fb_hw_csw, __ATOMIC_RELAXED),
++			    ids != NULL ? nids : 0u, lid[0], lpid[0], ln[0], lid[1], lpid[1], ln[1], ids != NULL ? "" : " (test/re-apply)");
+ 		}
+ 		fHwLastCon[0] = c[0][0] ? c[0][0] : c[1][0]; fHwLastCon[1] = c[0][1] ? c[0][1] : c[1][1];
+ 	}
+@@ -2398,6 +2426,7 @@
+ int
+ AppleCLCD::hwFrameTry(uint32_t mode)
+ {
++	sweet_fb_hw_bootargs();      /* 0414: before the first plan (hwInit runs after it) */
+ 	struct sweet_fb_hw_in in[SWEET_FB_HW_MAX_IN];
+ 	SweetSurface *ss[SWEET_FB_HW_MAX_IN];
+ 	uint32_t ids[SWEET_FB_HW_MAX_IN];
+@@ -2435,7 +2464,9 @@
+ 	}
+ 	fHwN = n;
+ 	sweet_fb_hw_plan_csw(&p, __atomic_load_n(&sweet_fb_hw_csw, __ATOMIC_RELAXED));      /* 0399 */
+-	if (!hwApply(&p)) { fHwN = 0; fHwSt.cpu_frames++; return 0; }      /* faulted: mode 0, CPU path restored; this frame by CPU */
++	int32_t lpid[SWEET_FB_HW_MAX_IN];      /* 0414: producer pids for the CON log */
++	for (unsigned i = 0; i < n; i++) { lpid[i] = ss[i] != NULL ? ss[i]->creator : 0; }
++	if (!hwApply(&p, ids, lpid, n)) { fHwN = 0; fHwSt.cpu_frames++; return 0; }      /* faulted: mode 0, CPU path restored; this frame by CPU */
+ 	fHwPlan = p;
+ 	fHwSt.planned++;
+ 	if (fHwSt.plans_logged < 8) { fHwSt.plans_logged++; sweet_fb_hw_log_plan(mode == SWEET_FB_HW_SINGLE ? "single" : "dual", get32(fWorkRec, 0x50), &p); }
+--- a/iokit/Kernel/arm/sweet_fb_hw.h
++++ b/iokit/Kernel/arm/sweet_fb_hw.h
+@@ -22,7 +22,7 @@
+  * black background, the upper one with per-pixel alpha in the CON variant chosen at run time (kern.n2fbhwpm; H2 settles it):
+  *   pm 0: CFMT 2 + AEN                               straight alpha (exact for opaque and fully clear pixels, darker edges otherwise)
+  *   pm 1: CFMT 3 + MAN + AEN                         "legacy" 0x00803000 (alpha first: wrong layout for 'BGRA'; test variant only)
+- *   pm 2: CFMT 3 + MAN + RGB_SWAP + AEN              0x028031ff: premultiplied, memory B,G,R,A  (0399: the default)
++ *   pm 2: CFMT 3 + MAN + RGB_SWAP + AEN              0x028031ff: premultiplied, memory B,G,R,A  (0399's default; 0414: NOT the default)
+  *   pm 3: CFMT 3 + MAN + BYTE_SWAP + RGB_SWAP + AEN  0x038031ff: the DRM table's "ARGB8888 premultiplied" (0396's pm 2)
+  *
+  * 0399 (hwcolor-20261112) COLOUR ORDER.  CON bits (mtk_disp_ovl.c 296-313, identical in oneplus-mt6893 and nord2-current-kernel):
+@@ -35,6 +35,14 @@
+  * kern.n2fbhwcsw flips bit 24 per layer at run time to settle it in one boot).  sweet_fb_hw_con_decode() below is this model,
+  * written out so the host test checks every layer's CON against it instead of silently assuming the colour order.
+  *
++ * 0414 (colorfix-20261113): on q10jgk (0399, pm 2 = 0x028031ff, csw 0, CON written logged) the user still saw iOS blue as ORANGE
++ * in Photos while frames were composed by the overlay (Library grid = two-layer frames, layer 1 = backboardd's UI) [V-dev, user
++ * report, no photo yet].  So BOTH premultiplied values (0x038031ff and 0x028031ff) showed R/B swapped on layer 1: the CFMT 3 + MAN
++ * rows of the model below are UNVERIFIED (BYTE_SWAP may be ignored with MAN set).  Only CFMT 2 is known right on this OVL (LK's
++ * 0x21ff, our 0x20ff).  Default pm is therefore 0 (CFMT 2 + AEN = 0x000021ff, straight alpha: exact colours, opaque and clear pixels
++ * exact, anti-aliased edges slightly darker).  kern.n2fbhwpm / kern.n2fbhwcsw unchanged; boot-args n2fbhwpm=0..3 / n2fbhwcsw=0..3
++ * set them once at hwInit.  sweet_fb_hw_con_verified() = the CON values known right on the phone.
++ *
+  * Every address a plan lets the OVL read lies inside the layer's own surface memory AND inside a display-reachable window
+  * (the display pool or the framebuffer carve-out, both below 4 GiB); otherwise the swap is not planned (CPU path).
+  */
+@@ -169,6 +177,16 @@
+ 	return (a << 24) | (r << 16) | (c1 << 8) | b;
+ }
+ 
++/* 0414: the default upper-layer variant (kern.n2fbhwpm / boot-arg n2fbhwpm override it) */
++#define SWEET_FB_HW_PM_DEFAULT      0u
++
++/* 0414: CON values whose colour order is verified on the phone: CFMT 2 (LK's 0x21ff, layer 0's 0x20ff), no MAN, no swap bits */
++static inline bool
++sweet_fb_hw_con_verified(uint32_t con)
++{
++	return SWEET_FB_HW_CON_CFMT(con) == 2u && !(con & (SWEET_FB_HW_CON_MAN | SWEET_FB_HW_CON_BYTE_SWAP | SWEET_FB_HW_CON_RGB_SWAP));
++}
++
+ static inline uint32_t
+ sweet_fb_hw_con_upper(uint32_t pm)
+ {

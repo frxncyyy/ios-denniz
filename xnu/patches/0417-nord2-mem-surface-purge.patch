@@ -1,0 +1,963 @@
+--- a/bsd/dev/nord2_gpu_transport.h
++++ b/bsd/dev/nord2_gpu_transport.h
+@@ -220,12 +220,24 @@
+ }
+ 
+ /* Device-wide check: the request (already rounded) plus every client's private
+- * bytes must stay within the global private budget. */
++ * bytes must stay within the global private budget.
++ * 0417 (memfix-20261113): in the kernel also the ONE budget of surfaces + GPU private
++ * memory (kern.n2mem_budget, SweetSurface.cpp sweet_mem_gpu_private_ok), which also
++ * records the GPU's private total for the surface side and the NORD2 MEM SURF line. */
++#if defined(KERNEL) && defined(__cplusplus)
++extern "C" bool sweet_mem_gpu_private_ok(uint64_t total_private, uint64_t rounded);
++#endif
+ static inline bool nord2_gpu_global_private_ok(uint64_t total_private,
+                                                uint64_t rounded,
+                                                uint64_t limit)
+ {
++#if defined(KERNEL) && defined(__cplusplus)
++        if (!(total_private <= limit && rounded <= limit - total_private))
++                return false;
++        return sweet_mem_gpu_private_ok(total_private, rounded);
++#else
+         return total_private <= limit && rounded <= limit - total_private;
++#endif
+ }
+ 
+ /* Imported surface pages: 4 KiB granularity (surface offset/length are page
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -48,6 +48,9 @@
+ #include "sweet_fb_hw_pool_alloc.h"     /* 0394 */
+ #include "sweet_surface_use.h"          /* 0398 */
+ #include "sweet_fb_pool_reclaim.h"     /* 0406 */
++#include "sweet_surface_purge.h"         /* 0417 */
++#include <IOKit/IOSubMemoryDescriptor.h>  /* 0417: purged surfaces = views of the sink */
++#include <kern/thread_call.h>           /* 0417: the 2 s pressure scan */
+ extern "C" {
+ #include <arm/caches_internal.h>
+ vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+@@ -203,6 +206,43 @@
+ SYSCTL_UINT(_kern, OID_AUTO, n2fbhw_pool_remap_failed, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_pool_remap_failed, 0, "0406: client mappings left on the old range");
+ static void sweet_pool_reclaim(uint64_t bytes);
+ static void sweet_pool_reclaim_drain(void);
++/*
++ * 0417 (memfix-20261113): purge of idle VOLATILE surfaces under pressure, one budget for surfaces + GPU private memory, a per-process
++ * surface budget, and "NORD2 MEM SURF:" every 10 s (sweet_surface_purge.h).  A purged surface keeps its id, state page and user addresses;
++ * its pages are a view (IOSubMemoryDescriptor) of one shared wired sink and its own wired buffer is freed after the 0406 grace.
++ * Accounting: a purged surface leaves sweet_surface_wired / sweet_surface_buffers / its creator's bytes at the purge (its old buffer is
++ * counted in "pend" until the grace returns it); SetPurgeable(NonVolatile) charges it again.  Locks: sweet_pool_evict_lock serialises
++ * purges, unpurges, SetPurgeable and the 0406 evictions; under it sweet_clients_lock, a client's fLock, sweet_surface_lock, n2io_lock,
++ * the GPU lock (nord2_gpu_surface_busy) as in 0406.  sweet_mem_spin (spin) guards the per-process table only.
++ */
++static int           sweet_purge_mode = SWEET_PURGE_ON;         /* kern.n2surf_purge (boot-arg n2sp) */
++static uint32_t      sweet_purge_thr_mib = 1228;                /* surface wired bytes above this = pressure */
++static uint32_t      sweet_purge_avail_min = 40000;             /* memorystatus_available_pages below this = pressure (16 KiB pages) */
++static uint32_t      sweet_purge_idle_s = 3;                    /* not created / swapped for this long */
++static uint32_t      sweet_mem_budget_mib = 2240;               /* kern.n2mem_budget_mib (boot-arg n2mb): surfaces + GPU private, 0 off */
++static uint32_t      sweet_surf_proc_mib = 896;                 /* kern.n2surf_proc_mib: wired surface bytes one process may make, 0 off */
++static uint32_t      sweet_purge_n, sweet_unpurge_n, sweet_purge_failed, sweet_unpurge_failed, sweet_purge_passes, sweet_purge_remap_bad;
++static uint32_t      sweet_purged_live, sweet_purge_given, sweet_purge_npend;
++static uint64_t      sweet_purged_bytes, sweet_purge_pend_bytes;
++static uint32_t      sweet_mem_refused_combined, sweet_mem_refused_proc, sweet_mem_refused_gpu, sweet_mem_gpu_kicks, sweet_mem_exempted;
++static uint64_t      sweet_mem_gpu_private;                     /* the GPU's private total at its last allocation check */
++static uint64_t      sweet_mem_idle_bytes;                      /* idle volatile bytes found by the last scan (purge estimate) */
++static IOSimpleLock *sweet_mem_spin;
++static struct sweet_mem_proc sweet_mem_procs[SWEET_MEM_PROCS]; /* under sweet_mem_spin */
++SYSCTL_INT(_kern, OID_AUTO, n2surf_purge, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_purge_mode, 0, "0417: idle volatile surfaces under pressure: 0 off, 1 log only, 2 purge");
++SYSCTL_UINT(_kern, OID_AUTO, n2surf_purge_mib, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_purge_thr_mib, 0, "0417: surface wired MiB above which idle volatile surfaces go");
++SYSCTL_UINT(_kern, OID_AUTO, n2surf_purge_avail, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_purge_avail_min, 0, "0417: available pages below which idle volatile surfaces go");
++SYSCTL_UINT(_kern, OID_AUTO, n2surf_purge_idle, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_purge_idle_s, 0, "0417: s without a swap before a volatile surface may go");
++SYSCTL_UINT(_kern, OID_AUTO, n2mem_budget_mib, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_mem_budget_mib, 0, "0417: one budget for surfaces + GPU private (MiB, 0 off)");
++SYSCTL_UINT(_kern, OID_AUTO, n2surf_proc_mib, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_surf_proc_mib, 0, "0417: surface MiB one process may make (0 off)");
++SYSCTL_UINT(_kern, OID_AUTO, n2surf_purged, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_purge_n, 0, "0417: surfaces purged");
++SYSCTL_UINT(_kern, OID_AUTO, n2surf_unpurged, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_unpurge_n, 0, "0417: purged surfaces made non-volatile again");
++static bool sweet_mem_admit(uint32_t size, int32_t pid);
++static bool sweet_purge_unpurge_locked(SweetSurface *s);
++static void sweet_mem_proc_charge(int32_t pid, int64_t delta);
++static uintptr_t sweet_purge_sink_kva(void);
++static void sweet_purge_start(void);
++extern "C" bool sweet_mem_gpu_private_ok(uint64_t total_private, uint64_t rounded);     /* called by nord2_gpu_transport.h */
+ 
+ static void
+ sweet_pool_args(void)
+@@ -408,6 +448,10 @@
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 		OSDecrementAtomic((volatile SInt32 *)&sweet_surface_buffers);
++		sweet_mem_proc_charge(creator, -(int64_t)allocSize);   /* 0417 */
++	} else if (purged) {    /* 0417: a view of the sink: its buffer already left the accounting at the purge */
++		OSDecrementAtomic((volatile SInt32 *)&sweet_purged_live);
++		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_purged_bytes);
+ 	}
+ 	/* 0394: a pool surface gives its range back once nothing else holds the descriptor (a holder could still map it). */
+ 	uint64_t poolPa = sweet_pool_surface_pa(this), poolLen = poolPa != 0 ? memory->getLength() : 0;
+@@ -445,6 +489,9 @@
+ 	if (buffer != NULL) {
+ 		return (uintptr_t)buffer->getBytesNoCopy();
+ 	}
++	if (purged) {           /* 0417: the sink's permanent kernel mapping (never a kernelMap that an unpurge would have to drop) */
++		return sweet_purge_sink_kva();
++	}
+ 	uint64_t poolPa = sweet_pool_surface_pa(this);         /* 0394: the pool's own kernel mapping (same attribute as the users') */
+ 	if (poolPa != 0) {
+ 		return (uintptr_t)(sweet_pool_kva + (poolPa - SWEET_FB_HW_POOL_BASE));
+@@ -571,6 +618,12 @@
+ 			IOLockFree(lock);
+ 		}
+ 	}
++	if (sweet_mem_spin == NULL) {   /* 0417: the per-process table */
++		IOSimpleLock *spin = IOSimpleLockAlloc();
++		if (!OSCompareAndSwapPtr(NULL, spin, &sweet_mem_spin)) {
++			IOSimpleLockFree(spin);
++		}
++	}
+ }
+ 
+ static SweetSurface *
+@@ -857,6 +910,7 @@
+ 	if (sweet_pool_evict_lock == NULL) {
+ 		sweet_pool_evict_lock = IOLockAlloc();  /* 0406 */
+ 	}
++	sweet_purge_start();    /* 0417: sink, 2 s pressure scan, NORD2 MEM SURF line */
+ 	sweet_use_args();       /* 0398 */
+ 	IOLog("NORD2 SURF USE: IOSurface use count mode %d (kern.n2surfuse / n2su: 0 off, 1 user traps, 2 + display/GPU holds), counts at state page +0x%x\n",
+ 	    sweet_use_mode, SWEET_USE_STATE_WORDS);
+@@ -877,6 +931,7 @@
+ 	int32_t  fPid;          /* 0300 */
+ 	friend void sweet_surface_report(const char *why, uint32_t asked);
+ 	friend void sweet_pool_evict_remap(SweetSurface *s, IOMemoryDescriptor *old, IOMemoryDescriptor *buf, uint32_t *ok, uint32_t *bad);
++	friend void sweet_purge_remap(SweetSurface *s, IOMemoryDescriptor *old, IOMemoryDescriptor *buf, uint32_t *ok, uint32_t *bad);
+ 
+ 	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index);
+ 	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
+@@ -1174,6 +1229,556 @@
+ 	IOLockUnlock(sweet_pool_evict_lock);
+ }
+ 
++/*
++ * ---------------------------------------------------------------- 0417 (memfix-20261113): purge, budgets, NORD2 MEM SURF
++ */
++extern "C" {
++extern unsigned int memorystatus_available_pages, vm_page_wire_count;
++}
++#define SWEET_PURGE_SINK_MAX    (16u << 20)     /* surfaces up to this size can be purged (Photos' volatile ones: ~0.6 MiB average) */
++#define SWEET_PURGE_PEND_MAX    512u
++#define SWEET_PURGE_SCAN_MAX    SWEET_SURFACE_MAX_ID
++#define SWEET_PURGE_PICK_MAX    256u            /* surfaces purged per pass at most */
++#define SWEET_PURGE_HYST        (64ull << 20)
++struct sweet_purge_pend_ent { SweetSurface *s; IOBufferMemoryDescriptor *old; uint32_t len, armed_at, shown_at; };
++static struct sweet_purge_pend_ent sweet_purge_pend[SWEET_PURGE_PEND_MAX];     /* under sweet_pool_evict_lock */
++static IOBufferMemoryDescriptor *sweet_purge_sink;                              /* set once in IOCoreSurfaceRoot::start */
++static uint64_t      sweet_purge_sink_len;
++static thread_call_t sweet_purge_tc, sweet_purge_kick_tc;
++static uint32_t      sweet_purge_kick_pending;
++static uint64_t      sweet_mem_create_pass_ns;
++static uint32_t      sweet_mem_log_at, sweet_mem_told_refuse, sweet_mem_told_gpu, sweet_purge_told;
++/* last scan (periodic line) */
++static uint32_t      sweet_purge_st_vol_n, sweet_purge_st_idle_n, sweet_purge_st_bufs;
++static uint64_t      sweet_purge_st_vol_b, sweet_purge_st_idle_b;
++static uint32_t      sweet_purge_st_why[SWEET_PURGE_NREASONS];
++SYSCTL_UINT(_kern, OID_AUTO, n2surf_purge_failed, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_purge_failed, 0, "0417: purges refused at the re-check or remap");
++SYSCTL_UINT(_kern, OID_AUTO, n2surf_unpurge_failed, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_unpurge_failed, 0, "0417: NonVolatile requests left on the sink (no memory)");
++SYSCTL_UINT(_kern, OID_AUTO, n2surf_purge_remap_bad, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_purge_remap_bad, 0, "0417: client mappings left on the old pages");
++
++static uintptr_t
++sweet_purge_sink_kva(void)
++{
++	return sweet_purge_sink != NULL ? (uintptr_t)sweet_purge_sink->getBytesNoCopy() : 0;
++}
++
++static uint64_t
++sweet_mem_now_ns(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns;
++}
++
++static void
++sweet_mem_proc_charge(int32_t pid, int64_t delta)
++{
++	if (sweet_mem_spin == NULL || pid <= 0 || delta == 0) {
++		return;
++	}
++	IOSimpleLockLock(sweet_mem_spin);
++	sweet_mem_proc_add(sweet_mem_procs, pid, delta);
++	IOSimpleLockUnlock(sweet_mem_spin);
++}
++
++static uint64_t
++sweet_mem_proc_bytes(int32_t pid)
++{
++	uint64_t b = 0;
++	if (sweet_mem_spin == NULL || pid <= 0) {
++		return 0;
++	}
++	IOSimpleLockLock(sweet_mem_spin);
++	int i = sweet_mem_proc_find(sweet_mem_procs, pid, false);
++	b = i >= 0 ? sweet_mem_procs[i].bytes : 0;
++	IOSimpleLockUnlock(sweet_mem_spin);
++	return b;
++}
++
++/* The render server and the home screen never get a budget refusal (a failed CA surface there can take the UI down); they still purge. */
++static bool
++sweet_mem_exempt_self(void)
++{
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	return strncmp(name, "backboardd", sizeof(name)) == 0 || strncmp(name, "SpringBoard", sizeof(name)) == 0;
++}
++
++/* Is s's IOVA programmed in an overlay slot now (purging it would pull the pages from under the scan)?  No lock held. */
++static bool
++sweet_purge_iommu_programmed(const SweetSurface *s)
++{
++	bool prog = false;
++	if (__atomic_load_n(&n2io_state, __ATOMIC_RELAXED) != 1 || n2io_lock == NULL) {
++		return false;
++	}
++	IOLockLock(n2io_lock);
++	for (unsigned i = 0; i < SWEET_FB_IOMMU_CACHE; i++) {
++		if (n2io_ent[i].obj == s && sweet_fb_iommu_ent_programmed(&n2io_ent[i], &n2io_prog)) {
++			prog = true;
++		}
++	}
++	IOLockUnlock(n2io_lock);
++	return prog;
++}
++
++/* As sweet_pool_evict_remap (0406), with kIOMapUnique: a mapping of the shared sink is never reused for another surface. */
++void
++sweet_purge_remap(SweetSurface *s, IOMemoryDescriptor *old, IOMemoryDescriptor *buf, uint32_t *ok, uint32_t *bad)
++{
++	if (sweet_clients_lock == NULL) {
++		return;
++	}
++	IOLockLock(sweet_clients_lock);
++	for (uint32_t i = 0; i < SWEET_CLIENTS_MAX; i++) {
++		IOSurfaceRootUserClient *c = sweet_clients[i];
++		if (c == NULL || c->fLock == NULL || c->fRefs == NULL) {
++			continue;
++		}
++		IOLockLock(c->fLock);
++		for (unsigned int k = 0; k < c->fRefs->getCount(); k++) {
++			SweetSurfaceRef *ref = (SweetSurfaceRef *)c->fRefs->getObject(k);
++			IOMemoryMap *om = ref != NULL && ref->surface == s ? ref->data : NULL;
++			if (om == NULL || om->getMemoryDescriptor() != old) {
++				continue;
++			}
++			IOMemoryMap *nm = buf->createMappingInTask(om->getAddressTask(), om->getAddress(),
++			    kIOMapOverwrite | kIOMapUnique | kIOMapDefaultCache, 0, om->getLength());
++			if (nm == NULL || nm->getAddress() != om->getAddress()) {
++				OSSafeReleaseNULL(nm);
++				(*bad)++;
++				continue;
++			}
++			nm->fOptions &= ~(IOOptionBits)kIOMapOverwrite;  /* the new map owns the range */
++			om->fOptions |= kIOMapOverwrite;                  /* the old one must not unmap it */
++			ref->data = nm;
++			om->release();
++			(*ok)++;
++		}
++		IOLockUnlock(c->fLock);
++	}
++	IOLockUnlock(sweet_clients_lock);
++}
++
++/* Old buffers whose grace is over are freed.  sweet_pool_evict_lock held. */
++static void
++sweet_purge_drain_locked(uint32_t now)
++{
++	if (__atomic_load_n(&sweet_purge_npend, __ATOMIC_RELAXED) == 0) {
++		return;
++	}
++	for (uint32_t i = 0; i < SWEET_PURGE_PEND_MAX; i++) {
++		struct sweet_purge_pend_ent *e = &sweet_purge_pend[i];
++		if (e->s == NULL) {
++			continue;
++		}
++		int v = sweet_reclaim_grace(now, e->armed_at, __atomic_load_n(&sweet_pool_reclaim_grace_s, __ATOMIC_RELAXED), e->shown_at,
++		    e->s->shownAt, e->s->useKern[0], e->s->useKern[1], e->s->gpuImports, (uint32_t)e->old->getRetainCount());
++		if (v == SWEET_RECLAIM_REARM) {
++			e->armed_at = now;
++			e->shown_at = e->s->shownAt;
++		} else if (v == SWEET_RECLAIM_GIVE) {
++			OSSafeReleaseNULL(e->old);
++			OSAddAtomic64(-(SInt64)e->len, (volatile SInt64 *)&sweet_purge_pend_bytes);
++			OSIncrementAtomic((volatile SInt32 *)&sweet_purge_given);
++			OSSafeReleaseNULL(e->s);
++			__atomic_sub_fetch(&sweet_purge_npend, 1, __ATOMIC_RELAXED);
++		}
++	}
++}
++
++/* Move s onto the sink (verdict re-checked under sweet_surface_lock).  sweet_pool_evict_lock held, nothing else. */
++static bool
++sweet_purge_one(SweetSurface *s, uint32_t now, bool busy, bool prog)
++{
++	uint32_t slot = SWEET_PURGE_PEND_MAX;
++	for (uint32_t i = 0; i < SWEET_PURGE_PEND_MAX && slot == SWEET_PURGE_PEND_MAX; i++) {
++		slot = sweet_purge_pend[i].s == NULL ? i : slot;
++	}
++	if (slot == SWEET_PURGE_PEND_MAX || sweet_purge_sink == NULL || s->state == NULL || s->allocSize > sweet_purge_sink_len) {
++		return false;
++	}
++	uint32_t size = s->allocSize;
++	IOSubMemoryDescriptor *view = IOSubMemoryDescriptor::withSubRange(sweet_purge_sink, 0, size, kIODirectionInOut);
++	if (view == NULL) {
++		return false;
++	}
++	IOLockLock(sweet_surface_lock);
++	volatile uint32_t *w = sweet_use_words(s);
++	IOBufferMemoryDescriptor *old = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
++	struct sweet_purge_cand c = { size, s->bornAt, s->shownAt, s->purgeable, w[0], w[1], s->useKern[0], s->useKern[1], s->gpuImports,
++		                      s->creator, old != NULL && !s->purged && sweet_pool_surface_pa(s) == 0, busy, prog };
++	uint32_t v = sweet_purge_verdict(&c, now, __atomic_load_n(&sweet_purge_idle_s, __ATOMIC_RELAXED), sweet_use_mode_now() == SWEET_USE_MODE_ALL,
++	    sweet_purge_sink_len);
++	if (v != SWEET_PURGE_OK || old == NULL || old->getLength() < size) {
++		IOLockUnlock(sweet_surface_lock);
++		view->release();
++		OSIncrementAtomic((volatile SInt32 *)&sweet_purge_failed);
++		return false;
++	}
++	s->memory = view;                       /* s's reference moves from old to the view; old's goes to the pending record */
++	s->mapCache = kIOMapDefaultCache;
++	s->purgeable = SWEET_PURGEABLE_EMPTY;   /* the next IOSurfaceSetPurgeable answers Empty: the client redraws */
++	s->purged = 1;
++	IOLockUnlock(sweet_surface_lock);
++	OSAddAtomic64(-(SInt64)size, (volatile SInt64 *)&sweet_surface_wired);
++	OSDecrementAtomic((volatile SInt32 *)&sweet_surface_buffers);
++	sweet_mem_proc_charge(s->creator, -(int64_t)size);
++	OSIncrementAtomic((volatile SInt32 *)&sweet_purged_live);
++	OSAddAtomic64((SInt64)size, (volatile SInt64 *)&sweet_purged_bytes);
++	OSAddAtomic64((SInt64)size, (volatile SInt64 *)&sweet_purge_pend_bytes);
++	s->retain();
++	struct sweet_purge_pend_ent e = { s, old, size, now, s->shownAt };
++	sweet_purge_pend[slot] = e;
++	__atomic_add_fetch(&sweet_purge_npend, 1, __ATOMIC_RELAXED);
++	uint32_t ok = 0, bad = 0;
++	sweet_purge_remap(s, old, view, &ok, &bad);
++	sweet_fb_iommu_surface_gone(s);         /* a cached IOVA of the old pages goes (nothing programmed: checked) */
++	OSIncrementAtomic((volatile SInt32 *)&sweet_purge_n);
++	if (bad != 0) {
++		OSAddAtomic((SInt32)bad, (volatile SInt32 *)&sweet_purge_remap_bad);
++	}
++	uint32_t k = sweet_purge_told++;
++	if (k < 24 || bad != 0 || (k % 256) == 0) {
++		char name[32] = "?";
++		proc_name(s->creator, name, sizeof(name));
++		IOLog("NORD2 MEM SURF: purged surface %u %ux%u fmt 0x%x %u KiB by %s[%d] (volatile, idle %u s): %u mapping(s) remapped%s%u (purged %u)\n",
++		    s->id, s->width, s->height, s->pixelFormat, size >> 10, name, s->creator, now - (s->shownAt ? s->shownAt : s->bornAt), ok,
++		    bad ? ", LEFT ON THE OLD PAGES (buffer kept): " : ", failed ", bad, sweet_purge_n);
++	}
++	return true;
++}
++
++/*
++ * One scan of the id table: last-scan statistics, and (mode 2, goal > 0) purge of LRU idle volatile surfaces until goal bytes.
++ * only_pid != 0: that process's surfaces only (its budget).  sweet_pool_evict_lock held, nothing else.  Returns the bytes purged.
++ */
++static uint64_t
++sweet_purge_pass_locked(uint64_t goal, int32_t only_pid, const char *why)
++{
++	static SweetSurface *cs[SWEET_PURGE_SCAN_MAX];
++	static struct sweet_purge_cand cand[SWEET_PURGE_SCAN_MAX];
++	static uint32_t verdict[SWEET_PURGE_SCAN_MAX], pick[SWEET_PURGE_PICK_MAX];
++	uint32_t now = sweet_surface_uptime(), n = 0, bufs = 0;
++	uint32_t idle_s = __atomic_load_n(&sweet_purge_idle_s, __ATOMIC_RELAXED);
++	bool all = sweet_use_mode_now() == SWEET_USE_MODE_ALL;
++	sweet_purge_drain_locked(now);
++	sweet_purge_passes++;
++	IOLockLock(sweet_surface_lock);
++	for (uint32_t id = 1; id < SWEET_SURFACE_MAX_ID && n < SWEET_PURGE_SCAN_MAX; id++) {
++		SweetSurface *t = sweet_surface_table[id];
++		if (t == NULL || t->state == NULL || t->memory == NULL || OSDynamicCast(IOBufferMemoryDescriptor, t->memory) == NULL) {
++			continue;
++		}
++		bufs++;
++		if (only_pid != 0 && t->creator != only_pid) {
++			continue;
++		}
++		volatile uint32_t *w = sweet_use_words(t);
++		struct sweet_purge_cand c = { t->allocSize, t->bornAt, t->shownAt, t->purgeable, w[0], w[1], t->useKern[0], t->useKern[1], t->gpuImports,
++			                      t->creator, !t->purged && sweet_pool_surface_pa(t) == 0, false, false };
++		t->retain();
++		cs[n] = t;
++		cand[n++] = c;
++	}
++	IOLockUnlock(sweet_surface_lock);
++	uint32_t why_n[SWEET_PURGE_NREASONS] = { 0 }, vol_n = 0, idle_n = 0;
++	uint64_t vol_b = 0, idle_b = 0;
++	for (uint32_t i = 0; i < n; i++) {
++		verdict[i] = sweet_purge_verdict(&cand[i], now, idle_s, all, sweet_purge_sink_len);
++		if (verdict[i] == SWEET_PURGE_OK) {     /* only now the questions that take other locks */
++			cand[i].gpu_busy = nord2_gpu_surface_busy(cs[i]);
++			cand[i].iommu_prog = !cand[i].gpu_busy && sweet_purge_iommu_programmed(cs[i]);
++			verdict[i] = sweet_purge_verdict(&cand[i], now, idle_s, all, sweet_purge_sink_len);
++		}
++		why_n[verdict[i]]++;
++		if (cand[i].purgeable == SWEET_PURGE_VOLATILE) {
++			vol_n++;
++			vol_b += cand[i].size;
++		}
++		if (verdict[i] == SWEET_PURGE_OK) {
++			idle_n++;
++			idle_b += cand[i].size;
++		}
++	}
++	if (only_pid == 0) {
++		sweet_purge_st_vol_n = vol_n; sweet_purge_st_vol_b = vol_b; sweet_purge_st_idle_n = idle_n; sweet_purge_st_idle_b = idle_b;
++		sweet_purge_st_bufs = bufs;
++		memcpy(sweet_purge_st_why, why_n, sizeof(why_n));
++		__atomic_store_n(&sweet_mem_idle_bytes, idle_b, __ATOMIC_RELAXED);
++	}
++	uint64_t done = 0;
++	int mode = __atomic_load_n(&sweet_purge_mode, __ATOMIC_RELAXED);
++	if (goal != 0 && idle_n != 0 && mode >= SWEET_PURGE_REPORT) {
++		uint64_t sel = 0;
++		uint32_t k = sweet_purge_pick(cand, verdict, n, goal, pick, SWEET_PURGE_PICK_MAX, &sel);
++		for (uint32_t i = 0; i < k && mode >= SWEET_PURGE_ON; i++) {
++			if (sweet_purge_one(cs[pick[i]], now, cand[pick[i]].gpu_busy, cand[pick[i]].iommu_prog)) {
++				done += cand[pick[i]].size;
++			}
++		}
++		uint32_t t = sweet_purge_told;
++		if (t < 64 || (sweet_purge_passes % 32) == 0 || mode < SWEET_PURGE_ON) {
++			IOLog("NORD2 MEM SURF: pass %u (%s%s): goal %llu MiB, idle volatile %u (%llu MiB) of %u volatile (%llu MiB): %s %u (%llu MiB) -> %llu MiB\n",
++			    sweet_purge_passes, why, only_pid ? ", one process" : "", goal >> 20, idle_n, idle_b >> 20, vol_n, vol_b >> 20,
++			    mode >= SWEET_PURGE_ON ? "purging" : "would purge (mode 1)", k, sel >> 20, done >> 20);
++		}
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		cs[i]->release();
++	}
++	return done;
++}
++
++static uint64_t
++sweet_mem_goal(uint64_t need)
++{
++	return sweet_purge_goal(__atomic_load_n(&sweet_surface_wired, __ATOMIC_RELAXED), __atomic_load_n(&sweet_mem_gpu_private, __ATOMIC_RELAXED),
++	           memorystatus_available_pages, (uint32_t)page_size, (uint64_t)__atomic_load_n(&sweet_purge_thr_mib, __ATOMIC_RELAXED) << 20,
++	           __atomic_load_n(&sweet_purge_avail_min, __ATOMIC_RELAXED), (uint64_t)__atomic_load_n(&sweet_mem_budget_mib, __ATOMIC_RELAXED) << 20,
++	           SWEET_PURGE_HYST, need);
++}
++
++/*
++ * NonVolatile asked for a purged surface: own wired memory again (zeroed), every client mapping back onto it.  The caller answers
++ * Empty either way.  false = no memory: the surface stays on the sink (its pixels are then shared garbage).  sweet_pool_evict_lock held.
++ */
++static bool
++sweet_purge_unpurge_locked(SweetSurface *s)
++{
++	if (!s->purged || sweet_purge_sink == NULL) {
++		return true;
++	}
++	uint32_t size = s->allocSize;
++	uint64_t limit = (uint64_t)__atomic_load_n(&sweet_mem_budget_mib, __ATOMIC_RELAXED) << 20;
++	for (int attempt = 0; attempt < 2; attempt++) {
++		bool fits = __atomic_load_n(&sweet_surface_wired, __ATOMIC_RELAXED) + size <= SWEET_SURFACE_WIRED_MAX &&
++		    sweet_mem_combined_ok(__atomic_load_n(&sweet_surface_wired, __ATOMIC_RELAXED), __atomic_load_n(&sweet_mem_gpu_private, __ATOMIC_RELAXED),
++		    size, limit);
++		if (fits || attempt == 1) {
++			break;
++		}
++		(void)sweet_purge_pass_locked(sweet_mem_goal(size), 0, "unpurge");
++	}
++	IOBufferMemoryDescriptor *buf = NULL;
++	if ((uint64_t)OSAddAtomic64(size, (volatile SInt64 *)&sweet_surface_wired) + size <= SWEET_SURFACE_WIRED_MAX) {
++		buf = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, size, page_size);
++	}
++	if (buf == NULL || buf->getLength() < size) {
++		OSSafeReleaseNULL(buf);
++		OSAddAtomic64(-(SInt64)size, (volatile SInt64 *)&sweet_surface_wired);
++		uint32_t k = OSIncrementAtomic((volatile SInt32 *)&sweet_unpurge_failed);
++		if (k < 16 || (k % 64) == 0) {
++			IOLog("NORD2 MEM SURF: NonVolatile for purged surface %u (%u KiB): no memory (wired %llu MiB): left on the sink (unpurge failures %u)\n",
++			    s->id, size >> 10, sweet_surface_wired >> 20, k + 1);
++		}
++		return false;
++	}
++	bzero(buf->getBytesNoCopy(), size);
++	IOLockLock(sweet_surface_lock);
++	IOMemoryDescriptor *view = s->memory;
++	s->memory = buf;
++	s->mapCache = kIOMapDefaultCache;
++	s->purged = 0;
++	IOLockUnlock(sweet_surface_lock);
++	OSIncrementAtomic((volatile SInt32 *)&sweet_surface_buffers);
++	sweet_mem_proc_charge(s->creator, (int64_t)size);
++	OSDecrementAtomic((volatile SInt32 *)&sweet_purged_live);
++	OSAddAtomic64(-(SInt64)size, (volatile SInt64 *)&sweet_purged_bytes);
++	uint32_t ok = 0, bad = 0;
++	sweet_purge_remap(s, sweet_purge_sink, buf, &ok, &bad);   /* the maps of a view belong to the sink (IOSubMemoryDescriptor::makeMapping) */
++	sweet_fb_iommu_surface_gone(s);         /* a cached IOVA of the sink goes */
++	OSSafeReleaseNULL(view);                /* nothing but maps holds a view; the GPU / IOMMU used the sink's pages, which stay */
++	OSIncrementAtomic((volatile SInt32 *)&sweet_unpurge_n);
++	if (bad != 0) {
++		OSAddAtomic((SInt32)bad, (volatile SInt32 *)&sweet_purge_remap_bad);
++	}
++	if (sweet_unpurge_n <= 24 || bad != 0 || (sweet_unpurge_n % 256) == 0) {
++		IOLog("NORD2 MEM SURF: surface %u NonVolatile again: own %u KiB, %u mapping(s) remapped%s%u, answered Empty (unpurged %u)\n", s->id,
++		    size >> 10, ok, bad ? ", LEFT ON THE SINK: " : ", failed ", bad, sweet_unpurge_n);
++	}
++	return true;
++}
++
++/*
++ * Creation of a wired buffer surface of size by pid (thread context, no lock held): purge under pressure first, then the per-process and
++ * the combined budget.  false = refuse (kIOReturnNoMemory, as the 2048 MiB budget).
++ */
++static bool
++sweet_mem_admit(uint32_t size, int32_t pid)
++{
++	if (sweet_pool_evict_lock == NULL) {
++		return true;
++	}
++	uint64_t plim = (uint64_t)__atomic_load_n(&sweet_surf_proc_mib, __ATOMIC_RELAXED) << 20;
++	uint64_t clim = (uint64_t)__atomic_load_n(&sweet_mem_budget_mib, __ATOMIC_RELAXED) << 20;
++	uint64_t goal = sweet_mem_goal(size), mine = sweet_mem_proc_bytes(pid);
++	bool proc_over = !sweet_mem_proc_ok(mine, size, plim);
++	uint64_t now = sweet_mem_now_ns(), last = __atomic_load_n(&sweet_mem_create_pass_ns, __ATOMIC_RELAXED);
++	if ((goal != 0 || proc_over) && __atomic_load_n(&sweet_purge_mode, __ATOMIC_RELAXED) >= SWEET_PURGE_ON && now - last >= 200000000ull) {
++		__atomic_store_n(&sweet_mem_create_pass_ns, now, __ATOMIC_RELAXED);
++		IOLockLock(sweet_pool_evict_lock);
++		if (proc_over) {
++			(void)sweet_purge_pass_locked(mine + size - plim + SWEET_PURGE_HYST, pid, "process budget");
++		}
++		if (goal != 0) {
++			(void)sweet_purge_pass_locked(goal, 0, "create");
++		}
++		IOLockUnlock(sweet_pool_evict_lock);
++		mine = sweet_mem_proc_bytes(pid);
++		proc_over = !sweet_mem_proc_ok(mine, size, plim);
++	}
++	bool comb_over = !sweet_mem_combined_ok(__atomic_load_n(&sweet_surface_wired, __ATOMIC_RELAXED), __atomic_load_n(&sweet_mem_gpu_private,
++	    __ATOMIC_RELAXED), size, clim);
++	if (!proc_over && !comb_over) {
++		return true;
++	}
++	if (sweet_mem_exempt_self()) {
++		OSIncrementAtomic((volatile SInt32 *)&sweet_mem_exempted);
++		return true;
++	}
++	OSIncrementAtomic((volatile SInt32 *)(proc_over ? &sweet_mem_refused_proc : &sweet_mem_refused_combined));
++	uint32_t k = sweet_mem_told_refuse++;
++	if (k < 16 || (k % 128) == 0) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("NORD2 MEM SURF: %s[%d] %u KiB refused by the %s budget: process %llu of %llu MiB, surfaces %llu + GPU private %llu of %llu MiB "
++		    "(refused: process %u, combined %u)\n", name, pid, size >> 10, proc_over ? "per-process" : "combined", mine >> 20, plim >> 20,
++		    sweet_surface_wired >> 20, sweet_mem_gpu_private >> 20, clim >> 20, sweet_mem_refused_proc, sweet_mem_refused_combined);
++	}
++	return false;
++}
++
++/* GPU side of the combined budget (nord2_gpu_transport.h nord2_gpu_global_private_ok, under the GPU locks: never purges inline). */
++extern "C" bool
++sweet_mem_gpu_private_ok(uint64_t total_private, uint64_t rounded)
++{
++	__atomic_store_n(&sweet_mem_gpu_private, total_private, __ATOMIC_RELAXED);
++	uint64_t limit = (uint64_t)__atomic_load_n(&sweet_mem_budget_mib, __ATOMIC_RELAXED) << 20;
++	int d = sweet_mem_gpu_decide(__atomic_load_n(&sweet_surface_wired, __ATOMIC_RELAXED), total_private, rounded, limit,
++	    __atomic_load_n(&sweet_mem_idle_bytes, __ATOMIC_RELAXED));
++	if (d == 1) {
++		return true;
++	}
++	if (sweet_purge_kick_tc != NULL && __atomic_exchange_n(&sweet_purge_kick_pending, 1u, __ATOMIC_ACQ_REL) == 0) {
++		OSIncrementAtomic((volatile SInt32 *)&sweet_mem_gpu_kicks);
++		thread_call_enter(sweet_purge_kick_tc);
++	}
++	if (d == 2) {
++		return true;            /* fits once the idle volatile surfaces are purged (just kicked) */
++	}
++	if (sweet_mem_exempt_self()) {
++		OSIncrementAtomic((volatile SInt32 *)&sweet_mem_exempted);
++		return true;
++	}
++	uint32_t k = OSIncrementAtomic((volatile SInt32 *)&sweet_mem_refused_gpu);
++	if (sweet_mem_told_gpu++ < 16 || (k % 128) == 0) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("NORD2 MEM SURF: GPU allocation of %llu KiB by %s[%d] refused by the combined budget: GPU private %llu + surfaces %llu of %llu MiB "
++		    "(GPU refusals %u)\n", rounded >> 10, name, proc_selfpid(), total_private >> 20, sweet_surface_wired >> 20, limit >> 20, k + 1);
++	}
++	return false;
++}
++
++static void
++sweet_mem_log_line(void)
++{
++	char top[48] = "-";
++	int32_t tp = 0;
++	uint64_t tb = 0;
++	if (sweet_mem_spin != NULL) {
++		IOSimpleLockLock(sweet_mem_spin);
++		for (unsigned i = 0; i < SWEET_MEM_PROCS; i++) {
++			if (sweet_mem_procs[i].pid > 0 && sweet_mem_procs[i].bytes > tb) {
++				tb = sweet_mem_procs[i].bytes;
++				tp = sweet_mem_procs[i].pid;
++			}
++		}
++		IOSimpleLockUnlock(sweet_mem_spin);
++	}
++	if (tp > 0) {
++		char name[32] = "?";
++		proc_name(tp, name, sizeof(name));
++		snprintf(top, sizeof(top), "%s[%d] %llu MiB", name, tp, tb >> 20);
++	}
++	uint64_t gp = __atomic_load_n(&sweet_mem_gpu_private, __ATOMIC_RELAXED), sw = __atomic_load_n(&sweet_surface_wired, __ATOMIC_RELAXED);
++	IOLog("NORD2 MEM SURF: wired=%llu MiB bufs=%u (table %u) volatile=%u/%llu MiB idle=%u/%llu MiB iommu=%u MiB purged=%u/%llu MiB pend=%u/%llu MiB "
++	    "gpu_private=%llu MiB combined=%llu/%u MiB avail=%u wired_pages=%u purges=%u unpurges=%u fail=%u/%u remap_bad=%u refused=proc %u comb %u gpu %u "
++	    "exempt %u kicks %u top=%s mode=%d\n", sw >> 20, sweet_surface_buffers, sweet_purge_st_bufs, sweet_purge_st_vol_n, sweet_purge_st_vol_b >> 20, sweet_purge_st_idle_n,
++	    sweet_purge_st_idle_b >> 20, (n2io_pt.mapped * 4096u) >> 20, sweet_purged_live, sweet_purged_bytes >> 20, sweet_purge_npend, sweet_purge_pend_bytes >> 20,
++	    gp >> 20, (sw + gp) >> 20, sweet_mem_budget_mib, memorystatus_available_pages, vm_page_wire_count, sweet_purge_n, sweet_unpurge_n, sweet_purge_failed,
++	    sweet_unpurge_failed, sweet_purge_remap_bad, sweet_mem_refused_proc, sweet_mem_refused_combined, sweet_mem_refused_gpu, sweet_mem_exempted,
++	    sweet_mem_gpu_kicks, top, sweet_purge_mode);
++	if (sweet_purge_st_vol_n != 0) {
++		uint32_t *y = sweet_purge_st_why;
++		IOLog("NORD2 MEM SURF: volatile kept because: young %u active %u in-use %u display %u gpu-job %u gpu-import %u gpu-busy %u iommu %u size %u mode %u\n",
++		    y[SWEET_PURGE_NO_YOUNG], y[SWEET_PURGE_NO_ACTIVE], y[SWEET_PURGE_NO_USE], y[SWEET_PURGE_NO_DISPLAY], y[SWEET_PURGE_NO_GPU_JOB],
++		    y[SWEET_PURGE_NO_GPU_IMPORT], y[SWEET_PURGE_NO_GPU_BUSY], y[SWEET_PURGE_NO_IOMMU], y[SWEET_PURGE_NO_SIZE], y[SWEET_PURGE_NO_MODE]);
++	}
++}
++
++/* Every 2 s (thread call): drain, scan, purge under pressure; the line every 10 s. */
++static void
++sweet_purge_tick(thread_call_param_t p0, thread_call_param_t)
++{
++	bool periodic = p0 == NULL;
++	if (!periodic) {
++		__atomic_store_n(&sweet_purge_kick_pending, 0u, __ATOMIC_RELEASE);
++	}
++	if (sweet_pool_evict_lock != NULL && sweet_surface_lock != NULL) {
++		uint64_t goal = sweet_mem_goal(0);
++		IOLockLock(sweet_pool_evict_lock);
++		(void)sweet_purge_pass_locked(goal, 0, periodic ? "pressure" : "gpu budget");
++		IOLockUnlock(sweet_pool_evict_lock);
++	}
++	if (!periodic) {
++		return;
++	}
++	uint32_t now = sweet_surface_uptime();
++	if (now - sweet_mem_log_at >= 10) {
++		sweet_mem_log_at = now;
++		sweet_mem_log_line();
++	}
++	uint64_t dl = 0;
++	clock_interval_to_deadline(2, kSecondScale, &dl);
++	thread_call_enter_delayed(sweet_purge_tc, dl);
++}
++
++static void
++sweet_purge_start(void)
++{
++	uint32_t v = 0;
++	if (PE_parse_boot_argn("n2sp", &v, sizeof(v)) && v <= SWEET_PURGE_ON) {
++		sweet_purge_mode = (int)v;
++	}
++	if (PE_parse_boot_argn("n2mb", &v, sizeof(v))) {
++		sweet_mem_budget_mib = v;
++	}
++	for (uint64_t len = SWEET_PURGE_SINK_MAX; sweet_purge_sink == NULL && len >= (4u << 20); len >>= 1) {
++		IOBufferMemoryDescriptor *b = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared,
++		    (vm_size_t)len, page_size);
++		if (b != NULL && b->getLength() >= len) {
++			bzero(b->getBytesNoCopy(), (size_t)len);
++			sweet_purge_sink_len = len;
++			sweet_purge_sink = b;
++		} else {
++			OSSafeReleaseNULL(b);
++		}
++	}
++	sweet_purge_tc = thread_call_allocate(sweet_purge_tick, NULL);
++	sweet_purge_kick_tc = thread_call_allocate(sweet_purge_tick, (thread_call_param_t)1);
++	IOLog("NORD2 MEM SURF: purge mode %d (kern.n2surf_purge / n2sp), sink %llu MiB, pressure: surfaces > %u MiB or available < %u pages, idle %u s; "
++	    "budgets: surfaces + GPU private %u MiB (kern.n2mem_budget_mib / n2mb), per process %u MiB, surfaces %llu MiB\n", sweet_purge_mode,
++	    sweet_purge_sink_len >> 20, sweet_purge_thr_mib, sweet_purge_avail_min, sweet_purge_idle_s, sweet_mem_budget_mib, sweet_surf_proc_mib,
++	    SWEET_SURFACE_WIRED_MAX >> 20);
++	if (sweet_purge_tc != NULL) {
++		uint64_t dl = 0;
++		clock_interval_to_deadline(10, kSecondScale, &dl);
++		thread_call_enter_delayed(sweet_purge_tc, dl);
++	}
++}
++
+ static void
+ sweet_clients_init_lock(void)
+ {
+@@ -1505,7 +2110,9 @@
+ 		if (mem == NULL) {
+ 			break;
+ 		}
+-		ref->data = mem->createMappingInTask(fTask, 0, kIOMapAnywhere | cache);
++		/* 0417: a purged surface's view maps the shared sink: kIOMapUnique, never another surface's compatible mapping of it */
++		ref->data = mem->createMappingInTask(fTask, 0, kIOMapAnywhere | cache |
++		    (OSDynamicCast(IOSubMemoryDescriptor, mem) != NULL ? (IOOptionBits)kIOMapUnique : 0));
+ 		IOLockLock(sweet_surface_lock);
+ 		bool moved = s->memory != mem;
+ 		IOLockUnlock(sweet_surface_lock);
+@@ -1711,8 +2318,9 @@
+ 		}
+ 	} else if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
++		bool admitted = sweet_mem_admit(s->allocSize, fPid);      /* 0417: purge under pressure, per-process and combined budgets */
+ 		bool in_budget = (uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+-		    s->allocSize <= SWEET_SURFACE_WIRED_MAX;
++		    s->allocSize <= SWEET_SURFACE_WIRED_MAX && admitted;
+ 		if (in_budget) {
+ 			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+ 			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
+@@ -1720,7 +2328,7 @@
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 			ret = kIOReturnNoMemory;
+-			sweet_surface_report(in_budget ? "the kernel gave no memory" : "over the budget", s->allocSize);   /* 0299 */
++			sweet_surface_report(in_budget ? "the kernel gave no memory" : (admitted ? "over the budget" : "over the 0417 budgets"), s->allocSize);   /* 0299 */
+ 		} else {
+ 			OSIncrementAtomic((volatile SInt32 *)&sweet_surface_buffers);
+ 			OSIncrementAtomic((volatile SInt32 *)&sweet_surface_created);
+@@ -1781,6 +2389,7 @@
+ 			if (mem != NULL) {
+ 			s->memory = mem;
+ 			s->mapCache = kIOMapDefaultCache;
++			sweet_mem_proc_charge(fPid, (int64_t)s->allocSize);    /* 0417 (free() gives it back by s->creator == fPid) */
+ 			if (!sweet_surface_publish(s)) {
+ 				ret = kIOReturnNoResources;
+ 			}
+@@ -1875,9 +2484,18 @@
+ 		if (sweet_pool_evict_lock != NULL) {
+ 			IOLockLock(sweet_pool_evict_lock);     /* 0406: not in the middle of an eviction of s */
+ 		}
++		uint32_t req = (uint32_t)args->scalarInput[1];
+ 		IOLockLock(sweet_surface_lock);
+-		uint32_t old = sweet_purgeable_update(&s->purgeable, (uint32_t)args->scalarInput[1]);
++		bool was_purged = s->purged != 0;
++		uint32_t old = sweet_purgeable_update(&s->purgeable, req);
+ 		IOLockUnlock(sweet_surface_lock);
++		if (was_purged) {
++			/* 0417: the contents are gone whatever was asked in between: Empty; NonVolatile gets own memory again (evict lock held) */
++			old = SWEET_PURGEABLE_EMPTY;
++			if (req == SWEET_PURGEABLE_NONVOLATILE && sweet_pool_evict_lock != NULL) {
++				(void)sweet_purge_unpurge_locked(s);
++			}
++		}
+ 		if (sweet_pool_evict_lock != NULL) {
+ 			IOLockUnlock(sweet_pool_evict_lock);
+ 		}
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -46,6 +46,7 @@
+ 	int32_t                   creator;      /* 0398: pid of the creating process (0 = kernel) */
+ 	uint32_t                  bornAt;       /* 0398: uptime second of the creation */
+ 	volatile uint32_t         gpuImports;   /* 0398: Nord2GPU import buffers holding a reference (BufferOwner) */
++	uint32_t                  purged;       /* 0417: 1 = memory is a view of the shared purge sink (contents gone, state Empty) */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+--- /dev/null
++++ b/iokit/Kernel/arm/sweet_surface_purge.h
+@@ -0,0 +1,200 @@
++/*
++ * 0417 (memfix-20261113): purge of idle VOLATILE IOSurfaces under memory pressure, one budget for surfaces + GPU private memory,
++ * a per-process surface budget.  SPDX-License-Identifier: MIT
++ *
++ * Why (autocycle/runs/lag1, q10jgn, fresh boot + Camera + Photos, 5 min): wired 208,837 pages (3.2 GiB of 16 KiB) with avail ~8-11k
++ * pages and 8-23k pageins / 2 s (file-backed pages thrashing = the display lags).  Every SweetSurface is a wired IOBufferMemoryDescriptor
++ * (~1.8 GiB, budget 2048 MiB) and GPU private memory is 1388 MiB (budget 1536 MiB): 3584 MiB of budgets in a 3776 MiB window, so RAM
++ * runs out before either refuses.  IOSurfaceSetPurgeable only recorded the state (Photos: 521 volatile surfaces, 312 MiB).
++ *
++ * Purge: a surface whose holders marked it VOLATILE and nobody uses (use counts 0, no display hold, no GPU job, no GPU import, GPU not
++ * writing it, not on an IOMMU-programmed layer, not swapped / created for idle_s) gets, at the same user addresses (the 0406 in-place
++ * kIOMapOverwrite remap), a view of one shared wired "sink" buffer instead of its own pages; its purgeable state becomes Empty and its
++ * own wired buffer is freed after a grace period (sweet_reclaim_grace of 0406).  A later SetPurgeable(NonVolatile) allocates wired memory
++ * again (remap back) and answers Empty, so the client redraws.
++ *
++ * Why a shared physical sink and not "pageable memory": getPhysicalSegment() on an unwired virtual descriptor panics ("IOGMD: not wired
++ * for the IODMACommand", IOMemoryDescriptor.cpp) and the GPU import (Nord2GPU::importSurface), the display IOMMU map (n2io_map_locked) and
++ * the framebuffer's H0 log all call it on s->memory without prepare().  A withPhysicalAddress view of the sink is always walkable,
++ * costs no RAM per surface, and anything that still writes a purged surface (an app ignoring Empty, the GPU) only writes the sink.
++ *
++ * Pure: no IOKit; shared by SweetSurface.cpp and memfix-20261113/test/purge_host_test.c.
++ */
++#ifndef SWEET_SURFACE_PURGE_H
++#define SWEET_SURFACE_PURGE_H
++/* (uint*_t / bool come from the includer: the kernel's headers, or stdint.h + stdbool.h in the host test) */
++
++/* kern.n2surf_purge: 0 off, 1 decide and log only, 2 purge (default) */
++enum { SWEET_PURGE_OFF = 0, SWEET_PURGE_REPORT = 1, SWEET_PURGE_ON = 2 };
++
++#define SWEET_PURGE_VOLATILE    1u      /* kIOSurfacePurgeableVolatile */
++
++enum {
++	SWEET_PURGE_OK = 0,
++	SWEET_PURGE_NO_BUFFER,          /* not a wired buffer surface (pool, panel, already purged) */
++	SWEET_PURGE_NO_KERNEL,          /* made by the kernel */
++	SWEET_PURGE_NO_MODE,            /* kern.n2surfuse < 2: holds not counted, idleness cannot be proven */
++	SWEET_PURGE_NO_SIZE,            /* bigger than the sink */
++	SWEET_PURGE_NO_NONVOLATILE,     /* contents still wanted */
++	SWEET_PURGE_NO_YOUNG,           /* created less than idle_s ago */
++	SWEET_PURGE_NO_ACTIVE,          /* named in a swap less than idle_s ago */
++	SWEET_PURGE_NO_USE,             /* IOSurfaceIsInUse (a use-count word != 0) */
++	SWEET_PURGE_NO_DISPLAY,         /* a swap holds it */
++	SWEET_PURGE_NO_GPU_JOB,         /* a GPU job lists it */
++	SWEET_PURGE_NO_GPU_IMPORT,      /* a GPU import maps its pages */
++	SWEET_PURGE_NO_GPU_BUSY,        /* a GPU job writing it has not finished */
++	SWEET_PURGE_NO_IOMMU,           /* its IOVA is programmed in an overlay slot now */
++	SWEET_PURGE_NREASONS
++};
++
++struct sweet_purge_cand {
++	uint32_t size;                  /* allocSize */
++	uint32_t born_at, shown_at;     /* uptime s; shown_at 0 = never in a swap */
++	uint32_t purgeable;
++	uint32_t w0, w1, kd, kg, imports;
++	int32_t  creator;
++	bool     buffer, gpu_busy, iommu_prog;
++};
++
++static inline uint32_t
++sweet_purge_verdict(const struct sweet_purge_cand *c, uint32_t now, uint32_t idle_s, bool use_mode_all, uint64_t sink_bytes)
++{
++	if (!c->buffer || c->size == 0) return SWEET_PURGE_NO_BUFFER;
++	if (c->creator <= 0) return SWEET_PURGE_NO_KERNEL;
++	if (!use_mode_all) return SWEET_PURGE_NO_MODE;
++	if ((uint64_t)c->size > sink_bytes) return SWEET_PURGE_NO_SIZE;
++	if (c->purgeable != SWEET_PURGE_VOLATILE) return SWEET_PURGE_NO_NONVOLATILE;
++	if (idle_s == 0) idle_s = 1;
++	if (now - c->born_at < idle_s) return SWEET_PURGE_NO_YOUNG;
++	if (c->shown_at != 0 && now - c->shown_at < idle_s) return SWEET_PURGE_NO_ACTIVE;
++	if (c->w0 != 0 || c->w1 != 0) return SWEET_PURGE_NO_USE;
++	if (c->kd != 0) return SWEET_PURGE_NO_DISPLAY;
++	if (c->kg != 0) return SWEET_PURGE_NO_GPU_JOB;
++	if (c->imports != 0) return SWEET_PURGE_NO_GPU_IMPORT;
++	if (c->gpu_busy) return SWEET_PURGE_NO_GPU_BUSY;
++	if (c->iommu_prog) return SWEET_PURGE_NO_IOMMU;
++	return SWEET_PURGE_OK;
++}
++
++static inline uint32_t
++sweet_purge_last_use(const struct sweet_purge_cand *c)
++{
++	return c->shown_at != 0 ? c->shown_at : c->born_at;
++}
++
++/*
++ * Bytes a purge pass should free now (0 = no pressure).  Pressure = surface wired bytes over thr (back to thr - hyst), available pages
++ * under avail_min (back to avail_min + hyst), surfaces + GPU private + need over the combined budget, plus need itself when any of these
++ * holds (a creation that triggered the pass must fit afterwards).  Overflow-safe; limits of 0 = that rule off.
++ */
++static inline uint64_t
++sweet_purge_goal(uint64_t surf_wired, uint64_t gpu_private, uint32_t avail_pages, uint32_t page_bytes, uint64_t thr, uint32_t avail_min,
++    uint64_t combined, uint64_t hyst, uint64_t need)
++{
++	uint64_t goal = 0, g;
++	if (thr != 0 && surf_wired + need > thr) {
++		g = surf_wired + need - (thr > hyst ? thr - hyst : 0);
++		if (g > goal) goal = g;
++	}
++	if (avail_min != 0 && avail_pages < avail_min) {
++		g = (uint64_t)(avail_min - avail_pages) * page_bytes + hyst;
++		if (g > goal) goal = g;
++	}
++	if (combined != 0 && surf_wired + gpu_private + need > combined) {
++		g = surf_wired + gpu_private + need - combined + hyst;
++		if (g > goal) goal = g;
++	}
++	if (goal != 0 && need > goal) goal = need;
++	return goal;
++}
++
++/* kern.n2mem_budget: one budget for surface wired bytes + GPU private bytes.  0 = off. */
++static inline bool
++sweet_mem_combined_ok(uint64_t surf_wired, uint64_t gpu_private, uint64_t request, uint64_t limit)
++{
++	if (limit == 0) return true;
++	return surf_wired <= limit && gpu_private <= limit - surf_wired && request <= limit - surf_wired - gpu_private;
++}
++
++/*
++ * The GPU side of the combined budget (called from nord2_gpu_global_private_ok, under the GPU locks: cannot purge inline).  It may go
++ * ahead when the request fits once the idle volatile surfaces seen by the last scan are purged (the caller kicks the purge thread);
++ * idle_bytes is that estimate.  Returns 0 refuse, 1 fits now, 2 fits after the purge (kick it).
++ */
++static inline int
++sweet_mem_gpu_decide(uint64_t surf_wired, uint64_t gpu_private, uint64_t request, uint64_t limit, uint64_t idle_bytes)
++{
++	if (sweet_mem_combined_ok(surf_wired, gpu_private, request, limit)) return 1;
++	uint64_t after = surf_wired > idle_bytes ? surf_wired - idle_bytes : 0;
++	return sweet_mem_combined_ok(after, gpu_private, request, limit) ? 2 : 0;
++}
++
++/* Per-process surface budget (bytes made by one pid).  0 = off. */
++static inline bool
++sweet_mem_proc_ok(uint64_t proc_bytes, uint64_t request, uint64_t limit)
++{
++	return limit == 0 || (proc_bytes <= limit && request <= limit - proc_bytes);
++}
++
++/* Per-process byte table (pid -> wired surface bytes it created).  Caller serialises.  A full table leaves a pid untracked. */
++#define SWEET_MEM_PROCS 64
++struct sweet_mem_proc { int32_t pid; uint64_t bytes; };
++
++/* Index of pid's row (make: a new or emptied row for it), -1 = none. */
++static inline int
++sweet_mem_proc_find(const struct sweet_mem_proc *t, int32_t pid, bool make)
++{
++	int empty = -1;
++	if (pid <= 0) return -1;
++	for (int i = 0; i < SWEET_MEM_PROCS; i++) {
++		if (t[i].pid == pid) return i;
++		if (empty < 0 && (t[i].pid == 0 || t[i].bytes == 0)) empty = i;
++	}
++	return make ? empty : -1;
++}
++
++static inline void
++sweet_mem_proc_add(struct sweet_mem_proc *t, int32_t pid, int64_t delta)
++{
++	int i = sweet_mem_proc_find(t, pid, delta > 0);
++	if (i < 0) return;
++	if (t[i].pid != pid) {
++		t[i].pid = pid;
++		t[i].bytes = 0;
++	}
++	if (delta < 0 && (uint64_t)(-delta) > t[i].bytes) t[i].bytes = 0;
++	else t[i].bytes = (uint64_t)((int64_t)t[i].bytes + delta);
++}
++
++/*
++ * LRU victims: indices of candidates with verdict OK, oldest last use first, until their sizes reach goal (or cap).  order[] is scratch
++ * of n entries.  Returns the count; *freed = their bytes.  Selection sort over at most n (n <= a few thousand, called at most every 2 s).
++ */
++static inline uint32_t
++sweet_purge_pick(const struct sweet_purge_cand *c, const uint32_t *verdict, uint32_t n, uint64_t goal, uint32_t *out, uint32_t cap,
++    uint64_t *freed)
++{
++	uint32_t k = 0;
++	uint64_t got = 0;
++	uint32_t last_v = 0, last_i = 0;
++	bool have_last = false;
++	while (k < cap && got < goal) {
++		int best = -1;
++		for (uint32_t i = 0; i < n; i++) {
++			if (verdict[i] != SWEET_PURGE_OK) continue;
++			uint32_t v = sweet_purge_last_use(&c[i]);
++			/* strictly after the previous pick in (last_use, index) order: no "taken" array needed */
++			if (have_last && (v < last_v || (v == last_v && i <= last_i))) continue;
++			if (best < 0 || v < sweet_purge_last_use(&c[best])) best = (int)i;
++		}
++		if (best < 0) break;
++		out[k++] = (uint32_t)best;
++		got += c[best].size;
++		last_v = sweet_purge_last_use(&c[best]);
++		last_i = (uint32_t)best;
++		have_last = true;
++	}
++	*freed = got;
++	return k;
++}
++#endif /* SWEET_SURFACE_PURGE_H */

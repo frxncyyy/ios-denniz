@@ -1,0 +1,671 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -40,6 +40,13 @@
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
++#include <sys/sysctl.h>
++#include <pexpert/pexpert.h>
++#include "sweet_fb_hw_pool_alloc.h"     /* 0394 */
++extern "C" {
++#include <arm/caches_internal.h>
++vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
++}
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -89,6 +96,214 @@
+ static uint32_t      sweet_surface_created;     /* buffer surfaces ever made (released = created - alive) */
+ static void sweet_surface_report(const char *why, uint32_t asked);      /* after the client class */
+ 
++/*
++ * 0394 (hwcomp-20261112, TRACK A): the display surface pool, PA 0xC0000000..0xD0000000 (sweet_fb_hw_pool.h).
++ * Memory map (gpu/hwcodec/DISPLAY_HW_COMPOSE.md, section "Display pool"): XNU's RAM is 0x1_42000000 + 3776 MiB (loader
++ * NORD2_XNU_PHYS_BASE / loader3776 + ADT dram-size 0xec000000), so XNU never manages the pool and nothing has to be taken out
++ * of its RAM map.  Neighbours: atf-ramdump ends at 0xC0000000 (no-map), the camera buffers start at 0xD0000000 (nord2_camsv.inc).
++ * The live DTS names exactly this range as Linux's SSMR CMA pool (reusable, not no-map; LK lists it as free RAM): nobody asks the
++ * TEE for it under XNU.  The pool init writes a canary into every 64 KiB granule and reads it back; any mismatch turns the pool
++ * off for the boot (NORD2 FB POOL: ... disabled).
++ * Every CPU mapping of the pool has the same attribute, chosen once (boot-arg n2fbpoolc): 0 = write-combined (default), 1 =
++ * write-back cacheable.  Never kIOMapDefaultCache: for a PA outside XNU's RAM that resolves to VM_WIMG_IO (Device memory:
++ * IODefaultCacheBits -> pmap_cache_attributes), on which unaligned accesses and DC ZVA fault.
++ * One kernel mapping of the whole pool (ml_io_map_unmappable: kernel_map; ml_io_map_wcomb would use the 8 MiB io_submap with
++ * KMA_NOFAIL and panic); user mappings are withPhysicalAddress descriptors mapped like the panel buffers.
++ */
++#define SWEET_POOL_WIMG_COPYBACK        0x2u    /* osfmk/arm/memory_types.h VM_WIMG_COPYBACK (== VM_WIMG_DEFAULT) */
++#define SWEET_POOL_WIMG_WCOMB           0x6u    /* VM_WIMG_WCOMB */
++_Static_assert(SWEET_FB_HW_POOL_BASE >= 0xC0000000ull, "pool overlaps atf-ramdump (ends at 0xC0000000)");
++_Static_assert(SWEET_FB_HW_POOL_BASE + SWEET_FB_HW_POOL_SIZE <= 0xD0000000ull, "pool overlaps the camera buffers at 0xD0000000");
++_Static_assert(SWEET_FB_HW_POOL_BASE + SWEET_FB_HW_POOL_SIZE <= 0x100000000ull, "OVL Ln_ADDR is 32 bits");
++_Static_assert((SWEET_FB_HW_POOL_BASE % SWEET_FB_HW_POOL_GRANULE) == 0 && (SWEET_FB_HW_POOL_GRANULE % 16384) == 0, "granule");
++
++static int           sweet_pool_enabled;        /* kern.n2fbhw_pool (boot-arg n2fbhw_pool), default 0 */
++static uint32_t      sweet_pool_copyback;       /* boot-arg n2fbpoolc: fixed at the first pool use */
++static uint32_t      sweet_pool_state;          /* 0 not set up, 1 ready, 2 off for this boot */
++static bool          sweet_pool_args_done;
++static IOSimpleLock *sweet_pool_spin;           /* the bitmap */
++static struct sweet_fb_pool sweet_pool;
++static volatile uint8_t *sweet_pool_kva;        /* the whole pool */
++static uint32_t      sweet_pool_live, sweet_pool_used_kib, sweet_pool_full, sweet_pool_foreign, sweet_pool_leaked;
++static uint32_t      sweet_pool_why[SWEET_FB_POOL_NREASONS];    /* creations by eligibility answer (0 = went to the pool) */
++static uint32_t      sweet_pool_logged_alloc, sweet_pool_logged_free;
++SYSCTL_INT(_kern, OID_AUTO, n2fbhw_pool, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_pool_enabled, 0, "0394: big BGRA IOSurfaces from the display pool");
++SYSCTL_UINT(_kern, OID_AUTO, n2fbhw_pool_live, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_pool_live, 0, "");
++SYSCTL_UINT(_kern, OID_AUTO, n2fbhw_pool_used_kib, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_pool_used_kib, 0, "");
++SYSCTL_UINT(_kern, OID_AUTO, n2fbhw_pool_full, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_pool_full, 0, "");
++SYSCTL_UINT(_kern, OID_AUTO, n2fbhw_pool_foreign, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_pool_foreign, 0, "");
++
++static void
++sweet_pool_args(void)
++{
++	if (sweet_pool_args_done) {
++		return;
++	}
++	uint32_t v = 0;
++	/* n2fp = short alias (the command line has 4-11 chars left), so backboardd's boot-time surfaces can be pooled too */
++	if (PE_parse_boot_argn("n2fbhw_pool", &v, sizeof(v)) || PE_parse_boot_argn("n2fp", &v, sizeof(v))) {
++		sweet_pool_enabled = v ? 1 : 0;
++	}
++	v = 0;
++	if (PE_parse_boot_argn("n2fbpoolc", &v, sizeof(v))) {
++		sweet_pool_copyback = v ? 1 : 0;
++	}
++	sweet_pool_args_done = true;
++}
++
++static void
++sweet_pool_flush(vm_offset_t va, size_t len)
++{
++	if (sweet_pool_copyback) {
++		FlushPoC_DcacheRegion(va, len);         /* no dirty CPU line may later land over GPU/OVL data */
++	} else {
++		__builtin_arm_dsb(0xf);                 /* WC: drain the write buffers */
++	}
++}
++
++/* Map the pool and check it once (thread context; creation paths only). */
++static bool
++sweet_pool_ready(void)
++{
++	if (sweet_pool_state != 0) {
++		return sweet_pool_state == 1;
++	}
++	IOLockLock(sweet_surface_lock);
++	if (sweet_pool_state == 0) {
++		sweet_pool_args();
++		sweet_pool_spin = IOSimpleLockAlloc();
++		vm_offset_t va = sweet_pool_spin != NULL ? ml_io_map_unmappable((vm_offset_t)SWEET_FB_HW_POOL_BASE,
++		    (vm_size_t)SWEET_FB_HW_POOL_SIZE, sweet_pool_copyback ? SWEET_POOL_WIMG_COPYBACK : SWEET_POOL_WIMG_WCOMB) : 0;
++		uint32_t bad = 0;
++		if (va != 0) {
++			for (uint32_t g = 0; g < SWEET_FB_POOL_NGRAN; g++) {
++				sweet_fb_pool_canary_put((volatile uint64_t *)(va + (uint64_t)g * SWEET_FB_HW_POOL_GRANULE), g);
++				sweet_pool_flush(va + (uint64_t)g * SWEET_FB_HW_POOL_GRANULE, 64);
++			}
++			for (uint32_t g = 0; g < SWEET_FB_POOL_NGRAN; g++) {
++				if (!sweet_fb_pool_canary_ok((volatile uint64_t *)(va + (uint64_t)g * SWEET_FB_HW_POOL_GRANULE), g)) {
++					bad++;
++				}
++			}
++		}
++		sweet_pool_kva = (volatile uint8_t *)va;
++		__builtin_arm_dmb(0xb);
++		sweet_pool_state = (va != 0 && bad == 0) ? 1 : 2;
++		IOLog("NORD2 FB POOL: pa %#llx size %llu MiB granule %llu KiB, %s mapping at %#lx, canary readback %u bad of %u -> %s\n",
++		    SWEET_FB_HW_POOL_BASE, SWEET_FB_HW_POOL_SIZE >> 20, SWEET_FB_HW_POOL_GRANULE >> 10,
++		    sweet_pool_copyback ? "write-back" : "write-combined", (unsigned long)va, bad, SWEET_FB_POOL_NGRAN,
++		    sweet_pool_state == 1 ? "ready" : "disabled for this boot");
++	}
++	IOLockUnlock(sweet_surface_lock);
++	return sweet_pool_state == 1;
++}
++
++/* PA of a pool surface's pixels, 0 for every other surface. */
++static uint64_t
++sweet_pool_surface_pa(const SweetSurface *cs)
++{
++	SweetSurface *s = const_cast<SweetSurface *>(cs);
++	if (s == NULL || s->memory == NULL || sweet_pool_state != 1 || OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL) {
++		return 0;
++	}
++	IOByteCount len = 0;
++	uint64_t pa = s->memory->getPhysicalSegment(0, &len, kIOMemoryMapperNone);
++	return sweet_fb_hw_pool_contains(pa, s->memory->getLength()) ? pa : 0;
++}
++
++static void
++sweet_pool_publish_stats(void)
++{
++	sweet_pool_live = sweet_pool.live;
++	sweet_pool_used_kib = (uint32_t)(sweet_pool.used * (SWEET_FB_HW_POOL_GRANULE >> 10));
++	sweet_pool_full = (uint32_t)sweet_pool.full;
++}
++
++/* Contiguous, zeroed pool memory of bytes; 0 when the pool is off or full (the caller falls back to normal memory). */
++static uint64_t
++sweet_pool_take(uint64_t bytes)
++{
++	if (!sweet_pool_ready()) {
++		return 0;
++	}
++	IOSimpleLockLock(sweet_pool_spin);
++	uint64_t off = sweet_fb_pool_alloc(&sweet_pool, bytes);
++	uint32_t largest = off == SWEET_FB_POOL_FAIL ? sweet_fb_pool_largest_free(&sweet_pool) : 0;
++	sweet_pool_publish_stats();
++	IOSimpleLockUnlock(sweet_pool_spin);
++	if (off == SWEET_FB_POOL_FAIL) {
++		if (sweet_pool_full <= 8 || (sweet_pool_full % 100) == 0) {
++			IOLog("NORD2 FB POOL: full for %llu bytes (live %u, used %u MiB, largest free %llu MiB, full %u) -> normal memory\n",
++			    bytes, sweet_pool_live, sweet_pool_used_kib >> 10, ((uint64_t)largest * SWEET_FB_HW_POOL_GRANULE) >> 20, sweet_pool_full);
++		}
++		return 0;
++	}
++	uint32_t g0 = (uint32_t)(off / SWEET_FB_HW_POOL_GRANULE), n = sweet_fb_pool_granules(bytes), foreign = 0;
++	for (uint32_t g = g0; g < g0 + n; g++) {
++		if (!sweet_fb_pool_canary_ok((volatile uint64_t *)(sweet_pool_kva + (uint64_t)g * SWEET_FB_HW_POOL_GRANULE), g)) {
++			if (foreign++ < 2) {
++				IOLog("NORD2 FB POOL: foreign write in free granule at pa %#llx (seen at alloc)\n",
++				    SWEET_FB_HW_POOL_BASE + (uint64_t)g * SWEET_FB_HW_POOL_GRANULE);
++			}
++		}
++	}
++	if (foreign != 0) {
++		OSAddAtomic((SInt32)foreign, (volatile SInt32 *)&sweet_pool_foreign);
++	}
++	bzero((void *)(sweet_pool_kva + off), (size_t)bytes);
++	sweet_pool_flush((vm_offset_t)(sweet_pool_kva + off), (size_t)bytes);
++	return SWEET_FB_HW_POOL_BASE + off;
++}
++
++/* Give a pool range back (SweetSurface::free, after every mapping of it is gone). */
++static void
++sweet_pool_give(uint64_t pa, uint64_t bytes)
++{
++	uint64_t off = pa - SWEET_FB_HW_POOL_BASE;
++	uint32_t g0 = (uint32_t)(off / SWEET_FB_HW_POOL_GRANULE), n = sweet_fb_pool_granules(bytes);
++	for (uint32_t g = g0; g < g0 + n && g < SWEET_FB_POOL_NGRAN; g++) {
++		sweet_fb_pool_canary_put((volatile uint64_t *)(sweet_pool_kva + (uint64_t)g * SWEET_FB_HW_POOL_GRANULE), g);
++		sweet_pool_flush((vm_offset_t)(sweet_pool_kva + (uint64_t)g * SWEET_FB_HW_POOL_GRANULE), 64);
++	}
++	IOSimpleLockLock(sweet_pool_spin);
++	bool ok = sweet_fb_pool_free(&sweet_pool, off, bytes);
++	sweet_pool_publish_stats();
++	IOSimpleLockUnlock(sweet_pool_spin);
++	uint32_t k = sweet_pool_logged_free++;
++	if (!ok || k < 32 || (k % 64) == 0) {
++		IOLog("NORD2 FB POOL: free pa %#llx %llu bytes%s (live %u, used %u MiB)\n", pa, bytes, ok ? "" : " REFUSED (not allocated)",
++		    sweet_pool_live, sweet_pool_used_kib >> 10);
++	}
++}
++
++/* Put s (geometry set, allocSize final) into the pool: memory + mapCache; false = pool off or full. */
++static bool
++sweet_pool_attach(SweetSurface *s)
++{
++	uint64_t pa = sweet_pool_take(s->allocSize);
++	if (pa == 0) {
++		return false;
++	}
++	s->memory = IOMemoryDescriptor::withPhysicalAddress(pa, s->allocSize, kIODirectionInOut);
++	if (s->memory == NULL) {
++		sweet_pool_give(pa, s->allocSize);
++		return false;
++	}
++	s->mapCache = sweet_pool_copyback ? kIOMapCopybackCache : kIOMapWriteCombineCache;
++	return true;
++}
++
++static void
++sweet_pool_log_alloc(SweetSurface *s, const char *who)
++{
++	uint32_t k = sweet_pool_logged_alloc++;
++	if (k < 32 || (k % 64) == 0) {
++		IOLog("NORD2 FB POOL: %s id %u %ux%u bpr %u -> pa %#llx size %u (live %u, used %u MiB of %llu)\n", who, s->id, s->width,
++		    s->height, s->bytesPerRow, sweet_pool_surface_pa(s), s->allocSize, sweet_pool_live, sweet_pool_used_kib >> 10,
++		    SWEET_FB_HW_POOL_SIZE >> 20);
++	}
++}
++
+ static uint32_t
+ sweet_surface_uptime(void)
+ {
+@@ -106,9 +321,19 @@
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 		OSDecrementAtomic((volatile SInt32 *)&sweet_surface_buffers);
+ 	}
++	/* 0394: a pool surface gives its range back once nothing else holds the descriptor (a holder could still map it). */
++	uint64_t poolPa = sweet_pool_surface_pa(this), poolLen = poolPa != 0 ? memory->getLength() : 0;
++	bool poolHeld = poolPa != 0 && memory->getRetainCount() > 1;
+ 	OSSafeReleaseNULL(kernelMap);
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
++	if (poolPa != 0 && !poolHeld) {
++		sweet_pool_give(poolPa, poolLen);
++	} else if (poolHeld) {
++		OSIncrementAtomic((volatile SInt32 *)&sweet_pool_leaked);
++		IOLog("NORD2 FB POOL: pa %#llx %llu bytes kept out of the pool: its descriptor is still held (leaked %u)\n",
++		    poolPa, poolLen, sweet_pool_leaked);
++	}
+ 	OSObject::free();
+ }
+ 
+@@ -119,6 +344,10 @@
+ 	if (buffer != NULL) {
+ 		return (uintptr_t)buffer->getBytesNoCopy();
+ 	}
++	uint64_t poolPa = sweet_pool_surface_pa(this);         /* 0394: the pool's own kernel mapping (same attribute as the users') */
++	if (poolPa != 0) {
++		return (uintptr_t)(sweet_pool_kva + (poolPa - SWEET_FB_HW_POOL_BASE));
++	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+ 		kernelMap = memory->map(kIOMapWriteCombineCache);
+@@ -274,6 +503,76 @@
+ 	return s;
+ }
+ 
++/* 0394: kernel-made pool surface (sweet_fb_hw_pool.h). */
++SweetSurface *
++sweet_surface_create_pool(uint32_t width, uint32_t height)
++{
++	uint64_t bpr = ((uint64_t)width * 4 + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1);
++	if (width == 0 || height == 0 || width > SWEET_SURFACE_MAX_DIM || height > SWEET_SURFACE_MAX_DIM ||
++	    round_page(bpr * height) > SWEET_FB_HW_POOL_SIZE) {
++		return NULL;
++	}
++	SweetSurface *s = sweet_surface_alloc();
++	if (s == NULL) {
++		return NULL;
++	}
++	s->width = width;
++	s->height = height;
++	s->bytesPerRow = (uint32_t)bpr;
++	s->bytesPerElement = 4;
++	s->elementWidth = s->elementHeight = 1;
++	s->pixelFormat = SWEET_FB_POOL_BGRA;
++	s->allocSize = (uint32_t)round_page(bpr * height);
++	if (!sweet_pool_attach(s) || !sweet_surface_publish(s)) {
++		s->release();           /* gives the range back if it got one */
++		return NULL;
++	}
++	sweet_pool_log_alloc(s, "kernel");
++	return s;
++}
++
++/* 0394: what the GPU import (TRACK B) and the OVL planner (TRACK C) need (sweet_fb_hw_pool.h). */
++extern "C" uint64_t
++sweet_surface_pool_pa_obj(const void *surface)
++{
++	return sweet_pool_surface_pa((const SweetSurface *)surface);
++}
++
++extern "C" uint32_t
++sweet_surface_pool_stride_obj(const void *surface)
++{
++	return sweet_pool_surface_pa((const SweetSurface *)surface) != 0 ? ((const SweetSurface *)surface)->bytesPerRow : 0;
++}
++
++extern "C" uint64_t
++sweet_surface_pool_size_obj(const void *surface)
++{
++	return sweet_pool_surface_pa((const SweetSurface *)surface) != 0 ? ((const SweetSurface *)surface)->memory->getLength() : 0;
++}
++
++extern "C" uint32_t
++sweet_surface_pool_cache_obj(const void *surface)
++{
++	if (sweet_pool_surface_pa((const SweetSurface *)surface) == 0) {
++		return SWEET_FB_HW_POOL_CACHE_NONE;
++	}
++	return sweet_pool_copyback ? SWEET_FB_HW_POOL_CACHE_COPYBACK : SWEET_FB_HW_POOL_CACHE_WC;
++}
++
++#define SWEET_POOL_BY_ID(type, name) \
++	extern "C" type \
++	sweet_surface_pool_ ## name(uint32_t surface_id) \
++	{ \
++	        SweetSurface *s = sweet_surface_copy(surface_id); \
++	        type v = s != NULL ? sweet_surface_pool_ ## name ## _obj(s) : 0; \
++	        OSSafeReleaseNULL(s); \
++	        return v; \
++	}
++SWEET_POOL_BY_ID(uint64_t, pa)
++SWEET_POOL_BY_ID(uint32_t, stride)
++SWEET_POOL_BY_ID(uint64_t, size)
++SWEET_POOL_BY_ID(uint32_t, cache)
++
+ mach_port_name_t
+ sweet_surface_port_in_task(SweetSurface *s, task_t task)
+ {
+@@ -419,6 +718,9 @@
+ 		return false;
+ 	}
+ 	sweet_surface_init_lock();
++	sweet_pool_args();      /* 0394: kern.n2fbhw_pool's boot default; the pool itself is mapped at its first use */
++	IOLog("NORD2 FB POOL: kern.n2fbhw_pool %d, cache %s (n2fbhw_pool / n2fbpoolc)\n", sweet_pool_enabled,
++	    sweet_pool_copyback ? "write-back" : "write-combined");
+ 	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
+ 	registerService();
+ 	IOLog("SWEET SURF: IOCoreSurfaceRoot registered\n");
+@@ -623,6 +925,11 @@
+ 	IOLog("SWEET SURF: refused (%s, %u bytes asked, refusal %llu): %llu of %llu MiB wired in %u buffer surfaces (%u made, %u released); table has %u, %llu MiB; volatile %u, %llu MiB\n",
+ 	    why, asked, refused, sweet_surface_wired >> 20, SWEET_SURFACE_WIRED_MAX >> 20, sweet_surface_buffers,
+ 	    sweet_surface_created, sweet_surface_created - sweet_surface_buffers, in_table, table_bytes >> 20, vol_count, vol_bytes >> 20);
++	IOLog("NORD2 FB POOL: (not in the wired budget) live %u, used %u MiB, full %u, foreign %u, leaked %u; creations: eligible %u (full -> normal: see full), eligible-but-off %u, "
++	    "format %u, planes %u, small %u, stride %u, offset %u, size %u\n", sweet_pool_live, sweet_pool_used_kib >> 10, sweet_pool_full,
++	    sweet_pool_foreign, sweet_pool_leaked, sweet_pool_why[SWEET_FB_POOL_OK], sweet_pool_why[SWEET_FB_POOL_NO_OFF],
++	    sweet_pool_why[SWEET_FB_POOL_NO_FORMAT], sweet_pool_why[SWEET_FB_POOL_NO_PLANES], sweet_pool_why[SWEET_FB_POOL_NO_SMALL],
++	    sweet_pool_why[SWEET_FB_POOL_NO_STRIDE], sweet_pool_why[SWEET_FB_POOL_NO_OFFSET], sweet_pool_why[SWEET_FB_POOL_NO_SIZE]);   /* 0394 */
+ 	for (uint32_t n = 0; n < 5 && n < made_n; n++) {
+ 		char name[32] = "?";
+ 		proc_name(made[n].pid, name, sizeof(name));
+@@ -928,7 +1235,38 @@
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
++	bool pooled = false;
+ 	if (ret == kIOReturnSuccess) {
++		/* 0394: full-screen BGRA surfaces from the display pool when kern.n2fbhw_pool = 1; anything else, or a full pool, below. */
++		uint32_t why = sweet_fb_pool_eligible(1, s->width, s->height, s->bytesPerRow, s->bytesPerElement,
++		    s->elementWidth, s->elementHeight, s->pixelFormat, s->planeCount, s->offset, s->allocSize);
++		if (why == SWEET_FB_POOL_OK && !sweet_pool_enabled) {
++			why = SWEET_FB_POOL_NO_OFF;     /* "off" = would have gone to the pool (H0 data with the pool off) */
++		}
++		OSIncrementAtomic((volatile SInt32 *)&sweet_pool_why[why]);
++		pooled = why == SWEET_FB_POOL_OK && sweet_pool_attach(s);
++	}
++	if (pooled) {
++		OSNumber *client = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++		if (client == NULL) { client = OSDynamicCast(OSNumber, props->getObject("IOSurfaceClientAddress")); }
++		if (client != NULL) {   /* snapshot of the creator's memory, as below (no planes here) */
++			uint64_t address = client->unsigned64BitValue();
++			uint64_t used = sweet_client_range_bytes(address, 0, (uint64_t)s->bytesPerRow * s->height, 0, s->allocSize);
++			uintptr_t kva = s->kernelAddress();
++			int err = used == 0 || kva == 0 ? EINVAL : copyin((user_addr_t)address, (void *)kva, (size_t)used);
++			if (err == 0) {
++				sweet_pool_flush((vm_offset_t)kva, (size_t)used);
++			}
++			IOLog("NORD2 FB POOL: create from client memory %#llx (%llu bytes) -> %s\n", address, used, err ? "refused" : "snapshot copied");
++			ret = err ? kIOReturnBadArgument : kIOReturnSuccess;        /* refused: s->release() below gives the range back */
++		}
++		if (ret == kIOReturnSuccess && !sweet_surface_publish(s)) {
++			ret = kIOReturnNoResources;
++		}
++		if (ret == kIOReturnSuccess) {
++			sweet_pool_log_alloc(s, "create");
++		}
++	} else if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		bool in_budget = (uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX;
+--- /dev/null
++++ b/iokit/Kernel/arm/sweet_fb_hw_pool.h
+@@ -0,0 +1,79 @@
++/*
++ * 0394 (hwcomp-20261112, TRACK A): the display surface pool -- INTERFACE CONTRACT shared by the HW-composition tracks.
++ *
++ * Master copy: gpu/build/hwcomp-20261112/sweet_fb_hw_pool.h.  Installed by patch 0394 as iokit/Kernel/arm/sweet_fb_hw_pool.h
++ * (byte-identical; pool-0394/make_patch.sh checks it).  Pure C/C++, no kernel headers: usable from Nord2GPU.cpp,
++ * SweetFramebuffer.cpp, bsd/dev C files and host tests.
++ *
++ * The pool is 256 MiB of low DRAM (PA 0xC0000000..0xD0000000) that XNU never owns as RAM (XNU's RAM is 0x1_42000000 + 3776 MiB,
++ * all above 4 GiB).  The display OVL (32-bit Ln_ADDR, larb MMU off) and the Mali GPU can both address it.  Large BGRA surfaces
++ * are carved from it as physically contiguous IOSurfaces when sysctl kern.n2fbhw_pool = 1 (boot-arg n2fbhw_pool or n2fp, default 0).
++ *
++ * Cache attribute of EVERY CPU mapping of the pool (kernel and user) is chosen once per boot (boot-arg n2fbpoolc):
++ *   0 (default) = SWEET_FB_HW_POOL_CACHE_WC:       Normal non-cacheable (write-combined).  CPU writes reach DRAM after a DSB,
++ *                                                  no CPU cache maintenance is ever needed for the display or the GPU; CPU
++ *                                                  reads are uncached (slow).
++ *   1           = SWEET_FB_HW_POOL_CACHE_COPYBACK: Normal write-back cacheable.  The usual IOSurface rules apply: the CPU writer
++ *                                                  must clean (IOSurfaceUnlock -> nord2_gpu_surface_cpu_release) before a
++ *                                                  non-coherent reader (GPU, OVL) reads; readers after a GPU write invalidate.
++ * The two are never mixed for the same PA (no mismatched-attribute aliases); XNU's physmap has no alias of the pool.
++ */
++#ifndef SWEET_FB_HW_POOL_H
++#define SWEET_FB_HW_POOL_H
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#define SWEET_FB_HW_POOL_BASE           0xC0000000ull
++#define SWEET_FB_HW_POOL_SIZE           0x10000000ull   /* 256 MiB */
++#define SWEET_FB_HW_POOL_GRANULE        0x10000ull      /* 64 KiB: allocation unit and alignment of every pool surface */
++
++#define SWEET_FB_HW_POOL_CACHE_NONE     0u              /* not a pool surface */
++#define SWEET_FB_HW_POOL_CACHE_WC       1u
++#define SWEET_FB_HW_POOL_CACHE_COPYBACK 2u
++
++/* True iff [pa, pa + len) lies inside the pool and len > 0.  Pure range check: says nothing about allocation state. */
++static inline bool
++sweet_fb_hw_pool_contains(uint64_t pa, uint64_t len)
++{
++	return len != 0 && pa >= SWEET_FB_HW_POOL_BASE && len <= SWEET_FB_HW_POOL_SIZE &&
++	       pa - SWEET_FB_HW_POOL_BASE <= SWEET_FB_HW_POOL_SIZE - len;
++}
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++/*
++ * Defined in SweetSurface.cpp (0394).  By surface id (looked up in the IOSurface table; 0 / NONE for a missing or non-pool id):
++ *   pool_pa     PA of the surface base = pixel (0,0) (pool surfaces always have IOSurfaceOffset 0); below 4 GiB, 64 KiB aligned.
++ *   pool_stride bytes per row (multiple of 64).
++ *   pool_size   bytes of the contiguous allocation starting at pool_pa (>= stride * height, multiple of 64 KiB).
++ *   pool_cache  SWEET_FB_HW_POOL_CACHE_* of all CPU mappings of it.
++ * The *_obj variants take a SweetSurface * the caller already holds (use these when the caller keeps the object: an id can be
++ * reused once the surface left the table while a kernel holder still retains the old object).
++ * A pool surface's memory goes back to the pool in SweetSurface::free(), i.e. when the LAST retain is dropped: whoever lets the
++ * OVL or the GPU read it (scanout until FRAME_DONE, a GPU job) must hold a retain on the SweetSurface for that whole time.
++ */
++uint64_t sweet_surface_pool_pa(uint32_t surface_id);
++uint32_t sweet_surface_pool_stride(uint32_t surface_id);
++uint64_t sweet_surface_pool_size(uint32_t surface_id);
++uint32_t sweet_surface_pool_cache(uint32_t surface_id);
++uint64_t sweet_surface_pool_pa_obj(const void *surface);
++uint32_t sweet_surface_pool_stride_obj(const void *surface);
++uint64_t sweet_surface_pool_size_obj(const void *surface);
++uint32_t sweet_surface_pool_cache_obj(const void *surface);
++#ifdef __cplusplus
++}
++#endif
++
++#ifdef __cplusplus
++class SweetSurface;
++/*
++ * Kernel-side pool surface (e.g. H2 test patterns): width x height 'BGRA', bytesPerRow = round_up(width * 4, 64), zeroed,
++ * published in the id table like sweet_surface_create_physical().  Ignores kern.n2fbhw_pool (the caller asked for the pool
++ * explicitly).  NULL when the pool is full or the size is out of range.  Returned retained (caller releases).
++ */
++SweetSurface *sweet_surface_create_pool(uint32_t width, uint32_t height);
++#endif
++
++#endif /* SWEET_FB_HW_POOL_H */
+--- /dev/null
++++ b/iokit/Kernel/arm/sweet_fb_hw_pool_alloc.h
+@@ -0,0 +1,186 @@
++/*
++ * 0394: display pool allocator logic, pure (no kernel calls) so the host test (hwcomp-20261112/test/pool_host_test.c) runs
++ * exactly this code.  Locking, mapping, zeroing and logging live in SweetSurface.cpp.
++ *
++ * Bitmap of 64 KiB granules (256 MiB / 64 KiB = 4096 bits = 512 bytes), first fit over contiguous runs.  A 1125x2436 BGRA
++ * surface (pitch 4544, 11,069,184 bytes) takes 169 granules (6 KiB waste): 24 fit in an empty pool, as with 10.56 MiB slots,
++ * but any other size fits too.
++ */
++#ifndef SWEET_FB_HW_POOL_ALLOC_H
++#define SWEET_FB_HW_POOL_ALLOC_H
++
++#include "sweet_fb_hw_pool.h"
++
++#define SWEET_FB_POOL_NGRAN     ((uint32_t)(SWEET_FB_HW_POOL_SIZE / SWEET_FB_HW_POOL_GRANULE))     /* 4096 */
++#define SWEET_FB_POOL_WORDS     (SWEET_FB_POOL_NGRAN / 64)
++#define SWEET_FB_POOL_FAIL      (~0ull)
++#define SWEET_FB_POOL_BGRA      0x42475241u     /* 'BGRA' = memory B,G,R,A = DRM ARGB8888 = OVL CFMT 2/3 */
++#define SWEET_FB_POOL_MIN_PIXELS (1000ull * 2000ull)   /* "full screen or larger" (the panel is 1080x2400, CA's canvas 1125x2436) */
++#define SWEET_FB_POOL_MAX_PITCH (1u << 20)      /* OVL Ln_PITCH 16 bits + Ln_PITCH_MSB 4 bits */
++
++/* Why a surface does not go to the pool (index into the per-reason counters). */
++enum {
++	SWEET_FB_POOL_OK = 0,
++	SWEET_FB_POOL_NO_OFF,           /* kern.n2fbhw_pool == 0 (SweetSurface.cpp: only for surfaces that are otherwise eligible) */
++	SWEET_FB_POOL_NO_FORMAT,        /* not 'BGRA' with 4-byte 1x1 elements */
++	SWEET_FB_POOL_NO_PLANES,        /* planar */
++	SWEET_FB_POOL_NO_SMALL,         /* fewer than 1000*2000 pixels */
++	SWEET_FB_POOL_NO_STRIDE,        /* bytesPerRow not a multiple of 64, < width*4 or >= 1 MiB */
++	SWEET_FB_POOL_NO_OFFSET,        /* IOSurfaceOffset != 0 */
++	SWEET_FB_POOL_NO_SIZE,          /* allocation larger than the pool or smaller than the pixels */
++	SWEET_FB_POOL_NREASONS
++};
++
++static inline uint32_t
++sweet_fb_pool_eligible(uint32_t enabled, uint32_t width, uint32_t height, uint32_t bytesPerRow, uint32_t bytesPerElement,
++    uint32_t elementWidth, uint32_t elementHeight, uint32_t pixelFormat, uint32_t planeCount, uint32_t offset, uint64_t allocSize)
++{
++	if (!enabled) {
++		return SWEET_FB_POOL_NO_OFF;
++	}
++	if (pixelFormat != SWEET_FB_POOL_BGRA || bytesPerElement != 4 || elementWidth != 1 || elementHeight != 1) {
++		return SWEET_FB_POOL_NO_FORMAT;
++	}
++	if (planeCount != 0) {
++		return SWEET_FB_POOL_NO_PLANES;
++	}
++	if ((uint64_t)width * height < SWEET_FB_POOL_MIN_PIXELS) {
++		return SWEET_FB_POOL_NO_SMALL;
++	}
++	if ((bytesPerRow & 63u) != 0 || (uint64_t)bytesPerRow < (uint64_t)width * 4 || bytesPerRow >= SWEET_FB_POOL_MAX_PITCH) {
++		return SWEET_FB_POOL_NO_STRIDE;
++	}
++	if (offset != 0) {
++		return SWEET_FB_POOL_NO_OFFSET;
++	}
++	if (allocSize > SWEET_FB_HW_POOL_SIZE || allocSize < (uint64_t)bytesPerRow * height) {
++		return SWEET_FB_POOL_NO_SIZE;
++	}
++	return SWEET_FB_POOL_OK;
++}
++
++struct sweet_fb_pool {
++	uint64_t bits[SWEET_FB_POOL_WORDS];     /* 1 = granule in use */
++	uint32_t used, used_peak;               /* granules */
++	uint32_t live, live_peak;               /* allocations */
++	uint64_t allocs, frees, full, bad_free;
++};
++
++static inline uint32_t
++sweet_fb_pool_granules(uint64_t bytes)
++{
++	return (uint32_t)((bytes + SWEET_FB_HW_POOL_GRANULE - 1) / SWEET_FB_HW_POOL_GRANULE);
++}
++
++static inline bool
++sweet_fb_pool_test(const struct sweet_fb_pool *p, uint32_t g)
++{
++	return (p->bits[g >> 6] >> (g & 63)) & 1;
++}
++
++/* Longest run of free granules (for logs). */
++static inline uint32_t
++sweet_fb_pool_largest_free(const struct sweet_fb_pool *p)
++{
++	uint32_t best = 0, run = 0;
++	for (uint32_t g = 0; g < SWEET_FB_POOL_NGRAN; g++) {
++		if (sweet_fb_pool_test(p, g)) {
++			run = 0;
++		} else if (++run > best) {
++			best = run;
++		}
++	}
++	return best;
++}
++
++/* First fit: byte offset of the allocation inside the pool, or SWEET_FB_POOL_FAIL (counted as full). */
++static inline uint64_t
++sweet_fb_pool_alloc(struct sweet_fb_pool *p, uint64_t bytes)
++{
++	uint32_t n = sweet_fb_pool_granules(bytes);
++	if (bytes == 0 || bytes > SWEET_FB_HW_POOL_SIZE || n > SWEET_FB_POOL_NGRAN - p->used) {
++		p->full++;
++		return SWEET_FB_POOL_FAIL;
++	}
++	uint32_t start = 0, run = 0;
++	for (uint32_t g = 0; g < SWEET_FB_POOL_NGRAN; g++) {
++		if ((g & 63) == 0 && p->bits[g >> 6] == ~0ull) {        /* whole word in use */
++			run = 0;
++			g += 63;
++			continue;
++		}
++		if (sweet_fb_pool_test(p, g)) {
++			run = 0;
++			continue;
++		}
++		if (run++ == 0) {
++			start = g;
++		}
++		if (run == n) {
++			for (uint32_t k = start; k < start + n; k++) {
++				p->bits[k >> 6] |= 1ull << (k & 63);
++			}
++			p->used += n;
++			if (p->used > p->used_peak) {
++				p->used_peak = p->used;
++			}
++			if (++p->live > p->live_peak) {
++				p->live_peak = p->live;
++			}
++			p->allocs++;
++			return (uint64_t)start * SWEET_FB_HW_POOL_GRANULE;
++		}
++	}
++	p->full++;
++	return SWEET_FB_POOL_FAIL;
++}
++
++/* Give back what sweet_fb_pool_alloc(bytes) returned at off.  A misaligned / out-of-range / not-allocated range changes nothing. */
++static inline bool
++sweet_fb_pool_free(struct sweet_fb_pool *p, uint64_t off, uint64_t bytes)
++{
++	uint32_t n = sweet_fb_pool_granules(bytes), g0 = (uint32_t)(off / SWEET_FB_HW_POOL_GRANULE);
++	if (bytes == 0 || (off % SWEET_FB_HW_POOL_GRANULE) != 0 || off >= SWEET_FB_HW_POOL_SIZE ||
++	    n > SWEET_FB_POOL_NGRAN - g0 || p->live == 0) {
++		p->bad_free++;
++		return false;
++	}
++	for (uint32_t k = g0; k < g0 + n; k++) {
++		if (!sweet_fb_pool_test(p, k)) {
++			p->bad_free++;
++			return false;
++		}
++	}
++	for (uint32_t k = g0; k < g0 + n; k++) {
++		p->bits[k >> 6] &= ~(1ull << (k & 63));
++	}
++	p->used -= n;
++	p->live--;
++	p->frees++;
++	return true;
++}
++
++/*
++ * Canary in the first 16 bytes of every FREE granule (written at pool init and on free, checked on alloc): a mismatch means
++ * something outside XNU (firmware, a stray DMA master) wrote into the pool (risk R9).  Detects writes that hit a granule head only.
++ */
++static inline uint64_t
++sweet_fb_pool_canary(uint32_t granule)
++{
++	return 0x4e32504f4f4c0000ull ^ ((uint64_t)granule * 0x9e3779b97f4a7c15ull);
++}
++
++static inline void
++sweet_fb_pool_canary_put(volatile uint64_t *head, uint32_t granule)
++{
++	head[0] = sweet_fb_pool_canary(granule);
++	head[1] = ~sweet_fb_pool_canary(granule);
++}
++
++static inline bool
++sweet_fb_pool_canary_ok(const volatile uint64_t *head, uint32_t granule)
++{
++	return head[0] == sweet_fb_pool_canary(granule) && head[1] == ~sweet_fb_pool_canary(granule);
++}
++
++#endif /* SWEET_FB_HW_POOL_ALLOC_H */

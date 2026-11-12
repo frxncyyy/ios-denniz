@@ -1,0 +1,223 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -85,7 +85,8 @@
+ extern "C" uint64_t nord2_gpu_surface_write_seq(uint32_t surface_id);
+ extern "C" bool     nord2_gpu_surface_write_pending(uint32_t surface_id);
+ #endif
+-static uint32_t sweet_fb_hw_mode;               /* kern.n2fbhw */
++static uint32_t sweet_fb_hw_mode = 3;           /* kern.n2fbhw.  0413: default 3 (overlay composition is the only frame source; 0/1 = debug CPU path) */
++static uint32_t sweet_fb_cpu_emerg = 1;         /* 0413: kern.n2fbcpuemerg: CPU copy only if the overlay is unusable for the whole boot (0 = hold even then) */
+ static uint32_t sweet_fb_hw_pm = 2;             /* kern.n2fbhwpm */
+ static uint32_t sweet_fb_hw_test_req;           /* kern.n2fbhwtest: requested test, taken by handOver */
+ static uint32_t sweet_fb_hw_test_last;          /* last test run (read back by the sysctl) */
+@@ -261,6 +262,11 @@
+ 	uint8_t      *snap(const uint32_t want[6], uint32_t info[8]);   /* 0296 */
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
++	bool          fHwDead, fPanelBlank, fCpuEmergLogged;      /* 0413 */
++	uint32_t      fBlankFails;
++	uint64_t      fHeldN, fHeld[SWEET_FB_HW_W_COUNT_ENUM];
++	bool          takeDisplay(void);
++	bool          cpuAllowed(void);
+ 	SweetFBDiagnostics fDiag;
+ 	void reportDiagnostics(const char *reason);
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+@@ -565,6 +571,7 @@
+     "0396/0399 H2 test: 1 pattern, 2/3/4 + alpha gradient with pm 0/2/3, 6 colour test (R|G|B on both layers), 5 = 1,2,3,4,6");
+ SYSCTL_PROC(_kern, OID_AUTO, n2fbhwcsw, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sweet_fb_hw_sysctl_csw, "I",
+     "0399 flip CON BYTE_SWAP (R<->B): bit 0 layer 1, bit 1 layer 0");
++SYSCTL_UINT(_kern, OID_AUTO, n2fbcpuemerg, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_cpu_emerg, 0, "0413: 1 = CPU copy only when the overlay is unusable for the boot, 0 = hold");
+ SYSCTL_UINT(_kern, OID_AUTO, n2fbhwselftest, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_hw_selftest, 0,
+     "0399 1: colour test 6 before the first HW frame of a boot");
+ SYSCTL_PROC(_kern, OID_AUTO, n2fbhwhold, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sweet_fb_hw_sysctl_hold, "I",
+@@ -697,6 +704,7 @@
+ 	IOLog("SWEET FB: layer composition %s (0390)\n", sweet_fb_blend_mode ? "on" : "off (n2fbblend=0)");
+ 	sweet_fb_pending_surfaces_init(&fHwHeld);       /* 0396 */
+ 	bzero(&fHwSt, sizeof(fHwSt)); fHwInitDone = fHwInitOk = fHwOn = fWorkHw = false; fHwN = 0; fHwTestMem = NULL; fHwTestMap = NULL;
++	fHwDead = fPanelBlank = fCpuEmergLogged = false; fBlankFails = 0; fHeldN = 0; bzero(fHeld, sizeof(fHeld));      /* 0413 */
+ 	bzero(&fFps, sizeof(fFps)); fFpsWinUs = 0;      /* 0407 */
+ 	sweet_fb_iommu_boot();      /* 0411: display IOMMU default on, armed by a thread_call later */
+ 	IOLog("NORD2 FB HW: overlay composition (0396) mode %u at boot (sysctl kern.n2fbhw 0 off / 1 dry / 2 single / 3 two layers; kern.n2fbhwtest 1..6, kern.n2fbhwcsw)\n",
+@@ -948,6 +956,28 @@
+ 		if (diag_report) { fb->reportDiagnostics("timer-off"); }
+ 		return;
+ 	}
++#if defined(NORD2)
++	if (fb->fPowerOff) {      /* 0413: overlay is the frame source: blank the panel with DCS display off instead of the CPU fade */
++		bool src = !fb->cpuAllowed();
++		int act = sweet_fb_blank_action(true, fb->fPanelBlank, src, fb->fBlankFails);
++		if (act == SWEET_FB_BLANK_NONE && fb->fPanelBlank) { IOLockUnlock(fb->fLock); if (diag_report) { fb->reportDiagnostics("timer-off"); } return; }
++		if (act == SWEET_FB_BLANK_OFF) {
++			IOLockUnlock(fb->fLock);
++			if (fb->fPState == 0) {
++				static const uint8_t off[] = { 0x28 };
++				fb->dropNext();
++				bool ok = fb->dsiDcs(off, 1);
++				if (ok) { fb->fPanelBlank = true; } else { fb->fBlankFails++; }
++				if (ok || fb->fBlankFails <= 2 || fb->fBlankFails == 30) {
++					IOLog("NORD2 FB BLANK: DCS display off %s (fails %u%s)\n", ok ? "sent: panel dark, no CPU fade" : "FAILED", fb->fBlankFails,
++					    fb->fBlankFails >= 30 ? ": CPU fade fallback" : "");
++				}
++			}
++			if (diag_report) { fb->reportDiagnostics("timer-off"); }
++			return;
++		}
++	}
++#endif
+ 	if (fb->fPowerOff) {
+ 		if (fb->fDiag.enabled) { __atomic_fetch_add(&fb->fDiag.off, 1, __ATOMIC_RELAXED); }
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+@@ -1026,6 +1056,28 @@
+ 	fDistinctLastUs = nowUs;
+ }
+ 
++/* 0413: display ownership from the early console (was done by the first CPU copy). */
++bool
++AppleCLCD::takeDisplay(void)
++{
++	if (fConsolePaused) { return true; }
++#if defined(NORD2)
++	if (!nord2_display_begin()) { return false; }
++#endif
++	int quiet = 0;
++	fConsolePaused = true;
++	if (PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) { sweet_console_muted = 1; }
++	IOLog("NORD2 FB HOLD: display taken from the early console (overlay-only composition, kern.n2fbhw %u)\n", __atomic_load_n(&sweet_fb_hw_mode, __ATOMIC_RELAXED));
++	return true;
++}
++
++bool
++AppleCLCD::cpuAllowed(void)
++{
++	return sweet_fb_hw_cpu_allowed(__atomic_load_n(&sweet_fb_hw_mode, __ATOMIC_RELAXED), fHwBackoffMode != 0, fHwDead,
++	    __atomic_load_n(&sweet_fb_cpu_emerg, __ATOMIC_RELAXED) != 0);
++}
++
+ /* 0156: drop a taken-but-unpresented frame (power off, stop). */
+ void
+ AppleCLCD::dropNext(void)
+@@ -1117,6 +1169,7 @@
+ 	if (!fDbl) { return; }
+ 	/* 0396: in the HW modes the next swap is not copied ahead: it is planned (and, if eligible, shown without any copy) when it is presented */
+ 	if (fNextState == 0 && __atomic_load_n(&sweet_fb_hw_mode, __ATOMIC_RELAXED) >= SWEET_FB_HW_SINGLE) { return; }
++	if (fNextState == 0 && !cpuAllowed()) { return; }      /* 0413: no copy-ahead while frames are held (backoff, or overlay-only) */
+ 	if (fNextState == 0) {
+ 		IOLockLock(fLock);
+ 		if (fPowerOff || !fDirty || fNextState != 0) { IOLockUnlock(fLock); return; }
+@@ -1312,6 +1365,9 @@
+ 		bool wasPrepared = fb->fPrepared;
+ 		bool shown = true;
+ 		int hw = 0;
++		if (!fb->fConsolePaused && !fb->takeDisplay()) { fb->presentDone(false, false, false); return; }      /* 0413: before any frame, HW or not */
++		uint64_t why0[SWEET_FB_HW_W_COUNT_ENUM];
++		memcpy(why0, fb->fHwSt.why, sizeof(why0));
+ #if defined(NORD2)
+ 		/* 0396: plan the frame for the overlay (counts only in modes 0/1); 1 = registers written, no copy; -1 = eligible but a GPU write
+ 		 * is in flight: requeued, never shown; 0 = CPU path for this frame */
+@@ -1328,7 +1384,36 @@
+ #endif
+ 		if (wasPrepared) { fb->fPrepared = false; }
+ 		else if (hw > 0) { }
++		else if (!fb->cpuAllowed()) {
++			/* 0413: the overlays cannot compose this frame: the last programmed overlay frame stays on the panel (GRAM, nothing pushed), the swap
++			 * is retired, held[reason] counted -- never a CPU copy.  Before the first push the link is latched with the boot (LK) buffer as is. */
++			int r = SWEET_FB_HW_W_STATE;
++			for (int i = 0; i < (int)SWEET_FB_HW_W_COUNT_ENUM; i++) { if (fb->fHwSt.why[i] != why0[i]) { r = i; } }
++			fb->fHeld[r]++; fb->fHeldN++;
++			if (fb->fHeldN <= 8 || (fb->fHeldN % 600) == 0) {
++				IOLog("NORD2 FB HELD: frame not composable by the overlays (%s): last overlay frame kept, no CPU copy (held %llu: memory %llu format %llu count %llu state %llu missing %llu)\n",
++				    sweet_fb_hw_why_name(r), fb->fHeldN, fb->fHeld[SWEET_FB_HW_W_MEMORY], fb->fHeld[SWEET_FB_HW_W_FORMAT], fb->fHeld[SWEET_FB_HW_W_COUNT],
++				    fb->fHeld[SWEET_FB_HW_W_STATE], fb->fHeld[SWEET_FB_HW_W_MISSING]);
++			}
++#if defined(NORD2)
++			if (!fb->fNbReady) {
++				IOLog("NORD2 FB HOLD: first push of the boot buffer as is (latches the panel link for the overlay; no copy)\n");
++				IOSleep(50);
++				int done = nord2_display_refresh();
++				if (done && fb->fDsi != NULL && fb->fMutex != NULL) { fb->fNbReady = true; }
++				IOLog("NORD2 FB HOLD: link %s\n", fb->fNbReady ? "latched" : "NOT latched (retried at the next frame)");
++			}
++#endif
++			fb->fXferStart = mach_absolute_time();
++			fb->presentDone(true, false, true);
++			return;
++		}
+ 		else {
++			if (!fb->fCpuEmergLogged && fb->fHwDead) {
++				fb->fCpuEmergLogged = true;
++				IOLog("NORD2 FB CPU EMERGENCY: the overlay is unusable for this boot (init %u/%u, faults %llu): CPU copy path from now on (kern.n2fbcpuemerg=0 holds instead)\n",
++				    fb->fHwInitDone, fb->fHwInitOk, fb->fHwSt.faults);
++			}
+ 			fb->fCopyDst = fb->fDbl ? (fb->fFront ? fb->fPixels : fb->fPixelsB) : fb->fPixels;
+ 			shown = fb->presentCopy(fb->fWorkRec, (SweetSurface *const *)fb->fWorkSurfaces.object);
+ 			fb->fWorkEmpty = fb->fCopyEmpty;
+@@ -1365,6 +1450,14 @@
+ 			if (fb->ovlSelect(back)) { fb->fFront = back; }
+ 			else { IOLog("NORD2 FB DBL: overlay flip refused, back to one buffer\n"); fb->fDbl = false; (void)fb->ovlSelect(0); fb->fFront = 0; fb->dropNext(); }
+ 		}
++#if defined(NORD2)
++		if (sweet_fb_blank_action(false, fb->fPanelBlank, true, 0) == SWEET_FB_BLANK_ON) {      /* 0413: display on again (DCS 0x29) before the push */
++			static const uint8_t on[] = { 0x29 };
++			bool ok = fb->dsiDcs(on, 1);
++			IOLog("NORD2 FB BLANK: DCS display on %s\n", ok ? "sent" : "FAILED (pushing anyway)");
++			fb->fPanelBlank = false;
++		}
++#endif
+ 		fb->fPushSafe = false;
+ 		if (fb->fNbReady && fb->fDsi != NULL && sweet_fb_abs_to_us(t1) >= fb->fTeOffUntilUs && !(fb->fDsi[SWEET_FB_DSI_INTSTA / 4] & SWEET_FB_DSI_BUSY)) {
+ 			/* 0155: the transfer starts at the panel's next TE (the scan then stays behind the write: no tear lines) */
+@@ -2087,7 +2180,7 @@
+ 	fHwInitOk = (why == NULL);
+ 	IOLog("NORD2 FB HW: init %s%s%s\n", fHwInitOk ? "ok: overlay layers usable" : "REFUSED: ", fHwInitOk ? "" : why,
+ 	    fHwInitOk ? " (OVL0_2L/OVL1_2L layers 0/1, physical addresses)" : "");
+-	if (!fHwInitOk) { fHwSt.last_fault = SWEET_FB_HW_F_BASE; (void)__atomic_exchange_n(&sweet_fb_hw_mode, 0, __ATOMIC_RELAXED); }
++	if (!fHwInitOk) { fHwSt.last_fault = SWEET_FB_HW_F_BASE; (void)__atomic_exchange_n(&sweet_fb_hw_mode, 0, __ATOMIC_RELAXED); fHwDead = true; }      /* 0413 */
+ 	return fHwInitOk;
+ }
+ 
+@@ -2220,7 +2313,7 @@
+ 			IOLog("NORD2 FB HW: restored the CPU path (%s)%s, layer 0 -> %08x/%08x\n", why, ok ? "" : " READBACK MISMATCH: HW composition off for this boot",
+ 			    sweet_fb_scan_base_addr(front, fWidth, 0), sweet_fb_scan_base_addr(front, fWidth, 1));
+ 		}
+-		if (!ok) { fHwInitOk = false; (void)__atomic_exchange_n(&sweet_fb_hw_mode, 0, __ATOMIC_RELAXED); }
++		if (!ok) { fHwInitOk = false; (void)__atomic_exchange_n(&sweet_fb_hw_mode, 0, __ATOMIC_RELAXED); fHwDead = true; }      /* 0413 */
+ 	}
+ 	fHwOn = false;
+ 	sweet_fb_pending_surfaces_release(&held, sweet_fb_release_surface);
+@@ -2242,6 +2335,7 @@
+ 		IOLog("NORD2 FB HW: BACKOFF mode %u back on in %llu ms (backoff %u/4)\n", old, ms, fHwBackoffN);
+ 	} else if (old >= SWEET_FB_HW_SINGLE) {
+ 		fHwBackoffMode = 0;
++		fHwDead = true;      /* 0413 */
+ 		IOLog("NORD2 FB HW: BACKOFF exhausted (4 faults): HW composition stays off (kern.n2fbhw=%u turns it on again)\n", old);
+ 	}
+ 	hwRestore("auto-disable");
+--- a/iokit/Kernel/arm/sweet_fb_hw.h
++++ b/iokit/Kernel/arm/sweet_fb_hw.h
+@@ -548,4 +548,26 @@
+ 	return (dbl && front) ? buf_b : buf_a;
+ }
+ 
++/* 0413: no CPU copy composition.  May this frame go through the CPU copy path?  Only in the debug modes 0/1 chosen by hand, or as the
++ * emergency path when the overlay is unusable for the whole boot (kern.n2fbcpuemerg, default 1: a frozen screen hides even a panic).
++ * During a fault backoff (mode 0 set by the driver, back on later) frames are held, never copied. */
++static inline bool
++sweet_fb_hw_cpu_allowed(uint32_t mode, bool backoff_pending, bool overlay_dead, bool emergency_ok)
++{
++	if (overlay_dead) { return emergency_ok; }
++	if (backoff_pending) { return false; }
++	return mode < SWEET_FB_HW_SINGLE;
++}
++/* 0413: panel blank on display off (DCS 0x28 display off / 0x29 on, no CPU fade) when the overlay is the frame source. */
++enum { SWEET_FB_BLANK_NONE = 0, SWEET_FB_BLANK_OFF, SWEET_FB_BLANK_ON, SWEET_FB_BLANK_CPU_FADE };
++static inline int
++sweet_fb_blank_action(bool power_off, bool blanked, bool overlay_source, unsigned off_failures)
++{
++	if (power_off) {
++		if (!overlay_source || off_failures >= 30) { return blanked ? SWEET_FB_BLANK_NONE : SWEET_FB_BLANK_CPU_FADE; }
++		return blanked ? SWEET_FB_BLANK_NONE : SWEET_FB_BLANK_OFF;
++	}
++	return blanked ? SWEET_FB_BLANK_ON : SWEET_FB_BLANK_NONE;
++}
++
+ #endif /* SWEET_FB_HW_H */

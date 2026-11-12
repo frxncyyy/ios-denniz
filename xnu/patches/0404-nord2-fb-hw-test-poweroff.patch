@@ -1,0 +1,100 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -92,7 +92,7 @@
+ /* 0399 (hwcolor-20261112): colour order.  kern.n2fbhwcsw bit 0 flips CON BYTE_SWAP (R<->B) on layer 1, bit 1 on layer 0, for every HW
+  * frame and test; kern.n2fbhwselftest (default 1): the first switch to mode 2/3 of a boot runs the colour test (test 6) first. */
+ static uint32_t sweet_fb_hw_csw;
+-static uint32_t sweet_fb_hw_selftest = 1, sweet_fb_hw_selftest_done;
++static uint32_t sweet_fb_hw_selftest = 0, sweet_fb_hw_selftest_done;     /* 0404: default 0 (the colour test needs a human photo anyway) */
+ static uint32_t sweet_fb_hw_mode_gen;           /* 0397: kern.n2fbhw writes (a manual setting cancels a fault backoff) */
+ static uint32_t sweet_fb_pool_alias_mode = 1;   /* 0397: kern.n2fbpoolalias: CPU-path reads of WC pool surfaces via a read-only cacheable alias */
+ /*
+@@ -1013,6 +1013,12 @@
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
++	if (fb->fPowerOff && !sweet_fb_hw_fade_may_run(fb->fPState)) {
++		/* 0404: an H2 test pattern owns the panel: no fade step drawn or pushed under it (the fade starts after the test end) */
++		IOLockUnlock(fb->fLock);
++		if (diag_report) { fb->reportDiagnostics("timer-off"); }
++		return;
++	}
+ 	if (fb->fPowerOff) {
+ 		if (fb->fDiag.enabled) { __atomic_fetch_add(&fb->fDiag.off, 1, __ATOMIC_RELAXED); }
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+@@ -2335,7 +2341,7 @@
+ 	IOLockUnlock(fLock);
+ 	if (fHwInitOk) {
+ 		struct sweet_fb_hw_reg r[SWEET_FB_HW_MAX_REGS];
+-		uint64_t front = (fDbl && fFront) ? fPhysB : fPhys;
++		uint64_t front = sweet_fb_hw_front_base(fDbl, fFront, fPhys, fPhysB);      /* 0404: same rule, host-tested */
+ 		uint32_t bad = 0;
+ 		bool ok = true;
+ 		for (unsigned k = 0; k < SWEET_FB_HW_PIPES && ok; k++) {
+@@ -2677,7 +2683,9 @@
+ 	fHwTestPhase = 3;       /* finishing: the registers below are the final ones */
+ 	bool busy = false;
+ 	for (unsigned i = 0; i < SWEET_FB_PENDING_SURFACE_COUNT; i++) { if (fHwHeld.object[i] != NULL && nord2_gpu_surface_busy(fHwHeld.object[i])) { busy = true; } }
+-	if (fHwTestReapply && !busy && sweet_fb_pending_surfaces_any(&fHwHeld) && __atomic_load_n(&sweet_fb_hw_mode, __ATOMIC_RELAXED) >= SWEET_FB_HW_SINGLE) {
++	struct sweet_fb_hw_test_end te = sweet_fb_hw_test_end_action(fPowerOff, fDbl, fFront,
++	    fHwTestReapply && !busy && sweet_fb_pending_surfaces_any(&fHwHeld) && __atomic_load_n(&sweet_fb_hw_mode, __ATOMIC_RELAXED) >= SWEET_FB_HW_SINGLE);
++	if (te.reapply) {      /* 0404: never with the display off */
+ 		if (!hwApply(&fHwShownPlan)) { hwTestFinish("aborted: read-back mismatch putting the HW frame back"); return; }
+ 		hwTestFinish("finished, previous HW frame back");
+ 	} else {
+@@ -2690,10 +2698,15 @@
+ AppleCLCD::hwTestFinish(const char *how)
+ {
+ 	if (fHwTestPhase < 3 && fHwOn) { hwRestore("test abort"); }
++	/* 0404: the display was turned off during the test: CPU path on buffer 0 (the fade's buffer), nothing pushed; the fade runs next */
++	struct sweet_fb_hw_test_end te = sweet_fb_hw_test_end_action(fPowerOff, fDbl, fFront, false);
++	if (fPowerOff && fHwOn) { hwRestore("test end, display off"); }
++	if (te.select_buffer0) { (void)ovlSelect(0); fFront = 0; }
+ 	bool pushed = false;
+-	if (fNbReady && !panic_active()) { pushed = nord2_display_refresh() != 0; }       /* the restored picture onto the panel (blocking, <= 20 ms) */
++	if (te.push && fNbReady && !panic_active()) { pushed = nord2_display_refresh() != 0; }       /* the restored picture onto the panel (blocking, <= 20 ms) */
+ 	if (fOvl[0] != NULL && fOvl[1] != NULL) { fOvl[0][SWEET_FB_OVL_INTSTA / 4] = 0; fOvl[1][SWEET_FB_OVL_INTSTA / 4] = 0; }
+-	IOLog("NORD2 FB HW: test %u %s (pushed %u, overlay %s)\n", fHwTestId, how, pushed ? 1u : 0u, fHwOn ? "HW frame" : "CPU path");
++	IOLog("NORD2 FB HW: test %u %s (pushed %u, overlay %s%s)\n", fHwTestId, how, pushed ? 1u : 0u, fHwOn ? "HW frame" : "CPU path",
++	    fPowerOff ? "; display off: buffer 0, not pushed, the fade follows" : "");
+ 	__atomic_store_n(&sweet_fb_hw_test_last, fHwTestId, __ATOMIC_RELAXED);
+ 	fHwSt.tests++;
+ 	fHwTestPhase = 0;
+--- a/iokit/Kernel/arm/sweet_fb_hw.h
++++ b/iokit/Kernel/arm/sweet_fb_hw.h
+@@ -654,4 +654,35 @@
+ 	return ready ? SWEET_FB_HW_H6_READY : (age_us < limit_us ? SWEET_FB_HW_H6_WAIT : SWEET_FB_HW_H6_FORCED);
+ }
+ 
++/* ---- 0404 (hwfix-20261113): test pattern vs display power-off ---------------------------------------------------------------
++ * Device (night12/night10/night8, q10jfw): backboardd turned the display off (RequestPowerChange 0) during the 3 s hold of the
++ * 0399 colour self-test.  The power-off fade (vsync thread) then drew black into panel buffer 0 and pushed it while the test still
++ * owned the panel (present state 7), and at the test end the CPU path was restored and the front buffer pushed: buffer 0 = the
++ * fade's black, buffer 1 = a stale UI frame lit on a display that is off.  Nothing woke the display afterwards in night12/10 (no
++ * power key: the scenario's touches do not wake an off screen), so no present followed -- the "frozen" display.
++ * Rules: the fade waits while a test owns the panel; a test that ends with the display off restores the CPU path onto buffer 0
++ * (the buffer the fade draws into), never re-applies a HW frame and pushes nothing; the fade then runs from its first step. */
++#define SWEET_FB_HW_PSTATE_TEST     7u      /* AppleCLCD::fPState while an H2 test pattern owns the panel */
++static inline bool
++sweet_fb_hw_fade_may_run(uint32_t pstate)
++{
++	return pstate != SWEET_FB_HW_PSTATE_TEST;
++}
++struct sweet_fb_hw_test_end { bool select_buffer0, push, reapply; };
++static inline struct sweet_fb_hw_test_end
++sweet_fb_hw_test_end_action(bool power_off, bool dbl, uint32_t front, bool reapply_wanted)
++{
++	struct sweet_fb_hw_test_end e;
++	e.select_buffer0 = power_off && dbl && front != 0;
++	e.push = !power_off;
++	e.reapply = !power_off && reapply_wanted;
++	return e;
++}
++/* the panel buffer the CPU path shows: what layer 0 is restored to */
++static inline uint64_t
++sweet_fb_hw_front_base(bool dbl, uint32_t front, uint64_t buf_a, uint64_t buf_b)
++{
++	return (dbl && front) ? buf_b : buf_a;
++}
++
+ #endif /* SWEET_FB_HW_H */
