@@ -1,0 +1,527 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -45,6 +45,7 @@
+ #include "sweet_fb_pace.h"            /* 0397 */
+ #include "sweet_fb_iommu.h"           /* 0401 IOMMU */
+ #include "sweet_fb_fpsmeter.h"         /* 0407: HW-frame content clock (measurement only) */
++#include "sweet_fb_backlight.h"        /* 0495: panel brightness (AppleARMBacklight + DCS 0x51) */
+ 
+ /*
+  * 0397 (fbpace-20261112): keep the panel at 90 Hz and measure the present pacing.
+@@ -148,6 +149,7 @@
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++#include <kern/thread_call.h>         /* 0495: thermal poll of the brightness cap */
+ #include <sys/proc.h>
+ #include <sys/sysctl.h>               /* 0396: kern.n2fbhw* */
+ #include <sys/errno.h>
+@@ -471,6 +473,20 @@
+ 	int         hwStat(char *buf, size_t len);
+ 	void        hwLogSurface(SweetSurface *s, uint32_t id);
+ 
++	/* 0495: panel brightness.  fBl / sweet_bl_cfg_g: fBlLock.  The DCS 0x51 goes out between two frames (presentDone, the presenter
++	 * owns the engine) or from the vsync thread while the presenter is idle (fPState 7 claims the engine for that one packet). */
++	struct sweet_bl     fBl;
++	IOLock             *fBlLock;
++	thread_call_t       fBlThermCall;
++	uint32_t            fBlLogN;
++	uint64_t            fBlSumUs, fBlSumSends;
++	void        blRequest(int32_t q16, const char *who);
++	void        blService(bool owned);
++	void        blThermTick(void);
++	int         blStat(char *buf, size_t len);
++	void        blConfigChanged(void);
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+@@ -505,6 +521,234 @@
+ 
+ static AppleCLCD *gSweetFBSnapOwner;   /* 0296 */
+ 
++/*
++ * 0495 (bright-fix-20261114): the brightness slider.  Until now nothing in the registry had backlight-control = true (boot log:
++ * "IOK backboardd: matching ... backlight-control ... -> 0 found"), so CoreBrightness had no display module and the slider, Control
++ * Center and Settings > Display & Brightness moved nothing.  CoreBrightness keeps a service only if it conforms to the class
++ * AppleARMBacklight (-[CBDisplayContaineriOS findBacklight]), reads IODisplayParameters.brightness from it and then sets
++ * "brightness-nits" (nits 16.16) on it; it also sets IOMFBBrightnessLevel (the same number) on the framebuffer.  Both end in
++ * AppleCLCD::blRequest -> DCS 0x51 (sweet_fb_backlight.h).
++ * Kill switches: boot-arg n2bl=0 = the service is not published (exactly the old behaviour); sysctl kern.n2bl=0 = requests are
++ * recorded, nothing is sent (the panel keeps its level).  kern.n2bl_floor / kern.n2bl_max (DBV 4..2047), kern.n2bl_nits (nits at
++ * DBV 2047, 100..1000), kern.n2blstat (read only).  Thermal cap from the battery gauge: >= 42 C 70 %, >= 45 C 50 % (1 C hysteresis).
++ */
++static uint64_t sweet_fb_abs_to_us(uint64_t abs);     /* below */
++static struct sweet_bl_cfg sweet_bl_cfg_g = { 1, SWEET_BL_FLOOR_DEFAULT, SWEET_BL_MAX_DEFAULT, SWEET_BL_NITS_FULL };
++
++/* the kernel's own macros (OSDefineMetaClassAndStructors, SYSCTL_PROC) warn under -Weverything; same warnings as the existing ones */
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wreserved-identifier"
++#pragma clang diagnostic ignored "-Wmissing-designated-field-initializers"
++#pragma clang diagnostic ignored "-Wcast-function-type-strict"
++#pragma clang diagnostic ignored "-Wreorder-init-list"
++#pragma clang diagnostic ignored "-Wc99-designator"
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++public:
++	AppleCLCD *fFB;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++#pragma clang diagnostic pop
++
++/* a brightness number from userland: OSNumber, nits 16.16 (SInt32) */
++static bool
++sweet_bl_number(OSDictionary *d, const char *key, int32_t *q16)
++{
++	OSNumber *n = d != NULL ? OSDynamicCast(OSNumber, d->getObject(key)) : NULL;
++	if (n == NULL) { return false; }
++	*q16 = (int32_t)n->unsigned32BitValue();
++	return true;
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	int32_t q16 = 0;
++	if (d == NULL || fFB == NULL) { return kIOReturnBadArgument; }
++	if (sweet_bl_number(d, "brightness-nits", &q16)) {
++		fFB->blRequest(q16, "brightness-nits");
++		OSNumber *n = OSNumber::withNumber((unsigned long long)(uint32_t)q16, 32);
++		if (n != NULL) { setProperty("brightness-nits", n); n->release(); }
++	}
++	/* everything else CoreBrightness may set (brightness-nits-cap, DisplayBrightnessSliderPosition, ...) is accepted and ignored */
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleCLCD::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	int32_t q16 = 0;
++	if (d != NULL && sweet_bl_number(d, "IOMFBBrightnessLevel", &q16)) {
++		blRequest(q16, "IOMFBBrightnessLevel");
++		return kIOReturnSuccess;
++	}
++	return IOMobileFramebuffer::setProperties(properties);
++}
++
++void
++AppleCLCD::blRequest(int32_t q16, const char *who)
++{
++	if (fBlLock == NULL) { return; }
++	IOLockLock(fBlLock);
++	struct sweet_bl_cfg c = sweet_bl_cfg_g;
++	uint32_t old = fBl.want_dbv, dbv = sweet_bl_request(&fBl, &c, q16);
++	uint32_t n = fBlLogN < 16 && dbv != old ? ++fBlLogN : 0;
++	IOLockUnlock(fBlLock);
++	if (n != 0) {
++		IOLog("NORD2 BL: %s %d.%02u nits -> DBV %u (floor %u max %u, %u nits at 2047, mode %u)%s\n", who, q16 >> 16,
++		    (unsigned)(((uint32_t)q16 & 0xffffu) * 100u >> 16), dbv, c.floor_dbv, c.max_dbv, c.nits_full, c.mode, n == 16 ? "; further requests in NORD2 BL SUM" : "");
++	}
++}
++
++/* owned: the presenter owns the engine (presentDone).  Otherwise the engine is claimed with fPState 7 if the presenter is idle. */
++void
++AppleCLCD::blService(bool owned)
++{
++#if defined(NORD2)
++	if (fBlLock == NULL || fDsi == NULL || !fNbReady) { return; }
++	uint64_t nowUs = sweet_fb_abs_to_us(mach_absolute_time());
++	IOLockLock(fBlLock);
++	struct sweet_bl_cfg c = sweet_bl_cfg_g;
++	uint32_t dbv = sweet_bl_due(&fBl, &c, nowUs);
++	IOLockUnlock(fBlLock);
++	if (dbv == 0) { return; }
++	if (!owned) {
++		IOLockLock(fLock);
++		if (fPowerOff || fPState != 0 || fPanelBlank) { IOLockUnlock(fLock); return; }
++		fPState = 7;
++		IOLockUnlock(fLock);
++	}
++	uint8_t p[3];
++	sweet_bl_packet(dbv, p);
++	bool ok = dsiDcs(p, 3);
++	if (!owned) {
++		IOLockLock(fLock);
++		fPState = 0;
++		IOLockUnlock(fLock);
++	}
++	IOLockLock(fBlLock);
++	sweet_bl_sent(&fBl, dbv, ok, nowUs);
++	uint64_t sends = fBl.sends, fails = fBl.fails, reqs = fBl.reqs;
++	uint32_t want = fBl.want_dbv, therm = fBl.therm;
++	bool sum = nowUs - fBlSumUs >= 10000000ull && sends != fBlSumSends;
++	if (sum) { fBlSumUs = nowUs; fBlSumSends = sends; }
++	IOLockUnlock(fBlLock);
++	if (!ok && (fails <= 3 || (fails % 256) == 0)) {
++		IOLog("NORD2 BL: DCS 0x51 %02x %02x (DBV %u) FAILED (fails %llu), retried\n", p[1], p[2], dbv, fails);
++	} else if (ok && (sends <= 4 || sum)) {
++		IOLog("NORD2 BL SUM: DBV %u sent (want %u, thermal level %u, %s) requests %llu sends %llu fails %llu\n", dbv, want, therm,
++		    owned ? "between frames" : "idle panel", reqs, sends, fails);
++	}
++#else
++	(void)owned;
++#endif
++}
++
++#if defined(NORD2)
++extern "C" bool nord2_battery_temperature_cC(int *centi);     /* Nord2GPU.cpp */
++#endif
++
++static void
++sweet_bl_therm_call(thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	((AppleCLCD *)p0)->blThermTick();
++}
++
++/* thread call, every 5 s: the thermal cap (never from the vsync or present thread: the gauge lookup takes registry locks) */
++void
++AppleCLCD::blThermTick(void)
++{
++#if defined(NORD2)
++	int cc = 0;
++	bool ok = nord2_battery_temperature_cC(&cc);
++	uint64_t nowUs = sweet_fb_abs_to_us(mach_absolute_time());
++	IOLockLock(fBlLock);
++	bool changed = sweet_bl_therm_update(&fBl, ok, cc, nowUs);
++	uint32_t lvl = fBl.therm, cap = sweet_bl_cap(&fBl);
++	IOLockUnlock(fBlLock);
++	if (changed) {
++		IOLog("NORD2 BL: thermal level %u at battery %d.%02d C: brightness cap DBV %u\n", lvl, cc / 100, (cc < 0 ? -cc : cc) % 100, cap);
++	}
++	uint64_t deadline = 0;
++	clock_interval_to_deadline(5000, NSEC_PER_MSEC, &deadline);
++	if (!__atomic_load_n(&fSwapLifecycle.stopped, __ATOMIC_ACQUIRE)) { thread_call_enter_delayed(fBlThermCall, deadline); }
++#endif
++}
++
++void
++AppleCLCD::blConfigChanged(void)
++{
++	if (fBlLock == NULL) { return; }
++	IOLockLock(fBlLock);
++	sweet_bl_remap(&fBl, &sweet_bl_cfg_g);
++	IOLockUnlock(fBlLock);
++}
++
++int
++AppleCLCD::blStat(char *buf, size_t len)
++{
++	if (fBlLock == NULL) { return snprintf(buf, len, "no backlight"); }
++	IOLockLock(fBlLock);
++	struct sweet_bl b = fBl;
++	struct sweet_bl_cfg c = sweet_bl_cfg_g;
++	IOLockUnlock(fBlLock);
++	return snprintf(buf, len, "mode=%u req_q16=%d want=%u sent=%u target=%u floor=%u max=%u nits=%u therm=%u bat_cC=%d reqs=%llu sends=%llu "
++	    "fails=%llu floored=%llu capped=%llu therm_changes=%llu", c.mode, b.req_q16, b.want_dbv, b.sent_dbv, sweet_bl_target(&b, &c),
++	    c.floor_dbv, c.max_dbv, c.nits_full, b.therm, b.therm_cc, b.reqs, b.sends, b.fails, b.floored, b.capped, b.therm_changes);
++}
++
++static int
++sweet_bl_sysctl_cfg SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1)
++	AppleCLCD *fb = gSweetFBSnapOwner;
++	if (fb == NULL || fb->fBlLock == NULL) { return ENODEV; }
++	IOLockLock(fb->fBlLock);
++	struct sweet_bl_cfg c = sweet_bl_cfg_g;
++	IOLockUnlock(fb->fBlLock);
++	uint32_t *field = arg2 == 0 ? &c.mode : arg2 == 1 ? &c.floor_dbv : arg2 == 2 ? &c.max_dbv : &c.nits_full;
++	int v = (int)*field, changed = 0;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (err != 0 || !changed) { return err; }
++	if (v < 0 || v > 4095) { return EINVAL; }
++	*field = (uint32_t)v;
++	sweet_bl_cfg_fix(&c);
++	IOLockLock(fb->fBlLock);
++	sweet_bl_cfg_g = c;
++	IOLockUnlock(fb->fBlLock);
++	fb->blConfigChanged();
++	IOLog("NORD2 BL: sysctl %s: mode %u floor %u max %u nits %u\n", oidp->oid_name, c.mode, c.floor_dbv, c.max_dbv, c.nits_full);
++	return 0;
++}
++static int
++sweet_bl_sysctl_stat SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[512];
++	buf[0] = 0;
++	if (gSweetFBSnapOwner != NULL) { (void)gSweetFBSnapOwner->blStat(buf, sizeof(buf)); } else { snprintf(buf, sizeof(buf), "no framebuffer"); }
++	return sysctl_io_string(req, buf, sizeof(buf), 0, NULL);
++}
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wreserved-identifier"
++#pragma clang diagnostic ignored "-Wmissing-designated-field-initializers"
++#pragma clang diagnostic ignored "-Wcast-function-type-strict"
++SYSCTL_PROC(_kern, OID_AUTO, n2bl, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sweet_bl_sysctl_cfg, "I",
++    "0495 panel brightness: 1 act on CoreBrightness requests (DCS 0x51), 0 record only");
++SYSCTL_PROC(_kern, OID_AUTO, n2bl_floor, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 1, sweet_bl_sysctl_cfg, "I",
++    "0495 lowest DBV sent (4..2047, default 16)");
++SYSCTL_PROC(_kern, OID_AUTO, n2bl_max, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 2, sweet_bl_sysctl_cfg, "I",
++    "0495 highest DBV sent (4..2047, default 2047; HBM never)");
++SYSCTL_PROC(_kern, OID_AUTO, n2bl_nits, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 3, sweet_bl_sysctl_cfg, "I",
++    "0495 nits that map to DBV 2047 (100..1000, default 400)");
++SYSCTL_PROC(_kern, OID_AUTO, n2blstat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sweet_bl_sysctl_stat, "A",
++    "0495 brightness state and counters");
++#pragma clang diagnostic pop
++
+ #if defined(NORD2)
+ /* 0396: runtime control (no boot-arg: the UI command line is at its 607-character limit) */
+ static int
+@@ -820,6 +1064,34 @@
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	gSweetFBSnapOwner = this;   /* 0296 */
++	/* 0495: the backlight service CoreBrightness looks for (boot-arg n2bl=0: not published, the slider stays dead as before) */
++	sweet_bl_init(&fBl); fBlLogN = 0; fBlSumUs = 0; fBlSumSends = 0;
++	fBlLock = IOLockAlloc();
++	fBlThermCall = fBlLock != NULL ? thread_call_allocate(sweet_bl_therm_call, this) : NULL;
++	{
++		uint32_t bl = 1;
++		(void)PE_parse_boot_argn("n2bl", &bl, sizeof(bl));
++		AppleARMBacklight *b = (bl != 0 && fBlLock != NULL) ? OSTypeAlloc(AppleARMBacklight) : NULL;
++		bool published = false;
++		if (b != NULL && b->init()) {
++			b->fFB = this;
++			b->setProperty("backlight-control", true);
++			OSDictionary *params = OSDictionary::withCapacity(1), *br = OSDictionary::withCapacity(3);
++			OSNumber *mn = OSNumber::withNumber(0ULL, 32), *mx = OSNumber::withNumber((unsigned long long)SWEET_BL_DBV_HW_MAX, 32),
++			    *val = OSNumber::withNumber(1024ULL, 32);      /* initial slider position only: CoreBrightness restores the saved level */
++			if (params != NULL && br != NULL && mn != NULL && mx != NULL && val != NULL) {
++				br->setObject("min", mn); br->setObject("max", mx); br->setObject("value", val);
++				params->setObject("brightness", br);
++				b->setProperty("IODisplayParameters", params);
++			}
++			OSSafeReleaseNULL(mn); OSSafeReleaseNULL(mx); OSSafeReleaseNULL(val); OSSafeReleaseNULL(br); OSSafeReleaseNULL(params);
++			if (b->attach(this)) { b->registerService(); published = true; }
++		}
++		OSSafeReleaseNULL(b);
++		IOLog("NORD2 BL: AppleARMBacklight %s (boot-arg n2bl=%u; sysctl kern.n2bl %u, floor DBV %u, max DBV %u, %u nits = DBV 2047; DCS 0x51)\n",
++		    published ? "published" : "NOT published", bl, sweet_bl_cfg_g.mode, sweet_bl_cfg_g.floor_dbv, sweet_bl_cfg_g.max_dbv, sweet_bl_cfg_g.nits_full);
++		if (published && fBlThermCall != NULL) { blThermTick(); }
++	}
+ 	return true;
+ }
+ 
+@@ -912,6 +1184,7 @@
+ 	}
+ #endif
+ 	IOLockUnlock(fb->fLock);
++	fb->blService(false);      /* 0495: brightness while the presenter is idle (claims the engine for one DCS) */
+ 	/* 0155: the tick is only the fallback; swaps and a finished present hand over at once (handOver() also takes the GPU wait and the TE wait off this thread). */
+ 	if (sweet_fb_flush_due(count, fb->fFlushTicks)) { fb->handOver(count); }
+ 	fb->reapLate();
+@@ -1026,7 +1299,7 @@
+ AppleCLCD::presentFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+-	if (fb->fPState == 0) { return; }
++	if (fb->fPState == 0 || fb->fPState == 7) { return; }      /* 0495: 7 = the vsync thread sends a DCS 0x51 */
+ 	if (__atomic_load_n(&fb->fSwapLifecycle.stopped, __ATOMIC_ACQUIRE)) {
+ 		fb->presentDone(false, false, false);
+ 		return;
+@@ -1121,6 +1394,7 @@
+ 			bool ok = fb->dsiDcs(on, 1);
+ 			IOLog("NORD2 FB BLANK: DCS display on %s\n", ok ? "sent" : "FAILED (pushing anyway)");
+ 			fb->fPanelBlank = false;
++			if (fb->fBlLock != NULL) { IOLockLock(fb->fBlLock); fb->fBl.sent_dbv = 0; IOLockUnlock(fb->fBlLock); }      /* 0495: level again after display on */
+ 		}
+ #endif
+ 		fb->fPushSafe = false;
+@@ -1644,6 +1918,7 @@
+ 			IOLog("NORD2 FB PANEL: 90 Hz retry %u/%u after the %s revert %u presents ago\n", fP90.retries, SWEET_FB_P90_RETRIES,
+ 			    sweet_fb_p90_reason_name(fP90.last_reason), fPresents - fP90.revert_at);
+ 		}
++		blService(true);      /* 0495: brightness between two frames (the presenter owns the engine, the link is idle) */
+ 	}
+ #endif
+ 	IOLockLock(fLock);
+@@ -2599,6 +2874,7 @@
+ 		fVsync->disable();
+ 	}
+ 	if (fTrackTimer != NULL) { fTrackTimer->cancelTimeout(); fTrackTimer->disable(); }
++	if (fBlThermCall != NULL) { (void)thread_call_cancel_wait(fBlThermCall); }      /* 0495 */
+ 	if (fPresentTimer != NULL) {
+ 		/* Let the present thread notice the stop and drop its frame (copy/transfer in flight finishes first). */
+ 		for (unsigned i = 0; i < 200 && fPState != 0; i++) {
+--- /dev/null
++++ b/iokit/Kernel/arm/sweet_fb_backlight.h
+@@ -0,0 +1,174 @@
++/*
++ * sweet_fb_backlight.h -- 0495 (bright-fix-20261114): panel brightness policy for SweetFramebuffer.cpp (pure C, host-tested by
++ * bright-fix-20261114/test/bl_test.c).  No kernel calls in here: the caller owns the locks, the clock and the DSI.
++ *
++ * What iOS sends (CoreBrightness, iOS 16.7, verified by disassembly of the 20H392 cache):
++ *  -[CBDisplayContaineriOS findBacklight] matches {IOPropertyMatch: {backlight-control: true}} and keeps the service only if it
++ *  conforms to the class AppleARMBacklight; DisplayCreateWithID reads IODisplayParameters.brightness.{min,max,value} (SInt32) from
++ *  it; SetBLDriverNitsValue then sets "brightness-nits" on it and SetIOMFBBrightness sets "IOMFBBrightnessLevel" on the
++ *  IOMobileFramebuffer service, both as SInt32 = nits * 65536 (CFNumber type 3).  The default curve without calibration
++ *  properties spans 5 .. 400 nits; digital dimming stays off as long as "digital-dimming-min-nits" is not published.
++ *
++ * The panel (Samsung AMS643YE05, Android oplus20615_samsung_ams643ye05_1080p_dsi_cmd.c lcm_setbacklight_cmdq): DCS 0x51 with two
++ * bytes MSB first, 4..2047 = normal range (DBV), 2048..4095 = HBM (needs the ELVSS sequence and 0x53 0xE0: never sent here).
++ * The DBV is taken as linear in nits (Samsung DBV), full scale SWEET_BL_NITS_FULL (kern.n2bl_nits) = DBV 2047.
++ */
++#ifndef SWEET_FB_BACKLIGHT_H
++#define SWEET_FB_BACKLIGHT_H
++#include <stdint.h>
++#include <stdbool.h>
++
++#define SWEET_BL_DBV_HW_MAX        2047u     /* normal range top; never HBM */
++#define SWEET_BL_DBV_HW_MIN        4u        /* the Android driver's lowest non-AOD level */
++#define SWEET_BL_FLOOR_DEFAULT     16u       /* kern.n2bl_floor: never darker than this (a request of 0 nits is not a black panel) */
++#define SWEET_BL_MAX_DEFAULT       2047u     /* kern.n2bl_max */
++#define SWEET_BL_NITS_FULL         400u      /* kern.n2bl_nits default: CoreBrightness' uncalibrated slider top (400 nits) = DBV 2047 */
++#define SWEET_BL_NITS_MIN          100u
++#define SWEET_BL_NITS_MAX          1000u
++#define SWEET_BL_MIN_GAP_US        8000u     /* at most one DCS 0x51 per 8 ms (a fade sends ~60 requests a second) */
++/* thermal: battery gauge temperature (centi-C), the only temperature this port reads.  Caps the DBV, with 1 C hysteresis. */
++#define SWEET_BL_WARM_CC           4200
++#define SWEET_BL_HOT_CC            4500
++#define SWEET_BL_HYST_CC           100
++#define SWEET_BL_WARM_CAP          1434u     /* 70 % */
++#define SWEET_BL_HOT_CAP           1024u     /* 50 % */
++#define SWEET_BL_THERM_STALE_US    30000000ull   /* no reading for 30 s: keep the last level (never lift a cap on a missing reading) */
++
++struct sweet_bl_cfg {
++	uint32_t mode;          /* kern.n2bl: 0 = requests recorded, no DCS; 1 = act */
++	uint32_t floor_dbv;     /* kern.n2bl_floor */
++	uint32_t max_dbv;       /* kern.n2bl_max */
++	uint32_t nits_full;     /* kern.n2bl_nits */
++};
++
++struct sweet_bl {
++	int32_t  req_q16;       /* last request, nits 16.16 (-1 = none yet) */
++	uint32_t want_dbv;      /* request mapped, before the thermal cap */
++	uint32_t sent_dbv;      /* last DBV the panel accepted (0 = none / unknown, e.g. after display on) */
++	uint64_t last_us;       /* last DCS attempt */
++	uint32_t therm;         /* 0 none, 1 warm, 2 hot */
++	uint64_t therm_us;      /* last valid reading */
++	int32_t  therm_cc;
++	/* counters */
++	uint64_t reqs, sends, fails, floored, capped, therm_changes, skipped_off;
++};
++
++static inline void
++sweet_bl_cfg_default(struct sweet_bl_cfg *c)
++{
++	c->mode = 1; c->floor_dbv = SWEET_BL_FLOOR_DEFAULT; c->max_dbv = SWEET_BL_MAX_DEFAULT; c->nits_full = SWEET_BL_NITS_FULL;
++}
++
++/* sanitises a configuration: floor in [HW_MIN, max], max in [HW_MIN, HW_MAX], nits in [NITS_MIN, NITS_MAX] */
++static inline void
++sweet_bl_cfg_fix(struct sweet_bl_cfg *c)
++{
++	if (c->max_dbv > SWEET_BL_DBV_HW_MAX) { c->max_dbv = SWEET_BL_DBV_HW_MAX; }
++	if (c->max_dbv < SWEET_BL_DBV_HW_MIN) { c->max_dbv = SWEET_BL_DBV_HW_MIN; }
++	if (c->floor_dbv < SWEET_BL_DBV_HW_MIN) { c->floor_dbv = SWEET_BL_DBV_HW_MIN; }
++	if (c->floor_dbv > c->max_dbv) { c->floor_dbv = c->max_dbv; }
++	if (c->nits_full < SWEET_BL_NITS_MIN) { c->nits_full = SWEET_BL_NITS_MIN; }
++	if (c->nits_full > SWEET_BL_NITS_MAX) { c->nits_full = SWEET_BL_NITS_MAX; }
++	c->mode = c->mode ? 1u : 0u;
++}
++
++static inline void
++sweet_bl_init(struct sweet_bl *b)
++{
++	b->req_q16 = -1; b->want_dbv = 0; b->sent_dbv = 0; b->last_us = 0; b->therm = 0; b->therm_us = 0; b->therm_cc = 0;
++	b->reqs = b->sends = b->fails = b->floored = b->capped = b->therm_changes = b->skipped_off = 0;
++}
++
++/* nits 16.16 -> DBV, rounded, clamped to [floor, max] (cfg already fixed).  A request at or below 0 gives the floor. */
++static inline uint32_t
++sweet_bl_q16_to_dbv(int32_t q16, const struct sweet_bl_cfg *c, bool *floored)
++{
++	uint64_t full = (uint64_t)c->nits_full << 16;
++	uint64_t v = q16 <= 0 ? 0 : ((uint64_t)(uint32_t)q16 * SWEET_BL_DBV_HW_MAX + full / 2) / full;
++	if (floored) { *floored = v < c->floor_dbv; }
++	if (v < c->floor_dbv) { v = c->floor_dbv; }
++	if (v > c->max_dbv) { v = c->max_dbv; }
++	return (uint32_t)v;
++}
++
++/* a new request (any thread; the caller serialises).  Returns the mapped DBV. */
++static inline uint32_t
++sweet_bl_request(struct sweet_bl *b, const struct sweet_bl_cfg *c, int32_t q16)
++{
++	bool fl = false;
++	b->req_q16 = q16 < 0 ? 0 : q16;
++	b->want_dbv = sweet_bl_q16_to_dbv(b->req_q16, c, &fl);
++	b->reqs++;
++	if (fl) { b->floored++; }
++	return b->want_dbv;
++}
++
++/* the configuration changed: re-map the last request */
++static inline void
++sweet_bl_remap(struct sweet_bl *b, const struct sweet_bl_cfg *c)
++{
++	if (b->req_q16 >= 0) { b->want_dbv = sweet_bl_q16_to_dbv(b->req_q16, c, NULL); }
++}
++
++/* thermal level from a battery reading (ok = valid).  Hysteresis: a level drops only SWEET_BL_HYST_CC under its threshold.
++ * An invalid reading keeps the level.  Returns true when the level changed. */
++static inline bool
++sweet_bl_therm_update(struct sweet_bl *b, bool ok, int32_t cc, uint64_t now_us)
++{
++	if (!ok) { return false; }
++	uint32_t lvl = b->therm;
++	if (cc >= SWEET_BL_HOT_CC) { lvl = 2; }
++	else if (cc >= SWEET_BL_WARM_CC) { lvl = lvl == 2 && cc >= SWEET_BL_HOT_CC - SWEET_BL_HYST_CC ? 2u : 1u; }
++	else if (lvl == 2) { lvl = cc >= SWEET_BL_HOT_CC - SWEET_BL_HYST_CC ? 2u : cc >= SWEET_BL_WARM_CC - SWEET_BL_HYST_CC ? 1u : 0u; }
++	else if (lvl == 1) { lvl = cc >= SWEET_BL_WARM_CC - SWEET_BL_HYST_CC ? 1u : 0u; }
++	b->therm_us = now_us; b->therm_cc = cc;
++	if (lvl != b->therm) { b->therm = lvl; b->therm_changes++; return true; }
++	return false;
++}
++
++static inline uint32_t
++sweet_bl_cap(const struct sweet_bl *b)
++{
++	return b->therm >= 2 ? SWEET_BL_HOT_CAP : b->therm == 1 ? SWEET_BL_WARM_CAP : SWEET_BL_DBV_HW_MAX;
++}
++
++/* the DBV the panel should show now (0 = no request yet: leave the panel at its boot level) */
++static inline uint32_t
++sweet_bl_target(const struct sweet_bl *b, const struct sweet_bl_cfg *c)
++{
++	if (b->req_q16 < 0 || b->want_dbv == 0) { return 0; }
++	uint32_t t = b->want_dbv, cap = sweet_bl_cap(b);
++	if (t > cap) { t = cap; }
++	if (t < c->floor_dbv) { t = c->floor_dbv; }      /* a cap never goes under the floor (both are user settable) */
++	if (t > SWEET_BL_DBV_HW_MAX) { t = SWEET_BL_DBV_HW_MAX; }
++	return t;
++}
++
++/* what to send now: 0 = nothing (mode 0, no request, already shown, or too soon after the last DCS) */
++static inline uint32_t
++sweet_bl_due(const struct sweet_bl *b, const struct sweet_bl_cfg *c, uint64_t now_us)
++{
++	if (!c->mode) { return 0; }
++	uint32_t t = sweet_bl_target(b, c);
++	if (t == 0 || t == b->sent_dbv) { return 0; }
++	if (b->last_us != 0 && now_us - b->last_us < SWEET_BL_MIN_GAP_US) { return 0; }
++	return t;
++}
++
++/* result of a DCS attempt for dbv */
++static inline void
++sweet_bl_sent(struct sweet_bl *b, uint32_t dbv, bool ok, uint64_t now_us)
++{
++	b->last_us = now_us;
++	if (ok) { b->sent_dbv = dbv; b->sends++; if (dbv < b->want_dbv) { b->capped++; } }
++	else { b->fails++; }
++}
++
++/* the DCS packet: 0x51, DBV high byte, low byte (MSB first, as lcm_setbacklight_cmdq) */
++static inline void
++sweet_bl_packet(uint32_t dbv, uint8_t p[3])
++{
++	if (dbv > SWEET_BL_DBV_HW_MAX) { dbv = SWEET_BL_DBV_HW_MAX; }
++	p[0] = 0x51; p[1] = (uint8_t)(dbv >> 8); p[2] = (uint8_t)dbv;
++}
++#endif

@@ -1,0 +1,796 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -164,6 +164,7 @@
+         BufferOwner *o = (BufferOwner *)cookie;
+         if (!o) return;
+         if (o->md && o->prepared) o->md->complete(kIODirectionInOut);
++        sweet_surface_wod_unhold(o->surface);    /* 0480: the import's hold (the GPU pages were unmapped and flushed before the owner goes) */
+         if (o->surface) OSDecrementAtomic((volatile SInt32 *)&o->surface->gpuImports);    /* 0398: pool leak attribution */
+         OSSafeReleaseNULL(o->md);
+         OSSafeReleaseNULL(o->surface);
+@@ -1576,6 +1577,7 @@
+         }
+         return io_error(e);
+ }
++#include "nord2_gpu_wod.inc"    /* 0480: import of a wire-on-demand surface */
+ IOReturn Nord2GPU::importSurface(unsigned c, uint32_t id, uint32_t offset, uint32_t bytes,
+                                 uint32_t *h, uint64_t *va, uint64_t *actual) {
+         if (!ready || !core || c >= N2C_MAX_CTX || !bytes || (offset & 4095)) return kIOReturnBadArgument;
+@@ -1585,6 +1587,7 @@
+                 budgetReject("import", c, mapped, NORD2_GPU_IMPORT_LIMIT); return kIOReturnNoMemory;
+         }
+         SweetSurface *s = sweet_surface_copy(id); if (!s) return kIOReturnNotFound;
++        if (s->wod.on) return n2wod_import(this, c, s, offset, mapped, charged, h, va, actual);     /* 0480 */
+         uint64_t base = (uint64_t)s->offset + offset;
+         if (!s->memory || (base & 4095) || base > s->allocSize || mapped > s->allocSize - base ||
+             base > s->memory->getLength() || mapped > s->memory->getLength() - base || !s->kernelAddress()) {
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -224,6 +224,11 @@
+ 	SweetSurface *s = sweet_surface_copy(id);       /* retained, or NULL */
+ 	if (s != NULL) {
+ 		(void)sweet_surface_use_kernel(s, SWEET_SURFACE_USE_DISPLAY, 1);
++		if (!sweet_surface_wod_hold(s)) {       /* 0480: wired here, on the SwapEnd caller's thread; not wired = not shown */
++			(void)sweet_surface_use_kernel(s, SWEET_SURFACE_USE_DISPLAY, -1);
++			s->release();
++			s = NULL;
++		}
+ 	}
+ 	return s;
+ }
+@@ -232,6 +237,7 @@
+ sweet_fb_release_surface(void *p)
+ {
+ 	(void)sweet_surface_use_kernel(p, SWEET_SURFACE_USE_DISPLAY, -1);      /* 0398 (refused, not counted twice, if none was taken) */
++	sweet_surface_wod_unhold(p);            /* 0480 */
+ 	((SweetSurface *)p)->release();
+ }
+ 
+@@ -2302,6 +2308,7 @@
+ 	unsigned slot = __atomic_fetch_add(&seenN, 1, __ATOMIC_RELAXED) % 64;
+ 	seen[slot] = s; seenId[slot] = id;
+ 	if (__atomic_add_fetch(&logged, 1, __ATOMIC_RELAXED) > 160) { return; }
++	if (sweet_surface_wod_unwired(s)) { return; }      /* 0480: no physical walk of unwired memory */
+ 	bool buffer = s->memory != NULL && OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL;
+ 	uint64_t len = s->memory != NULL ? s->memory->getLength() : 0, off = 0, lo = ~0ULL, hi = 0, prevEnd = 0;
+ 	uint32_t segs = 0;
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -438,6 +438,8 @@
+ 	}
+ }
+ 
++#include "sweet_surface_wod_kern.inc"   /* 0480: wire-on-demand surfaces (kern.n2surf_wod, default off) */
++
+ static uint32_t
+ sweet_surface_uptime(void)
+ {
+@@ -455,6 +457,7 @@
+ SweetSurface::free()
+ {
+ 	sweet_fb_iommu_surface_gone(this);      /* 0401 IOMMU: unmap before the pages can go */
++	sweet_wod_free(this);                   /* 0480: unwire (a pageable surface is in sweet_surface_wired only while wired) */
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 		OSDecrementAtomic((volatile SInt32 *)&sweet_surface_buffers);
+@@ -1495,7 +1498,7 @@
+ 	IOLockLock(sweet_surface_lock);
+ 	for (uint32_t id = 1; id < SWEET_SURFACE_MAX_ID && n < SWEET_PURGE_SCAN_MAX; id++) {
+ 		SweetSurface *t = sweet_surface_table[id];
+-		if (t == NULL || t->state == NULL || t->memory == NULL || OSDynamicCast(IOBufferMemoryDescriptor, t->memory) == NULL) {
++		if (t == NULL || t->state == NULL || t->memory == NULL || OSDynamicCast(IOBufferMemoryDescriptor, t->memory) == NULL || t->wod.on) {      /* 0480: pageable = the VM's */
+ 			continue;
+ 		}
+ 		bufs++;
+@@ -2400,6 +2403,8 @@
+ 		} else if (ret == kIOReturnSuccess) {
+ 			sweet_pool_log_alloc(s, "create");
+ 		}
++	} else if (ret == kIOReturnSuccess && sweet_wod_create(s, props, fPid, &ret)) {
++		/* 0480: pageable + purgeable, wired on demand (or refused by the 0417 guards) */
+ 	} else if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		bool admitted = sweet_mem_admit(s->allocSize, fPid);      /* 0417: purge under pressure, per-process and combined budgets */
+@@ -2583,6 +2588,7 @@
+ 		if (sweet_pool_evict_lock != NULL) {
+ 			IOLockUnlock(sweet_pool_evict_lock);
+ 		}
++		old = sweet_wod_purgeable(s, req, old);  /* 0480: the VM object follows; Empty if the VM purged it */
+ 		if (args->scalarOutputCount >= 1) {
+ 			args->scalarOutput[0] = old;
+ 			args->scalarOutputCount = 1;
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -15,6 +15,7 @@
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <libkern/c++/OSObject.h>
+ #include <mach/mach_types.h>
++#include "sweet_surface_wod.h"          /* 0480 */
+ 
+ #define SWEET_SURFACE_MAX_PLANES        20
+ 
+@@ -47,6 +48,7 @@
+ 	uint32_t                  bornAt;       /* 0398: uptime second of the creation */
+ 	volatile uint32_t         gpuImports;   /* 0398: Nord2GPU import buffers holding a reference (BufferOwner) */
+ 	uint32_t                  purged;       /* 0417: 1 = memory is a view of the shared purge sink (contents gone, state Empty) */
++	struct sweet_wod          wod;          /* 0480: wire-on-demand state; wod.on = pageable memory, physical addresses only under a hold */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -90,6 +92,17 @@
+ #define SWEET_SURFACE_USE_GPU           1
+ extern "C" bool sweet_surface_use_kernel(void *surface, uint32_t kind, int delta);
+ 
++/*
++ * 0480: wire-on-demand surfaces (kern.n2surf_wod, sweet_surface_wod.h).  A holder that needs the physical pages of a surface (GPU
++ * page tables, display IOMMU, any getPhysicalSegment) takes a hold first and gives it back when the hardware can no longer reach them.
++ * hold may block (prepare() pages the pixels in): false = not wired, no hold taken.  hold_try never blocks: true only if wired now.
++ * All three are no-ops (true) for the ordinary wired surfaces.  unwired: a physical lookup would panic now (diagnostics ask first).
++ */
++extern "C" bool sweet_surface_wod_hold(void *surface);
++extern "C" bool sweet_surface_wod_hold_try(void *surface);
++extern "C" void sweet_surface_wod_unhold(void *surface);
++extern "C" bool sweet_surface_wod_unwired(const void *surface);
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
+--- a/iokit/Kernel/arm/sweet_fb_iommu_hw.h
++++ b/iokit/Kernel/arm/sweet_fb_iommu_hw.h
+@@ -267,6 +267,7 @@
+ 	n2io_tlb_range(e->iova, e->pages * 0x1000u);
+ 	(void)sweet_fb_iova_free(&n2io_iova, e->iova, (uint64_t)e->pages * 0x1000u);
+ 	n2io_st.unmaps++;
++	n2io_wod_unmapped(e);      /* 0480: the hold of a wire-on-demand surface goes after the unmap + TLB invalidate */
+ 	e->obj = NULL;
+ }
+ 
+@@ -337,6 +338,8 @@
+ 	return e;
+ }
+ 
++#include "sweet_fb_iommu_wod.inc"      /* 0480: wire-on-demand surfaces: entry holds, idle unmap, page-wise cache clean */
++
+ /* Fault status (lock held).  true = a fault was latched (logged, cleared, IOMMU auto-disabled). */
+ static bool
+ n2io_poll_fault_locked(const char *where)
+@@ -406,13 +409,13 @@
+ 	if (n2io_arm_locked()) {
+ 		for (unsigned i = 0; i < SWEET_FB_IOMMU_CACHE; i++) { if (n2io_ent[i].obj == s && n2io_ent[i].id == s->id) { e = &n2io_ent[i]; break; } }
+ 		if (e != NULL) { n2io_st.hits++; e->stamp = n2io_gen; }
+-		else { e = n2io_map_locked(s, s->id, s->memory, s->memory->getLength()); }
++		else { e = n2io_map_surface(s); }      /* 0480: n2io_map_locked under a hold */
+ 		/* The OVL does not snoop: pixels the CPU wrote (IOSurfaceUnlock only marks GPU imports dirty; zero-fill, kernel copy-in) may sit dirty
+ 		 * in the cache.  Clean to PoC at the first map and after every CPU write-unlock; GPU-written frames cost nothing (lines already clean). */
+ 		uint32_t cs = s->id < SWEET_SURFACE_MAX_ID ? __atomic_load_n(&n2io_cpu_seq[s->id], __ATOMIC_ACQUIRE) : 0u;
+ 		IOBufferMemoryDescriptor *buf = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
+ 		if (e != NULL && e->cpu_seq != cs && buf != NULL) {
+-			CleanPoC_DcacheRegion((vm_offset_t)buf->getBytesNoCopy(), (size_t)e->bytes);
++			n2io_clean_surface(s, buf, e->bytes);      /* 0480: a pageable surface has no kernel mapping */
+ 			e->cpu_seq = cs; n2io_st.cleans++;
+ 		}
+ 		if (e != NULL && mode >= 2 && n2io_mode >= 2) { *iova = e->iova; *len = e->bytes; ok = true; n2io_st.layers++; }
+--- /dev/null
++++ b/iokit/Kernel/arm/nord2_gpu_wod.inc
+@@ -0,0 +1,50 @@
++/*
++ * 0480 (memwod-20261113): GPU import of a WIRE-ON-DEMAND surface (SweetSurface wod.on, sweet_surface_wod.h).  Included ONCE by
++ * Nord2GPU.cpp in front of Nord2GPU::importSurface, which hands every such surface here.  SPDX-License-Identifier: MIT
++ *
++ * Same result as the wired path with three differences: (1) the surface is wired (prepare(), may page its pixels in) BEFORE any
++ * physical lookup, with the GPU lock dropped (the caller's connection lock stays, so the context cannot close meanwhile; the driver
++ * state is checked again); (2) the hold lasts as long as the import buffer: free_owner gives it back after the core unmapped and
++ * flushed the GPU pages, so no job can read or write the pages of an unwired surface; (3) the surface has no kernel mapping, so the
++ * per-page CPU address for the core's cache maintenance is the physical aperture (the pages are XNU RAM: valid_ram first).
++ * Called with the connection lock and the GPU lock held; `mapped` and `charged` were computed and budgeted by the caller.
++ */
++static IOReturn
++n2wod_import(Nord2GPU *g, unsigned c, SweetSurface *s, uint32_t offset, uint64_t mapped, uint64_t charged, uint32_t *h, uint64_t *va, uint64_t *actual)
++{
++        uint64_t base = (uint64_t)s->offset + offset;
++        if (!s->memory || (base & 4095) || base > s->allocSize || mapped > s->allocSize - base ||
++            base > s->memory->getLength() || mapped > s->memory->getLength() - base) {
++                s->release(); return kIOReturnBadArgument;
++        }
++        unsigned count = (unsigned)(mapped / 4096); const uint32_t sid = s->id;     /* (s may be gone after free_owner) */
++        IOLockUnlock(g->lock);
++        bool held = sweet_surface_wod_hold(s);
++        BufferOwner *owner = held ? (BufferOwner *)IOMallocZero(sizeof(*owner)) : NULL;
++        n2c_page *pages = held ? (n2c_page *)IOMallocZero(count * sizeof(*pages)) : NULL;
++        IOLockLock(g->lock);
++        bool up = g->ready && !g->stopping && g->core;
++        if (!owner || !pages || !up) {
++                if (owner) IOFree(owner, sizeof(*owner));
++                if (pages) IOFree(pages, count * sizeof(*pages));
++                if (held) sweet_surface_wod_unhold(s);
++                s->release();
++                return up ? kIOReturnNoMemory : kIOReturnNotReady;
++        }
++        owner->surface = s; bool valid = true;
++        OSIncrementAtomic((volatile SInt32 *)&s->gpuImports);     /* 0398: given back in free_owner, with the hold */
++        for (unsigned i = 0; i < count; i++) {
++                IOByteCount length = 0; pages[i].pa = s->memory->getPhysicalSegment(base + (uint64_t)i * 4096, &length, kIOMemoryMapperNone);
++                if (!valid_ram(pages[i].pa) || length < 4096) { valid = false; break; }
++                pages[i].cpu = (void *)ml_static_ptovirt((vm_offset_t)pages[i].pa);
++        }
++        bool adopted = false;
++        enum n2c_error e = valid ? n2c_bo_map(g->core, c, pages, count, N2C_BO_GPU_READ | N2C_BO_GPU_WRITE | N2C_BO_IMPORTED,
++                                             owner, charged, h, va, &adopted) : N2C_E_ARGS;
++        IOFree(pages, count * sizeof(*pages)); if (!adopted) free_owner(g, owner);
++        static unsigned logs; if (logs < 8 || e != N2C_OK) { logs++;
++                IOLog("NORD2 GPU WOD: import ctx=%u sid=%u pages=%u valid=%d e=%d\n", c, sid, count, (int)valid, (int)e); }
++        if (e == N2C_OK && g->core->track_level >= N2C_TRACK_EXPLICIT) (void)n2c_bo_track(g->core, c, *h);
++        if (e == N2C_OK) *actual = mapped;
++        return io_error(e);
++}
+--- /dev/null
++++ b/iokit/Kernel/arm/sweet_fb_iommu_wod.inc
+@@ -0,0 +1,80 @@
++/*
++ * 0480 (memwod-20261113): wire-on-demand surfaces and the display IOMMU.  Included ONCE by sweet_fb_iommu_hw.h after n2io_map_locked.
++ * SPDX-License-Identifier: MIT
++ *
++ * A cache entry of a pageable surface holds it wired from before the page-table walk (n2io_map_surface: a never-blocking hold, the
++ * swap's own hold wired it on the SwapEnd caller's thread) until after the unmap + TLB invalidate (n2io_unmap_ent -> n2io_wod_unmapped).
++ * The 96-entry cache would otherwise keep every surface ever shown wired: n2io_wod_sweep (the 2 s tick of sweet_surface_wod_kern.inc)
++ * unmaps the entries of pageable surfaces that no lookup touched for idle_s, with sweet_fb_iommu_victim's safety rule (not looked up
++ * in the generation being planned, not programmed in an overlay slot).  Entries of ordinary wired surfaces are left alone.
++ */
++extern "C" vm_offset_t ml_static_ptovirt(vm_offset_t);
++static bool          n2io_wod_held[SWEET_FB_IOMMU_CACHE];       /* entry i holds its surface (n2io_lock) */
++static uint64_t      n2io_wod_seen[SWEET_FB_IOMMU_CACHE];       /* its stamp at the last sweep */
++static uint32_t      n2io_wod_at[SWEET_FB_IOMMU_CACHE];         /* uptime s the stamp last moved (0 = not seen yet) */
++
++static void
++n2io_wod_unmapped(struct sweet_fb_iommu_ent *e)
++{
++	unsigned i = (unsigned)(e - n2io_ent);
++	if (i < SWEET_FB_IOMMU_CACHE && n2io_wod_held[i]) {
++		n2io_wod_held[i] = false;
++		sweet_surface_wod_unhold((void *)(uintptr_t)e->obj);
++	}
++}
++
++/* n2io_map_locked for a surface; lock held.  NULL also when a pageable surface is not wired now (then nothing walks it). */
++static struct sweet_fb_iommu_ent *
++n2io_map_surface(SweetSurface *s)
++{
++	if (!sweet_surface_wod_hold_try(s)) {
++		n2io_wod_refused++;
++		return NULL;
++	}
++	struct sweet_fb_iommu_ent *e = n2io_map_locked(s, s->id, s->memory, s->memory->getLength());
++	if (e == NULL || !s->wod.on) {
++		sweet_surface_wod_unhold(s);    /* (no-op for a wired surface) */
++	} else {
++		unsigned i = (unsigned)(e - n2io_ent);
++		n2io_wod_held[i] = true; n2io_wod_at[i] = 0;
++	}
++	return e;
++}
++
++/* The pixels of a mapped surface to the point of coherency (lock held, entry exists: a pageable surface is wired). */
++static void
++n2io_clean_surface(SweetSurface *s, IOBufferMemoryDescriptor *buf, uint32_t bytes)
++{
++	if (!s->wod.on) {
++		CleanPoC_DcacheRegion((vm_offset_t)buf->getBytesNoCopy(), (size_t)bytes);
++		return;
++	}
++	for (uint64_t off = 0; off < bytes;) {          /* through the physical aperture, one contiguous run at a time */
++		IOByteCount sl = 0;
++		uint64_t pa = buf->getPhysicalSegment((IOByteCount)off, &sl, kIOMemoryMapperNone);
++		if (sl == 0 || pa < gPhysBase || pa - gPhysBase >= gPhysSize || sl > gPhysSize - (pa - gPhysBase)) { break; }
++		if (sl > bytes - off) { sl = (IOByteCount)(bytes - off); }
++		CleanPoC_DcacheRegion(ml_static_ptovirt((vm_offset_t)pa), (size_t)sl);
++		off += sl;
++	}
++}
++
++static void
++n2io_wod_sweep(uint32_t now, uint32_t idle_s)
++{
++	if (__atomic_load_n(&n2io_state, __ATOMIC_RELAXED) != 1 || n2io_lock == NULL) { return; }
++	IOLockLock(n2io_lock);
++	for (unsigned i = 0; n2io_state == 1 && i < SWEET_FB_IOMMU_CACHE; i++) {
++		struct sweet_fb_iommu_ent *e = &n2io_ent[i];
++		if (e->obj == NULL || !n2io_wod_held[i]) { continue; }
++		if (n2io_wod_at[i] == 0 || n2io_wod_seen[i] != e->stamp) {
++			n2io_wod_seen[i] = e->stamp; n2io_wod_at[i] = now | 1u;
++			continue;
++		}
++		if (sweet_wod_iommu_idle(e->stamp, n2io_gen, sweet_fb_iommu_ent_programmed(e, &n2io_prog), n2io_wod_at[i], now, idle_s)) {
++			n2io_unmap_ent(e);      /* unmap, flush, TLB range invalidate, IOVA back, hold back */
++			n2io_wod_swept++;
++		}
++	}
++	IOLockUnlock(n2io_lock);
++}
+--- /dev/null
++++ b/iokit/Kernel/arm/sweet_surface_wod.h
+@@ -0,0 +1,181 @@
++/*
++ * 0480 (memwod-20261113): WIRE-ON-DEMAND IOSurfaces.  SPDX-License-Identifier: MIT
++ *
++ * Until now every buffer surface is a wired IOBufferMemoryDescriptor for its whole life (~1.8 GiB in autocycle/runs/lag1).  With
++ * kern.n2surf_wod = 1 a new surface that needs no kernel write at creation is PAGEABLE + PURGEABLE memory with no kernel mapping
++ * (IOBufferMemoryDescriptor::inTaskWithOptions(NULL, kIOMemoryPageable | kIOMemoryPurgeable)); clients fault its pages in like any
++ * anonymous memory, the VM may compress them, and it is wired (prepare()) only while somebody that needs PHYSICAL addresses holds it:
++ *   - a GPU import (Nord2GPU: the pages are in the GPU page tables for the life of the import buffer, which covers every job),
++ *   - a swap (SweetFramebuffer sweet_fb_retain_surface .. sweet_fb_release_surface, taken on the SwapEnd caller's thread),
++ *   - a display IOMMU cache entry (sweet_fb_iommu_hw.h: from the page-table write to the unmap + TLB invalidate).
++ * getPhysicalSegment() on an unwired descriptor panics ("IOGMD: not wired for the IODMACommand"), so the rule every holder follows is:
++ * hold first, look up after, give the hold back only when the hardware can no longer reach the pages.  The last hold only starts an
++ * idle timer; the unwire (complete()) is done by a 2 s thread call after idle_s without holders, so a surface shown or drawn every
++ * frame is never unwired.  IOSurfaceSetPurgeable(Volatile) becomes a volatile VM object only while unwired and idle (the VM then
++ * discards it under pressure without compressing); any hold or SetPurgeable(NonVolatile) makes it non-volatile FIRST, and a purged
++ * object answers Empty at the next SetPurgeable.
++ *
++ * This file is the state machine only (no IOKit): shared by SweetSurface.cpp and memwod-20261113/wod-0480/test/wod_host_test.c, which
++ * explores every interleaving of holders, the tick, SetPurgeable and VM purges against the invariants below.  All functions are called
++ * with the one WOD lock held (a leaf mutex); the descriptor operations (prepare / complete / setPurgeable) are done WITHOUT the lock by
++ * the thread that moved the state to BUSY, everybody else waits (holders, SetPurgeable) or skips (the tick, the never-blocking try).
++ *
++ * Invariants (checked by the host test after every step):
++ *   I1  holds > 0  =>  state == WIRED (a holder may look up physical addresses at any time)
++ *   I2  the descriptor is prepared exactly while state == WIRED, or BUSY on the way in or out (never prepared twice)
++ *   I3  the VM object is volatile only while not prepared; prepare() is never called on a volatile object
++ *   I4  complete() only with holds == 0, and never while a GPU write is pending
++ *   I5  a client that was answered for SetPurgeable(NonVolatile) owns a non-volatile object until it asks for Volatile again
++ */
++#ifndef SWEET_SURFACE_WOD_H
++#define SWEET_SURFACE_WOD_H
++/* (uint*_t / bool come from the includer: the kernel's headers, or stdint.h + stdbool.h in the host test) */
++
++enum { SWEET_WOD_UNWIRED = 0, SWEET_WOD_WIRED = 1, SWEET_WOD_BUSY = 2 };
++
++/* What the caller has to do after a *_begin (lock dropped), then report with the matching *_done. */
++enum {
++	SWEET_WOD_A_NONE = 0,           /* nothing: the call is complete */
++	SWEET_WOD_A_WAIT,               /* another thread owns a transition: sleep on the surface, call again */
++	SWEET_WOD_A_WIRE,               /* [setPurgeable(NonVolatile) if md_volatile] then prepare() */
++	SWEET_WOD_A_UNWIRE,             /* complete() */
++	SWEET_WOD_A_VOLATILE,           /* setPurgeable(Volatile) */
++	SWEET_WOD_A_NONVOLATILE         /* setPurgeable(NonVolatile, &old) */
++};
++
++/* IOSurfacePurgeable requests / answers (IOSurface.framework) */
++#define SWEET_WOD_P_NONVOLATILE 0u
++#define SWEET_WOD_P_VOLATILE    1u
++#define SWEET_WOD_P_EMPTY       2u
++#define SWEET_WOD_P_KEEP        3u
++
++struct sweet_wod {
++	uint8_t  on;                    /* 1 = pageable surface managed here; fixed at creation, read without the lock */
++	uint8_t  state;                 /* SWEET_WOD_* */
++	uint8_t  md_volatile;           /* the VM object is volatile now */
++	uint8_t  want_volatile;         /* the clients' last SetPurgeable was Volatile / Empty */
++	uint8_t  empty;                 /* the VM purged it: the next SetPurgeable answers Empty */
++	uint32_t holds;                 /* GPU imports + swaps + display IOMMU entries */
++	uint32_t idle_at;               /* uptime s of the creation / the last hold given back / the last unwire */
++};
++
++/* kern.n2surf_wod at creation.  Surfaces the kernel must write at creation (the 4:2:0 chroma fill, a snapshot of client memory) and
++ * tiny ones stay wired buffers: no kernel write path to pageable pixels exists and none is added. */
++static inline bool
++sweet_wod_eligible(int mode, uint32_t alloc_size, bool chroma_init, bool client_memory, uint32_t min_bytes)
++{
++	return mode == 1 && !chroma_init && !client_memory && alloc_size >= min_bytes;
++}
++
++/* A holder that may block.  A_NONE = held and wired; A_WAIT; A_WIRE = this thread wires, then sweet_wod_hold_done. */
++static inline int
++sweet_wod_hold_begin(struct sweet_wod *w)
++{
++	if (w->state == SWEET_WOD_BUSY) { return SWEET_WOD_A_WAIT; }
++	if (w->state == SWEET_WOD_WIRED) { w->holds++; return SWEET_WOD_A_NONE; }
++	w->state = SWEET_WOD_BUSY;
++	return SWEET_WOD_A_WIRE;
++}
++
++/* made_nonvolatile: the owner cleared the object's volatility before prepare() (only when md_volatile was set); was_empty: it had
++ * been purged.  wired false = prepare() failed: no hold was taken. */
++static inline bool
++sweet_wod_hold_done(struct sweet_wod *w, bool wired, bool made_nonvolatile, bool was_empty)
++{
++	if (made_nonvolatile) { w->md_volatile = 0; }
++	if (was_empty) { w->empty = 1; }
++	w->state = wired ? SWEET_WOD_WIRED : SWEET_WOD_UNWIRED;
++	if (wired) { w->holds++; }
++	return wired;
++}
++
++/* A holder that must not block (the present thread).  True only when the surface is wired now. */
++static inline bool
++sweet_wod_hold_try(struct sweet_wod *w)
++{
++	if (w->state != SWEET_WOD_WIRED) { return false; }
++	w->holds++;
++	return true;
++}
++
++/* false = no hold to give back (an accounting bug: counted and logged by the caller, never wrapped). */
++static inline bool
++sweet_wod_unhold(struct sweet_wod *w, uint32_t now)
++{
++	if (w->holds == 0) { return false; }
++	if (--w->holds == 0) { w->idle_at = now; }
++	return true;
++}
++
++/* The 2 s tick.  in_use: an IOSurface use-count word is not 0; gpu_busy: a GPU job that writes the surface has not finished. */
++static inline int
++sweet_wod_tick_begin(struct sweet_wod *w, uint32_t now, uint32_t idle_s, bool in_use, bool gpu_busy)
++{
++	if (w->state == SWEET_WOD_BUSY || w->holds != 0 || now - w->idle_at < idle_s) { return SWEET_WOD_A_NONE; }
++	if (w->state == SWEET_WOD_WIRED) {
++		if (gpu_busy) { return SWEET_WOD_A_NONE; }
++		w->state = SWEET_WOD_BUSY;
++		return SWEET_WOD_A_UNWIRE;
++	}
++	if (w->want_volatile && !w->md_volatile && !in_use) {
++		w->state = SWEET_WOD_BUSY;
++		return SWEET_WOD_A_VOLATILE;
++	}
++	return SWEET_WOD_A_NONE;
++}
++
++static inline void
++sweet_wod_tick_done(struct sweet_wod *w, int action, bool ok, uint32_t now)
++{
++	if (action == SWEET_WOD_A_UNWIRE) {
++		w->state = SWEET_WOD_UNWIRED;
++		w->idle_at = now;               /* the volatile step waits idle_s more */
++	} else if (action == SWEET_WOD_A_VOLATILE) {
++		w->state = SWEET_WOD_UNWIRED;
++		if (ok) { w->md_volatile = 1; }
++	}
++}
++
++/* IOSurfaceSetPurgeable.  A_NONE = recorded; A_WAIT; A_NONVOLATILE = this thread clears the volatility, then purgeable_done. */
++static inline int
++sweet_wod_purgeable_begin(struct sweet_wod *w, uint32_t req)
++{
++	if (w->state == SWEET_WOD_BUSY) { return SWEET_WOD_A_WAIT; }
++	if (req == SWEET_WOD_P_VOLATILE || req == SWEET_WOD_P_EMPTY) {
++		w->want_volatile = 1;           /* applied by the tick once unwired and idle */
++		if (req == SWEET_WOD_P_EMPTY) { w->empty = 1; }
++	} else if (req == SWEET_WOD_P_NONVOLATILE) {
++		w->want_volatile = 0;
++		if (w->md_volatile) {           /* only ever set while UNWIRED */
++			w->state = SWEET_WOD_BUSY;
++			return SWEET_WOD_A_NONVOLATILE;
++		}
++	}
++	return SWEET_WOD_A_NONE;
++}
++
++static inline void
++sweet_wod_purgeable_done(struct sweet_wod *w, bool was_empty)
++{
++	w->md_volatile = 0;
++	if (was_empty) { w->empty = 1; }
++	w->state = SWEET_WOD_UNWIRED;
++}
++
++/* The previous state for the client: Empty once the contents are gone, until it has been told with a NonVolatile request. */
++static inline uint32_t
++sweet_wod_purgeable_answer(struct sweet_wod *w, uint32_t req, uint32_t recorded_old)
++{
++	if (!w->empty) { return recorded_old; }
++	if (req == SWEET_WOD_P_NONVOLATILE) { w->empty = 0; }
++	return SWEET_WOD_P_EMPTY;
++}
++
++/* Display IOMMU cache entry of a wire-on-demand surface: may it be unmapped now?  (same safety rule as sweet_fb_iommu_victim: not
++ * looked up in the generation being planned, not programmed in an overlay slot) + not looked up for idle_s. */
++static inline bool
++sweet_wod_iommu_idle(uint64_t stamp, uint64_t gen, bool programmed, uint32_t seen_at, uint32_t now, uint32_t idle_s)
++{
++	return stamp < gen && !programmed && now - seen_at >= idle_s;
++}
++#endif /* SWEET_SURFACE_WOD_H */
+--- /dev/null
++++ b/iokit/Kernel/arm/sweet_surface_wod_kern.inc
+@@ -0,0 +1,301 @@
++/*
++ * 0480 (memwod-20261113): wire-on-demand IOSurfaces, KERNEL part.  Included ONCE by SweetSurface.cpp (before the display IOMMU code).
++ * State machine, rules and invariants: sweet_surface_wod.h.  SPDX-License-Identifier: MIT
++ *
++ * kern.n2surf_wod        0 (default) = every surface is a wired buffer as before; 1 = new eligible surfaces are pageable + purgeable
++ *                        and wired on demand.  Read at creation only: surfaces keep the kind they were made with.
++ *                        Boot-arg n2wod=1 turns it on from the first surface of the boot (backboardd's and SpringBoard's included).
++ * kern.n2surf_wod_idle   s without a holder before the unwire, and before a volatile surface becomes a volatile VM object (5)
++ * kern.n2surf_wod_min    smallest surface made pageable (bytes, 65536)
++ * Log: "NORD2 SURF WOD:" (first 8 wires / unwires, every failure, one line every 10 s while pageable surfaces exist).
++ *
++ * Locks: sweet_wod_lock is a LEAF mutex (nothing is called with it held; IOLockSleep on the surface for a transition in progress).  It
++ * is taken under n2io_lock (IOMMU entry holds) and under the GPU locks (free_owner), never the other way round.  sweet_pool_evict_lock
++ * is NOT used: the 0417 purge pass holds it while it takes n2io_lock, the opposite order.  Purgeable changes of one surface are
++ * serialised by the BUSY state instead.
++ * Accounting: sweet_surface_wired counts a pageable surface only while it is wired; sweet_surface_buffers and the per-process bytes
++ * (0417 runaway guard) count it always.
++ */
++static int           sweet_wod_mode = 0;
++static uint32_t      sweet_wod_idle_s = 5, sweet_wod_min = 65536;
++static IOLock       *sweet_wod_lock;
++static thread_call_t sweet_wod_tc;
++static uint32_t      sweet_wod_live, sweet_wod_wired_n, sweet_wod_wires, sweet_wod_unwires, sweet_wod_fail, sweet_wod_vol, sweet_wod_emptied;
++static uint32_t      sweet_wod_unmatched, sweet_wod_told, sweet_wod_log_at, sweet_wod_slow_ms;
++static uint64_t      sweet_wod_bytes, sweet_wod_wired_bytes;
++static uint32_t      n2io_wod_swept, n2io_wod_refused;         /* display IOMMU side (sweet_fb_iommu_hw.h) */
++SYSCTL_INT(_kern, OID_AUTO, n2surf_wod, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_wod_mode, 0, "0480: new IOSurfaces pageable, wired on demand: 0 off, 1 on");
++SYSCTL_UINT(_kern, OID_AUTO, n2surf_wod_idle, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_wod_idle_s, 0, "0480: s without a holder before the unwire");
++SYSCTL_UINT(_kern, OID_AUTO, n2surf_wod_min, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_wod_min, 0, "0480: smallest pageable surface (bytes)");
++SYSCTL_UINT(_kern, OID_AUTO, n2surf_wod_live, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_wod_live, 0, "0480: pageable surfaces alive");
++SYSCTL_UINT(_kern, OID_AUTO, n2surf_wod_wired, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_wod_wired_n, 0, "0480: ... wired now");
++SYSCTL_UINT(_kern, OID_AUTO, n2surf_wod_fail, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_wod_fail, 0, "0480: prepare() failures");
++SYSCTL_UINT(_kern, OID_AUTO, n2surf_wod_unmatched, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_wod_unmatched, 0, "0480: holds given back that were never taken (must stay 0)");
++
++static uint32_t sweet_surface_uptime(void);
++static bool sweet_surface_publish(SweetSurface *s);
++static void n2io_wod_sweep(uint32_t now, uint32_t idle_s);     /* sweet_fb_iommu_hw.h */
++struct sweet_fb_iommu_ent;
++static void n2io_wod_unmapped(struct sweet_fb_iommu_ent *e);     /* sweet_fb_iommu_wod.inc, called by n2io_unmap_ent */
++static void sweet_wod_tick(thread_call_param_t, thread_call_param_t);
++
++static inline IOBufferMemoryDescriptor *
++sweet_wod_md(SweetSurface *s)
++{
++	return (IOBufferMemoryDescriptor *)s->memory;       /* wod.on: always the buffer it was created with (0406 / 0417 leave it alone) */
++}
++
++/* The lock and the tick exist from the first pageable surface on. */
++static bool
++sweet_wod_start(void)
++{
++	if (sweet_wod_lock == NULL) {
++		IOLock *l = IOLockAlloc();
++		if (l != NULL && !OSCompareAndSwapPtr(NULL, l, (void * volatile *)&sweet_wod_lock)) { IOLockFree(l); }
++	}
++	if (sweet_wod_lock != NULL && sweet_wod_tc == NULL) {
++		thread_call_t tc = thread_call_allocate(sweet_wod_tick, NULL);
++		if (tc != NULL && !OSCompareAndSwapPtr(NULL, tc, (void * volatile *)&sweet_wod_tc)) {
++			thread_call_free(tc);
++		} else if (tc != NULL) {
++			uint64_t dl = 0;
++			clock_interval_to_deadline(2, kSecondScale, &dl);
++			thread_call_enter_delayed(tc, dl);
++			IOLog("NORD2 SURF WOD: wire-on-demand surfaces on (kern.n2surf_wod %d, idle %u s, min %u bytes)\n", sweet_wod_mode, sweet_wod_idle_s, sweet_wod_min);
++		}
++	}
++	return sweet_wod_lock != NULL && sweet_wod_tc != NULL;
++}
++
++/* May block (prepare() pages the pixels in): never on the present thread, never under the GPU lock.  false = not wired, no hold. */
++extern "C" bool
++sweet_surface_wod_hold(void *surface)
++{
++	SweetSurface *s = (SweetSurface *)surface;
++	if (s == NULL || !s->wod.on) { return true; }
++	int a;
++	IOLockLock(sweet_wod_lock);
++	while ((a = sweet_wod_hold_begin(&s->wod)) == SWEET_WOD_A_WAIT) {
++		(void)IOLockSleep(sweet_wod_lock, &s->wod, THREAD_UNINT);
++	}
++	bool unvol = a == SWEET_WOD_A_WIRE && s->wod.md_volatile;
++	IOLockUnlock(sweet_wod_lock);
++	if (a == SWEET_WOD_A_NONE) { return true; }
++	uint64_t t0 = mach_absolute_time(), ns = 0;
++	IOOptionBits old = kIOMemoryPurgeableNonVolatile;
++	if (unvol) { (void)sweet_wod_md(s)->setPurgeable(kIOMemoryPurgeableNonVolatile, &old); }     /* I3: never wire a volatile object */
++	IOReturn r = sweet_wod_md(s)->prepare(kIODirectionInOut);
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	IOLockLock(sweet_wod_lock);
++	bool ok = sweet_wod_hold_done(&s->wod, r == kIOReturnSuccess, unvol, unvol && old == kIOMemoryPurgeableEmpty);
++	if (ok) {
++		sweet_wod_wires++; sweet_wod_wired_n++; sweet_wod_wired_bytes += s->allocSize;
++		OSAddAtomic64((SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++	} else {
++		sweet_wod_fail++;
++	}
++	if (unvol && old == kIOMemoryPurgeableEmpty) { sweet_wod_emptied++; }
++	if ((uint32_t)(ns / 1000000ull) > sweet_wod_slow_ms) { sweet_wod_slow_ms = (uint32_t)(ns / 1000000ull); }
++	IOLockWakeup(sweet_wod_lock, &s->wod, false);
++	IOLockUnlock(sweet_wod_lock);
++	if (!ok || sweet_wod_told++ < 8) {
++		IOLog("NORD2 SURF WOD: wire id %u %u KiB -> %s in %llu us (prepare 0x%x%s; wired %u of %u, %llu MiB)\n", s->id, s->allocSize >> 10,
++		    ok ? "wired" : "FAILED", ns / 1000ull, (unsigned)r, unvol ? (old == kIOMemoryPurgeableEmpty ? ", was purged" : ", was volatile") : "",
++		    sweet_wod_wired_n, sweet_wod_live, sweet_wod_wired_bytes >> 20);
++	}
++	return ok;
++}
++
++/* Never blocks: a hold only if the surface is wired now (the display IOMMU map on the present thread, the GPU import after its
++ * blocking hold).  true for surfaces that are not wire-on-demand. */
++extern "C" bool
++sweet_surface_wod_hold_try(void *surface)
++{
++	SweetSurface *s = (SweetSurface *)surface;
++	if (s == NULL || !s->wod.on) { return true; }
++	IOLockLock(sweet_wod_lock);
++	bool ok = sweet_wod_hold_try(&s->wod);
++	IOLockUnlock(sweet_wod_lock);
++	return ok;
++}
++
++extern "C" void
++sweet_surface_wod_unhold(void *surface)
++{
++	SweetSurface *s = (SweetSurface *)surface;
++	if (s == NULL || !s->wod.on) { return; }
++	IOLockLock(sweet_wod_lock);
++	if (!sweet_wod_unhold(&s->wod, sweet_surface_uptime())) { sweet_wod_unmatched++; }
++	IOLockUnlock(sweet_wod_lock);
++}
++
++/* True when a lookup of physical addresses would panic (diagnostic paths ask before they walk s->memory). */
++extern "C" bool
++sweet_surface_wod_unwired(const void *surface)
++{
++	const SweetSurface *s = (const SweetSurface *)surface;
++	return s != NULL && s->wod.on && __atomic_load_n(&s->wod.state, __ATOMIC_RELAXED) != SWEET_WOD_WIRED;
++}
++
++/*
++ * IOSurfaceRootUserClient::create, in front of the wired-buffer path.  true = this function made the surface or refused it (*ret);
++ * false = not eligible / no pageable memory: the wired path runs as before.
++ */
++static bool
++sweet_wod_create(SweetSurface *s, OSDictionary *props, int32_t pid, IOReturn *ret)
++{
++	static bool args_done;
++	if (!args_done) {       /* boot-arg n2wod (the sysctl may change it later) */
++		uint32_t v = 0;
++		args_done = true;
++		if (PE_parse_boot_argn("n2wod", &v, sizeof(v)) && v <= 1) { sweet_wod_mode = (int)v; }
++	}
++	bool chroma = s->planeCount == 2 && (s->pixelFormat == 0x34323066 || s->pixelFormat == 0x34323076 ||
++	    s->pixelFormat == 0x78663230 || s->pixelFormat == 0x78343230);
++	bool client = props->getObject("IOSurfaceAddress") != NULL || props->getObject("IOSurfaceClientAddress") != NULL;
++	if (!sweet_wod_eligible(__atomic_load_n(&sweet_wod_mode, __ATOMIC_RELAXED), s->allocSize, chroma, client,
++	    __atomic_load_n(&sweet_wod_min, __ATOMIC_RELAXED)) || !sweet_wod_start()) {
++		return false;
++	}
++	if (!sweet_mem_admit(s->allocSize, pid)) {      /* 0417/0418: runaway-process guard and the memory floor still apply */
++		*ret = kIOReturnNoMemory;
++		return true;
++	}
++	/* NULL task = no kernel mapping (IOBufferMemoryDescriptor.h): the kernel's pageable maps (16 x 96 MiB, shared with the GPU's
++	 * pageable buffers) are not used.  Fresh pageable memory is zero-fill anonymous VM: no bzero. */
++	IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithOptions(NULL,
++	    kIODirectionInOut | kIOMemoryPageable | kIOMemoryPurgeable, s->allocSize, page_size);
++	if (mem == NULL || mem->getLength() < s->allocSize) {
++		OSSafeReleaseNULL(mem);
++		return false;
++	}
++	s->wod.on = 1;
++	s->wod.idle_at = sweet_surface_uptime();
++	s->memory = mem;
++	s->mapCache = kIOMapDefaultCache;
++	OSIncrementAtomic((volatile SInt32 *)&sweet_surface_buffers);
++	OSIncrementAtomic((volatile SInt32 *)&sweet_surface_created);
++	sweet_mem_proc_charge(pid, (int64_t)s->allocSize);
++	IOLockLock(sweet_wod_lock);
++	sweet_wod_live++; sweet_wod_bytes += s->allocSize;
++	IOLockUnlock(sweet_wod_lock);
++	if (!sweet_surface_publish(s)) {
++		*ret = kIOReturnNoResources;     /* s->release() in the caller: SweetSurface::free undoes the accounting */
++	}
++	return true;
++}
++
++/* SweetSurface::free, first thing after the IOMMU mapping went: nobody holds it any more (holders have a retain). */
++static void
++sweet_wod_free(SweetSurface *s)
++{
++	if (!s->wod.on || sweet_wod_lock == NULL) { return; }
++	IOLockLock(sweet_wod_lock);
++	bool wired = s->wod.state == SWEET_WOD_WIRED;
++	uint32_t holds = s->wod.holds;
++	s->wod.state = SWEET_WOD_UNWIRED; s->wod.holds = 0;
++	sweet_wod_live--; sweet_wod_bytes -= s->allocSize;
++	if (wired) { sweet_wod_wired_n--; sweet_wod_wired_bytes -= s->allocSize; }
++	IOLockUnlock(sweet_wod_lock);
++	if (wired) {
++		(void)sweet_wod_md(s)->complete(kIODirectionInOut);
++	} else {        /* free() takes allocSize out of sweet_surface_wired for every buffer surface: this one is not in it */
++		OSAddAtomic64((SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++	}
++	if (holds != 0) {
++		IOLog("NORD2 SURF WOD: LEAK at free: surface %u freed with %u holds\n", s->id, holds);
++	}
++}
++
++/* IOSurfaceSetPurgeable for a pageable surface (after the recorded state changed; no other lock held).  Returns the old state. */
++static uint32_t
++sweet_wod_purgeable(SweetSurface *s, uint32_t req, uint32_t old)
++{
++	if (!s->wod.on) { return old; }
++	int a;
++	IOLockLock(sweet_wod_lock);
++	while ((a = sweet_wod_purgeable_begin(&s->wod, req)) == SWEET_WOD_A_WAIT) {
++		(void)IOLockSleep(sweet_wod_lock, &s->wod, THREAD_UNINT);
++	}
++	if (a == SWEET_WOD_A_NONVOLATILE) {
++		IOOptionBits was = kIOMemoryPurgeableNonVolatile;
++		IOLockUnlock(sweet_wod_lock);
++		(void)sweet_wod_md(s)->setPurgeable(kIOMemoryPurgeableNonVolatile, &was);
++		IOLockLock(sweet_wod_lock);
++		sweet_wod_purgeable_done(&s->wod, was == kIOMemoryPurgeableEmpty);
++		if (was == kIOMemoryPurgeableEmpty) { sweet_wod_emptied++; }
++		IOLockWakeup(sweet_wod_lock, &s->wod, false);
++	}
++	old = sweet_wod_purgeable_answer(&s->wod, req, old);
++	IOLockUnlock(sweet_wod_lock);
++	return old;
++}
++
++/* One surface of the tick (retained by the caller, no lock held). */
++static void
++sweet_wod_tick_one(SweetSurface *s, uint32_t now, uint32_t idle_s)
++{
++	volatile uint32_t *w = (volatile uint32_t *)((uintptr_t)s->state->getBytesNoCopy() + SWEET_USE_STATE_WORDS);
++	bool in_use = (w[0] | w[1]) != 0;
++	/* I4: a GPU write needs an import, an import is a hold; asked anyway (takes the GPU lock, so before ours) */
++	bool busy = s->wod.state == SWEET_WOD_WIRED && s->wod.holds == 0 && nord2_gpu_surface_busy(s);
++	IOLockLock(sweet_wod_lock);
++	int a = sweet_wod_tick_begin(&s->wod, now, idle_s, in_use, busy);
++	IOLockUnlock(sweet_wod_lock);
++	if (a == SWEET_WOD_A_NONE) { return; }
++	IOReturn r = a == SWEET_WOD_A_UNWIRE ? sweet_wod_md(s)->complete(kIODirectionInOut) :
++	    sweet_wod_md(s)->setPurgeable(kIOMemoryPurgeableVolatile, NULL);
++	IOLockLock(sweet_wod_lock);
++	sweet_wod_tick_done(&s->wod, a, r == kIOReturnSuccess, now);
++	if (a == SWEET_WOD_A_UNWIRE) {
++		sweet_wod_unwires++; sweet_wod_wired_n--; sweet_wod_wired_bytes -= s->allocSize;
++		OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++	} else if (r == kIOReturnSuccess) {
++		sweet_wod_vol++;
++	}
++	IOLockWakeup(sweet_wod_lock, &s->wod, false);
++	IOLockUnlock(sweet_wod_lock);
++	if (r != kIOReturnSuccess || (a == SWEET_WOD_A_UNWIRE && sweet_wod_unwires <= 8)) {
++		IOLog("NORD2 SURF WOD: %s id %u %u KiB -> 0x%x (wired %u of %u, %llu MiB)\n", a == SWEET_WOD_A_UNWIRE ? "unwire" : "volatile", s->id,
++		    s->allocSize >> 10, (unsigned)r, sweet_wod_wired_n, sweet_wod_live, sweet_wod_wired_bytes >> 20);
++	}
++}
++
++/* Every 2 s: idle display IOMMU entries of pageable surfaces go first (unmap + TLB invalidate, then their hold), then the surfaces
++ * without holders are unwired / made volatile.  Thread-call context: may take the GPU lock and n2io_lock, may free surfaces. */
++static void
++sweet_wod_tick(thread_call_param_t, thread_call_param_t)
++{
++	static SweetSurface *cs[256];
++	uint32_t now = sweet_surface_uptime(), idle_s = __atomic_load_n(&sweet_wod_idle_s, __ATOMIC_RELAXED);
++	static uint32_t next_id = 1;
++	if (sweet_wod_live != 0 && sweet_surface_lock != NULL) {
++		n2io_wod_sweep(now, idle_s);
++		uint32_t n = 0, id = next_id;
++		IOLockLock(sweet_surface_lock);
++		for (uint32_t k = 1; k < SWEET_SURFACE_MAX_ID && n < 256; k++, id = id + 1 < SWEET_SURFACE_MAX_ID ? id + 1 : 1) {
++			SweetSurface *t = sweet_surface_table[id];
++			if (t != NULL && t->wod.on && t->state != NULL && t->wod.holds == 0 &&
++			    (t->wod.state == SWEET_WOD_WIRED || (t->wod.want_volatile && !t->wod.md_volatile))) {
++				t->retain();
++				cs[n++] = t;
++			}
++		}
++		next_id = id;
++		IOLockUnlock(sweet_surface_lock);
++		for (uint32_t i = 0; i < n; i++) {
++			sweet_wod_tick_one(cs[i], now, idle_s);
++			cs[i]->release();
++		}
++		if (now - sweet_wod_log_at >= 10) {
++			sweet_wod_log_at = now;
++			IOLog("NORD2 SURF WOD: live=%u/%llu MiB wired=%u/%llu MiB wires=%u unwires=%u volatile=%u purged=%u fail=%u unmatched=%u slowest_wire=%u ms "
++			    "iommu_swept=%u iommu_refused=%u mode=%d idle=%u\n", sweet_wod_live, sweet_wod_bytes >> 20, sweet_wod_wired_n, sweet_wod_wired_bytes >> 20,
++			    sweet_wod_wires, sweet_wod_unwires, sweet_wod_vol, sweet_wod_emptied, sweet_wod_fail, sweet_wod_unmatched, sweet_wod_slow_ms,
++			    n2io_wod_swept, n2io_wod_refused, sweet_wod_mode, idle_s);
++		}
++	}
++	uint64_t dl = 0;
++	clock_interval_to_deadline(2, kSecondScale, &dl);
++	thread_call_enter_delayed(sweet_wod_tc, dl);
++}

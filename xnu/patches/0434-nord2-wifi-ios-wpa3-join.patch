@@ -1,0 +1,265 @@
+--- a/bsd/dev/wifi_ios_join.c
++++ b/bsd/dev/wifi_ios_join.c
+@@ -1,6 +1,7 @@
+ #include <arm64/sweet_early.h>
+ #if defined(NORD2)
+ #include "wifi_ios_join.h"
++#include "wifi_station_transaction.h"
+ static uint16_t j16(const uint8_t*p){return p[0]|(uint16_t)p[1]<<8;}
+ static uint32_t j32(const uint8_t*p){return j16(p)|(uint32_t)j16(p+2)<<16;}
+ static int same(const uint8_t*a,const uint8_t*b,size_t n){unsigned d=0;while(n--)d|=*a++^*b++;return !d;}
+@@ -21,17 +22,48 @@
+  * 802.1X, WEP, WPA1/TKIP and a station RSN that demands MFP stay refused. */
+ unsigned niwj_privmac_mode=1;
+ int printf(const char*,...) __attribute__((format(printf,1,2)));
++unsigned niwj_sae_mode=1,niwj_pmf_flags=0,niwj_select_allow=0;
+ #if defined(KERNEL)
+ /* Kernel: PBKDF2 of the existing WPA2 engine; mode from the boot-arg once. */
+-extern int nwp_pmk(const uint8_t*,size_t,const uint8_t*,size_t,uint8_t out[32]);
++#include <sys/sysctl.h>
+ extern int PE_parse_boot_argn(const char*,void*,int);
+ int (*niwj_pmk_hook)(const uint8_t*,size_t,const uint8_t*,size_t,uint8_t out[32])=nwp_pmk;
+-static void mode_once(void){static unsigned done;if(!done){unsigned m=0;done=1;if(PE_parse_boot_argn("n2wpm",&m,sizeof(m))&&m<=1)niwj_privmac_mode=m;}}
++static void mode_once(void){static unsigned done;if(!done){unsigned m=0;done=1;if(PE_parse_boot_argn("n2wpm",&m,sizeof(m))&&m<=1)niwj_privmac_mode=m;
++ if(PE_parse_boot_argn("n2sae",&m,sizeof(m))&&m<=2)niwj_sae_mode=m;if(PE_parse_boot_argn("n2pmf",&m,sizeof(m))&&m<=3)niwj_pmf_flags=m;}}
++SYSCTL_UINT(_kern, OID_AUTO, n2wifi_sae, CTLFLAG_RW | CTLFLAG_LOCKED, &niwj_sae_mode, 0, "0434: WPA3-Personal (SAE), PSK-SHA256, PMF-required joins: 0 off, 1 on (SAE when requested), 2 SAE whenever possible; capability bits follow the value at wifid start (boot-arg n2sae)");
++SYSCTL_UINT(_kern, OID_AUTO, n2wifi_pmf, CTLFLAG_RW | CTLFLAG_LOCKED, &niwj_pmf_flags, 0, "0434: PMF experiments (not hardware verified): 1 ucMgmtProtection in the pairwise key command, 2 ignore unprotected deauth/disassoc after key install");
+ #else
+ int (*niwj_pmk_hook)(const uint8_t*,size_t,const uint8_t*,size_t,uint8_t out[32]);
+ static void mode_once(void){}
+ #endif
+ static unsigned join_logs;
++unsigned niwj_sae_enabled(void){mode_once();return niwj_sae_mode!=0;}
++/* 0434: secret records of decoded requests, by SSID; see wifi_ios_join.h. */
++static struct {uint8_t valid,ssid_length,ssid[32];struct stc_secret secret;} pending[2];
++static unsigned pending_next;
++static int pending_find(const uint8_t*ssid,size_t n){
++ for(int k=0;k<2;k++)if(pending[k].valid&&n&&n<=32&&pending[k].ssid_length==n&&same(pending[k].ssid,ssid,n))return k;
++ return -1;
++}
++int niwj_secret_take(const uint8_t*ssid,size_t n,struct stc_secret*out){
++ int k=ssid&&out?pending_find(ssid,n):-1;
++ if(k<0)return 0;
++ *out=pending[k].secret;niwj_clear(&pending[k],sizeof pending[k]);return 1;
++}
++/* Tolerant view of an RSN element: AKM bitmap (bit n = 00-0F-AC:n), capabilities, group management cipher; 0 when malformed. */
++static int rsn_view(const uint8_t*p,size_t n,unsigned*akms,unsigned*caps,unsigned*management){
++ size_t at=8;unsigned count,ccmp=0;*akms=*caps=*management=0;
++ if(n<20||n>257||p[0]!=48||(size_t)p[1]+2!=n||j16(p+2)!=1)return 0;
++ count=j16(p+at);at+=2;if(!count||count>(n-at)/4)return 0;
++ while(count--){ccmp|=(unsigned)(!p[at]&&p[at+1]==15&&p[at+2]==172&&p[at+3]==4);at+=4;}
++ if(!ccmp||n-at<2)return 0;
++ count=j16(p+at);at+=2;if(!count||count>(n-at)/4)return 0;
++ while(count--){if(!p[at]&&p[at+1]==15&&p[at+2]==172&&p[at+3]<32)*akms|=1u<<p[at+3];at+=4;}
++ if(n-at>=2){*caps=j16(p+at);at+=2;}
++ if(n-at>=2){count=j16(p+at);at+=2;if(count>(n-at)/16)return 0;at+=16*(size_t)count;}
++ if(n-at>=4&&!p[at]&&p[at+1]==15&&p[at+2]==172)*management=p[at+3];
++ return 1;
++}
+ static int suite0(const uint8_t*p,unsigned type){return !p[0]&&p[1]==15&&p[2]==172&&p[3]==type;}
+ /* The framework's own RSN element only has to offer CCMP and PSK and must
+  * not require MFP; association and M2 always carry station_rsn22. */
+@@ -47,27 +79,41 @@
+  return n-at<2||!(j16(p+at)&64u);
+ }
+ /* class: 1 open, 2 WPA2-PSK with PMK, 3 WPA2-PSK with passphrase, 4 802.1X
+- * style (no PSK bit, WPA/WPA2/802.1X bits), 5 anything else (SAE-only). */
+-static int relaxed(const uint8_t*p,struct niwj_request*out,unsigned*klass,unsigned*ignored){
+- unsigned upper=j16(p+8),open=upper==0,pass=0;
+- *klass=open?1:(upper&8u)?2:(upper&0x125u)?4:5;*ignored=0;
++ * style, 5 anything else, 6 SAE (WPA3-Personal), 7 PSK-SHA256.
++ * 0434, from the IO80211 producer (__performAssociation, iOS 16.7): auth_lower
++ * is 1 for every RSN join; auth_upper 0x8 WPA2-PSK, 0x400 PSK-SHA256, 0x1000
++ * SAE (0x1/0x4/0x80/0x800/0x4000/0x8000 are the 802.1X family). Once the card
++ * reports SAE (capability bit 75) every personal join carries the passphrase
++ * as key kind 10 at +72 and the PBKDF2 PMK at +472 (+468 = 32); +504 is 0x4
++ * or 0x40000004 when WPA2-PSK is an allowed alternative and 0x100 /
++ * 0x40000100 for WPA3-only / transition disabled. The framework RSN element
++ * lists only the AKM it selected; the native side negotiates its own. */
++static int relaxed(const uint8_t*p,struct niwj_request*out,unsigned*klass,unsigned*ignored,unsigned*akms_out,unsigned*allow_out){
++ unsigned upper=j16(p+8),open=upper==0,pass=0,flags=j32(p+504),cached=j32(p+468);
++ unsigned akms=0,caps=0,management=0,rsn_bytes=j16(p+204);
++ unsigned viewed=rsn_bytes>=20&&rsn_bytes<=64&&rsn_view(p+206,rsn_bytes,&akms,&caps,&management);
++ unsigned shape_sae=(upper&0x1000u)!=0,personal=(upper&0x1408u)!=0,alternative=(flags&4u)!=0&&!(j32(p+584)&1u);
++ unsigned sae=niwj_sae_mode&&shape_sae;
++ *klass=open?1:shape_sae?6:(upper&0x400u)?7:(upper&8u)?2:(upper&0xc885u)?4:5;*ignored=0;*akms_out=(akms&0xffffu)|caps<<16;*allow_out=0;
+  if(j32(p)!=1||!j32(p+12)||j32(p+12)>32||(nz(p+48,6)&&(p[48]&1)))return NIWJ_SHAPE;
+- if(j16(p+4)!=2||j16(p+6)!=1||(!open&&!(upper&8u)))return NIWJ_PROFILE;
++ if(j16(p+4)!=2||j16(p+6)!=1||(!open&&!personal))return NIWJ_PROFILE;
+  if(open){
+-  if(j32(p+56)||j32(p+60)||j32(p+64)||j16(p+68)||j16(p+70)||j32(p+468))return NIWJ_CREDENTIAL;
++  if(j32(p+56)||j32(p+60)||j32(p+64)||j16(p+68)||j16(p+70)||cached)return NIWJ_CREDENTIAL;
+   if(j16(p+204))return NIWJ_SECURITY;
+  }else{
+-  if(j32(p+56)!=1||j16(p+68)||j16(p+70)||j32(p+468))return NIWJ_CREDENTIAL;
+-  if(j32(p+64)==6&&j32(p+60)==32)pass=0;
+-  else if(j32(p+64)==10&&j32(p+60)>=8&&j32(p+60)<=63&&niwj_pmk_hook){pass=1;*klass=3;}
++  if(j32(p+56)!=1||j16(p+68)||j16(p+70)||(cached&&cached!=32))return NIWJ_CREDENTIAL;
++  if(j32(p+64)==6&&j32(p+60)==32&&!cached)pass=0;
++  else if(j32(p+64)==10&&j32(p+60)>=8&&j32(p+60)<=63&&(cached||niwj_pmk_hook)){pass=1;if(*klass==2)*klass=3;}
+   else return NIWJ_CREDENTIAL;
+-  if(!station_rsn_ok(p+206,j16(p+204))&&!station_rsn_psk(p+206,j16(p+204)))return NIWJ_SECURITY;
+-  if(j32(p+584)&1u)return NIWJ_SECURITY; /* WPA3 transition disabled: no PSK fallback */
++  if(!station_rsn_ok(p+206,rsn_bytes)&&!station_rsn_psk(p+206,rsn_bytes)&&!(viewed&&(akms&0x144u)&&(niwj_sae_mode||shape_sae||(upper&0x400u))))return NIWJ_SECURITY;
++  /* Without SAE (kern.n2wifi_sae=0) an SAE request is served only where WPA2-PSK is an allowed alternative. */
++  if(shape_sae&&(!pass||(!sae&&!alternative)))return NIWJ_SECURITY;
++  if((j32(p+584)&1u)&&!sae)return NIWJ_SECURITY; /* WPA3 transition disabled: no PSK fallback */
+  }
+  /* Unknown association flag bits are reported, not refused; band preference
+   * is a hint. Blacklists and conditional options stay unimplemented. */
+  *ignored=(p[463]&~0x20u)|((unsigned)(p[464]&~0x48u)<<8);
+- if(p[465]>2||((p[463]&0x20u)&&!nz(p+48,6))||(j32(p+504)!=0&&(open||j32(p+504)!=4))||p[514]||j32(p+580))return NIWJ_OPTIONS;
++ if(p[465]>2||((p[463]&0x20u)&&!nz(p+48,6))||(flags&&(open||(flags&~0x40000104u)))||p[514]||j32(p+580))return NIWJ_OPTIONS;
+  if((p[464]&8u)&&(!nz(p+508,6)||(p[508]&3u)!=2u))return NIWJ_OPTIONS;
+  unsigned scope=j32(p+536);
+  if(p[464]&0x40u){
+@@ -77,11 +123,25 @@
+  out->ssid_length=(uint8_t)j32(p+12);copy(out->ssid,p+16,out->ssid_length);
+  out->has_target=(uint8_t)nz(p+48,6);copy(out->target,p+48,6);
+  if(!open){
+-  if(pass){if(niwj_pmk_hook(p+72,j32(p+60),p+16,j32(p+12),out->pmk))return NIWJ_CREDENTIAL;}
++  if(pass&&cached)copy(out->pmk,p+472,32);
++  else if(pass){if(niwj_pmk_hook(p+72,j32(p+60),p+16,j32(p+12),out->pmk))return NIWJ_CREDENTIAL;}
+   else copy(out->pmk,p+72,32);
+   copy(out->station_rsn,station_rsn,22);
+  }
+- out->association_reason=p[465];out->security=open?NIWJ_OPEN:NIWJ_WPA2_PSK_CCMP;out->native_flags=j32(p+504);
++ out->association_reason=p[465];out->security=open?NIWJ_OPEN:NIWJ_WPA2_PSK_CCMP;out->native_flags=flags&4u;
++ {int k=pending_find(out->ssid,out->ssid_length);if(k>=0)niwj_clear(&pending[k],sizeof pending[k]);}
++ if(!open&&niwj_sae_mode){
++  /* Which AKM families the station transaction may negotiate for this
++   * request. The WPA2-PSK profile without PMF is excluded when the framework
++   * element requires MFP and when the request is WPA3-only / transition disabled. */
++  unsigned only=(shape_sae&&!alternative)||(j32(p+584)&1u),k=!pending[0].valid?0u:!pending[1].valid?1u:(pending_next++&1u);
++  unsigned allow=only?0u:(NIWJ_ALLOW_PMF|((viewed&&(caps&64u))?0u:NIWJ_ALLOW_LEGACY));
++  niwj_clear(&pending[k],sizeof pending[k]);
++  if(pass){allow|=NIWJ_ALLOW_SAE;if(shape_sae||niwj_sae_mode>=2)allow|=NIWJ_SAE_REQUESTED;
++   pending[k].secret.bytes=j32(p+60);copy(pending[k].secret.password,p+72,j32(p+60));}
++  pending[k].secret.allow=allow;pending[k].secret.pmf_flags=niwj_pmf_flags;
++  pending[k].ssid_length=out->ssid_length;copy(pending[k].ssid,out->ssid,out->ssid_length);pending[k].valid=1;*allow_out=allow;
++ }
+  return 0;
+ }
+ int niwj_decode_identity(const void*v,size_t n,const uint8_t owner_mac[6],struct niwj_request*out,struct niwj_diagnostic*d){
+@@ -94,9 +154,11 @@
+   d->private_address_matches=d->private_address_present&&d->owner_address_valid&&same(p+508,owner_mac,6);}
+  mode_once();
+  if(niwj_privmac_mode&&owner_mac){
+-  unsigned klass=0,ignored=0;
+-  int r=relaxed(p,out,&klass,&ignored);if(r)niwj_clear(out,sizeof(*out));
+-  if(join_logs<4096){join_logs++;printf("NORD2 WIFI IOS JOINSEC: class=%u upper=%#x key_kind=%u key_bytes=%u rsn_bytes=%u flags=%#x ignored=%#x private=%u mode=%u refusal=%d\n",klass,(unsigned)j16(p+8),(unsigned)j32(p+64),(unsigned)j32(p+60),(unsigned)j16(p+204),(unsigned)j16(p+463),ignored,(unsigned)((p[464]&8u)!=0),niwj_privmac_mode,-r);}
++  unsigned klass=0,ignored=0,akms=0,allow=0;
++  int r=relaxed(p,out,&klass,&ignored,&akms,&allow);if(r)niwj_clear(out,sizeof(*out));
++  if(join_logs<4096){join_logs++;printf("NORD2 WIFI IOS JOINSEC: class=%u upper=%#x key_kind=%u key_bytes=%u rsn_bytes=%u flags=%#x ignored=%#x private=%u mode=%u refusal=%d\n",klass,(unsigned)j16(p+8),(unsigned)j32(p+64),(unsigned)j32(p+60),(unsigned)j16(p+204),(unsigned)j16(p+463),ignored,(unsigned)((p[464]&8u)!=0),niwj_privmac_mode,-r);
++   /* 0434: numbers only (bit n of akms = AKM 00-0F-AC:n of the framework RSN element). */
++   printf("NORD2 WIFI IOS JOINSAE: sae=%u upper=%#x akms=%#x rsn_caps=%#x native=%#x transition=%#x cached_pmk=%u allow=%#x\n",niwj_sae_mode,(unsigned)j16(p+8),akms&0xffffu,akms>>16,(unsigned)j32(p+504),(unsigned)j32(p+584),(unsigned)j32(p+468),allow);}
+   return r?refuse(d,r):0;
+  }
+  if(j32(p)!=1||!j32(p+12)||j32(p+12)>32||(nz(p+48,6)&&(p[48]&1)))return refuse(d,NIWJ_SHAPE);
+@@ -154,9 +216,19 @@
+  /* Group-management cipher may be advertised with optional PMF; never used. */
+  return z-at==4&&(caps&128u)!=0&&!p[at]&&p[at+1]==15&&p[at+2]==172;
+ }
++/* 0434: AP offers that only the SAE / PSK-SHA256 / PMF profiles can use; the
++ * station transaction repeats the exact choice (nwq_negotiate). BIP-CMAC-128 only. */
++static int rsn_wide(const uint8_t*p,size_t z,unsigned allow){
++ unsigned akms,caps,management;
++ if(!(allow&(NIWJ_ALLOW_SAE|NIWJ_ALLOW_PMF))||z<22||z>NIWJ_AP_RSN_BYTES||!suite(p+4,4)||!rsn_view(p,z,&akms,&caps,&management)||(caps&2u))return 0;
++ if((caps&128u)&&management&&management!=6)return 0;
++ if((allow&NIWJ_ALLOW_SAE)&&(akms&0x100u))return 1;
++ if(!(allow&NIWJ_ALLOW_PMF))return 0;
++ return ((akms&0x40u)!=0)||((akms&4u)&&(caps&192u)==192u);
++}
+ static int legacy_rate(unsigned v){return v==2||v==4||v==11||v==22||v==12||v==18||v==24||v==36||v==48||v==72||v==96||v==108;}
+ struct parsed {unsigned rsn_at,rsn_bytes,count;uint8_t rates[12];int16_t rssi;};
+-static int candidate(const struct nsb_record*r,const struct niwj_request*q,const struct nss_info*info,uint64_t now,struct parsed*a){
++static int candidate(const struct nsb_record*r,const struct niwj_request*q,const struct nss_info*info,uint64_t now,struct parsed*a,unsigned allow){
+  unsigned seen=0;niwj_clear(a,sizeof(*a));
+  if(!r->ssid_present||r->hidden||r->ssid_len!=q->ssid_length||!same(r->ssid,q->ssid,r->ssid_len)||
+   !nz(r->bssid,6)||(r->bssid[0]&1)||(q->has_target&&!same(q->target,r->bssid,6))||
+@@ -169,9 +241,10 @@
+  unsigned x=r->rxv[4],y=r->rxv[5];if(x==255&&y==255)return 0;if(x==255)x=0;if(y==255)y=0;x=x>y?x:y;if(x>220)x=220;a->rssi=(int16_t)((int)x/2-110);
+  for(size_t i=0;i<r->ie_bytes;){if(r->ie_bytes-i<2)return 0;unsigned id=r->ies[i],z=r->ies[i+1];size_t body=i+2;if(z>r->ie_bytes-body)return 0;
+   if(q->security==NIWJ_OPEN&&(id==48||(id==221&&z>=4&&!r->ies[body]&&r->ies[body+1]==80&&r->ies[body+2]==242&&r->ies[body+3]==1)))return 0;
+-  if(id==48){if(seen&4||!rsn_ok(r->ies+i,z+2))return 0;seen|=4;a->rsn_at=(unsigned)i;a->rsn_bytes=z+2;}
++  if(id==48){if(seen&4||(!rsn_ok(r->ies+i,z+2)&&!rsn_wide(r->ies+i,z+2,allow)))return 0;seen|=4;a->rsn_at=(unsigned)i;a->rsn_bytes=z+2;}
+   if(id==1||id==50){unsigned flag=id==1?1:2;if((seen&flag)||!z||(id==1&&z>8))return 0;seen|=flag;
+-   for(unsigned j=0;j<z;j++){unsigned raw=r->ies[body+j],rate=raw&127;if(!legacy_rate(rate)){if(raw&128)return 0;continue;}
++   for(unsigned j=0;j<z;j++){unsigned raw=r->ies[body+j],rate=raw&127;if(raw==0xfbu&&(allow&NIWJ_ALLOW_SAE))continue; /* SAE hash-to-element only */
++    if(!legacy_rate(rate)){if(raw&128)return 0;continue;}
+     if(band==2&&(rate==2||rate==4||rate==11||rate==22)){if(raw&128)return 0;continue;}
+     unsigned k=0;while(k<a->count&&(a->rates[k]&127)!=rate)k++;if(k==a->count){if(k==12)return 0;a->rates[a->count++]=(uint8_t)raw;}else a->rates[k]|=(uint8_t)(raw&128);}
+   }i=body+z;
+@@ -187,7 +260,11 @@
+    (info->channels[i].band==1&&info->channels[i].channel>14)||
+    (info->channels[i].band==2&&(!info->band5||info->channels[i].channel<=14||info->channels[i].channel>196)))return NIWJ_TARGET;
+   for(unsigned j=0;j<i;j++)if(info->channels[j].band==info->channels[i].band&&info->channels[j].channel==info->channels[i].channel)return NIWJ_TARGET;}
+- for(unsigned i=0;i<s->count;i++)if(candidate(&s->records[i],q,info,now,&a)&&(!best||a.rssi>b.rssi)){best=&s->records[i];b=a;}
++ /* 0434: families the waiting secret record of this SSID allows (a password is needed for SAE). */
++ unsigned allow=NIWJ_ALLOW_LEGACY;
++ if(niwj_select_allow)allow=niwj_select_allow;
++ else if(niwj_sae_mode){int k=pending_find(q->ssid,q->ssid_length);if(k>=0){allow=pending[k].secret.allow&7u;if(!pending[k].secret.bytes)allow&=~NIWJ_ALLOW_SAE;}}
++ for(unsigned i=0;i<s->count;i++)if(candidate(&s->records[i],q,info,now,&a,allow)&&(!best||a.rssi>b.rssi)){best=&s->records[i];b=a;}
+  if(!best)return NIWJ_TARGET;
+  niwj_clear(out,sizeof(*out));out->security=q->security;out->record=*best;out->band=best->hw_channel<=14?1:2;out->channel=best->channel;out->rssi_dbm=b.rssi;
+  out->rate_count=(uint8_t)b.count;copy(out->rates,b.rates,b.count);out->ap_rsn_bytes=(uint16_t)b.rsn_bytes;copy(out->ap_rsn,best->ies+b.rsn_at,b.rsn_bytes);return 0;
+--- a/bsd/dev/wifi_ios_join.h
++++ b/bsd/dev/wifi_ios_join.h
+@@ -47,6 +47,29 @@
+  *   not send. struct niwj_request/niwj_diagnostic keep the CI layout. */
+ extern unsigned niwj_privmac_mode;
+ extern int (*niwj_pmk_hook)(const uint8_t*,size_t,const uint8_t*,size_t,uint8_t out[32]);
++/* 0434 WPA3-Personal. kern.n2wifi_sae / boot-arg n2sae (niwj_sae_mode):
++ * 0 = the 0430 decoder and selection (an SAE request is served as WPA2-PSK
++ *     where the request allows that, else refused; no capability bits),
++ * 1 = SAE when the request asks for it (auth_upper 0x1000) or the AP offers
++ *     no WPA2-PSK alternative, plus PSK-SHA256 and PMF-required APs (default),
++ * 2 = SAE whenever a passphrase is present and the AP offers it.
++ * kern.n2wifi_pmf / boot-arg n2pmf (niwj_pmf_flags): STC_PMF_* bits, default 0.
++ * struct niwj_request keeps the CI layout and the binders are not touched:
++ * the passphrase and the allowed AKM families of a decoded request wait in a
++ * two-entry store keyed by SSID (replaced by a later decode of that SSID)
++ * until the station transaction of that SSID takes them through
++ * stc_secret_hook = niwj_secret_take. Values equal NWP_ALLOW_* / STC_*. */
++#define NIWJ_ALLOW_LEGACY 1u
++#define NIWJ_ALLOW_PMF 2u
++#define NIWJ_ALLOW_SAE 4u
++#define NIWJ_SAE_REQUESTED 8u
++extern unsigned niwj_sae_mode,niwj_pmf_flags;
++/* Test override of the allowed families used by niwj_select (0 = from the store). */
++extern unsigned niwj_select_allow;
++/* Boot-args applied; nonzero when WPA3-Personal is offered (capability bits 75 and 52). */
++unsigned niwj_sae_enabled(void);
++struct stc_secret;
++int niwj_secret_take(const uint8_t*ssid,size_t,struct stc_secret*);
+ struct niwj_target {
+  struct nsb_record record;
+  uint8_t band,channel,rate_count,rates[12]; /*500kbps; basic flags retained*/
+--- a/bsd/dev/wifi_ios_card.c
++++ b/bsd/dev/wifi_ios_card.c
+@@ -2,6 +2,13 @@
+ #if defined(NORD2)
+ #include "wifi_ios_card.h"
+ #include "wifi_ios_control.h"
++#if defined(KERNEL)
++extern unsigned niwj_sae_enabled(void); /* wifi_ios_join.c: kern.n2wifi_sae after the boot-args */
++#define NIWC_WPA3 niwj_sae_enabled()
++#else
++unsigned niwc_wpa3; /* host tests */
++#define NIWC_WPA3 niwc_wpa3
++#endif
+ int niwc_card_reply(const void*input,size_t bytes,const struct niwc_manifest*m,
+  void*out,size_t capacity,size_t*used){
+  static const uint8_t bits[NIWC_FEATURES]={0,1,3,13,14,76};
+@@ -14,6 +21,11 @@
+      (seen&(1u<<f)))return -1;
+   seen|=1u<<f;raw[bits[f]/8]|=(uint8_t)(1u<<(bits[f]%8));
+  }
++ /* 0434: WPA3-Personal. IO80211/wifid (iOS 16.7) gate SAE on capability bit
++  * 75 and 802.11w (also PSK-SHA256) on bit 52; SAE needs both. Reported only
++  * together with the reviewed CCMP + RSN path; struct niwc_manifest keeps
++  * its CI layout. */
++ if(NIWC_WPA3&&(seen&(1u<<NIWC_RSN_IE))&&(seen&(1u<<NIWC_CCMP))){raw[75/8]|=(uint8_t)(1u<<(75%8));raw[52/8]|=(uint8_t)(1u<<(52%8));}
+  for(unsigned n=0;n<sizeof(raw);n++)((uint8_t*)out)[n]=raw[n];
+  *used=sizeof(raw);return 0;
+ }

@@ -1,0 +1,52 @@
+--- a/iokit/Kernel/arm/Nord2WifiSupplicant.cpp
++++ b/iokit/Kernel/arm/Nord2WifiSupplicant.cpp
+@@ -16,6 +16,7 @@
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOMessage.h>
+ #include <libkern/c++/OSBoolean.h>
+ #include <libkern/c++/OSString.h>
+ #include <kern/task.h>
+@@ -27,6 +28,7 @@
+ #include "../../../bsd/dev/wifi_8021x_glue.h"
+ IOReturn niwc_create_client(IOService*,task_t,void*,UInt32,OSDictionary*,IOUserClient**); /* the CI factory, renamed */
+ IOReturn niwl_create_client(IOService*,task_t,void*,UInt32,OSDictionary*,IOUserClient**);
++extern void (*n8x_port_open_hook)(void);
+ }
+ static uint32_t n8s_u32(const uint8_t*p){return p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
+ static unsigned long long n8s_ms(void){uint64_t now=0,ns=0;clock_get_uptime(&now);absolutetime_to_nanoseconds(now,&ns);return ns/1000000u;}
+@@ -35,6 +37,16 @@
+  OSObject*entitlement=IOUserClient::copyClientEntitlement(task,name);OSBoolean*allowed=OSDynamicCast(OSBoolean,entitlement);
+  bool yes=allowed&&allowed->isTrue();if(entitlement)entitlement->release();return yes;
+ }
++/* 0453: eapolclient's "4-way handshake complete" (it then asks for the DHCP renewal: "force renew"). Verified in its code:
++ * IOServiceAddInterestNotification(kIOGeneralInterest) on the service two levels above the registry entry with the BSD
++ * name, handler taken for messageType 0xE0000130 = kIOMessageServicePropertyChange. Sent from the 802.1X thread call when
++ * the keys are in place, to the clients of the service the supplicant opened and of its two ancestors. */
++static IOService*n8s_service;
++static void n8s_handshake_complete(void){
++ unsigned sent=0;IOService*s=n8s_service;
++ for(unsigned level=0;s&&level<3;level++,s=s->getProvider()){(void)s->messageClients(kIOMessageServicePropertyChange);sent++;}
++ printf("NORD2 WIFI 8021X: handshake complete message sent services=%u\n",sent);
++}
+ class Nord2WifiSupplicantClient : public IOUserClient {
+  OSDeclareDefaultStructors(Nord2WifiSupplicantClient)
+  task_t owner;IOLock*gate;unsigned logs;char interfaceName[16];
+@@ -152,7 +164,7 @@
+ void Nord2WifiSupplicantClient::free(void){if(owner){task_deallocate(owner);owner=TASK_NULL;}if(gate){IOLockFree(gate);gate=nullptr;}IOUserClient::free();}
+ /* The registry's factory call. Manager clients get the CI client exactly as before. */
+ extern "C" IOReturn niwl_create_client(IOService*provider,task_t task,void*security,UInt32 type,OSDictionary*props,IOUserClient**handler){
+- bool supplicant=niwj_8021x&&provider&&handler&&task&&current_task()==task&&!type&&!n8s_entitled(task,"com.apple.wifi.manager-access")&&n8s_entitled(task,"com.apple.wlan.authentication");
++ bool supplicant=(niwj_8021x&1u)&&provider&&handler&&task&&current_task()==task&&!type&&!n8s_entitled(task,"com.apple.wifi.manager-access")&&n8s_entitled(task,"com.apple.wlan.authentication");
+  if(!supplicant)return niwc_create_client(provider,task,security,type,props,handler);
+  if(provider->isInactive())return kIOReturnNotReady;
+  OSString*name=OSDynamicCast(OSString,provider->getProperty("IOInterfaceName"));if(!name||name->getLength()>=16)return kIOReturnNotReady;
+@@ -161,6 +173,7 @@
+  c->bindInterface(name->getCStringNoCopy());
+  if(!c->attach(provider)){c->release();return kIOReturnNotReady;}
+  if(!c->start(provider)){c->detach(provider);c->release();return kIOReturnNotReady;}
++ if(!n8s_service){provider->retain();n8s_service=provider;}n8x_port_open_hook=n8s_handshake_complete;
+  *handler=c;printf("NORD2 WIFI 8021X: supplicant client opened t_ms=%llu\n",n8s_ms());return kIOReturnSuccess;
+ }
+ 

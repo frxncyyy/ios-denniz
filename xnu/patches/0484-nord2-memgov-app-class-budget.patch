@@ -1,0 +1,237 @@
+--- a/bsd/kern/nord2_memgov.h
++++ b/bsd/kern/nord2_memgov.h
+@@ -58,6 +58,16 @@
+ 	"securityd", "cfprefsd", "UserEventAgent", "powerd", "thermalmonitord", "lockdownd", "CommCenter", "wifid", "locationd",
+ 	"fseventsd", "containermanagerd", "keybagd", "audiomxd", "assertiond", "FrontBoard", "PineBoard", "watchdogd", "syslogd",
+ 	"aggregated", "mobileassetd",
++	/* 0484 (integ-20261114): our own daemons, the CommCenter helpers, code-signing/trust, and every system process seen in
++	 * autocycle/runs/lag2 + r5d (p_name and its 16-character p_comm form).  The class rule below protects them anyway. */
++	"vcodecd", "n2sample", "CommCenterMobileHelper", "CommCenterRootHelper", "CommCenterMobileH", "CommCenterRootHel", "amfid", "trustd",
++	"AccessibilityUIServer", "AccessibilityUIS", "Camera", "MobileSlideShow", "PosterBoard", "Preferences", "ProtectedCloudKeySyncing",
++	"ProtectedCloudKe", "SafariBookmarksSyncAgent", "SafariBookmarksS", "ScreenTimeAgent", "UsageTrackingAgent", "UsageTrackingAge",
++	"accessoryupdaterd", "accessoryupdater", "adprivacyd", "amsaccountsd", "amsengagementd", "appleaccountd", "assistantd", "axassetsd",
++	"carkitd", "chronod", "cloudpaird", "com.apple.WebKit.GPU", "contextstored", "coreduetd", "coreidvd", "dasd", "donotdisturbd",
++	"driverkitd", "duetexpertd", "financed", "fmfd", "gamed", "healthd", "homed", "identityservicesd", "identityservices", "imagent",
++	"mediaanalysisd", "passd", "photoanalysisd", "searchpartyd", "siriactionsd", "siriinferenced", "siriknowledged", "sociallayerd",
++	"suggestd", "syncdefaultsd", "transparencyd", "triald",
+ };
+ 
+ static inline bool
+@@ -84,6 +94,68 @@
+ 	return false;
+ }
+ 
++/*
++ * 0484 (integ-20261114): victim CLASS.  Default protect: only a process whose executable is a third-party application (installed bundle
++ * under .../containers/Bundle/Application/) may be chosen; everything else (daemons, system apps in /Applications, our own tools) is
++ * N2MG_NO_CLASS.  The class is noted at exec (kern_exec.c) by p_uniqueid, which is never reused.
++ */
++#define N2MG_NO_CLASS           N2MG_NREASONS   /* reported in why[] after the 0420 reasons */
++#define N2MG_NREASONS2          (N2MG_NREASONS + 1)
++static inline bool
++n2mg_prefix(const char *s, const char *p)
++{
++	while (*p != 0) {
++		if (*s++ != *p++) return false;
++	}
++	return true;
++}
++static inline bool
++n2mg_path_is_app(const char *path)
++{
++	if (path == 0) return false;
++	if (n2mg_prefix(path, "/private")) path += 8;
++	return n2mg_prefix(path, "/var/containers/Bundle/Application/");
++}
++/* Kill budget: at most N2MG_BUDGET_KILLS victims within N2MG_BUDGET_WINDOW_MS, then none for N2MG_BUDGET_PAUSE_MS (lag1-like pressure
++ * would otherwise choose one every 2 s).  Counts log-only picks the same way, so mode 1 shows what mode 2 would do. */
++#define N2MG_BUDGET_KILLS       3u
++#define N2MG_BUDGET_WINDOW_MS   60000u
++#define N2MG_BUDGET_PAUSE_MS    120000u
++struct n2mg_budget {
++	uint64_t at[N2MG_BUDGET_KILLS];         /* times of the last picks, 0 = free slot */
++	uint64_t pause_until;
++};
++/* true = a pick is allowed now; *paused_now set when this call starts a pause (log it once). */
++static inline bool
++n2mg_budget_ok(struct n2mg_budget *b, uint64_t now_ms, bool *paused_now)
++{
++	*paused_now = false;
++	if (b->pause_until != 0) {
++		if (now_ms < b->pause_until) return false;
++		b->pause_until = 0;
++		for (unsigned i = 0; i < N2MG_BUDGET_KILLS; i++) b->at[i] = 0;
++	}
++	unsigned in_window = 0;
++	for (unsigned i = 0; i < N2MG_BUDGET_KILLS; i++) {
++		if (b->at[i] != 0 && now_ms - b->at[i] < N2MG_BUDGET_WINDOW_MS) in_window++;
++	}
++	if (in_window >= N2MG_BUDGET_KILLS) {
++		b->pause_until = now_ms + N2MG_BUDGET_PAUSE_MS;
++		*paused_now = true;
++		return false;
++	}
++	return true;
++}
++static inline void
++n2mg_budget_note(struct n2mg_budget *b, uint64_t now_ms)
++{
++	unsigned old = 0;
++	for (unsigned i = 1; i < N2MG_BUDGET_KILLS; i++) {
++		if (b->at[i] < b->at[old]) old = i;
++	}
++	b->at[old] = now_ms ? now_ms : 1;
++}
++
+ struct n2mg_limits {
+ 	uint32_t pages, low, crit;      /* RAM pages, thresholds in pages */
+ };
+@@ -136,6 +208,15 @@
+ 	return N2MG_OK;
+ }
+ 
++/* 0484: the 0420 verdict, then the class rule (app = a third-party application by its exec path). */
++static inline uint32_t
++n2mg_verdict_class(const struct n2mg_cand *c, int32_t maxband, bool app)
++{
++	uint32_t v = n2mg_verdict(c, maxband);
++	if (v == N2MG_OK && !app) return N2MG_NO_CLASS;
++	return v;
++}
++
+ /* true = a is the better victim: lower band first, then the bigger footprint, then the higher pid (younger). */
+ static inline bool
+ n2mg_better(const struct n2mg_cand *a, const struct n2mg_cand *b)
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -183,6 +183,7 @@
+ #include "kern_exec_internal.h"
+ 
+ static void nord2_memgov_start_once(void);      /* 0420 */
++static void nord2_memgov_note_exec(struct image_params *imgp, proc_t p);      /* 0484 */
+ 
+ extern boolean_t vm_darkwake_mode;
+ 
+@@ -1930,6 +1931,7 @@
+ 
+ 	/* NORD2 applog (0286): one line per exec of a program applog_name names; its fd 1/2 onto /dev/null */
+ 	exec_applog_report(imgp, p);
++	nord2_memgov_note_exec(imgp, p);        /* 0484: victim class (third-party application or not) by p_uniqueid */
+ 
+ #if CONFIG_SECLUDED_MEMORY
+ 	if (secluded_for_apps &&
+@@ -8054,10 +8056,49 @@
+ SYSCTL_UINT(_kern, OID_AUTO, n2memgov_kills, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mg_kills, 0, "NORD2 MEMGOV: processes killed");
+ SYSCTL_UINT(_kern, OID_AUTO, n2memgov_would, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mg_would, 0, "NORD2 MEMGOV: victims chosen in log-only mode");
+ 
++/* 0484 (integ-20261114): third-party applications by p_uniqueid (never reused), noted at exec; 64 most recent. */
++#define N2MG_APPS 64
++static uint64_t n2mg_apps[N2MG_APPS];
++static uint32_t n2mg_apps_next, n2mg_apps_told, n2mg_budget_pauses;
++static LCK_MTX_DECLARE_ATTR(n2mg_apps_lock, &proc_lck_grp, &proc_lck_attr);
++SYSCTL_UINT(_kern, OID_AUTO, n2memgov_pauses, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mg_budget_pauses, 0, "NORD2 MEMGOV: kill-budget pauses (3 per 60 s, then 120 s)");
++
++static void
++nord2_memgov_note_exec(struct image_params *imgp, proc_t p)
++{
++	const char *path = imgp->ip_strings != NULL ? imgp->ip_strings + strlen(EXECUTABLE_KEY) : NULL;
++	bool app = n2mg_path_is_app(path);
++	uint64_t uid = proc_uniqueid(p);
++	lck_mtx_lock(&n2mg_apps_lock);
++	unsigned slot = N2MG_APPS;
++	for (unsigned i = 0; i < N2MG_APPS; i++) {
++		if (n2mg_apps[i] == uid) { slot = i; break; }
++	}
++	if (app && slot == N2MG_APPS) {
++		n2mg_apps[n2mg_apps_next++ % N2MG_APPS] = uid;
++	} else if (!app && slot != N2MG_APPS) {
++		n2mg_apps[slot] = 0;    /* an application exec'd something else in place */
++	}
++	lck_mtx_unlock(&n2mg_apps_lock);
++	if (app && n2mg_apps_told < 64) {
++		n2mg_apps_told++;
++		printf("NORD2 MEMGOV: app class pid=%d name=%s (killable under crit; every other process is protected)\n", proc_getpid(p), proc_best_name(p));
++	}
++}
++
++static bool
++n2mg_is_app(const uint64_t *apps, uint64_t uid)
++{
++	for (unsigned i = 0; i < N2MG_APPS; i++) {
++		if (apps[i] == uid && uid != 0) return true;
++	}
++	return false;
++}
++
+ struct n2mg_pick {
+ 	int32_t  pid, band;
+ 	uint64_t footprint;
+-	uint32_t eligible, why[N2MG_NREASONS];
++	uint32_t eligible, why[N2MG_NREASONS2];      /* 0484: + N2MG_NO_CLASS */
+ 	char     name[MAXCOMLEN * 2 + 1];
+ };
+ 
+@@ -8081,7 +8122,11 @@
+ {
+ 	unsigned int b = 0;
+ 	struct n2mg_cand best = { .pid = 0 };
++	uint64_t apps[N2MG_APPS];       /* 0484: snapshot, so no lock nests under proc_list_lock */
+ 	bzero(pick, sizeof(*pick));
++	lck_mtx_lock(&n2mg_apps_lock);
++	memcpy(apps, n2mg_apps, sizeof(apps));
++	lck_mtx_unlock(&n2mg_apps_lock);
+ 	proc_list_lock();
+ 	for (proc_t p = memorystatus_get_first_proc_locked(&b, TRUE); p != NULL; p = memorystatus_get_next_proc_locked(&b, p, TRUE)) {
+ 		if ((int32_t)b > maxband || b >= N2MG_BAND_FOREGROUND) {
+@@ -8096,7 +8141,7 @@
+ 			.footprint = 0,
+ 			.name = proc_best_name(p),
+ 		};
+-		uint32_t v = n2mg_verdict(&c, maxband);
++		uint32_t v = n2mg_verdict_class(&c, maxband, n2mg_is_app(apps, proc_uniqueid(p)));     /* 0484: default protect */
+ 		pick->why[v]++;
+ 		if (v != N2MG_OK) {
+ 			continue;
+@@ -8136,6 +8181,7 @@
+ 	uint32_t crit_run = 0, last_low_pm = 0, last_crit_pm = 0;
+ 	uint64_t last_kill_ms = 0, last_kick_ms = 0, last_line_ms = 0, last_would_ms = 0;
+ 	int32_t last_would_pid = 0;
++	struct n2mg_budget budget = { .pause_until = 0 };      /* 0484 */
+ 	/* after a kill: A again 1 s later */
+ 	int32_t after_pid = 0;
+ 	uint32_t after_a = 0;
+@@ -8175,14 +8221,23 @@
+ 				    vm_page_wire_count, level == N2MG_LEVEL_CRIT ? "CRIT" : "low", lim.low, lim.crit, n2mg_kicks, n2mg_would, n2mg_kills,
+ 				    n2mg_kill_failed);
+ 			}
+-			if (n2mg_should_pick(level, &crit_run, now, last_kill_ms, (uint32_t)(now / 1000))) {
++			bool paused_now = false, want = n2mg_should_pick(level, &crit_run, now, last_kill_ms, (uint32_t)(now / 1000));
++			if (want && !n2mg_budget_ok(&budget, now, &paused_now)) {
++				last_kill_ms = now;
++				if (paused_now) {
++					n2mg_budget_pauses++;
++					printf("NORD2 MEMGOV: kill budget used (%u victims in %u s): no victim for %u s (pauses %u)\n", N2MG_BUDGET_KILLS,
++					    N2MG_BUDGET_WINDOW_MS / 1000, N2MG_BUDGET_PAUSE_MS / 1000, n2mg_budget_pauses);
++				}
++			} else if (want) {
+ 				last_kill_ms = now;
+ 				n2mg_choose(maxband, &pick);
+ 				if (pick.pid == 0) {
+-					printf("NORD2 MEMGOV: A=%u < crit %u but no victim in bands <= %d (skipped: pid %u band %u state %u system %u name %u)\n",
++					printf("NORD2 MEMGOV: A=%u < crit %u but no victim in bands <= %d (skipped: pid %u band %u state %u system %u name %u class %u)\n",
+ 					    a, lim.crit, maxband, pick.why[N2MG_NO_PID], pick.why[N2MG_NO_BAND], pick.why[N2MG_NO_STATE],
+-					    pick.why[N2MG_NO_SYSTEM], pick.why[N2MG_NO_NAME]);
++					    pick.why[N2MG_NO_SYSTEM], pick.why[N2MG_NO_NAME], pick.why[N2MG_NO_CLASS]);
+ 				} else if (mode == N2MG_LOG) {
++					n2mg_budget_note(&budget, now);
+ 					n2mg_would++;
+ 					if (pick.pid != last_would_pid || now - last_would_ms >= 30000) {
+ 						last_would_pid = pick.pid;
+@@ -8194,6 +8249,7 @@
+ 				} else if (!n2mg_still_same(&pick, maxband)) {
+ 					printf("NORD2 MEMGOV: victim pid=%d name=%s changed before the kill; skipped\n", pick.pid, pick.name);
+ 				} else {
++					n2mg_budget_note(&budget, now);
+ 					boolean_t ok = memorystatus_kill_on_zone_map_exhaustion(pick.pid);
+ 					if (ok) {
+ 						n2mg_kills++;

@@ -1,0 +1,49 @@
+--- a/bsd/dev/nord2_cpufreq.c
++++ b/bsd/dev/nord2_cpufreq.c
+@@ -860,6 +860,22 @@
+ 		kmem_free(kernel_map, b, N2MB_BYTES);
+ }
+ 
++/* 0494: every register map of the optional DRAM reads below (0121 n2dram, 0462/0493 kern.n2dramprobe / n2drp / n2gdv +16) is made with ml_io_map_unmappable
++ * (kernel_map), never from XNU's 8 MiB io_submap (the 0410 rule).  The io_submap is permanent, KMA_NOFAIL and nearly full on this kernel: 501 of its 512 pages are
++ * taken before the SCP thread's delayed maps at boot + 90 s, which need 8 more (3 left).  0493's probe took 4 pages from it when the governor loop started, so the
++ * SCP's FIFO map (or the next late map of anything else) found it full and panicked inside ml_io_map, invisible on the pulled console: q10jcc reset to fastboot
++ * 75..110 s after boot, twice (wall4, wall4_retry: io_submap range and SCP IOMAP lines of both logs).  Each map is logged; nothing else changes. */
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++#define N2CF_WIMG_IO 0x7u       /* VM_WIMG_IO (osfmk/arm/memory_types.h) */
++
++static volatile uint32_t *
++n2cf_iomap_late(const char *what, uint32_t pa, uint32_t size)
++{
++	vm_offset_t va = ml_io_map_unmappable((vm_offset_t)pa, (vm_size_t)size, N2CF_WIMG_IO);
++	printf("NORD2 DRAM IOMAP: %s pa %#x +%#x -> %#lx (ml_io_map_unmappable, outside io_submap)%s\n", what, pa, size, (unsigned long)va, va ? "" : " FAILED");
++	return (volatile uint32_t *)va;
++}
++
+ /* ---- patch 0121: DRAM clock state, read-only ------------------------------------------------------------------------------------
+  * The stock kernel runs DVFSRC (DRAM 800..4266 MHz, 24 OPPs, 2400 MHz idle in the rescue).  Ours never touches it, so the DRAM may sit at
+  * the bootloader level.  Only 32-bit reads of the DVFSRC page (0x10012000, a platform device of the stock kernel) are done; level 2 then
+@@ -867,7 +883,7 @@
+ static void
+ n2dram_page(const char *tag, uint32_t pa)
+ {
+-	volatile uint32_t *m = (volatile uint32_t *)ml_io_map(pa, 0x1000);
++	volatile uint32_t *m = n2cf_iomap_late(tag, pa, 0x1000);      /* 0494: was ml_io_map (one io_submap page per call) */
+ 	unsigned zero = 0;
+ 
+ 	if (m == NULL) {
+@@ -918,10 +934,10 @@
+ 	static volatile uint32_t *dv, *spm;
+ 	struct n2dr r;
+ 	if (n2dr_map[0] == NULL) {
+-		n2dr_map[0] = (volatile uint32_t *)ml_io_map(N2DR_NAO_PA, 0x1000);
+-		n2dr_map[1] = (volatile uint32_t *)ml_io_map(N2DR_AO_PA, 0x2000);
+-		dv = (volatile uint32_t *)ml_io_map(0x10012000, 0x1000);
+-		spm = (volatile uint32_t *)ml_io_map(0x10006000, 0x1000);
++		n2dr_map[0] = n2cf_iomap_late("DDRPHY NAO CHA", N2DR_NAO_PA, 0x1000);      /* 0494: these four were ml_io_map = 4 io_submap pages */
++		n2dr_map[1] = n2cf_iomap_late("DDRPHY AO CHA", N2DR_AO_PA, 0x2000);
++		dv = n2cf_iomap_late("DVFSRC", 0x10012000, 0x1000);
++		spm = n2cf_iomap_late("SPM", 0x10006000, 0x1000);
+ 	}
+ 	if (n2dr_map[0] == NULL || n2dr_map[1] == NULL || dv == NULL || spm == NULL) {
+ 		printf("NORD2 DRAM RATE: mapping failed\n");

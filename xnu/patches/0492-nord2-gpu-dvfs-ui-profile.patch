@@ -1,0 +1,86 @@
+--- a/bsd/dev/nord2_gov.h
++++ b/bsd/dev/nord2_gov.h
+@@ -11,6 +11,10 @@
+  *             after a swap that arrived more than 1.6 frame periods after its predecessor: both clusters at the cap).  Nothing above the thermal cap.
+  *   GPU       simple_ondemand shape on the exact vendor OPPs the rails cover: busy >= 88 % over 40 ms -> highest allowed OPP; otherwise the lowest
+  *             OPP that keeps the projected busy share under 75 % (100 ms window, 100 ms after the last switch); 654 MHz floor while the UI animates.
++ *             0492 (kern.n2gdvfs +8, both 0 = exactly 0461): min_idx = an OPP the policy never goes below, whatever the load (the thermal cap still
++ *             wins); the caller sets it to the cold-start OPP, so the clock only ever moves between the rate every image ran at so far and the cap.
++ *             up_boost_pm = the busy share that sends the clock to the cap while the UI animates or is touched (800: Control Center over the Photos
++ *             grid ran at 805..861 permille over 2 s with every third frame late, under the 880 of the general rule).
+  */
+ #include <stdbool.h>
+ #include <stdint.h>
+@@ -287,6 +291,8 @@
+ 
+ struct n2g_gpu {
+ 	uint8_t max_idx;                       /* highest OPP whose table voltage the rails cover */
++	uint8_t min_idx;                       /* 0492: lowest OPP the policy may ask for (0 = no limit, as 0461); never lifts the thermal cap */
++	uint16_t up_boost_pm;                  /* 0492: "up" threshold while boost is set (0 = N2G_GPU_UP_PM, as 0461) */
+ 	uint8_t cur, want, why, cap, floor;
+ 	uint16_t u[N2G_HIST];
+ 	unsigned n;
+@@ -357,15 +363,19 @@
+ 			floor++;
+ 		}
+ 	}
++	if (floor < g->min_idx) {                                 /* 0492 */
++		floor = g->min_idx < cap ? g->min_idx : cap;
++	}
+ 	g->cap = (uint8_t)cap; g->floor = (uint8_t)floor;
+ 	bool rate_ok = now_ms - g->last_switch_ms >= N2G_GPU_RATE_MS;
++	unsigned up_pm = boost && g->up_boost_pm != 0 ? g->up_boost_pm : N2G_GPU_UP_PM;      /* 0492 */
+ 	if (cur > cap) {
+ 		want = cap; why = N2G_W_THERM;                    /* at once */
+ 	} else if (cur < floor) {
+ 		if (rate_ok) {
+ 			want = floor; why = N2G_W_BOOST;
+ 		}
+-	} else if (g->u_up >= N2G_GPU_UP_PM && cur < cap) {
++	} else if (g->u_up >= up_pm && cur < cap) {
+ 		if (rate_ok) {
+ 			want = cap; why = N2G_W_UP;
+ 		}
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -183,11 +183,13 @@
+ /* 0461: runtime GPU DVFS.  Policy: bsd/dev/nord2_gov.h (n2g_gpu_*); clock: n2clk_retune (the vendor's parking switch); voltage: never touched, only OPPs the
+  * rails found at power-on already cover are used.  kern.n2gdvfs / boot-arg n2gdv: 0 off, 1 decisions logged only (default), 2 act; +4 = change the clock under a
+  * running job like the vendor does (default: job starts are held, at most 50 ms, and the clock changes in the gap).  Everything runs in tick() under the driver lock.
++ * 0492: +8 = UI profile (n2gdv=10 acts with it, 9 logs its decisions): never below the cold-start OPP, so the clock moves between the cold-start rate and the cap and
++ * nowhere else, and while the UI animates or is touched the cap is taken at 80 % busy over 40 ms instead of 88 %.
+  * The first three switches are announced 400 ms ahead (the console is pulled by the host), the first eight are checked against the GPU's own cycle counter.  Any
+  * clock error, a mismatching measurement or a job fault / reset / timeout within 500 ms of a switch returns to the cold-start OPP and stops acting until reboot. */
+ #include "../../../bsd/dev/nord2_gov.h"
+ static int gGdvfs = 1;
+-SYSCTL_INT(_kern, OID_AUTO, n2gdvfs, CTLFLAG_RW | CTLFLAG_LOCKED, &gGdvfs, 0, "0461: GPU DVFS 0 off, 1 decisions logged, 2 act, +4 no wait for a gap between jobs");
++SYSCTL_INT(_kern, OID_AUTO, n2gdvfs, CTLFLAG_RW | CTLFLAG_LOCKED, &gGdvfs, 0, "0461: GPU DVFS 0 off, 1 decisions logged, 2 act, +4 no wait for a gap between jobs, +8 UI profile: never below the cold-start OPP, up at 80 % while the UI animates (0492)");
+ extern "C" { extern struct n2g_gpu_report nord2_gdvfs_report; void nord2_dvfs_hints(struct n2g_hints *); }      /* bsd/dev/nord2_cpufreq.c (0460) */
+ static struct {
+         struct n2g_gpu g; struct n2g_therm th;
+@@ -705,7 +707,7 @@
+         int lm = 0; if (PE_parse_boot_argn("nord2_lvts_mask", &lm, sizeof(lm)) && lm > 0 && (lm & ~(int)N2LVTS_MASK_ALL) == 0) lvtsMask = (uint32_t)lm;
+         int lc = 0; if (PE_parse_boot_argn("nord2_lvts_max_c", &lc, sizeof(lc)) && lc >= 30 && lc <= 100) lvtsMaxC = lc;
+         if (lvtsMode) IOLog("NORD2 GPU: LVTS thermal sensing requested: mode %u mask %x cold-start guard %d C\n", lvtsMode, lvtsMask, lvtsMaxC);
+-        { int gm = 0; if (PE_parse_boot_argn("n2gdv", &gm, sizeof(gm))) gGdvfs = gm & 7; }      /* 0461 */
++        { int gm = 0; if (PE_parse_boot_argn("n2gdv", &gm, sizeof(gm))) gGdvfs = gm & 15; }      /* 0461, 0492: +8; +16 belongs to nord2_cpufreq.c (0493: DRAM rate probe and watch) */
+         int irq = 1; PE_parse_boot_argn("nord2_gpu_irq", &irq, sizeof(irq)); irqWanted = irq == 1;   /* 0132: on by default (confirmed on the phone: SPI 364 / intid 396 asserts with the job line); nord2_gpu_irq=0 turns it off, which also frees the 16 characters the boot line needed for it */
+         int spi = 0; if (PE_parse_boot_argn("nord2_gpu_irq_spi", &spi, sizeof(spi)) && spi >= 32 && spi <= 900) irqSpi = (uint32_t)spi;
+         if (irqWanted) IOLog("NORD2 GPU: job interrupt requested (spi %u), polling remains the fallback\n", irqSpi);
+@@ -1277,7 +1279,7 @@
+                 v.g.cur = (uint8_t)v.boot;
+                 v.g.max_idx = (uint8_t)(rails ? n2g_gpu_max_idx(vg, vs) : v.boot);
+                 v.failed = v.dead = !rails || bi < 0 || !clk.mux_on || !clk.cg_on || v.g.max_idx < v.boot;
+-                IOLog("NORD2 GDVFS: kern.n2gdvfs=%d (0 off, 1 decisions only, 2 act, +4 no idle wait), cold-start %u kHz, rails VGPU %u uV / VSRAM %u uV cover up to %u kHz%s\n", gGdvfs, clk.after.khz, vg, vs,
++                IOLog("NORD2 GDVFS: kern.n2gdvfs=%d (0 off, 1 decisions only, 2 act, +4 no idle wait, +8 UI profile), cold-start %u kHz, rails VGPU %u uV / VSRAM %u uV cover up to %u kHz%s\n", gGdvfs, clk.after.khz, vg, vs,
+                       n2g_gpu_khz[v.g.max_idx], v.dead ? ": NOT usable (rails unread, or the clock is not an exact OPP): decisions only" : "");
+         }
+         if (v.pend >= 0) gdvfsSwitch(now);
+@@ -1296,6 +1298,7 @@
+         v.swaps[v.nsw++ % N2G_HIST] = h.swaps;
+         if (h.swaps - old >= N2G_ANIM_N || (h.touch_ms && ms >= h.touch_ms && ms - h.touch_ms < N2G_TOUCH_MS)) v.boostMs = ms ? ms : 1;
+         n2g_gpu_sample(&v.g, pm);
++        v.g.min_idx = (uint8_t)((gGdvfs & 8) ? v.boot : 0u); v.g.up_boost_pm = (uint16_t)((gGdvfs & 8) ? 800u : 0u);      /* 0492: UI profile */
+         v.busySum += pm; v.polls++; if (pm > v.busyMax) v.busyMax = pm;
+         unsigned want = n2g_gpu_decide(&v.g, ms, v.boostMs && ms - v.boostMs < N2G_ANIM_MS, v.th.level);
+         if (v.wdUs && now < v.wdUs && !v.failed && core->stats.faulted + core->stats.resets + core->stats.timeouts != v.wdCount) {

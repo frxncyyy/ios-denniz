@@ -1,0 +1,349 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -605,6 +605,7 @@
+     "0399 flip CON BYTE_SWAP (R<->B): bit 0 layer 1, bit 1 layer 0");
+ SYSCTL_PROC(_kern, OID_AUTO, n2fbhwstat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sweet_fb_hw_sysctl_stat, "A",
+     "0396 HW composition counters");
++#include "sweet_fb_yuv_kern.inc"      /* 0490: kern.n2fbyuv */
+ /* 0397: panel refresh rate at runtime, pacing counters */
+ static int
+ sweet_fb_pace_sysctl_hz SYSCTL_HANDLER_ARGS
+@@ -1969,6 +1970,7 @@
+ 		bzero(&l, sizeof(l));
+ 		l.format_ok = (s->pixelFormat == SWEET_FB_FORMAT_BGRA && s->planeCount == 0 && (s->bytesPerElement == 4 || s->bytesPerElement == 0) &&
+ 		    s->elementWidth == 1 && s->elementHeight == 1) ? 1u : 0u;
++		if (!l.format_ok) { l.format_ok = sweet_fb_yuv_layer_con(s); }      /* 0490: packed 4:2:2 (kern.n2fbyuv) */
+ 		{   /* display reachable only as a pool surface (0394: one contiguous range below 4 GiB), by the object we hold (not by id), and
+ 			 * only with write-combined CPU mappings (the overlay does not snoop CPU caches; n2fbpoolc=1 copy-back pools stay on the CPU path) */
+ 			uint64_t pa = sweet_surface_pool_pa_obj(s), len = sweet_surface_pool_size_obj(s);
+@@ -2197,6 +2199,7 @@
+ 	if (!hwApply(&p, ids, lpid, n)) { fHwN = 0; fHwSt.cpu_frames++; fHwSt.why[SWEET_FB_HW_W_STATE]++; return 0; }      /* faulted / 4L lost */
+ 	fHwPlan = p;
+ 	fHwSt.planned++;
++	sweet_fb_yuv_note(in, n, ids, ss);      /* 0490 */
+ 	if (fHwUses4) { fHwSt.l4_frames++; }
+ 	if (fHwSt.plans_logged < 8 || (fHwUses4 && fHwSt.l4_frames <= 4)) {
+ 		fHwSt.plans_logged++;
+--- a/iokit/Kernel/arm/sweet_fb_hw.h
++++ b/iokit/Kernel/arm/sweet_fb_hw.h
+@@ -61,6 +61,7 @@
+  */
+ #include <stdbool.h>
+ #include <stdint.h>
++#include "sweet_fb_yuv.h"             /* 0490 */
+ 
+ #define SWEET_FB_HW_PIPES           2u
+ #define SWEET_FB_HW_SLOTS           2u          /* OVL*_2L layers 0 and 1 */
+@@ -144,13 +145,14 @@
+ 	uint64_t len;               /* bytes of surface memory from pa */
+ 	uint32_t offset;            /* first pixel's byte offset in that memory (IOSurface offset) */
+ 	uint32_t pitch;             /* bytes per row */
+-	uint32_t format_ok;         /* 32 bpp BGRA, one plane, 1x1 elements */
++	uint32_t format_ok;         /* 32 bpp BGRA, one plane, 1x1 elements; 0490: > 1 = packed 4:2:2, the L_CON format bits (sweet_fb_yuv_con) */
+ 	int32_t sx, sy, dx, dy, w, h;   /* panel geometry after sweet_fb_layer_clip (dx,dy in panel pixels) */
+ 	uint32_t alpha;             /* 0402: plane alpha 1..254, 0 or >= 255 = opaque layer (no plane alpha) */
+ };
+ 
+ struct sweet_fb_hw_slot {
+ 	uint32_t en, addr, pitch, size, offset, con;
++	uint32_t clip;              /* 0490: Ln_CLIP (0 for BGRA) */
+ };
+ 
+ struct sweet_fb_hw_plan {
+@@ -262,12 +264,15 @@
+ 		if (l->pa == 0) { return SWEET_FB_HW_W_MEMORY; }
+ 		if (l->w <= 0 || l->h <= 0 || l->sx < 0 || l->sy < 0 || l->dx < 0 || l->dy < 0 ||
+ 		    (uint32_t)l->dx + (uint32_t)l->w > fw || (uint32_t)l->dy + (uint32_t)l->h > fh) { return SWEET_FB_HW_W_RANGE; }
+-		if (l->pitch == 0 || (l->pitch & 3u) || l->pitch > SWEET_FB_HW_PITCH_MAX || l->pitch < ((uint32_t)l->sx + (uint32_t)l->w) * 4u) {
++		uint32_t bp = l->format_ok > 1u ? 2u : 4u;      /* 0490: bytes per pixel; a 4:2:2 layer reads even column pairs (vx, vw) */
++		int32_t vx = l->sx, vw = l->w;
++		if (bp == 2u) { (void)sweet_fb_yuv_span(l->sx, l->w, &vx, &vw); }
++		if (l->pitch == 0 || (l->pitch & 3u) || l->pitch > SWEET_FB_HW_PITCH_MAX || l->pitch < ((uint32_t)vx + (uint32_t)vw) * bp) {
+ 			return SWEET_FB_HW_W_PITCH;
+ 		}
+ 		/* the whole rectangle read by both pipes together: [first, last) bytes from pa */
+-		uint64_t first = (uint64_t)l->offset + (uint64_t)l->sy * l->pitch + (uint64_t)l->sx * 4u;
+-		uint64_t last = (uint64_t)l->offset + (uint64_t)(l->sy + l->h - 1) * l->pitch + (uint64_t)(l->sx + l->w) * 4u;
++		uint64_t first = (uint64_t)l->offset + (uint64_t)l->sy * l->pitch + (uint64_t)vx * bp;
++		uint64_t last = (uint64_t)l->offset + (uint64_t)(l->sy + l->h - 1) * l->pitch + (uint64_t)(vx + vw) * bp;
+ 		if (last > l->len || !sweet_fb_hw_reachable(l->pa + first, l->pa + last) || l->pa + last > 0x100000000ull) {
+ 			return SWEET_FB_HW_W_RANGE;
+ 		}
+@@ -284,14 +289,16 @@
+ 			if (x1 <= x0) { continue; }                              /* not in this pipe: no slot */
+ 			if (ns >= cap) { return SWEET_FB_HW_W_COUNT; }
+ 			struct sweet_fb_hw_slot *s = &p->slot[k][ns];
+-			int32_t sx = l->sx + (x0 - l->dx);
++			int32_t sx = l->sx + (x0 - l->dx), sw = x1 - x0;
++			if (l->format_ok > 1u) { s->clip = sweet_fb_yuv_span(sx, sw, &sx, &sw); }      /* 0490 */
+ 			uint32_t a = (l->alpha == 0 || l->alpha >= 255u) ? 255u : l->alpha;
+ 			s->en = 1;
+-			s->addr = (uint32_t)(l->pa + l->offset + (uint64_t)l->sy * l->pitch + (uint64_t)sx * 4u);
++			s->addr = (uint32_t)(l->pa + l->offset + (uint64_t)l->sy * l->pitch + (uint64_t)sx * (l->format_ok > 1u ? 2u : 4u));
+ 			s->pitch = l->pitch;
+-			s->size = ((uint32_t)l->h << 16) | (uint32_t)(x1 - x0);
++			s->size = ((uint32_t)l->h << 16) | (uint32_t)sw;
+ 			s->offset = ((uint32_t)l->dy << 16) | (uint32_t)(x0 - c0);
+ 			s->con = (ns == 0 && a == 255u) ? SWEET_FB_HW_CON_OPAQUE : ((sweet_fb_hw_con_upper(pm) & ~0xffu) | a);
++			if (l->format_ok > 1u) { s->con = sweet_fb_yuv_con_alpha(l->format_ok, l->alpha); }      /* 0490 */
+ 			p->src_con[k] |= 1u << ns;
+ 			p->nslot[k] = ns + 1u;
+ 		}
+@@ -360,7 +367,7 @@
+ 		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_PITCH_MSB(i), (b->pitch_msb[i] & ~0xfu) | ((s->pitch >> 16) & 0xfu), 0xfu);
+ 		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_SRC_SIZE(i), s->size, 0xffffffffu);
+ 		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_OFFSET(i), s->offset, 0xffffffffu);
+-		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_CLIP(i), 0u, 0xffffffffu);
++		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_CLIP(i), s->clip, 0xffffffffu);
+ 		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_CON(i), s->con ^ p->con_xor[i], 0x03fff1ffu);
+ 		if (i > 0) {      /* RDMA GMC/FIFO = bandwidth only (no colour bits) */
+ 			n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_RDMA_GMC(i), b->gmc[i] ? b->gmc[i] : b->gmc[0], 0xffffffffu);
+@@ -390,7 +397,7 @@
+ 		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_PITCH_MSB(j), (b->pitch_msb[j] & ~0xfu) | ((s->pitch >> 16) & 0xfu), 0xfu);
+ 		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_SRC_SIZE(j), s->size, 0xffffffffu);
+ 		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_OFFSET(j), s->offset, 0xffffffffu);
+-		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_CLIP(j), 0u, 0xffffffffu);
++		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_CLIP(j), s->clip, 0xffffffffu);
+ 		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_CON(j), s->con ^ p->con_xor[1], 0x03fff1ffu);
+ 		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_RDMA_GMC(j), b->gmc[j] ? b->gmc[j] : b->gmc_fb, 0xffffffffu);
+ 		n = sweet_fb_hw_put(r, n, SWEET_FB_HW_R_RDMA_FIFO(j), b->fifo[j] ? b->fifo[j] : b->fifo_fb, 0xffffffffu);
+--- /dev/null
++++ b/iokit/Kernel/arm/sweet_fb_yuv.h
+@@ -0,0 +1,151 @@
++#ifndef SWEET_FB_YUV_H
++#define SWEET_FB_YUV_H
++/*
++ * 0490 (yuvovl-20261113): packed 4:2:2 YCbCr IOSurfaces as overlay layers.  Pure and host-testable (test/yuv_host_test.c).
++ *
++ * What the MT6893 OVL reads (Android DRM driver mtk_disp_ovl.c, mt6885_ovl_driver_data; identical in both vendor trees) [V-code]:
++ *   RGB565 / RGB888 / the 32-bit RGB layouts, and two packed 4:2:2 layouts only: UYVY = CFMT 4, YUYV = CFMT 5 (L_CON [15:12]).
++ *   No semi-planar or planar input (no second address register per layer): 420v / 420f / NV12 can never be an OVL layer.
++ *   The YCbCr -> RGB matrix is chosen per layer by L_CON [19:16] (L_CON_FLD_MTX): 4 = full-range BT.601 ("JPEG"), 6 = video-range
++ *   BT.601, 7 = video-range BT.709 (mtk_ovl_yuv_matrix_convert).  Nothing else is programmed for a YUV layer (no EXT_MTX, no
++ *   coefficient registers); 4:2:2 needs an even first column and an even column count, so an odd edge reads one column more and
++ *   trims it with Ln_CLIP ([7:0] left, [15:8] right) (_ovl_common_config).
++ * None of this has run on the phone yet [I]: byte order, matrix codes and the CLIP trim are the DRM driver's, so the path is
++ * OFF by default (kern.n2fbyuv = 0) and the mode word carries the test variants to settle them in one boot.
++ *
++ * kern.n2fbyuv (SWEET_FB_YUV_MODE_*):
++ *   bit 0       packed 4:2:2 surfaces ('2vuy', 'yuvs', 'yuvf') are planned as overlay layers (else refused: "format", as before)
++ *   bits 7..4   matrix override: 0 = automatic (full range -> 4; else 7 for HD sizes, 6 otherwise), 1..15 = that L_CON MTX code
++ *   bit 8       set L_CON BYTE_SWAP on the layer (Cb and Cr exchanged = blue/red tinted picture)
++ *   bit 9       exchange the UYVY / YUYV codes (luma and chroma exchanged = green/purple stripes)
++ */
++#include <stdbool.h>
++#include <stdint.h>
++
++#define SWEET_FB_YUV_FCC_2VUY       0x32767579u     /* '2vuy': Cb Y0 Cr Y1, video range */
++#define SWEET_FB_YUV_FCC_YUVS       0x79757673u     /* 'yuvs': Y0 Cb Y1 Cr, video range */
++#define SWEET_FB_YUV_FCC_YUVF       0x79757666u     /* 'yuvf': Y0 Cb Y1 Cr, full range */
++#define SWEET_FB_YUV_FCC_420V       0x34323076u     /* '420v' two planes, video range */
++#define SWEET_FB_YUV_FCC_420F       0x34323066u     /* '420f' two planes, full range */
++
++#define SWEET_FB_YUV_CFMT_UYVY      (4u << 12)
++#define SWEET_FB_YUV_CFMT_YUYV      (5u << 12)
++#define SWEET_FB_YUV_MTX(c)         (((uint32_t)(c) & 0xfu) << 16)
++#define SWEET_FB_YUV_MTX_JPEG       4u              /* full-range BT.601 */
++#define SWEET_FB_YUV_MTX_BT601      6u
++#define SWEET_FB_YUV_MTX_BT709      7u
++#define SWEET_FB_YUV_CON_BYTE_SWAP  (1u << 24)
++#define SWEET_FB_YUV_CON_MASK       0x010ff000u     /* the L_CON bits a YUV layer owns: CFMT, MTX, BYTE_SWAP */
++
++#define SWEET_FB_YUV_MODE_ON        0x001u
++#define SWEET_FB_YUV_MODE_MTX(m)    (((m) >> 4) & 0xfu)
++#define SWEET_FB_YUV_MODE_SWAP      0x100u
++#define SWEET_FB_YUV_MODE_XCHG      0x200u
++#define SWEET_FB_YUV_MODE_VALID     0x3f1u
++
++enum sweet_fb_yuv_kind {
++	SWEET_FB_YUV_NONE = 0,      /* not a YCbCr format known here */
++	SWEET_FB_YUV_UYVY,          /* packed 4:2:2, the OVL reads it */
++	SWEET_FB_YUV_YUYV,          /* packed 4:2:2, the OVL reads it */
++	SWEET_FB_YUV_BIPLANAR,      /* 4:2:0 two planes: no OVL input format */
++	SWEET_FB_YUV_BAD            /* a packed 4:2:2 code with a layout that is not 2 bytes per pixel in one plane */
++};
++
++static inline bool
++sweet_fb_yuv_mode_valid(uint32_t mode)
++{
++	return (mode & ~SWEET_FB_YUV_MODE_VALID) == 0u;
++}
++
++/* A surface's format and element layout -> kind.  Element layouts of packed 4:2:2: 2 bytes x 1 pixel or 4 bytes x 2 pixels. */
++static inline enum sweet_fb_yuv_kind
++sweet_fb_yuv_classify(uint32_t fcc, uint32_t planes, uint32_t bpe, uint32_t ew, uint32_t eh)
++{
++	if (fcc == SWEET_FB_YUV_FCC_420V || fcc == SWEET_FB_YUV_FCC_420F) { return SWEET_FB_YUV_BIPLANAR; }
++	if (fcc != SWEET_FB_YUV_FCC_2VUY && fcc != SWEET_FB_YUV_FCC_YUVS && fcc != SWEET_FB_YUV_FCC_YUVF) { return SWEET_FB_YUV_NONE; }
++	if (planes != 0u || eh != 1u || !((bpe == 2u && ew == 1u) || (bpe == 4u && ew == 2u))) { return SWEET_FB_YUV_BAD; }
++	return fcc == SWEET_FB_YUV_FCC_2VUY ? SWEET_FB_YUV_UYVY : SWEET_FB_YUV_YUYV;
++}
++
++static inline bool
++sweet_fb_yuv_full_range(uint32_t fcc)
++{
++	return fcc == SWEET_FB_YUV_FCC_YUVF || fcc == SWEET_FB_YUV_FCC_420F;
++}
++
++/* automatic matrix: the surface carries no colour tags here, so the usual size rule (HD = BT.709) */
++static inline uint32_t
++sweet_fb_yuv_matrix(uint32_t fcc, uint32_t width, uint32_t height)
++{
++	if (sweet_fb_yuv_full_range(fcc)) { return SWEET_FB_YUV_MTX_JPEG; }
++	return (width >= 1280u || height > 576u) ? SWEET_FB_YUV_MTX_BT709 : SWEET_FB_YUV_MTX_BT601;
++}
++
++/*
++ * The L_CON format bits (CFMT | MTX | BYTE_SWAP; never 0 for a planned layer) of a surface under a mode word, or 0 = not an
++ * overlay YUV layer (off, another format, or a layout the OVL cannot read).  Alpha bits are the planner's.
++ */
++static inline uint32_t
++sweet_fb_yuv_con(uint32_t mode, uint32_t fcc, uint32_t planes, uint32_t bpe, uint32_t ew, uint32_t eh, uint32_t width, uint32_t height)
++{
++	enum sweet_fb_yuv_kind k = sweet_fb_yuv_classify(fcc, planes, bpe, ew, eh);
++	if (!(mode & SWEET_FB_YUV_MODE_ON) || !sweet_fb_yuv_mode_valid(mode) || (k != SWEET_FB_YUV_UYVY && k != SWEET_FB_YUV_YUYV)) { return 0u; }
++	bool uyvy = (k == SWEET_FB_YUV_UYVY);
++	if (mode & SWEET_FB_YUV_MODE_XCHG) { uyvy = !uyvy; }
++	uint32_t mtx = SWEET_FB_YUV_MODE_MTX(mode) ? SWEET_FB_YUV_MODE_MTX(mode) : sweet_fb_yuv_matrix(fcc, width, height);
++	return (uyvy ? SWEET_FB_YUV_CFMT_UYVY : SWEET_FB_YUV_CFMT_YUYV) | SWEET_FB_YUV_MTX(mtx) |
++	       ((mode & SWEET_FB_YUV_MODE_SWAP) ? SWEET_FB_YUV_CON_BYTE_SWAP : 0u);
++}
++
++/*
++ * 4:2:2 column rule: the columns [sx, sx + w) the layer shows become the columns [*rx, *rx + *rw) the OVL reads (even start,
++ * even count, at most one more on each side); returns the Ln_CLIP value that trims the extra ones.  sx >= 0, w > 0.
++ */
++static inline uint32_t
++sweet_fb_yuv_span(int32_t sx, int32_t w, int32_t *rx, int32_t *rw)
++{
++	uint32_t clip = 0u;
++	if (sx & 1) { sx -= 1; w += 1; clip |= 1u; }
++	if (w & 1) { w += 1; clip |= 1u << 8; }
++	*rx = sx; *rw = w;
++	return clip;
++}
++
++/* the L_CON word of a YUV layer: no per-pixel alpha, so opaque (AEN 0) unless a plane alpha 1..254 is asked for */
++static inline uint32_t
++sweet_fb_yuv_con_alpha(uint32_t ycon, uint32_t alpha)
++{
++	uint32_t a = (alpha == 0u || alpha >= 255u) ? 255u : alpha;
++	return (ycon & SWEET_FB_YUV_CON_MASK) | (a == 255u ? 0xffu : ((1u << 8) | a));
++}
++
++/*
++ * Reference conversion of one sample to 0x00RRGGBB under a matrix code (what a correct layer must show; the host test checks
++ * the grey axis and the primaries, the phone test compares a pattern against it).  Unknown codes return 0xff000000.
++ */
++static inline uint32_t
++sweet_fb_yuv_ref_rgb(uint32_t mtx, uint32_t y, uint32_t cb, uint32_t cr)
++{
++	int32_t c, d = (int32_t)cb - 128, e = (int32_t)cr - 128, r, g, b;
++	switch (mtx) {
++	case SWEET_FB_YUV_MTX_JPEG:
++		c = (int32_t)y * 65536;
++		r = c + 91881 * e; g = c - 22554 * d - 46802 * e; b = c + 116130 * d;
++		break;
++	case SWEET_FB_YUV_MTX_BT601:
++		c = ((int32_t)y - 16) * 76309;
++		r = c + 104597 * e; g = c - 25675 * d - 53279 * e; b = c + 132201 * d;
++		break;
++	case SWEET_FB_YUV_MTX_BT709:
++		c = ((int32_t)y - 16) * 76309;
++		r = c + 117489 * e; g = c - 13975 * d - 34925 * e; b = c + 138438 * d;
++		break;
++	default:
++		return 0xff000000u;
++	}
++	r = (r + 32768) >> 16; g = (g + 32768) >> 16; b = (b + 32768) >> 16;
++	r = r < 0 ? 0 : (r > 255 ? 255 : r); g = g < 0 ? 0 : (g > 255 ? 255 : g); b = b < 0 ? 0 : (b > 255 ? 255 : b);
++	return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
++}
++
++#endif /* SWEET_FB_YUV_H */
+--- /dev/null
++++ b/iokit/Kernel/arm/sweet_fb_yuv_kern.inc
+@@ -0,0 +1,83 @@
++/*
++ * 0490 (yuvovl-20261113): kernel side of sweet_fb_yuv.h, included once by SweetFramebuffer.cpp (NORD2 only, after the 0396
++ * sysctls).  kern.n2fbyuv (RW, default 0 = off: YUV surfaces are refused by the planner as before) and kern.n2fbyuvstat (RO).
++ * No boot-arg (the UI command line is full).  Counters are the present thread's; the sysctls only read them.
++ */
++static uint32_t sweet_fb_yuv_mode;      /* kern.n2fbyuv */
++static struct {
++	uint64_t frames, layers;            /* HW frames with a YUV layer / YUV layers in them */
++	uint64_t seen_off, seen_biplanar, seen_bad;   /* planner inputs refused: packed 4:2:2 while off / 4:2:0 two planes / odd layout */
++	uint32_t last_con, last_fcc, logs;
++} sweet_fb_yuv_st;
++
++static int
++sweet_fb_yuv_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = (int)__atomic_load_n(&sweet_fb_yuv_mode, __ATOMIC_RELAXED), changed = 0;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (err != 0 || !changed) { return err; }
++	if (v < 0 || !sweet_fb_yuv_mode_valid((uint32_t)v)) { return EINVAL; }
++	__atomic_store_n(&sweet_fb_yuv_mode, (uint32_t)v, __ATOMIC_RELAXED);
++	IOLog("NORD2 FB YUV: kern.n2fbyuv %#x (packed 4:2:2 overlay layers %s, matrix %u (0 = auto), byte swap %u, uyvy/yuyv exchanged %u)\n", (uint32_t)v,
++	    (v & SWEET_FB_YUV_MODE_ON) ? "on" : "off", SWEET_FB_YUV_MODE_MTX((uint32_t)v), (v & SWEET_FB_YUV_MODE_SWAP) ? 1u : 0u,
++	    (v & SWEET_FB_YUV_MODE_XCHG) ? 1u : 0u);
++	return 0;
++}
++static int
++sweet_fb_yuv_sysctl_stat SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[256];
++	snprintf(buf, sizeof(buf), "mode=%#x frames=%llu layers=%llu seen_off=%llu seen_biplanar=%llu seen_bad=%llu last_con=%08x last_fcc=%08x",
++	    __atomic_load_n(&sweet_fb_yuv_mode, __ATOMIC_RELAXED), sweet_fb_yuv_st.frames, sweet_fb_yuv_st.layers, sweet_fb_yuv_st.seen_off,
++	    sweet_fb_yuv_st.seen_biplanar, sweet_fb_yuv_st.seen_bad, sweet_fb_yuv_st.last_con, sweet_fb_yuv_st.last_fcc);
++	return sysctl_io_string(req, buf, sizeof(buf), 0, NULL);
++}
++SYSCTL_PROC(_kern, OID_AUTO, n2fbyuv, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sweet_fb_yuv_sysctl, "I",
++    "0490 packed 4:2:2 overlay layers: bit 0 on, bits 7..4 matrix code (0 auto), bit 8 byte swap, bit 9 uyvy/yuyv exchanged");
++SYSCTL_PROC(_kern, OID_AUTO, n2fbyuvstat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sweet_fb_yuv_sysctl_stat, "A",
++    "0490 YUV overlay layer counters");
++
++/* hwInputs: the L_CON format bits of a surface that is not BGRA, 0 = still not an overlay layer (the planner says "format") */
++static inline uint32_t
++sweet_fb_yuv_layer_con(const SweetSurface *s)
++{
++	uint32_t mode = __atomic_load_n(&sweet_fb_yuv_mode, __ATOMIC_RELAXED);
++	switch (sweet_fb_yuv_classify(s->pixelFormat, s->planeCount, s->bytesPerElement, s->elementWidth, s->elementHeight)) {
++	case SWEET_FB_YUV_UYVY:
++	case SWEET_FB_YUV_YUYV:
++		if (!(mode & SWEET_FB_YUV_MODE_ON)) { sweet_fb_yuv_st.seen_off++; }
++		break;
++	case SWEET_FB_YUV_BIPLANAR:
++		sweet_fb_yuv_st.seen_biplanar++;
++		return 0u;
++	case SWEET_FB_YUV_BAD:
++		sweet_fb_yuv_st.seen_bad++;
++		return 0u;
++	default:
++		return 0u;
++	}
++	return sweet_fb_yuv_con(mode, s->pixelFormat, s->planeCount, s->bytesPerElement, s->elementWidth, s->elementHeight, s->width, s->height);
++}
++
++/* a planned and applied HW frame: counts its YUV layers; the first 8 and every change of the format bits are logged */
++static inline void
++sweet_fb_yuv_note(const struct sweet_fb_hw_in *in, unsigned n, const uint32_t *ids, SweetSurface *const *ss)
++{
++	unsigned y = 0;
++	for (unsigned i = 0; i < n; i++) {
++		if (in[i].format_ok <= 1u) { continue; }
++		y++;
++		sweet_fb_yuv_st.layers++;
++		if (sweet_fb_yuv_st.logs < 8 || in[i].format_ok != sweet_fb_yuv_st.last_con) {
++			sweet_fb_yuv_st.logs++;
++			IOLog("NORD2 FB YUV: layer %u id %u fcc %08x %ux%u bpr %u -> CON format %08x (cfmt %u mtx %u swap %u) src %d,%d %dx%d at %d,%d"
++			    " (layers=%llu frames=%llu)\n", i, ids[i], ss[i]->pixelFormat, ss[i]->width, ss[i]->height, in[i].pitch, in[i].format_ok,
++			    (in[i].format_ok >> 12) & 0xfu, (in[i].format_ok >> 16) & 0xfu, (in[i].format_ok >> 24) & 1u, in[i].sx, in[i].sy, in[i].w, in[i].h,
++			    in[i].dx, in[i].dy, sweet_fb_yuv_st.layers, sweet_fb_yuv_st.frames + 1u);
++		}
++		sweet_fb_yuv_st.last_con = in[i].format_ok; sweet_fb_yuv_st.last_fcc = ss[i]->pixelFormat;
++	}
++	if (y != 0) { sweet_fb_yuv_st.frames++; }
++}

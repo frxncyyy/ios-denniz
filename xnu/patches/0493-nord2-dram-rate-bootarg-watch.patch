@@ -1,0 +1,106 @@
+--- a/bsd/dev/nord2_cpufreq.c
++++ b/bsd/dev/nord2_cpufreq.c
+@@ -901,8 +901,12 @@
+ }
+ 
+ /* 0462: `sysctl kern.n2dramprobe=1` prints once, from the DVFS thread, the DRAM data rate decoded from the DDRPHY (stock fmeter_v1) and the state of the blocks
+- * that would change it at run time (DVFSRC, the SPM's vcore-DVFS levels).  Read-only: 32-bit loads of registers the stock kernel reads from the normal world. */
+-static int nord2_dram_probe;
++ * that would change it at run time (DVFSRC, the SPM's vcore-DVFS levels).  Read-only: 32-bit loads of registers the stock kernel reads from the normal world.
++ * 0493: boot-arg n2drp=<same values> so that no tool is needed on the phone: 1 = that probe once, when the governor loop starts (-> 2); 3 = the probe, then (-> 4)
++ * the DDRPHY part again with every 2 s DECISION line, without sleeping, printed only when the rate or the shuffle level changed (does the rate move under load?).
++ * Default 0: nothing is read.  The boot line has 12 characters left (q10jib), not enough for n2gdv and n2drp together: n2gdv +16 means n2drp=3 (Nord2GPU.cpp
++ * keeps the low four bits), so "n2gdv=25" = GPU decisions logged with the 0492 UI profile + this probe and watch, "n2gdv=26" = the same with the GPU clock acting. */
++TUNABLE_WRITEABLE(int, nord2_dram_probe, "n2drp", 0);
+ SYSCTL_INT(_kern, OID_AUTO, n2dramprobe, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_dram_probe, 0, "");
+ static volatile uint32_t *n2dr_map[2];
+ 
+@@ -938,6 +942,26 @@
+ 	    r.shu_lv, r.pll_id, r.sdmpcw, r.prediv, r.posdiv, r.ckdiv4, r.pll_md, r.cldiv2, r.fbksel, r.dqopen, r.raw, r.mbps, r.mbps * 8u);
+ }
+ 
++/* 0493 */
++static void
++n2dram_rate_watch(void)
++{
++	static struct n2dr_watch w;
++	struct n2dr r;
++	if (n2dr_map[0] == NULL || n2dr_map[1] == NULL) {
++		return;
++	}
++	unsigned lv = w.lv, mbps = w.mbps, reads = w.reads;
++	n2dr_read(n2dr_rd, NULL, &r);
++	if (n2dr_watch_update(&w, &r)) {
++		if (reads == 0) {
++			printf("NORD2 DRAM RATE: watch starts at shu_lv=%u %u Mbps (read every 2 s, printed on change)\n", r.shu_lv, r.mbps);
++		} else {
++			printf("NORD2 DRAM RATE: change %u after %u reads: shu_lv %u -> %u, %u -> %u Mbps (raw %u)\n", w.changes, w.reads, lv, r.shu_lv, mbps, r.mbps, r.raw);
++		}
++	}
++}
++
+ static void
+ n2dvfs_main(void)
+ {
+@@ -978,13 +1002,20 @@
+ 		static struct n2s_gov sg;
+ 		uint64_t last_old = 0;
+ 		n2s_init(&st, &sg);
++		{                                                  /* 0493 */
++			int gm = 0;
++			if (nord2_dram_probe == 0 && PE_parse_boot_argn("n2gdv", &gm, sizeof(gm)) && (gm & 16) != 0) {
++				nord2_dram_probe = 3;
++			}
++		}
+ 		printf("NORD2 DVFS sched: kern.n2dvfs_mode=%d (0 old governor, 1 + decisions logged, 2 new policy acts, 3 pinned at the cap), tick %u ms, idle rows L %u B %u\n", nord2_dvfs_mode, N2G_CPU_TICK_MS,
+ 		    sg.cl[0].slowest, sg.cl[1].slowest);
+ 		while (!st.stopped && st.inited) {
+ 			int mode = nord2_dvfs_mode;
+-			if (nord2_dram_probe == 1) {                       /* 0462 */
++			if (nord2_dram_probe == 1 || nord2_dram_probe == 3) {      /* 0462; 0493: 3 -> 4 = watch */
++				int was = nord2_dram_probe;
+ 				n2dram_rate_probe();
+-				nord2_dram_probe = 2;
++				nord2_dram_probe = was + 1;
+ 			}
+ 			if (mode <= 0) {                                   /* exactly the 0172 loop */
+ 				n2cf_sleep_ms(NULL, N2D_GOV_TICK_MS);
+@@ -996,6 +1027,9 @@
+ 			if (n2s_tick(&n2dv_ops, &n2s_kops, NULL, &cfg, &st, &gov, &sg, mode >= 2)) {
+ 				struct n2g_hints h;
+ 				n2s_print(&st, &sg, mode);
++				if (nord2_dram_probe == 4) {                       /* 0493 */
++					n2dram_rate_watch();
++				}
+ 				nord2_dvfs_hints(&h);
+ 				n2s_report_done(&sg, &h);
+ 			}
+--- a/bsd/dev/nord2_dram_rate.h
++++ b/bsd/dev/nord2_dram_rate.h
+@@ -48,4 +48,26 @@
+ 	o->raw = ((52u >> o->prediv) * (o->sdmpcw >> 8)) >> o->posdiv >> o->ckdiv4 >> o->pll_md >> o->cldiv2 << o->fbksel >> (o->dqopen << 1);
+ 	o->mbps = n2dr_decode(o->raw);
+ }
++
++/*
++ * 0493: watch.  The same eight loads again every 2 s (no sleep, nothing written); a line only when the shuffle level or the decoded rate differs from
++ * the previous read.  n2dr_watch_update returns true when that line is due: the first read, every one of the first 32 changes, then every 32nd.
++ */
++#include <stdbool.h>
++struct n2dr_watch { unsigned lv, mbps, reads, changes; };
++
++static inline bool
++n2dr_watch_update(struct n2dr_watch *w, const struct n2dr *r)
++{
++	bool first = w->reads == 0;
++	w->reads++;
++	if (!first && r->shu_lv == w->lv && r->mbps == w->mbps) {
++		return false;
++	}
++	if (!first) {
++		w->changes++;
++	}
++	w->lv = r->shu_lv; w->mbps = r->mbps;
++	return first || w->changes <= 32u || (w->changes & 31u) == 0;
++}
+ #endif

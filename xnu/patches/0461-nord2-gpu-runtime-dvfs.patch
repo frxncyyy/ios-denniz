@@ -1,0 +1,283 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -176,6 +176,23 @@
+  *   4 every pageable allocation zeroed again after prepare() (pre-0400)            8 buffer owners released inline under the GPU lock (pre-0400) */
+ static int gLatMode = 0;
+ SYSCTL_INT(_kern, OID_AUTO, n2gpu_lat, CTLFLAG_RW | CTLFLAG_LOCKED, &gLatMode, 0, "0400: GPU latency changes off-mask: 1 BH thread, 2 late release, 4 zero skip, 8 deferred owner free");
++/* 0461: runtime GPU DVFS.  Policy: bsd/dev/nord2_gov.h (n2g_gpu_*); clock: n2clk_retune (the vendor's parking switch); voltage: never touched, only OPPs the
++ * rails found at power-on already cover are used.  kern.n2gdvfs / boot-arg n2gdv: 0 off, 1 decisions logged only (default), 2 act; +4 = change the clock under a
++ * running job like the vendor does (default: job starts are held, at most 50 ms, and the clock changes in the gap).  Everything runs in tick() under the driver lock.
++ * The first three switches are announced 400 ms ahead (the console is pulled by the host), the first eight are checked against the GPU's own cycle counter.  Any
++ * clock error, a mismatching measurement or a job fault / reset / timeout within 500 ms of a switch returns to the cold-start OPP and stops acting until reboot. */
++#include "../../../bsd/dev/nord2_gov.h"
++static int gGdvfs = 1;
++SYSCTL_INT(_kern, OID_AUTO, n2gdvfs, CTLFLAG_RW | CTLFLAG_LOCKED, &gGdvfs, 0, "0461: GPU DVFS 0 off, 1 decisions logged, 2 act, +4 no wait for a gap between jobs");
++extern "C" { extern struct n2g_gpu_report nord2_gdvfs_report; void nord2_dvfs_hints(struct n2g_hints *); }      /* bsd/dev/nord2_cpufreq.c (0460) */
++static struct {
++        struct n2g_gpu g; struct n2g_therm th;
++        bool init, failed, dead;
++        int pend, bat;
++        uint64_t armUs, retryUs, busyBase, lastBusy, lastUs, slowUs, wdUs, wdCount, boostMs, busySum;
++        uint32_t swaps[N2G_HIST];
++        unsigned nsw, boot, switches, announced, gapMiss, errors, busyMax, polls;
++} gGdv;
+ /* Owners of torn-down buffers (unwire + release of up to 32 MiB, ms) are pushed here by the core's free_owner and released by a thread call,
+  * after the GPU pages were unmapped and flushed: nothing the GPU can reach is freed later than before, only the CPU-side release moves. */
+ static BufferOwner *volatile gOwnerList;
+@@ -357,6 +374,9 @@
+         uint64_t ckCycles = 0, ckStamp = 0, ckUs = 0;      /* 0127: GPU cycle counter / timestamp at the previous stats window */
+         bool ckRunning = false;
+         void clockCheck();
++        void gdvfsPoll(uint64_t nowUs);      /* 0461 */
++        void gdvfsSwitch(uint64_t nowUs);
++        uint32_t gdvfsMeasure(uint32_t khz);
+         unsigned pfWaits = 0, pfArms = 0, pfFails = 0, pfSinceArm = 0;
+         void prfcntSample();
+         uint32_t waitN = 0, waitGapMax = 0, waitDurMax = 0, waitRetMax = 0;
+@@ -607,6 +627,7 @@
+ static void lat_emit(Nord2GPU *d) {
+         n2c_lat l;
+         if (!d->core || !n2c_lat_take(d->core, &l, 2000000ull)) return;
++        gGdv.busyBase += l.busy_us;      /* 0461: the busy time stays cumulative for the DVFS poll */
+         uint64_t w = l.window_start_us ? l.window_start_us : 1;
+         IOLog("NORD2 GPU LAT: n=%llu win_ms=%llu irq_us=%llu/%u hand_us=%llu/%u phase_us=%llu/%u(%u) depth=%llu/%u busy_pm=%llu kinds=c%u/r%u/f%u same=%u rel_us=%llu/%u(%u) def=%u\n",
+               l.submits, w / 1000, l.irq_n ? l.irq_sum / l.irq_n : 0ull, l.irq_max, l.hand_n ? l.hand_sum / l.hand_n : 0ull, l.hand_max,
+@@ -644,6 +665,7 @@
+                 n2c_poll(d->core);
+                 d->emitJobStats();
+                 lat_emit(d);
++                d->gdvfsPoll(now_us(NULL));      /* 0461 */
+                 if (d->core->state == N2C_CORE_BROKEN) {
+                         d->ready = false; d->setProperty("Nord2GPUState", "fault-memory-pinned");
+                 }
+@@ -677,6 +699,7 @@
+         int lm = 0; if (PE_parse_boot_argn("nord2_lvts_mask", &lm, sizeof(lm)) && lm > 0 && (lm & ~(int)N2LVTS_MASK_ALL) == 0) lvtsMask = (uint32_t)lm;
+         int lc = 0; if (PE_parse_boot_argn("nord2_lvts_max_c", &lc, sizeof(lc)) && lc >= 30 && lc <= 100) lvtsMaxC = lc;
+         if (lvtsMode) IOLog("NORD2 GPU: LVTS thermal sensing requested: mode %u mask %x cold-start guard %d C\n", lvtsMode, lvtsMask, lvtsMaxC);
++        { int gm = 0; if (PE_parse_boot_argn("n2gdv", &gm, sizeof(gm))) gGdvfs = gm & 7; }      /* 0461 */
+         int irq = 1; PE_parse_boot_argn("nord2_gpu_irq", &irq, sizeof(irq)); irqWanted = irq == 1;   /* 0132: on by default (confirmed on the phone: SPI 364 / intid 396 asserts with the job line); nord2_gpu_irq=0 turns it off, which also frees the 16 characters the boot line needed for it */
+         int spi = 0; if (PE_parse_boot_argn("nord2_gpu_irq_spi", &spi, sizeof(spi)) && spi >= 32 && spi <= 900) irqSpi = (uint32_t)spi;
+         if (irqWanted) IOLog("NORD2 GPU: job interrupt requested (spi %u), polling remains the fallback\n", irqSpi);
+@@ -1176,6 +1199,124 @@
+         } else IOLog("NORD2 GPUCLK: counter restarted (cycles %llu -> %llu)\n", ckCycles, cyc);
+         ckCycles = cyc; ckStamp = st; ckUs = t;
+ }
++/* 0461: the shader cores' real clock over 500 us (CYCLE_COUNT, as clockCheck); up to three tries, the first within 5 % of khz wins.  Lock held, GPU idle or held. */
++uint32_t Nord2GPU::gdvfsMeasure(uint32_t khz) {
++        uint32_t got = 0;
++        write_bank(&gpu, 0x30, 5u);
++        for (unsigned k = 0; k < 3; k++) {
++                uint64_t c[2], t[2];
++                for (unsigned i = 0; i < 2; i++) {
++                        uint32_t hi, lo;
++                        do { hi = read_bank(&gpu, 0x94); lo = read_bank(&gpu, 0x90); } while (hi != read_bank(&gpu, 0x94));
++                        c[i] = ((uint64_t)hi << 32) | lo; t[i] = now_us(NULL);
++                        if (!i) IODelay(500);
++                }
++                if (t[1] <= t[0] || c[1] <= c[0]) continue;
++                got = (uint32_t)((c[1] - c[0]) * 1000ull / (t[1] - t[0]));
++                if ((uint64_t)got * 100u >= (uint64_t)khz * 95u && (uint64_t)got * 100u <= (uint64_t)khz * 105u) break;
++        }
++        return got;
++}
++void Nord2GPU::gdvfsSwitch(uint64_t now) {
++        auto &v = gGdv;
++        if (now < v.armUs) return;
++        if (v.dead) { v.pend = -1; core->hold_start = false; return; }
++        bool busy = false;
++        for (unsigned s = 0; s < 16; s++) busy |= core->running[s] != 0;
++        if (busy && !(gGdvfs & 4)) {
++                core->hold_start = true;
++                if (now - v.armUs > 50000ull) { core->hold_start = false; v.gapMiss++; v.pend = -1; v.retryUs = now + 500000ull; n2c_poll(core); }      /* a long job: try again in 500 ms */
++                return;
++        }
++        unsigned to = (unsigned)v.pend, from = v.g.cur, oi = 0;
++        uint32_t khz = n2g_gpu_khz[to], meas = 0;
++        v.pend = -1;
++        if (to != v.boot && (v.failed || (gGdvfs & 3) != 2 || to > v.g.cap)) { core->hold_start = false; n2c_poll(core); return; }      /* switched off or capped since it was announced */
++        enum n2clk_error e = N2CLK_E_PLL_RANGE;
++        if (to <= v.g.max_idx && n2rail_opp_index_exact(khz, &oi)) e = n2clk_retune(&clk, khz, n2rail_opp_table[oi].posdiv_power);
++        uint64_t t1 = now_us(NULL);
++        bool ok = e == N2CLK_OK;
++        if (ok && v.switches < 8) { meas = gdvfsMeasure(khz); ok = (uint64_t)meas * 100u >= (uint64_t)khz * 95u && (uint64_t)meas * 100u <= (uint64_t)khz * 105u; }
++        core->hold_start = false;
++        if (ok) {
++                n2g_gpu_applied(&v.g, to, t1 / 1000);
++                v.wdUs = t1 + 500000ull; v.wdCount = core->stats.faulted + core->stats.resets + core->stats.timeouts;
++                if (v.switches++ < 8) IOLog("NORD2 GDVFS switch %u: %u -> %u kHz in %llu us%s, core clock measures %u kHz\n", v.switches, n2g_gpu_khz[from], khz, t1 - now, busy ? " under a running job" : "", meas);
++        } else {
++                uint32_t pll = n2rail_mfgpll_khz(read_bank(&clocks[N2CLK_APMIXED], N2CLK_MFGPLL_CON1));
++                int pi = n2g_gpu_index(pll);
++                IOLog("NORD2 GDVFS FALLBACK: switch %u -> %u kHz failed (clk error %u step %u, measured %u kHz, PLL %u kHz, mux %u): %s\n", n2g_gpu_khz[from], khz, (unsigned)e, clk.retune_step, meas, pll,
++                      (read_bank(&clocks[N2CLK_TOPCK], N2CLK_CFG_5) >> N2CLK_MFG_MUX_SHIFT) & N2CLK_MFG_MUX_MASK, v.failed || pi < 0 ? "clock left alone until reboot" : "back to the cold-start OPP, no more switching");
++                v.errors++;
++                if (v.failed || pi < 0) v.dead = true;
++                if (pi >= 0) v.g.cur = (uint8_t)pi;
++                v.failed = true;
++        }
++        n2c_poll(core);
++}
++void Nord2GPU::gdvfsPoll(uint64_t now) {
++        static const char *const wn[N2G_NWHY] = { "hold", "util", "floor", "burst", "heavy", "therm", "rate", "up", "down", "boost" };
++        auto &v = gGdv;
++        int mode = gGdvfs & 3;
++        if (!core || core->state != N2C_CORE_READY || !board.powered) { if (core) core->hold_start = false; v.pend = -1; return; }
++        if (!v.init) {
++                uint32_t vg = 0, vs = 0;
++                const struct n2rail_snapshot &a = rail.after;
++                bool rails = rail.on && !rail.uncertain && (a.valid & 0x1ffu) == 0x1ffu && (a.vgpu_da_en & 1u) && (a.vsram_mon & 1u) &&
++                             n2rail_vgpu_uv(a.vgpu_da_vosel, &vg) && n2rail_vsram_uv((uint8_t)((a.vsram_vosel1 >> 8) & 0x7fu), &vs);
++                int bi = n2g_gpu_index(clk.after.khz);
++                v.init = true; v.pend = -1; v.bat = -1;
++                n2g_therm_init(&v.th);
++                v.boot = bi < 0 ? 0u : (unsigned)bi;
++                v.g.cur = (uint8_t)v.boot;
++                v.g.max_idx = (uint8_t)(rails ? n2g_gpu_max_idx(vg, vs) : v.boot);
++                v.failed = v.dead = !rails || bi < 0 || !clk.mux_on || !clk.cg_on || v.g.max_idx < v.boot;
++                IOLog("NORD2 GDVFS: kern.n2gdvfs=%d (0 off, 1 decisions only, 2 act, +4 no idle wait), cold-start %u kHz, rails VGPU %u uV / VSRAM %u uV cover up to %u kHz%s\n", gGdvfs, clk.after.khz, vg, vs,
++                      n2g_gpu_khz[v.g.max_idx], v.dead ? ": NOT usable (rails unread, or the clock is not an exact OPP): decisions only" : "");
++        }
++        if (v.pend >= 0) gdvfsSwitch(now);
++        if (v.lastUs && now - v.lastUs < N2G_GPU_POLL_MS * 1000ull) return;
++        uint64_t busy = v.busyBase + core->lat.busy_us + (core->lat_slots_busy && now > core->lat_busy_since ? now - core->lat_busy_since : 0ull);
++        unsigned pm = v.lastUs && busy >= v.lastBusy ? (unsigned)((busy - v.lastBusy) * 1000ull / (now - v.lastUs)) : 0u;
++        bool first = !v.lastUs;
++        v.lastBusy = busy; v.lastUs = now;
++        if (first) return;
++        uint64_t ms = now / 1000;
++        bool slow = !v.slowUs || now - v.slowUs >= 2000000ull;
++        if (slow) { int c = 0; bool okb = battery_temperature(&c); (void)n2g_therm_update(&v.th, okb, c); v.bat = okb ? c : -1; }
++        struct n2g_hints h = {};
++        nord2_dvfs_hints(&h);
++        uint32_t old = v.nsw >= 5 ? v.swaps[(v.nsw - 5) % N2G_HIST] : h.swaps;
++        v.swaps[v.nsw++ % N2G_HIST] = h.swaps;
++        if (h.swaps - old >= N2G_ANIM_N || (h.touch_ms && ms >= h.touch_ms && ms - h.touch_ms < N2G_TOUCH_MS)) v.boostMs = ms ? ms : 1;
++        n2g_gpu_sample(&v.g, pm);
++        v.busySum += pm; v.polls++; if (pm > v.busyMax) v.busyMax = pm;
++        unsigned want = n2g_gpu_decide(&v.g, ms, v.boostMs && ms - v.boostMs < N2G_ANIM_MS, v.th.level);
++        if (v.wdUs && now < v.wdUs && !v.failed && core->stats.faulted + core->stats.resets + core->stats.timeouts != v.wdCount) {
++                IOLog("NORD2 GDVFS FALLBACK: a job fault, reset or timeout within 500 ms of a switch to %u kHz: back to the cold-start OPP, no more switching\n", n2g_gpu_khz[v.g.cur]);
++                v.failed = true; v.errors++;
++        }
++        int go = -1;
++        if (v.failed || mode != 2) { if (v.g.cur != v.boot) go = (int)v.boot; }      /* not acting: the cold-start OPP */
++        else if (want != v.g.cur) go = (int)want;
++        if (go >= 0 && v.pend < 0 && !v.dead && now >= v.retryUs) {
++                v.pend = go; v.armUs = now;
++                if (v.announced < 3) {
++                        v.announced++; v.armUs = now + 400000ull;
++                        IOLog("NORD2 GDVFS access: next in 400 ms is %u -> %u kHz (mfg_sel to the 218 MHz parking clock, MFGPLL_CON1, 20 us, mfg_sel back; job starts held)\n", n2g_gpu_khz[v.g.cur], n2g_gpu_khz[go]);
++                }
++        }
++        struct n2g_gpu_report r = { n2g_gpu_khz[want], n2g_gpu_khz[v.g.cur], n2g_gpu_khz[v.g.cap], v.g.u_down, (uint32_t)(v.failed ? 8 | mode : mode), v.g.why, v.switches, v.errors };
++        nord2_gdvfs_report = r;
++        if (!slow) return;
++        v.slowUs = now;
++        if (mode)
++                IOLog("NORD2 GDVFS: mode=%d%s cur=%u want=%u cap=%u floor=%u kHz pll=%u mux=%u busy_pm avg=%llu max=%u now=%u why=%s therm=%u bat_cC=%d switches=%u gap_miss=%u err=%u\n", gGdvfs,
++                      v.dead ? " DEAD" : (v.failed ? " FAILED" : ""), n2g_gpu_khz[v.g.cur], n2g_gpu_khz[want], n2g_gpu_khz[v.g.cap], n2g_gpu_khz[v.g.floor],
++                      n2rail_mfgpll_khz(read_bank(&clocks[N2CLK_APMIXED], N2CLK_MFGPLL_CON1)), (read_bank(&clocks[N2CLK_TOPCK], N2CLK_CFG_5) >> N2CLK_MFG_MUX_SHIFT) & N2CLK_MFG_MUX_MASK,
++                      v.polls ? v.busySum / v.polls : 0ull, v.busyMax, v.g.u_down, wn[v.g.why % N2G_NWHY], v.th.level, v.bat, v.switches, v.gapMiss, v.errors);
++        v.busySum = 0; v.polls = v.busyMax = 0;
++}
+ /* patch 0123 (n2pf=1): hardware counters, v2.  The v1 sampler (0122) spun up to 20 ms with the driver lock held and, after its first sample timeout, left the job
+  * manager waiting behind the unfinished dump (job queue delays of 2..13 s).  v2 never waits: it issues PRFCNT_SAMPLE in one stats window and collects the dump in the next
+  * one, drops everything when the GPU was power-cycled in between, and on a stuck sample prints the fault registers, switches the counters off (PRFCNT_CONFIG = 0) and stops.
+--- a/bsd/dev/nord2_gpu_clk.c
++++ b/bsd/dev/nord2_gpu_clk.c
+@@ -199,6 +199,51 @@
+         return N2CLK_OK;
+ }
+ 
++enum n2clk_error n2clk_retune(struct n2clk *c, uint32_t khz, uint32_t posdiv)
++{
++        if (!c)
++                return N2CLK_E_ARGS;
++        if (!c->mux_on || !c->cg_on)
++                return N2CLK_E_STATE;
++        unsigned opp = 0;
++        if (!n2rail_opp_index_exact(khz, &opp) ||
++            n2rail_opp_table[opp].posdiv_power != posdiv)
++                return N2CLK_E_PLL_RANGE;
++        uint32_t dds = (((khz / 100u * (1u << posdiv)) << 14) / 26u + 5u) / 10u;
++        uint32_t con1 = (posdiv << 24) | dds;
++        if (n2rail_mfgpll_khz(con1) != khz)
++                return N2CLK_E_PLL_RANGE;
++        uint32_t cfg = rd(c, N2CLK_TOPCK, N2CLK_CFG_5);
++        uint32_t con3 = rd(c, N2CLK_APMIXED, N2CLK_MFGPLL_CON3);
++        uint32_t old = rd(c, N2CLK_APMIXED, N2CLK_MFGPLL_CON1) & 0x7fffffffu;
++        if (mux_parent(cfg) != N2CLK_MFG_PARENT_MFGPLL ||
++            (cfg & (1u << N2CLK_MFG_PDN_BIT)) ||
++            !(rd(c, N2CLK_APMIXED, N2CLK_MFGPLL_CON0) & 1u) ||
++            !(con3 & 1u) || (con3 & 2u) ||
++            old != (c->after.mfgpll_con1 & 0x7fffffffu))
++                return N2CLK_E_STATE;
++        if (con1 == old)
++                return N2CLK_OK;
++        c->retune_step = 1;
++        if (!set_parent(c, N2CLK_MFG_PARENT_PARK)) {
++                (void)set_parent(c, N2CLK_MFG_PARENT_MFGPLL);
++                return N2CLK_E_VERIFY;
++        }
++        c->pll_changed = true;  /* mux_off restores the boot chain's rate */
++        c->retune_step = 2;
++        bool ok = pll_rate(c, con1);
++        if (!ok) {
++                c->retune_step = 3;
++                (void)pll_rate(c, old);
++        }
++        c->retune_step = 4;
++        if (!set_parent(c, N2CLK_MFG_PARENT_MFGPLL))
++                return N2CLK_E_VERIFY;
++        c->retune_step = 0;
++        capture_clock(c, &c->after);
++        return ok ? N2CLK_OK : N2CLK_E_VERIFY;
++}
++
+ static void rmw(struct n2clk *c, uint32_t off, uint32_t set, uint32_t clear)
+ {
+         uint32_t v = rd(c, N2CLK_MFGCFG, off);
+--- a/bsd/dev/nord2_gpu_clk.h
++++ b/bsd/dev/nord2_gpu_clk.h
+@@ -111,6 +111,7 @@
+         bool cg_ungated_by_us;
+         bool pll_changed;
+         struct n2clk_snapshot after;
++        uint32_t retune_step;  /* 0461: last step of n2clk_retune (1 park, 2 PLL, 3 PLL back, 4 unpark) */
+ };
+ 
+ bool n2clk_init(struct n2clk *c, const struct n2clk_ops *ops, void *ctx);
+@@ -124,6 +125,12 @@
+ /* BG3D gate, external CG and timestamp (after MTCMOS; MFGCFG powered). */
+ enum n2clk_error n2clk_mfg_cg_on(struct n2clk *c);
+ void n2clk_mfg_cg_off(struct n2clk *c);
++/* 0461: live frequency change of a powered GPU, the vendor's __mt_gpufreq_clock_switch with parking (the path it uses whenever frequency
++ * hopping is not available): mfg_sel -> mainpll_d5_d2 (218.4 MHz), MFGPLL_CON1 = PCW_CHG | posdiv | dds, 20 us, mfg_sel -> mfgpll.
++ * khz must be an exact vendor OPP and the rails must already cover the HIGHER of the old and the new OPP (no voltage is touched here).
++ * Nothing is written unless mux, gate and PLL are exactly as this module left them.  On a PLL read-back mismatch the old rate is
++ * written back before the mux returns.  N2CLK_E_VERIFY with retune_step 4 means the GPU is left on the 218.4 MHz parking clock. */
++enum n2clk_error n2clk_retune(struct n2clk *c, uint32_t khz, uint32_t posdiv);
+ /* mt_gpufreq_check_bus_idle(), bounded. */
+ enum n2clk_error n2clk_bus_idle(struct n2clk *c);
+ const char *n2clk_error_string(enum n2clk_error e);
+--- a/bsd/dev/nord2_gpu_core.c
++++ b/bsd/dev/nord2_gpu_core.c
+@@ -1227,7 +1227,7 @@
+ 
+ static void try_start(struct n2c_core *c)
+ {
+-        if (c->state != N2C_CORE_READY || c->reset_pending)
++        if (c->state != N2C_CORE_READY || c->reset_pending || c->hold_start)
+                 return;
+         for (;;) {
+                 /* Oldest queued job whose context has nothing older still
+--- a/bsd/dev/nord2_gpu_core.h
++++ b/bsd/dev/nord2_gpu_core.h
+@@ -334,6 +334,7 @@
+         /* 0400: the completion handler releases buffers AFTER starting the next job (false = old order: release, then start). */
+         bool lat_release_late;
+         bool lat_in_irq;                  /* inside handle_job_irqs (completions defer their release) */
++        bool hold_start;                  /* 0461: no job is started (the GPU DVFS waits for the running ones, at most 50 ms, to change the clock in the gap) */
+         volatile uint64_t lat_irq_us;     /* set by the interrupt top half, consumed by the poll */
+         uint64_t lat_done_us[N2C_MAX_CTX];  /* last phase completion of each context (0 = none since its last start) */
+         uint8_t lat_done_slot[N2C_MAX_CTX];

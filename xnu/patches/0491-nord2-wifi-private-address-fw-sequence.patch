@@ -1,0 +1,136 @@
+--- a/bsd/dev/wifi_ios_join.c
++++ b/bsd/dev/wifi_ios_join.c
+@@ -21,7 +21,7 @@
+ static int refuse(struct niwj_diagnostic*d,int reason){if(d)d->reason=(uint32_t)-reason;return reason;}
+ /* 0430: relaxed IOUC join decoder. Still WPA2-PSK/CCMP or OPEN only: SAE-only,
+  * 802.1X, WEP, WPA1/TKIP and a station RSN that demands MFP stay refused. */
+-unsigned niwj_privmac_mode=1;
++unsigned niwj_privmac_mode=2;
+ unsigned niwj_8021x=0x11,niwj_ap_mfpr;
+ int printf(const char*,...) __attribute__((format(printf,1,2)));
+ unsigned niwj_sae_mode=1,niwj_pmf_flags=0,niwj_select_allow=0;
+--- a/bsd/dev/wifi_ios_join.h
++++ b/bsd/dev/wifi_ios_join.h
+@@ -38,15 +38,21 @@
+ int niwj_decode_identity(const void*,size_t,const uint8_t actual_owner_mac[6],
+  struct niwj_request*,struct niwj_diagnostic*);
+ void niwj_clear(void*,size_t);
+-/* 0430/0436 join policy, kern.n2wifi_privmac (boot-arg n2wpm), default 1:
++/* 0430/0436/0491 join policy, kern.n2wifi_privmac (boot-arg n2wpm), default 2:
+  * 0 legacy decoder: exact WPA2 profile, a private address must equal the
+  *   current station address;
+  * 1 relaxed decoder, the requested private (locally administered) address
+- *   becomes the station address: firmware BSS re-activated with it before
+- *   authentication (0436);
+- * 2 as 1, with a deactivate command before the activate;
++ *   becomes the station address, firmware told by a second BSS activate
++ *   while the BSS is active. q10jia on hardware: the firmware keeps its old
++ *   own address (authentication frames from the new one are never
++ *   acknowledged), so this mode only remains for experiments;
++ * 2 as 1, with the vendor driver's sequence: BSS deactivate, then activate
++ *   with the new address (gen4m nicDeactivateNetwork/nicActivateNetwork, the
++ *   only path by which that driver changes the own address). Default (0491);
+  * 3 relaxed decoder, private address accepted and ignored (board address).
+- *   This is the kill switch: no address is ever changed in modes 0 and 3.
++ *   This is the kill switch: no private address is used in modes 0 and 3.
++ * 0491: a private address that fails before authentication is given up for
++ * the board address (kern.n2wifi_privmac_state, wifi_station_service_bind.inc).
+  * struct niwj_request/niwj_diagnostic keep the CI layout (the IOUC object is
+  * not rebuilt): the requested address travels through niwj_take_self,
+  * recorded by a successful decode, taken once by the native enqueue for the
+--- a/bsd/dev/wifi_scan_service_bind.inc
++++ b/bsd/dev/wifi_scan_service_bind.inc
+@@ -111,8 +111,9 @@
+  if(ncd_native.worker!=current_thread()||!ncd_native.active||ncd_native.halt||nct_native.active||s->phase!=NCT_DONE||s->halt||r->active||r->halt){nss_diag(11,0,s->phase,0,0);return 1;}
+  uint8_t mac[6];IOLockLock(nss_native.lock);unsigned pre=nss_native.mac_switch>2?0:nss_native.mac_switch;memcpy(mac,nss_native.info.mac,6);IOLockUnlock(nss_native.lock);
+  if(ncs_build(ncd_native.diag.frame,ncd_native.diag.frame_bytes,ncd_native.diag.history[ncd_native.diag.events-1].sequence,mac,channels,count,1,2,sequence,1,slot->request.dwell_tu,0,&nss_native.frames)){nss_diag(12,0,(unsigned)count,slot->request.dwell_tu,pre);return 1;}
+- /* Deactivate = the same command with ucActive 0 and the address the firmware has now. */
+- if(pre==2){memcpy(nss_native.deactivate,nss_native.frames.activate,NCS_ACTIVATE_BYTES);nss_native.deactivate[65]=0;memcpy(nss_native.deactivate+68,nss_native.fw_mac,6);}
++ /* Deactivate = gen4m nicDeactivateNetworkEx: zeroed command with the BSS index, ucActive 0, network type, own-address index and
++  * BMC WLAN index of the activate; no address (0491: was the address the firmware had). */
++ if(pre==2){memcpy(nss_native.deactivate,nss_native.frames.activate,NCS_ACTIVATE_BYTES);nss_native.deactivate[65]=0;memset(nss_native.deactivate+68,0,6);}
+  nss_native.build_pre=pre;
+  nss_native.previous=*s;nss_native.previous_rx=*r;nss_native.previous_rx.session=&nss_native.previous;
+  memset(s,0,sizeof(*s));memset(r,0,sizeof(*r));
+--- a/bsd/dev/wifi_station_service_bind.inc
++++ b/bsd/dev/wifi_station_service_bind.inc
+@@ -11,7 +11,7 @@
+ #include <sys/sysctl.h>
+ #include <net/kpi_interface.h>
+ extern unsigned niwi_scan_relax;
+-SYSCTL_UINT(_kern, OID_AUTO, n2wifi_privmac, CTLFLAG_RW | CTLFLAG_LOCKED, &niwj_privmac_mode, 0, "0436: private Wi-Fi address: 0 legacy refuse, 1 use it (default), 2 use it with a deactivate first, 3 accept and ignore (kill switch)");
++SYSCTL_UINT(_kern, OID_AUTO, n2wifi_privmac, CTLFLAG_RW | CTLFLAG_LOCKED, &niwj_privmac_mode, 0, "0436/0491: private Wi-Fi address: 0 legacy refuse, 1 use it with a second activate only (ignored by the firmware), 2 use it with deactivate + activate (default), 3 accept and ignore (kill switch)");
+ SYSCTL_UINT(_kern, OID_AUTO, n2wifi_scanrelax, CTLFLAG_RW | CTLFLAG_LOCKED, &niwi_scan_relax, 0, "0430: serve directed scan requests with the passive scan (0 = refuse them)");
+ #endif
+ /* Same clock_get_uptime conversion as ncd_native_now, usable from IOUC:
+@@ -102,7 +102,36 @@
+  * link-layer address, and the firmware through one internal passive scan
+  * whose command recipe starts with BSS activate-control (nss_execute_mac).
+  * Until that scan ran the join stays queued; three refused scans give up and
+- * the join then fails by its ordinary timeout. No address is ever logged. */
++ * the join then fails by its ordinary timeout. No address is ever logged.
++ * 0491, from q10jia on hardware (mode 1): both joins on a private address
++ * ended with the first authentication frame never acknowledged (TX status 3
++ * after 30 transmissions) while the same AP acknowledged the board address at
++ * once: the firmware had not taken the new own address. So (a) every change,
++ * also the way back to the board address, is deactivate + activate unless
++ * mode 1 is forced, and (b) njs_privmac_state remembers a private address
++ * that does not get through authentication:
++ * 0 private addresses are used; 1 suspected: an attempt on a private address
++ * failed before any association request (no acknowledgement or no answer to
++ * authentication), the next attempts use the board address; 2 confirmed: the
++ * board address then passed authentication, board address until reboot (or
++ * until kern.n2wifi_privmac_state is written 0). A suspected state is dropped
++ * when the board address fails the same way (the AP is simply not there). */
++static unsigned njs_privmac_state,njs_privmac_logs;
++#ifndef NJS_HOST_TEST
++SYSCTL_UINT(_kern, OID_AUTO, n2wifi_privmac_state, CTLFLAG_RW | CTLFLAG_LOCKED, &njs_privmac_state, 0, "0491: private Wi-Fi address fallback: 0 in use, 1 suspected after a failed authentication (board address next), 2 confirmed not working (board address); write 0 to try again");
++#endif
++/* Admission lock held, first terminal observation of an attempt. stc keeps
++ * auth_attempts/assoc_attempts through its cleanup (authenticated/associated
++ * are cleared there): an association request was sent = authentication passed. */
++static inline __attribute__((always_inline)) unsigned njs_privmac_verdict_locked(void){
++ const struct stc*t=&njs_native.driver.owner.transaction;
++ unsigned on_private=memcmp(nss_native.info.mac,nss_native.factory_mac,6)!=0,passed=njs_native.joined||t->assoc_attempts!=0;
++ unsigned early=!passed&&t->auth_attempts!=0&&(t->outcome==STC_FAILED||t->outcome==STC_TIMEOUT),old=njs_privmac_state,now=old;
++ if(on_private){if(early&&!old)now=1;}
++ else if(old==1)now=passed?2:early?0:1;
++ njs_privmac_state=now;
++ return (on_private||old!=now)?1u|on_private<<1|passed<<2|early<<3|old<<4|now<<6:0;
++}
+ static int njs_ifnet_set_mac(const uint8_t old[6],const uint8_t mac[6]){
+ #ifdef NJS_HOST_TEST
+  (void)old;(void)mac;return 0;
+@@ -121,10 +150,10 @@
+ }
+ static void njs_mac_select_locked(void){
+  unsigned mode=niwj_privmac_mode;
+- const uint8_t*want=(mode==1||mode==2)&&njs_native.has_self?njs_native.want_self:nss_native.factory_mac;
++ const uint8_t*want=(mode==1||mode==2)&&njs_native.has_self&&!njs_privmac_state?njs_native.want_self:nss_native.factory_mac;
+  if(!(want[0]|want[1]|want[2]|want[3]|want[4]|want[5])||(want[0]&1)||!memcmp(want,nss_native.info.mac,6))return;
+  memcpy(nss_native.lladdr_old,nss_native.info.mac,6);memcpy(nss_native.info.mac,want,6);
+- nss_native.mac_switch=mode==2?2:1;nss_native.lladdr_pending=1;nss_native.mac_attempts=0;
++ nss_native.mac_switch=mode==1?1:2;nss_native.lladdr_pending=1;nss_native.mac_attempts=0; /* 0491: deactivate + activate also on the way back (modes 0/3, fallback) */
+ }
+ static void njs_mac_scan_done(void*cookie,uint64_t generation,uint64_t ticket,enum nss_status status){(void)cookie;(void)generation;(void)status;(void)nord2_wifi_scan_release(ticket);}
+ /* Owner thread, no lock held. 0 nothing pending, 1 activation scan queued for
+@@ -394,7 +423,7 @@
+    * Never feed the pre-constructor sample back into the monotonic engine. */
+   if(ncd_native_now(&ncd_native,&now_us))return njs_fatal_owner(2);
+  }
+- unsigned notify_join=0,notify_terminal=0,retire=0,detach=0,link_up=0,link_down=0;
++ unsigned notify_join=0,notify_terminal=0,retire=0,detach=0,link_up=0,link_down=0,verdict=0;
+  IOLockLock(nss_native.lock);
+  if(njs_native.detach){njs_native.detach=0;detach=1;}
+  if(nst_native.state.associated_scan&&(njs_native.canceled||njs_native.leave||nst_native.state.link_lost))(void)nst_associated_scan_cancel(&nst_native.state);
+@@ -412,8 +441,9 @@
+  if(nwo_authorized(&njs_native.driver.owner)&&nst_native.state.controlled_port&&!njs_native.canceled&&!njs_native.leave&&!njs_native.linked)link_up=1;
+  if((!njs_native.snapshot.data_ready||njs_native.canceled||njs_native.leave)&&njs_native.linked){njs_native.linked=njs_native.tx_admit=0;link_down=1;njs_drop_tx_locked();}
+  unsigned terminal=(njs_native.driver.owner.transaction.phase==STC_DONE||njs_native.driver.owner.transaction.phase==STC_HALTED)&&!nst_native.state.associated_scan;
+- if(terminal){if(!njs_native.terminal){njs_native.terminal=1;notify_terminal=1;}njs_native.active=0;njs_native.retiring=1;retire=1;niwj_clear(&njs_native.driver.owner.transaction.wpa,sizeof njs_native.driver.owner.transaction.wpa);njs_drop_tx_locked();}
++ if(terminal){if(!njs_native.terminal){njs_native.terminal=1;notify_terminal=1;verdict=njs_privmac_verdict_locked();if(verdict&&njs_privmac_logs<64)njs_privmac_logs++;else verdict=0;}njs_native.active=0;njs_native.retiring=1;retire=1;niwj_clear(&njs_native.driver.owner.transaction.wpa,sizeof njs_native.driver.owner.transaction.wpa);njs_drop_tx_locked();}
+  IOLockUnlock(nss_native.lock);
++ if(verdict)printf("NORD2 WIFI IOS MAC: verdict private=%u passed_auth=%u failed_before_assoc=%u state=%u->%u\n",(verdict>>1)&1u,(verdict>>2)&1u,(verdict>>3)&1u,(verdict>>4)&3u,(verdict>>6)&3u);
+  if(scan_done)nss_deliver(scan_done,!scan_done->scan.done?NSS_REFUSED:scan_done->scan.completion.state==7&&!scan_done->scan.partial&&!scan_done->scan.dropped?NSS_COMPLETE:NSS_PARTIAL);
+  /* Canceled queued slots must retire even while station owns the loop. */
+  for(unsigned k=0;k<NSS_SLOTS;k++){IOLockLock(nss_native.lock);unsigned cancel_scan=nss_native.slot[k].state==NSS_QUEUED&&nss_native.slot[k].canceled;IOLockUnlock(nss_native.lock);if(cancel_scan)nss_deliver(&nss_native.slot[k],NSS_CANCELED);}

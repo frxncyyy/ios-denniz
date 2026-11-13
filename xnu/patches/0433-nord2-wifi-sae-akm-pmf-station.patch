@@ -1,0 +1,738 @@
+--- a/bsd/dev/wifi_station_transaction.c
++++ b/bsd/dev/wifi_station_transaction.c
+@@ -3,6 +3,10 @@
+ /* New private transaction model. No kernel IO, waits, publication or secrets log. */
+ #include "wifi_station_transaction.h"
+ #include "wifi_wpa_diag.h"
++#include "wifi_wpa3.h"
++#include "wifi_sae.h"
++#include "wifi_station_wire2.h"
++#include "wifi_station_source_layout.h"
+ #if defined(KERNEL) || defined(_KERNEL)
+ #include <sys/systm.h>
+ #else
+@@ -10,14 +14,33 @@
+ #endif
+ static void erase(void*v,size_t n){volatile uint8_t*p=v;while(n--)*p++=0;}
+ static unsigned le16(const uint8_t*p){return p[0]|(unsigned)p[1]<<8;}
++/* ---- 0433: negotiated profiles (SAE, PSK-SHA256, PMF). One numeric log line
++ * per step so that a hang is attributable; never an address, key, nonce or
++ * password octet. */
++int printf(const char*,...) __attribute__((format(printf,1,2)));
++#if defined(KERNEL) || defined(_KERNEL)
++extern int niwj_secret_take(const uint8_t*,size_t,struct stc_secret*);
++int (*stc_secret_hook)(const uint8_t*,size_t,struct stc_secret*)=niwj_secret_take;
++#else
++int (*stc_secret_hook)(const uint8_t*,size_t,struct stc_secret*);
++#endif
++static struct {const struct stc*owner;unsigned sae_step,sae_tokens,akm,pmf,pmf_flags,pmf_keys,authorized,unprotected_seen;} stc_x;
++static struct nwq stc_q;      /* handshake engine of the extension's transaction */
++static struct nsae stc_sae;
++static unsigned stc_sae_retreat; /* an SAE attempt ended before authorization: the next one prefers the WPA2 alternative */
++#define X(s) (stc_x.owner==(s))
++#define W(s,member) (X(s)?stc_q.member:(s)->wpa.member)
++static void x_release(const struct stc*s){if(X(s)){nwq_cancel(&stc_q);nsae_cancel(&stc_sae);erase(&stc_x,sizeof stc_x);}}
++static void w_cancel(struct stc*s){nwp_cancel(&s->wpa);if(X(s)){if(stc_x.akm==NWP_AKM_SAE&&!stc_x.authorized)stc_sae_retreat=1;nwq_cancel(&stc_q);nsae_cancel(&stc_sae);stc_x.sae_step=0;}}
++static int w_keys_ready(struct stc*s,uint64_t gen,unsigned mask){return X(s)?nwq_keys_ready(&stc_q,gen,stc_q.install_ticket,mask,1):nwp_keys_ready(&s->wpa,gen,s->wpa.install_ticket,mask,1);}
+ int stc_scan_acquire(struct stc_arbiter*a,uint64_t g){if(!a||!g||a->mode)return -1;a->mode=1;a->generation=g;return 0;}
+ int stc_scan_release(struct stc_arbiter*a,uint64_t g){if(!a||a->mode!=1||a->generation!=g)return -1;a->mode=0;a->generation=0;return 0;}
+ static int emit(struct stc*s,unsigned phase,unsigned kind){
+  erase(&s->action,sizeof s->action);s->phase=phase;
+- if(s->serial==UINT64_MAX){s->phase=STC_HALTED;nwp_cancel(&s->wpa);return -1;}
++ if(s->serial==UINT64_MAX){s->phase=STC_HALTED;w_cancel(s);return -1;}
+  s->action.generation=s->generation;s->action.ticket=++s->serial;s->action.kind=kind;return 1;
+ }
+-static int halt(struct stc*s){if(s->outcome==STC_AUTHORIZED)s->outcome=STC_FAILED;erase(s->queued_eapol,sizeof s->queued_eapol);nwp_cancel(&s->wpa);erase(&s->action,sizeof s->action);erase(s->response,sizeof s->response);s->phase=STC_HALTED;return -1;}
++static int halt(struct stc*s){if(s->outcome==STC_AUTHORIZED)s->outcome=STC_FAILED;erase(s->queued_eapol,sizeof s->queued_eapol);w_cancel(s);erase(&s->action,sizeof s->action);erase(s->response,sizeof s->response);s->phase=STC_HALTED;return -1;}
+ static int release_done(struct stc*s){
+  if(!s->arbiter||s->arbiter->mode!=2||s->arbiter->generation!=s->generation)return halt(s);
+  s->arbiter->mode=0;s->arbiter->generation=0;s->authenticated=s->associated=0;s->phase=STC_DONE;erase(&s->action,sizeof s->action);erase(&s->peer,sizeof s->peer);return 1;
+@@ -31,10 +54,14 @@
+ static int stop(struct stc*,unsigned);
+ static int command_key(struct stc*s,int group,int remove){
+  struct sw_key k={0};size_t used=0;int slot=group?group_slot(s,s->gtk_index):s->sta_wlan;if(slot<0)return stop(s,STC_FAILED);k.bss=s->channel.bss;k.wlan=(uint8_t)slot;k.pairwise=!group;k.key_id=group?s->gtk_index:0;memcpy(k.ap,s->peer.ap,6);
+- if(!remove){k.key=group?s->wpa.gtk:s->wpa.tk;k.key_len=16;if(!group)s->ptk_attempted=1;}
++ if(!remove){k.key=group?W(s,gtk):W(s,tk);k.key_len=16;if(!group)s->ptk_attempted=1;
++  /* The CI owner reads the GTK index and RSC for the replay lane from the embedded engine. */
++  if(group&&X(s)){s->wpa.gtk_index=stc_q.gtk_index;memcpy(s->wpa.rsc,stc_q.rsc,8);}}
+  if(emit(s,remove?(group?STC_REMOVE_GTK:STC_REMOVE_PTK):(group?STC_GTK:STC_PTK),remove?(group?STC_DELETE_GTK:STC_DELETE_PTK):(group?(s->group_active?STC_REKEY_GTK:STC_CID_GTK):STC_CID_PTK))<0)return -1;
+  int r=remove?sw_key_remove(s->action.payload,sizeof s->action.payload,&used,&k):sw_key_add(s->action.payload,sizeof s->action.payload,&used,&k);
+- if(r)return halt(s);s->action.bytes=(unsigned)used;return 1;
++ if(r)return halt(s);s->action.bytes=(unsigned)used;
++ if(!remove&&!group&&X(s)&&stc_x.pmf&&(stc_x.pmf_flags&STC_PMF_PTK_PROTECTION))s->action.payload[SW_OFF_CMD_802_11_KEY_ucMgmtProtection]=1;
++ return 1;
+ }
+ static int abort_channel(struct stc*s){s->channel_held=0;struct sw_channel c=s->channel;c.abort=1;size_t used=0;if(emit(s,STC_RELEASE,STC_ABORT_CHANNEL)<0)return -1;if(sw_channel(s->action.payload,sizeof s->action.payload,&used,&c))return halt(s);s->action.bytes=(unsigned)used;return 1;}
+ static int cleanup_next(struct stc*s){
+@@ -51,7 +78,7 @@
+ }
+ static int stop(struct stc*s,unsigned outcome){
+  if(s->phase>=STC_DEAUTH)return 0;
+- s->outcome=outcome;if(s->last_ms>UINT64_MAX-s->cleanup_timeout_ms)return halt(s);s->cleanup_deadline=s->last_ms+s->cleanup_timeout_ms;nwp_cancel(&s->wpa);erase(s->ssid,sizeof s->ssid);erase(s->rates,sizeof s->rates);erase(s->response,sizeof s->response);erase(s->queued_eapol,sizeof s->queued_eapol);s->eapol_pending=s->eapol_bytes=0;s->response_bytes=s->response_seen=0;
++ s->outcome=outcome;if(s->last_ms>UINT64_MAX-s->cleanup_timeout_ms)return halt(s);s->cleanup_deadline=s->last_ms+s->cleanup_timeout_ms;w_cancel(s);erase(s->ssid,sizeof s->ssid);erase(s->rates,sizeof s->rates);erase(s->response,sizeof s->response);erase(s->queued_eapol,sizeof s->queued_eapol);s->eapol_pending=s->eapol_bytes=0;s->response_bytes=s->response_seen=0;
+  if(s->phase<STC_EAPOL){s->cleanup_abort_first=s->channel_held;if(!s->associated)s->authenticated=0;}
+ 
+  erase(&s->action,sizeof s->action);return cleanup_next(s);
+@@ -64,12 +91,12 @@
+  if(now<s->last_ms)return halt(s);s->last_ms=now;
+  if(s->phase>=STC_DEAUTH){if(now>=s->cleanup_deadline)return halt(s);return 0;}
+  if(s->group_active&&now>=s->group_deadline)return stop(s,STC_TIMEOUT);
+- if(s->outcome!=STC_AUTHORIZED&&now>=s->deadline)return stop(s,STC_TIMEOUT);
++ if(s->outcome!=STC_AUTHORIZED&&now>=s->deadline){if(X(s)&&stc_x.sae_step)printf("NORD2 WIFI SAE: join deadline in step %u (1 commit, 2 confirm), phase %u\n",stc_x.sae_step,s->phase);return stop(s,STC_TIMEOUT);}
+  /* Start response timer only after authoritative air completion. Two total
+   * requests per stage, always within the actual remaining grant deadline. */
+  if((s->phase==STC_AUTH_RX||s->phase==STC_ASSOC_RX)&&!s->response_seen&&s->response_deadline&&now>=s->response_deadline){
+   unsigned attempts=s->phase==STC_AUTH_RX?s->auth_attempts:s->assoc_attempts;
+-  if(attempts>=2)return stop(s,STC_TIMEOUT);
++  if(attempts>=(X(s)?3u:2u)){if(X(s)&&stc_x.sae_step)printf("NORD2 WIFI SAE: no answer to %s after %u transmissions\n",stc_x.sae_step==1?"commit":"confirm",attempts);return stop(s,STC_TIMEOUT);}
+   return s->phase==STC_AUTH_RX?send_auth(s):send_assoc(s);
+  }
+  return 0;
+@@ -82,19 +109,73 @@
+  if(!s||!a||!c||s->attempted||a->mode||a->connection_used||!c->generation||c->deadline_ms<=now||!c->cleanup_timeout_ms||c->security>SW_SECURITY_OPEN||c->assoc.security!=c->security||c->sta_wlan==255||c->group_wlan==255||c->sta_wlan==c->group_wlan)return -1;
+  uint8_t preflight[640];size_t used;
+  if(sw_auth(preflight,sizeof preflight,&used,&c->assoc.peer)||sw_assoc(preflight,sizeof preflight,&used,&c->assoc)||sw_channel(preflight,sizeof preflight,&used,&c->channel)||c->channel.abort)return -1;
++ x_release(s);
+  memset(s,0,sizeof *s);s->attempted=1;s->generation=c->generation;s->last_ms=now;s->deadline=c->deadline_ms;s->cleanup_timeout_ms=c->cleanup_timeout_ms;
+  s->security=c->security;
+- if(c->security==SW_SECURITY_OPEN){if(c->pmk||c->station_rsn||c->ap_rsn||c->ap_rsn_bytes||c->rng){erase(s,sizeof *s);s->attempted=1;return -1;}}
+- else if(nwp_begin_ap(&s->wpa,c->generation,c->pmk,c->assoc.peer.self,c->assoc.peer.ap,c->station_rsn,c->ap_rsn,c->ap_rsn_bytes?c->ap_rsn_bytes:22,c->rng,c->rng_context)||nwp_copy_ap_rsnxe(&s->wpa,c->ap_ies,c->ap_ies_bytes)){erase(s,sizeof *s);s->attempted=1;return -1;}
+- for(unsigned k=0;k<3;k++){unsigned x=c->group_spare[k];if(x&&(x<6||x==c->sta_wlan||x==c->group_wlan)){erase(s,sizeof *s);s->attempted=1;return -1;}for(unsigned j=0;j<k;j++)if(x&&x==c->group_spare[j]){erase(s,sizeof *s);s->attempted=1;return -1;}s->group_spare[k]=(uint8_t)x;}
++ if(c->security==SW_SECURITY_OPEN){if(c->pmk||c->station_rsn||c->ap_rsn||c->ap_rsn_bytes||c->rng){x_release(s);erase(s,sizeof *s);s->attempted=1;return -1;}}
++ else{
++  struct stc_secret secret;struct nwp_profile f={0};int bad=0;unsigned profile=0;
++  if(stc_secret_hook&&stc_secret_hook(c->assoc.ssid,c->assoc.ssid_len,&secret)==1){
++   /* SAE first when the request asked for it; otherwise only when the AP leaves no alternative. */
++   unsigned allow=secret.allow&7u;if(!secret.bytes)allow&=~STC_ALLOW_SAE;
++   unsigned first=allow;
++   if(!(allow&STC_ALLOW_SAE)||!(secret.allow&STC_SAE_REQUESTED))first&=~STC_ALLOW_SAE;
++   else if(stc_sae_retreat&&(allow&(STC_ALLOW_LEGACY|STC_ALLOW_PMF))){first&=~STC_ALLOW_SAE;printf("NORD2 WIFI SAE: the previous SAE attempt failed; this attempt prefers the WPA2 alternative\n");}
++   bad=!c->ap_rsn||((!first||nwq_negotiate(c->ap_rsn,c->ap_rsn_bytes,c->ap_ies,c->ap_ies_bytes,first,&f))&&nwq_negotiate(c->ap_rsn,c->ap_rsn_bytes,c->ap_ies,c->ap_ies_bytes,allow,&f));
++   profile=!bad&&!(f.akm==NWP_AKM_PSK&&!f.pmf);
++   printf("NORD2 WIFI SAE: profile akm=%u pmf=%u required=%u h2e=%u allow=%#x pmf_flags=%#x%s\n",f.akm,f.pmf,f.pmf_required,f.h2e,secret.allow,secret.pmf_flags,bad?" (no acceptable AKM: join refused)":"");
++   if(!bad&&f.akm!=NWP_AKM_SAE)stc_sae_retreat=0;
++   if(profile){
++    unsigned sae=f.akm==NWP_AKM_SAE;
++    bad=!c->rng||(!sae&&!c->pmk)||nwq_begin(&stc_q,c->generation,sae?0:c->pmk,c->assoc.peer.self,c->assoc.peer.ap,&f,c->ap_rsn,c->ap_rsn_bytes,c->rng,c->rng_context)||nwq_copy_ap_rsnxe(&stc_q,c->ap_ies,c->ap_ies_bytes);
++    if(!bad&&sae){
++     printf("NORD2 WIFI SAE: deriving password element (%s), group 19\n",f.h2e?"hash-to-element":"hunting-and-pecking");
++     bad=nsae_begin(&stc_sae,c->assoc.peer.self,c->assoc.peer.ap,secret.password,secret.bytes,c->assoc.ssid,c->assoc.ssid_len,f.h2e,c->rng,c->rng_context);
++     printf("NORD2 WIFI SAE: commit %s\n",bad?"preparation failed":"prepared");
++    }
++    if(!bad){stc_x.owner=s;stc_x.akm=f.akm;stc_x.pmf=f.pmf;stc_x.pmf_flags=secret.pmf_flags;stc_x.sae_step=sae;}
++    else{nwq_cancel(&stc_q);nsae_cancel(&stc_sae);}
++   }
++  }
++  erase(&secret,sizeof secret);
++  if(bad||(!profile&&(nwp_begin_ap(&s->wpa,c->generation,c->pmk,c->assoc.peer.self,c->assoc.peer.ap,c->station_rsn,c->ap_rsn,c->ap_rsn_bytes?c->ap_rsn_bytes:22,c->rng,c->rng_context)||nwp_copy_ap_rsnxe(&s->wpa,c->ap_ies,c->ap_ies_bytes)))){x_release(s);erase(s,sizeof *s);s->attempted=1;return -1;}
++ }
++ for(unsigned k=0;k<3;k++){unsigned x=c->group_spare[k];if(x&&(x<6||x==c->sta_wlan||x==c->group_wlan)){x_release(s);erase(s,sizeof *s);s->attempted=1;return -1;}for(unsigned j=0;j<k;j++)if(x&&x==c->group_spare[j]){x_release(s);erase(s,sizeof *s);s->attempted=1;return -1;}s->group_spare[k]=(uint8_t)x;}
+  s->arbiter=a;a->mode=2;a->connection_used=1;a->generation=c->generation;s->peer=c->assoc.peer;s->channel=c->channel;s->sta_wlan=c->sta_wlan;s->group_wlan=c->group_wlan;s->assoc=c->assoc;
+  memcpy(s->ssid,c->assoc.ssid,c->assoc.ssid_len);memcpy(s->rates,c->assoc.rates,c->assoc.rates_len);s->assoc.ssid=s->ssid;s->assoc.rates=s->rates;s->peer_prepared=1;return emit(s,STC_PREPARE,STC_PREPARE_PEER);
+ }
+ const struct stc_action*stc_next(const struct stc*s){return s&&s->action.kind?&s->action:0;}
+-static int send_auth(struct stc*s){size_t n=0;s->response_seen=0;s->response_deadline=0;s->auth_attempts++;if(emit(s,STC_AUTH_TX,STC_TX_AUTH)<0)return -1;if(sw_auth(s->action.payload,sizeof s->action.payload,&n,&s->peer))return stop(s,STC_FAILED);s->action.bytes=(unsigned)n;return 1;}
+-static int send_assoc(struct stc*s){size_t n=0;s->response_seen=0;s->response_deadline=0;s->assoc_attempts++;if(emit(s,STC_ASSOC_TX,STC_TX_ASSOC)<0)return -1;if(sw_assoc(s->action.payload,sizeof s->action.payload,&n,&s->assoc))return stop(s,STC_FAILED);s->action.bytes=(unsigned)n;return 1;}
++static int send_auth(struct stc*s){size_t n=0;s->response_seen=0;s->response_deadline=0;s->auth_attempts++;if(emit(s,STC_AUTH_TX,STC_TX_AUTH)<0)return -1;
++ if(X(s)&&stc_x.sae_step){
++  uint8_t body[SW_SAE_BODY_MAX];size_t used=0;unsigned step=stc_x.sae_step;
++  int e=step==1?nsae_commit(&stc_sae,body,sizeof body,&used):nsae_confirm(&stc_sae,body,sizeof body,&used);
++  if(!e)e=sw_auth_sae(s->action.payload,sizeof s->action.payload,&n,&s->peer,step,step==1&&stc_sae.h2e?NSAE_STATUS_H2E:0,body,used);
++  erase(body,sizeof body);
++  if(e){printf("NORD2 WIFI SAE: could not build the %s frame\n",step==1?"commit":"confirm");return stop(s,STC_FAILED);}
++  printf("NORD2 WIFI SAE: %s sent to the radio (transmission %u, %u bytes, h2e=%u, token=%u)\n",step==1?"commit":"confirm",s->auth_attempts,(unsigned)n,stc_sae.h2e,stc_sae.token_bytes);
++  s->action.bytes=(unsigned)n;return 1;
++ }
++ if(sw_auth(s->action.payload,sizeof s->action.payload,&n,&s->peer))return stop(s,STC_FAILED);s->action.bytes=(unsigned)n;return 1;}
++static int send_assoc(struct stc*s){size_t n=0;s->response_seen=0;s->response_deadline=0;s->assoc_attempts++;if(emit(s,STC_ASSOC_TX,STC_TX_ASSOC)<0)return -1;if(X(s)?sw_assoc_rsn(s->action.payload,sizeof s->action.payload,&n,&s->assoc,stc_q.own_rsn,stc_q.own_rsn_bytes,stc_q.own_rsnxe,stc_q.own_rsnxe_bytes):sw_assoc(s->action.payload,sizeof s->action.payload,&n,&s->assoc))return stop(s,STC_FAILED);s->action.bytes=(unsigned)n;return 1;}
+ static int response_done(struct stc*s){
+  if(!s->response_seen)return 0;
++ if(s->phase==STC_AUTH_RX&&X(s)&&stc_x.sae_step==1){
++  unsigned status=le16(s->response+28),bytes=s->response_bytes-30;const uint8_t*body=s->response+30;
++  if(status==NSAE_STATUS_TOKEN){
++   if(stc_x.sae_tokens++>=2||nsae_token(&stc_sae,body,bytes)){printf("NORD2 WIFI SAE: anti-clogging token request refused (round %u, %u bytes)\n",stc_x.sae_tokens,bytes);return stop(s,STC_FAILED);}
++   printf("NORD2 WIFI SAE: anti-clogging token received (%u bytes), commit repeated\n",stc_sae.token_bytes);s->auth_attempts=0;return send_auth(s);
++  }
++  if(nsae_peer_commit(&stc_sae,body,bytes)){printf("NORD2 WIFI SAE: peer commit invalid (group/scalar/element, %u bytes)\n",bytes);return stop(s,STC_FAILED);}
++  printf("NORD2 WIFI SAE: peer commit ok, keys derived\n");stc_x.sae_step=2;s->auth_attempts=0;erase(s->response,sizeof s->response);return send_auth(s);
++ }
++ if(s->phase==STC_AUTH_RX&&X(s)&&stc_x.sae_step==2){
++  if(nsae_peer_confirm(&stc_sae,s->response+30,s->response_bytes-30)){printf("NORD2 WIFI SAE: confirm mismatch (wrong password?)\n");return stop(s,STC_FAILED);}
++  printf("NORD2 WIFI SAE: confirm ok\n");
++  int e=nwq_set_pmk(&stc_q,s->generation,stc_sae.pmk);nsae_cancel(&stc_sae);
++  if(e)return stop(s,STC_FAILED);
++  stc_x.sae_step=0;erase(s->response,sizeof s->response);
++  printf("NORD2 WIFI SAE: PMK done, associating with AKM 8 (pmf=%u)\n",stc_x.pmf);
++ }
+  if(s->phase==STC_AUTH_RX){s->authenticated=1;return send_assoc(s);}
+  if(s->phase==STC_ASSOC_RX){s->associated=1;if(emit(s,STC_CONFIGURE,STC_CONFIGURE_PEER)<0)return -1;memcpy(s->action.payload,s->response,s->response_bytes);s->action.bytes=s->response_bytes;s->response_seen=0;erase(s->response,sizeof s->response);return 1;}
+  return 0;
+@@ -125,7 +206,7 @@
+   * barrier. A negative air result must still run actual key/peer cleanup.
+   * Failed command deletion/retirement remains fatal. Native unknown-DMA
+   * failures never deliver an air receipt and keep their retained halt. */
+- if(success!=1){if(phase==STC_DEAUTH)return cleanup_next(s);if(phase>=STC_DEAUTH)return halt(s);return stop(s,STC_FAILED);}
++ if(success!=1){if(phase==STC_DEAUTH)return cleanup_next(s);if(phase>=STC_DEAUTH)return halt(s);if(X(s)&&stc_x.sae_step)printf("NORD2 WIFI SAE: %s transmission failed\n",stc_x.sae_step==1?"commit":"confirm");return stop(s,STC_FAILED);}
+  size_t n=0;
+  switch(phase){
+  case STC_PREPARE:s->channel_held=1;if(emit(s,STC_CHANNEL,STC_CID_CHANNEL)<0)return -1;if(sw_channel(s->action.payload,sizeof s->action.payload,&n,&s->channel))return stop(s,STC_FAILED);s->action.bytes=(unsigned)n;return 1;
+@@ -133,10 +214,11 @@
+  case STC_AUTH_TX:s->phase=STC_AUTH_RX;s->response_deadline=now>UINT64_MAX-524?UINT64_MAX:now+524;return response_done(s);
+  case STC_ASSOC_TX:s->phase=STC_ASSOC_RX;s->response_deadline=now>UINT64_MAX-524?UINT64_MAX:now+524;return response_done(s);
+  case STC_CONFIGURE:/* Actual peer/BSS/RLM and station-activation receipt, no invented grant release. */if(s->security==SW_SECURITY_OPEN)return emit(s,STC_DATA,STC_INSTALL_DATA_PATH);s->phase=STC_EAPOL;return consume_eapol(s,now);
+- case STC_EAPOL_TX:{int r=nwp_security_submitted(&s->wpa,gen,s->wpa_tx_ticket,1);s->wpa_tx_ticket=0;if(r==NWP_INSTALL){s->gtk_index=s->wpa.gtk_index;return command_key(s,0,0);}if(r<0)return stop(s,STC_FAILED);if(s->group_active){s->group_active=0;s->group_deadline=0;}s->phase=s->resume_phase;s->resume_phase=0;if(s->phase==STC_PTK_READY&&s->key_event_seen){if(nwp_keys_ready(&s->wpa,gen,s->wpa.install_ticket,1,1)<0)return stop(s,STC_FAILED);return command_key(s,1,0);}return consume_eapol(s,now);}
+- case STC_PTK:s->phase=STC_PTK_READY;if(s->key_event_seen){if(nwp_keys_ready(&s->wpa,gen,s->wpa.install_ticket,1,1)<0)return stop(s,STC_FAILED);return command_key(s,1,0);}return consume_eapol(s,now); /* submission, not key-ready */
+- case STC_GTK:if(s->group_active){struct nwp_result r;int v=nwp_group_ready(&s->wpa,gen,s->wpa.group_ticket,1,&r);if(v!=NWP_TX){erase(&r,sizeof r);return stop(s,STC_FAILED);}return group_tx(s,&r);}/* Source no-response host completion/replay initialization, NOT firmware ACK. */if(nwp_keys_ready(&s->wpa,gen,s->wpa.install_ticket,2,1)<0)return stop(s,STC_FAILED);return emit(s,STC_DATA,STC_INSTALL_DATA_PATH);
+- case STC_DATA:if(s->security==SW_SECURITY_OPEN){s->phase=STC_CONNECTED;s->outcome=STC_AUTHORIZED;return 1;}if(nwp_keys_ready(&s->wpa,gen,s->wpa.install_ticket,4,1)!=NWP_AUTH)return stop(s,STC_FAILED);s->phase=STC_CONNECTED;s->outcome=STC_AUTHORIZED;return consume_eapol(s,now);
++ case STC_EAPOL_TX:{int r=X(s)?nwq_security_submitted(&stc_q,gen,s->wpa_tx_ticket,1):nwp_security_submitted(&s->wpa,gen,s->wpa_tx_ticket,1);s->wpa_tx_ticket=0;if(r==NWP_INSTALL){s->gtk_index=W(s,gtk_index);return command_key(s,0,0);}if(r<0)return stop(s,STC_FAILED);if(s->group_active){s->group_active=0;s->group_deadline=0;}s->phase=s->resume_phase;s->resume_phase=0;if(s->phase==STC_PTK_READY&&s->key_event_seen){if(w_keys_ready(s,gen,1)<0)return stop(s,STC_FAILED);return command_key(s,1,0);}return consume_eapol(s,now);}
++ case STC_PTK:s->phase=STC_PTK_READY;if(X(s))stc_x.pmf_keys=1;if(s->key_event_seen){if(w_keys_ready(s,gen,1)<0)return stop(s,STC_FAILED);return command_key(s,1,0);}return consume_eapol(s,now); /* submission, not key-ready */
++ case STC_GTK:if(s->group_active){struct nwp_result r;int v=X(s)?nwq_group_ready(&stc_q,gen,stc_q.group_ticket,1,&r):nwp_group_ready(&s->wpa,gen,s->wpa.group_ticket,1,&r);if(v!=NWP_TX){erase(&r,sizeof r);return stop(s,STC_FAILED);}return group_tx(s,&r);}/* Source no-response host completion/replay initialization, NOT firmware ACK. */if(w_keys_ready(s,gen,2)<0)return stop(s,STC_FAILED);return emit(s,STC_DATA,STC_INSTALL_DATA_PATH);
++ case STC_DATA:if(s->security==SW_SECURITY_OPEN){s->phase=STC_CONNECTED;s->outcome=STC_AUTHORIZED;return 1;}if(w_keys_ready(s,gen,4)!=NWP_AUTH)return stop(s,STC_FAILED);s->phase=STC_CONNECTED;s->outcome=STC_AUTHORIZED;
++  if(X(s)){stc_x.authorized=1;if(stc_x.akm==NWP_AKM_SAE)stc_sae_retreat=0;printf("NORD2 WIFI SAE: authorized (akm=%u pmf=%u igtk=%u)\n",stc_x.akm,stc_x.pmf,stc_q.igtk_ready);}return consume_eapol(s,now);
+  case STC_DEAUTH:case STC_REMOVE_PTK:case STC_REMOVE_GTK:case STC_RETIRE:case STC_RELEASE:return cleanup_next(s);
+  default:return halt(s);
+  }
+@@ -148,27 +230,54 @@
+ int stc_management(struct stc*s,uint64_t gen,const uint8_t*p,size_t n,uint64_t now){
+  if(!current(s,gen,now)||!p||n<24)return 0;
+  unsigned fc=le16(p);if((fc&0x4703)||memcmp(p+4,s->peer.self,6)||memcmp(p+10,s->peer.ap,6)||memcmp(p+16,s->peer.ap,6))return 0;
+- if((fc&0xfc)==0xc0||(fc&0xfc)==0xa0){if(n<26)return 0;s->authenticated=0;return stop(s,STC_DISCONNECTED);}
++ if((fc&0xfc)==0xc0||(fc&0xfc)==0xa0){if(n<26)return 0;
++  /* 0433 PMF: the CI transport delivers only unprotected management frames.
++   * By default they keep their pre-PMF meaning (the link ends); with
++   * STC_PMF_IGNORE_UNPROTECTED they are ignored once the pairwise key is
++   * installed and only the firmware's link-loss event ends the link. */
++  if(X(s)&&stc_x.pmf&&stc_x.pmf_keys&&s->phase<STC_DEAUTH){
++   unsigned ignore=(stc_x.pmf_flags&STC_PMF_IGNORE_UNPROTECTED)!=0;
++   if(stc_x.unprotected_seen<4){stc_x.unprotected_seen++;printf("NORD2 WIFI PMF: unprotected %s reason %u %s (%u)\n",(fc&0xfc)==0xc0?"deauth":"disassoc",le16(p+24),ignore?"ignored":"honoured",stc_x.unprotected_seen);}
++   if(ignore)return 0;
++  }
++  s->authenticated=0;return stop(s,STC_DISCONNECTED);}
+  int auth=s->phase==STC_AUTH_TX||s->phase==STC_AUTH_RX,assoc=s->phase==STC_ASSOC_TX||s->phase==STC_ASSOC_RX;
+  if((!auth&&!assoc)||s->response_seen)return 0;
+  if(n<30||n>sizeof s->response||(fc&0xfc)!=(auth?0xb0u:0x10u))return 0;
+- if(auth){if(le16(p+24)!=0||le16(p+26)!=2)return 0;for(size_t i=30;i<n;){if(n-i<2||p[i+1]>n-i-2)return 0;i+=2+p[i+1];}if(le16(p+28))return stop(s,STC_FAILED);}
+- else{if(le16(p+26)||(s->security==SW_SECURITY_OPEN&&(!(le16(p+24)&1)||(le16(p+24)&16))))return stop(s,STC_FAILED);unsigned aid=le16(p+28)&0x3fff;if(!aid||aid>2007)return stop(s,STC_FAILED);for(size_t i=30;i<n;){if(n-i<2||p[i+1]>n-i-2)return stop(s,STC_FAILED);i+=2+p[i+1];}s->aid=(uint16_t)aid;}
++ if(auth&&X(s)&&stc_x.sae_step){
++  unsigned status=le16(p+28),step=stc_x.sae_step;
++  if(le16(p+24)!=3||le16(p+26)!=step)return 0; /* other algorithm or the other transaction: not for this step */
++  if(step==1&&status==NSAE_STATUS_TOKEN){if(n<33)return 0;}
++  else if(step==1&&status==NSAE_STATUS_GROUP){printf("NORD2 WIFI SAE: AP refuses group 19 (status 77, unsupported group)\n");return stop(s,STC_FAILED);}
++  else if(status!=(step==1&&stc_sae.h2e?NSAE_STATUS_H2E:0u)){printf("NORD2 WIFI SAE: %s rejected by the AP, status %u\n",step==1?"commit":"confirm",status);return stop(s,STC_FAILED);}
++  else if(n<(step==1?30u+NSAE_COMMIT_MIN:64u))return 0;
++  printf("NORD2 WIFI SAE: %s received (status %u, %u bytes)\n",step==1?(status==NSAE_STATUS_TOKEN?"token request":"commit"):"confirm",status,(unsigned)n);
++ }
++ else if(auth){if(le16(p+24)!=0||le16(p+26)!=2)return 0;for(size_t i=30;i<n;){if(n-i<2||p[i+1]>n-i-2)return 0;i+=2+p[i+1];}if(le16(p+28))return stop(s,STC_FAILED);}
++ else{
++  if(le16(p+26)==30&&X(s)&&stc_x.pmf&&s->assoc_attempts<3){ /* association comeback: the AP runs SA Query for an older association of this address */
++   unsigned tu=1000;for(size_t i=30;i+2<=n&&(size_t)p[i+1]+2<=n-i;i+=2u+p[i+1])if(p[i]==56&&p[i+1]==5&&p[i+2]==3)tu=le16(p+i+3)|le16(p+i+5)<<16;
++   if(tu<100)tu=100;if(tu>3000)tu=3000;
++   printf("NORD2 WIFI PMF: association comeback, retry in %u TU (attempt %u)\n",tu,s->assoc_attempts);
++   s->response_deadline=now>UINT64_MAX-tu-24?UINT64_MAX:now+tu+24;return 0;
++  }
++  if(le16(p+26)||(s->security==SW_SECURITY_OPEN&&(!(le16(p+24)&1)||(le16(p+24)&16))))return stop(s,STC_FAILED);unsigned aid=le16(p+28)&0x3fff;if(!aid||aid>2007)return stop(s,STC_FAILED);for(size_t i=30;i<n;){if(n-i<2||p[i+1]>n-i-2)return stop(s,STC_FAILED);i+=2+p[i+1];}s->aid=(uint16_t)aid;}
+  memcpy(s->response,p,n);s->response_bytes=(unsigned)n;s->response_seen=1;return response_done(s);
+ }
+ int stc_eapol(struct stc*s,uint64_t gen,const uint8_t*p,size_t n,uint64_t now){
+  if(!current(s,gen,now)||s->security==SW_SECURITY_OPEN||s->phase<STC_CONFIGURE||s->phase>=STC_DEAUTH)return 0;
+- if(!p||!n||n>640){nwpd_gate_observe(gen,s->action.ticket,s->wpa.state,p!=0,n);return stop(s,STC_FAILED);}
++ if(!p||!n||n>640){nwpd_gate_observe(gen,s->action.ticket,W(s,state),p!=0,n);return stop(s,STC_FAILED);}
+  if(s->phase!=STC_EAPOL&&s->phase!=STC_PTK_READY&&s->phase!=STC_CONNECTED){
+   if(s->eapol_pending)return s->eapol_bytes==n&&!memcmp(s->queued_eapol,p,n)?0:2;
+   memcpy(s->queued_eapol,p,n);s->eapol_bytes=(unsigned)n;s->eapol_pending=1;return 1;
+  }
+- unsigned resume=s->phase,security_state=s->wpa.state;struct nwp_result r;int result=nwp_receive(&s->wpa,p,n,&r);
++ unsigned resume=s->phase,security_state=W(s,state);struct nwp_result r;int result=X(s)?nwq_receive(&stc_q,p,n,&r):nwp_receive(&s->wpa,p,n,&r);
++ if(X(s)&&result<0)printf("NORD2 WIFI SAE: EAPOL-Key refused in state %u, failure %u (%u bytes)\n",security_state,r.failure,(unsigned)n);
+  nwpd_observe(gen,s->action.ticket,security_state,p,n,result,r.failure);
+  if(result<0){erase(&r,sizeof r);return stop(s,STC_FAILED);}
+- if((result==NWP_INSTALL||result==NWP_TX)&&s->wpa.group_phase){
++ if((result==NWP_INSTALL||result==NWP_TX)&&W(s,group_phase)){
+   if(!s->group_active){if(now>UINT64_MAX-10000){erase(&r,sizeof r);return stop(s,STC_FAILED);}s->group_active=1;s->group_deadline=now+10000;}
+-  if(result==NWP_INSTALL){s->gtk_index=(uint8_t)s->wpa.gtk_index;erase(&r,sizeof r);return command_key(s,1,0);}
++  if(result==NWP_INSTALL){s->gtk_index=(uint8_t)W(s,gtk_index);erase(&r,sizeof r);return command_key(s,1,0);}
+   return group_tx(s,&r);
+  }
+  if(result!=NWP_TX){erase(&r,sizeof r);return 0;}
+@@ -177,7 +286,7 @@
+ int stc_key_event(struct stc*s,uint64_t gen,const uint8_t*p,size_t n,uint64_t now){
+  if(!current(s,gen,now)||s->security==SW_SECURITY_OPEN||(s->phase!=STC_PTK_READY&&s->phase!=STC_PTK&&!(s->phase==STC_EAPOL_TX&&s->resume_phase==STC_PTK_READY))||!p||n!=8||p[0]!=s->channel.bss||memcmp(p+2,s->peer.ap,6))return 0;
+  s->key_event_seen=1;if(s->phase!=STC_PTK_READY)return 1;
+- if(nwp_keys_ready(&s->wpa,gen,s->wpa.install_ticket,1,1)<0)return stop(s,STC_FAILED);return command_key(s,1,0);
++ if(w_keys_ready(s,gen,1)<0)return stop(s,STC_FAILED);return command_key(s,1,0);
+ }
+ int stc_link_lost(struct stc*s,uint64_t gen,uint64_t now){if(!current(s,gen,now))return 0;s->authenticated=0;return stop(s,STC_DISCONNECTED);}
+ int stc_cancel(struct stc*s,uint64_t gen,uint64_t now){if(!current(s,gen,now))return 0;return stop(s,STC_CANCELED);}
+--- a/bsd/dev/wifi_station_transaction.h
++++ b/bsd/dev/wifi_station_transaction.h
+@@ -45,6 +45,24 @@
+  * PREPARE/CONFIGURE/RETIRE/DATA receipts are explicit future-adapter contracts,
+  * not evidence that these operations exist in the current installed runtime. */
+ int stc_begin(struct stc*,struct stc_arbiter*,const struct stc_config*,uint64_t now_ms);
++/* 0433 (WPA3-Personal SAE, PSK-SHA256, PMF negotiation). struct stc,
++ * struct stc_config and every structure they embed keep the CI layout: the
++ * binders and the CI owner/transport objects are not rebuilt for this. What a
++ * negotiated profile needs beyond them (SAE state, the wifi_wpa3 engine, PMF
++ * flags) lives in one static extension inside wifi_station_transaction.c,
++ * bound to the single transaction that began with a secret record; the
++ * native service runs one transaction at a time.
++ * stc_begin asks the hook for the record of its SSID (join decoder side
++ * channel: allowed AKM families, SAE password, PMF flags). 1 = record copied
++ * and consumed, 0 = none (legacy WPA2-PSK/CCMP with the configured PMK). */
++struct stc_secret {unsigned allow,bytes,pmf_flags;uint8_t password[64];};
++#define STC_ALLOW_LEGACY 1u        /* = NWP_ALLOW_* */
++#define STC_ALLOW_PMF 2u
++#define STC_ALLOW_SAE 4u
++#define STC_SAE_REQUESTED 8u       /* SAE first; without it SAE only when the AP leaves no alternative */
++#define STC_PMF_PTK_PROTECTION 1u  /* ucMgmtProtection=1 in the pairwise key command (gen4m); not hardware verified */
++#define STC_PMF_IGNORE_UNPROTECTED 2u /* ignore unprotected deauth/disassoc once the pairwise key is installed */
++extern int (*stc_secret_hook)(const uint8_t*ssid,size_t,struct stc_secret*);
+ const struct stc_action*stc_next(const struct stc*);
+ int stc_submitted(struct stc*,uint64_t generation,uint64_t ticket);
+ int stc_receipt(struct stc*,uint64_t generation,uint64_t ticket,int success,uint64_t now_ms);
+--- a/bsd/dev/wifi_station_wire.c
++++ b/bsd/dev/wifi_station_wire.c
+@@ -191,6 +191,12 @@
+         if(fc!=0xb0&&fc!=0&&fc!=0xc0)return SW_INVALID;
+         if(fc==0xc0&&(len!=26||rd16(frame+24)!=3))return SW_INVALID;
+         if(fc==0&&len<28)return SW_INVALID;
++        /* 0433: SAE authentication (algorithm 3): transaction 1 commit with status
++         * 0 or 126 (hash-to-element), transaction 2 confirm; payload 34..360. */
++        if(fc==0xb0&&rd16(frame+24)==3) {
++            if(len<64||len>390||rd16(frame+26)<1||rd16(frame+26)>2||
++               (rd16(frame+28)&&(rd16(frame+28)!=126||rd16(frame+26)!=1)))return SW_INVALID;
++        } else
+         if(fc==0xb0&&(len!=30||rd16(frame+24)||rd16(frame+26)!=1||rd16(frame+28)))return SW_INVALID;
+     }
+     life=(p->lifetime_ms*1000u/1024u)>>6;
+--- /dev/null
++++ b/bsd/dev/wifi_station_wire2.c
+@@ -0,0 +1,61 @@
++#include <arm64/sweet_early.h>
++#if defined(NORD2)
++#include "wifi_station_wire2.h"
++#include <string.h>
++static void w2_le16(uint8_t *p,uint16_t v) {p[0]=(uint8_t)v;p[1]=(uint8_t)(v>>8);}
++static int w2_unicast(const uint8_t p[6]) {
++    unsigned i; uint8_t v=0;
++    if(p[0]&1)return 0;
++    for(i=0;i<6;i++)v|=p[i];
++    return v!=0;
++}
++static int w2_peer_ok(const struct sw_peer *p) {
++    return p&&w2_unicast(p->self)&&w2_unicast(p->ap)&&memcmp(p->self,p->ap,6);
++}
++static void w2_header(uint8_t *b,uint16_t fc,const struct sw_peer *p) {
++    w2_le16(b,fc);memcpy(b+4,p->ap,6);memcpy(b+10,p->self,6);memcpy(b+16,p->ap,6);
++}
++static int w2_finish(uint8_t *out,size_t cap,size_t *used,const uint8_t *b,size_t n) {
++    if(!out)return SW_INVALID;
++    if(cap<n)return SW_CAPACITY;
++    memcpy(out,b,n);*used=n;return SW_OK;
++}
++int sw_auth_sae(uint8_t *out,size_t cap,size_t *used,const struct sw_peer *p,unsigned transaction,unsigned status,const uint8_t *body,size_t n) {
++    uint8_t b[30+SW_SAE_BODY_MAX]={0};
++    if(!used)return SW_INVALID;
++    *used=0;
++    if(!w2_peer_ok(p)||!body||n<34||n>SW_SAE_BODY_MAX||transaction<1||transaction>2||
++       (status&&(status!=126||transaction!=1)))return SW_INVALID;
++    w2_header(b,0xb0,p);w2_le16(b+24,3);w2_le16(b+26,(uint16_t)transaction);w2_le16(b+28,(uint16_t)status);memcpy(b+30,body,n);
++    return w2_finish(out,cap,used,b,30+n);
++}
++static int w2_rate_ok(uint8_t r) {
++    switch(r&127) {case 2:case 4:case 11:case 22:case 12:case 18:case 24:
++    case 36:case 48:case 72:case 96:case 108:return 1;default:return 0;}
++}
++int sw_assoc_rsn(uint8_t *out,size_t cap,size_t *used,const struct sw_assoc *p,const uint8_t *rsn,size_t rsn_len,const uint8_t *rsnxe,size_t rsnxe_len) {
++    uint8_t b[144]={0};size_t i,j,n=28,first;
++    if(!used)return SW_INVALID;
++    *used=0;
++    if(!p||!w2_peer_ok(&p->peer)||!p->ssid||!p->ssid_len||
++       p->ssid_len>32||!p->rates||!p->rates_len||p->rates_len>12||
++       !p->listen_interval||p->security!=SW_SECURITY_WPA2||
++       (p->capability&0x11)!=0x11u||(p->capability&~0x0431u)||
++       !rsn||(rsn_len!=22&&rsn_len!=28)||rsn[0]!=48||rsn[1]!=rsn_len-2||
++       (rsnxe_len&&(!rsnxe||rsnxe_len!=3||rsnxe[0]!=244||rsnxe[1]!=1)))return SW_INVALID;
++    for(i=0;i<p->rates_len;i++) {
++        if(!w2_rate_ok(p->rates[i]))return SW_INVALID;
++        for(j=0;j<i;j++)if((p->rates[i]&127)==(p->rates[j]&127))return SW_INVALID;
++    }
++    w2_header(b,0,&p->peer);w2_le16(b+24,p->capability);w2_le16(b+26,p->listen_interval);
++    b[n++]=0;b[n++]=(uint8_t)p->ssid_len;memcpy(b+n,p->ssid,p->ssid_len);n+=p->ssid_len;
++    first=p->rates_len<8?p->rates_len:8;
++    b[n++]=1;b[n++]=(uint8_t)first;memcpy(b+n,p->rates,first);n+=first;
++    if(p->rates_len>8) {b[n++]=50;b[n++]=(uint8_t)(p->rates_len-8);
++        memcpy(b+n,p->rates+8,p->rates_len-8);n+=p->rates_len-8;}
++    memcpy(b+n,rsn,rsn_len);n+=rsn_len;
++    if(rsnxe_len){memcpy(b+n,rsnxe,3);n+=3;}
++    return w2_finish(out,cap,used,b,n);
++}
++
++#endif /* NORD2 */
+--- /dev/null
++++ b/bsd/dev/wifi_station_wire2.h
+@@ -0,0 +1,19 @@
++#ifndef STATION_WIRE2_H
++#define STATION_WIRE2_H
++#include "wifi_station_wire.h"
++/* 0433: frame builders for the negotiated profiles, in a new object. The CI
++ * codec wifi_station_wire.o changes only in its management TXD check (it now
++ * admits the SAE authentication frames built here); every structure of
++ * wifi_station_wire.h keeps its layout. Same rules: pure, disjoint buffers,
++ * on failure used=0 and the output is unchanged. */
++#define SW_SAE_BODY_MAX 360u
++/* SAE authentication frame (algorithm 3): transaction 1 commit with status 0
++ * or 126 (hash-to-element), transaction 2 confirm with status 0; body is the
++ * SAE payload after the three fixed fields (34..360 octets). */
++int sw_auth_sae(uint8_t *, size_t, size_t *, const struct sw_peer *, unsigned transaction,
++                unsigned status, const uint8_t *body, size_t);
++/* sw_assoc with the negotiated station RSN element (22 or 28 octets) and an
++ * optional RSNXE (0 or 3 octets) in place of the fixed WPA2-PSK element. */
++int sw_assoc_rsn(uint8_t *, size_t, size_t *, const struct sw_assoc *, const uint8_t *rsn, size_t,
++                 const uint8_t *rsnxe, size_t);
++#endif
+--- /dev/null
++++ b/bsd/dev/wifi_wpa3.c
+@@ -0,0 +1,291 @@
++#include <arm64/sweet_early.h>
++#if defined(NORD2)
++/* 0433: pairwise handshake and group-key renewal for the negotiated profiles
++ * the CI engine wifi_wpa2.o refuses: AKM 00-0F-AC:8 (SAE) and :6 (PSK-SHA256)
++ * with AES-128-CMAC / KDF-SHA256 (key descriptor versions 0 and 3), and
++ * AKM :2 with management frame protection (version 2, HMAC-SHA1 / PRF-SHA1).
++ * A new object: the WPA2-PSK path without PMF stays in the untouched CI
++ * member. Same rules as wifi_wpa2.h: pure, serialized by one owner, any
++ * NWP_FAIL wipes the engine. The IGTK of M3 / Group 1 is validated and kept
++ * here only: this image sends no BIP key command to the firmware. */
++#include "wifi_wpa3.h"
++#include "wifi_wpa_crypto.h"
++#include "wifi_sae_crypto.h"
++#if defined(KERNEL) || defined(_KERNEL)
++#include <sys/systm.h>
++#else
++#include <string.h>
++#endif
++static void q_wipe(void*v,size_t n){volatile uint8_t*p=v;while(n--)*p++=0;}
++static void q_hmac_sha1(const uint8_t*k,unsigned kn,const uint8_t*const*p,const unsigned*n,unsigned count,uint8_t out[20]){
++ size_t sizes[4];if(count>4){q_wipe(out,20);return;}for(unsigned i=0;i<count;i++)sizes[i]=n[i];(void)nwpc_hmac(k,kn,p,sizes,count,out);
++}
++static void q_mic_cmac(const uint8_t*k,const uint8_t*const*p,const unsigned*n,unsigned count,uint8_t out[16]){
++ size_t sizes[4];if(count>4){q_wipe(out,16);return;}for(unsigned i=0;i<count;i++)sizes[i]=n[i];(void)nsc_cmac(k,p,sizes,count,out);
++}
++static int q_aes_unwrap(const uint8_t*k,const uint8_t*p,unsigned n,uint8_t*out){size_t used=0;return nwpc_unwrap(k,p,n,out,NWP_FRAME,&used);}
++static unsigned q_be16(const uint8_t*p){return (unsigned)p[0]<<8|p[1];}
++static void q_put16(uint8_t*p,unsigned v){p[0]=(uint8_t)(v>>8);p[1]=(uint8_t)v;}
++static int q_equal(const uint8_t*a,const uint8_t*b,size_t n){unsigned d=0;for(size_t i=0;i<n;i++)d|=a[i]^b[i];return !d;}
++static int q_nonzero(const uint8_t*a,size_t n){unsigned d=0;for(size_t i=0;i<n;i++)d|=a[i];return !!d;}
++static unsigned q_le16(const uint8_t*p){return p[0]|(unsigned)p[1]<<8;}
++static int q_suite(const uint8_t*p,unsigned type){return p[0]==0&&p[1]==15&&p[2]==172&&p[3]==type;}
++/* Captured RSNXE must match authenticated M3. */
++int nwq_copy_ap_rsnxe(struct nwq*w,const uint8_t*p,size_t n){
++ if(!w||w->state!=NWP_M1||n>1024||(!p&&n))return -1;
++ unsigned found=0;const uint8_t*e=0;size_t z=0;
++ for(size_t at=0;at<n;){if(n-at<2||p[at+1]>n-at-2)return -1;
++  size_t bytes=p[at+1]+2u;
++  if(p[at]==244){if(found++||bytes<3||((p[at+2]&15u)+1u)!=p[at+1])return -1;e=p+at;z=bytes;}
++  at+=bytes;
++ }
++ q_wipe(w->ap_rsnxe,sizeof w->ap_rsnxe);w->ap_rsnxe_bytes=(unsigned)z;if(z)memcpy(w->ap_rsnxe,e,z);return 0;
++}
++/* M1 may carry a single plaintext PMKID KDE; no PMKSA cache or trust grant. */
++static int q_m1_data(const uint8_t*p,unsigned n){
++ unsigned seen=0;
++ for(unsigned at=0;at<n;){
++  if(p[at]==221&&(at+1==n||p[at+1]==0)){for(unsigned j=at+1;j<n;j++)if(p[j])return -1;return 0;}
++  if(n-at<22||seen++||p[at]!=221||p[at+1]!=20||!q_suite(p+at+2,4))return -1;
++  at+=22;
++ }return 0;
++}
++void nwq_cancel(struct nwq*w){if(w)q_wipe(w,sizeof(*w));}
++static int q_fail(struct nwq*w,struct nwp_result*r){nwq_cancel(w);if(r){q_wipe(r,sizeof(*r));r->failure=NWP_F_INTERNAL;}return NWP_FAIL;}
++static int q_failed(struct nwq*w,struct nwp_result*r,unsigned why){int v=q_fail(w,r);if(r)r->failure=why;return v;}
++/* ---- profile choice and begin ---- */
++struct rsn_view {unsigned akms,caps,group_management;};
++/* Full AP RSN element: CCMP group and pairwise offered, well formed tail. */
++static int q_rsn_view(const uint8_t*p,size_t n,struct rsn_view*v){
++ if(!p||n<20||n>257||p[0]!=48||p[1]+2u!=n||q_le16(p+2)!=1||!q_suite(p+4,4))return -1;
++ size_t at=8;unsigned count=q_le16(p+at),ccmp=0;at+=2;v->akms=v->caps=v->group_management=0;
++ if(!count||count>(n-at)/4)return -1;
++ for(unsigned i=0;i<count;i++,at+=4)ccmp|=q_suite(p+at,4);
++ if(!ccmp||n-at<2)return -1;count=q_le16(p+at);at+=2;
++ if(!count||count>(n-at)/4)return -1;
++ for(unsigned i=0;i<count;i++,at+=4)if(p[at]==0&&p[at+1]==15&&p[at+2]==172&&p[at+3]<32)v->akms|=1u<<p[at+3];
++ if(at==n)return 0;
++ if(n-at<2)return -1;v->caps=q_le16(p+at);at+=2;if(v->caps&2u)return -1;
++ if(at==n)return 0;
++ if(n-at<2)return -1;count=q_le16(p+at);at+=2;
++ if(count>(n-at)/16)return -1;at+=(size_t)count*16;
++ if(at==n)return 0;
++ if(n-at!=4||p[at]||p[at+1]!=15||p[at+2]!=172)return -1;
++ v->group_management=p[at+3];return 0;
++}
++static int q_profile_fits(const struct nwp_profile*f,const struct rsn_view*v){
++ if(!f||(f->akm!=NWP_AKM_PSK&&f->akm!=NWP_AKM_PSK_SHA256&&f->akm!=NWP_AKM_SAE)||f->pmf>1||f->pmf_required>1||f->h2e>1||
++    (f->pmf_required&&!f->pmf)||(f->h2e&&f->akm!=NWP_AKM_SAE)||!(v->akms&(1u<<f->akm)))return 0;
++ if(f->pmf)return (v->caps&128u)&&(!v->group_management||v->group_management==6)&&f->pmf_required==((v->caps&64u)!=0);
++ return !(v->caps&64u);
++}
++int nwq_negotiate(const uint8_t*ap,size_t n,const uint8_t*ies,size_t ies_bytes,unsigned allow,struct nwp_profile*out){
++ struct rsn_view v;struct nwp_profile f={0};unsigned h2e=0;
++ if(!out)return -1;
++ q_wipe(out,sizeof *out);
++ if(q_rsn_view(ap,n,&v)||ies_bytes>1024||(!ies&&ies_bytes))return -1;
++ for(size_t at=0;at<ies_bytes;){if(ies_bytes-at<2||ies[at+1]>ies_bytes-at-2)return -1;
++  if(ies[at]==244&&ies[at+1]>=1&&(ies[at+2]&32u))h2e=1;
++  at+=2u+ies[at+1];}
++ f.pmf=(v.caps&128u)!=0;f.pmf_required=(v.caps&64u)!=0;
++ if((allow&NWP_ALLOW_SAE)&&(v.akms&(1u<<NWP_AKM_SAE))){f.akm=NWP_AKM_SAE;f.h2e=h2e;}
++ else if((allow&NWP_ALLOW_LEGACY)&&(v.akms&(1u<<NWP_AKM_PSK))&&!f.pmf_required){f.akm=NWP_AKM_PSK;f.pmf=0;}
++ else if((allow&NWP_ALLOW_PMF)&&(v.akms&(1u<<NWP_AKM_PSK_SHA256)))f.akm=NWP_AKM_PSK_SHA256;
++ else if((allow&NWP_ALLOW_PMF)&&(v.akms&(1u<<NWP_AKM_PSK))&&f.pmf_required)f.akm=NWP_AKM_PSK;
++ else return -1;
++ if(f.pmf&&v.group_management&&v.group_management!=6)return -1; /* only BIP-CMAC-128 */
++ if(!q_profile_fits(&f,&v))return -1;
++ *out=f;return 0;
++}
++int nwq_station_rsn(const struct nwp_profile*f,uint8_t out[28],size_t*used){
++ static const uint8_t base[22]={48,20,1,0,0,15,172,4,1,0,0,15,172,4,1,0,0,15,172,2,0,0};
++ if(used)*used=0;
++ if(!f||!out||!used||(f->akm!=NWP_AKM_PSK&&f->akm!=NWP_AKM_PSK_SHA256&&f->akm!=NWP_AKM_SAE)||f->pmf>1||f->pmf_required>f->pmf)return -1;
++ memcpy(out,base,22);out[19]=(uint8_t)f->akm;
++ if(!f->pmf){*used=22;return 0;}
++ out[1]=26;out[20]=(uint8_t)(128u|(f->pmf_required?64u:0u));out[22]=out[23]=0;out[24]=0;out[25]=15;out[26]=172;out[27]=6;*used=28;return 0;
++}
++int nwq_begin(struct nwq*w,uint64_t gen,const uint8_t*pmk,const uint8_t own[6],const uint8_t peer[6],const struct nwp_profile*f,const uint8_t*ap,size_t ap_bytes,nwp_rng rng,void*ctx){
++ struct rsn_view v;size_t used=0;
++ if(!w)return -1;
++ nwq_cancel(w);
++ if(!gen||!own||!peer||!f||!ap||!rng||q_rsn_view(ap,ap_bytes,&v)||!q_profile_fits(f,&v)||(!pmk&&f->akm!=NWP_AKM_SAE)||
++    !q_nonzero(own,6)||!q_nonzero(peer,6)||(own[0]&1)||(peer[0]&1)||q_equal(own,peer,6)||nwq_station_rsn(f,w->own_rsn,&used))return -1;
++ w->generation=gen;memcpy(w->own,own,6);memcpy(w->peer,peer,6);memcpy(w->ap_rsn,ap,ap_bytes);w->ap_rsn_bytes=(unsigned)ap_bytes;
++ w->own_rsn_bytes=(unsigned)used;memcpy(w->rsn,w->own_rsn,22);
++ w->akm=f->akm;w->pmf=f->pmf;w->version=f->akm==NWP_AKM_PSK?2:f->akm==NWP_AKM_PSK_SHA256?3:0;
++ if(f->h2e){w->own_rsnxe[0]=244;w->own_rsnxe[1]=1;w->own_rsnxe[2]=32;w->own_rsnxe_bytes=3;}
++ if(pmk){memcpy(w->pmk,pmk,32);w->pmk_ready=1;}
++ if(rng(ctx,w->snonce,32)||!q_nonzero(w->snonce,32)){nwq_cancel(w);return -1;}
++ w->state=NWP_M1;return 0;
++}
++int nwq_set_pmk(struct nwq*w,uint64_t gen,const uint8_t pmk[32]){
++ if(!w||!pmk||gen!=w->generation||w->state!=NWP_M1||w->pmk_ready||w->akm!=NWP_AKM_SAE||!q_nonzero(pmk,32))return -1;
++ memcpy(w->pmk,pmk,32);w->pmk_ready=1;return 0;
++}
++static void q_derive_keys(struct nwq*w){
++ uint8_t data[76],keys[48];int m=memcmp(w->own,w->peer,6)<0,n=memcmp(w->snonce,w->anonce,32)<0;
++ memcpy(data,m?w->own:w->peer,6);memcpy(data+6,m?w->peer:w->own,6);
++ memcpy(data+12,n?w->snonce:w->anonce,32);memcpy(data+44,n?w->anonce:w->snonce,32);
++ if(w->akm==NWP_AKM_PSK)(void)nwpc_ptk(w->pmk,data,keys);else (void)nsc_ptk256(w->pmk,data,keys);
++ memcpy(w->kck,keys,16);memcpy(w->kek,keys+16,16);memcpy(w->tk,keys+32,16);q_wipe(keys,48);q_wipe(data,76);
++}
++static void q_mic(const struct nwq*w,const uint8_t*p,unsigned n,uint8_t*out){
++ const uint8_t z[16]={0},*pieces[3]={p,z,p+97};unsigned sizes[3]={81,16,n-97};uint8_t d[20];
++ if(w->akm!=NWP_AKM_PSK){q_mic_cmac(w->kck,pieces,sizes,3,out);return;}
++ q_hmac_sha1(w->kck,16,pieces,sizes,3,d);memcpy(out,d,16);q_wipe(d,20);
++}
++static int q_reply(struct nwq*w,const uint8_t*p,unsigned kind,struct nwp_result*r){
++ if(w->serial==UINT64_MAX)return q_fail(w,r);
++ unsigned data=w->own_rsn_bytes+w->own_rsnxe_bytes,n=kind==1?99+data:99;memset(r,0,sizeof(*r));r->frame[0]=p[0];r->frame[1]=3;q_put16(r->frame+2,n-4);r->frame[4]=2;
++ q_put16(r->frame+5,(kind==1?0x0108u:kind==4?0x0300u:0x0308u)|w->version);memcpy(r->frame+9,p+9,8);
++ if(kind==1){memcpy(r->frame+17,w->snonce,32);q_put16(r->frame+97,data);memcpy(r->frame+99,w->own_rsn,w->own_rsn_bytes);memcpy(r->frame+99+w->own_rsn_bytes,w->own_rsnxe,w->own_rsnxe_bytes);}
++ q_mic(w,r->frame,n,r->frame+81);r->action=NWP_TX;r->bytes=n;r->ticket=++w->serial;w->pending=r->ticket;w->tx_kind=kind;return NWP_TX;
++}
++static int q_kde(struct nwq*w,const uint8_t*p,unsigned n,const uint8_t*rsc){
++ unsigned at=0,have_rsn=0,have_gtk=0,have_rsnxe=0,have_igtk=0;
++ while(at<n){
++  if(p[at]==0xdd&&(at+1==n||p[at+1]==0)){
++   for(unsigned j=at+1;j<n;j++)if(p[j])return -1;
++   break;
++  }
++  if(n-at<2||p[at+1]>n-at-2)return -1;
++  unsigned len=p[at+1]+2;const uint8_t*e=p+at;
++  if(e[0]==48){if(have_rsn++||len!=w->ap_rsn_bytes||!q_equal(e,w->ap_rsn,len))return -1;}
++  else if(e[0]==244){if(have_rsnxe++||len!=w->ap_rsnxe_bytes||len<3||!q_equal(e,w->ap_rsnxe,len))return -1;}
++  else if(e[0]==221&&len>=6&&!(e[2]==0&&e[3]==15&&e[4]==172)){/* Bounded unknown vendor IE: no security state. */}
++  else if(e[0]==221&&w->pmf&&len>=6&&e[5]==9){ /* IGTK KDE: key ID 4/5, IPN, BIP-CMAC-128 key */
++   if(have_igtk++||len!=30||(e[6]!=4&&e[6]!=5)||e[7])return -1;
++   w->igtk_index=e[6];memcpy(w->ipn,e+8,6);memcpy(w->igtk,e+14,16);w->igtk_ready=1;
++  }
++  else if(e[0]==221&&len>=6&&e[5]!=1&&e[5]!=9){/* 0433: OCI/BIGTK and other RSN KDEs carry no state here. */}
++  else if(e[0]==221){
++   static const uint8_t oui[4]={0,15,172,1};
++   if(have_gtk++||len!=24||!q_equal(e+2,oui,4)||(e[6]&~7u)||e[7])return -1;
++   w->gtk_index=e[6]&3;memcpy(w->gtk,e+8,16);memcpy(w->rsc,rsc,8);
++  }else return -1;
++  at+=len;
++ }
++ return have_rsn==1&&have_gtk==1&&have_igtk==(w->pmf?1u:0u)&&have_rsnxe==(w->ap_rsnxe_bytes?1u:0u)?0:-1;
++}
++/* RSN group key data does not require M3's RSN/RSNXE repetition. Optional
++ * copies must still equal the authenticated association selection; PMF KDEs
++ * are not admitted. Ignore only bounded non-RSN vendor metadata. */
++static int q_group_kde(struct nwq*w,const uint8_t*p,unsigned n,uint8_t key[16],unsigned*index){
++ unsigned at=0,gtk=0,rsn=0,xe=0,igtk=0;
++ while(at<n){
++  if(p[at]==221&&(at+1==n||p[at+1]==0)){for(unsigned j=at+1;j<n;j++)if(p[j])return -1;break;}
++  if(n-at<2||p[at+1]>n-at-2)return -1;
++  unsigned z=p[at+1]+2u;const uint8_t*e=p+at;
++  if(e[0]==48){if(rsn++||z!=w->ap_rsn_bytes||!q_equal(e,w->ap_rsn,z))return -1;}
++  else if(e[0]==244){if(xe++||z!=w->ap_rsnxe_bytes||!q_equal(e,w->ap_rsnxe,z))return -1;}
++  else if(e[0]==221&&z>=6&&!(e[2]==0&&e[3]==15&&e[4]==172)){}
++  else if(e[0]==221&&w->pmf&&z>=6&&e[5]==9){
++   if(igtk++||z!=30||(e[6]!=4&&e[6]!=5)||e[7])return -1;
++   if(!q_equal(e+14,w->igtk,16)||e[6]!=w->igtk_index){w->igtk_index=e[6];memcpy(w->ipn,e+8,6);memcpy(w->igtk,e+14,16);w->igtk_fresh=1;}
++  }
++  else if(e[0]==221&&z>=6&&e[5]!=1&&e[5]!=9){}
++  else if(e[0]==221){if(gtk++||z!=24||!q_suite(e+2,1)||(e[6]&~7u)||e[7])return -1;*index=e[6]&3;memcpy(key,e+8,16);}
++  else return -1;
++  at+=z;
++ }
++ return gtk==1?0:-1;
++}
++static int q_group_receive(struct nwq*w,const uint8_t*p,unsigned n,struct nwp_result*r){
++ /* KeyLength is unused for RSN Group1; KDE validates the actual CCMP length.
++  * GNonce is not the original pairwise ANonce. Never compare them. */
++ if(w->state!=NWP_AUTHORIZED||!w->installed||w->ready_mask!=7)return q_failed(w,r,NWP_F_KEYINFO_STATE);
++ uint8_t sig[16];q_mic(w,p,n,sig);int valid=q_equal(sig,p+81,16);q_wipe(sig,sizeof sig);
++ if(!valid)return q_failed(w,r,NWP_F_MIC);
++ int replay=memcmp(p+9,w->rx_replay,8);
++ if(replay<0)return q_failed(w,r,NWP_F_M3_STATE_REPLAY);
++ if(!replay){
++  if(!w->group_bytes||n!=w->group_bytes||!q_equal(p,w->group,n))return q_failed(w,r,NWP_F_M3_CONTENT);
++  if(w->pending||w->group_phase)return NWP_BUSY;
++  w->group_phase=2;return q_reply(w,p,4,r); /* ACK retry, no installation or PN reset. */
++ }
++ if(w->pending||w->group_phase)return NWP_BUSY;
++ unsigned z=q_be16(p+97),index=0;uint8_t plain[NWP_FRAME],key[16];
++ if(p[71]||p[72]||q_aes_unwrap(w->kek,p+99,z,plain)){q_wipe(plain,sizeof plain);return q_failed(w,r,NWP_F_UNWRAP);}
++ if(q_group_kde(w,plain,z-8,key,&index)){q_wipe(key,sizeof key);q_wipe(plain,sizeof plain);return q_failed(w,r,NWP_F_KDE);}
++ q_wipe(plain,sizeof plain);
++ int same=q_equal(key,w->gtk,16);
++ if(same&&index!=w->gtk_index){q_wipe(key,sizeof key);return q_failed(w,r,NWP_F_KDE);}
++ if(!same){
++  for(unsigned k=0;k<w->gtk_history_count;k++)if(q_equal(key,w->gtk_history[k],16)){q_wipe(key,sizeof key);return q_failed(w,r,NWP_F_KDE);}
++  if(w->gtk_history_count>=32||w->serial==UINT64_MAX){q_wipe(key,sizeof key);return q_fail(w,r);}
++  memcpy(w->gtk_history[w->gtk_history_count++],key,16);
++ }
++ memcpy(w->rx_replay,p+9,8);memcpy(w->group,p,n);w->group_bytes=n;
++ if(same){q_wipe(key,sizeof key);w->group_phase=2;return q_reply(w,p,4,r);}
++ memcpy(w->gtk,key,16);q_wipe(key,sizeof key);w->gtk_index=index;memcpy(w->rsc,p+65,8);
++ w->group_phase=1;w->group_ticket=++w->serial;w->pending=w->group_ticket;
++ r->ticket=w->group_ticket;r->action=NWP_INSTALL;return NWP_INSTALL;
++}
++int nwq_group_ready(struct nwq*w,uint64_t gen,uint64_t ticket,int success,struct nwp_result*r){
++ if(!r)return NWP_FAIL;memset(r,0,sizeof *r);
++ if(!w||gen!=w->generation||!ticket||ticket!=w->group_ticket||ticket!=w->pending||w->group_phase!=1||w->state!=NWP_AUTHORIZED)return NWP_DROP;
++ if(success!=1)return q_fail(w,r);w->pending=0;w->group_ticket=0;w->group_phase=2;
++ return q_reply(w,w->group,4,r);
++}
++int nwq_receive(struct nwq*w,const uint8_t*p,size_t n,struct nwp_result*r){
++ if(!r)return NWP_FAIL;
++ memset(r,0,sizeof(*r));
++ if(!w){r->failure=NWP_F_INTERNAL;return NWP_FAIL;}
++ if(w->state==NWP_OFF){r->failure=NWP_F_OFF;return NWP_FAIL;}
++ if(!p||n<99||n>NWP_FRAME||p[0]<1||p[0]>2||p[1]!=3||q_be16(p+2)!=n-4||p[4]!=2||q_be16(p+97)!=n-99)return q_failed(w,r,3);
++ unsigned info=q_be16(p+5);
++ if(!w->pmk_ready)return q_failed(w,r,NWP_F_OFF);
++ if(info==(0x1380u|w->version))return q_group_receive(w,p,(unsigned)n,r);
++ if(q_be16(p+7)!=16)return q_failed(w,r,4);
++ if(w->group_bytes)return q_failed(w,r,NWP_F_KEYINFO_STATE);
++ if(info==(0x0088u|w->version)){
++  if(!q_nonzero(p+17,32)||q_m1_data(p+99,q_be16(p+97)))return q_failed(w,r,5);
++  if(w->state!=NWP_M1){
++   if(w->state!=NWP_M3||memcmp(p+9,w->m1_replay,8)<0||!q_equal(p+17,w->anonce,32))return q_failed(w,r,6);
++   if(w->pending)return NWP_BUSY;
++   memcpy(w->m1_replay,p+9,8);
++   return q_reply(w,p,1,r); /* Same ANonce, same SNonce/PTK; monotonic retransmit counter. */
++  }
++  if(w->pending)return NWP_BUSY;
++  memcpy(w->anonce,p+17,32);memcpy(w->m1_replay,p+9,8);q_derive_keys(w);w->state=NWP_M3;
++  return q_reply(w,p,1,r);
++ }
++ if(info!=(0x13c8u|w->version)||w->state<NWP_M3)return q_failed(w,r,7);
++ uint8_t signature[16];q_mic(w,p,(unsigned)n,signature);int ok=q_equal(signature,p+81,16);q_wipe(signature,16);
++ if(!ok)return q_failed(w,r,8);
++ if(!q_equal(p+17,w->anonce,32))return q_failed(w,r,13);
++ if(w->m3_bytes){
++  /* AP retries may use a higher replay counter. All authenticated key/RSN/RSC
++   * contents must remain identical; never reinstall/reset any packet number. */
++  if(n!=w->m3_bytes||memcmp(p+9,w->m3+9,8)<0)return q_failed(w,r,9);
++  for(unsigned i=0;i<n;i++)if(!((i>=9&&i<17)||(i>=81&&i<97))&&p[i]!=w->m3[i])return q_failed(w,r,10);
++  if(w->pending)return NWP_BUSY;
++  memcpy(w->m3,p,n);memcpy(w->rx_replay,p+9,8);
++  return q_reply(w,p,3,r);
++ }
++ if(w->state!=NWP_M3||memcmp(p+9,w->m1_replay,8)<=0)return q_failed(w,r,11);
++ if(w->pending)return NWP_BUSY;
++ uint8_t plain[NWP_FRAME];unsigned wrapped=q_be16(p+97);
++ if(q_aes_unwrap(w->kek,p+99,wrapped,plain)){q_wipe(plain,sizeof plain);return q_failed(w,r,12);}
++ if(q_kde(w,plain,wrapped-8,p+65)){q_wipe(plain,sizeof plain);return q_failed(w,r,14);}
++ q_wipe(plain,sizeof plain);memcpy(w->m3,p,n);w->m3_bytes=(unsigned)n;memcpy(w->rx_replay,p+9,8);memcpy(w->gtk_history[0],w->gtk,16);w->gtk_history_count=1;w->state=NWP_M4_TX;
++ return q_reply(w,p,2,r);
++}
++int nwq_security_submitted(struct nwq*w,uint64_t gen,uint64_t ticket,int success){
++ if(!w||!ticket||gen!=w->generation||ticket!=w->pending)return NWP_DROP;
++ unsigned kind=w->tx_kind;w->pending=0;w->tx_kind=0;
++ if(!success){nwq_cancel(w);return NWP_FAIL;}
++ if(kind==4){if(w->state!=NWP_AUTHORIZED||w->group_phase!=2){nwq_cancel(w);return NWP_FAIL;}w->group_phase=0;return NWP_DROP;}
++ if((kind==2||kind==3)&&w->state==NWP_M4_TX&&!w->installed){w->installed=1;w->install_ticket=ticket;w->state=NWP_KEYS;return NWP_INSTALL;}
++ return NWP_DROP;
++}
++int nwq_keys_ready(struct nwq*w,uint64_t gen,uint64_t ticket,unsigned mask,int success){
++ if(!w||gen!=w->generation||!ticket||ticket!=w->install_ticket||w->state!=NWP_KEYS||!w->installed)return NWP_DROP;
++ if(!mask||(mask&~7u)||success!=1){nwq_cancel(w);return NWP_FAIL;}
++ w->ready_mask|=mask;
++ if(w->ready_mask!=7)return NWP_DROP;
++ w->state=NWP_AUTHORIZED;return NWP_AUTH;
++}
++
++#endif /* NORD2 */
+--- /dev/null
++++ b/bsd/dev/wifi_wpa3.h
+@@ -0,0 +1,48 @@
++#ifndef WIFI_WPA3_H
++#define WIFI_WPA3_H
++#include "wifi_wpa2.h"
++/* 0433: engine for the negotiated profiles beside the CI engine. It shares
++ * wifi_wpa2.h's states, actions, failures, struct nwp_result and RNG type and
++ * the same call sequence; struct nwq repeats struct nwp's members (same
++ * names, same meaning) and appends the profile state. struct nwp itself and
++ * every structure embedding it keep their CI layout. */
++struct nwq {
++ uint64_t generation,serial,pending,install_ticket;unsigned state,tx_kind,installed,ready_mask;
++ uint8_t pmk[32],own[6],peer[6],snonce[32],anonce[32],kck[16],kek[16],tk[16],gtk[16],rsc[8];
++ unsigned group_phase,group_bytes,gtk_history_count;uint64_t group_ticket;
++ uint8_t rx_replay[8],group[NWP_FRAME],gtk_history[32][16];
++ unsigned gtk_index;uint8_t rsn[22],ap_rsn[257],m1_replay[8];unsigned ap_rsn_bytes;
++ uint8_t ap_rsnxe[257];unsigned ap_rsnxe_bytes;
++ uint8_t m3[NWP_FRAME];unsigned m3_bytes;
++ /* version is the EAPOL-Key descriptor version: 2 HMAC-SHA1/PRF-SHA1, 3 and 0 AES-128-CMAC/KDF-SHA256. */
++ unsigned akm,pmf,version,pmk_ready,own_rsn_bytes,own_rsnxe_bytes;
++ unsigned igtk_ready,igtk_index,igtk_fresh;
++ uint8_t own_rsn[28],own_rsnxe[3],igtk[16],ipn[6];
++};
++#define NWP_AKM_PSK 2u
++#define NWP_AKM_PSK_SHA256 6u
++#define NWP_AKM_SAE 8u
++#define NWP_ALLOW_LEGACY 1u /* WPA2-PSK without PMF: served by the CI engine, byte for byte as before */
++#define NWP_ALLOW_PMF 2u    /* AKM 2 with PMF required by the AP, AKM 6 */
++#define NWP_ALLOW_SAE 4u    /* AKM 8 */
++/* pmf: management frame protection negotiated (BIP-CMAC-128, IGTK in M3);
++ * pmf_required: the AP sets MFPR and so does the station element;
++ * h2e: SAE hash-to-element, the station sends RSNXE in association and M2. */
++struct nwp_profile {unsigned akm,pmf,pmf_required,h2e;};
++/* Pure choice from a full AP RSN element and the complete AP element list
++ * (RSNXE). Order: SAE when allowed and offered; else the legacy profile when
++ * the AP offers AKM 2 without requiring PMF; else AKM 6; else AKM 2 with PMF.
++ * 0 chosen, -1 nothing acceptable (output zero). */
++int nwq_negotiate(const uint8_t*ap_rsn,size_t,const uint8_t*ap_ies,size_t,unsigned allow,struct nwp_profile*);
++/* Station RSN element for a profile: 22 octets, or 28 with PMF (capabilities + BIP group management cipher). */
++int nwq_station_rsn(const struct nwp_profile*,uint8_t out[28],size_t*used);
++/* pmk may be null for SAE: every frame is then refused until nwq_set_pmk supplies the SAE PMK. */
++int nwq_begin(struct nwq*,uint64_t,const uint8_t*pmk,const uint8_t own[6],const uint8_t peer[6],const struct nwp_profile*,const uint8_t*ap_rsn,size_t ap_bytes,nwp_rng,void*);
++int nwq_set_pmk(struct nwq*,uint64_t generation,const uint8_t pmk[32]);
++int nwq_copy_ap_rsnxe(struct nwq*,const uint8_t*,size_t);
++int nwq_receive(struct nwq*,const uint8_t*,size_t,struct nwp_result*);
++int nwq_security_submitted(struct nwq*,uint64_t generation,uint64_t ticket,int success);
++int nwq_keys_ready(struct nwq*,uint64_t generation,uint64_t install_ticket,unsigned mask,int success);
++int nwq_group_ready(struct nwq*,uint64_t generation,uint64_t ticket,int success,struct nwp_result*);
++void nwq_cancel(struct nwq*);
++#endif

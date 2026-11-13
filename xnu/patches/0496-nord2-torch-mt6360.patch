@@ -1,0 +1,506 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -790,6 +790,9 @@
+ 
+ #include "nord2_slider.inc"
+ 
++static void n2t_service(void);      /* 0496, below */
++static void n2t_force_off(void);
++
+ int
+ nord2_input_prepare_return(void)
+ {
+@@ -810,6 +813,7 @@
+ 	}
+ 	bool power_ok = true;
+ 	if (ni_bus_owned) {
++		n2t_force_off();      /* 0496: the flash LED off before the return */
+ 		ni_bus(false); (void)ni_stop();
+ 		ni_bus(true); (void)ni_stop();
+ 		if (ns_enabled) { ns_bus(); (void)ni_stop(); }
+@@ -951,6 +955,7 @@
+ 		}
+ 		if ((++slider_ticks % 10) == 0) { ns_poll(); }
+ 		n2scp_pmic_service(); n2c_pmic_service();   /* 0284: VIBR on/off requests from the SCP thread */
++		if (powered) { n2t_service(); }   /* 0496: torch requests from /dev/redwood-torch (MT6360 FLED, same I2C5 bus) */
+ 		ni_wait(10);
+ 	}
+ }
+@@ -964,6 +969,280 @@
+ #include "nord2_jpegdev.inc"   /* 0310: /dev/redwood-jpeg (K01) */
+ #include "nord2_vcodec_at.inc"   /* 0311: VENC bring-up steps, autotest command 8 */
+ #include "nord2_autotest.inc"   /* 0296: synthetic touches/keys and panel pictures over the USB console */
++/*
++ * 0496 (bright-fix-20261114): the torch.  /dev/redwood-torch did not exist, so the camera's TorchLevel writes ("the flashlight at N
++ * of 1000 NOT TAKEN", camera-userland rwcam_device.c torch_set) went nowhere and the flash LED never lit.  The device only records
++ * the request; the MT6360 FLED registers are written by the input owner thread (n2t_service, every 10 ms), the only thread that
++ * drives the GPIO202/203 software I2C.  Policy and limits: nord2_torch.h.
++ * Kill switches: boot-arg n2torch=0 (no device node; also sysctl kern.n2torch=0 at run time: LED off and kept off).
++ * kern.n2torch_maxsel (ITOR 0..14, default 6 = 100 mA per channel), kern.n2torch_flashsel (default 14 = 200 mA per channel, pulses of
++ * at most 1 s, duty <= 20 %), kern.n2torch_max_s (default 300 s), kern.n2torchstat (read only).
++ */
++#include <sys/sysctl.h>
++#include "nord2_torch.h"
++extern bool nord2_battery_temperature_cC(int *centi);     /* iokit/Kernel/arm/Nord2GPU.cpp */
++
++static struct n2t_cfg n2t_cfg_g = { 1, N2T_MAXSEL_DEFAULT, N2T_FLASHSEL_DEFAULT, N2T_ON_S_DEFAULT };
++static struct n2t_state n2t_st;                 /* owner thread (stat copy under n2t_lock) */
++static volatile uint64_t n2t_req_word;          /* seq:32 | level:16 | ms:16, written by userland, read by the owner thread */
++static uint32_t n2t_seq, n2t_opens;
++static bool n2t_made, n2t_owner_ready, n2t_announced;
++static lck_grp_t *n2t_grp;
++static lck_mtx_t *n2t_lock;                     /* n2t_seq / n2t_opens / n2t_req_word writers, stat copies */
++static uint64_t n2t_therm_next_us;
++
++static void
++n2t_post(uint32_t level, uint32_t ms)
++{
++	lck_mtx_lock(n2t_lock);
++	n2t_seq = n2t_seq + 1 == 0 ? 1 : n2t_seq + 1;
++	__atomic_store_n(&n2t_req_word, (uint64_t)n2t_seq << 32 | (uint64_t)(level & 0xffffu) << 16 | (ms & 0xffffu), __ATOMIC_RELEASE);
++	lck_mtx_unlock(n2t_lock);
++}
++
++/* MT6360 PMU (0x34), plain SMBus byte write / read, on the power bus (GPIO202/203).  Owner thread only. */
++static bool
++n2t_pmu_write(uint8_t reg, uint8_t value)
++{
++	ni_bus(true);
++	bool ok = ni_start() && ni_send(N2T_PMU_ADDR << 1) && ni_send(reg) && ni_send(value);
++	bool stopped = ni_stop();
++	uint8_t check = 0;
++	bool rb = ok && stopped && ni_bus_read(N2T_PMU_ADDR, reg, &check, 1);
++	ni_bus(false);
++	return rb && check == value;
++}
++
++static bool
++n2t_pmu_read(uint8_t reg, uint8_t *value)
++{
++	ni_bus(true);
++	bool ok = ni_bus_read(N2T_PMU_ADDR, reg, value, 1);
++	ni_bus(false);
++	return ok;
++}
++
++/* LED off: CS1/CS2/TORCH cleared (STROBE is never set here) */
++static bool
++n2t_hw_off(void)
++{
++	uint8_t en = 0;
++	if (!n2t_pmu_read(N2T_REG_FLED_EN, &en)) { return false; }
++	return (en & (N2T_EN_ON | N2T_EN_STROBE)) == 0 || n2t_pmu_write(N2T_REG_FLED_EN, (uint8_t)(en & ~(N2T_EN_ON | N2T_EN_STROBE)));
++}
++
++/* LED on in torch mode at ITOR sel on both channels (Android DUAL_TORCH: strobe off, 500 us, CS1|CS2|TORCH) */
++static bool
++n2t_hw_on(uint32_t sel, bool was_on)
++{
++	uint8_t t1 = 0, t2 = 0, en = 0;
++	if (sel > N2T_SEL_HW_MAX) { sel = N2T_SEL_HW_MAX; }
++	if (!n2t_pmu_read(N2T_REG_FLED1_TOR, &t1) || !n2t_pmu_read(N2T_REG_FLED2_TOR, &t2) || !n2t_pmu_read(N2T_REG_FLED_EN, &en)) { return false; }
++	if (!n2t_pmu_write(N2T_REG_FLED1_TOR, (uint8_t)((t1 & ~N2T_ITOR_MASK) | sel)) ||
++	    !n2t_pmu_write(N2T_REG_FLED2_TOR, (uint8_t)((t2 & ~N2T_ITOR_MASK) | sel))) { return false; }
++	if (was_on && (en & N2T_EN_ON) == N2T_EN_ON && !(en & N2T_EN_STROBE)) { return true; }      /* current change only */
++	if ((en & N2T_EN_STROBE) && !n2t_pmu_write(N2T_REG_FLED_EN, (uint8_t)(en & ~N2T_EN_STROBE))) { return false; }
++	delay(500);
++	return n2t_pmu_write(N2T_REG_FLED_EN, (uint8_t)((en & ~N2T_EN_STROBE) | N2T_EN_ON));
++}
++
++static void
++n2t_io_result(bool ok, const char *what)
++{
++	if (ok) { n2t_st.faults = 0; return; }
++	n2t_st.io_fails++;
++	if (++n2t_st.faults >= N2T_FAULT_LATCH && !n2t_st.latched) {
++		n2t_st.latched = true;
++		(void)n2t_hw_off();
++		printf("NORD2 TORCH: %u I2C failures in a row (%s, stage %u): torch disabled for this boot\n", n2t_st.faults, what, ni_stage);
++	} else {
++		printf("NORD2 TORCH: %s FAILED (stage %u, fails %u)\n", what, ni_stage, n2t_st.faults);
++	}
++}
++
++/* input owner thread, every loop (10 ms) */
++static void
++n2t_service(void)
++{
++	if (!n2t_made) { return; }
++	uint64_t now = ni_now_us();
++	if (!n2t_owner_ready) {
++		n2t_owner_ready = true;
++		uint8_t en = 0, st2 = 0;
++		bool ok = n2t_pmu_read(N2T_REG_FLED_EN, &en) && n2t_pmu_read(N2T_REG_CHG_STAT2, &st2);
++		bool off = ok && n2t_hw_off();
++		printf("NORD2 TORCH: MT6360 FLED_EN=%#x CHG_STAT2=%#x (VINOVP %u) read %s, LED off at start %s\n", en, st2, (st2 & N2T_VINOVP) ? 1u : 0u,
++		    ok ? "ok" : "FAILED", off ? "ok" : "FAILED");
++		n2t_io_result(ok && off, "start");
++	}
++	uint64_t w = __atomic_load_n(&n2t_req_word, __ATOMIC_ACQUIRE);
++	struct n2t_req r = { (uint32_t)(w >> 32), (uint32_t)(w >> 16) & 0xffffu, (uint32_t)w & 0xffffu };
++	lck_mtx_lock(n2t_lock);
++	struct n2t_cfg c = n2t_cfg_g;
++	lck_mtx_unlock(n2t_lock);
++	uint32_t prev_seq = n2t_st.seen_seq;
++	n2t_take(&n2t_st, &r, now);
++	bool fresh = n2t_st.seen_seq != prev_seq;
++	if ((n2t_st.hw_on || n2t_st.level != 0) && now >= n2t_therm_next_us) {      /* the gauge only while the LED is (to be) lit */
++		int cc = 0;
++		bool ok = nord2_battery_temperature_cC(&cc);
++		n2t_therm_next_us = now + N2T_THERM_PERIOD_US;
++		if (n2t_therm_update(&n2t_st, ok, cc, now)) {
++			printf("NORD2 TORCH: thermal level %u at battery %d.%02d C (%s)\n", n2t_st.therm, cc / 100, (cc < 0 ? -cc : cc) % 100,
++			    n2t_st.therm >= 2 ? "LED off" : n2t_st.therm == 1 ? "lowest current" : "normal");
++		}
++	}
++	bool was_expired = n2t_st.expired;
++	uint32_t sel = 0;
++	bool want = n2t_decide(&n2t_st, &c, now, &sel);
++	if (!was_expired && n2t_st.expired && n2t_st.ms == 0) {
++		printf("NORD2 TORCH: on for %u s: turned off (kern.n2torch_max_s; a new request relights it)\n", c.max_on_s);
++	}
++	if (want && (!n2t_st.hw_on || sel != n2t_st.hw_sel)) {
++		bool ok = n2t_hw_on(sel, n2t_st.hw_on);
++		n2t_io_result(ok, "on");
++		if (ok) {
++			if (!n2t_st.hw_on) { n2t_st.ons++; }
++			n2t_st.hw_on = true; n2t_st.hw_sel = sel;
++			printf("NORD2 TORCH: on, level %u/1000%s -> ITOR %u (%u mA x 2)%s\n", n2t_st.level, n2t_st.ms ? " (flash pulse)" : "", sel,
++			    25u + sel * 25u / 2u, n2t_st.ms ? "" : "");
++		}
++	} else if (!want && n2t_st.hw_on) {
++		bool ok = n2t_hw_off();
++		n2t_io_result(ok, "off");
++		if (ok) {
++			n2t_st.hw_on = false; n2t_st.offs++;
++			uint8_t s1 = 0, s2 = 0;
++			(void)n2t_pmu_read(N2T_REG_FLED_STAT1, &s1); (void)n2t_pmu_read(N2T_REG_FLED_STAT2, &s2);
++			printf("NORD2 TORCH: off (%s) FLED_STAT %#x %#x\n", !c.mode ? "kern.n2torch=0" : n2t_st.latched ? "fault latch" :
++			    n2t_st.therm >= 2 ? "thermal" : n2t_st.expired ? (n2t_st.ms ? "end of pulse" : "time limit") : "request", s1, s2);
++		}
++	} else if (fresh && !want && n2t_st.level != 0) {
++		printf("NORD2 TORCH: request %u/1000 not lit (%s)\n", n2t_st.level, !c.mode ? "kern.n2torch=0" : n2t_st.latched ? "fault latch" :
++		    n2t_st.therm >= 2 ? "thermal" : "expired");
++	}
++}
++
++/* nord2_input_prepare_return: other cores are off, no locks */
++static void
++n2t_force_off(void)
++{
++	if (n2t_made && n2t_owner_ready) { (void)n2t_hw_off(); }
++}
++
++static int
++n2td_open(dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	if (!n2t_made || minor(dev) != 0) { return ENXIO; }
++	lck_mtx_lock(n2t_lock);
++	n2t_opens++;
++	lck_mtx_unlock(n2t_lock);
++	return 0;
++}
++
++static int
++n2td_close(dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	if (!n2t_made || minor(dev) != 0) { return ENXIO; }
++	n2t_post(0, 0);         /* the last close (devfs calls d_close once): the owner is gone, the LED goes off */
++	lck_mtx_lock(n2t_lock);
++	n2t_opens = 0;
++	lck_mtx_unlock(n2t_lock);
++	return 0;
++}
++
++static int
++n2td_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	uint8_t b[8];
++	uint32_t level = 0, ms = 0;
++	if (!n2t_made || minor(dev) != 0) { return ENXIO; }
++	user_ssize_t n = uio_resid(uio);
++	if (n != 4 && n != 8) { return EINVAL; }
++	int err = uiomove((char *)b, (int)n, uio);
++	if (err != 0) { return err; }
++	if (!n2t_parse(b, (unsigned)n, &level, &ms)) { return EINVAL; }
++	n2t_post(level, ms);
++	if (!n2t_announced) { n2t_announced = true; printf("NORD2 TORCH: first request %u/1000%s from %s\n", level, ms ? " (pulse)" : "", "userland"); }
++	return 0;
++}
++
++static const struct cdevsw n2td_cdevsw = {
++	.d_open = n2td_open, .d_close = n2td_close,
++	.d_read = eno_rdwrt, .d_write = n2td_write, .d_ioctl = eno_ioctl,
++	.d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL,
++	.d_select = eno_select, .d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0,
++};
++
++static int
++n2t_sysctl_cfg SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1)
++	if (n2t_lock == NULL) { return ENODEV; }
++	lck_mtx_lock(n2t_lock);
++	struct n2t_cfg c = n2t_cfg_g;
++	lck_mtx_unlock(n2t_lock);
++	uint32_t *field = arg2 == 0 ? &c.mode : arg2 == 1 ? &c.maxsel : arg2 == 2 ? &c.flashsel : &c.max_on_s;
++	int v = (int)*field, changed = 0;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (err != 0 || !changed) { return err; }
++	if (v < 0 || v > 100000) { return EINVAL; }
++	*field = (uint32_t)v;
++	n2t_cfg_fix(&c);
++	lck_mtx_lock(n2t_lock);
++	n2t_cfg_g = c;
++	lck_mtx_unlock(n2t_lock);
++	printf("NORD2 TORCH: sysctl %s: mode %u maxsel %u flashsel %u max_s %u\n", oidp->oid_name, c.mode, c.maxsel, c.flashsel, c.max_on_s);
++	return 0;
++}
++static int
++n2t_sysctl_stat SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[384];
++	struct n2t_state s = n2t_st;            /* owner-thread fields, read without a lock: a diagnostic snapshot */
++	snprintf(buf, sizeof(buf), "made=%u owner=%u lit=%u sel=%u level=%u ms=%u expired=%u therm=%u bat_cC=%d latched=%u opens=%u reqs=%llu "
++	    "ons=%llu offs=%llu timeouts=%llu flashes=%llu cooled=%llu derates=%llu therm_offs=%llu io_fails=%llu", n2t_made, n2t_owner_ready,
++	    s.hw_on, s.hw_sel, s.level, s.ms, s.expired, s.therm, s.therm_cc, s.latched, n2t_opens, s.reqs, s.ons, s.offs, s.timeouts, s.flashes,
++	    s.flash_cooled, s.therm_derates, s.therm_offs, s.io_fails);
++	return sysctl_io_string(req, buf, sizeof(buf), 0, NULL);
++}
++SYSCTL_PROC(_kern, OID_AUTO, n2torch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, n2t_sysctl_cfg, "I",
++    "0496 torch: 1 allow, 0 off and kept off");
++SYSCTL_PROC(_kern, OID_AUTO, n2torch_maxsel, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 1, n2t_sysctl_cfg, "I",
++    "0496 torch current ceiling, ITOR 0..14 (25 mA + 12.5 mA x n per channel), default 6");
++SYSCTL_PROC(_kern, OID_AUTO, n2torch_flashsel, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 2, n2t_sysctl_cfg, "I",
++    "0496 flash pulse current ceiling, ITOR 0..14, default 14");
++SYSCTL_PROC(_kern, OID_AUTO, n2torch_max_s, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 3, n2t_sysctl_cfg, "I",
++    "0496 torch on-time limit, s (10..1800, default 300)");
++SYSCTL_PROC(_kern, OID_AUTO, n2torchstat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, n2t_sysctl_stat, "A",
++    "0496 torch state and counters");
++
++static void
++nord2_torch_start(void)
++{
++	uint32_t on = 1;
++	(void)PE_parse_boot_argn("n2torch", &on, sizeof(on));
++	n2t_init(&n2t_st);
++	n2t_grp = lck_grp_alloc_init("nord2-torch", LCK_GRP_ATTR_NULL);
++	n2t_lock = n2t_grp != NULL ? lck_mtx_alloc_init(n2t_grp, LCK_ATTR_NULL) : NULL;
++	if (on == 0 || n2t_lock == NULL) {
++		printf("NORD2 TORCH: /dev/redwood-torch not made (boot-arg n2torch=%u)\n", on);
++		return;
++	}
++	int major = cdevsw_add(-1, &n2td_cdevsw);
++	if (major < 0) { printf("NORD2 TORCH: cdevsw_add failed (%d)\n", major); return; }
++	if (devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-torch") == NULL) {
++		printf("NORD2 TORCH: devfs_make_node failed\n");
++		(void)cdevsw_remove(major, &n2td_cdevsw);
++		return;
++	}
++	__atomic_store_n(&n2t_made, true, __ATOMIC_RELEASE);
++	printf("NORD2 TORCH: /dev/redwood-torch made (major %d, 0666): MT6360 FLED1+FLED2 torch mode, ceiling ITOR %u (%u mA x 2), "
++	    "pulses ITOR %u <= %u ms duty 1/%u, off after %u s, thermal derate %d C / off %d C\n", major, n2t_cfg_g.maxsel,
++	    25u + n2t_cfg_g.maxsel * 25u / 2u, n2t_cfg_g.flashsel, N2T_FLASH_MS_MAX, N2T_FLASH_DUTY_DIV + 1, n2t_cfg_g.max_on_s,
++	    N2T_WARM_CC / 100, N2T_HOT_CC / 100);
++}
+ 
+ void
+ nord2_input_init(void)
+@@ -983,6 +1262,7 @@
+ 	nord2_autotest_start();   /* 0296 */
+ 	nord2_jpegdev_start();   /* 0310: /dev/redwood-jpeg */
+ 	nord2_vcodec_start();   /* 0310: /dev/redwood-vcodec + /dev/redwood-vcodec-client */
++	nord2_torch_start();    /* 0496: /dev/redwood-torch */
+ }
+ #else /* original Sweet hardware */
+ /*
+--- /dev/null
++++ b/bsd/dev/nord2_torch.h
+@@ -0,0 +1,186 @@
++/*
++ * nord2_torch.h -- 0496 (bright-fix-20261114): the flash LED as a torch (pure C policy, host-tested by test/torch_test.c).
++ *
++ * Hardware (Android nord2-current-kernel, mt6893_defconfig CONFIG_MTK_FLASHLIGHT_MT6360 + CONFIG_MT6360_PMU_FLED,
++ * drivers/misc/mediatek/pmic/mt6360/pmu/mt6360_pmu_fled.c, flashlights-mt6360.c, flashlight/oplus/flashlight_custom.c for
++ * projects 20817/20827/20831: both channels are driven together, DUAL_TORCH / DUAL_FLASH):
++ *   MT6360 PMU, plain SMBus at 7-bit 0x34 (no CRC, unlike the LDO 0x64 / PMIC 0x1a) on I2C5 = GPIO202/203, the same software
++ *   bus the input thread already uses for the MT6360 ID read and the touch rail (sweet_touch.c ni_power_on).
++ *   FLED1_TOR_CTRL 0x75 / FLED2_TOR_CTRL 0x79 bits [4:0] ITOR: 25 mA + 12.5 mA * sel (0..0x1E = 25..400 mA)
++ *   FLED_EN 0x7E: bit 3 TORCH, bit 2 STROBE, bit 1 FLCS1_EN, bit 0 FLCS2_EN.  Torch on = STROBE off, 500 us, CS1|CS2|TORCH on.
++ *   CHG_STAT2 0xE1 bit 3 FLED_CHG_VINOVP (the Android driver's "not ready").  FLED_STAT1/2 0xE9/0xEA (faults, logged only).
++ * Torch mode only (no STROBE: no hardware strobe timing on this port).  A "flash" here is a short torch pulse at a higher, still
++ * torch-rated current, with a software duty limit.
++ *
++ * Userland ABI of /dev/redwood-torch (0666, write only; the camera already writes it: camera-userland rwcam_device.c torch_set):
++ *   4 bytes  uint32 level in thousandths (0 = off, 1..1000)            -> torch at that fraction of kern.n2torch_maxsel
++ *   8 bytes  uint32 level, uint32 ms (1..N2T_FLASH_MS_MAX)              -> flash pulse at that fraction of kern.n2torch_flashsel,
++ *                                                                           off after ms; then N2T_FLASH_DUTY_DIV x ms cool-down
++ *   the last close of the device turns the LED off.
++ */
++#ifndef NORD2_TORCH_H
++#define NORD2_TORCH_H
++#include <stdint.h>
++#include <stdbool.h>
++
++#define N2T_PMU_ADDR            0x34u
++#define N2T_REG_FLED1_TOR       0x75u
++#define N2T_REG_FLED2_TOR       0x79u
++#define N2T_REG_FLED_EN         0x7Eu
++#define N2T_REG_CHG_STAT2       0xE1u
++#define N2T_REG_FLED_STAT1      0xE9u
++#define N2T_REG_FLED_STAT2      0xEAu
++#define N2T_EN_TORCH            0x08u
++#define N2T_EN_STROBE           0x04u
++#define N2T_EN_CS1              0x02u
++#define N2T_EN_CS2              0x01u
++#define N2T_EN_ON               (N2T_EN_TORCH | N2T_EN_CS1 | N2T_EN_CS2)
++#define N2T_ITOR_MASK           0x1Fu
++#define N2T_VINOVP              0x08u
++
++#define N2T_SEL_HW_MAX          0x0Eu     /* hard ceiling here: 200 mA per channel (the part allows 0x1E = 400 mA) */
++#define N2T_MAXSEL_DEFAULT      0x06u     /* kern.n2torch_maxsel: 100 mA per channel, 200 mA for the LED */
++#define N2T_FLASHSEL_DEFAULT    0x0Eu     /* kern.n2torch_flashsel: 200 mA per channel for a pulse */
++#define N2T_ON_S_DEFAULT        300u      /* kern.n2torch_max_s: the torch turns itself off after 5 min (a new request relights it) */
++#define N2T_ON_S_MIN            10u
++#define N2T_ON_S_MAX            1800u
++#define N2T_FLASH_MS_MAX        1000u
++#define N2T_FLASH_DUTY_DIV      4u        /* cool-down = 4 x the pulse: duty <= 20 % */
++/* thermal (battery gauge, centi-C): >= 43 C lowest current (sel 0 = 25 mA per channel), >= 46 C off until < 44 C */
++#define N2T_WARM_CC             4300
++#define N2T_HOT_CC              4600
++#define N2T_HOT_CLEAR_CC        4400
++#define N2T_THERM_PERIOD_US     5000000ull
++#define N2T_FAULT_LATCH         3u        /* consecutive I2C failures: torch disabled for the boot */
++
++struct n2t_cfg {
++	uint32_t mode;        /* kern.n2torch: 1 allow, 0 off (and kept off) */
++	uint32_t maxsel;      /* kern.n2torch_maxsel 0..N2T_SEL_HW_MAX */
++	uint32_t flashsel;    /* kern.n2torch_flashsel 0..N2T_SEL_HW_MAX */
++	uint32_t max_on_s;    /* kern.n2torch_max_s */
++};
++
++/* a request as written by userland (seq changes on every write; level 0 = off) */
++struct n2t_req {
++	uint32_t seq, level, ms;
++};
++
++struct n2t_state {
++	uint32_t seen_seq;        /* last request taken */
++	uint32_t level, ms;       /* that request */
++	uint64_t req_us;          /* when it was taken */
++	bool     expired;         /* the on-time limit or the pulse length ran out: dark until a new request */
++	uint64_t cool_until_us;   /* no flash current before this */
++	uint32_t ceiling;         /* current ceiling of the request taken (maxsel, or flashsel for a pulse outside its cool-down) */
++	uint32_t therm;           /* 0 ok, 1 warm, 2 hot */
++	uint64_t therm_us;
++	int32_t  therm_cc;
++	uint32_t faults;          /* consecutive I2C failures */
++	bool     latched;         /* N2T_FAULT_LATCH reached */
++	/* what the hardware has (owner thread) */
++	bool     hw_on;
++	uint32_t hw_sel;
++	/* counters */
++	uint64_t reqs, ons, offs, timeouts, flashes, flash_cooled, therm_derates, therm_offs, io_fails;
++};
++
++static inline void
++n2t_cfg_default(struct n2t_cfg *c)
++{
++	c->mode = 1; c->maxsel = N2T_MAXSEL_DEFAULT; c->flashsel = N2T_FLASHSEL_DEFAULT; c->max_on_s = N2T_ON_S_DEFAULT;
++}
++
++static inline void
++n2t_cfg_fix(struct n2t_cfg *c)
++{
++	c->mode = c->mode ? 1u : 0u;
++	if (c->maxsel > N2T_SEL_HW_MAX) { c->maxsel = N2T_SEL_HW_MAX; }
++	if (c->flashsel > N2T_SEL_HW_MAX) { c->flashsel = N2T_SEL_HW_MAX; }
++	if (c->max_on_s < N2T_ON_S_MIN) { c->max_on_s = N2T_ON_S_MIN; }
++	if (c->max_on_s > N2T_ON_S_MAX) { c->max_on_s = N2T_ON_S_MAX; }
++}
++
++static inline void
++n2t_init(struct n2t_state *s)
++{
++	struct n2t_state z = { 0 };
++	*s = z;
++}
++
++/* userland bytes -> request; false = malformed (wrong size, level > 1000, ms out of range) */
++static inline bool
++n2t_parse(const uint8_t *b, unsigned len, uint32_t *level, uint32_t *ms)
++{
++	uint32_t l, m = 0;
++	if (len != 4 && len != 8) { return false; }
++	l = (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
++	if (len == 8) { m = (uint32_t)b[4] | (uint32_t)b[5] << 8 | (uint32_t)b[6] << 16 | (uint32_t)b[7] << 24; }
++	if (l > 1000) { return false; }
++	if (len == 8 && (m == 0 || m > N2T_FLASH_MS_MAX)) { return false; }
++	*level = l; *ms = m;
++	return true;
++}
++
++/* level (1..1000) of a current ceiling sel -> ITOR selector, rounded, never above the ceiling */
++static inline uint32_t
++n2t_level_sel(uint32_t level, uint32_t ceiling)
++{
++	if (ceiling > N2T_SEL_HW_MAX) { ceiling = N2T_SEL_HW_MAX; }
++	uint32_t s = (level * ceiling + 500u) / 1000u;
++	return s > ceiling ? ceiling : s;
++}
++
++/* takes a new request (owner thread) */
++static inline void
++n2t_take(struct n2t_state *s, const struct n2t_req *r, uint64_t now_us)
++{
++	if (r->seq == s->seen_seq) { return; }
++	s->seen_seq = r->seq; s->level = r->level; s->ms = r->ms; s->req_us = now_us; s->expired = false; s->reqs++;
++	s->ceiling = 0xffffffffu;                                /* resolved against the configuration in n2t_decide */
++	if (r->ms != 0 && r->level != 0) {
++		if (now_us < s->cool_until_us) { s->flash_cooled++; s->ceiling = 0xfffffffeu; }   /* inside the cool-down: torch current */
++		else { s->flashes++; }
++	}
++}
++
++/* thermal level from a battery reading; invalid readings keep the level.  true = changed */
++static inline bool
++n2t_therm_update(struct n2t_state *s, bool ok, int32_t cc, uint64_t now_us)
++{
++	if (!ok) { return false; }
++	uint32_t l = s->therm;
++	if (cc >= N2T_HOT_CC) { l = 2; }
++	else if (l == 2 && cc >= N2T_HOT_CLEAR_CC) { l = 2; }
++	else if (cc >= N2T_WARM_CC) { l = 1; }
++	else if (l >= 1 && cc >= N2T_WARM_CC - 100) { l = 1; }
++	else { l = 0; }
++	s->therm_us = now_us; s->therm_cc = cc;
++	if (l != s->therm) {
++		if (l == 2) { s->therm_offs++; } else if (l == 1 && s->therm == 0) { s->therm_derates++; }
++		s->therm = l;
++		return true;
++	}
++	return false;
++}
++
++/* the decision: what the LED should be now.  *sel valid when true.  Marks expiry (time limit / end of pulse). */
++static inline bool
++n2t_decide(struct n2t_state *s, const struct n2t_cfg *c, uint64_t now_us, uint32_t *sel)
++{
++	if (!c->mode || s->latched || s->level == 0 || s->expired || s->therm >= 2) { return false; }
++	uint64_t age = now_us - s->req_us;
++	if (s->ms != 0) {                                        /* flash pulse */
++		if (age >= (uint64_t)s->ms * 1000u) {
++			s->expired = true;
++			s->cool_until_us = now_us + (uint64_t)s->ms * 1000u * N2T_FLASH_DUTY_DIV;
++			return false;
++		}
++		*sel = n2t_level_sel(s->level, s->ceiling == 0xfffffffeu ? c->maxsel : c->flashsel);
++	} else {
++		if (age >= (uint64_t)c->max_on_s * 1000000u) { s->expired = true; s->timeouts++; return false; }
++		*sel = n2t_level_sel(s->level, c->maxsel);
++	}
++	if (s->therm == 1) { *sel = 0; }                        /* warm: lowest current */
++	return true;
++}
++#endif

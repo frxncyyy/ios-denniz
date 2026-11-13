@@ -1,0 +1,466 @@
+--- /dev/null
++++ b/bsd/dev/wifi_sae.c
+@@ -0,0 +1,286 @@
++#include <arm64/sweet_early.h>
++#if defined(NORD2)
++/* 0432: SAE for group 19. Original code: a small fixed-width Montgomery
++ * field (eight 32-bit limbs) for the P-256 prime and group order, Jacobian
++ * point arithmetic, the two password element derivations and the commit /
++ * confirm computations of IEEE 802.11-2020 12.4. Hashing comes from
++ * wifi_sae_crypto. Secret-dependent work uses fixed iteration
++ * counts and masked selection; it is not hardened beyond that. */
++#include "wifi_sae.h"
++#include "wifi_sae_crypto.h"
++#if defined(KERNEL) || defined(_KERNEL)
++#include <sys/systm.h>
++#else
++#include <string.h>
++#endif
++typedef uint32_t fe[8];
++struct mod {fe m;uint32_t k;fe r2,one;};
++static const struct mod FP={{0xffffffff,0xffffffff,0xffffffff,0x00000000,0x00000000,0x00000000,0x00000001,0xffffffff},0x00000001,
++ {0x00000003,0x00000000,0xffffffff,0xfffffffb,0xfffffffe,0xffffffff,0xfffffffd,0x00000004},
++ {0x00000001,0x00000000,0x00000000,0xffffffff,0xffffffff,0xffffffff,0xfffffffe,0x00000000}};
++static const struct mod FN={{0xfc632551,0xf3b9cac2,0xa7179e84,0xbce6faad,0xffffffff,0xffffffff,0x00000000,0xffffffff},0xee00bc4f,
++ {0xbe79eea2,0x83244c95,0x49bd6fa6,0x4699799c,0x2b6bec59,0x2845b239,0xf3d95620,0x66e12d94},
++ {0x039cdaaf,0x0c46353d,0x58e8617b,0x43190552,0x00000000,0x00000000,0xffffffff,0x00000000}};
++static const fe CURVE_B={0x27d2604b,0x3bce3c3e,0xcc53b0f6,0x651d06b0,0x769886bc,0xb3ebbd55,0xaa3a93e7,0x5ac635d8};
++static const fe SSWU_C1={0x2375f224,0xbdba1313,0x20693090,0x146fe6a0,0xd94959d3,0x6c65b982,0x96bdaf99,0xa528bd86}; /* b/(z*a), z=-10 */
++static const fe SSWU_C2={0x629b756e,0x6944bebf,0x441be5a7,0xcc5f023b,0x7cdd823e,0x3bf93f1c,0xe368dbf8,0x73976747}; /* -b/a */
++static const fe EXP_SQRT={0x00000000,0x00000000,0x40000000,0x00000000,0x00000000,0x40000000,0xc0000000,0x3fffffff}; /* (p+1)/4 */
++static const fe EXP_INV={0xfffffffd,0xffffffff,0xffffffff,0x00000000,0x00000000,0x00000000,0x00000001,0xffffffff}; /* p-2 */
++static const fe RAW_ONE={1,0,0,0,0,0,0,0};
++static void sae_wipe(void*v,size_t n){volatile uint8_t*p=v;while(n--)*p++=0;}
++static uint32_t sae_add_raw(fe r,const fe a,const fe b){uint64_t c=0;for(unsigned i=0;i<8;i++){c+=(uint64_t)a[i]+b[i];r[i]=(uint32_t)c;c>>=32;}return (uint32_t)c;}
++static uint32_t sae_sub_raw(fe r,const fe a,const fe b){uint64_t c=0;for(unsigned i=0;i<8;i++){c=(uint64_t)a[i]-b[i]-c;r[i]=(uint32_t)c;c=(c>>32)&1;}return (uint32_t)c;}
++static void sae_cmov(fe r,const fe a,uint32_t mask){for(unsigned i=0;i<8;i++)r[i]^=(r[i]^a[i])&mask;}
++static void sae_copy(fe r,const fe a){for(unsigned i=0;i<8;i++)r[i]=a[i];}
++static uint32_t sae_is_zero(const fe a){uint32_t d=0;for(unsigned i=0;i<8;i++)d|=a[i];return 0u-(uint32_t)(((uint64_t)d-1)>>63);} /* all ones when zero */
++static uint32_t sae_is_equal(const fe a,const fe b){uint32_t d=0;for(unsigned i=0;i<8;i++)d|=a[i]^b[i];return 0u-(uint32_t)(((uint64_t)d-1)>>63);}
++static void sae_load(fe r,const uint8_t*p){for(unsigned i=0;i<8;i++)r[7-i]=(uint32_t)p[4*i]<<24|(uint32_t)p[4*i+1]<<16|(uint32_t)p[4*i+2]<<8|p[4*i+3];}
++static void sae_store(uint8_t*p,const fe a){for(unsigned i=0;i<8;i++){uint32_t v=a[7-i];p[4*i]=(uint8_t)(v>>24);p[4*i+1]=(uint8_t)(v>>16);p[4*i+2]=(uint8_t)(v>>8);p[4*i+3]=(uint8_t)v;}}
++/* r = a-m when a >= m (a < 2m). */
++static void sae_reduce_once(fe r,const fe a,const fe m){fe d;uint32_t borrow=sae_sub_raw(d,a,m);sae_copy(r,a);sae_cmov(r,d,borrow-1);}
++static void sae_madd(fe r,const fe a,const fe b,const struct mod*M){fe t,d;uint32_t carry=sae_add_raw(t,a,b),borrow=sae_sub_raw(d,t,M->m);sae_cmov(t,d,0u-(carry|(1u-borrow)));sae_copy(r,t);}
++static void sae_msub(fe r,const fe a,const fe b,const struct mod*M){fe t,d;uint32_t borrow=sae_sub_raw(t,a,b);sae_add_raw(d,t,M->m);sae_cmov(t,d,0u-borrow);sae_copy(r,t);}
++/* Montgomery product a*b/2^256 mod m; r may alias the inputs. */
++static void sae_mmul(fe r,const fe a,const fe b,const struct mod*M){
++ uint32_t t[10]={0};fe d;
++ for(unsigned i=0;i<8;i++){
++  uint64_t c=0;
++  for(unsigned j=0;j<8;j++){c+=(uint64_t)a[j]*b[i]+t[j];t[j]=(uint32_t)c;c>>=32;}
++  c+=t[8];t[8]=(uint32_t)c;t[9]=(uint32_t)(c>>32);
++  uint32_t q=t[0]*M->k;
++  c=((uint64_t)q*M->m[0]+t[0])>>32;
++  for(unsigned j=1;j<8;j++){c+=(uint64_t)q*M->m[j]+t[j];t[j-1]=(uint32_t)c;c>>=32;}
++  c+=t[8];t[7]=(uint32_t)c;t[8]=t[9]+(uint32_t)(c>>32);
++ }
++ uint32_t borrow=sae_sub_raw(d,t,M->m);sae_cmov(t,d,0u-(t[8]|(1u-borrow)));sae_copy(r,t);
++}
++static void sae_to_mont(fe r,const fe a,const struct mod*M){sae_mmul(r,a,M->r2,M);}
++static void sae_from_mont(fe r,const fe a,const struct mod*M){sae_mmul(r,a,RAW_ONE,M);}
++/* r = a^e, a and r in Montgomery form, fixed 256 squarings and products. */
++static void sae_mpow(fe r,const fe a,const fe e,const struct mod*M){
++ fe x,t;sae_copy(x,M->one);
++ for(int i=255;i>=0;i--){sae_mmul(x,x,x,M);sae_mmul(t,x,a,M);sae_cmov(x,t,0u-((e[i>>5]>>(i&31))&1u));}
++ sae_copy(r,x);
++}
++/* ---- curve: y^2 = x^3 - 3x + b, Jacobian coordinates in Montgomery form, z = 0 is infinity ---- */
++struct pt {fe x,y,z;};
++static void sae_curve_g(fe r,const fe x){
++ fe t,u,b;sae_mmul(t,x,x,&FP);sae_mmul(t,t,x,&FP);sae_madd(u,x,x,&FP);sae_madd(u,u,x,&FP);sae_msub(t,t,u,&FP);sae_to_mont(b,CURVE_B,&FP);sae_madd(r,t,b,&FP);
++}
++/* y = sqrt(v) when v is a square; returns all ones when it is. */
++static uint32_t sae_field_sqrt(fe y,const fe v){fe t;sae_mpow(y,v,EXP_SQRT,&FP);sae_mmul(t,y,y,&FP);return sae_is_equal(t,v);}
++static void sae_pt_dbl(struct pt*r,const struct pt*p){
++ fe delta,gamma,beta,alpha,t,u;
++ sae_mmul(delta,p->z,p->z,&FP);sae_mmul(gamma,p->y,p->y,&FP);sae_mmul(beta,p->x,gamma,&FP);
++ sae_msub(t,p->x,delta,&FP);sae_madd(u,p->x,delta,&FP);sae_mmul(t,t,u,&FP);sae_madd(alpha,t,t,&FP);sae_madd(alpha,alpha,t,&FP);
++ sae_madd(t,p->y,p->z,&FP);sae_mmul(t,t,t,&FP);sae_msub(t,t,gamma,&FP);sae_msub(r->z,t,delta,&FP);
++ sae_madd(beta,beta,beta,&FP);sae_madd(beta,beta,beta,&FP); /* 4 beta */
++ sae_mmul(t,alpha,alpha,&FP);sae_msub(t,t,beta,&FP);sae_msub(r->x,t,beta,&FP);
++ sae_mmul(gamma,gamma,gamma,&FP);sae_madd(gamma,gamma,gamma,&FP);sae_madd(gamma,gamma,gamma,&FP);sae_madd(gamma,gamma,gamma,&FP); /* 8 gamma^2 */
++ sae_msub(t,beta,r->x,&FP);sae_mmul(t,t,alpha,&FP);sae_msub(r->y,t,gamma,&FP);
++}
++static void sae_pt_add(struct pt*r,const struct pt*p,const struct pt*q){
++ fe z1z1,z2z2,u1,u2,s1,s2,h,rr,hh,hhh,v,t;struct pt o;
++ uint32_t inf1=sae_is_zero(p->z),inf2=sae_is_zero(q->z);
++ sae_mmul(z1z1,p->z,p->z,&FP);sae_mmul(z2z2,q->z,q->z,&FP);sae_mmul(u1,p->x,z2z2,&FP);sae_mmul(u2,q->x,z1z1,&FP);
++ sae_mmul(s1,p->y,q->z,&FP);sae_mmul(s1,s1,z2z2,&FP);sae_mmul(s2,q->y,p->z,&FP);sae_mmul(s2,s2,z1z1,&FP);
++ sae_msub(h,u2,u1,&FP);sae_msub(rr,s2,s1,&FP);
++ if(!inf1&&!inf2&&sae_is_zero(h)){ /* same x: doubling or the inverse; never reached with a scalar in 1..order-1 */
++  if(sae_is_zero(rr)){sae_pt_dbl(r,p);return;}
++  sae_wipe(r,sizeof *r);return;
++ }
++ sae_mmul(hh,h,h,&FP);sae_mmul(hhh,hh,h,&FP);sae_mmul(v,u1,hh,&FP);
++ sae_mmul(t,rr,rr,&FP);sae_msub(t,t,hhh,&FP);sae_msub(t,t,v,&FP);sae_msub(o.x,t,v,&FP);
++ sae_msub(t,v,o.x,&FP);sae_mmul(t,t,rr,&FP);sae_mmul(s1,s1,hhh,&FP);sae_msub(o.y,t,s1,&FP);
++ sae_mmul(t,p->z,q->z,&FP);sae_mmul(o.z,t,h,&FP);
++ sae_cmov(o.x,q->x,inf1);sae_cmov(o.y,q->y,inf1);sae_cmov(o.z,q->z,inf1);
++ sae_cmov(o.x,p->x,inf2);sae_cmov(o.y,p->y,inf2);sae_cmov(o.z,p->z,inf2);
++ *r=o;
++}
++static void sae_pt_mul(struct pt*r,const struct pt*p,const fe k){
++ struct pt acc,t;sae_wipe(&acc,sizeof acc);
++ for(int i=255;i>=0;i--){
++  sae_pt_dbl(&acc,&acc);sae_pt_add(&t,&acc,p);
++  uint32_t mask=0u-((k[i>>5]>>(i&31))&1u);sae_cmov(acc.x,t.x,mask);sae_cmov(acc.y,t.y,mask);sae_cmov(acc.z,t.z,mask);
++ }
++ *r=acc;sae_wipe(&acc,sizeof acc);sae_wipe(&t,sizeof t);
++}
++static int sae_pt_store(const struct pt*p,uint8_t out[64]){
++ fe zi,z2,x,y;if(sae_is_zero(p->z))return -1;
++ sae_mpow(zi,p->z,EXP_INV,&FP);sae_mmul(z2,zi,zi,&FP);sae_mmul(x,p->x,z2,&FP);sae_mmul(z2,z2,zi,&FP);sae_mmul(y,p->y,z2,&FP);
++ sae_from_mont(x,x,&FP);sae_from_mont(y,y,&FP);sae_store(out,x);sae_store(out+32,y);return 0;
++}
++static int sae_pt_load(struct pt*p,const uint8_t in[64]){
++ fe x,y,t,g;sae_load(x,in);sae_load(y,in+32);
++ if(!sae_sub_raw(t,x,FP.m)||!sae_sub_raw(t,y,FP.m))return -1; /* coordinates below p */
++ sae_to_mont(p->x,x,&FP);sae_to_mont(p->y,y,&FP);sae_copy(p->z,FP.one);
++ sae_curve_g(g,p->x);sae_mmul(t,p->y,p->y,&FP);return sae_is_equal(t,g)?0:-1;
++}
++static int sae_scalar_ok(const fe k){fe t;static const fe two={2,0,0,0,0,0,0,0};return !sae_sub_raw(t,k,two)&&sae_sub_raw(t,k,FN.m);} /* 1 < k < order */
++int nsae_scalar_mult(const uint8_t point[64],const uint8_t k[32],uint8_t out[64]){
++ struct pt p,r;fe s,t;if(!point||!k||!out)return -1;
++ sae_load(s,k);if(sae_is_zero(s)||!sae_sub_raw(t,s,FN.m)||sae_pt_load(&p,point))return -1;
++ sae_pt_mul(&r,&p,s);int e=sae_pt_store(&r,out);sae_wipe(s,sizeof s);sae_wipe(&r,sizeof r);return e;
++}
++static void sae_order_addresses(const uint8_t a[6],const uint8_t b[6],uint8_t out[12]){
++ int first=memcmp(a,b,6)>0;memcpy(out,first?a:b,6);memcpy(out+6,first?b:a,6); /* max | min */
++}
++/* 12.4.4.2.2: forty iterations, the first valid candidate is kept by masked selection. */
++int nsae_pwe_loop(const uint8_t a[6],const uint8_t b[6],const uint8_t*password,size_t pn,uint8_t out[64]){
++ if(!out)return -1;
++ if(!a||!b||!password||!pn||pn>63){sae_wipe(out,64);return -1;}
++ uint8_t addresses[12],seed[32],value[32],prime[32];fe x,y,g,t,bx,by;uint32_t found=0,parity=0;
++ sae_order_addresses(a,b,addresses);sae_store(prime,FP.m);sae_wipe(bx,sizeof bx);sae_wipe(by,sizeof by);
++ for(unsigned counter=1;counter<=40;counter++){
++  uint8_t c=(uint8_t)counter;const uint8_t*parts[2]={password,&c};size_t sizes[2]={pn,1};
++  (void)nsc_hmac256(addresses,12,parts,sizes,2,seed);
++  (void)nsc_kdf256(seed,32,"SAE Hunting and Pecking",prime,32,value,32);
++  sae_load(x,value);uint32_t below=0u-sae_sub_raw(t,x,FP.m); /* value < p */
++  sae_reduce_once(x,x,FP.m);sae_to_mont(x,x,&FP);sae_curve_g(g,x);
++  uint32_t take=sae_field_sqrt(y,g)&below&~found;
++  sae_cmov(bx,x,take);sae_cmov(by,y,take);parity^=(parity^(uint32_t)(seed[31]&1u))&take;found|=take;
++ }
++ sae_from_mont(x,bx,&FP);sae_from_mont(y,by,&FP);
++ sae_msub(t,FP.m,y,&FP); /* p - y (y is never zero on this curve) */
++ sae_cmov(y,t,0u-((y[0]&1u)^parity));
++ sae_store(out,x);sae_store(out+32,y);
++ sae_wipe(seed,32);sae_wipe(value,32);sae_wipe(x,sizeof x);sae_wipe(y,sizeof y);sae_wipe(bx,sizeof bx);sae_wipe(by,sizeof by);sae_wipe(g,sizeof g);sae_wipe(t,sizeof t);
++ if(!found){sae_wipe(out,64);return -1;}
++ return 0;
++}
++/* 12.4.4.2.3 simplified SWU for a = -3, z = -10; u in Montgomery form. */
++static void sae_sswu(struct pt*r,const fe u){
++ fe z,u2,m,t,x1,x2,gx1,gx2,y,c,plain,neg;static const fe ten={10,0,0,0,0,0,0,0};
++ sae_to_mont(t,ten,&FP);sae_wipe(z,sizeof z);sae_msub(z,z,t,&FP); /* -10 */
++ sae_mmul(u2,u,u,&FP);sae_mmul(u2,u2,z,&FP); /* z u^2 */
++ sae_mmul(m,u2,u2,&FP);sae_madd(m,m,u2,&FP); /* z^2 u^4 + z u^2 */
++ uint32_t zero=sae_is_zero(m);
++ sae_mpow(t,m,EXP_INV,&FP); /* 0 stays 0 */
++ sae_madd(t,t,FP.one,&FP);sae_to_mont(c,SSWU_C2,&FP);sae_mmul(x1,t,c,&FP);sae_to_mont(c,SSWU_C1,&FP);sae_cmov(x1,c,zero);
++ sae_curve_g(gx1,x1);sae_mmul(x2,u2,x1,&FP);sae_curve_g(gx2,x2);
++ uint32_t square=sae_field_sqrt(y,gx1);
++ sae_copy(r->x,x2);sae_cmov(r->x,x1,square);
++ sae_cmov(gx2,gx1,square);(void)sae_field_sqrt(y,gx2);
++ sae_from_mont(plain,y,&FP);sae_from_mont(t,u,&FP);sae_wipe(neg,sizeof neg);sae_msub(neg,neg,y,&FP);
++ sae_cmov(y,neg,0u-((plain[0]^t[0])&1u)); /* LSB(y) = LSB(u) */
++ sae_copy(r->y,y);sae_copy(r->z,FP.one);
++ sae_wipe(u2,sizeof u2);sae_wipe(m,sizeof m);sae_wipe(t,sizeof t);sae_wipe(x1,sizeof x1);sae_wipe(x2,sizeof x2);sae_wipe(y,sizeof y);sae_wipe(plain,sizeof plain);
++}
++/* HKDF-Expand(seed, label, 48) reduced modulo p, in Montgomery form. */
++static void sae_hash_to_field(fe u,const uint8_t seed[32],const char*label){
++ uint8_t t1[32],t2[32],one=1,two=2;size_t ln=strlen(label);fe hi,lo;
++ const uint8_t*p1[2]={(const uint8_t*)label,&one};size_t n1[2]={ln,1};(void)nsc_hmac256(seed,32,p1,n1,2,t1);
++ const uint8_t*p2[3]={t1,(const uint8_t*)label,&two};size_t n2[3]={32,ln,1};(void)nsc_hmac256(seed,32,p2,n2,3,t2);
++ /* value = t1 | t2[0..15]: 384 bits = hi(128) * 2^256 + lo(256) */
++ uint8_t wide[32]={0};memcpy(wide+16,t1,16);sae_load(hi,wide);memcpy(wide,t1+16,16);memcpy(wide+16,t2,16);sae_load(lo,wide);
++ sae_reduce_once(lo,lo,FP.m);sae_to_mont(lo,lo,&FP);sae_to_mont(hi,hi,&FP);sae_to_mont(hi,hi,&FP);sae_madd(u,lo,hi,&FP);
++ sae_wipe(t1,32);sae_wipe(t2,32);sae_wipe(wide,32);sae_wipe(hi,sizeof hi);sae_wipe(lo,sizeof lo);
++}
++int nsae_pt(const uint8_t*ssid,size_t sn,const uint8_t*password,size_t pn,const uint8_t*identifier,size_t in,uint8_t out[64]){
++ if(!out)return -1;
++ if(!ssid||!sn||sn>32||!password||!pn||pn>63||(!identifier&&in)||in>255){sae_wipe(out,64);return -1;}
++ uint8_t seed[32];fe u;struct pt p1,p2;const uint8_t*parts[2]={password,identifier};size_t sizes[2]={pn,in};
++ (void)nsc_hmac256(ssid,sn,parts,sizes,in?2:1,seed);
++ sae_hash_to_field(u,seed,"SAE Hash to Element u1 P1");sae_sswu(&p1,u);
++ sae_hash_to_field(u,seed,"SAE Hash to Element u2 P2");sae_sswu(&p2,u);
++ sae_pt_add(&p1,&p1,&p2);int e=sae_pt_store(&p1,out);
++ sae_wipe(seed,32);sae_wipe(u,sizeof u);sae_wipe(&p1,sizeof p1);sae_wipe(&p2,sizeof p2);if(e)sae_wipe(out,64);return e;
++}
++int nsae_pwe_pt(const uint8_t pt[64],const uint8_t a[6],const uint8_t b[6],uint8_t out[64]){
++ if(!out)return -1;
++ if(!pt||!a||!b){sae_wipe(out,64);return -1;}
++ uint8_t addresses[12],zero[32]={0},digest[32];fe val,limit,t;struct pt p,r;const uint8_t*parts[1]={addresses};size_t sizes[1]={12};
++ sae_order_addresses(a,b,addresses);(void)nsc_hmac256(zero,32,parts,sizes,1,digest);
++ sae_load(val,digest);sae_sub_raw(limit,FN.m,RAW_ONE);sae_reduce_once(val,val,limit);sae_add_raw(t,val,RAW_ONE); /* val mod (r-1) + 1 */
++ int e=sae_pt_load(&p,pt);if(!e){sae_pt_mul(&r,&p,t);e=sae_pt_store(&r,out);}
++ sae_wipe(digest,32);sae_wipe(val,sizeof val);sae_wipe(t,sizeof t);sae_wipe(&p,sizeof p);sae_wipe(&r,sizeof r);if(e)sae_wipe(out,64);return e;
++}
++void nsae_cancel(struct nsae*s){if(s)sae_wipe(s,sizeof *s);}
++static int sae_refuse(struct nsae*s){nsae_cancel(s);return -1;}
++static int sae_unicast(const uint8_t*p){unsigned any=0;for(unsigned i=0;i<6;i++)any|=p[i];return any&&!(p[0]&1);}
++static int sae_draw(nsae_rng rng,void*ctx,fe out){
++ uint8_t raw[32];
++ for(unsigned tries=0;tries<8;tries++){
++  if(rng(ctx,raw,32)){sae_wipe(raw,32);return -1;}
++  sae_load(out,raw);sae_reduce_once(out,out,FN.m);if(sae_scalar_ok(out)){sae_wipe(raw,32);return 0;}
++ }
++ sae_wipe(raw,32);return -1;
++}
++int nsae_begin(struct nsae*s,const uint8_t own[6],const uint8_t peer[6],const uint8_t*password,size_t pn,const uint8_t*ssid,size_t sn,unsigned h2e,nsae_rng rng,void*ctx){
++ if(!s)return -1;
++ nsae_cancel(s);
++ if(!own||!peer||!password||!pn||pn>63||!ssid||!sn||sn>32||h2e>1||!rng||!sae_unicast(own)||!sae_unicast(peer)||!memcmp(own,peer,6))return -1;
++ memcpy(s->own,own,6);memcpy(s->peer,peer,6);s->h2e=h2e;
++ if(h2e){uint8_t pt[64];int e=nsae_pt(ssid,sn,password,pn,0,0,pt)||nsae_pwe_pt(pt,own,peer,s->pwe);sae_wipe(pt,64);if(e)return sae_refuse(s);}
++ else if(nsae_pwe_loop(own,peer,password,pn,s->pwe))return sae_refuse(s);
++ struct pt pwe,e;fe r,m,sum;int bad=sae_pt_load(&pwe,s->pwe);
++ for(unsigned tries=0;!bad;tries++){
++  if(tries==4||sae_draw(rng,ctx,r)||sae_draw(rng,ctx,m)){bad=1;break;}
++  sae_madd(sum,r,m,&FN);if(sae_scalar_ok(sum))break;
++ }
++ if(!bad){
++  sae_pt_mul(&e,&pwe,m);fe zero={0};sae_msub(e.y,zero,e.y,&FP); /* element = inverse(mask * PWE) */
++  bad=sae_pt_store(&e,s->element);sae_store(s->rand,r);sae_store(s->scalar,sum);
++ }
++ sae_wipe(r,sizeof r);sae_wipe(m,sizeof m);sae_wipe(sum,sizeof sum);sae_wipe(&pwe,sizeof pwe);sae_wipe(&e,sizeof e);
++ if(bad)return sae_refuse(s);
++ s->state=NSAE_READY;return 0;
++}
++static void sae_put16(uint8_t*p,unsigned v){p[0]=(uint8_t)v;p[1]=(uint8_t)(v>>8);}
++int nsae_commit(struct nsae*s,uint8_t*out,size_t capacity,size_t*used){
++ if(used)*used=0;
++ if(!s||!out||!used||(s->state!=NSAE_READY&&s->state!=NSAE_COMMITTED))return -1;
++ size_t n=NSAE_COMMIT_MIN+s->token_bytes+(s->h2e&&s->token_bytes?3u:0u),at=2;
++ if(capacity<n)return -1;
++ sae_put16(out,NSAE_GROUP);
++ if(!s->h2e&&s->token_bytes){memcpy(out+at,s->token,s->token_bytes);at+=s->token_bytes;}
++ memcpy(out+at,s->scalar,32);memcpy(out+at+32,s->element,64);at+=96;
++ if(s->h2e&&s->token_bytes){out[at++]=255;out[at++]=(uint8_t)(1+s->token_bytes);out[at++]=93;memcpy(out+at,s->token,s->token_bytes);at+=s->token_bytes;}
++ s->state=NSAE_COMMITTED;*used=at;return 0;
++}
++int nsae_token(struct nsae*s,const uint8_t*p,size_t n){
++ if(!s||s->state!=NSAE_COMMITTED||!p||n<3||(unsigned)(p[0]|p[1]<<8)!=NSAE_GROUP)return -1;
++ p+=2;n-=2;
++ if(s->h2e){if(n<4||p[0]!=255||p[1]<2||(size_t)p[1]+2>n||p[2]!=93)return -1;n=p[1]-1u;p+=3;}
++ if(!n||n>(s->h2e?254u:255u))return -1;
++ memcpy(s->token,p,n);s->token_bytes=(unsigned)n;return 0;
++}
++int nsae_peer_commit(struct nsae*s,const uint8_t*p,size_t n){
++ if(!s||s->state!=NSAE_COMMITTED)return -1;
++ if(!p||n<NSAE_COMMIT_MIN||n>NSAE_BODY_MAX||(unsigned)(p[0]|p[1]<<8)!=NSAE_GROUP)return sae_refuse(s);
++ fe ps,own,rnd,sum;struct pt pwe,element,k;uint8_t shared[64],seed[32],zero[32]={0},keys[64],val[32];
++ sae_load(ps,p+2);
++ if(!sae_scalar_ok(ps)||sae_pt_load(&element,p+34)||(!memcmp(p+2,s->scalar,32)&&!memcmp(p+34,s->element,64))||sae_pt_load(&pwe,s->pwe))return sae_refuse(s);
++ sae_pt_mul(&k,&pwe,ps);sae_pt_add(&k,&k,&element);sae_load(rnd,s->rand);sae_pt_mul(&k,&k,rnd);
++ int bad=sae_pt_store(&k,shared);
++ if(!bad){
++  const uint8_t*parts[1]={shared};size_t sizes[1]={32};(void)nsc_hmac256(zero,32,parts,sizes,1,seed);
++  sae_load(own,s->scalar);sae_madd(sum,own,ps,&FN);sae_store(val,sum);
++  bad=nsc_kdf256(seed,32,"SAE KCK and PMK",val,32,keys,64);
++  memcpy(s->kck,keys,32);memcpy(s->pmk,keys+32,32);memcpy(s->pmkid,val,16);
++  memcpy(s->peer_scalar,p+2,32);memcpy(s->peer_element,p+34,64);
++ }
++ sae_wipe(rnd,sizeof rnd);sae_wipe(&pwe,sizeof pwe);sae_wipe(&k,sizeof k);sae_wipe(shared,64);sae_wipe(seed,32);sae_wipe(keys,64);sae_wipe(val,32);
++ if(bad)return sae_refuse(s);
++ sae_wipe(s->rand,32);sae_wipe(s->pwe,64);s->state=NSAE_CONFIRMED;return 0;
++}
++static void sae_confirm_value(const struct nsae*s,unsigned counter,int mine,uint8_t out[32]){
++ uint8_t sc[2];sae_put16(sc,counter);
++ const uint8_t*parts[5]={sc,mine?s->scalar:s->peer_scalar,mine?s->element:s->peer_element,mine?s->peer_scalar:s->scalar,mine?s->peer_element:s->element};
++ size_t sizes[5]={2,32,64,32,64};(void)nsc_hmac256(s->kck,32,parts,sizes,5,out);
++}
++int nsae_confirm(struct nsae*s,uint8_t*out,size_t capacity,size_t*used){
++ if(used)*used=0;
++ if(!s||!out||!used||capacity<34||(s->state!=NSAE_CONFIRMED&&s->state!=NSAE_ACCEPTED)||s->send_confirm>=65534)return -1;
++ s->send_confirm++;sae_put16(out,s->send_confirm);sae_confirm_value(s,s->send_confirm,1,out+2);*used=34;return 0;
++}
++int nsae_peer_confirm(struct nsae*s,const uint8_t*p,size_t n){
++ if(!s||s->state!=NSAE_CONFIRMED)return -1;
++ if(!p||n<34)return sae_refuse(s);
++ uint8_t want[32];unsigned d=0;sae_confirm_value(s,(unsigned)(p[0]|p[1]<<8),0,want);
++ for(unsigned i=0;i<32;i++)d|=want[i]^p[2+i];
++ sae_wipe(want,32);if(d)return sae_refuse(s);
++ sae_wipe(s->kck,32);s->state=NSAE_ACCEPTED;return 0;
++}
++
++#endif /* NORD2 */
+--- /dev/null
++++ b/bsd/dev/wifi_sae.h
+@@ -0,0 +1,49 @@
++#ifndef WIFI_SAE_H
++#define WIFI_SAE_H
++#include <stddef.h>
++#include <stdint.h>
++/* 0432: WPA3-Personal SAE (IEEE 802.11-2020 12.4), group 19 (NIST P-256)
++ * only, hunting-and-pecking and hash-to-element. Pure serialized engine in
++ * the style of wifi_wpa2: no IO, timers, logging or allocation; one owner
++ * serializes all calls; every buffer is a kernel-owned copy. A negative
++ * return leaves no usable key material (the state is wiped).
++ * Bodies are the octets that follow the six fixed octets (algorithm 3,
++ * transaction sequence, status) of an Authentication frame. */
++#define NSAE_GROUP 19u
++#define NSAE_COMMIT_MIN 98u          /* group + scalar + element */
++#define NSAE_BODY_MAX 360u           /* commit with a 255 octet token container */
++#define NSAE_STATUS_H2E 126u         /* SAE_HASH_TO_ELEMENT */
++#define NSAE_STATUS_TOKEN 76u        /* ANTI_CLOGGING_TOKEN_REQUIRED */
++#define NSAE_STATUS_GROUP 77u        /* UNSUPPORTED_FINITE_CYCLIC_GROUP */
++enum nsae_state {NSAE_OFF,NSAE_READY,NSAE_COMMITTED,NSAE_CONFIRMED,NSAE_ACCEPTED};
++/* Same contract as nwp_rng: fill exactly 32 octets from a real CSPRNG, 0 on success. */
++typedef int (*nsae_rng)(void*,uint8_t*,size_t);
++struct nsae {
++ unsigned state,h2e,send_confirm,token_bytes;
++ uint8_t own[6],peer[6],pwe[64],rand[32],scalar[32],element[64];
++ uint8_t peer_scalar[32],peer_element[64],kck[32],pmk[32],pmkid[16],token[255];
++};
++/* Derives the PWE (h2e: PT from SSID/password, then PWE; otherwise the 40
++ * iteration loop), draws rand and mask and computes the commit scalar and
++ * element. Password 1..63 octets, SSID 1..32, unicast distinct addresses. */
++int nsae_begin(struct nsae*,const uint8_t own[6],const uint8_t peer[6],const uint8_t*password,size_t,
++ const uint8_t*ssid,size_t,unsigned h2e,nsae_rng,void*);
++/* group | [token] | scalar | element | [token container] ; READY or COMMITTED (retransmission). */
++int nsae_commit(struct nsae*,uint8_t*out,size_t capacity,size_t*used);
++/* Body of a status 76 frame: remembers the token for the next nsae_commit. */
++int nsae_token(struct nsae*,const uint8_t*,size_t);
++/* Peer commit body (status 0 or 126 already checked by the caller): validates
++ * group, scalar range, element on curve, reflection; derives KCK, PMK, PMKID. */
++int nsae_peer_commit(struct nsae*,const uint8_t*,size_t);
++/* send-confirm | confirm (34 octets); each call uses the next send-confirm. */
++int nsae_confirm(struct nsae*,uint8_t*out,size_t capacity,size_t*used);
++/* Verifies the peer confirm; on success the state is ACCEPTED and pmk/pmkid are final. */
++int nsae_peer_confirm(struct nsae*,const uint8_t*,size_t);
++void nsae_cancel(struct nsae*);
++/* Building blocks, exposed for the known-answer tests. Affine x||y, big endian. */
++int nsae_pwe_loop(const uint8_t a[6],const uint8_t b[6],const uint8_t*password,size_t,uint8_t out[64]);
++int nsae_pt(const uint8_t*ssid,size_t,const uint8_t*password,size_t,const uint8_t*identifier,size_t,uint8_t out[64]);
++int nsae_pwe_pt(const uint8_t pt[64],const uint8_t a[6],const uint8_t b[6],uint8_t out[64]);
++/* out = k*P (affine), k big endian 32 octets, 0 < k < order; test support. */
++int nsae_scalar_mult(const uint8_t point[64],const uint8_t k[32],uint8_t out[64]);
++#endif
+--- /dev/null
++++ b/bsd/dev/wifi_sae_crypto.c
+@@ -0,0 +1,103 @@
++#include <arm64/sweet_early.h>
++#if defined(NORD2)
++/* 0432: SHA-256 family glue (RFC 2104, RFC 4493, IEEE 802.11-2020 12.7.1.6.2). */
++#include "wifi_sae_crypto.h"
++#if defined(KERNEL) || defined(_KERNEL)
++#include "../../libkern/crypto/sweet_bearssl/inc/bearssl_block.h"
++#include <sys/systm.h>
++#include <libkern/crypto/sha2.h>
++typedef SHA256_CTX hash;
++static void sc_hash_init(hash*c){SHA256_Init(c);}
++static void sc_hash_update(hash*c,const void*p,size_t n){SHA256_Update(c,p,n);}
++static void sc_hash_final(hash*c,uint8_t out[32]){SHA256_Final(out,c);}
++#else
++#include "bearssl_block.h"
++#include <string.h>
++/* Host tests: FIPS 180-4 SHA-256 standing in for libkern's SHA256_*. */
++typedef struct {uint32_t h[8];uint64_t bytes;uint8_t block[64];} hash;
++static uint32_t sc_ror(uint32_t x,unsigned n){return x>>n|x<<(32-n);}
++static void sc_block(uint32_t h[8],const uint8_t*p){
++ static const uint32_t k[64]={
++ 0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
++ 0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
++ 0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
++ 0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
++ uint32_t w[64],s[8];
++ for(unsigned i=0;i<16;i++)w[i]=(uint32_t)p[4*i]<<24|(uint32_t)p[4*i+1]<<16|(uint32_t)p[4*i+2]<<8|p[4*i+3];
++ for(unsigned i=16;i<64;i++)w[i]=w[i-16]+(sc_ror(w[i-15],7)^sc_ror(w[i-15],18)^(w[i-15]>>3))+w[i-7]+(sc_ror(w[i-2],17)^sc_ror(w[i-2],19)^(w[i-2]>>10));
++ for(unsigned i=0;i<8;i++)s[i]=h[i];
++ for(unsigned i=0;i<64;i++){
++  uint32_t a=s[0],e=s[4];
++  uint32_t t1=s[7]+(sc_ror(e,6)^sc_ror(e,11)^sc_ror(e,25))+((e&s[5])^(~e&s[6]))+k[i]+w[i];
++  uint32_t t2=(sc_ror(a,2)^sc_ror(a,13)^sc_ror(a,22))+((a&s[1])^(a&s[2])^(s[1]&s[2]));
++  for(unsigned j=7;j;j--)s[j]=s[j-1];
++  s[4]+=t1;s[0]=t1+t2;
++ }
++ for(unsigned i=0;i<8;i++)h[i]+=s[i];
++}
++static void sc_hash_init(hash*c){
++ static const uint32_t iv[8]={0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
++ for(unsigned i=0;i<8;i++)c->h[i]=iv[i];c->bytes=0;
++}
++static void sc_hash_update(hash*c,const void*v,size_t n){
++ const uint8_t*p=v;
++ while(n--){c->block[c->bytes++&63]=*p++;if(!(c->bytes&63))sc_block(c->h,c->block);}
++}
++static void sc_hash_final(hash*c,uint8_t out[32]){
++ uint64_t bits=c->bytes*8;uint8_t pad=0x80,z=0,len[8];
++ sc_hash_update(c,&pad,1);while((c->bytes&63)!=56)sc_hash_update(c,&z,1);
++ for(unsigned i=0;i<8;i++)len[i]=(uint8_t)(bits>>(56-8*i));
++ sc_hash_update(c,len,8);
++ for(unsigned i=0;i<8;i++){out[4*i]=(uint8_t)(c->h[i]>>24);out[4*i+1]=(uint8_t)(c->h[i]>>16);out[4*i+2]=(uint8_t)(c->h[i]>>8);out[4*i+3]=(uint8_t)c->h[i];}
++}
++#endif
++static void sc_clear(void*v,size_t n){volatile uint8_t*p=v;while(n--)*p++=0;}
++int nsc_hmac256(const uint8_t*k,size_t kn,const uint8_t*const*p,const size_t*n,size_t count,uint8_t out[32]){
++ if(!out)return -1;
++ if((!k&&kn)||kn>64||(count&&(!p||!n))||count>6){sc_clear(out,32);return -1;}
++ for(size_t i=0;i<count;i++)if(n[i]>1024||(!p[i]&&n[i])){sc_clear(out,32);return -1;}
++ uint8_t pad[64],digest[32];hash c;
++ for(unsigned i=0;i<64;i++)pad[i]=(i<kn?k[i]:0)^0x36;
++ sc_hash_init(&c);sc_hash_update(&c,pad,64);
++ for(size_t i=0;i<count;i++)if(n[i])sc_hash_update(&c,p[i],n[i]);
++ sc_hash_final(&c,digest);
++ for(unsigned i=0;i<64;i++)pad[i]^=0x36^0x5c;
++ sc_hash_init(&c);sc_hash_update(&c,pad,64);sc_hash_update(&c,digest,32);sc_hash_final(&c,out);
++ sc_clear(&c,sizeof c);sc_clear(pad,64);sc_clear(digest,32);return 0;
++}
++int nsc_kdf256(const uint8_t*k,size_t kn,const char*label,const uint8_t*context,size_t cn,uint8_t*out,size_t bytes){
++ if(!out||!bytes||bytes>64)return -1;
++ size_t ln=0;if(label)while(label[ln])ln++;
++ if(!k||!label||!ln||ln>64||(!context&&cn)||cn>1024){sc_clear(out,bytes);return -1;}
++ uint8_t d[32],bits[2]={(uint8_t)(bytes*8),(uint8_t)(bytes*8>>8)};
++ for(size_t done=0,i=1;done<bytes;i++){
++  uint8_t counter[2]={(uint8_t)i,0};const uint8_t*p[4]={counter,(const uint8_t*)label,context,bits};size_t ns[4]={2,ln,cn,2};
++  if(nsc_hmac256(k,kn,p,ns,4,d)){sc_clear(out,bytes);return -1;}
++  size_t take=bytes-done<32?bytes-done:32;memcpy(out+done,d,take);done+=take;
++ }
++ sc_clear(d,32);return 0;
++}
++int nsc_ptk256(const uint8_t key[32],const uint8_t context[76],uint8_t out[48]){
++ if(!out)return -1;
++ if(!key||!context){sc_clear(out,48);return -1;}
++ return nsc_kdf256(key,32,"Pairwise key expansion",context,76,out,48);
++}
++static void sc_cmac_double(uint8_t b[16]){unsigned carry=b[0]>>7;for(unsigned i=0;i<15;i++)b[i]=(uint8_t)(b[i]<<1|b[i+1]>>7);b[15]=(uint8_t)((b[15]<<1)^(carry?0x87:0));}
++int nsc_cmac(const uint8_t key[16],const uint8_t*const*p,const size_t*n,size_t count,uint8_t out[16]){
++ if(!out)return -1;
++ if(!key||(count&&(!p||!n))||count>4){sc_clear(out,16);return -1;}
++ for(size_t i=0;i<count;i++)if(n[i]>1024||(!p[i]&&n[i])){sc_clear(out,16);return -1;}
++ br_aes_ct_cbcenc_keys ctx;uint8_t x[16]={0},sub[16]={0},block[16],iv[16]={0};unsigned fill=0;
++ br_aes_ct_cbcenc_init(&ctx,key,16);
++ br_aes_ct_cbcenc_run(&ctx,iv,sub,16);sc_cmac_double(sub); /* K1 */
++ for(size_t i=0;i<count;i++)for(size_t j=0;j<n[i];j++){
++  if(fill==16){br_aes_ct_cbcenc_run(&ctx,x,block,16);fill=0;} /* x = E(x ^ block) */
++  block[fill++]=p[i][j];
++ }
++ if(fill!=16){sc_cmac_double(sub);block[fill++]=0x80;while(fill<16)block[fill++]=0;} /* K2 */
++ for(unsigned i=0;i<16;i++)block[i]^=sub[i];
++ br_aes_ct_cbcenc_run(&ctx,x,block,16);memcpy(out,x,16);
++ sc_clear(&ctx,sizeof ctx);sc_clear(x,16);sc_clear(sub,16);sc_clear(block,16);sc_clear(iv,16);return 0;
++}
++
++#endif /* NORD2 */
+--- /dev/null
++++ b/bsd/dev/wifi_sae_crypto.h
+@@ -0,0 +1,16 @@
++#ifndef WIFI_SAE_CRYPTO_H
++#define WIFI_SAE_CRYPTO_H
++#include <stddef.h>
++#include <stdint.h>
++/* 0432 (WPA3-SAE, AKM 00-0F-AC:6/8): HMAC-SHA256, the IEEE 802.11
++ * KDF-SHA256-Length, AES-128-CMAC and the SHA-256 pairwise key expansion.
++ * A new object beside the CI member wifi_wpa_crypto.o, which stays as built.
++ * SHA-256 is the kernel's libkern implementation; AES is the BearSSL
++ * constant-time code already in the kernel archive. Separate nonaliasing
++ * bounded input/output; outputs are wiped on refusal. */
++int nsc_hmac256(const uint8_t*key,size_t,const uint8_t*const*parts,const size_t*sizes,size_t count,uint8_t out[32]);
++/* out = L(HMAC-SHA256(key, i_le16 | label | context | bits_le16), i=1.., 0, 8*bytes); bytes 1..64. */
++int nsc_kdf256(const uint8_t*key,size_t,const char*label,const uint8_t*context,size_t,uint8_t*out,size_t bytes);
++int nsc_cmac(const uint8_t key[16],const uint8_t*const*parts,const size_t*sizes,size_t count,uint8_t out[16]);
++int nsc_ptk256(const uint8_t pmk[32],const uint8_t sorted_context[76],uint8_t out[48]);
++#endif

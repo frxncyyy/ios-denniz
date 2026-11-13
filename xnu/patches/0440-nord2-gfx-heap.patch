@@ -1,0 +1,873 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -446,6 +446,7 @@
+ 	return (uint32_t)(ns / 1000000000ull);
+ }
+ 
++#include "sweet_gfx_heap_kern.inc"    /* 0440: low-bank graphics heap (before the IOMMU: n2io_ram accepts its pages) */
+ #include "sweet_fb_iommu_hw.h"        /* 0401 IOMMU: display IOMMU (uses the pool code above for its page tables) */
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+@@ -465,6 +466,9 @@
+ 	/* 0394: a pool surface gives its range back once nothing else holds the descriptor (a holder could still map it). */
+ 	uint64_t poolPa = sweet_pool_surface_pa(this), poolLen = poolPa != 0 ? memory->getLength() : 0;
+ 	bool poolHeld = poolPa != 0 && memory->getRetainCount() > 1;
++	/* 0440: a heap surface likewise (never a pool surface: the two ranges are disjoint) */
++	uint64_t heapPa = poolPa == 0 ? sweet_heap_surface_pa(this) : 0, heapLen = heapPa != 0 ? memory->getLength() : 0;
++	bool heapHeld = heapPa != 0 && memory->getRetainCount() > 1;
+ 	/* 0398: nobody maps or holds this surface any more, so its use counts must be 0 (else the accounting lost a give-back) */
+ 	if (state != NULL) {
+ 		volatile uint32_t *w = (volatile uint32_t *)((uintptr_t)state->getBytesNoCopy() + SWEET_USE_STATE_WORDS);
+@@ -488,6 +492,13 @@
+ 		IOLog("NORD2 FB POOL: pa %#llx %llu bytes kept out of the pool: its descriptor is still held (leaked %u)\n",
+ 		    poolPa, poolLen, sweet_pool_leaked);
+ 	}
++	if (heapPa != 0 && !heapHeld) {        /* 0440 */
++		sweet_heap_give(heapPa, heapLen, false);
++	} else if (heapHeld) {
++		OSIncrementAtomic((volatile SInt32 *)&sweet_heap_leaked);
++		IOLog("NORD2 HEAP: surface pa %#llx %llu KiB kept out of the heap: its descriptor is still held (quarantined %u)\n",
++		    heapPa, heapLen >> 10, sweet_heap_leaked);
++	}
+ 	OSObject::free();
+ }
+ 
+@@ -505,6 +516,10 @@
+ 	if (poolPa != 0) {
+ 		return (uintptr_t)(sweet_pool_kva + (poolPa - SWEET_FB_HW_POOL_BASE));
+ 	}
++	uint64_t heapPa = sweet_heap_surface_pa(this);         /* 0440: the heap region's own kernel mapping (write-combined, as the users') */
++	if (heapPa != 0) {
++		return (uintptr_t)sweet_heap_va(heapPa, memory->getLength());
++	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+ 		kernelMap = memory->map(kIOMapWriteCombineCache);
+@@ -920,6 +935,7 @@
+ 		sweet_pool_evict_lock = IOLockAlloc();  /* 0406 */
+ 	}
+ 	sweet_purge_start();    /* 0417: sink, 2 s pressure scan, NORD2 MEM SURF line */
++	sweet_heap_start();     /* 0440: graphics heap (regions mapped by its thread call) */
+ 	sweet_use_args();       /* 0398 */
+ 	IOLog("NORD2 SURF USE: IOSurface use count mode %d (kern.n2surfuse / n2su: 0 off, 1 user traps, 2 + display/GPU holds), counts at state page +0x%x\n",
+ 	    sweet_use_mode, SWEET_USE_STATE_WORDS);
+@@ -1995,6 +2011,7 @@
+ 	    sweet_pool_foreign, sweet_pool_leaked, sweet_pool_why[SWEET_FB_POOL_OK], sweet_pool_why[SWEET_FB_POOL_NO_OFF],
+ 	    sweet_pool_why[SWEET_FB_POOL_NO_FORMAT], sweet_pool_why[SWEET_FB_POOL_NO_PLANES], sweet_pool_why[SWEET_FB_POOL_NO_SMALL],
+ 	    sweet_pool_why[SWEET_FB_POOL_NO_STRIDE], sweet_pool_why[SWEET_FB_POOL_NO_OFFSET], sweet_pool_why[SWEET_FB_POOL_NO_SIZE]);   /* 0394 */
++	sweet_heap_log_line(true);      /* 0440: not in the wired budget either */
+ 	for (uint32_t n = 0; n < 5 && n < made_n; n++) {
+ 		char name[32] = "?";
+ 		proc_name(made[n].pid, name, sizeof(name));
+@@ -2327,17 +2344,18 @@
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+-	bool pooled = false;
++	bool pooled = false, heaped = false;
+ 	if (ret == kIOReturnSuccess) {
+ 		/* 0394: full-screen BGRA surfaces from the display pool when kern.n2fbhw_pool = 1; anything else, or a full pool, below. */
+ 		uint32_t why = sweet_fb_pool_eligible(1, s->width, s->height, s->bytesPerRow, s->bytesPerElement,
+ 		    s->elementWidth, s->elementHeight, s->pixelFormat, s->planeCount, s->offset, s->allocSize);
++		uint32_t elig = why;            /* 0440: the heap takes the same surfaces (and the same admission) when the pool does not */
+ 		if (why == SWEET_FB_POOL_OK && !sweet_pool_enabled) {
+ 			why = SWEET_FB_POOL_NO_OFF;     /* "off" = would have gone to the pool (H0 data with the pool off) */
+ 		}
+ 		OSIncrementAtomic((volatile SInt32 *)&sweet_pool_why[why]);
+ 		bool admit = true;
+-		if (why == SWEET_FB_POOL_OK) {  /* 0398: who makes it decides too (snapshots are never scanned out) */
++		if (elig == SWEET_FB_POOL_OK) { /* 0398: who makes it decides too (snapshots are never scanned out) */
+ 			char pname[32];
+ 			proc_selfname(pname, sizeof(pname));
+ 			admit = sweet_pool_admit(__atomic_load_n(&sweet_pool_policy, __ATOMIC_RELAXED), pname);
+@@ -2351,8 +2369,9 @@
+ 		}
+ 		s->creator = fPid;
+ 		pooled = why == SWEET_FB_POOL_OK && admit && sweet_pool_attach(s, true);
++		heaped = !pooled && elig == SWEET_FB_POOL_OK && admit && sweet_heap_attach(s);     /* 0440: else normal memory below */
+ 	}
+-	if (pooled) {
++	if (pooled || heaped) {
+ 		OSNumber *client = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
+ 		if (client == NULL) { client = OSDynamicCast(OSNumber, props->getObject("IOSurfaceClientAddress")); }
+ 		if (client != NULL) {   /* snapshot of the creator's memory, as below (no planes here) */
+@@ -2361,15 +2380,24 @@
+ 			uintptr_t kva = s->kernelAddress();
+ 			int err = used == 0 || kva == 0 ? EINVAL : copyin((user_addr_t)address, (void *)kva, (size_t)used);
+ 			if (err == 0) {
+-				sweet_pool_flush((vm_offset_t)kva, (size_t)used);
++				if (heaped) {
++					sweet_heap_wc_drain();      /* 0440: write-combined */
++				} else {
++					sweet_pool_flush((vm_offset_t)kva, (size_t)used);
++				}
+ 			}
+-			IOLog("NORD2 FB POOL: create from client memory %#llx (%llu bytes) -> %s\n", address, used, err ? "refused" : "snapshot copied");
++			IOLog("%s: create from client memory %#llx (%llu bytes) -> %s\n", heaped ? "NORD2 HEAP" : "NORD2 FB POOL", address, used,
++			    err ? "refused" : "snapshot copied");
+ 			ret = err ? kIOReturnBadArgument : kIOReturnSuccess;        /* refused: s->release() below gives the range back */
+ 		}
+ 		if (ret == kIOReturnSuccess && !sweet_surface_publish(s)) {
+ 			ret = kIOReturnNoResources;
+ 		}
+-		if (ret == kIOReturnSuccess) {
++		if (ret == kIOReturnSuccess && heaped) {
++			char hname[32];
++			proc_selfname(hname, sizeof(hname));
++			sweet_heap_log_alloc(s, hname);
++		} else if (ret == kIOReturnSuccess) {
+ 			sweet_pool_log_alloc(s, "create");
+ 		}
+ 	} else if (ret == kIOReturnSuccess) {
+--- a/iokit/Kernel/arm/sweet_fb_iommu_hw.h
++++ b/iokit/Kernel/arm/sweet_fb_iommu_hw.h
+@@ -273,7 +273,8 @@
+ static bool
+ n2io_ram(uint64_t pa)
+ {
+-	return !(pa & 0xfffu) && ((pa >= gPhysBase && pa + 0x1000u <= (uint64_t)gPhysBase + gPhysSize) || sweet_fb_hw_pool_contains(pa, 0x1000u));
++	return !(pa & 0xfffu) && ((pa >= gPhysBase && pa + 0x1000u <= (uint64_t)gPhysBase + gPhysSize) || sweet_fb_hw_pool_contains(pa, 0x1000u) ||
++	    sweet_heap_page_ok(pa));      /* 0440: graphics-heap pages (only ever reached through an IOVA PTE, never as a physical OVL address) */
+ }
+ 
+ /* Map desc (len bytes) for obj/id; lock held.  NULL = not mappable. */
+@@ -348,6 +349,7 @@
+ 	IOLog("NORD2 FB IOMMU: fault (%s): fault_st1 %08x l2 %08x va %08x (iova %#x%s) pa %08x int_id %08x (larb axi %u port %u) ports %u prog %08x %08x | %08x %08x\n",
+ 	    where, st, l2, va, va & 0xfffff000u, (va & 0x10u) ? " translation fault" : ((va & 0x20u) ? " invalid pa" : ""), fpa, id, (id >> 7) & 0x1fu,
+ 	    (id >> 2) & 0x1fu, n2io_ports_on, n2io_prog.addr[0][0], n2io_prog.addr[0][1], n2io_prog.addr[1][0], n2io_prog.addr[1][1]);
++	if (va & 0x20u) { sweet_heap_m4u_fault_pa(fpa); }      /* 0440: invalid-PA fault on a heap page: that region takes no new allocations */
+ 	n2io_wr(n2io_m4u, N2IO_INT_CTRL0, n2io_rd(n2io_m4u, N2IO_INT_CTRL0) | (1u << 12));      /* clear */
+ 	n2io_tlb_all();                                                                           /* re-arm: every walk starts again */
+ 	if (n2io_rd(n2io_m4u, N2IO_PT_BASE) != n2io_ptbase_val) {                                  /* 0416: state lost: PT_BASE/TFRP back */
+--- /dev/null
++++ b/iokit/Kernel/arm/sweet_gfx_heap.h
+@@ -0,0 +1,292 @@
++/*
++ * 0440 (gfxheap-20261113): the low-bank GRAPHICS HEAP -- region table and allocator, pure (no kernel calls; the host test
++ * gfxheap-20261113/heap-0440/test/gfx_heap_host_test.c runs exactly this code).  Kernel part: sweet_gfx_heap_kern.inc (SweetSurface.cpp).
++ *
++ * Why: XNU's own window is 5088 MiB at 0x1_00000000; the phone has 8 GiB.  The free holes of the low bank (LK mblock_info free blocks,
++ * outside every reserved-memory node and every fixed claim of our code, region table = 0419's) hold wired graphics memory instead of
++ * XNU pages: displayed full-screen BGRA IOSurfaces and GPU-only buffers.  XNU keeps every page of its window for pageable memory.
++ * Probe result (0419, image q10jgx, mode 2 with canary writes, 10 min of normal use): all 9 regions FREE, canary_bad 0, restore_bad 0,
++ * late 0.  The probe only proves CPU access; GPU / display (M4U) / EMI MPU per-master permissions are NOT proven by it.
++ *
++ * Classes: SAFE = inside an LK free block, no claim of unknown extent nearby (on by default with kern.n2heap = 1); CHECK = next to a
++ * claim whose real extent is not known (SCP firmware, ccci, Wi-Fi): used only with kern.n2heap_check = 1.
++ * F_NOPHYS (mb13b): its PAs have the same numbers as the display IOMMU's IOVA window 0x90000000..0xB0000000.  Heap surfaces are never
++ * pool surfaces (sweet_surface_pool_pa_obj() = 0), so the overlay planner only ever sees them through an IOVA mapping (PTE -> PA);
++ * a heap PA is never programmed into an OVL address register.  The window has no identity sections, so no IOVA == PA aliasing exists.
++ *
++ * Allocator: one bitmap of 64 KiB granules over all regions (global numbering = regions concatenated in table order), first fit that
++ * restarts at every region start, so no allocation ever spans two regions (each allocation is ONE physically contiguous range).
++ */
++#ifndef SWEET_GFX_HEAP_H
++#define SWEET_GFX_HEAP_H
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#define SWEET_GFX_HEAP_GRANULE  0x10000ull      /* 64 KiB, = SWEET_FB_HW_POOL_GRANULE = SWEET_FB_IOMMU_GRANULE */
++#define SWEET_GFX_HEAP_NREG     9u
++#define SWEET_GFX_HEAP_SAFE     0u
++#define SWEET_GFX_HEAP_CHECK    1u
++#define SWEET_GFX_HEAP_F_NOPHYS 1u              /* never a physical OVL address (IOVA window numbers) */
++#define SWEET_GFX_HEAP_NGRAN    15945u          /* sum of the regions' granules (host test + _Static_assert in the .inc) */
++#define SWEET_GFX_HEAP_WORDS    ((SWEET_GFX_HEAP_NGRAN + 63u) / 64u)
++#define SWEET_GFX_HEAP_FAIL     0xffffffffu
++#define SWEET_GFX_HEAP_ALL      ((1u << SWEET_GFX_HEAP_NREG) - 1u)
++
++struct sweet_gfx_heap_region {
++	uint64_t    base, size;
++	uint32_t    cls, flags;
++	const char *name;
++};
++
++static const struct sweet_gfx_heap_region sweet_gfx_heap_regions[SWEET_GFX_HEAP_NREG] = {
++	{ 0x55100000ull, 0x0ae00000ull, SWEET_GFX_HEAP_SAFE,  0,                       "mb5"   },   /* 174 MiB  (Linux: dram_r0_dummy_read) */
++	{ 0x5ff80000ull, 0x10080000ull, SWEET_GFX_HEAP_SAFE,  0,                       "mb6a"  },   /* 256.5 MiB, PICACHU end .. DVFS share */
++	{ 0x70200000ull, 0x03e00000ull, SWEET_GFX_HEAP_SAFE,  0,                       "mb6b"  },   /* 62 MiB, DVFS share end .. adsp */
++	{ 0x74e30000ull, 0x00fd0000ull, SWEET_GFX_HEAP_SAFE,  0,                       "mb7"   },   /* 15.8 MiB, adsp end .. SPM */
++	{ 0x80000000ull, 0x09000000ull, SWEET_GFX_HEAP_SAFE,  0,                       "mb11a" },   /* 144 MiB, .. SCP DRAM */
++	{ 0x89320000ull, 0x00ce0000ull, SWEET_GFX_HEAP_CHECK, 0,                       "mb11b" },   /* 12.9 MiB, SCP DRAM end .. ccci */
++	{ 0x8d560000ull, 0x00aa0000ull, SWEET_GFX_HEAP_CHECK, 0,                       "mb12"  },   /* 10.6 MiB, ccci end .. ap_md_nc_smem */
++	{ 0x91000000ull, 0x0ea00000ull, SWEET_GFX_HEAP_CHECK, SWEET_GFX_HEAP_F_NOPHYS, "mb13b" },   /* 234 MiB, Wi-Fi pool end (+16 MiB) .. SCP-reserved */
++	{ 0xb8000000ull, 0x056c0000ull, SWEET_GFX_HEAP_SAFE,  0,                       "mb14b" },   /* 86.75 MiB, RWVC end .. vpu_binary */
++};
++
++static inline uint32_t
++sweet_gfx_heap_ngran(unsigned r)
++{
++	return (uint32_t)(sweet_gfx_heap_regions[r].size / SWEET_GFX_HEAP_GRANULE);
++}
++
++/* First global granule of region r. */
++static inline uint32_t
++sweet_gfx_heap_first(unsigned r)
++{
++	uint32_t g = 0;
++	for (unsigned i = 0; i < r && i < SWEET_GFX_HEAP_NREG; i++) {
++		g += sweet_gfx_heap_ngran(i);
++	}
++	return g;
++}
++
++/* Region holding all of [pa, pa + len), or -1. */
++static inline int
++sweet_gfx_heap_region_of(uint64_t pa, uint64_t len)
++{
++	if (len == 0) {
++		return -1;
++	}
++	for (unsigned r = 0; r < SWEET_GFX_HEAP_NREG; r++) {
++		const struct sweet_gfx_heap_region *g = &sweet_gfx_heap_regions[r];
++		if (pa >= g->base && len <= g->size && pa - g->base <= g->size - len) {
++			return (int)r;
++		}
++	}
++	return -1;
++}
++
++/* Region mask a creation may use: SAFE regions with on, CHECK regions only with check too; minus the off and admin masks. */
++static inline uint32_t
++sweet_gfx_heap_allowed(int on, int check, uint32_t admin_mask, uint32_t off_mask)
++{
++	if (!on) {
++		return 0;
++	}
++	uint32_t m = 0;
++	for (unsigned r = 0; r < SWEET_GFX_HEAP_NREG; r++) {
++		if (sweet_gfx_heap_regions[r].cls == SWEET_GFX_HEAP_SAFE || check) {
++			m |= 1u << r;
++		}
++	}
++	return m & admin_mask & ~off_mask & SWEET_GFX_HEAP_ALL;
++}
++
++struct sweet_gfx_heap {
++	uint64_t bits[SWEET_GFX_HEAP_WORDS];    /* 1 = granule in use (or quarantined) */
++	uint32_t used[SWEET_GFX_HEAP_NREG];     /* granules in use per region */
++	uint32_t live[SWEET_GFX_HEAP_NREG];     /* allocations per region */
++	uint32_t used_total, used_peak, live_total;
++	uint64_t allocs, frees, full, bad_free;
++};
++
++static inline uint32_t
++sweet_gfx_heap_granules(uint64_t bytes)
++{
++	return (uint32_t)((bytes + SWEET_GFX_HEAP_GRANULE - 1) / SWEET_GFX_HEAP_GRANULE);
++}
++
++static inline bool
++sweet_gfx_heap_test(const struct sweet_gfx_heap *h, uint32_t g)
++{
++	return (h->bits[g >> 6] >> (g & 63)) & 1;
++}
++
++static inline void
++sweet_gfx_heap_set(struct sweet_gfx_heap *h, uint32_t g0, uint32_t n, bool on)
++{
++	for (uint32_t k = g0; k < g0 + n; k++) {
++		if (on) {
++			h->bits[k >> 6] |= 1ull << (k & 63);
++		} else {
++			h->bits[k >> 6] &= ~(1ull << (k & 63));
++		}
++	}
++}
++
++/* Global granule -> PA (~0 past the end). */
++static inline uint64_t
++sweet_gfx_heap_gran_pa(uint32_t g)
++{
++	for (unsigned r = 0; r < SWEET_GFX_HEAP_NREG; r++) {
++		uint32_t n = sweet_gfx_heap_ngran(r);
++		if (g < n) {
++			return sweet_gfx_heap_regions[r].base + (uint64_t)g * SWEET_GFX_HEAP_GRANULE;
++		}
++		g -= n;
++	}
++	return ~0ull;
++}
++
++/* Longest free run of region r (granules, for logs). */
++static inline uint32_t
++sweet_gfx_heap_largest_free(const struct sweet_gfx_heap *h, unsigned r)
++{
++	uint32_t g0 = sweet_gfx_heap_first(r), n = sweet_gfx_heap_ngran(r), best = 0, run = 0;
++	for (uint32_t g = g0; g < g0 + n; g++) {
++		if (sweet_gfx_heap_test(h, g)) {
++			run = 0;
++		} else if (++run > best) {
++			best = run;
++		}
++	}
++	return best;
++}
++
++/*
++ * First fit of bytes in the regions of mask (table order), never across a region boundary.  Returns the first global granule, or
++ * SWEET_GFX_HEAP_FAIL (counted in full).  cap_gran: the global cap (granules in use after this allocation must stay <= cap_gran).
++ */
++static inline uint32_t
++sweet_gfx_heap_alloc(struct sweet_gfx_heap *h, uint64_t bytes, uint32_t mask, uint32_t cap_gran, unsigned *region_out)
++{
++	uint32_t n = sweet_gfx_heap_granules(bytes);
++	if (bytes == 0 || n > SWEET_GFX_HEAP_NGRAN || h->used_total + n > cap_gran) {
++		h->full++;
++		return SWEET_GFX_HEAP_FAIL;
++	}
++	uint32_t base = 0;
++	for (unsigned r = 0; r < SWEET_GFX_HEAP_NREG; base += sweet_gfx_heap_ngran(r), r++) {
++		uint32_t rn = sweet_gfx_heap_ngran(r);
++		if (!((mask >> r) & 1u) || n > rn - h->used[r]) {
++			continue;
++		}
++		uint32_t start = base, run = 0;
++		for (uint32_t g = base; g < base + rn; g++) {
++			if ((g & 63) == 0 && g + 64 <= base + rn && h->bits[g >> 6] == ~0ull) {     /* whole word in use */
++				run = 0;
++				g += 63;
++				continue;
++			}
++			if (sweet_gfx_heap_test(h, g)) {
++				run = 0;
++				continue;
++			}
++			if (run++ == 0) {
++				start = g;
++			}
++			if (run == n) {
++				sweet_gfx_heap_set(h, start, n, true);
++				h->used[r] += n;
++				h->live[r]++;
++				h->used_total += n;
++				h->live_total++;
++				if (h->used_total > h->used_peak) {
++					h->used_peak = h->used_total;
++				}
++				h->allocs++;
++				if (region_out != NULL) {
++					*region_out = r;
++				}
++				return start;
++			}
++		}
++	}
++	h->full++;
++	return SWEET_GFX_HEAP_FAIL;
++}
++
++/* True iff [pa, pa + bytes) is exactly the kind of range sweet_gfx_heap_alloc hands out and every granule of it is in use (the kernel
++ * checks this before writing the free canaries, so a bad give-back never writes into another allocation). */
++static inline bool
++sweet_gfx_heap_is_allocated(const struct sweet_gfx_heap *h, uint64_t pa, uint64_t bytes)
++{
++	uint32_t n = sweet_gfx_heap_granules(bytes);
++	int r = bytes != 0 ? sweet_gfx_heap_region_of(pa, (uint64_t)n * SWEET_GFX_HEAP_GRANULE) : -1;
++	if (r < 0 || ((pa - sweet_gfx_heap_regions[r].base) % SWEET_GFX_HEAP_GRANULE) != 0 || h->live[r] == 0 || h->used[r] < n) {
++		return false;
++	}
++	uint32_t g0 = sweet_gfx_heap_first((unsigned)r) + (uint32_t)((pa - sweet_gfx_heap_regions[r].base) / SWEET_GFX_HEAP_GRANULE);
++	for (uint32_t k = g0; k < g0 + n; k++) {
++		if (!sweet_gfx_heap_test(h, k)) {
++			return false;
++		}
++	}
++	return true;
++}
++
++/* Give back what sweet_gfx_heap_alloc(bytes) returned (as a PA).  Misaligned / out of the regions / not allocated: nothing changes. */
++static inline bool
++sweet_gfx_heap_free(struct sweet_gfx_heap *h, uint64_t pa, uint64_t bytes)
++{
++	uint32_t n = sweet_gfx_heap_granules(bytes);
++	int r = bytes != 0 ? sweet_gfx_heap_region_of(pa, (uint64_t)n * SWEET_GFX_HEAP_GRANULE) : -1;
++	if (r < 0 || ((pa - sweet_gfx_heap_regions[r].base) % SWEET_GFX_HEAP_GRANULE) != 0 || h->live[r] == 0 || h->used[r] < n) {
++		h->bad_free++;
++		return false;
++	}
++	uint32_t g0 = sweet_gfx_heap_first((unsigned)r) + (uint32_t)((pa - sweet_gfx_heap_regions[r].base) / SWEET_GFX_HEAP_GRANULE);
++	for (uint32_t k = g0; k < g0 + n; k++) {
++		if (!sweet_gfx_heap_test(h, k)) {
++			h->bad_free++;
++			return false;
++		}
++	}
++	sweet_gfx_heap_set(h, g0, n, false);
++	h->used[r] -= n;
++	h->live[r]--;
++	h->used_total -= n;
++	h->live_total--;
++	h->frees++;
++	return true;
++}
++
++/* Canary in the first 16 bytes of every FREE granule (setup, free; checked at alloc and by the 30 s scrub).  PA-derived: a write that
++ * lands on another granule (address aliasing) never matches. */
++static inline uint64_t
++sweet_gfx_heap_canary(uint64_t pa)
++{
++	uint64_t x = pa ^ 0x4e32474658480000ull;
++	x ^= x >> 31; x *= 0x9e3779b97f4a7c15ull; x ^= x >> 29;
++	return x;
++}
++
++static inline void
++sweet_gfx_heap_canary_put(volatile uint64_t *head, uint64_t pa)
++{
++	head[0] = sweet_gfx_heap_canary(pa);
++	head[1] = ~sweet_gfx_heap_canary(pa);
++}
++
++static inline bool
++sweet_gfx_heap_canary_ok(const volatile uint64_t *head, uint64_t pa)
++{
++	return head[0] == sweet_gfx_heap_canary(pa) && head[1] == ~sweet_gfx_heap_canary(pa);
++}
++
++/* GPU-only buffer placement: exactly flags 2 (GPU-only, not executable, not write-combined) and at least min_bytes. */
++static inline bool
++sweet_gfx_heap_gpu_eligible(uint32_t flags, uint64_t bytes, uint64_t min_bytes)
++{
++	return flags == 2u && bytes >= min_bytes && (bytes % 4096u) == 0;
++}
++
++#endif /* SWEET_GFX_HEAP_H */
+--- /dev/null
++++ b/iokit/Kernel/arm/sweet_gfx_heap_kern.inc
+@@ -0,0 +1,434 @@
++/*
++ * 0440 (gfxheap-20261113): the low-bank graphics heap, KERNEL part.  Included ONCE by SweetSurface.cpp after the 0394 pool code and
++ * before sweet_fb_iommu_hw.h (n2io_ram accepts heap pages).  Table + allocator: sweet_gfx_heap.h (pure, host-tested).
++ *
++ * What goes there (nothing else):
++ *   - IOSurfaces of the pool's eligibility AND admission policy (full-screen 'BGRA', 1x1 elements, no planes, pitch % 64, offset 0,
++ *     kern.n2fbhw_pool_policy) that did not go to the display pool (default: the pool is off since 0416, so all of them);
++ *   - GPU-only buffers (Nord2GPU ALLOC flags == 2) of >= 64 KiB (0441, sweet_heap_gpu_take / _give).
++ * Heap memory is NOT XNU memory: it is not counted in sweet_surface_wired, the 0417 per-process / combined budgets or the 0418 caps,
++ * and Nord2GPU (0441) leaves heap buffers out of its global private total.  Own cap: kern.n2heap_cap_mib.
++ * Mapping: each region ONCE, write-combined, with ml_io_map_unmappable (kernel_map; never io_submap: the 8 MiB io_submap is nearly full
++ * and its KMA_NOFAIL exhaustion was the invisible panic of 0410).  User mappings: withPhysicalAddress descriptors, kIOMapWriteCombineCache
++ * (as pool surfaces).  Canary in the head of every free granule: written at setup (a region with a bad readback is switched off for the
++ * boot), checked at every allocation and by a 30 s scrub of the free granules (a foreign write switches that region off for new
++ * allocations; what it already holds stays).  An M4U fault whose PA lies in a region switches that region off as well.
++ * Display: a heap surface is never a pool surface (sweet_surface_pool_pa_obj() = 0), so it is only ever shown through the display IOMMU
++ * (IOVA window 0x90000000..0xB0000000 -> PTEs with the heap PA); never as a physical OVL address (mb13b has IOVA-window numbers).
++ * 0406 eviction and 0417 purge only touch pool / IOBufferMemoryDescriptor surfaces, so heap surfaces are neither evicted nor purged:
++ * their range goes back to the heap in SweetSurface::free (once nothing holds the descriptor), as pool ranges do.
++ * Locks: sweet_heap_spin (spin) = the bitmap + counters; sweet_heap_setup_lock (IOLock) = region setup (thread call only).
++ * Sysctls (no boot-arg): kern.n2heap 0 off / 1 on (default: the SAFE regions), kern.n2heap_check 1 = also the CHECK regions,
++ * kern.n2heap_gpu 0 = no GPU buffers, kern.n2heap_mask (admin region mask), kern.n2heap_cap_mib, read-only stats.
++ * Log: "NORD2 HEAP:" (setup per region, allocation/free samples, foreign writes, one stats line with used/free per region every 60 s
++ * when something changed and every 10 min regardless).
++ */
++#include "sweet_gfx_heap.h"
++extern "C" {
++extern unsigned long gPhysBase, gPhysSize;     /* = sweet_fb_iommu_hw.h */
++}
++
++#define SWEET_HEAP_WIMG_WCOMB          0x6u    /* VM_WIMG_WCOMB (= SWEET_POOL_WIMG_WCOMB) */
++#define SWEET_HEAP_GPU_MIN              0x10000ull
++#define SWEET_HEAP_TICK_S               30u
++
++static int           sweet_heap_on = 1;         /* kern.n2heap */
++static int           sweet_heap_check;          /* kern.n2heap_check */
++static int           sweet_heap_gpu = 1;        /* kern.n2heap_gpu */
++static uint32_t      sweet_heap_mask = SWEET_GFX_HEAP_ALL;      /* kern.n2heap_mask */
++static uint32_t      sweet_heap_cap_mib = 1024;  /* kern.n2heap_cap_mib (all regions = 996 MiB) */
++static uint32_t      sweet_heap_ready;          /* regions mapped + canary ok (bit r) */
++static uint32_t      sweet_heap_off;            /* regions off for this boot (setup canary, foreign write, M4U fault) */
++static IOSimpleLock *sweet_heap_spin;
++static IOLock       *sweet_heap_setup_lock;
++static struct sweet_gfx_heap sweet_heap;        /* under sweet_heap_spin */
++static volatile uint8_t *sweet_heap_kva[SWEET_GFX_HEAP_NREG];
++static uint32_t      sweet_heap_used_kib, sweet_heap_live, sweet_heap_full, sweet_heap_foreign, sweet_heap_leaked;
++static uint32_t      sweet_heap_surf_live, sweet_heap_gpu_live, sweet_heap_logged, sweet_heap_told_full;
++static uint32_t      sweet_heap_log_at, sweet_heap_log_sig;
++static thread_call_t sweet_heap_tc;
++SYSCTL_INT(_kern, OID_AUTO, n2heap, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_heap_on, 0, "0440: low-bank graphics heap: 0 off, 1 on (SAFE regions)");
++SYSCTL_INT(_kern, OID_AUTO, n2heap_check, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_heap_check, 0, "0440: 1 = also the CHECK regions mb11b mb12 mb13b");
++SYSCTL_INT(_kern, OID_AUTO, n2heap_gpu, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_heap_gpu, 0, "0440: 1 = GPU-only buffers >= 64 KiB from the heap");
++SYSCTL_UINT(_kern, OID_AUTO, n2heap_mask, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_heap_mask, 0, "0440: region mask (bit = table index)");
++SYSCTL_UINT(_kern, OID_AUTO, n2heap_cap_mib, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_heap_cap_mib, 0, "0440: heap MiB in use at most");
++SYSCTL_UINT(_kern, OID_AUTO, n2heap_ready, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_heap_ready, 0, "0440: regions mapped and checked");
++SYSCTL_UINT(_kern, OID_AUTO, n2heap_off, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_heap_off, 0, "0440: regions switched off for this boot");
++SYSCTL_UINT(_kern, OID_AUTO, n2heap_used_kib, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_heap_used_kib, 0, "");
++SYSCTL_UINT(_kern, OID_AUTO, n2heap_live, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_heap_live, 0, "");
++SYSCTL_UINT(_kern, OID_AUTO, n2heap_full, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_heap_full, 0, "");
++SYSCTL_UINT(_kern, OID_AUTO, n2heap_foreign, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_heap_foreign, 0, "");
++
++static inline void
++sweet_heap_wc_drain(void)
++{
++	__builtin_arm_dsb(0xf);                 /* WC: drain the write buffers before a master (GPU/OVL) or the next check reads */
++}
++
++static uint32_t
++sweet_heap_ready_mask(void)
++{
++	return __atomic_load_n(&sweet_heap_ready, __ATOMIC_ACQUIRE) & ~__atomic_load_n(&sweet_heap_off, __ATOMIC_RELAXED);
++}
++
++/* Kernel VA of [pa, pa + len) when it lies in a ready region (an off region keeps its mapping: its allocations stay valid). */
++static volatile uint8_t *
++sweet_heap_va(uint64_t pa, uint64_t len)
++{
++	int r = sweet_gfx_heap_region_of(pa, len);
++	if (r < 0 || !((__atomic_load_n(&sweet_heap_ready, __ATOMIC_ACQUIRE) >> r) & 1u)) {
++		return NULL;
++	}
++	return sweet_heap_kva[r] + (pa - sweet_gfx_heap_regions[r].base);
++}
++
++/* For n2io_ram (0401) and the GPU import (0441): a 4 KiB page of a mapped region. */
++static bool
++sweet_heap_page_ok(uint64_t pa)
++{
++	return !(pa & 0xfffu) && sweet_heap_va(pa, 0x1000u) != NULL;
++}
++
++static void
++sweet_heap_publish_locked(void)
++{
++	sweet_heap_used_kib = sweet_heap.used_total * (uint32_t)(SWEET_GFX_HEAP_GRANULE >> 10);
++	sweet_heap_live = sweet_heap.live_total;
++	sweet_heap_full = (uint32_t)sweet_heap.full;
++}
++
++static void
++sweet_heap_region_off(unsigned r, const char *why, uint64_t pa)
++{
++	uint32_t was = __atomic_fetch_or(&sweet_heap_off, 1u << r, __ATOMIC_RELAXED);
++	if (!((was >> r) & 1u)) {
++		IOLog("NORD2 HEAP: region %s OFF for new allocations (%s at pa %#llx); %u allocations stay where they are\n",
++		    sweet_gfx_heap_regions[r].name, why, pa, sweet_heap.live[r]);
++	}
++}
++
++/* Map region r once and check it.  Thread call only, sweet_heap_setup_lock held. */
++static void
++sweet_heap_setup_region(unsigned r)
++{
++	const struct sweet_gfx_heap_region *g = &sweet_gfx_heap_regions[r];
++	uint32_t n = sweet_gfx_heap_ngran(r), bad = 0;
++	vm_offset_t va = ml_io_map_unmappable((vm_offset_t)g->base, (vm_size_t)g->size, SWEET_HEAP_WIMG_WCOMB);
++	if (va != 0) {
++		for (uint32_t k = 0; k < n; k++) {
++			uint64_t pa = g->base + (uint64_t)k * SWEET_GFX_HEAP_GRANULE;
++			sweet_gfx_heap_canary_put((volatile uint64_t *)(uintptr_t)(va + (uint64_t)k * SWEET_GFX_HEAP_GRANULE), pa);
++		}
++		sweet_heap_wc_drain();
++		for (uint32_t k = 0; k < n; k++) {
++			uint64_t pa = g->base + (uint64_t)k * SWEET_GFX_HEAP_GRANULE;
++			if (!sweet_gfx_heap_canary_ok((volatile uint64_t *)(uintptr_t)(va + (uint64_t)k * SWEET_GFX_HEAP_GRANULE), pa)) {
++				bad++;
++			}
++		}
++	}
++	sweet_heap_kva[r] = (volatile uint8_t *)va;
++	if (va == 0 || bad != 0) {
++		__atomic_fetch_or(&sweet_heap_off, 1u << r, __ATOMIC_RELAXED);
++	}
++	__atomic_fetch_or(&sweet_heap_ready, va != 0 ? 1u << r : 0u, __ATOMIC_RELEASE);
++	IOLog("NORD2 HEAP: region %s pa %#llx..%#llx (%llu KiB, %s%s) -> kva %#lx write-combined, canary readback %u bad of %u -> %s\n", g->name, g->base,
++	    g->base + g->size, g->size >> 10, g->cls == SWEET_GFX_HEAP_SAFE ? "SAFE" : "CHECK", (g->flags & SWEET_GFX_HEAP_F_NOPHYS) ? ", IOMMU only" : "",
++	    (unsigned long)va, bad, n, va == 0 ? "NOT MAPPED, off" : (bad ? "OFF for this boot" : "ready"));
++}
++
++/* Contiguous, zeroed heap memory: PA (0 = heap off/full; the caller falls back to normal memory).  Thread context, no spin lock held. */
++static uint64_t
++sweet_heap_take(uint64_t bytes, bool gpu)
++{
++	if (sweet_heap_spin == NULL || bytes == 0) {
++		return 0;
++	}
++	uint32_t mask = sweet_gfx_heap_allowed(__atomic_load_n(&sweet_heap_on, __ATOMIC_RELAXED), __atomic_load_n(&sweet_heap_check, __ATOMIC_RELAXED),
++	    __atomic_load_n(&sweet_heap_mask, __ATOMIC_RELAXED), 0) & sweet_heap_ready_mask();
++	uint32_t cap = (uint32_t)(((uint64_t)__atomic_load_n(&sweet_heap_cap_mib, __ATOMIC_RELAXED) << 20) / SWEET_GFX_HEAP_GRANULE);
++	uint32_t n = sweet_gfx_heap_granules(bytes);
++	for (unsigned tries = 0; mask != 0 && tries < SWEET_GFX_HEAP_NREG; tries++) {
++		unsigned r = 0;
++		IOSimpleLockLock(sweet_heap_spin);
++		uint32_t g0 = sweet_gfx_heap_alloc(&sweet_heap, bytes, mask & sweet_heap_ready_mask(), cap, &r);
++		sweet_heap_publish_locked();
++		IOSimpleLockUnlock(sweet_heap_spin);
++		if (g0 == SWEET_GFX_HEAP_FAIL) {
++			uint32_t k = sweet_heap_told_full++;
++			if (k < 8 || (k % 100) == 0) {
++				IOLog("NORD2 HEAP: full for %llu KiB %s (used %u MiB, live %u, cap %u MiB, full %u) -> normal memory\n", bytes >> 10,
++				    gpu ? "GPU buffer" : "surface", sweet_heap_used_kib >> 10, sweet_heap_live, sweet_heap_cap_mib, sweet_heap_full);
++			}
++			return 0;
++		}
++		uint64_t pa = sweet_gfx_heap_gran_pa(g0);
++		volatile uint8_t *va = sweet_heap_va(pa, (uint64_t)n * SWEET_GFX_HEAP_GRANULE);
++		uint32_t foreign = 0;
++		uint64_t fpa = 0;
++		for (uint32_t k = 0; va != NULL && k < n; k++) {
++			if (!sweet_gfx_heap_canary_ok((volatile uint64_t *)(uintptr_t)(va + (uint64_t)k * SWEET_GFX_HEAP_GRANULE), pa + (uint64_t)k * SWEET_GFX_HEAP_GRANULE)) {
++				if (foreign++ == 0) {
++					fpa = pa + (uint64_t)k * SWEET_GFX_HEAP_GRANULE;
++				}
++			}
++		}
++		if (va == NULL || foreign != 0) {
++			/* someone else writes there (or the region vanished): the range stays allocated forever (quarantine), the region goes off */
++			OSAddAtomic((SInt32)foreign, (volatile SInt32 *)&sweet_heap_foreign);
++			OSIncrementAtomic((volatile SInt32 *)&sweet_heap_leaked);
++			IOLog("NORD2 HEAP: FOREIGN write in %u of %u free granules of %s (first pa %#llx, seen at alloc): range quarantined\n", foreign, n,
++			    sweet_gfx_heap_regions[r].name, fpa);
++			sweet_heap_region_off(r, "foreign write", fpa);
++			mask &= ~(1u << r);
++			continue;
++		}
++		bzero((void *)va, (size_t)bytes);       /* Normal non-cacheable memory: DC ZVA is allowed (never Device) */
++		sweet_heap_wc_drain();
++		OSIncrementAtomic((volatile SInt32 *)(gpu ? &sweet_heap_gpu_live : &sweet_heap_surf_live));
++		return pa;
++	}
++	return 0;
++}
++
++/* Give a range back (after every mapping and every device use of it is gone). */
++static void
++sweet_heap_give(uint64_t pa, uint64_t bytes, bool gpu)
++{
++	uint32_t n = sweet_gfx_heap_granules(bytes);
++	volatile uint8_t *va = sweet_heap_va(pa, (uint64_t)n * SWEET_GFX_HEAP_GRANULE);
++	bool ok = false;
++	bool mine = false;
++	if (va != NULL && sweet_heap_spin != NULL) {
++		IOSimpleLockLock(sweet_heap_spin);
++		mine = sweet_gfx_heap_is_allocated(&sweet_heap, pa, bytes);
++		IOSimpleLockUnlock(sweet_heap_spin);
++	}
++	if (mine) {
++		for (uint32_t k = 0; k < n; k++) {      /* canary first, bit second: a free granule always holds its canary (scrub relies on it) */
++			sweet_gfx_heap_canary_put((volatile uint64_t *)(uintptr_t)(va + (uint64_t)k * SWEET_GFX_HEAP_GRANULE), pa + (uint64_t)k * SWEET_GFX_HEAP_GRANULE);
++		}
++		sweet_heap_wc_drain();
++		IOSimpleLockLock(sweet_heap_spin);
++		ok = sweet_gfx_heap_free(&sweet_heap, pa, bytes);
++		sweet_heap_publish_locked();
++		IOSimpleLockUnlock(sweet_heap_spin);
++	}
++	if (ok) {
++		OSDecrementAtomic((volatile SInt32 *)(gpu ? &sweet_heap_gpu_live : &sweet_heap_surf_live));
++	}
++	uint32_t k = sweet_heap_logged++;
++	if (!ok || k < 16 || (k % 256) == 0) {
++		IOLog("NORD2 HEAP: free %s pa %#llx %llu KiB%s (used %u MiB, live %u)\n", gpu ? "GPU buffer" : "surface", pa, bytes >> 10,
++		    ok ? "" : " REFUSED (not a heap allocation)", sweet_heap_used_kib >> 10, sweet_heap_live);
++	}
++}
++
++/* PA of a heap surface's pixels, 0 for every other surface (pool surfaces included). */
++static uint64_t
++sweet_heap_surface_pa(const SweetSurface *cs)
++{
++	SweetSurface *s = const_cast<SweetSurface *>(cs);
++	if (s == NULL || s->memory == NULL || s->purged || __atomic_load_n(&sweet_heap_ready, __ATOMIC_ACQUIRE) == 0 ||
++	    OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL || OSDynamicCast(IOSubMemoryDescriptor, s->memory) != NULL) {
++		return 0;
++	}
++	IOByteCount len = 0;
++	uint64_t pa = s->memory->getPhysicalSegment(0, &len, kIOMemoryMapperNone);
++	return sweet_heap_va(pa, s->memory->getLength()) != NULL ? pa : 0;
++}
++
++/* Put s (geometry set, allocSize final) into the heap: memory + mapCache; false = heap off/full (s untouched). */
++static bool
++sweet_heap_attach(SweetSurface *s)
++{
++	uint64_t pa = sweet_heap_take(s->allocSize, false);
++	if (pa == 0) {
++		return false;
++	}
++	s->memory = IOMemoryDescriptor::withPhysicalAddress(pa, s->allocSize, kIODirectionInOut);
++	if (s->memory == NULL) {
++		sweet_heap_give(pa, s->allocSize, false);
++		return false;
++	}
++	s->mapCache = kIOMapWriteCombineCache;
++	return true;
++}
++
++static void
++sweet_heap_log_alloc(SweetSurface *s, const char *pname)
++{
++	uint32_t k = sweet_heap_logged++;
++	if (k < 16 || (k % 256) == 0) {
++		uint64_t pa = sweet_heap_surface_pa(s);
++		int r = sweet_gfx_heap_region_of(pa, s->allocSize);
++		IOLog("NORD2 HEAP: surface id %u by %s %ux%u bpr %u -> pa %#llx (%s) %u KiB (used %u MiB, live %u)\n", s->id, pname, s->width, s->height,
++		    s->bytesPerRow, pa, r >= 0 ? sweet_gfx_heap_regions[r].name : "?", s->allocSize >> 10, sweet_heap_used_kib >> 10, sweet_heap_live);
++	}
++}
++
++/* 0401 IOMMU hook: an M4U fault reported a PA inside a mapped region: that region takes no new allocations. */
++static void
++sweet_heap_m4u_fault_pa(uint64_t pa)
++{
++	int r = sweet_gfx_heap_region_of(pa & ~0xfffull, 0x1000u);
++	if (r >= 0 && ((__atomic_load_n(&sweet_heap_ready, __ATOMIC_ACQUIRE) >> r) & 1u)) {
++		sweet_heap_region_off((unsigned)r, "display M4U fault", pa);
++	}
++}
++
++/* Free granules whose canary changed (thread call).  A candidate is confirmed under the spin lock: a granule whose bit is clear there
++ * holds its canary unless something outside XNU wrote it (allocation sets the bit before zeroing; free writes the canary before clearing). */
++static uint32_t
++sweet_heap_scrub(void)
++{
++	uint32_t found = 0, g = 0;
++	for (unsigned r = 0; r < SWEET_GFX_HEAP_NREG; g += sweet_gfx_heap_ngran(r), r++) {
++		if (!((sweet_heap_ready_mask() >> r) & 1u)) {
++			continue;
++		}
++		const struct sweet_gfx_heap_region *rg = &sweet_gfx_heap_regions[r];
++		for (uint32_t k = 0; k < sweet_gfx_heap_ngran(r); k++) {
++			uint64_t pa = rg->base + (uint64_t)k * SWEET_GFX_HEAP_GRANULE;
++			volatile uint64_t *head = (volatile uint64_t *)(uintptr_t)(sweet_heap_kva[r] + (uint64_t)k * SWEET_GFX_HEAP_GRANULE);
++			if (sweet_gfx_heap_test(&sweet_heap, g + k) || sweet_gfx_heap_canary_ok(head, pa)) {
++				continue;                       /* racy pre-filter */
++			}
++			IOSimpleLockLock(sweet_heap_spin);
++			bool bad = !sweet_gfx_heap_test(&sweet_heap, g + k) && !sweet_gfx_heap_canary_ok(head, pa);
++			if (bad) {
++				sweet_gfx_heap_set(&sweet_heap, g + k, 1, true);        /* quarantined: never handed out (not counted as used) */
++			}
++			IOSimpleLockUnlock(sweet_heap_spin);
++			if (bad) {
++				found++;
++				OSIncrementAtomic((volatile SInt32 *)&sweet_heap_foreign);
++				if (found <= 2) {
++					IOLog("NORD2 HEAP: FOREIGN write in free granule pa %#llx of %s (seen by the scrub): %016llx %016llx\n", pa, rg->name, head[0], head[1]);
++				}
++				sweet_heap_region_off(r, "foreign write (scrub)", pa);
++			}
++		}
++	}
++	return found;
++}
++
++static void
++sweet_heap_log_line(bool force)
++{
++	char buf[400];
++	int o = 0;
++	uint32_t ready = __atomic_load_n(&sweet_heap_ready, __ATOMIC_ACQUIRE), off = __atomic_load_n(&sweet_heap_off, __ATOMIC_RELAXED);
++	uint32_t sig = sweet_heap_used_kib ^ (sweet_heap_live << 20) ^ (ready << 8) ^ (off << 17) ^ (sweet_heap_foreign << 26) ^ (uint32_t)sweet_heap_on ^
++	    ((uint32_t)sweet_heap_check << 1) ^ ((uint32_t)sweet_heap_gpu << 2);
++	uint32_t now = sweet_surface_uptime();
++	if (!force && sig == sweet_heap_log_sig && now - sweet_heap_log_at < 600) {
++		return;
++	}
++	sweet_heap_log_sig = sig;
++	sweet_heap_log_at = now;
++	uint64_t total_ready = 0;
++	for (unsigned r = 0; r < SWEET_GFX_HEAP_NREG && o < (int)sizeof(buf) - 48; r++) {
++		uint32_t used_kib = sweet_heap.used[r] * (uint32_t)(SWEET_GFX_HEAP_GRANULE >> 10), size_kib = (uint32_t)(sweet_gfx_heap_regions[r].size >> 10);
++		char st = ((off >> r) & 1u) ? 'O' : (((ready >> r) & 1u) ? 'R' : '-');
++		if (((ready & ~off) >> r) & 1u) {
++			total_ready += sweet_gfx_heap_regions[r].size;
++		}
++		o += snprintf(buf + o, sizeof(buf) - (size_t)o, " %s %c %u/%u", sweet_gfx_heap_regions[r].name, st, used_kib >> 10, (size_kib - used_kib) >> 10);
++	}
++	IOLog("NORD2 HEAP: on %d check %d gpu %d mask %#x cap %u MiB | used %u MiB (peak %llu) of %llu ready, live %u (surfaces %u, GPU %u), full %u, foreign %u, "
++	    "quarantined %u | used/free MiB per region (R ready, O off, - unmapped):%s\n", sweet_heap_on, sweet_heap_check, sweet_heap_gpu, sweet_heap_mask,
++	    sweet_heap_cap_mib, sweet_heap_used_kib >> 10, ((uint64_t)sweet_heap.used_peak * SWEET_GFX_HEAP_GRANULE) >> 20, total_ready >> 20, sweet_heap_live,
++	    sweet_heap_surf_live, sweet_heap_gpu_live, sweet_heap_full, sweet_heap_foreign, sweet_heap_leaked, buf);
++}
++
++/* Every 30 s (thread call): map the regions now allowed, scrub the free granules, the stats line. */
++static void
++sweet_heap_tick(thread_call_param_t, thread_call_param_t)
++{
++	IOLockLock(sweet_heap_setup_lock);
++	uint32_t want = sweet_gfx_heap_allowed(__atomic_load_n(&sweet_heap_on, __ATOMIC_RELAXED), __atomic_load_n(&sweet_heap_check, __ATOMIC_RELAXED),
++	    __atomic_load_n(&sweet_heap_mask, __ATOMIC_RELAXED), 0);
++	bool changed = false;
++	for (unsigned r = 0; r < SWEET_GFX_HEAP_NREG; r++) {
++		if (((want & ~__atomic_load_n(&sweet_heap_ready, __ATOMIC_ACQUIRE) & ~__atomic_load_n(&sweet_heap_off, __ATOMIC_RELAXED)) >> r) & 1u) {
++			sweet_heap_setup_region(r);
++			changed = true;
++		}
++	}
++	(void)sweet_heap_scrub();
++	IOLockUnlock(sweet_heap_setup_lock);
++	sweet_heap_log_line(changed);
++	uint64_t dl = 0;
++	clock_interval_to_deadline(changed ? 5 : SWEET_HEAP_TICK_S, kSecondScale, &dl);
++	thread_call_enter_delayed(sweet_heap_tc, dl);
++}
++
++/* IOCoreSurfaceRoot::start: locks, the table check, the first tick (regions are mapped there, never on a creation path). */
++static void
++sweet_heap_start(void)
++{
++	uint32_t total = 0;
++	for (unsigned r = 0; r < SWEET_GFX_HEAP_NREG; r++) {
++		total += sweet_gfx_heap_ngran(r);
++	}
++	if (total != SWEET_GFX_HEAP_NGRAN) {
++		IOLog("NORD2 HEAP: region table has %u granules, bitmap %u: heap disabled\n", total, SWEET_GFX_HEAP_NGRAN);
++		return;
++	}
++	for (unsigned r = 0; r < SWEET_GFX_HEAP_NREG; r++) {     /* never XNU's window, the display pool or the IOMMU identity sections */
++		const struct sweet_gfx_heap_region *g = &sweet_gfx_heap_regions[r];
++		if (g->base + g->size > (uint64_t)gPhysBase && g->base < (uint64_t)gPhysBase + gPhysSize) {
++			IOLog("NORD2 HEAP: region %s overlaps XNU's window %#lx+%#lx: heap disabled\n", g->name, gPhysBase, gPhysSize);
++			return;
++		}
++		if (g->base + g->size > SWEET_FB_HW_POOL_BASE && g->base < SWEET_FB_HW_POOL_BASE + SWEET_FB_HW_POOL_SIZE) {
++			IOLog("NORD2 HEAP: region %s overlaps the display pool: heap disabled\n", g->name);
++			return;
++		}
++	}
++	sweet_heap_spin = IOSimpleLockAlloc();
++	sweet_heap_setup_lock = IOLockAlloc();
++	sweet_heap_tc = (sweet_heap_spin != NULL && sweet_heap_setup_lock != NULL) ? thread_call_allocate(sweet_heap_tick, NULL) : NULL;
++	IOLog("NORD2 HEAP: 0440 graphics heap: %u regions, %llu MiB (SAFE %llu MiB), kern.n2heap %d, kern.n2heap_check %d, kern.n2heap_gpu %d, cap %u MiB%s\n",
++	    SWEET_GFX_HEAP_NREG, ((uint64_t)total * SWEET_GFX_HEAP_GRANULE) >> 20,
++	    ((uint64_t)(sweet_gfx_heap_ngran(0) + sweet_gfx_heap_ngran(1) + sweet_gfx_heap_ngran(2) + sweet_gfx_heap_ngran(3) + sweet_gfx_heap_ngran(4) +
++	    sweet_gfx_heap_ngran(8)) * SWEET_GFX_HEAP_GRANULE) >> 20, sweet_heap_on, sweet_heap_check, sweet_heap_gpu, sweet_heap_cap_mib,
++	    sweet_heap_tc != NULL ? "" : " -- NO LOCKS/THREAD CALL: heap off");
++	if (sweet_heap_tc != NULL) {
++		thread_call_enter(sweet_heap_tc);
++	}
++}
++
++/* ---- 0441: Nord2GPU (GPU-only buffers, imports of heap surfaces) */
++extern "C" uint64_t sweet_heap_gpu_take(uint64_t bytes, uintptr_t *kva);
++extern "C" void sweet_heap_gpu_give(uint64_t pa, uint64_t bytes);
++extern "C" bool sweet_heap_gpu_page_ok(uint64_t pa);
++extern "C" uint64_t
++sweet_heap_gpu_take(uint64_t bytes, uintptr_t *kva)
++{
++	if (kva == NULL || !__atomic_load_n(&sweet_heap_gpu, __ATOMIC_RELAXED) || !sweet_gfx_heap_gpu_eligible(2u, bytes, SWEET_HEAP_GPU_MIN)) {
++		return 0;
++	}
++	uint64_t pa = sweet_heap_take(bytes, true);
++	*kva = pa != 0 ? (uintptr_t)sweet_heap_va(pa, bytes) : 0;
++	if (pa != 0) {
++		uint32_t k = sweet_heap_logged++;
++		if (k < 16 || (k % 256) == 0) {
++			IOLog("NORD2 HEAP: GPU buffer %llu KiB -> pa %#llx (used %u MiB, live %u)\n", bytes >> 10, pa, sweet_heap_used_kib >> 10, sweet_heap_live);
++		}
++	}
++	return pa;
++}
++
++extern "C" void
++sweet_heap_gpu_give(uint64_t pa, uint64_t bytes)
++{
++	sweet_heap_give(pa, bytes, true);
++}
++
++extern "C" bool
++sweet_heap_gpu_page_ok(uint64_t pa)
++{
++	return sweet_heap_page_ok(pa);
++}

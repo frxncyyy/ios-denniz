@@ -1,0 +1,120 @@
+--- a/bsd/dev/nord2_cpufreq.c
++++ b/bsd/dev/nord2_cpufreq.c
+@@ -29,6 +29,7 @@
+ #include "nord2_dvfs.h"
+ #include <sys/sysctl.h>
+ #include "nord2_dvfs_sched.h"      /* 0460 */
++#include "nord2_dram_rate.h"       /* 0462 */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+@@ -899,6 +900,44 @@
+ 		n2dram_page(tag, 0x10230000);
+ }
+ 
++/* 0462: `sysctl kern.n2dramprobe=1` prints once, from the DVFS thread, the DRAM data rate decoded from the DDRPHY (stock fmeter_v1) and the state of the blocks
++ * that would change it at run time (DVFSRC, the SPM's vcore-DVFS levels).  Read-only: 32-bit loads of registers the stock kernel reads from the normal world. */
++static int nord2_dram_probe;
++SYSCTL_INT(_kern, OID_AUTO, n2dramprobe, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_dram_probe, 0, "");
++static volatile uint32_t *n2dr_map[2];
++
++static uint32_t
++n2dr_rd(__unused void *ctx, unsigned block, uint32_t off)
++{
++	return n2dr_map[block & 1][off / 4];
++}
++
++static void
++n2dram_rate_probe(void)
++{
++	static volatile uint32_t *dv, *spm;
++	struct n2dr r;
++	if (n2dr_map[0] == NULL) {
++		n2dr_map[0] = (volatile uint32_t *)ml_io_map(N2DR_NAO_PA, 0x1000);
++		n2dr_map[1] = (volatile uint32_t *)ml_io_map(N2DR_AO_PA, 0x2000);
++		dv = (volatile uint32_t *)ml_io_map(0x10012000, 0x1000);
++		spm = (volatile uint32_t *)ml_io_map(0x10006000, 0x1000);
++	}
++	if (n2dr_map[0] == NULL || n2dr_map[1] == NULL || dv == NULL || spm == NULL) {
++		printf("NORD2 DRAM RATE: mapping failed\n");
++		return;
++	}
++	printf("NORD2 DRAM RATE: reading DVFSRC and SPM (read-only)\n");
++	n2cf_sleep_ms(NULL, 400);
++	printf("NORD2 DRAM RATE: DVFSRC basic_control=%08x (en %u, out_en %u) sw_req1/2/3=%08x/%08x/%08x current_level=%08x target_level=%08x | SPM dvfs_level=%08x dvs_dfs_level=%08x dvfs_sta=%08x sw_flag_0=%08x\n",
++	    dv[0], dv[0] & 1u, (dv[0] >> 8) & 1u, dv[0x4 / 4], dv[0x8 / 4], dv[0xc / 4], dv[0xd44 / 4], dv[0xd48 / 4], spm[0x4a4 / 4], spm[0x4f8 / 4], spm[0x1f8 / 4], spm[0x600 / 4]);
++	printf("NORD2 DRAM RATE: next is the DDRPHY of channel A (NAO %#x + 0x50c, AO %#x + 0x704..0x8b4 of the active shuffle level), read-only\n", N2DR_NAO_PA, N2DR_AO_PA);
++	n2cf_sleep_ms(NULL, 400);
++	n2dr_read(n2dr_rd, NULL, &r);
++	printf("NORD2 DRAM RATE: shu_lv=%u pll=%u sdmpcw=%#x prediv=%u posdiv=%u ckdiv4=%u pll_md=%u cldiv2=%u fbksel=%u dqopen=%u -> %u = %u Mbps (steps 4266 3733 3200 2400 1866 1600 1200 800; 4 channels x 16 bit: %u MB/s peak)\n",
++	    r.shu_lv, r.pll_id, r.sdmpcw, r.prediv, r.posdiv, r.ckdiv4, r.pll_md, r.cldiv2, r.fbksel, r.dqopen, r.raw, r.mbps, r.mbps * 8u);
++}
++
+ static void
+ n2dvfs_main(void)
+ {
+@@ -943,6 +982,10 @@
+ 		    sg.cl[0].slowest, sg.cl[1].slowest);
+ 		while (!st.stopped && st.inited) {
+ 			int mode = nord2_dvfs_mode;
++			if (nord2_dram_probe == 1) {                       /* 0462 */
++				n2dram_rate_probe();
++				nord2_dram_probe = 2;
++			}
+ 			if (mode <= 0) {                                   /* exactly the 0172 loop */
+ 				n2cf_sleep_ms(NULL, N2D_GOV_TICK_MS);
+ 				n2d_gov_tick(&n2dv_ops, NULL, &cfg, &st, &gov);
+--- /dev/null
++++ b/bsd/dev/nord2_dram_rate.h
+@@ -0,0 +1,51 @@
++#ifndef NORD2_DRAM_RATE_H
++#define NORD2_DRAM_RATE_H
++/*
++ * 0462: which data rate the DRAM runs at, read-only.  The stock kernel's fmeter_v1 (drivers/memory/mediatek/dramc.c) with the register list of mt6893.dts
++ * (dramc@10230000: shu_lv / pll_id in DDRPHY NAO channel A + 0x50c, the PLL fields in DDRPHY AO channel A + 0x700 * shu_lv), crystal 52 MHz.  Nothing is written.
++ * The steps the bootloader calibrated (live FDT freq_step): 4266 3733 3068 2366 1866 1534 1200 800 Mbps.
++ */
++#include <stdint.h>
++
++#define N2DR_NAO_PA 0x10236000u       /* DDRPHY NAO CHA, 0x1000 */
++#define N2DR_AO_PA  0x10238000u       /* DDRPHY AO CHA, 0x2000 */
++
++struct n2dr { unsigned shu_lv, pll_id, sdmpcw, prediv, posdiv, ckdiv4, pll_md, cldiv2, fbksel, dqopen, raw, mbps; };
++
++static inline unsigned
++n2dr_decode(unsigned v)
++{
++	switch (v) {
++	case 4264: return 4266;
++	case 3718: return 3733;
++	case 3094: case 3068: return 3200;
++	case 2392: case 2366: return 2400;
++	case 1859: return 1866;
++	case 1534: return 1600;
++	case 1196: case 1144: return 1200;
++	case 819: case 754: return 800;
++	default: return v;
++	}
++}
++
++/* rd(ctx, block, offset): block 0 = DDRPHY NAO CHA, 1 = DDRPHY AO CHA */
++static inline void
++n2dr_read(uint32_t (*rd)(void *ctx, unsigned block, uint32_t off), void *ctx, struct n2dr *o)
++{
++	uint32_t s = rd(ctx, 0, 0x50c);
++	o->shu_lv = (s & 0x00030000u) >> 16;
++	o->pll_id = (s & 0x00000100u) >> 8;
++	uint32_t sh = 0x700u * o->shu_lv, p = o->pll_id ? 0x20u : 0u;
++	o->sdmpcw = (rd(ctx, 1, 0x704 + p + sh) & 0xffff0000u) >> 16;
++	uint32_t d = rd(ctx, 1, 0x708 + p + sh);
++	o->prediv = (d & 0x000c0000u) >> 18;
++	o->posdiv = d & 7u;
++	o->ckdiv4 = (rd(ctx, 1, 0x874 + sh) & 4u) >> 2;
++	o->pll_md = (rd(ctx, 1, 0x744 + sh) & 0x100u) >> 8;
++	o->cldiv2 = (rd(ctx, 1, 0x8b4 + sh) & 2u) >> 1;
++	o->fbksel = (rd(ctx, 1, 0x70c + sh) & 0x40u) >> 6;
++	o->dqopen = (rd(ctx, 1, 0x870 + sh) & 0x00200000u) >> 21;
++	o->raw = ((52u >> o->prediv) * (o->sdmpcw >> 8)) >> o->posdiv >> o->ckdiv4 >> o->pll_md >> o->cldiv2 << o->fbksel >> (o->dqopen << 1);
++	o->mbps = n2dr_decode(o->raw);
++}
++#endif

@@ -1,0 +1,258 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -147,6 +147,7 @@
+                pa - gPhysBase <= gPhysSize - 4096 && pa < (1ull << 40);
+ }
+ struct BufferOwner {
++        uint8_t madv;       /* 0481: N2MADV_F_* (nord2_gpu_madv.h), under Nord2GPU::lock until the owner is detached */
+         IOBufferMemoryDescriptor *md;
+         SweetSurface *surface;
+         bool prepared;      /* 0137: pageable write-combine memory, wired by prepare(), unwired by complete() */
+@@ -160,10 +161,12 @@
+ }
+ /* 0112: the display surface behind an imported buffer (NULL for any other buffer); only compared, never dereferenced, by the core. */
+ static const void *resv_token(void *, void *cookie) { return cookie ? (const void *)((BufferOwner *)cookie)->surface : NULL; }
++struct BufferOwner; static void n2madv_owner_gone(BufferOwner *o);     /* 0481: nord2_gpu_madv_kern.inc */
+ static void free_owner(void *, void *cookie) {
+         BufferOwner *o = (BufferOwner *)cookie;
+         if (!o) return;
+         if (o->md && o->prepared) o->md->complete(kIODirectionInOut);
++        n2madv_owner_gone(o);                    /* 0481: a purged buffer's pages go now, under the client's mapping */
+         sweet_surface_wod_unhold(o->surface);    /* 0480: the import's hold (the GPU pages were unmapped and flushed before the owner goes) */
+         if (o->surface) OSDecrementAtomic((volatile SInt32 *)&o->surface->gpuImports);    /* 0398: pool leak attribution */
+         OSSafeReleaseNULL(o->md);
+@@ -457,6 +460,8 @@
+         static void flushTable(void *, uint64_t, size_t);
+ };
+ OSDefineMetaClassAndStructors(Nord2GPU, IOAcceleratorES);
++#include "nord2_gpu_madv.h"      /* 0481: MADVISE for GPU buffers (kern.n2gpu_madv, default off) */
++#include "nord2_gpu_madv_kern.inc"
+ uint32_t Nord2GPU::clockRead(void *p, enum n2clk_block b, uint32_t o) {
+         return b <= N2CLK_MFGCFG ? read_bank(&((Nord2GPU *)p)->clocks[b], o) : 0;
+ }
+@@ -1477,7 +1482,7 @@
+                 md = NULL;              /* 0441: heap range, zeroed by the heap; kernel view = the heap's write-combined mapping */
+         } else if (pageableWc) {
+                 /* Pageable memory has a VM object of its own, so its cache mode can be set without touching the kernel's shared object */
+-                md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryPageable | kIOMapWriteCombineCache, (vm_size_t)bytes, 16384);
++                md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryPageable | kIOMapWriteCombineCache | n2madv_md_options(), (vm_size_t)bytes, 16384);   /* 0481: + purgeable */
+         } else {
+                 md = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared | ((flags & 4u) ? kIOMapWriteCombineCache : 0), (vm_size_t)bytes, 16384);
+         }
+@@ -1819,6 +1824,7 @@
+ }
+ IOReturn Nord2GPUUserClient::externalMethod(uint32_t sel,IOExternalMethodArguments *a,IOExternalMethodDispatch *,OSObject *,void *) {
+         if(!a || !gpu || !lock)return kIOReturnBadArgument;
++        if(sel==NORD2_GPU_SEL_MADVISE)return n2madv_call(gpu,lock,&closed,&context,a);   /* 0481 */
+         if(!nord2_gpu_call_valid(sel,a->scalarInputCount,a->scalarOutputCount,a->structureInputSize,a->structureOutputSize,
+                                  a->scalarInput,a->scalarOutput,a->structureInput,a->structureOutput) ||
+            a->structureInputDescriptor || a->structureOutputDescriptor || a->asyncWakePort!=MACH_PORT_NULL)return kIOReturnBadArgument;
+--- /dev/null
++++ b/iokit/Kernel/arm/nord2_gpu_madv.h
+@@ -0,0 +1,79 @@
++/*
++ * 0481 (memwod-20261113): the kernel side of MADVISE for GPU buffers (Panfrost DRM_IOCTL_PANFROST_MADVISE).  SPDX-License-Identifier: MIT
++ *
++ * Mesa's BO cache keeps freed buffers (64 MiB per process, more in an idle one) and tells the kernel which ones it does not need:
++ * MADV_DONTNEED when a buffer enters the cache, MADV_WILLNEED when it is taken out again; "retained = 0" in the answer means the
++ * kernel dropped it meanwhile and Mesa frees the BO instead of reusing it.  The shim (y2s/nord2_pan.c R_MADVISE) answers retained = 1
++ * itself today: the kernel had no call and no purge path.
++ *
++ * Selector NORD2_GPU_SEL_MADVISE (IOConnectCallMethod only): scalar inputs { handle, advice }, scalar output { retained }.
++ *   DONTNEED  marks a private, pageable + purgeable, CPU-uncached buffer; anything else is accepted and simply never purged
++ *   WILLNEED  clears the mark; retained = 0 if the handle no longer exists (purged) -- the caller then drops its BO: its CPU mapping
++ *             now reads zeros, and RELEASE of that handle answers "no handle" (to be ignored)
++ * Purge (under memory pressure only, from a 2 s thread call): a marked buffer that no job references is RELEASED by the kernel through
++ * the core's ordinary release path (n2c_bo_release: GPU unmap, address-space flush, deferred until every older job of the context is
++ * done -- the 0185/0187 rule for raw job chains), and when its owner goes its pages are unwired and DROPPED although the client still
++ * maps them (setPurgeable(Empty), then NonVolatile again so that a stray CPU access only zero-fills a page).
++ * kern.n2gpu_madv: 0 (default) = MADVISE answers retained = 1 and marks nothing, new buffers are not purgeable; 1 = on.
++ * A buffer is purgeable only if it was allocated while the mode was 1.
++ *
++ * Pure decisions (no IOKit): shared by Nord2GPU.cpp (nord2_gpu_madv_kern.inc) and memwod-20261113/gpumadv-0481/test/madv_host_test.c.
++ */
++#ifndef NORD2_GPU_MADV_H
++#define NORD2_GPU_MADV_H
++/* (uint*_t / bool come from the includer) */
++
++#define NORD2_GPU_SEL_MADVISE   16u
++#define N2MADV_WILLNEED         0u
++#define N2MADV_DONTNEED         1u
++
++/* BufferOwner.madv */
++#define N2MADV_F_DONTNEED       1u      /* the client does not need the contents */
++#define N2MADV_F_PURGED         2u      /* released by the kernel: free_owner drops the pages */
++
++/* What MADVISE may mark: a private (not imported) buffer of pageable, purgeable, prepared memory that is mapped in the GPU. */
++static inline bool
++n2madv_markable(bool has_md, bool prepared, bool md_purgeable, bool imported, bool mapped)
++{
++	return has_md && prepared && md_purgeable && !imported && mapped;
++}
++
++/* The call.  found: the handle names a live buffer of this context.  Returns false for a bad advice value.  *mark: +1 newly marked,
++ * -1 mark cleared, 0 unchanged. */
++static inline bool
++n2madv_advise(int mode, bool found, bool markable, uint8_t *flags, uint32_t advice, uint32_t *retained, int *mark)
++{
++	*mark = 0;
++	*retained = 1;
++	if (advice > N2MADV_DONTNEED) { return false; }
++	if (!found) { *retained = 0; return true; }             /* purged (or never there): the caller must drop its BO */
++	if (advice == N2MADV_DONTNEED) {
++		if (mode == 1 && markable && !(*flags & N2MADV_F_DONTNEED)) { *flags |= N2MADV_F_DONTNEED; *mark = 1; }
++	} else if (*flags & N2MADV_F_DONTNEED) {
++		*flags &= (uint8_t)~N2MADV_F_DONTNEED; *mark = -1;
++	}
++	return true;
++}
++
++/* May the purge pass release this buffer now?  refs: the handle's own reference + one per job that lists it. */
++static inline bool
++n2madv_purge_ok(uint8_t flags, bool handle_live, uint32_t refs, bool imported, bool mapped)
++{
++	return (flags & (N2MADV_F_DONTNEED | N2MADV_F_PURGED)) == N2MADV_F_DONTNEED && handle_live && refs == 1 && !imported && mapped;
++}
++
++/* Bytes the pass should free: 0 unless available pages are under the threshold (then the deficit + hysteresis). */
++static inline uint64_t
++n2madv_goal(uint64_t avail_pages, uint64_t thr_pages, uint32_t page_bytes, uint64_t hyst_bytes)
++{
++	return avail_pages >= thr_pages ? 0 : (thr_pages - avail_pages) * page_bytes + hyst_bytes;
++}
++
++/* Default threshold: free + file-backed pages under 20 % of RAM (the 0420 governor's "low" mark, where it starts to ask for purges;
++ * its kill mark is 12 %).  Above it the cache stays: reusing a cached buffer is what keeps allocation out of the frame. */
++static inline uint64_t
++n2madv_default_thr(uint64_t ram_bytes, uint32_t page_bytes)
++{
++	return page_bytes ? ram_bytes / page_bytes / 5 : 0;
++}
++#endif /* NORD2_GPU_MADV_H */
+--- /dev/null
++++ b/iokit/Kernel/arm/nord2_gpu_madv_kern.inc
+@@ -0,0 +1,124 @@
++/*
++ * 0481 (memwod-20261113): MADVISE for GPU buffers, KERNEL part.  Included ONCE by Nord2GPU.cpp after the Nord2GPU class.
++ * What, why, ABI: nord2_gpu_madv.h.  SPDX-License-Identifier: MIT
++ *
++ * kern.n2gpu_madv          0 off (default) / 1 on (boot-arg n2madv=1)        kern.n2gpu_madv_thr   pressure mark in pages (0 = 20 % of RAM)
++ * kern.n2gpu_madv_now      write 1 = one purge pass of everything marked, whatever the pressure (test hook)
++ * Log: "NORD2 GPU MADV:" (first marks, every pass that purged, a line every 10 s while buffers are marked).
++ * Locks: marks and the pass run under Nord2GPU::lock (the pass in a thread call); the pages are dropped in free_owner (owner_drain's
++ * thread call, or inline for a buffer the core never adopted) with no GPU lock needed: the buffer is out of the GPU by then.
++ */
++static int           gMadvMode = 0;
++static uint32_t      gMadvThr, gMadvNow;
++static thread_call_t gMadvCall;
++static uint32_t      gMadvMarked, gMadvCalls, gMadvGone, gMadvPurged, gMadvPasses, gMadvDropFail, gMadvLogAt, gMadvTold;
++static uint64_t      gMadvMarkedBytes, gMadvPurgedBytes, gMadvDroppedBytes;
++SYSCTL_INT(_kern, OID_AUTO, n2gpu_madv, CTLFLAG_RW | CTLFLAG_LOCKED, &gMadvMode, 0, "0481: GPU buffer MADVISE + purge under pressure: 0 off, 1 on");
++SYSCTL_UINT(_kern, OID_AUTO, n2gpu_madv_thr, CTLFLAG_RW | CTLFLAG_LOCKED, &gMadvThr, 0, "0481: free + file-backed pages under which DONTNEED buffers go (0 = 20 % of RAM)");
++SYSCTL_UINT(_kern, OID_AUTO, n2gpu_madv_now, CTLFLAG_RW | CTLFLAG_LOCKED, &gMadvNow, 0, "0481: 1 = purge every DONTNEED buffer at the next tick");
++SYSCTL_UINT(_kern, OID_AUTO, n2gpu_madv_marked, CTLFLAG_RD | CTLFLAG_LOCKED, &gMadvMarked, 0, "0481: buffers marked DONTNEED now");
++SYSCTL_UINT(_kern, OID_AUTO, n2gpu_madv_purged, CTLFLAG_RD | CTLFLAG_LOCKED, &gMadvPurged, 0, "0481: buffers purged");
++extern "C" {
++extern unsigned int vm_page_free_count, vm_page_pageable_external_count;
++}
++
++/* mapBuffer: pageable buffers are also purgeable while the mode is on (their pages can then be dropped under a live CPU mapping). */
++static inline IOOptionBits n2madv_md_options(void) {
++        static bool argsDone;
++        if (!argsDone) { uint32_t v = 0; argsDone = true; if (PE_parse_boot_argn("n2madv", &v, sizeof(v)) && v <= 1) gMadvMode = (int)v; }   /* boot-arg, once */
++        return __atomic_load_n(&gMadvMode, __ATOMIC_RELAXED) == 1 ? (IOOptionBits)kIOMemoryPurgeable : 0;
++}
++
++/* free_owner, after complete(): a buffer the purge released gives its pages back now; a marked one that goes normally is uncounted. */
++static void n2madv_owner_gone(BufferOwner *o) {
++        if (!(o->madv & N2MADV_F_DONTNEED)) return;
++        uint64_t len = o->md ? o->md->getLength() : 0;
++        __atomic_fetch_sub(&gMadvMarked, 1u, __ATOMIC_RELAXED); __atomic_fetch_sub(&gMadvMarkedBytes, len, __ATOMIC_RELAXED);
++        if (!(o->madv & N2MADV_F_PURGED) || !o->md) return;
++        IOOptionBits was = 0;
++        if (o->md->setPurgeable(kIOMemoryPurgeableEmpty, &was) == kIOReturnSuccess) {
++                (void)o->md->setPurgeable(kIOMemoryPurgeableNonVolatile, NULL);    /* a stray CPU access zero-fills, it does not fault */
++                __atomic_fetch_add(&gMadvDroppedBytes, len, __ATOMIC_RELAXED);
++        } else {
++                __atomic_fetch_add(&gMadvDropFail, 1u, __ATOMIC_RELAXED);            /* the pages stay until the client unmaps */
++        }
++}
++
++/* GPU lock held.  Releases marked, idle buffers until `goal` bytes are on their way out. */
++static uint64_t n2madv_pass(Nord2GPU *g, uint64_t goal) {
++        uint64_t freed = 0; uint32_t n = 0;
++        for (unsigned c = 1; c < N2C_MAX_CTX && freed < goal; c++) {
++                struct n2c_ctx *x = &g->core->ctxs[c];
++                if (x->state == N2C_CTX_FREE) continue;
++                for (unsigned k = 0; k < N2C_MAX_BOS && freed < goal; k++) {
++                        struct n2c_bo *b = x->bos[k]; BufferOwner *o = b ? (BufferOwner *)b->cookie : NULL;
++                        if (!o || !n2madv_purge_ok(o->madv, b->handle_live, b->refs, (b->flags & N2C_BO_IMPORTED) != 0, b->state == N2C_BO_MAPPED)) continue;
++                        uint64_t size = b->size;
++                        o->madv |= N2MADV_F_PURGED;
++                        (void)n2c_bo_release(g->core, c, b->handle);   /* b may be gone now (or waits for the context's older jobs) */
++                        freed += size; n++;
++                }
++        }
++        gMadvPasses++;
++        if (n) { gMadvPurged += n; gMadvPurgedBytes += freed;
++                IOLog("NORD2 GPU MADV: purged %u buffers %llu KiB (goal %llu KiB; marked now %u; purged %u, %llu MiB since boot)\n", n, freed >> 10,
++                      goal == ~0ull ? 0ull : goal >> 10, gMadvMarked, gMadvPurged, gMadvPurgedBytes >> 20); }
++        return freed;
++}
++
++static void n2madv_tick(thread_call_param_t, thread_call_param_t) {
++        Nord2GPU *g = gSurfaceGpu;
++        uint64_t thr = __atomic_load_n(&gMadvThr, __ATOMIC_RELAXED);
++        if (!thr) thr = n2madv_default_thr(gPhysSize, (uint32_t)page_size);
++        uint64_t avail = (uint64_t)vm_page_free_count + vm_page_pageable_external_count;
++        uint64_t goal = n2madv_goal(avail, thr, (uint32_t)page_size, 32ull << 20);
++        if (__atomic_exchange_n(&gMadvNow, 0u, __ATOMIC_ACQ_REL)) goal = ~0ull;
++        if (g && goal && __atomic_load_n(&gMadvMarked, __ATOMIC_RELAXED)) {
++                g->retain();
++                IOLockLock(g->lock);
++                if (g->ready && !g->stopping && g->core) (void)n2madv_pass(g, goal);
++                IOLockUnlock(g->lock);
++                g->release();
++        }
++        uint64_t t = now_ms(NULL) / 1000;
++        if (gMadvMarked && (uint32_t)t - gMadvLogAt >= 10) { gMadvLogAt = (uint32_t)t;
++                IOLog("NORD2 GPU MADV: marked=%u/%llu MiB calls=%u gone=%u purged=%u/%llu MiB dropped=%llu MiB drop_fail=%u passes=%u avail=%llu thr=%llu mode=%d\n",
++                      gMadvMarked, gMadvMarkedBytes >> 20, gMadvCalls, gMadvGone, gMadvPurged, gMadvPurgedBytes >> 20, gMadvDroppedBytes >> 20, gMadvDropFail,
++                      gMadvPasses, avail, thr, gMadvMode); }
++        uint64_t dl = 0; clock_interval_to_deadline(2, kSecondScale, &dl);
++        thread_call_enter_delayed(gMadvCall, dl);
++}
++
++/* Nord2GPUUserClient::externalMethod, selector NORD2_GPU_SEL_MADVISE (before the transport's validator, which does not know it). */
++static IOReturn n2madv_call(Nord2GPU *g, IOLock *clientLock, const bool *closed, const unsigned *context, IOExternalMethodArguments *a) {
++        if (a->scalarInputCount != 2 || a->scalarOutputCount < 1 || a->structureInputSize || a->structureInputDescriptor || a->structureOutputDescriptor ||
++            a->asyncWakePort != MACH_PORT_NULL || a->scalarInput[0] > UINT32_MAX || a->scalarInput[1] > UINT32_MAX) return kIOReturnBadArgument;
++        uint32_t handle = (uint32_t)a->scalarInput[0], advice = (uint32_t)a->scalarInput[1], retained = 1; int mark = 0;
++        IOReturn r = kIOReturnNotOpen;
++        IOLockLock(clientLock); IOLockLock(g->lock);
++        if (!*closed && g->ready && !g->stopping && g->core) {
++                const struct n2c_bo *b = *context < N2C_MAX_CTX ? n2c_bo_lookup(g->core, *context, handle) : NULL;
++                BufferOwner *o = b ? (BufferOwner *)b->cookie : NULL;
++                IOOptionBits st = 0;
++                bool imported = b && (b->flags & N2C_BO_IMPORTED), mapped = b && b->state == N2C_BO_MAPPED;
++                bool can = o && o->md && o->prepared && !imported && mapped && advice == N2MADV_DONTNEED && gMadvMode == 1 &&
++                           o->md->setPurgeable(kIOMemoryPurgeableKeepCurrent, &st) == kIOReturnSuccess;    /* only memory made purgeable (mode 1 at ALLOC) */
++                uint8_t none = 0;
++                r = n2madv_advise(gMadvMode, b != NULL, n2madv_markable(o && o->md, o && o->prepared, can, imported, mapped), o ? &o->madv : &none,
++                                  advice, &retained, &mark) ? kIOReturnSuccess : kIOReturnBadArgument;
++                gMadvCalls++; if (b == NULL) gMadvGone++;
++                if (mark) { uint64_t len = o->md ? o->md->getLength() : 0;
++                        /* (atomic: n2madv_owner_gone counts down without the GPU lock) */
++                        if (mark > 0) { __atomic_fetch_add(&gMadvMarked, 1u, __ATOMIC_RELAXED); __atomic_fetch_add(&gMadvMarkedBytes, len, __ATOMIC_RELAXED); }
++                        else { __atomic_fetch_sub(&gMadvMarked, 1u, __ATOMIC_RELAXED); __atomic_fetch_sub(&gMadvMarkedBytes, len, __ATOMIC_RELAXED); } }
++                if (mark > 0 && !gMadvCall) {
++                        gMadvCall = thread_call_allocate(n2madv_tick, NULL);
++                        if (gMadvCall) { uint64_t dl = 0; clock_interval_to_deadline(2, kSecondScale, &dl); thread_call_enter_delayed(gMadvCall, dl); }
++                }
++                if (gMadvTold < 4 && (mark > 0 || b == NULL)) { gMadvTold++;
++                        IOLog("NORD2 GPU MADV: ctx=%u handle=%u advice=%u -> retained=%u%s (marked %u)\n", *context, handle, advice, retained, mark > 0 ? " marked" : "", gMadvMarked); }
++        }
++        IOLockUnlock(g->lock); IOLockUnlock(clientLock);
++        if (r == kIOReturnSuccess) { a->scalarOutput[0] = retained; a->scalarOutputCount = 1; }
++        return r;
++}

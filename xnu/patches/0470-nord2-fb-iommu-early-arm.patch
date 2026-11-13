@@ -1,0 +1,103 @@
+--- a/iokit/Kernel/arm/sweet_fb_iommu_hw.h
++++ b/iokit/Kernel/arm/sweet_fb_iommu_hw.h
+@@ -784,11 +784,34 @@
+  * switched by the 0401 gate between transfers when a frame programs an IOVA (after overlay init; 0408 lets init accept them).  Failure =
+  * REFUSED for the boot, kern.n2fbiommu 0: the pool (0394, default on since 0411) keeps the overlay composing physically. */
+ static thread_call_t n2io_boot_tc;
+-static uint32_t      n2io_boot_delay_s = 20;
++/* 0470: armed 3 s after the framebuffer's start (was 20: ~440 frames HELD on the boot screen).  The 20 s kept clear of the SCP/io_submap
++ * mapping window, closed since 0410 (unmappable kernel_map register maps; powered M4U0 larbs checked before PT_BASE).  The fire waits
++ * (250 ms polls, no M4U0 access) until IOCoreSurfaceRoot has started (the pool tables come from it) and the MMSYS SMI/IOMMU clocks
++ * read ungated, at most until 20 s after start; then the 0401 path (which ungates them itself) runs as before.  kern.n2fbiommu_delay /
++ * boot-arg n2fbiommu_delay = seconds; a write while arming is pending re-times it from now. */
++static uint32_t      n2io_boot_delay_s = 3;
++static uint64_t      n2io_boot_t0_ms;
++static int           n2io_boot_want;      /* 0470: kern.n2fbiommu chosen at boot: restored after a refusal so the retry can arm */
++static void
++n2io_boot_after_ms(uint32_t ms)
++{
++	uint64_t dl = 0;
++	clock_interval_to_deadline(ms, kMillisecondScale, &dl);
++	thread_call_enter_delayed(n2io_boot_tc, dl);
++}
+ static void
+ n2io_boot_fire(thread_call_param_t, thread_call_param_t)
+ {
+-	IOLog("NORD2 FB IOMMU: BOOT ARM begin (kern.n2fbiommu %d): each M4U0/larb step below is logged before it runs\n", n2io_mode);
++	static bool told;
++	bool late = n2io_now_ms() - n2io_boot_t0_ms >= 20000u;
++	uint32_t g = (sweet_surface_lock != NULL && n2io_map_regs()) ? n2io_cg_gated() : 0xffffffffu;
++	if (!late && (sweet_surface_lock == NULL || g != 0)) {
++		if (!told) { told = true; IOLog("NORD2 FB IOMMU: BOOT ARM waits: surface root %s, MMSYS SMI/IOMMU gated %08x\n", sweet_surface_lock != NULL ? "up" : "not started", g); }
++		n2io_boot_after_ms(250);
++		return;
++	}
++	IOLog("NORD2 FB IOMMU: BOOT ARM begin (kern.n2fbiommu %d, %llu ms after fb start): each M4U0/larb step below is logged before it runs\n",
++	    n2io_mode, n2io_now_ms() - n2io_boot_t0_ms);
+ 	IOSleep(200);
+ 	IOLockLock(n2io_lock);
+ 	bool ok = false;
+@@ -797,14 +820,18 @@
+ 		ok = n2io_arm_locked();
+ 		n2io_stepwise = false;
+ 	}
+-	if (!ok && n2io_state == 2) { n2io_state = 0; }      /* 0416: a refusal is not final: retried */
++	if (!ok && n2io_state == 2) { n2io_state = 0; n2io_mode = n2io_boot_want; }      /* 0416: a refusal is not final: retried (0470: in mode) */
++	if (!ok && n2io_mode == 0) {      /* 0470: kern.n2fbiommu=0 written meanwhile: stop, frames go the pool-only way */
++		n2io_boot_pending = false;
++		IOLog("NORD2 FB IOMMU: BOOT ARM off (kern.n2fbiommu 0)\n");
++		IOLockUnlock(n2io_lock);
++		return;
++	}
+ 	if (!ok) {
+ 		static uint32_t tries;
+ 		uint32_t sec = tries < 4 ? (5u << tries) : 60u;
+ 		tries++;
+-		uint64_t dl = 0;
+-		clock_interval_to_deadline(sec, kSecondScale, &dl);
+-		thread_call_enter_delayed(n2io_boot_tc, dl);
++		n2io_boot_after_ms(sec * 1000u);
+ 		IOLog("NORD2 FB IOMMU: BOOT ARM REFUSED (%s): retry %u in %u s, frames held meanwhile (no other path)\n", n2io_why, tries, sec);
+ 		IOLockUnlock(n2io_lock);
+ 		return;
+@@ -815,6 +842,20 @@
+ 	IOLockUnlock(n2io_lock);
+ }
+ 
++static int
++n2io_sysctl_delay SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint32_t v = n2io_boot_delay_s;
++	int changed = 0, err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (err != 0 || !changed) { return err; }
++	if (v > 600) { return EINVAL; }
++	n2io_boot_delay_s = v;
++	if (n2io_boot_pending && n2io_boot_tc != NULL) { n2io_boot_after_ms(v * 1000u); }
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, n2fbiommu_delay, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, n2io_sysctl_delay, "IU", "0470: boot arming delay s (default 3)");
++
+ extern "C" void
+ sweet_fb_iommu_boot(void)
+ {
+@@ -824,15 +865,15 @@
+ 	int v = 0; uint32_t d = 0;
+ 	bool have = PE_parse_boot_argn("n2fbiommu", &v, sizeof(v));
+ 	n2io_mode = sweet_fb_iommu_boot_mode(have, v);
++	n2io_boot_want = n2io_mode;
+ 	if (PE_parse_boot_argn("n2fbiommu_delay", &d, sizeof(d)) && d <= 600) { n2io_boot_delay_s = d; }
+ 	if (n2io_mode == 0 || !n2io_lock_init()) { n2io_mode = 0; IOLog("NORD2 FB IOMMU: BOOT ARM off (kern.n2fbiommu 0)\n"); return; }
+ 	n2io_boot_tc = thread_call_allocate(n2io_boot_fire, NULL);
+ 	if (n2io_boot_tc == NULL) { n2io_mode = 0; IOLog("NORD2 FB IOMMU: BOOT ARM off (no thread_call)\n"); return; }
+ 	n2io_boot_pending = true;
+-	uint64_t dl = 0;
+-	clock_interval_to_deadline(n2io_boot_delay_s, kSecondScale, &dl);
+-	thread_call_enter_delayed(n2io_boot_tc, dl);
+-	IOLog("NORD2 FB IOMMU: BOOT ARM scheduled in %u s (kern.n2fbiommu %d; boot-args n2fbiommu=0 off, n2fbiommu_delay=S)\n", n2io_boot_delay_s, n2io_mode);
++	n2io_boot_t0_ms = n2io_now_ms();
++	n2io_boot_after_ms(n2io_boot_delay_s * 1000u);
++	IOLog("NORD2 FB IOMMU: BOOT ARM scheduled in %u s (kern.n2fbiommu %d; kern.n2fbiommu_delay / boot-args n2fbiommu=0 off, n2fbiommu_delay=S)\n", n2io_boot_delay_s, n2io_mode);
+ }
+ 
+ 

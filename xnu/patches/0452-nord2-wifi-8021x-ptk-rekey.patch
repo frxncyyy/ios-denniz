@@ -1,0 +1,413 @@
+--- a/bsd/dev/wifi_8021x_glue.c
++++ b/bsd/dev/wifi_8021x_glue.c
+@@ -69,6 +69,10 @@
+ int e8_nwn_cancel(struct nwn*,uint64_t,uint64_t);
+ int e8_stc_pmk(struct stc*,uint64_t,const uint8_t pmk[32],uint64_t);
+ int e8_stc_eap_waiting(const struct stc*);
++void e8_nwp_rekey_pmk(const uint8_t pmk[32]);
++extern unsigned e8_nwn_rekey_installs;
++/* 0453: set by the supplicant user client; called on the thread call when the keys of an 802.1X link are in place. */
++void (*n8x_port_open_hook)(void);
+ int n8x_output_frame(const uint8_t*,size_t);
+ static struct {
+ #ifdef N8X_KERNEL
+@@ -80,7 +84,8 @@
+  uint64_t generation;const struct nwn*owner;
+  uint8_t ssid[32],bssid[6],self[6];
+  /* shared with the thread call, the output filter and the supplicant client */
+- unsigned linked,want_up,want_down,key_pending,rx_head,rx_count,tx_head,tx_count;
++ unsigned linked,want_up,want_down,want_notify,key_pending,reauth,rekey_seen,rx_head,rx_count,tx_head,tx_count;
++ uint64_t rekey_reset_ms;
+  uint64_t down_generation;
+  unsigned rx_seen,rx_up,rx_drop,tx_seen,tx_sent,tx_drop,tx_done,keys_set,keys_ignored,frame_logs;
+  uint8_t key[32];
+@@ -88,7 +93,7 @@
+  unsigned rx_bytes[N8X_SLOTS],tx_bytes[N8X_SLOTS];
+ } g;
+ #ifdef N8X_KERNEL
+-SYSCTL_UINT(_kern, OID_AUTO, n2wifi_8021x, CTLFLAG_RW | CTLFLAG_LOCKED, &niwj_8021x, 0, "0450: WPA2-Enterprise (802.1X) joins: 0 refuse the profile, 1 associate, pass EAPOL to eapolclient, 4-way handshake with its PMK");
++SYSCTL_UINT(_kern, OID_AUTO, n2wifi_8021x, CTLFLAG_RW | CTLFLAG_LOCKED, &niwj_8021x, 0, "0450/0452 WPA2-Enterprise bits: 1 802.1X joins (clear: profile refused), 2 PTK rekey + EAP re-authentication on the link, 0x10 handshake-complete message for eapolclient");
+ static void n8x_call(thread_call_param_t,thread_call_param_t);
+ #define N8X_LOCK() IOLockLock(g.lock)
+ #define N8X_UNLOCK() IOLockUnlock(g.lock)
+@@ -113,7 +118,7 @@
+  * glue raised and the binder did not take over is revoked. */
+ static void n8x_end_locked(void){
+  if(g.linked&&!g.port_seen){g.want_down=1;g.down_generation=g.generation;}
+- g.linked=0;g.want_up=0;g.key_pending=0;g.rx_head=g.rx_count=g.tx_head=g.tx_count=0;
++ g.linked=0;g.want_up=0;g.key_pending=0;g.reauth=0;g.rekey_reset_ms=0;g.rx_head=g.rx_count=g.tx_head=g.tx_count=0;
+  n8x_clear(g.key,sizeof g.key);n8x_clear(g.rx,sizeof g.rx);n8x_clear(g.tx,sizeof g.tx);n8x_clear(g.rx_bytes,sizeof g.rx_bytes);n8x_clear(g.tx_bytes,sizeof g.tx_bytes);
+ }
+ /* ---- wrappers: owner thread, binder admission lock held ---- */
+@@ -122,7 +127,7 @@
+  n8x_init();
+  if(g.ready){N8X_LOCK();n8x_end_locked();g.eap=0;g.ended=1;down=g.want_down;N8X_UNLOCK();if(down)n8x_defer();}
+  if(!akm)return nwc_begin(s,t,a,c,peer,ctx,now);
+- if(!niwj_8021x||!g.ready||!s||!t||now>UINT64_MAX/1000-N8X_BUDGET_MS){printf("NORD2 WIFI 8021X: join refused enabled=%u ready=%u\n",niwj_8021x,g.ready);return -1;}
++ if(!(niwj_8021x&1u)||!g.ready||!s||!t||now>UINT64_MAX/1000-N8X_BUDGET_MS){printf("NORD2 WIFI 8021X: join refused enabled=%u ready=%u\n",niwj_8021x,g.ready);return -1;}
+  struct stc_config e=*c;uint8_t rsn[22];uint64_t transport_deadline=t->deadline;
+  n8x_station_rsn(akm,rsn);e.pmk=0;e.station_rsn=rsn;e.deadline_ms=now+N8X_BUDGET_MS;
+  t->deadline=e.deadline_ms*1000; /* unauthorized period of the native transport, same clock in us */
+@@ -130,7 +135,7 @@
+  n8x_clear(&e,sizeof e);
+  if(r!=1){t->deadline=transport_deadline;printf("NORD2 WIFI 8021X: join start refused akm=%u result=%d\n",akm,r);return r;}
+  N8X_LOCK();
+- g.eap=1;g.ended=0;g.akm=akm;g.tried=g.started=g.port_seen=0;g.generation=c->generation;g.owner=s;
++ g.eap=1;g.ended=0;g.akm=akm;g.tried=g.started=g.port_seen=0;g.generation=c->generation;g.owner=s;g.rekey_seen=e8_nwn_rekey_installs;
+  g.rx_seen=g.rx_up=g.rx_drop=g.tx_seen=g.tx_sent=g.tx_drop=g.tx_done=g.keys_set=g.keys_ignored=g.frame_logs=0;
+  g.ssid_len=c->assoc.ssid_len<=32?c->assoc.ssid_len:0;memcpy(g.ssid,c->assoc.ssid,g.ssid_len);memcpy(g.bssid,c->assoc.peer.ap,6);memcpy(g.self,c->assoc.peer.self,6);
+  g.band=c->channel.band;g.channel=c->channel.channel;
+@@ -142,6 +147,10 @@
+ static void n8x_key_locked(struct nwn*s,uint64_t now){
+  struct stc*t=&s->owner.transaction;
+  if(!g.key_pending)return;
++ if(!g.ended&&g.port_seen){ /* 0452: PMK of a re-authentication, used from the AP's next message 1 */
++  e8_nwp_rekey_pmk(g.key);n8x_clear(g.key,sizeof g.key);g.key_pending=0;g.reauth=0;
++  printf("NORD2 WIFI 8021X: pmk received (reauthentication) generation=%llu\n",(unsigned long long)g.generation);return;
++ }
+  if(g.ended||!e8_stc_eap_waiting(t)){n8x_clear(g.key,sizeof g.key);g.key_pending=0;return;}
+  if(s->owner.halted||s->owner.issuing||t->phase!=STC_EAPOL)return; /* association still completing */
+  unsigned waiting=t->eapol_pending;int r=e8_stc_pmk(t,g.generation,g.key,now);
+@@ -174,7 +183,7 @@
+  }
+  if(!g.ended&&!g.tried&&t->phase==STC_EAPOL&&t->associated&&n->sta_active){g.tried=1;g.want_up=1;work=1;} /* once per attempt */
+  if(!g.ended&&!g.port_seen&&n->controlled_port&&t->outcome==STC_AUTHORIZED){
+-  g.port_seen=1; /* the binder announces its own link now; the interface stays up */
++  g.port_seen=1;g.want_notify=1;work=1; /* the binder announces its own link now; the interface stays up */
+   printf("NORD2 WIFI 8021X: keys installed generation=%llu port=open eapol_rx=%u eapol_tx=%u\n",(unsigned long long)g.generation,g.rx_up,g.tx_sent);
+  }
+  if(g.rx_count&&live_locked())work=1;
+@@ -184,7 +193,14 @@
+  if(!mine(s))return nwc_pump(s,now);
+  N8X_LOCK();n8x_key_locked(s,now);N8X_UNLOCK();
+  int r=e8_nwn_pump(s,now);
+- N8X_LOCK();if(r>=0)n8x_tx_locked(s);unsigned work=n8x_state_locked(s);N8X_UNLOCK();
++ N8X_LOCK();if(r>=0)n8x_tx_locked(s);unsigned work=n8x_state_locked(s);
++ /* 0452: a rekeyed PTK went to the firmware; restart the pairwise replay counters once frames under the old key are gone */
++ if(e8_nwn_rekey_installs!=g.rekey_seen){g.rekey_seen=e8_nwn_rekey_installs;g.rekey_reset_ms=now+100;}
++ if(g.rekey_reset_ms&&now>=g.rekey_reset_ms&&!g.ended){
++  static const uint8_t zero[8];struct nst*n=s->transport;n->ptk.installed=0;int e=nst_replay_install(n,1,0,zero);g.rekey_reset_ms=0;g.want_notify=1;work=1;
++  printf("NORD2 WIFI 8021X: ptk rekey installed generation=%llu replay_restart=%d\n",(unsigned long long)g.generation,e);
++ }
++ N8X_UNLOCK();
+  if(work)n8x_defer();
+  return r;
+ }
+@@ -196,11 +212,14 @@
+      !memcmp(e->body,s->transport->peer.self,6)&&!memcmp(e->body+6,s->transport->peer.ap,6)){
+    /* EAP packet (or any EAPOL that is not EAPOL-Key): for eapolclient, never for the WPA engine. */
+    N8X_LOCK();g.rx_seen++;
++   if(g.port_seen&&e->bytes>=19&&e->body[15]==0&&e->body[18]==1)g.reauth=1; /* 0452: EAP-Request on an authorized link: a new PMK is coming */
+    if(g.ended||g.rx_count==N8X_SLOTS)g.rx_drop++;
+    else{unsigned k=(g.rx_head+g.rx_count++)%N8X_SLOTS;memcpy(g.rx[k],e->body,e->bytes);g.rx_bytes[k]=(unsigned)e->bytes;}
+    N8X_UNLOCK();return 0;
+   }
+  }
++ /* 0452: message 1 of the rekey after a re-authentication waits for the new PMK (the AP repeats it) */
++ if(e&&e->kind==NST_EAPOL&&e->body&&e->bytes>=21&&e->body[15]==3&&!(e->body[19]&1)&&g.port_seen&&g.reauth)return 0;
+  return e8_nwn_event(s,e,now);
+ }
+ int nwn_peer_complete(struct nwn*s,uint64_t generation,uint64_t ticket,unsigned type,int success,uint64_t now){
+@@ -220,7 +239,7 @@
+  * becomes the AP (the PAE group address means nothing on an infrastructure BSS). */
+ int n8x_output_frame(const uint8_t*p,size_t n){
+  if(!g.ready||!p||n<14||n>NWIL_ETHERNET_MAX||p[12]!=0x88||p[13]!=0x8e)return 0;
+- N8X_LOCK();int taken=niwj_8021x&&live_locked();
++ N8X_LOCK();int taken=(niwj_8021x&1u)&&live_locked();
+  if(taken){
+   if(n<18||p[15]==3||memcmp(p+6,g.self,6)||g.tx_count==N8X_SLOTS)g.tx_drop++;
+   else{unsigned k=(g.tx_head+g.tx_count++)%N8X_SLOTS;memcpy(g.tx[k],p,n);memcpy(g.tx[k],g.bssid,6);g.tx_bytes[k]=(unsigned)n;g.tx_seen++;}
+@@ -231,8 +250,8 @@
+  if(!key||(bytes!=32&&bytes!=64))return -1;
+  if(!g.ready)return 1;
+  N8X_LOCK();int r=1;unsigned eap=g.eap&&!g.ended;
+- /* Before the engine started only; a later key is a reauthentication (PTK rekey is not implemented). */
+- if(eap&&!g.started&&!g.port_seen){memcpy(g.key,key,32);g.key_pending=1;g.keys_set++;r=0;}else g.keys_ignored++;
++ /* Before the engine started, or (0452, bit 2) on the authorized link after a re-authentication. */
++ if(eap&&((!g.started&&!g.port_seen)||(g.port_seen&&(niwj_8021x&2u)))){memcpy(g.key,key,32);g.key_pending=1;g.keys_set++;r=0;}else g.keys_ignored++;
+  N8X_UNLOCK();
+  printf("NORD2 WIFI 8021X: key from supplicant bytes=%u taken=%u eap_join=%u\n",(unsigned)bytes,(unsigned)!r,eap);
+  return r;
+@@ -303,8 +322,8 @@
+ #endif
+ static void n8x_work(void){
+  for(unsigned round=0;round<4u*N8X_SLOTS;round++){
+-  unsigned up,down,bytes=0,log=0,akm;uint64_t generation,down_generation;
+-  N8X_LOCK();
++  unsigned up,down,notify,bytes=0,log=0,akm;uint64_t generation,down_generation;
++  N8X_LOCK();notify=g.want_notify&&(niwj_8021x&0x10u)&&g.eap&&!g.ended;g.want_notify=0;
+   down=g.want_down;down_generation=g.down_generation;g.want_down=0;
+   up=g.want_up&&g.eap&&!g.ended;g.want_up=0;generation=g.generation;akm=g.akm;
+   if(!up&&!down&&g.rx_count){
+@@ -313,6 +332,7 @@
+    if(bytes||g.ended){n8x_clear(g.rx[k],sizeof g.rx[k]);g.rx_bytes[k]=0;g.rx_head=(k+1)%N8X_SLOTS;g.rx_count--;if(!bytes)g.rx_drop++;}
+   }
+   N8X_UNLOCK();
++  if(notify&&n8x_port_open_hook)n8x_port_open_hook(); /* 0453: eapolclient's "4-way handshake complete" */
+   if(down){int error=nord2_wifi_ifnet_link(down_generation,0);printf("NORD2 WIFI 8021X: link down generation=%llu error=%d\n",(unsigned long long)down_generation,error);}
+   if(up){
+    int error;
+@@ -336,7 +356,7 @@
+    if(log)printf("NORD2 WIFI 8021X: eapol rx type=%u len=%u error=%d\n",(unsigned)g.scratch[15],bytes-14,error);
+    n8x_clear(g.scratch,sizeof g.scratch);
+   }
+-  if(!up&&!down&&!bytes)break;
++  if(!up&&!down&&!bytes&&!notify)break;
+  }
+ }
+ /* One worker at a time: a thread call may be entered again while it runs. */
+--- a/bsd/dev/wifi_8021x_nst.c
++++ b/bsd/dev/wifi_8021x_nst.c
+@@ -1,7 +1,93 @@
+ #include <arm64/sweet_early.h>
+ #if defined(NORD2)
+-/* 0450: 802.1X instance of wifi_wpa_nst.c (unmodified source, symbols prefixed e8_). */
++/* 0452: 802.1X instance of wifi_wpa_nst.c, generated by wifi8021x-20261113/work/gen.py (symbols prefixed e8_). Differences
++ * from the CI source, both for a PTK rekey: EAPOL-Key frames of the engine leave encrypted once the pairwise key is in use,
++ * and a second pairwise key command does not restart the receive replay counters here: frames still under the old key
++ * may sit in the RX ring, so wifi_8021x_glue.c restarts them 100 ms later (nwn_rekey_installs tells it). */
+ #include "wifi_8021x_rename.h"
+-#include "wifi_wpa_nst.c"
++#include "wifi_wpa_nst.h"
++#include "wifi_station_diag.h"
++#if defined(KERNEL) || defined(_KERNEL)
++#include <sys/systm.h>
++#else
++#include <string.h>
++#endif
++static void clear(void*v,size_t n){volatile uint8_t*p=v;while(n--)*p++=0;}
++unsigned nwn_rekey_installs;
++static int close_native(void*ctx){struct nwn*s=ctx;nst_close_port(s->transport);return s->transport->controlled_port?-1:0;}
++static int sync_cleanup(struct nwn*s){
++ if(s->owner.transaction.phase<STC_DEAUTH||s->cleanup_started)return 0;
++ uint64_t deadline=s->owner.transaction.cleanup_deadline;
++ if(deadline>UINT64_MAX/1000||s->now_ms>UINT64_MAX/1000)return -1;
++ uint64_t now=s->now_ms*1000;if(now<s->transport->last)now=s->transport->last;
++ if(nst_cleanup_begin(s->transport,now,deadline*1000))return -1;s->cleanup_started=1;return 0;
++}
++static int submit_native(void*ctx,const struct stc_action*a,const struct nwo_install*m){
++ struct nwn*s=ctx;struct nst*t=s->transport;
++ if(sync_cleanup(s))return -1;
++ if(t->wire_busy||t->air_pending)return 1;
++ switch(a->kind){
++ case STC_PREPARE_PEER:case STC_CONFIGURE_PEER:case STC_RETIRE_PEER:
++  return s->peer_submit(s->peer_context,a,&s->owner.transaction);
++ case STC_CID_CHANNEL:case STC_ABORT_CHANNEL:return nst_command(t,a->ticket,SW_CHANNEL,a->payload,a->bytes);
++ case STC_CID_PTK:case STC_CID_GTK:case STC_REKEY_GTK:case STC_DELETE_PTK:case STC_DELETE_GTK:{
++  int r=nst_command(t,a->ticket,SW_KEY,a->payload,a->bytes);
++  if(!r){s->install=*m;s->key_pairwise=a->kind==STC_CID_PTK;}
++  return r;}
++ case STC_TX_AUTH:case STC_TX_ASSOC:case STC_TX_DEAUTH:return nst_management(t,a->ticket,a->payload,a->bytes);
++ case STC_TX_EAPOL:case STC_TX_GROUP:{
++  uint8_t frame[654];if(a->bytes>640)return -1;
++  memcpy(frame,t->peer.ap,6);memcpy(frame+6,t->peer.self,6);frame[12]=0x88;frame[13]=0x8e;memcpy(frame+14,a->payload,a->bytes);
++  int r=nst_eapol(t,a->ticket,frame,a->bytes+14,a->kind==STC_TX_GROUP||(t->ptk_ready&&t->ptk.installed&&t->controlled_port));clear(frame,sizeof frame);return r;}
++ /* Pure readiness is performed by pump outside RX callback, then delivered
++  * as an explicit local receipt, not a fabricated firmware acknowledgement. */
++ case STC_INSTALL_DATA_PATH:return nst_authorize(t)?-1:0;
++ default:return -1;
++ }
++}
++int nwn_begin(struct nwn*s,struct nst*t,struct stc_arbiter*a,const struct stc_config*c,nwn_peer_submit peer,void*ctx,uint64_t now){
++ if(!s||!t||!c||!peer||!t->prepared||t->halt||t->security!=c->security||t->generation!=c->generation||t->peer.bss!=c->channel.bss||t->peer.wlan!=c->sta_wlan||t->peer.group_wlan!=c->group_wlan||memcmp(t->peer.ap,c->assoc.peer.ap,6)||memcmp(t->peer.self,c->assoc.peer.self,6))return -1;
++ for(unsigned k=0;k<3;k++)if(c->group_spare[k]&&c->group_spare[k]!=t->group_spare[k])return -1;
++ s->overall_deadline=c->deadline_ms;s->transport=t;s->peer_submit=peer;s->peer_context=ctx;s->now_ms=now;
++ const struct nwo_ops ops={submit_native,close_native};return nwo_begin(&s->owner,a,c,&ops,s,now);
++}
++int nwn_pump(struct nwn*s,uint64_t now){
++ if(!s)return -1;s->now_ms=now;int r=nwo_pump(&s->owner,now);if(r>=0&&sync_cleanup(s))return -1;
++ if(r==1&&s->owner.in_kind==STC_INSTALL_DATA_PATH){uint64_t g=s->owner.in_generation,t=s->owner.in_ticket;return nwo_complete(&s->owner,g,t,NWO_DATA_PATH,1,now);}return r;
++}
++int nwn_peer_complete(struct nwn*s,uint64_t g,uint64_t t,unsigned type,int success,uint64_t now){if(!s||(type!=NWO_PREPARED&&type!=NWO_CONFIGURED&&type!=NWO_RETIRED))return -1;s->now_ms=now;int r=nwo_complete(&s->owner,g,t,type,success,now);return r>=0&&sync_cleanup(s)?-1:r;}
++int nwn_cancel(struct nwn*s,uint64_t g,uint64_t now){if(!s)return -1;clear(&s->install,sizeof s->install);s->now_ms=now;int r=nwo_cancel(&s->owner,g,now);return r>=0&&sync_cleanup(s)?-1:r;}
++static int event_inner(struct nwn*s,const struct nst_event*e,uint64_t now){
++ if(!s||!e||e->generation!=s->owner.transaction.generation)return 0;
++ switch(e->kind){
++ case NST_COMMAND_DMA:{
++  if(e->ticket!=s->owner.in_ticket)return 0;
++  unsigned kind=s->owner.in_kind,type=NWO_COMMAND;int ok=e->status==0;
++  if(kind==STC_TX_EAPOL||kind==STC_TX_GROUP)return -1; /* untyped DMA is not the security receipt */
++  if(kind==STC_TX_AUTH||kind==STC_TX_ASSOC||kind==STC_TX_DEAUTH){if(ok)return 0;return nwo_complete(&s->owner,e->generation,e->ticket,NWO_AIR_TX,0,now);} /* DMA success is never air TX */
++  if(kind==STC_CID_GTK||kind==STC_REKEY_GTK)type=NWO_GTK_REPLAY;
++  const struct stc_action *current=stc_next(&s->owner.transaction);
++  if(ok&&kind==STC_CID_PTK&&s->transport->ptk.installed)nwn_rekey_installs++;
++  else if(ok&&current&&current->ticket==e->ticket&&(kind==STC_CID_PTK||kind==STC_CID_GTK||kind==STC_REKEY_GTK))ok=(kind==STC_REKEY_GTK?nst_replay_replace_group(s->transport,s->install.gtk_index,s->install.rsc):nst_replay_install(s->transport,s->key_pairwise,s->key_pairwise?0:s->install.gtk_index,s->install.rsc))==0;
++  int r=nwo_complete(&s->owner,e->generation,e->ticket,type,ok,now);clear(&s->install,sizeof s->install);return r;}
++ case NST_SECURITY_SUBMITTED:return nwo_complete(&s->owner,e->generation,e->ticket,NWO_SECURITY_SUBMITTED,e->status==0,now);
++ case NST_DATA_SUBMITTED:return 0; /* ordinary egress has no handshake ticket */
++ case NST_FRAME_RESULT:return nwo_complete(&s->owner,e->generation,e->ticket,NWO_AIR_TX,e->status==0,now);
++ case NST_CHANNEL_GRANT:{int r=nwo_grant(&s->owner,e->generation,e->bss,e->token,e->band,e->channel,e->status==0,now);
++  if(r>0){uint64_t interval=e->interval_ms>10?e->interval_ms-10:0;if(now>UINT64_MAX-interval)return nwo_link_lost(&s->owner,e->generation,now);uint64_t limit=now+interval;if(limit<s->owner.transaction.deadline)s->owner.transaction.deadline=limit;}return r;}
++ case NST_CHANNEL_RELEASED:{int r=stc_channel_released(&s->owner.transaction,e->generation,e->token,now);if(r>0&&s->owner.transaction.phase<STC_DEAUTH)s->owner.transaction.deadline=s->overall_deadline;return r;}
++ case NST_KEY_READY:return nwo_key24(&s->owner,e->generation,e->body,e->bytes,now);
++ case NST_MANAGEMENT:return nwo_management(&s->owner,e->generation,e->body,e->bytes,now);
++ case NST_EAPOL:{const uint8_t*p=e->body;size_t n=e->bytes;
++  if(!p||n<14||p[12]!=0x88||p[13]!=0x8e||memcmp(p,s->transport->peer.self,6)||memcmp(p+6,s->transport->peer.ap,6))return 0;
++  {struct nstd_record record;nstd_eapol(&record,e->generation,s->owner.in_ticket,p+14,n-14);nstd_log(&record);}
++  return nwo_eapol(&s->owner,e->generation,p+14,n-14,now);}
++ case NST_LINK_LOST:return nwo_link_lost(&s->owner,e->generation,now);
++ case NST_FATAL:return nwn_cancel(s,e->generation,now);
++ default:return 0;
++ }
++}
++
++int nwn_event(struct nwn*s,const struct nst_event*e,uint64_t now){if(!s)return -1;s->now_ms=now;int r=event_inner(s,e,now);return r>=0&&sync_cleanup(s)?-1:r;}
+ 
+ #endif /* NORD2 */
+--- a/bsd/dev/wifi_8021x_rename.h
++++ b/bsd/dev/wifi_8021x_rename.h
+@@ -4,9 +4,9 @@
+  * wifi_wpa2.o, wifi_station_transaction.o, wifi_wpa_owner.o and wifi_wpa_nst.o
+  * keep serving WPA2-PSK and OPEN unchanged; the 802.1X joins run through a
+  * second copy of the same four sources, compiled as new objects whose global
+- * symbols carry the prefix e8_ (wifi_8021x_wpa2.c and wifi_8021x_stc.c are the
+- * modified copies, wifi_8021x_owner.c and wifi_8021x_nst.c include the
+- * unmodified sources). Same structures, same transport, same binder storage.
++ * symbols carry the prefix e8_ (wifi_8021x_wpa2.c, wifi_8021x_stc.c and
++ * wifi_8021x_nst.c are generated modified copies, wifi_8021x_owner.c includes
++ * the unmodified source). Same structures, same transport, same binder storage.
+  * This header is the first include of those four files and of nothing else. */
+ #define nwp_begin_ap e8_nwp_begin_ap
+ #define nwp_copy_ap_rsnxe e8_nwp_copy_ap_rsnxe
+@@ -50,9 +50,18 @@
+ #define nwn_event e8_nwn_event
+ #define nwn_peer_complete e8_nwn_peer_complete
+ #define nwn_cancel e8_nwn_cancel
++#define nwp_rekey_pmk e8_nwp_rekey_pmk
++#define nwp_rekeying e8_nwp_rekeying
++#define nwp_rekey_done e8_nwp_rekey_done
++#define nwn_rekey_installs e8_nwn_rekey_installs
+ #include <stddef.h>
+ #include <stdint.h>
+-struct stc;
++struct stc;struct nwp;
++/* 0452 PTK rekey: new PMK of a re-authentication for the next message 1; a rekeyed PTK awaits its install; install done. */
++void nwp_rekey_pmk(const uint8_t pmk[32]);
++int nwp_rekeying(const struct nwp*);
++void nwp_rekey_done(void);
++extern unsigned nwn_rekey_installs;
+ /* Additions of the 802.1X instance (not in the CI headers). */
+ int nwp_ap_rsn_akm(const uint8_t*,size_t,unsigned akm);
+ /* The PMK of the EAP exchange starts the WPA engine: 1 started (a waiting
+--- a/bsd/dev/wifi_8021x_stc.c
++++ b/bsd/dev/wifi_8021x_stc.c
+@@ -164,7 +164,8 @@
+  case STC_ASSOC_TX:s->phase=STC_ASSOC_RX;s->response_deadline=now>UINT64_MAX-524?UINT64_MAX:now+524;return response_done(s);
+  case STC_CONFIGURE:/* Actual peer/BSS/RLM and station-activation receipt, no invented grant release. */if(s->security==SW_SECURITY_OPEN)return emit(s,STC_DATA,STC_INSTALL_DATA_PATH);s->phase=STC_EAPOL;return consume_eapol(s,now);
+  case STC_EAPOL_TX:{int r=nwp_security_submitted(&s->wpa,gen,s->wpa_tx_ticket,1);s->wpa_tx_ticket=0;if(r==NWP_INSTALL){s->gtk_index=s->wpa.gtk_index;return command_key(s,0,0);}if(r<0)return stop(s,STC_FAILED);if(s->group_active){s->group_active=0;s->group_deadline=0;}s->phase=s->resume_phase;s->resume_phase=0;if(s->phase==STC_PTK_READY&&s->key_event_seen){if(nwp_keys_ready(&s->wpa,gen,s->wpa.install_ticket,1,1)<0)return stop(s,STC_FAILED);return command_key(s,1,0);}return consume_eapol(s,now);}
+- case STC_PTK:s->phase=STC_PTK_READY;if(s->key_event_seen){if(nwp_keys_ready(&s->wpa,gen,s->wpa.install_ticket,1,1)<0)return stop(s,STC_FAILED);return command_key(s,1,0);}return consume_eapol(s,now); /* submission, not key-ready */
++ case STC_PTK:if(nwp_rekeying(&s->wpa)){if(nwp_keys_ready(&s->wpa,gen,s->wpa.install_ticket,1,1)<0||nwp_keys_ready(&s->wpa,gen,s->wpa.install_ticket,2,1)<0||nwp_keys_ready(&s->wpa,gen,s->wpa.install_ticket,4,1)!=NWP_AUTH)return stop(s,STC_FAILED);nwp_rekey_done();s->phase=STC_CONNECTED;return consume_eapol(s,now);}
++ s->phase=STC_PTK_READY;if(s->key_event_seen){if(nwp_keys_ready(&s->wpa,gen,s->wpa.install_ticket,1,1)<0)return stop(s,STC_FAILED);return command_key(s,1,0);}return consume_eapol(s,now); /* submission, not key-ready */
+  case STC_GTK:if(s->group_active){struct nwp_result r;int v=nwp_group_ready(&s->wpa,gen,s->wpa.group_ticket,1,&r);if(v!=NWP_TX){erase(&r,sizeof r);return stop(s,STC_FAILED);}return group_tx(s,&r);}/* Source no-response host completion/replay initialization, NOT firmware ACK. */if(nwp_keys_ready(&s->wpa,gen,s->wpa.install_ticket,2,1)<0)return stop(s,STC_FAILED);return emit(s,STC_DATA,STC_INSTALL_DATA_PATH);
+  case STC_DATA:if(s->security==SW_SECURITY_OPEN){s->phase=STC_CONNECTED;s->outcome=STC_AUTHORIZED;return 1;}if(nwp_keys_ready(&s->wpa,gen,s->wpa.install_ticket,4,1)!=NWP_AUTH)return stop(s,STC_FAILED);s->phase=STC_CONNECTED;s->outcome=STC_AUTHORIZED;return consume_eapol(s,now);
+  case STC_DEAUTH:case STC_REMOVE_PTK:case STC_REMOVE_GTK:case STC_RETIRE:case STC_RELEASE:return cleanup_next(s);
+--- a/bsd/dev/wifi_8021x_wpa2.c
++++ b/bsd/dev/wifi_8021x_wpa2.c
+@@ -34,6 +34,18 @@
+  if(equal(p,rsn,sizeof rsn))return 1; /* exactly one CCMP pairwise/group, PSK; no PMF */
+  return n8x_eap_akm(n8x_rsn_akm(p)); /* 0450: the same element with AKM 802.1X or 802.1X SHA-256 */
+ }
++/* 0452: PTK rekey on an authorized link (same PMK, or the new PMK of an EAP re-authentication), kern.n2wifi_8021x bit 2.
++ * The candidate key set lives outside struct nwp (its layout is shared with the CI objects) until message 3 proves it:
++ * a forged or stale message 1 costs nothing, the link keeps its keys. pmk..tk are contiguous in struct nwp. */
++#define REKEY_SPAN 156u
++_Static_assert(offsetof(struct nwp,gtk)-offsetof(struct nwp,pmk)==REKEY_SPAN&&offsetof(struct nwp,snonce)-offsetof(struct nwp,pmk)==44&&offsetof(struct nwp,anonce)-offsetof(struct nwp,pmk)==76,"rekey span");
++extern unsigned niwj_8021x;
++static struct {unsigned active,have_pmk;uint8_t pmk[32],next[REKEY_SPAN],m1_replay[8];} rekey;
++static uint8_t*rekey_span(struct nwp*w){return (uint8_t*)w+offsetof(struct nwp,pmk);}
++static void rekey_swap(struct nwp*w){uint8_t t[REKEY_SPAN],*live=rekey_span(w);memcpy(t,live,sizeof t);memcpy(live,rekey.next,sizeof t);memcpy(rekey.next,t,sizeof t);wipe(t,sizeof t);}
++void nwp_rekey_pmk(const uint8_t pmk[32]){if(pmk){memcpy(rekey.pmk,pmk,32);rekey.have_pmk=1;}}
++int nwp_rekeying(const struct nwp*w){return w&&rekey.active==2&&w->installed;}
++void nwp_rekey_done(void){wipe(&rekey,sizeof rekey);}
+ /* 0450: AKM of this handshake and its EAPOL-Key descriptor version (2 HMAC-SHA1, 3 AES-128-CMAC). */
+ static unsigned akm_of(const struct nwp*w){return w->rsn[19];}
+ static unsigned version_of(const struct nwp*w){return akm_of(w)==N8X_AKM_8021X_SHA256?3u:2u;}
+@@ -80,7 +92,7 @@
+   at+=22;
+  }return 0;
+ }
+-void nwp_cancel(struct nwp*w){if(w)wipe(w,sizeof(*w));}
++void nwp_cancel(struct nwp*w){if(w)wipe(w,sizeof(*w));wipe(&rekey,sizeof rekey);}
+ static int fail(struct nwp*w,struct nwp_result*r){nwp_cancel(w);if(r){wipe(r,sizeof(*r));r->failure=NWP_F_INTERNAL;}return NWP_FAIL;}
+ static int failed(struct nwp*w,struct nwp_result*r,unsigned why){int v=fail(w,r);if(r)r->failure=why;return v;}
+ int nwp_pmk(const uint8_t*p,size_t pn,const uint8_t*s,size_t sn,uint8_t out[32]){
+@@ -194,6 +206,29 @@
+  if(success!=1)return fail(w,r);w->pending=0;w->group_ticket=0;w->group_phase=2;
+  return reply(w,w->group,4,r);
+ }
++static int kde(struct nwp*,const uint8_t*,unsigned,const uint8_t*);
++static int rekey_receive(struct nwp*w,const uint8_t*p,unsigned n,unsigned info,struct nwp_result*r){
++ if(w->pending||w->group_phase)return NWP_BUSY;
++ if(!(info&0x0100u)){ /* message 1: answer with a candidate PTK, change nothing */
++  if(!nonzero(p+17,32)||m1_data(p+99,be16(p+97))||memcmp(p+9,w->rx_replay,8)<=0)return NWP_DROP;
++  memcpy(rekey.next,rekey_span(w),REKEY_SPAN);if(rekey.have_pmk)memcpy(rekey.next,rekey.pmk,32);
++  /* SNonce = HMAC-SHA256(KCK, ANonce || SPA): unique per ANonce, unpredictable without the KCK, the same for a retried message 1 */
++  const uint8_t*parts[2]={p+17,w->own};size_t sizes[2]={32,6};(void)n8x_hmac_sha256(w->kck,16,parts,sizes,2,rekey.next+44);
++  memcpy(rekey.next+76,p+17,32);memcpy(rekey.m1_replay,p+9,8);
++  rekey_swap(w);derive_keys(w);int v=reply(w,p,1,r);rekey_swap(w);
++  rekey.active=1;return v;
++ }
++ if(memcmp(p+9,rekey.m1_replay,8)<=0)return NWP_DROP;
++ /* message 3: must verify under the candidate keys and repeat the installed GTK */
++ uint8_t sig[16],plain[NWP_FRAME],gtk[16],rsc[8];unsigned index=w->gtk_index,z=be16(p+97);
++ rekey_swap(w);mic(w,p,n,sig);memcpy(gtk,w->gtk,16);memcpy(rsc,w->rsc,8);
++ int ok=equal(sig,p+81,16)&&equal(p+17,w->anonce,32)&&!aes_unwrap(w->kek,p+99,z,plain)&&!kde(w,plain,z-8,p+65)&&equal(gtk,w->gtk,16)&&index==w->gtk_index;
++ memcpy(w->gtk,gtk,16);memcpy(w->rsc,rsc,8);w->gtk_index=index;wipe(plain,sizeof plain);wipe(gtk,sizeof gtk);
++ if(!ok){rekey_swap(w);return NWP_DROP;}
++ wipe(&rekey,sizeof rekey);rekey.active=2;
++ memcpy(w->rx_replay,p+9,8);memcpy(w->m3,p,n);w->m3_bytes=n;w->group_bytes=0;w->installed=0;w->ready_mask=0;w->install_ticket=0;w->state=NWP_M4_TX;
++ return reply(w,p,2,r);
++}
+ int nwp_receive(struct nwp*w,const uint8_t*p,size_t n,struct nwp_result*r){
+  if(!r)return NWP_FAIL;
+  memset(r,0,sizeof(*r));
+@@ -202,6 +237,7 @@
+  if(!p||n<99||n>NWP_FRAME||p[0]<1||p[0]>2||p[1]!=3||be16(p+2)!=n-4||p[4]!=2||be16(p+97)!=n-99)return failed(w,r,3);
+  unsigned info=be16(p+5),version=version_of(w);
+  if(info==(0x1380u|version))return group_receive(w,p,(unsigned)n,r);
++ if(w->state==NWP_AUTHORIZED&&(niwj_8021x&2u)&&be16(p+7)==16&&(info==(0x0088u|version)||(info==(0x13c8u|version)&&rekey.active==1)))return rekey_receive(w,p,(unsigned)n,info,r); /* 0452 */
+  if(be16(p+7)!=16)return failed(w,r,4);
+  if(w->group_bytes)return failed(w,r,NWP_F_KEYINFO_STATE);
+  if(info==(0x0088u|version)){
+--- a/bsd/dev/wifi_ios_join.c
++++ b/bsd/dev/wifi_ios_join.c
+@@ -22,7 +22,7 @@
+ /* 0430: relaxed IOUC join decoder. Still WPA2-PSK/CCMP or OPEN only: SAE-only,
+  * 802.1X, WEP, WPA1/TKIP and a station RSN that demands MFP stay refused. */
+ unsigned niwj_privmac_mode=1;
+-unsigned niwj_8021x=1,niwj_ap_mfpr;
++unsigned niwj_8021x=0x11,niwj_ap_mfpr;
+ int printf(const char*,...) __attribute__((format(printf,1,2)));
+ unsigned niwj_sae_mode=1,niwj_pmf_flags=0,niwj_select_allow=0;
+ #if defined(KERNEL)
+@@ -121,7 +121,7 @@
+  *klass=open?1:shape_sae?6:(upper&0x400u)?7:(upper&8u)?2:(upper&0xc885u)?4:5;*ignored=0;*akms_out=(akms&0xffffu)|caps<<16;*allow_out=0;
+  if(j32(p)!=1||!j32(p+12)||j32(p+12)>32||(nz(p+48,6)&&(p[48]&1)))return NIWJ_SHAPE;
+  /* 0450: WPA2 (4) and/or SHA-256 802.1X (0x80), optionally with the WPA1 bit: no key in the request. */
+- unsigned eap=niwj_8021x&&!(upper&8u)&&(upper&0x84u)&&!(upper&~0x85u);
++ unsigned eap=(niwj_8021x&1u)&&!(upper&8u)&&(upper&0x84u)&&!(upper&~0x85u);
+  if(j16(p+4)!=2||j16(p+6)!=1||(!open&&!personal&&!eap))return NIWJ_PROFILE;
+  if(eap){
+   if(j32(p+60)||j16(p+68)||j16(p+70))return NIWJ_CREDENTIAL;
+@@ -296,7 +296,7 @@
+   for(unsigned j=0;j<i;j++)if(info->channels[j].band==info->channels[i].band&&info->channels[j].channel==info->channels[i].channel)return NIWJ_TARGET;}
+  /* 0450: a WPA2 request whose PMK is the 802.1X marker wants an AP with that AKM instead of PSK. */
+  unsigned eap=q->security==NIWJ_WPA2_PSK_CCMP?n8x_marker_akm(q->pmk):0;
+- if(eap&&!niwj_8021x)return NIWJ_TARGET;
++ if(eap&&!(niwj_8021x&1u))return NIWJ_TARGET;
+  wanted_akm=eap?eap:N8X_AKM_PSK;niwj_ap_mfpr=0;
+  /* 0434: families the waiting secret record of this SSID allows (a password is needed for SAE). */
+  unsigned allow=NIWJ_ALLOW_LEGACY;
+--- a/bsd/dev/wifi_ios_join.h
++++ b/bsd/dev/wifi_ios_join.h
+@@ -52,7 +52,9 @@
+  * recorded by a successful decode, taken once by the native enqueue for the
+  * same SSID, cleared by any decode. */
+ extern unsigned niwj_privmac_mode;
+-/* 0450, kern.n2wifi_8021x (default 1): 0 refuses 802.1X
++/* 0450/0452, kern.n2wifi_8021x, bits (default 0x11): 1 802.1X joins, 2 PTK rekey
++ * and EAP re-authentication on the link (0452, off: the link drops and rejoins),
++ * 0x10 "4-way handshake complete" message for eapolclient (0453). Bit 1 clear refuses 802.1X
+  * profiles as before (NIWJ_PROFILE). 1 decodes auth_upper WPA2 (4) / SHA-256
+  * 802.1X (0x80) without a key into a request that the unchanged native binder
+  * and IOUC client accept: security NIWJ_WPA2_PSK_CCMP, the WPA2-PSK station

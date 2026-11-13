@@ -1,0 +1,186 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -32,6 +32,14 @@
+ #include <sys/sysctl.h>        /* 0400: kern.n2gpu_lat */
+ #include <kern/thread_call.h>   /* 0400: buffer owners released off the GPU lock */
+ extern "C" kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);   /* 0400: osfmk/kern/thread.c (MACH_KERNEL_PRIVATE header) */
++/* 0441 (gfxheap-20261113): the 0440 graphics heap (SweetSurface.cpp, sweet_gfx_heap_kern.inc): GPU-only buffers >= 64 KiB (ALLOC flags == 2) out of
++ * the low-bank heap instead of XNU pages, and imports of heap surfaces.  Heap buffers are left out of the global private total (privateTotal, so out of
++ * the 0417/0418 GPU budget too); the per-context limits still count them.  kern.n2heap_gpu = 0 (or kern.n2heap = 0) turns the placement off. */
++extern "C" uint64_t sweet_heap_gpu_take(uint64_t bytes, uintptr_t *kva);
++extern "C" void sweet_heap_gpu_give(uint64_t pa, uint64_t bytes);
++extern "C" bool sweet_heap_gpu_page_ok(uint64_t pa);
++static uint64_t gHeapBytes;             /* 0441: bytes of live (adopted) heap buffers */
++static uint32_t gHeapBos, gHeapFallback, gHeapImports;
+ extern "C" {
+ extern unsigned long gPhysBase, gPhysSize;
+ extern int PE_parse_boot_argn(const char *, void *, int);
+@@ -143,7 +151,13 @@
+         SweetSurface *surface;
+         bool prepared;      /* 0137: pageable write-combine memory, wired by prepare(), unwired by complete() */
+         BufferOwner *next;  /* 0400: deferred-release list */
++        uint64_t heapPa, heapLen;       /* 0441: graphics-heap range (md NULL), given back when the owner goes */
++        bool heapCounted;               /* 0441: in gHeapBytes (set once the core adopted the buffer) */
+ };
++/* 0441: leave gHeapBytes when the core tears the buffer down (with x->wired), not when the deferred release runs */
++static void heap_uncount(BufferOwner *o) {
++        if (o && o->heapCounted) { o->heapCounted = false; __atomic_fetch_sub(&gHeapBytes, o->heapLen, __ATOMIC_RELAXED); __atomic_fetch_sub(&gHeapBos, 1u, __ATOMIC_RELAXED); }
++}
+ /* 0112: the display surface behind an imported buffer (NULL for any other buffer); only compared, never dereferenced, by the core. */
+ static const void *resv_token(void *, void *cookie) { return cookie ? (const void *)((BufferOwner *)cookie)->surface : NULL; }
+ static void free_owner(void *, void *cookie) {
+@@ -153,6 +167,8 @@
+         if (o->surface) OSDecrementAtomic((volatile SInt32 *)&o->surface->gpuImports);    /* 0398: pool leak attribution */
+         OSSafeReleaseNULL(o->md);
+         OSSafeReleaseNULL(o->surface);
++        heap_uncount(o);
++        if (o->heapPa) sweet_heap_gpu_give(o->heapPa, o->heapLen);     /* 0441: the GPU pages were unmapped and flushed before the owner goes */
+         IOFree(o, sizeof(*o));
+ }
+ /* 0400 (gpulat-20261112): GPU job latency.  kern.n2gpu_lat (boot-arg n2lat) = bit mask of the OLD behaviours, 0 = every 0400 change on:
+@@ -180,6 +196,7 @@
+ static void free_owner_deferred(void *ctx, void *cookie) {
+         BufferOwner *o = (BufferOwner *)cookie;
+         if (!o) return;
++        heap_uncount(o);        /* 0441 */
+         if (!gOwnerCall || (gLatMode & 8)) { free_owner(ctx, o); return; }
+         BufferOwner *h = __atomic_load_n(&gOwnerList, __ATOMIC_ACQUIRE);
+         do { o->next = h; } while (!__atomic_compare_exchange_n(&gOwnerList, &h, o, true, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE));
+@@ -758,7 +775,8 @@
+         uint64_t total = 0;
+         for (unsigned i = 0; i < N2C_MAX_CTX; i++)
+                 if (core->ctxs[i].state != N2C_CTX_FREE) total += core->ctxs[i].wired - core->ctxs[i].imported;
+-        return total;
++        uint64_t heap = __atomic_load_n(&gHeapBytes, __ATOMIC_RELAXED);      /* 0441: heap buffers are not XNU memory */
++        return total > heap ? total - heap : 0;
+ }
+ /* Rate-limited (1/s) diagnostic for budget rejections; counts what it skipped. */
+ /* ---- optional GPU job interrupt (boot-arg nord2_gpu_irq=1) -------------------------------
+@@ -1179,7 +1197,8 @@
+         if (core) {   /* 0185: released-but-still-mapped buffers (held for older jobs), live buffers, handle table fill of the fullest context */
+                 unsigned held = 0, fullest = 0;
+                 for (unsigned i = 1; i < N2C_MAX_CTX; i++) { unsigned used = 0; for (unsigned k = 0; k < N2C_MAX_BOS; k++) { struct n2c_bo *b = core->ctxs[i].bos[k]; if (b) { used++; if (!b->refs && b->state == N2C_BO_MAPPED) held++; } } if (used > fullest) fullest = used; }
+-                IOLog("NORD2 MEM GPU: bos_live=%llu released_held=%u fullest_handle_table=%u/%u private=%llu MiB\n", (unsigned long long)core->stats.bos_live, held, fullest, (unsigned)N2C_MAX_BOS, (unsigned long long)(privateTotal() >> 20));
++                IOLog("NORD2 MEM GPU: bos_live=%llu released_held=%u fullest_handle_table=%u/%u private=%llu MiB heap=%u/%llu MiB fallback=%u imports=%u\n", (unsigned long long)core->stats.bos_live, held, fullest, (unsigned)N2C_MAX_BOS, (unsigned long long)(privateTotal() >> 20),
++                      gHeapBos, (unsigned long long)(gHeapBytes >> 20), gHeapFallback, gHeapImports);      /* 0441 */
+         }
+         clockCheck();
+         if (pfMode == 2 || pfFailed || !core) return;                       /* n2pf=2: memory statistics and clock only, the GPU counters stay off */
+@@ -1288,18 +1307,33 @@
+         if (!nord2_gpu_allocation_size_limit(bytes, core->ctxs[c].wired - core->ctxs[c].imported, privateLimit, &bytes)) {
+                 budgetReject("private", c, requested, privateLimit); return kIOReturnBadArgument;
+         }
+-        if (!nord2_gpu_global_private_ok(privateTotal(), bytes, globalLimit)) {
++        bool heapTry = dropLock && flags == 2u && bytes >= 0x10000ull;     /* 0441: a client's GPU-only buffer: the heap first (lock dropped), global check only on fallback */
++        if (!heapTry && !nord2_gpu_global_private_ok(privateTotal(), bytes, globalLimit)) {
+                 budgetReject("global-private", c, requested, globalLimit); return kIOReturnNoMemory;
+         }
+         /* 0143: building the memory (allocation, wiring, zero fill, page walk) is the expensive part, a few ms and up to 100 ms for a big buffer: it
+          * does not touch the core, so the global lock (job dispatch, completions) is released meanwhile when the caller is a client's ALLOC. */
+         uint64_t t0 = now_us(NULL), t1 = t0, t2 = t0, t3 = t0, t4 = t0;
+         if (dropLock) IOLockUnlock(lock);
++        uintptr_t heapKva = 0;
++        uint64_t heapPa = heapTry ? sweet_heap_gpu_take(bytes, &heapKva) : 0;
++        if (heapPa && !heapKva) { sweet_heap_gpu_give(heapPa, bytes); heapPa = 0; }
++        if (heapTry && !heapPa) {       /* 0441: heap off/full: normal memory, after the global check skipped above */
++                __atomic_fetch_add(&gHeapFallback, 1u, __ATOMIC_RELAXED);
++                IOLockLock(lock);
++                if (!ready || stopping || !core) return kIOReturnNotReady;
++                if (!nord2_gpu_global_private_ok(privateTotal(), bytes, globalLimit)) {
++                        budgetReject("global-private", c, requested, globalLimit); return kIOReturnNoMemory;
++                }
++                IOLockUnlock(lock);
++        }
+         static unsigned extLogs; bool ext = (flags & 6u) != 0; bool lg = ext && extLogs < 4; if (lg) extLogs++;
+         bool pageableWc = (flags & 4u) && (gAllocExt & 4u);
+         if (lg) { IOLog("NORD2 GPU EXT: flags=%u bytes=%llu pageable=%d stage=md-create\n", flags, bytes, (int)pageableWc); }
+         IOBufferMemoryDescriptor *md;
+-        if (pageableWc) {
++        if (heapPa) {
++                md = NULL;              /* 0441: heap range, zeroed by the heap; kernel view = the heap's write-combined mapping */
++        } else if (pageableWc) {
+                 /* Pageable memory has a VM object of its own, so its cache mode can be set without touching the kernel's shared object */
+                 md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryPageable | kIOMapWriteCombineCache, (vm_size_t)bytes, 16384);
+         } else {
+@@ -1307,11 +1341,12 @@
+         }
+         if (lg) { IOLog("NORD2 GPU EXT: flags=%u md=%p stage=md-created\n", flags, (void *)md); }
+         t1 = now_us(NULL);
+-        if (!md) { if (dropLock) IOLockLock(lock); return kIOReturnNoMemory; }
++        if (!md && !heapPa) { if (dropLock) IOLockLock(lock); return kIOReturnNoMemory; }
+         BufferOwner *owner = (BufferOwner *)IOMallocZero(sizeof(*owner));
+         unsigned count = (unsigned)(bytes / 4096);
+         n2c_page *pages = (n2c_page *)IOMallocZero(count * sizeof(*pages));
+-        if (!owner || !pages) { if (owner) IOFree(owner, sizeof(*owner)); if (pages) IOFree(pages, count*sizeof(*pages)); md->release(); if (dropLock) IOLockLock(lock); return kIOReturnNoMemory; }
++        if (!owner || !pages) { if (owner) IOFree(owner, sizeof(*owner)); if (pages) IOFree(pages, count*sizeof(*pages)); OSSafeReleaseNULL(md); if (heapPa) sweet_heap_gpu_give(heapPa, bytes); if (dropLock) IOLockLock(lock); return kIOReturnNoMemory; }
++        owner->heapPa = heapPa; owner->heapLen = heapPa ? bytes : 0;     /* 0441: from here on free_owner gives the range back */
+         if (pageableWc) {
+                 if (md->prepare(kIODirectionInOut) != kIOReturnSuccess) { IOFree(owner, sizeof(*owner)); IOFree(pages, count*sizeof(*pages)); md->release(); if (dropLock) IOLockLock(lock); return kIOReturnNoMemory; }
+                 owner->prepared = true;
+@@ -1349,7 +1384,7 @@
+                         static uint8_t zeros[65536];   /* 0141: 64 KiB per call, not 4 KiB */
+                         for (uint64_t off = 0; off < bytes; off += sizeof(zeros)) { uint64_t n = bytes - off < sizeof(zeros) ? bytes - off : sizeof(zeros); md->writeBytes(off, zeros, (IOByteCount)n); }
+                 }
+-        } else {
++        } else if (!heapPa) {
+                 if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=bzero\n", flags); }
+                 bzero(md->getBytesNoCopy(), (size_t)bytes);
+         }
+@@ -1357,6 +1392,11 @@
+         if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=zeroed\n", flags); }
+         bool valid = true;
+         for (unsigned i = 0; i < count; i++) {
++                if (heapPa) {           /* 0441: one contiguous heap range (the GPU MMU maps it page by page like any buffer) */
++                        pages[i].pa = heapPa + (uint64_t)i * 4096; pages[i].cpu = (uint8_t *)heapKva + (uint64_t)i * 4096;
++                        if (!sweet_heap_gpu_page_ok(pages[i].pa)) valid = false;
++                        continue;
++                }
+                 IOByteCount length; pages[i].pa = md->getPhysicalSegment((uint64_t)i * 4096, &length, kIOMemoryMapperNone);
+                 pages[i].cpu = pageableWc ? NULL : (uint8_t *)md->getBytesNoCopy() + (uint64_t)i * 4096;
+                 if (!valid_ram(pages[i].pa) || length < 4096) valid = false;
+@@ -1372,6 +1412,12 @@
+         owner->md = md; bool adopted = false;
+         enum n2c_error e = valid ? n2c_bo_map(core, c, pages, count, N2C_BO_GPU_READ | N2C_BO_GPU_WRITE |
+                 ((flags & 1) ? N2C_BO_GPU_EXEC : 0) | ((flags & 2) ? N2C_BO_GPU_ONLY : 0) | ((flags & 4u) ? N2C_BO_CPU_UNCACHED : 0), owner, bytes, h, va, &adopted) : N2C_E_ARGS;
++        if (adopted && heapPa) {        /* 0441: counted while the core holds it (heap_uncount at teardown) */
++                owner->heapCounted = true; __atomic_fetch_add(&gHeapBytes, bytes, __ATOMIC_RELAXED); __atomic_fetch_add(&gHeapBos, 1u, __ATOMIC_RELAXED);
++        }
++        if (heapPa) { static unsigned heapLogs; if (heapLogs < 8 || e != N2C_OK) { heapLogs++;
++                IOLog("NORD2 GPU HEAP: ctx=%u GPU-only buffer %llu KiB -> heap pa 0x%llx e=%d (heap buffers %u, %llu MiB; fallbacks %u)\n", c, bytes >> 10, heapPa, (int)e,
++                      gHeapBos, gHeapBytes >> 20, gHeapFallback); } }
+         IOFree(pages, count * sizeof(*pages)); if (!adopted) free_owner(this, owner);
+         if (lg) { IOLog("NORD2 GPU EXT: flags=%u stage=mapped e=%d\n", flags, (int)e); }
+         { static unsigned slowLogs; uint64_t t5 = now_us(NULL);
+@@ -1408,15 +1454,16 @@
+         if (!owner || !pages) { if (owner) IOFree(owner, sizeof(*owner)); if (pages) IOFree(pages,count*sizeof(*pages)); s->release(); return kIOReturnNoMemory; }
+         owner->surface = s; bool valid = true;
+         OSIncrementAtomic((volatile SInt32 *)&s->gpuImports);     /* 0398: given back in free_owner */
+-        unsigned inPool = 0, inRam = 0, nearPool = 0;    /* 0395: display-pool pages (sweet_fb_hw_pool) are normal DRAM below XNU's RAM */
++        unsigned inPool = 0, inRam = 0, nearPool = 0, inHeap = 0;    /* 0395: display-pool pages (sweet_fb_hw_pool) are normal DRAM below XNU's RAM */
+         for (unsigned i=0; i<count; i++) {
+                 IOByteCount length; pages[i].pa = s->memory->getPhysicalSegment((uint64_t)s->offset+offset+(uint64_t)i*4096, &length, kIOMemoryMapperNone);
+                 pages[i].cpu = (void *)(s->kernelAddress()+base+(uint64_t)i*4096);
+                 bool ram = valid_ram(pages[i].pa), pool = !ram && gFencePool && n2gf_pool_page(pages[i].pa);
+-                inRam += ram; inPool += pool; nearPool += !ram && pages[i].pa - N2GF_POOL_BASE < N2GF_POOL_SIZE;
+-                if (!(ram || pool) || length < 4096) valid = false;
++                bool heap = !ram && !pool && sweet_heap_gpu_page_ok(pages[i].pa);     /* 0441: 0440 heap surface (contiguous, write-combined CPU view) */
++                inRam += ram; inPool += pool; inHeap += heap; nearPool += !ram && pages[i].pa - N2GF_POOL_BASE < N2GF_POOL_SIZE;
++                if (!(ram || pool || heap) || length < 4096) valid = false;
+         }
+-        if (inPool && inRam) valid = false;              /* a pool surface is one physical range: never mixed with XNU pages */
++        if ((inPool || inHeap) && inRam) valid = false;  /* a pool/heap surface is one physical range: never mixed with XNU pages */
+         bool adopted = false;
+         enum n2c_error e = valid ? n2c_bo_map(core,c,pages,count,N2C_BO_GPU_READ|N2C_BO_GPU_WRITE|N2C_BO_IMPORTED,
+                                              owner,charged,h,va,&adopted) : N2C_E_ARGS;
+@@ -1427,6 +1474,11 @@
+                         IOLog("NORD2 GPU FENCE: pool import ctx=%u sid=%u pa=0x%llx pages=%u pool=%u ram=%u e=%d%s\n", c, id, pages[0].pa, count, inPool, inRam, (int)e,
+                               gFencePool ? "" : " (n2gpool=0)"); }
+         }
++        if (inHeap) {   /* 0441 */
++                static unsigned heapImportLogs; if (e == N2C_OK) __atomic_fetch_add(&gHeapImports, 1u, __ATOMIC_RELAXED);
++                if (heapImportLogs < 8 || e != N2C_OK) { heapImportLogs++;
++                        IOLog("NORD2 GPU HEAP: import ctx=%u sid=%u pa=0x%llx pages=%u heap=%u e=%d (heap imports %u)\n", c, id, pages[0].pa, count, inHeap, (int)e, gHeapImports); }
++        }
+         IOFree(pages,count*sizeof(*pages)); if (!adopted) free_owner(this,owner);
+         /* Level 2: the surface's CPU access is bracketed by IOSurfaceLock/Unlock (see surfaceHook). */
+         if (e==N2C_OK && core->track_level>=N2C_TRACK_EXPLICIT) (void)n2c_bo_track(core,c,*h);
