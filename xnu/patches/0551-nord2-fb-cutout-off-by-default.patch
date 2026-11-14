@@ -1,0 +1,116 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -934,10 +934,10 @@
+ #pragma unused(oidp, arg1, arg2)
+ 	char buf[256];
+ 	struct sweet_fb_cut_cfg c = sweet_fb_cut_g;
+-	snprintf(buf, sizeof(buf), "on=%u band=%d ear=%d dx=%d trail=%d tdx=%d live=%u ok=%llu off=%llu config=%llu cover=%llu yuv=%llu slots=%llu",
++	snprintf(buf, sizeof(buf), "on=%u band=%d ear=%d dx=%d trail=%d tdx=%d live=%u ok=%llu off=%llu config=%llu cover=%llu yuv=%llu slots=%llu layers=%llu",
+ 	    c.on, c.band, c.lead_end, c.lead_dx, c.trail_start, c.trail_dx, __atomic_load_n(&sweet_fb_cut_live, __ATOMIC_RELAXED),
+ 	    sweet_fb_cut_n[SWEET_FB_CUT_OK], sweet_fb_cut_n[SWEET_FB_CUT_OFF], sweet_fb_cut_n[SWEET_FB_CUT_CFG], sweet_fb_cut_n[SWEET_FB_CUT_COVER],
+-	    sweet_fb_cut_n[SWEET_FB_CUT_YUV], sweet_fb_cut_n[SWEET_FB_CUT_SLOTS]);
++	    sweet_fb_cut_n[SWEET_FB_CUT_YUV], sweet_fb_cut_n[SWEET_FB_CUT_SLOTS], sweet_fb_cut_n[SWEET_FB_CUT_LAYERS]);
+ 	return sysctl_io_string(req, buf, sizeof(buf), 0, NULL);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, n2cut, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sweet_fb_cut_sysctl, "I", "0550 punch-hole band rotation 0/1");
+@@ -2237,11 +2237,12 @@
+ 	if (PE_parse_boot_argn("n2fbhwpm", &v, sizeof(v)) && v <= 3) { __atomic_store_n(&sweet_fb_hw_pm, v, __ATOMIC_RELAXED); }
+ 	v = 0;
+ 	if (PE_parse_boot_argn("n2fbhwcsw", &v, sizeof(v)) && v <= 3) { __atomic_store_n(&sweet_fb_hw_csw, v, __ATOMIC_RELAXED); }
+-	{   /* 0550: kill switch n2cut=0, or n2gdv +512 (the boot line has 4 characters left: n2gdv=521 fits) */
+-		uint32_t cut = 1, gdv = 0;
+-		if (!PE_parse_boot_argn("n2cut", &cut, sizeof(cut)) && PE_parse_boot_argn("n2gdv", &gdv, sizeof(gdv)) && (gdv & 512u) != 0) { cut = 0; }
++	{   /* 0550/0551: the band rotation is OFF by default since 0551 (the status bar is moved by iOS itself: guest payload sbshift1);
++		 * n2cut=1, or n2gdv +512 (the boot line has 4 characters left: n2gdv=521 fits), turns it on (fallback without sbshift1) */
++		uint32_t cut = 0, gdv = 0;
++		if (!PE_parse_boot_argn("n2cut", &cut, sizeof(cut)) && PE_parse_boot_argn("n2gdv", &gdv, sizeof(gdv)) && (gdv & 512u) != 0) { cut = 1; }
+ 		sweet_fb_cut_g.on = cut != 0 ? 1u : 0u;
+-		IOLog("NORD2 FB CUT: punch-hole band rotation %s: band %d ear %d dx %d trail %d tdx %d (kill switch n2cut=0 / n2gdv +512 / kern.n2cut=0)\n",
++		IOLog("NORD2 FB CUT: punch-hole band rotation %s: band %d ear %d dx %d trail %d tdx %d (0551: off by default; on with n2cut=1 / n2gdv +512 / kern.n2cut=1; single full-screen layer frames only)\n",
+ 		    sweet_fb_cut_g.on ? "on" : "OFF", sweet_fb_cut_g.band, sweet_fb_cut_g.lead_end, sweet_fb_cut_g.lead_dx, sweet_fb_cut_g.trail_start,
+ 		    sweet_fb_cut_g.trail_dx);
+ 	}
+--- a/iokit/Kernel/arm/sweet_fb_cutout.h
++++ b/iokit/Kernel/arm/sweet_fb_cutout.h
+@@ -29,6 +29,18 @@
+  * the composite of the band is reproduced exactly, only moved).  Needs layer 0 to cover the band and free slots, else the frame is
+  * shown unrotated (counted).  Touch is inverse-mapped with the same rotation while the shown frame is rotated.
+  */
++/*
++ * 0551 (sbshift-20261114): OFF BY DEFAULT.  On the phone (q10jcp, user photos IMG_20261114_003513/003547) the rotation moved the clock
++ * only to panel x ~125 (the hole is wider/further right than the Android-tree estimate: centre ~(104,72), radius ~35, right edge
++ * ~139 +-5 px), and, being a rotation of the composed picture, it also moves the APP content under the translucent status bar: in
++ * Photos / scrolling / app-launch zooms the band shows displaced rectangles with seams at x = 72, 299, 830 and 1056 (inherent, not
++ * a planner bug: 91% of the frames are a single 1:1 full-screen backboardd layer, which the pieces read correctly).  The status bar
++ * is now moved by iOS itself (guest payload sbshift1: UIKitCore Split1125 leading/trailing centring patched), so nothing in the
++ * picture is moved.  This code stays as a fallback (n2cut=1 / n2gdv +512 / kern.n2cut=1) with the measured geometry (dx 110 ->
++ * clock ~164..293, tdx 32) and is restricted to frames whose ONLY layer is an opaque 1:1 full-panel BGRA layer (any other frame,
++ * e.g. the Photos grid + UI two-layer frames, during which pipe 1's upper band rows showed garbled content on the phone -- cause not
++ * identified, 6 slots per pipe were in use -- is shown unrotated, reason "layers"); touch follows the frame on the panel as before.
++ */
+ #include <stdint.h>
+ #include <stdbool.h>
+ 
+@@ -50,15 +62,17 @@
+ #define SWEET_FB_CUT_OFFY           18      /* (2436 - 2400) / 2 */
+ 
+ /* hole estimate in panel pixels (documentation + host test; not used by the plan) */
+-#define SWEET_FB_CUT_HOLE_CX        77
+-#define SWEET_FB_CUT_HOLE_CY        56
+-#define SWEET_FB_CUT_HOLE_R         33
+-#define SWEET_FB_CUT_HOLE_TOL       12
+-/* estimated clock box in panel pixels (24 h "12:34"; Split1125 centring above, 15-17 pt semibold digits) */
+-#define SWEET_FB_CUT_CLOCK_X0       58
+-#define SWEET_FB_CUT_CLOCK_X1       178
+-#define SWEET_FB_CUT_CLOCK_Y0       17
+-#define SWEET_FB_CUT_CLOCK_Y1       50
++/* 0551: measured on the user's two photos (seams of the 0550 pieces at x 72 / 299 and the band edge y 114 as scale references):
++ * centre (102..107, 71..73), radius 33..36 incl. the dark rim -> (104, 72) r 35 +-5 */
++#define SWEET_FB_CUT_HOLE_CX        104
++#define SWEET_FB_CUT_HOLE_CY        72
++#define SWEET_FB_CUT_HOLE_R         35
++#define SWEET_FB_CUT_HOLE_TOL       5
++/* clock box in panel pixels, unrotated (24 h "00:35", measured: first digit at ~125 with dx 72, 128 px wide, rows ~35..68) */
++#define SWEET_FB_CUT_CLOCK_X0       54
++#define SWEET_FB_CUT_CLOCK_X1       183
++#define SWEET_FB_CUT_CLOCK_Y0       35
++#define SWEET_FB_CUT_CLOCK_Y1       68
+ 
+ struct sweet_fb_cut_cfg {
+ 	uint32_t on;            /* 0 off (as before 0550), 1 rotate */
+@@ -68,8 +82,8 @@
+ 	int32_t trail_start;    /* panel x where the right ear starts */
+ 	int32_t trail_dx;       /* right ear shift to the left (0 = off; default 24) */
+ };
+-#define SWEET_FB_CUT_DEFAULTS { 1u, SWEET_FB_CUT_IOS_BAND - SWEET_FB_CUT_OFFY, SWEET_FB_CUT_IOS_EAR - SWEET_FB_CUT_OFFX, 72, \
+-	                        SWEET_FB_CUT_IOS_TRAIL - SWEET_FB_CUT_OFFX, 24 }
++#define SWEET_FB_CUT_DEFAULTS { 0u, SWEET_FB_CUT_IOS_BAND - SWEET_FB_CUT_OFFY, SWEET_FB_CUT_IOS_EAR - SWEET_FB_CUT_OFFX, 110, \
++	                        SWEET_FB_CUT_IOS_TRAIL - SWEET_FB_CUT_OFFX, 32 }      /* 0551: off, dx 110, tdx 32 */
+ 
+ /* one rotation to the right by r inside [a, b) of the band: src [a, b-r) -> dst a+r ; src [b-r, b) -> dst a */
+ struct sweet_fb_cut_rot { int32_t a, b, r; };
+@@ -128,11 +142,12 @@
+ }
+ 
+ /* the plan part needs sweet_fb_hw.h first (SweetFramebuffer.cpp); hid/SweetHID.cpp only uses the touch part above */
+-enum { SWEET_FB_CUT_OK = 0, SWEET_FB_CUT_OFF, SWEET_FB_CUT_CFG, SWEET_FB_CUT_COVER, SWEET_FB_CUT_YUV, SWEET_FB_CUT_SLOTS, SWEET_FB_CUT_NREASON };
++enum { SWEET_FB_CUT_OK = 0, SWEET_FB_CUT_OFF, SWEET_FB_CUT_CFG, SWEET_FB_CUT_COVER, SWEET_FB_CUT_YUV, SWEET_FB_CUT_SLOTS, SWEET_FB_CUT_LAYERS,
++       SWEET_FB_CUT_NREASON };
+ static inline const char *
+ sweet_fb_cut_why_name(int w)
+ {
+-	static const char *const nm[SWEET_FB_CUT_NREASON] = { "ok", "off", "config", "cover", "yuv", "slots" };
++	static const char *const nm[SWEET_FB_CUT_NREASON] = { "ok", "off", "config", "cover", "yuv", "slots", "layers" };
+ 	return (w >= 0 && w < SWEET_FB_CUT_NREASON) ? nm[w] : "?";
+ }
+ 
+@@ -151,6 +166,9 @@
+ 	if (c->on == 0u) { return SWEET_FB_CUT_OFF; }
+ 	if (!sweet_fb_cut_rots(c, fw, rt, &nr)) { return SWEET_FB_CUT_CFG; }
+ 	if (nr == 0u || n == 0u) { return SWEET_FB_CUT_OFF; }
++	/* 0551: only a frame whose single layer is an opaque, 1:1, full-panel BGRA layer (the usual backboardd frame) */
++	if (n != 1u || in[0].format_ok != 1u || (in[0].alpha != 0u && in[0].alpha < 255u) || in[0].dx != 0 || in[0].dy != 0 ||
++	    SWEET_CUT_U32(in[0].w) != fw || in[0].h < c->band) { return SWEET_FB_CUT_LAYERS; }
+ 	cap &= 0xffu;
+ 	if (cap > SWEET_FB_HW_NSLOT) { cap = SWEET_FB_HW_NSLOT; }
+ 	int32_t pw = SWEET_CUT_I32(fw / SWEET_FB_HW_PIPES), band = c->band;

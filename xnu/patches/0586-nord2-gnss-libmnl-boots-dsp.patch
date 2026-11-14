@@ -1,0 +1,81 @@
+--- a/bsd/dev/nord2_gpsdl.inc
++++ b/bsd/dev/nord2_gpsdl.inc
+@@ -322,7 +322,7 @@
+ 	{ N2G_CFG_GALS_CONN2GPS, 1u << 4, 1u << 7 }, { N2G_CFG_GALS_CONN2GPS, 1u << 0, 1u << 3 },
+ 	{ N2G_CFG_GALS_GPS2CONN, 1u << 4, 1u << 7 }, { N2G_CFG_GALS_GPS2CONN, 1u << 0, 1u << 3 },
+ };
+-static const char *const n2gl_name[32] = { "", "GPS wake vote", "read conn_infra cfg page", "read conn_infra RGU page",
++static const char *const n2gl_name[33] = { "", "GPS wake vote", "read conn_infra cfg page", "read conn_infra RGU page",
+ 	"read WB_STA + GPS CSRs", "GPS EMI remap", "BGFSYS_ON_TOP power", "GP_FUNCTION_EN + BGF acks", "GALS sleep protection off",
+ 	"gps_top_off ACTIVE check", "A-die top clock", "read GPS bus (first)", "GPS CLKGEN1 DIGCK", "L1 DSP pwr_stat ON",
+ 	"read GPS RGU_ON page", "L1 power on + soft reset release", "USRT on + DSP ROM okay", "data link up (rings, DMA idle check)", "send libmnl frame 1 (A2D DMA)", "capture the DSP reply (D2A DMA)",
+@@ -331,7 +331,8 @@
+ 	"S10a RX DMA2 armed small (16 words) 3 s, no TX, disarm", "S10b RX DMA2 armed small + TX boot header, 1 s, disarm",
+ 	"S10c TX boot header, NO RX DMA (reply stays in the USRT FIFO), INTEN off", "S10d as S10c with USRT INTEN on (vendor)",
+ 	"S10e RX DMA2 armed small, GPS wake vote RELEASED 3 s idle, vote back, disarm",
+-	"S11 DSP code download (uploaded libmnl frames), post-boot command, rollback", "S11 DSP code download + HOLD (vote held, INTEN off, RX 256 B per arming)" };
++	"S11 DSP code download (uploaded libmnl frames), post-boot command, rollback", "S11 DSP code download + HOLD (vote held, INTEN off, RX 256 B per arming)",
++	"S12 HOLD with the DSP in ROM (NO kernel download): libmnl boots the DSP itself over the pipe, vendor flow (0586)" };
+ /* 0357: GPS RGU_ON (bus 0x80000000 -> AP 0x18c00000) and CFG_ON (0x80001000 -> 0x18c01000), plat/v010 gps_rgu_on.h / gps_cfg_on.h */
+ #define N2G_GPS_RGU_L1_CR          0x18c00014u   /* [0] RGU_GPS_L1_ON [5] RGU_GPS_L1_SOFT_RST_B */
+ #define N2G_GPS_RGU_L1_DLY_CHAIN   0x18c00160u   /* [19:16] MEM_PDN_DELAY_DUMMY_NUM (vendor 5) */
+@@ -1300,7 +1301,7 @@
+ 	    k, n2gl_name[k], g[0], g[3], g[4], g[5], g[6], g[7] >> 16, g[7] & 0xffff, g[8] >> 16, g[8] & 0xffff, ok ? "guard ok" : "GUARD REFUSES");
+ 	if (!ok) { return 0x01000000u; }
+ 	if (n2gd_hw(&n2gl_hw)) { return 0x0300u; }
+-	if ((k == 22 || k == 24 || k == 31) && n2gd.powered) { printf("NORD2 GNSS LAD %d: already held\n", k); return 1; }
++	if ((k == 22 || k == 24 || k == 31 || k == 32) && n2gd.powered) { printf("NORD2 GNSS LAD %d: already held\n", k); return 1; }
+ 	n2gl_tx_started = n2gl_rx_started = false;
+ 	n2gl_v9 = k >= 23; n2gl_rx_armed = false;                /* 0362 */
+ 	int last = k <= 19 ? k : (k == 21 ? 15 : (k == 22 || k >= 23) ? 17 : 16), rc = 0, s;
+@@ -1329,7 +1330,41 @@
+ 		printf("NORD2 GNSS LAD 24: V9 HOLD, GNSS powered, RX DMA2 armed, /dev/gpsdl0 read/write enabled (conn_infra %#x), NOT rolled back until reboot\n", n2gd.conn_hw_ver);
+ 		return 1;
+ 	}
+-	if (!rc && k >= 30) {
++	if (!rc && k == 32) {
++		/*
++		 * 0586 (gnss-20261114): K = 32 = steps 1..17 (DSP ROM okay, data link up) + the S11 data-link prep WITHOUT the kernel DSP code
++		 * download, then the same HOLD as K = 31 (GPS wake vote held, INTEN off, RX 256 B per arming). libmnl then runs its own
++		 * _BootDSP_UART_V2 over /dev/gpsdl0 (header, 50 fragments, post-boot 0xFE05) exactly as on Android, where the kernel never
++		 * boots the DSP. Reason (gnss6a/6b, 0583 traces hang3/hang4, V): with the kernel boot (K = 31) libmnl's own post-boot 0xFE05
++		 * reached a DSP that was ALREADY running the RAM code (the kernel had sent the same 0xFE05 ~0.6 s before); the TX DMA
++		 * completed (INTSTA 0x8000, STATE 1), two normal RX rounds followed and the phone died ~10 ms later with no AP access pending.
++		 * I: a second execute/jump command restarts the running DSP code and it then misbehaves on the bus. Without the kernel boot
++		 * the DSP receives each boot frame exactly once, from libmnl, whose state machine sees the genuine 0xFE31/0xFE32 acks and the
++		 * DSP's real post-boot answer (gnssd5..7 had to fake them, and libmnl stayed idle).
++		 */
++		printf("NORD2 GNSS LAD 32: about to run NEW S12 phase (%s)\n", n2gl_name[32]); delay(2000000);
++		n2gl_rx_cap = 256; n2gl_rx_norearm = false; n2gl_rx_armed = false; n2gl_rx_total = 0; n2gl_lines = 0;
++		n2gl_show("USRT INTEN", N2G_USRT_INTEN(0)); n2gl_show("USRT STA", N2G_USRT_STA(0)); n2gl_show("USRT D2AF", N2G_USRT_D2AF(0));
++		n2gl_mcub_ack(true);
++		n2gl_o.emictl = n2gl_rd(N2G_CFG_EMI_CTL); done[25] = true;
++		if (!n2gl_field(N2G_CFG_EMI_CTL, 1u, 1u)) { rc = N2G_E_ARG; failed = 32; }
++		if (!rc && !n2gl_stop) {
++			for (uint32_t i = 0; i < N2GL_RING; i++) { n2gl_ring_va[N2GL_RING + i] = N2GL_FILL; }
++			__builtin_arm_dsb(0xf);
++			n2gl_rx.rd = n2gl_rx.wr = 0;
++			n2gd.powered = true; n2gd.hw_valid = true; n2gd.last_err = 0;
++			n2gd.conn_hw_ver = n2gl_rd(N2G_CONN_HW_VER);
++			n2gl_v9hold = true; n2gd_dl_up = true;
++			printf("NORD2 GNSS LAD 32: S12 HOLD, DSP in ROM (no kernel download), GPS wake vote held, /dev/gpsdl0 read/write enabled for libmnl's own DSP boot, NOT rolled back until reboot\n");
++			n2gq_hb("HOLD start (0586 S12: libmnl boots the DSP)");
++			n2gt("S12 HOLD: DSP in ROM, libmnl boots it (0586)");
++			n2gt("LNA: GPIO162 -> mode 2 (0585)");
++			n2gd_lna_l1_dsp_ctrl();
++			return 1;
++		}
++		if (n2gl_stop) { return 0x01000000u | ((uint32_t)k << 8); }
++	}
++	if (!rc && k >= 30 && k <= 31) {
+ 		printf("NORD2 GNSS LAD %d: about to run NEW S11 phase (%s)\n", k, n2gl_name[k]); delay(2000000);
+ 		rc = n2gb_boot(done);
+ 		if (n2gl_stop) { return 0x01000000u | ((uint32_t)k << 8); }
+@@ -1515,6 +1550,7 @@
+ 	case (uint32_t)N2GD_IOC(169):
+ 	case (uint32_t)N2GD_IOC(170):                            /* 0364: S11 boot (K=30) / boot + HOLD (K=31) */
+ 	case (uint32_t)N2GD_IOC(171):
++	case (uint32_t)N2GD_IOC(172):                            /* 0586: S12 HOLD without the kernel DSP boot */
+ 		if (n2gd_ctl & 1) { printf("NORD2 GNSS: ladder refused (sysctl kern.n2gnss bit 0)\n"); return ENODEV; }
+ 		lck_mtx_lock(&n2gd_lock);
+ 		v = n2gd_ladder((int)((uint32_t)cmd & 0xff) - 140);

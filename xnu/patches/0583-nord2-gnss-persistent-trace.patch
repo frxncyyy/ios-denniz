@@ -1,0 +1,146 @@
+--- a/bsd/dev/nord2_gpsdl.inc
++++ b/bsd/dev/nord2_gpsdl.inc
+@@ -39,6 +39,7 @@
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
+ #include <pexpert/pexpert.h>
++#include <stdarg.h>
+ #endif
+ 
+ #define N2GD_LINKS        2                                  /* gpsdl0 = L1, gpsdl1 = L5 */
+@@ -66,6 +67,58 @@
+ SYSCTL_INT(_kern, OID_AUTO, n2gnss, CTLFLAG_RW | CTLFLAG_LOCKED, &n2gd_ctl, 0, "Nord2 GNSS: bit0 off, bit1 pipe gate observe-only");
+ #endif
+ static lck_grp_t *n2gd_grp;
++/*
++ * 0583 (gnss-20261114): GNSS register trace that SURVIVES a hard hang. Every GNSS register access (n2gd_rd/n2gd_wr), the Wi-Fi
++ * guard, every ioctl/read/write entry and the pipe events are written, BEFORE the access, as short text lines into the Linux
++ * ramoops CONSOLE zone that the stock LK preserves across a WDT/warm reset: phys 0x48090000 + 0x8F000 = 0x4811F000, 0x40000 bytes
++ * (live.dts mblock-16-pstore + LK bootargs ramoops.mem_address=0x48090000 mem_size=0xe0000 console_size=0x40000 pmsg_size=0x10000,
++ * fs/pstore/ram.c defaults record_size = ftrace_size = 4096 -> dump zones 0x8F000 first, then the console zone). Format = struct
++ * persistent_ram_buffer {u32 sig 0x43474244 'DBGC'; u32 start; u32 size; data[]} circular (ram_core.c, ecc 0), so after the hang the
++ * rescue (stock Android kernel + DT) shows the trace in /sys/fs/pstore/console-ramoops-0 (gnss-20261114/sweetlog_tail.sh).
++ * Mapped Device (uncached) with ml_io_map_unmappable: every line is in DRAM before the next register access, no flush needed.
++ * Outside XNU's RAM (0x1_0000_0000..). sysctl kern.n2gnss bit 3 = trace off. Lines: "GT <seq> <t_ms> <event>".
++ */
++#define N2GT_PA    0x4811f000u
++#define N2GT_SIZE  0x40000u
++static volatile uint8_t *n2gt_va;
++static uint32_t n2gt_seq;
++static void
++n2gt_put(const char *s, uint32_t n)
++{
++	volatile uint32_t *h = (volatile uint32_t *)(void *)n2gt_va;
++	uint32_t cap = N2GT_SIZE - 12u, st = h[1], sz = h[2];
++	if (st >= cap) { st = 0; sz = 0; }
++	for (uint32_t i = 0; i < n; i++) { n2gt_va[12u + st] = (uint8_t)s[i]; st = (st + 1u) % cap; }
++	sz = sz + n > cap ? cap : sz + n;
++	h[1] = st; h[2] = sz;
++	__builtin_arm_dsb(0xf);
++}
++static void n2gt(const char *fmt, ...) __printflike(1, 2);
++static void
++n2gt(const char *fmt, ...)
++{
++	if (!n2gt_va || (n2gd_ctl & 8)) { return; }
++	char line[160];
++	uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	int k = snprintf(line, sizeof line, "GT %u %llu ", ++n2gt_seq, (unsigned long long)(ns / 1000000ull));
++	va_list ap; va_start(ap, fmt); k += vsnprintf(line + k, sizeof line - (size_t)k - 1, fmt, ap); va_end(ap);
++	if (k > (int)sizeof line - 2) { k = (int)sizeof line - 2; }
++	line[k++] = '\n';
++	n2gt_put(line, (uint32_t)k);
++}
++static void
++n2gt_init(void)
++{
++	n2gt_va = (volatile uint8_t *)ml_io_map_unmappable(N2GT_PA, N2GT_SIZE, VM_WIMG_IO);
++	if (!n2gt_va) { printf("NORD2 GNSS TRACE: map of %#x failed, no persistent trace\n", N2GT_PA); return; }
++	volatile uint32_t *h = (volatile uint32_t *)(void *)n2gt_va;
++	uint32_t osig = h[0], ost = h[1], osz = h[2];
++	h[0] = 0x43474244u; h[1] = 0; h[2] = 0;                   /* fresh zone for this boot (the rescue already kept the old one) */
++	__builtin_arm_dsb(0xf);
++	printf("NORD2 GNSS TRACE: persistent register trace in the ramoops console zone %#x (+%#x), old header sig %#x start %u size %u\n",
++	    N2GT_PA, N2GT_SIZE, osig, ost, osz);
++	n2gt("boot: GNSS trace on (0583)");
++}
+ static lck_mtx_t n2gd_lock;
+ 
+ /* integration points (milestone 1 stubs; the integrator binds them to the existing owners) */
+@@ -1228,6 +1281,7 @@
+ 	uint32_t g[9] = {0};
+ 	bool done[32] = {false};
+ 	n2gl_k = k; n2gl_stop = false;
++	n2gt("ladder K=%d", k);
+ 	bool ok = n2gd_wifi_guard(g) && (g[7] >> 16) == 1 && (g[8] >> 16) == 0;
+ 	printf("NORD2 GNSS LAD %d (%s): spm304=%#x gals504=%#x infra228=%#x infra724=%#x gic130=%#x wifi ap=%u wf=%u asleep=%u stage=%u -> %s\n",
+ 	    k, n2gl_name[k], g[0], g[3], g[4], g[5], g[6], g[7] >> 16, g[7] & 0xffff, g[8] >> 16, g[8] & 0xffff, ok ? "guard ok" : "GUARD REFUSES");
+@@ -1387,6 +1441,7 @@
+ 	int l = minor(dev);
+ 	if (!n2gd.made || l < 0 || l >= N2GD_LINKS) { return ENXIO; }
+ 	if (data == NULL) { return EFAULT; }
++	n2gt("ioctl %#lx", cmd & 0xffffffffu);
+ 	uint32_t v = 0;
+ 	if ((uint32_t)cmd == (uint32_t)N2GD_IOC_CHUNK) {            /* 0364: S11 blob upload (kernel copy of the _IOW buffer) */
+ 		lck_mtx_lock(&n2gd_lock);
+@@ -1521,6 +1576,7 @@
+ n2gq_mcub_note(uint32_t f, uint32_t d0, uint32_t d1)
+ {
+ 	n2gq.mcub++;
++	n2gt("mcub flag %#x d0 %#x d1 %#x", f, d0, d1);
+ 	if (n2gd_dl_up && (f != n2gq.last_d2af || d0 != n2gq.last_d0) && n2gq.mlog < 40) {
+ 		n2gq.mlog++;
+ 		printf("NORD2 GNSS PIPE: MCUB d2a flag %#x d0 %#x d1 %#x (was %#x)\n", f, d0, d1, n2gq.last_d2af);
+@@ -1604,6 +1660,7 @@
+ 	if (!n2gd_dl_up) { e = ENODEV; goto out; }
+ 	n2gl_k = 30; n2gl_stop = false;
+ 	n2gq.rd++;
++	n2gt("read #%llu flag %#x", (unsigned long long)n2gq.rd, flag);
+ 	if ((e = n2gq_gate()) != 0) { if (e == EAGAIN) { n2gq.rd_eagain++; } goto out; }
+ 	for (int t = 0; !n2gl_rx_used() && t < 1000 && !n2gl_stop; t++) {
+ 		if (n2gl_v9hold) {                                   /* 0362: pre-armed RX DMA, MCUB flags acked and logged */
+@@ -1652,6 +1709,7 @@
+ 	int e = 0;
+ 	if (!n2gd_dl_up) { e = ENODEV; goto out; }
+ 	n2gl_k = 31; n2gl_stop = false;
++	n2gt("write %lld bytes", (long long)uio_resid(uio));
+ 	if ((e = n2gq_gate()) != 0) { goto out; }                /* nothing consumed: n2mnld retries EAGAIN */
+ 	while (uio_resid(uio) > 0 && !e) {
+ 		uint32_t m = uio_resid(uio) < (user_ssize_t)sizeof buf ? (uint32_t)uio_resid(uio) : (uint32_t)sizeof buf;
+@@ -1692,6 +1750,7 @@
+ {
+ 	if (n2gd.made) { return 0; }
+ 	int on = 0;
++	n2gt_init();                                               /* 0583 */
+ 	/* 0580: on by default (the boot command line has ~4 free characters, n2gps=1 no longer fits; the n2gdv bits are all taken).
+ 	 * Creating the nodes touches no register; the hardware is only reached by the ladder ioctls (Wi-Fi guard first) and the HOLD
+ 	 * pipe, i.e. only when the gnssfix payload's n2mnld runs. Kill switches: the payload gate /private/var/db/nord2-gnssd (or its
+--- a/bsd/dev/nord2_gnss_bind.inc
++++ b/bsd/dev/nord2_gnss_bind.inc
+@@ -46,6 +46,7 @@
+ static bool
+ n2gd_wifi_guard(uint32_t out[9])
+ {
++	n2gt("guard");                                             /* 0583 */
+ 	bool ok = n2gd_ao_predicates(out);
+ 	out[6] = nwfn_native.gic_va ? *(volatile uint32_t *)(nwfn_native.gic_va + 0x130) : 0xffffffffu;
+ 	out[7] = (nwfn_native.ap_owned << 16) | (nwfn_native.wf_owned & 0xffff);
+@@ -98,13 +99,17 @@
+ {
+ 	volatile uint32_t *r = n2gd_reg(pa);
+ 	if (r == NULL) { printf("NORD2 GNSS: refused read %#x\n", pa); return 0xffffffffu; }
+-	return *r;
++	n2gt("R %#x", pa);                                         /* 0583: logged BEFORE the access */
++	uint32_t v = *r;
++	n2gt("r %#x = %#x", pa, v);
++	return v;
+ }
+ static void
+ n2gd_wr(__unused void *ctx, uint32_t pa, uint32_t v)
+ {
+ 	volatile uint32_t *r = n2gd_reg(pa);
+ 	if (r == NULL) { printf("NORD2 GNSS: refused write %#x\n", pa); return; }
++	n2gt("W %#x := %#x", pa, v);                               /* 0583: logged BEFORE the access */
+ 	*r = v;
+ 	__builtin_arm_dsb(0xf);
+ }

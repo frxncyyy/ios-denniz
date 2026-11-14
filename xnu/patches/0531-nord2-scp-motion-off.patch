@@ -1,0 +1,78 @@
+--- a/bsd/dev/nord2_scp.inc
++++ b/bsd/dev/nord2_scp.inc
+@@ -435,6 +435,21 @@
+ #endif
+ static int n2scp_mode = N2SCP_DEFAULT_MODE;     /* 0 off, 1 read only (default since q10ee: the started SCP stalled the AP at boot), 2 all */
+ 
++/*
++ * 0531 (heat-20261114): the motion sensors are no longer enabled by default.  SweetHID publishes only the proximity service
++ * (N2_SENSOR_MASK 1: all five made backboardd crash, q10ef), so sweet_hid_motion() dropped every accelerometer / gyroscope /
++ * magnetometer record, yet the hub sampled them at 50 / 50 / 25 Hz and this thread woke every 20 ms to drain them: 156 records/s
++ * and 50 mailbox messages/s for the whole uptime, display off included (heat1.log: "records 253166 msgs 80989" in 1620 s).
++ * Now only proximity and light (both on-change) are enabled and the thread polls every N2SCP_IDLE_POLL_MS.
++ * kern.n2scp_motion = 1 (or boot-arg n2scpm=1, or n2gdv +128) is the old behaviour (the three sensors on, 20 ms polling) and can be
++ * switched at run time: the loop sends the nanohub enable / disable ConfigCmd when the value changes.
++ */
++#include <sys/sysctl.h>
++#define N2SCP_IDLE_POLL_MS  100u
++static int n2scp_motion;                        /* 0 (default): accelerometer, gyroscope, magnetometer off; 1: on */
++SYSCTL_INT(_kern, OID_AUTO, n2scp_motion, CTLFLAG_RW | CTLFLAG_LOCKED, &n2scp_motion, 0,
++    "NORD2 SCP: 1 = accelerometer/gyroscope/magnetometer sampled (50/50/25 Hz, 20 ms polling); 0 = off, 100 ms polling");
++
+ static void
+ n2scp_thread(void *arg __unused, wait_result_t res __unused)
+ {
+@@ -529,23 +544,33 @@
+ 	for (int i = 0; i < 100 && n2scp_vibr_done < 0; i++) { n2scp_sleep(10); }
+ 	(void)n2scp_config(N2S_PROX, 1, 0xFFFFFF01u);
+ 	(void)n2scp_config(N2S_LIGHT, 1, 0xFFFFFF01u);
+-	(void)n2scp_config(N2S_ACCEL, 1, 50u * 1024u);
+-	(void)n2scp_config(N2S_GYRO, 1, 50u * 1024u);
+-	(void)n2scp_config(N2S_MAG, 1, 25u * 1024u);
+ 	n2scp_state |= 4;
+-	printf("NORD2 SCP: step 5: sensors enabled; polling every 20 ms\n");
+-	for (uint32_t tick = 0;; tick++) {
++	printf("NORD2 SCP: step 5: proximity and light enabled; motion sensors %s (kern.n2scp_motion), polling every %u ms\n",
++	    n2scp_motion ? "on" : "off", n2scp_motion ? 20u : N2SCP_IDLE_POLL_MS);
++	int motion = 0;                         /* what the hub was last told */
++	for (uint32_t ms = 0, say = 0;;) {
++		int want = n2scp_motion ? 1 : 0;
++		if (want != motion) {           /* 0531: enable / disable only on a change (nothing is sent for the default) */
++			(void)n2scp_config(N2S_ACCEL, want, 50u * 1024u);
++			(void)n2scp_config(N2S_GYRO, want, 50u * 1024u);
++			(void)n2scp_config(N2S_MAG, want, 25u * 1024u);
++			motion = want;
++			printf("NORD2 SCP: motion sensors %s, polling every %u ms\n", want ? "on" : "off", want ? 20u : N2SCP_IDLE_POLL_MS);
++		}
+ 		while (n2scp_take(false)) { }
+ 		n2scp_drain();
+-		if ((tick % 500) == 0) {
++		if ((int32_t)(ms - say) >= 0) { /* the report keeps its 10 s period */
++			say = ms + 10000;
+ 			volatile uint32_t *h = (volatile uint32_t *)n2scp_dram + N2SCP_FIFO_OFF / 4;
+ 			printf("NORD2 SCP: counts acc %u mag %u gyr %u light %u prox %u\n", n2scp_count[0], n2scp_count[1], n2scp_count[3], n2scp_count[4], n2scp_count[7]);
+ 			printf("NORD2 SCP: t=%us records %u msgs %u fifo rp %u wp %u | prox %d lux %d acc %d %d %d gyr %d %d %d mag %d %d %d | core0 %#x PC %#x\n",
+-			    tick / 50, n2scp_records, n2scp_msgs, h[0], h[1], n2scp_prox, n2scp_lux, n2scp_acc[0], n2scp_acc[1], n2scp_acc[2],
++			    ms / 1000, n2scp_records, n2scp_msgs, h[0], h[1], n2scp_prox, n2scp_lux, n2scp_acc[0], n2scp_acc[1], n2scp_acc[2],
+ 			    n2scp_gyr[0], n2scp_gyr[1], n2scp_gyr[2], n2scp_magv[0], n2scp_magv[1], n2scp_magv[2],
+ 			    n2scp_rd(n2scp_c0, 0x70), n2scp_rd(n2scp_c0, 0x80));
+ 		}
+-		n2scp_sleep(20);
++		uint32_t step = motion ? 20u : N2SCP_IDLE_POLL_MS;
++		n2scp_sleep(step);
++		ms += step;
+ 	}
+ out:
+ 	(void)thread_terminate(current_thread());
+@@ -556,7 +581,11 @@
+ nord2_scp_start(void)
+ {
+ 	thread_t thread;
++	int gdv = 0;
+ 	(void)PE_parse_boot_argn("nord2scp", &n2scp_mode, sizeof(n2scp_mode));
++	if (!PE_parse_boot_argn("n2scpm", &n2scp_motion, sizeof(n2scp_motion)) && PE_parse_boot_argn("n2gdv", &gdv, sizeof(gdv)) && (gdv & 128)) {
++		n2scp_motion = 1;               /* 0531: the kill switch that fits the boot line */
++	}
+ 	if (n2scp_mode <= 0) { printf("NORD2 SCP: off (nord2scp=0)\n"); return; }
+ 	if (kernel_thread_start(n2scp_thread, NULL, &thread) == KERN_SUCCESS) { thread_deallocate(thread); }
+ }

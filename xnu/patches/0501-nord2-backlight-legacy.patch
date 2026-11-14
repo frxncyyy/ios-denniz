@@ -1,0 +1,374 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -480,7 +480,7 @@
+ 	thread_call_t       fBlThermCall;
+ 	uint32_t            fBlLogN;
+ 	uint64_t            fBlSumUs, fBlSumSends;
+-	void        blRequest(int32_t q16, const char *who);
++	void        blRequest(int32_t value, const char *who, bool raw = false, int32_t fade = 0);      /* 0501: raw = legacy "brightness" */
+ 	void        blService(bool owned);
+ 	void        blThermTick(void);
+ 	int         blStat(char *buf, size_t len);
+@@ -533,7 +533,17 @@
+  * DBV 2047, 100..1000), kern.n2blstat (read only).  Thermal cap from the battery gauge: >= 42 C 70 %, >= 45 C 50 % (1 C hysteresis).
+  */
+ static uint64_t sweet_fb_abs_to_us(uint64_t abs);     /* below */
+-static struct sweet_bl_cfg sweet_bl_cfg_g = { 1, SWEET_BL_FLOOR_DEFAULT, SWEET_BL_MAX_DEFAULT, SWEET_BL_NITS_FULL };
++static struct sweet_bl_cfg sweet_bl_cfg_g = { 1, SWEET_BL_FLOOR_DEFAULT, SWEET_BL_MAX_DEFAULT, SWEET_BL_NITS_FULL, SWEET_BL_SAFE_DEFAULT, 0 };
++/*
++ * 0501 (bltorch-20261114): q10jch on the phone: the service was found, CoreBrightness set "brightness-nits" 0.00 once and nothing
++ * when the slider moved.  Cause (disassembly, see sweet_fb_backlight.h): without "new-backlight-architecture" = true on this
++ * service CoreBrightness runs its LEGACY path and sets {"brightness", "FadePeriod", "backlight-level"} here -- keys 0495 dropped.
++ * Now "brightness" (0..2047, the range IODisplayParameters publishes) drives the panel.  boot-arg n2bl: 0 no service, 1 (default)
++ * legacy architecture, 2 (or n2gdv +64, e.g. n2gdv=73) = "new-backlight-architecture" published too (CoreBrightness then sends nits;
++ * untested).  In the legacy
++ * architecture the nits keys are counted and ignored.  kern.n2bl_safe (DBV 300): nothing below it until one request above it.
++ */
++static uint32_t sweet_bl_other_logged;
+ 
+ /* the kernel's own macros (OSDefineMetaClassAndStructors, SYSCTL_PROC) warn under -Weverything; same warnings as the existing ones */
+ #pragma clang diagnostic push
+@@ -568,12 +578,30 @@
+ 	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
+ 	int32_t q16 = 0;
+ 	if (d == NULL || fFB == NULL) { return kIOReturnBadArgument; }
++	bool known = false;
+ 	if (sweet_bl_number(d, "brightness-nits", &q16)) {
+ 		fFB->blRequest(q16, "brightness-nits");
+ 		OSNumber *n = OSNumber::withNumber((unsigned long long)(uint32_t)q16, 32);
+ 		if (n != NULL) { setProperty("brightness-nits", n); n->release(); }
++		known = true;
++	}
++	int32_t raw = 0, fade = 0;
++	if (sweet_bl_number(d, "brightness", &raw)) {      /* 0501: the legacy path (__DisplaySetPhysicalBrightnessLegacyOnThread) */
++		(void)sweet_bl_number(d, "FadePeriod", &fade);
++		fFB->blRequest(raw, "brightness", true, fade);
++		known = true;
++	}
++	/* everything else CoreBrightness may set (brightness-nits-cap, DisplayBrightnessSliderPosition, ...) is accepted and ignored;
++	 * 0501: the first few such dictionaries are named in the log (what else arrives here was not visible in q10jch's log) */
++	if (!known && sweet_bl_other_logged < 12) {
++		OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++		OSSymbol *k = it != NULL ? OSDynamicCast(OSSymbol, it->getNextObject()) : NULL;
++		OSNumber *v = k != NULL ? OSDynamicCast(OSNumber, d->getObject(k)) : NULL;
++		sweet_bl_other_logged++;
++		IOLog("NORD2 BL: property \"%s\" %s 0x%llx (%u keys in the request) accepted, not used\n", k != NULL ? k->getCStringNoCopy() : "?",
++		    v != NULL ? "number" : "not a number", v != NULL ? v->unsigned64BitValue() : 0ULL, d->getCount());
++		OSSafeReleaseNULL(it);
+ 	}
+-	/* everything else CoreBrightness may set (brightness-nits-cap, DisplayBrightnessSliderPosition, ...) is accepted and ignored */
+ 	return kIOReturnSuccess;
+ }
+ 
+@@ -590,17 +618,31 @@
+ }
+ 
+ void
+-AppleCLCD::blRequest(int32_t q16, const char *who)
++AppleCLCD::blRequest(int32_t value, const char *who, bool raw, int32_t fade)
+ {
+ 	if (fBlLock == NULL) { return; }
+ 	IOLockLock(fBlLock);
+ 	struct sweet_bl_cfg c = sweet_bl_cfg_g;
+-	uint32_t old = fBl.want_dbv, dbv = sweet_bl_request(&fBl, &c, q16);
+-	uint32_t n = fBlLogN < 16 && dbv != old ? ++fBlLogN : 0;
++	bool was = fBl.trusted;
++	uint32_t old = fBl.want_dbv, dbv = raw ? sweet_bl_request_raw(&fBl, &c, value) : sweet_bl_request(&fBl, &c, value);
++	uint32_t floor = sweet_bl_floor(&fBl, &c);
++	uint64_t ignored = fBl.nits_ignored;
++	bool trust = fBl.trusted && !was;
++	uint32_t n = fBlLogN < 24 && (dbv != old || trust) && dbv != 0 ? ++fBlLogN : 0;
+ 	IOLockUnlock(fBlLock);
+-	if (n != 0) {
+-		IOLog("NORD2 BL: %s %d.%02u nits -> DBV %u (floor %u max %u, %u nits at 2047, mode %u)%s\n", who, q16 >> 16,
+-		    (unsigned)(((uint32_t)q16 & 0xffffu) * 100u >> 16), dbv, c.floor_dbv, c.max_dbv, c.nits_full, c.mode, n == 16 ? "; further requests in NORD2 BL SUM" : "");
++	if (dbv == 0) {      /* 0501: a nits key in the legacy architecture */
++		if (ignored <= 4) {
++			IOLog("NORD2 BL: %s %d.%02u nits not used (legacy architecture published: \"brightness\" is the level; n2bl=2 publishes the new one)\n",
++			    who, value >> 16, (unsigned)(((uint32_t)value & 0xffffu) * 100u >> 16));
++		}
++		return;
++	}
++	if (n != 0 && raw) {
++		IOLog("NORD2 BL: brightness %d of %u (FadePeriod %d) -> DBV %u (floor %u%s, max %u)%s\n", value, SWEET_BL_DBV_HW_MAX, fade, dbv, floor,
++		    trust ? ": a level above kern.n2bl_safe was asked, the ordinary floor applies now" : "", c.max_dbv, n == 24 ? "; further requests in NORD2 BL SUM" : "");
++	} else if (n != 0) {
++		IOLog("NORD2 BL: %s %d.%02u nits -> DBV %u (floor %u max %u, %u nits at 2047, mode %u)%s\n", who, value >> 16,
++		    (unsigned)(((uint32_t)value & 0xffffu) * 100u >> 16), dbv, floor, c.max_dbv, c.nits_full, c.mode, n == 24 ? "; further requests in NORD2 BL SUM" : "");
+ 	}
+ }
+ 
+@@ -632,7 +674,7 @@
+ 	}
+ 	IOLockLock(fBlLock);
+ 	sweet_bl_sent(&fBl, dbv, ok, nowUs);
+-	uint64_t sends = fBl.sends, fails = fBl.fails, reqs = fBl.reqs;
++	uint64_t sends = fBl.sends, fails = fBl.fails, reqs = fBl.reqs, rawReqs = fBl.raw_reqs, nitsReqs = fBl.nits_reqs, nitsIgn = fBl.nits_ignored;
+ 	uint32_t want = fBl.want_dbv, therm = fBl.therm;
+ 	bool sum = nowUs - fBlSumUs >= 10000000ull && sends != fBlSumSends;
+ 	if (sum) { fBlSumUs = nowUs; fBlSumSends = sends; }
+@@ -640,8 +682,8 @@
+ 	if (!ok && (fails <= 3 || (fails % 256) == 0)) {
+ 		IOLog("NORD2 BL: DCS 0x51 %02x %02x (DBV %u) FAILED (fails %llu), retried\n", p[1], p[2], dbv, fails);
+ 	} else if (ok && (sends <= 4 || sum)) {
+-		IOLog("NORD2 BL SUM: DBV %u sent (want %u, thermal level %u, %s) requests %llu sends %llu fails %llu\n", dbv, want, therm,
+-		    owned ? "between frames" : "idle panel", reqs, sends, fails);
++		IOLog("NORD2 BL SUM: DBV %u sent (want %u, thermal level %u, %s) requests %llu (brightness %llu, nits %llu of them %llu not used) sends %llu fails %llu\n",
++		    dbv, want, therm, owned ? "between frames" : "idle panel", reqs, rawReqs, nitsReqs, nitsIgn, sends, fails);
+ 	}
+ #else
+ 	(void)owned;
+@@ -696,9 +738,11 @@
+ 	struct sweet_bl b = fBl;
+ 	struct sweet_bl_cfg c = sweet_bl_cfg_g;
+ 	IOLockUnlock(fBlLock);
+-	return snprintf(buf, len, "mode=%u req_q16=%d want=%u sent=%u target=%u floor=%u max=%u nits=%u therm=%u bat_cC=%d reqs=%llu sends=%llu "
+-	    "fails=%llu floored=%llu capped=%llu therm_changes=%llu", c.mode, b.req_q16, b.want_dbv, b.sent_dbv, sweet_bl_target(&b, &c),
+-	    c.floor_dbv, c.max_dbv, c.nits_full, b.therm, b.therm_cc, b.reqs, b.sends, b.fails, b.floored, b.capped, b.therm_changes);
++	return snprintf(buf, len, "mode=%u arch=%s req_q16=%d req_raw=%u kind=%u ask=%u want=%u sent=%u target=%u floor=%u safe=%u trusted=%u max=%u nits=%u "
++	    "therm=%u bat_cC=%d reqs=%llu raw_reqs=%llu nits_reqs=%llu nits_ignored=%llu sends=%llu fails=%llu floored=%llu capped=%llu therm_changes=%llu",
++	    c.mode, c.arch ? "new" : "legacy", b.req_q16, b.req_raw, b.req_kind, b.ask_dbv, b.want_dbv, b.sent_dbv, sweet_bl_target(&b, &c),
++	    c.floor_dbv, c.safe_dbv, b.trusted ? 1u : 0u, c.max_dbv, c.nits_full, b.therm, b.therm_cc, b.reqs, b.raw_reqs, b.nits_reqs, b.nits_ignored,
++	    b.sends, b.fails, b.floored, b.capped, b.therm_changes);
+ }
+ 
+ static int
+@@ -710,7 +754,7 @@
+ 	IOLockLock(fb->fBlLock);
+ 	struct sweet_bl_cfg c = sweet_bl_cfg_g;
+ 	IOLockUnlock(fb->fBlLock);
+-	uint32_t *field = arg2 == 0 ? &c.mode : arg2 == 1 ? &c.floor_dbv : arg2 == 2 ? &c.max_dbv : &c.nits_full;
++	uint32_t *field = arg2 == 0 ? &c.mode : arg2 == 1 ? &c.floor_dbv : arg2 == 2 ? &c.max_dbv : arg2 == 4 ? &c.safe_dbv : &c.nits_full;
+ 	int v = (int)*field, changed = 0;
+ 	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
+ 	if (err != 0 || !changed) { return err; }
+@@ -721,14 +765,14 @@
+ 	sweet_bl_cfg_g = c;
+ 	IOLockUnlock(fb->fBlLock);
+ 	fb->blConfigChanged();
+-	IOLog("NORD2 BL: sysctl %s: mode %u floor %u max %u nits %u\n", oidp->oid_name, c.mode, c.floor_dbv, c.max_dbv, c.nits_full);
++	IOLog("NORD2 BL: sysctl %s: mode %u floor %u max %u nits %u safe %u\n", oidp->oid_name, c.mode, c.floor_dbv, c.max_dbv, c.nits_full, c.safe_dbv);
+ 	return 0;
+ }
+ static int
+ sweet_bl_sysctl_stat SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(oidp, arg1, arg2)
+-	char buf[512];
++	char buf[640];
+ 	buf[0] = 0;
+ 	if (gSweetFBSnapOwner != NULL) { (void)gSweetFBSnapOwner->blStat(buf, sizeof(buf)); } else { snprintf(buf, sizeof(buf), "no framebuffer"); }
+ 	return sysctl_io_string(req, buf, sizeof(buf), 0, NULL);
+@@ -745,6 +789,8 @@
+     "0495 highest DBV sent (4..2047, default 2047; HBM never)");
+ SYSCTL_PROC(_kern, OID_AUTO, n2bl_nits, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 3, sweet_bl_sysctl_cfg, "I",
+     "0495 nits that map to DBV 2047 (100..1000, default 400)");
++SYSCTL_PROC(_kern, OID_AUTO, n2bl_safe, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 4, sweet_bl_sysctl_cfg, "I",
++    "0501 lowest DBV shown until a request above it has been seen (0..2047, default 300; 0 = off)");
+ SYSCTL_PROC(_kern, OID_AUTO, n2blstat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sweet_bl_sysctl_stat, "A",
+     "0495 brightness state and counters");
+ #pragma clang diagnostic pop
+@@ -1069,13 +1115,18 @@
+ 	fBlLock = IOLockAlloc();
+ 	fBlThermCall = fBlLock != NULL ? thread_call_allocate(sweet_bl_therm_call, this) : NULL;
+ 	{
+-		uint32_t bl = 1;
+-		(void)PE_parse_boot_argn("n2bl", &bl, sizeof(bl));
++		uint32_t bl = 1, gdv = 0;
++		/* 0501: n2gdv +64 = n2bl=2 (the boot line has 4 characters left with n2gdv=9: n2gdv=73 fits, " n2bl=2" does not) */
++		if (!PE_parse_boot_argn("n2bl", &bl, sizeof(bl)) && PE_parse_boot_argn("n2gdv", &gdv, sizeof(gdv)) && (gdv & 64) != 0) { bl = 2; }
+ 		AppleARMBacklight *b = (bl != 0 && fBlLock != NULL) ? OSTypeAlloc(AppleARMBacklight) : NULL;
+ 		bool published = false;
+ 		if (b != NULL && b->init()) {
+ 			b->fFB = this;
+ 			b->setProperty("backlight-control", true);
++			if (bl >= 2) {      /* 0501: n2bl=2: CoreBrightness' nits path (DisplayCreateWithID tests this property for kCFBooleanTrue) */
++				b->setProperty("new-backlight-architecture", kOSBooleanTrue);
++				sweet_bl_cfg_g.arch = 1;
++			}
+ 			OSDictionary *params = OSDictionary::withCapacity(1), *br = OSDictionary::withCapacity(3);
+ 			OSNumber *mn = OSNumber::withNumber(0ULL, 32), *mx = OSNumber::withNumber((unsigned long long)SWEET_BL_DBV_HW_MAX, 32),
+ 			    *val = OSNumber::withNumber(1024ULL, 32);      /* initial slider position only: CoreBrightness restores the saved level */
+@@ -1090,6 +1141,10 @@
+ 		OSSafeReleaseNULL(b);
+ 		IOLog("NORD2 BL: AppleARMBacklight %s (boot-arg n2bl=%u; sysctl kern.n2bl %u, floor DBV %u, max DBV %u, %u nits = DBV 2047; DCS 0x51)\n",
+ 		    published ? "published" : "NOT published", bl, sweet_bl_cfg_g.mode, sweet_bl_cfg_g.floor_dbv, sweet_bl_cfg_g.max_dbv, sweet_bl_cfg_g.nits_full);
++		IOLog("NORD2 BL ARCH: %s (0501): the level comes from %s; safe floor DBV %u until a request above it (kern.n2bl_safe)\n",
++		    sweet_bl_cfg_g.arch ? "new-backlight-architecture published (n2bl=2 / n2gdv +64)" : "legacy architecture",
++		    sweet_bl_cfg_g.arch ? "\"brightness-nits\" / IOMFBBrightnessLevel (and \"brightness\")" : "\"brightness\" 0..2047 (nits keys not used)",
++		    sweet_bl_cfg_g.safe_dbv);
+ 		if (published && fBlThermCall != NULL) { blThermTick(); }
+ 	}
+ 	return true;
+--- a/iokit/Kernel/arm/sweet_fb_backlight.h
++++ b/iokit/Kernel/arm/sweet_fb_backlight.h
+@@ -12,6 +12,16 @@
+  * The panel (Samsung AMS643YE05, Android oplus20615_samsung_ams643ye05_1080p_dsi_cmd.c lcm_setbacklight_cmdq): DCS 0x51 with two
+  * bytes MSB first, 4..2047 = normal range (DBV), 2048..4095 = HBM (needs the ELVSS sequence and 0x53 0xE0: never sent here).
+  * The DBV is taken as linear in nits (Samsung DBV), full scale SWEET_BL_NITS_FULL (kern.n2bl_nits) = DBV 2047.
++ *
++ * 0501 (bltorch-20261114), after the first run on the phone (q10jch: one "brightness-nits 0.00" at start, nothing from the slider):
++ *  DisplayCreateWithID takes the nits path ONLY when the backlight service has "new-backlight-architecture" = kOSBooleanTrue
++ *  (0x1af0d88bc..0x1af0d8904 sets display+0x20); without it display+0x24 is set and every slider / factor change goes through
++ *  __DisplaySetPhysicalBrightnessLegacyOnThread = IORegistryEntrySetCFProperties(backlight, {"brightness": SInt32 in
++ *  IODisplayParameters.brightness.min..max, "FadePeriod": SInt32, "backlight-level": SInt32}), which 0495 accepted and dropped.
++ *  The one "brightness-nits" of a legacy boot is a side path writing the never-computed nits value (0).
++ *  Now: "brightness" (raw, min 0 max 2047 = the DBV scale published) is acted on in both architectures; the nits keys only when
++ *  the new architecture is published (cfg.arch 1, boot-arg n2bl=2).  Until CoreBrightness has asked once for more than the safe
++ *  level (kern.n2bl_safe, DBV 300) nothing below it is shown: a stuck-at-zero requester cannot leave a dark panel again.
+  */
+ #ifndef SWEET_FB_BACKLIGHT_H
+ #define SWEET_FB_BACKLIGHT_H
+@@ -22,6 +32,7 @@
+ #define SWEET_BL_DBV_HW_MIN        4u        /* the Android driver's lowest non-AOD level */
+ #define SWEET_BL_FLOOR_DEFAULT     16u       /* kern.n2bl_floor: never darker than this (a request of 0 nits is not a black panel) */
+ #define SWEET_BL_MAX_DEFAULT       2047u     /* kern.n2bl_max */
++#define SWEET_BL_SAFE_DEFAULT      300u      /* 0501 kern.n2bl_safe: the floor until a request above it has been seen (0 = no such rule) */
+ #define SWEET_BL_NITS_FULL         400u      /* kern.n2bl_nits default: CoreBrightness' uncalibrated slider top (400 nits) = DBV 2047 */
+ #define SWEET_BL_NITS_MIN          100u
+ #define SWEET_BL_NITS_MAX          1000u
+@@ -39,10 +50,20 @@
+ 	uint32_t floor_dbv;     /* kern.n2bl_floor */
+ 	uint32_t max_dbv;       /* kern.n2bl_max */
+ 	uint32_t nits_full;     /* kern.n2bl_nits */
++	uint32_t safe_dbv;      /* 0501 kern.n2bl_safe */
++	uint32_t arch;          /* 0501: 0 = legacy architecture published ("brightness" raw), 1 = new ("brightness-nits"); fixed at boot */
+ };
+ 
++#define SWEET_BL_REQ_NONE          0u
++#define SWEET_BL_REQ_NITS          1u
++#define SWEET_BL_REQ_RAW           2u
++
+ struct sweet_bl {
+-	int32_t  req_q16;       /* last request, nits 16.16 (-1 = none yet) */
++	int32_t  req_q16;       /* last nits request, nits 16.16 (-1 = none yet) */
++	uint32_t req_kind;      /* 0501: SWEET_BL_REQ_*: which request want_dbv comes from */
++	uint32_t req_raw;       /* 0501: last legacy "brightness" (0..SWEET_BL_DBV_HW_MAX) */
++	uint32_t ask_dbv;       /* 0501: the request mapped to the DBV scale, before floor / max */
++	bool     trusted;       /* 0501: a request above cfg.safe_dbv has been seen: the ordinary floor applies from then on */
+ 	uint32_t want_dbv;      /* request mapped, before the thermal cap */
+ 	uint32_t sent_dbv;      /* last DBV the panel accepted (0 = none / unknown, e.g. after display on) */
+ 	uint64_t last_us;       /* last DCS attempt */
+@@ -51,12 +72,14 @@
+ 	int32_t  therm_cc;
+ 	/* counters */
+ 	uint64_t reqs, sends, fails, floored, capped, therm_changes, skipped_off;
++	uint64_t raw_reqs, nits_reqs, nits_ignored;      /* 0501 */
+ };
+ 
+ static inline void
+ sweet_bl_cfg_default(struct sweet_bl_cfg *c)
+ {
+ 	c->mode = 1; c->floor_dbv = SWEET_BL_FLOOR_DEFAULT; c->max_dbv = SWEET_BL_MAX_DEFAULT; c->nits_full = SWEET_BL_NITS_FULL;
++	c->safe_dbv = SWEET_BL_SAFE_DEFAULT; c->arch = 0;
+ }
+ 
+ /* sanitises a configuration: floor in [HW_MIN, max], max in [HW_MIN, HW_MAX], nits in [NITS_MIN, NITS_MAX] */
+@@ -70,6 +93,8 @@
+ 	if (c->nits_full < SWEET_BL_NITS_MIN) { c->nits_full = SWEET_BL_NITS_MIN; }
+ 	if (c->nits_full > SWEET_BL_NITS_MAX) { c->nits_full = SWEET_BL_NITS_MAX; }
+ 	c->mode = c->mode ? 1u : 0u;
++	if (c->safe_dbv > c->max_dbv) { c->safe_dbv = c->max_dbv; }
++	c->arch = c->arch ? 1u : 0u;
+ }
+ 
+ static inline void
+@@ -77,37 +102,71 @@
+ {
+ 	b->req_q16 = -1; b->want_dbv = 0; b->sent_dbv = 0; b->last_us = 0; b->therm = 0; b->therm_us = 0; b->therm_cc = 0;
+ 	b->reqs = b->sends = b->fails = b->floored = b->capped = b->therm_changes = b->skipped_off = 0;
++	b->req_kind = SWEET_BL_REQ_NONE; b->req_raw = 0; b->ask_dbv = 0; b->trusted = false;
++	b->raw_reqs = b->nits_reqs = b->nits_ignored = 0;
++}
++
++/* 0501: the floor in force: the safe level until a request above it has been seen, then the ordinary floor */
++static inline uint32_t
++sweet_bl_floor(const struct sweet_bl *b, const struct sweet_bl_cfg *c)
++{
++	uint32_t f = c->floor_dbv;
++	if (!b->trusted && c->safe_dbv > f) { f = c->safe_dbv; }
++	if (f > c->max_dbv) { f = c->max_dbv; }
++	return f;
+ }
+ 
+-/* nits 16.16 -> DBV, rounded, clamped to [floor, max] (cfg already fixed).  A request at or below 0 gives the floor. */
++/* 0501: a request on the DBV scale (already mapped): trust, floor, max.  Returns want_dbv. */
+ static inline uint32_t
+-sweet_bl_q16_to_dbv(int32_t q16, const struct sweet_bl_cfg *c, bool *floored)
++sweet_bl_apply(struct sweet_bl *b, const struct sweet_bl_cfg *c, uint32_t ask, bool count)
++{
++	if (ask > SWEET_BL_DBV_HW_MAX) { ask = SWEET_BL_DBV_HW_MAX; }
++	b->ask_dbv = ask;
++	if (c->safe_dbv != 0 && ask > c->safe_dbv) { b->trusted = true; }
++	uint32_t f = sweet_bl_floor(b, c), v = ask;
++	if (v < f) { v = f; if (count) { b->floored++; } }
++	if (v > c->max_dbv) { v = c->max_dbv; }
++	b->want_dbv = v;
++	return v;
++}
++
++/* nits 16.16 -> the DBV scale, rounded, no floor (0501) */
++static inline uint32_t
++sweet_bl_q16_to_ask(int32_t q16, const struct sweet_bl_cfg *c)
+ {
+ 	uint64_t full = (uint64_t)c->nits_full << 16;
+ 	uint64_t v = q16 <= 0 ? 0 : ((uint64_t)(uint32_t)q16 * SWEET_BL_DBV_HW_MAX + full / 2) / full;
+-	if (floored) { *floored = v < c->floor_dbv; }
+-	if (v < c->floor_dbv) { v = c->floor_dbv; }
+-	if (v > c->max_dbv) { v = c->max_dbv; }
+-	return (uint32_t)v;
++	return v > SWEET_BL_DBV_HW_MAX ? SWEET_BL_DBV_HW_MAX : (uint32_t)v;
+ }
+ 
+-/* a new request (any thread; the caller serialises).  Returns the mapped DBV. */
++/* a new nits request (any thread; the caller serialises).  Returns the mapped DBV; 0 = ignored (0501: the legacy architecture is
++ * published, where CoreBrightness' nits writes carry no level: counted, the panel keeps what "brightness" asked). */
+ static inline uint32_t
+ sweet_bl_request(struct sweet_bl *b, const struct sweet_bl_cfg *c, int32_t q16)
+ {
+-	bool fl = false;
++	b->reqs++; b->nits_reqs++;
++	if (!c->arch) { b->nits_ignored++; return 0; }
+ 	b->req_q16 = q16 < 0 ? 0 : q16;
+-	b->want_dbv = sweet_bl_q16_to_dbv(b->req_q16, c, &fl);
+-	b->reqs++;
+-	if (fl) { b->floored++; }
+-	return b->want_dbv;
++	b->req_kind = SWEET_BL_REQ_NITS;
++	return sweet_bl_apply(b, c, sweet_bl_q16_to_ask(b->req_q16, c), true);
++}
++
++/* 0501: a legacy request: "brightness" in IODisplayParameters.brightness.min..max = 0..SWEET_BL_DBV_HW_MAX.  Returns the mapped DBV. */
++static inline uint32_t
++sweet_bl_request_raw(struct sweet_bl *b, const struct sweet_bl_cfg *c, int32_t raw)
++{
++	b->reqs++; b->raw_reqs++;
++	b->req_raw = raw < 0 ? 0u : (uint32_t)raw > SWEET_BL_DBV_HW_MAX ? SWEET_BL_DBV_HW_MAX : (uint32_t)raw;
++	b->req_kind = SWEET_BL_REQ_RAW;
++	return sweet_bl_apply(b, c, b->req_raw, true);
+ }
+ 
+ /* the configuration changed: re-map the last request */
+ static inline void
+ sweet_bl_remap(struct sweet_bl *b, const struct sweet_bl_cfg *c)
+ {
+-	if (b->req_q16 >= 0) { b->want_dbv = sweet_bl_q16_to_dbv(b->req_q16, c, NULL); }
++	if (b->req_kind == SWEET_BL_REQ_NITS) { (void)sweet_bl_apply(b, c, sweet_bl_q16_to_ask(b->req_q16, c), false); }
++	else if (b->req_kind == SWEET_BL_REQ_RAW) { (void)sweet_bl_apply(b, c, b->req_raw, false); }
+ }
+ 
+ /* thermal level from a battery reading (ok = valid).  Hysteresis: a level drops only SWEET_BL_HYST_CC under its threshold.
+@@ -136,10 +195,10 @@
+ static inline uint32_t
+ sweet_bl_target(const struct sweet_bl *b, const struct sweet_bl_cfg *c)
+ {
+-	if (b->req_q16 < 0 || b->want_dbv == 0) { return 0; }
+-	uint32_t t = b->want_dbv, cap = sweet_bl_cap(b);
++	if (b->req_kind == SWEET_BL_REQ_NONE || b->want_dbv == 0) { return 0; }
++	uint32_t t = b->want_dbv, cap = sweet_bl_cap(b), f = sweet_bl_floor(b, c);
+ 	if (t > cap) { t = cap; }
+-	if (t < c->floor_dbv) { t = c->floor_dbv; }      /* a cap never goes under the floor (both are user settable) */
++	if (t < f) { t = f; }      /* a cap never goes under the floor (both are user settable) */
+ 	if (t > SWEET_BL_DBV_HW_MAX) { t = SWEET_BL_DBV_HW_MAX; }
+ 	return t;
+ }

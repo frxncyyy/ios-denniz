@@ -1,0 +1,416 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -986,7 +986,8 @@
+ #include "nord2_torch.h"
+ extern bool nord2_battery_temperature_cC(int *centi);     /* iokit/Kernel/arm/Nord2GPU.cpp */
+ 
+-static struct n2t_cfg n2t_cfg_g = { 1, N2T_MAXSEL_DEFAULT, N2T_FLASHSEL_DEFAULT, N2T_ON_S_DEFAULT };
++static struct n2t_cfg n2t_cfg_g = { 1, N2T_MAXSEL_DEFAULT, N2T_FLASHSEL_DEFAULT, N2T_ON_S_DEFAULT, 1, N2T_STROBESEL_DEFAULT };   /* 0560: + strobe */
++static struct n2t_status n2t_pub;               /* 0560: what read() gives (owner thread writes it under n2t_lock) */
+ static struct n2t_state n2t_st;                 /* owner thread (stat copy under n2t_lock) */
+ static volatile uint64_t n2t_req_word;          /* seq:32 | level:16 | ms:16, written by userland, read by the owner thread */
+ static uint32_t n2t_seq, n2t_opens;
+@@ -996,11 +997,13 @@
+ static uint64_t n2t_therm_next_us;
+ 
+ static void
+-n2t_post(uint32_t level, uint32_t ms)
++n2t_post(uint32_t level, uint32_t ms, uint32_t strobe)
+ {
+ 	lck_mtx_lock(n2t_lock);
+ 	n2t_seq = n2t_seq + 1 == 0 ? 1 : n2t_seq + 1;
+-	__atomic_store_n(&n2t_req_word, (uint64_t)n2t_seq << 32 | (uint64_t)(level & 0xffffu) << 16 | (ms & 0xffffu), __ATOMIC_RELEASE);
++	/* 0560: bit 15 of the level field = strobe (levels are <= 1000) */
++	__atomic_store_n(&n2t_req_word, (uint64_t)n2t_seq << 32 | (uint64_t)((level & 0x7fffu) | (strobe ? 0x8000u : 0u)) << 16 | (ms & 0xffffu),
++	    __ATOMIC_RELEASE);
+ 	lck_mtx_unlock(n2t_lock);
+ }
+ 
+@@ -1050,6 +1053,44 @@
+ 	return n2t_pmu_write(N2T_REG_FLED_EN, (uint8_t)((en & ~N2T_EN_STROBE) | N2T_EN_ON));
+ }
+ 
++/*
++ * 0560: LED on in STROBE mode at ISTRB sel on both channels (Android DUAL_FLASH: strobe off, 400 us, CS1|CS2|STROBE), with the hardware
++ * timeout STRB_TO set first (the strobe ends by itself even if this thread stalls).  *on_t = mach_absolute_time() after the enabling write.
++ */
++static bool
++n2t_hw_strobe(uint32_t sel, uint32_t ms, uint64_t *on_t)
++{
++	uint8_t s1 = 0, s2 = 0, to = 0, en = 0;
++	if (sel > N2T_STRB_HW_MAX) { sel = N2T_STRB_HW_MAX; }
++	if (!n2t_pmu_read(N2T_REG_FLED1_STRB2, &s1) || !n2t_pmu_read(N2T_REG_FLED2_STRB2, &s2) || !n2t_pmu_read(N2T_REG_FLED_STRB_CTRL, &to) ||
++	    !n2t_pmu_read(N2T_REG_FLED_EN, &en)) { return false; }
++	if (!n2t_pmu_write(N2T_REG_FLED_STRB_CTRL, (uint8_t)((to & ~N2T_STRB_TO_MASK) | n2t_strobe_to_sel(ms))) ||
++	    !n2t_pmu_write(N2T_REG_FLED1_STRB2, (uint8_t)((s1 & ~(N2T_UTRAL_ISTRB | N2T_ISTRB_MASK)) | N2T_UTRAL_ISTRB | sel)) ||
++	    !n2t_pmu_write(N2T_REG_FLED2_STRB2, (uint8_t)((s2 & ~(N2T_UTRAL_ISTRB | N2T_ISTRB_MASK)) | N2T_UTRAL_ISTRB | sel))) { return false; }
++	if ((en & (N2T_EN_STROBE | N2T_EN_TORCH)) && !n2t_pmu_write(N2T_REG_FLED_EN, (uint8_t)(en & ~(N2T_EN_STROBE | N2T_EN_TORCH)))) { return false; }
++	delay(400);
++	en = (uint8_t)((en & ~N2T_EN_TORCH) | N2T_EN_CS1 | N2T_EN_CS2 | N2T_EN_STROBE);
++	bool ok = n2t_pmu_write(N2T_REG_FLED_EN, en);
++	*on_t = mach_absolute_time();
++	return ok;
++}
++
++/* 0560: the read() status, refreshed by the owner thread */
++static void
++n2t_publish(uint32_t state, uint32_t sel, uint64_t on_t, uint64_t off_t, const struct n2t_cfg *c)
++{
++	lck_mtx_lock(n2t_lock);
++	n2t_pub.magic = N2T_STATUS_MAGIC; n2t_pub.version = 1;
++	n2t_pub.seq = n2t_st.seen_seq;
++	n2t_pub.state = state;
++	if (on_t != 0) { n2t_pub.on_time = on_t; n2t_pub.off_time = 0; n2t_pub.sel = sel; n2t_pub.lit_seq = n2t_st.seen_seq; }
++	if (off_t != 0) { n2t_pub.off_time = off_t; }
++	n2t_pub.flags = (c->strobe ? 1u : 0u) | (n2t_st.therm == 1 ? 2u : 0u) | (n2t_st.therm >= 2 ? 4u : 0u) | (n2t_st.latched ? 8u : 0u) |
++	    (c->mode ? 0u : 16u);
++	n2t_pub.strobesel = c->strobesel; n2t_pub.strobe_ms_max = N2T_STROBE_MS_MAX;
++	lck_mtx_unlock(n2t_lock);
++}
++
+ static void
+ n2t_io_result(bool ok, const char *what)
+ {
+@@ -1080,7 +1121,7 @@
+ 		n2t_io_result(ok && off, "start");
+ 	}
+ 	uint64_t w = __atomic_load_n(&n2t_req_word, __ATOMIC_ACQUIRE);
+-	struct n2t_req r = { (uint32_t)(w >> 32), (uint32_t)(w >> 16) & 0xffffu, (uint32_t)w & 0xffffu };
++	struct n2t_req r = { (uint32_t)(w >> 32), (uint32_t)(w >> 16) & 0x7fffu, (uint32_t)w & 0xffffu, (uint32_t)(w >> 31) & 1u };   /* 0560: + strobe bit */
+ 	lck_mtx_lock(n2t_lock);
+ 	struct n2t_cfg c = n2t_cfg_g;
+ 	lck_mtx_unlock(n2t_lock);
+@@ -1098,7 +1139,24 @@
+ 	}
+ 	bool was_expired = n2t_st.expired;
+ 	uint32_t sel = 0;
+-	bool want = n2t_decide(&n2t_st, &c, now, &sel);
++	uint32_t kind = n2t_decide_kind(&n2t_st, &c, now, &sel);      /* 0560: 0 dark, 1 torch mode, 2 strobe */
++	bool want = kind != 0;
++	if (fresh) { n2t_publish(n2t_st.hw_on ? (n2t_st.hw_strobe ? 2u : 1u) : 0u, 0, 0, 0, &c); }
++	if (want && kind == 2 && !(n2t_st.hw_on && n2t_st.hw_strobe && sel == n2t_st.hw_sel)) {
++		/* 0560: a strobe (from dark or from torch mode); its end is the pulse's (n2t_decide) or the hardware timeout */
++		uint64_t on_t = 0;
++		bool ok = n2t_hw_strobe(sel, n2t_st.ms, &on_t);
++		n2t_io_result(ok, "strobe");
++		if (ok) {
++			if (!n2t_st.hw_on) { n2t_st.ons++; }
++			n2t_st.hw_on = true; n2t_st.hw_strobe = true; n2t_st.hw_sel = sel; n2t_st.strobes++;
++			n2t_publish(2, sel, on_t, 0, &c);
++			printf("NORD2 TORCH: strobe %u ms, level %u/1000 -> ISTRB %u (%u mA x 2), hardware timeout %u ms\n", n2t_st.ms, n2t_st.level, sel,
++			    n2t_strobe_ma(sel), 64u + 32u * n2t_strobe_to_sel(n2t_st.ms));
++		}
++		return;
++	}
++	if (want && kind == 1 && n2t_st.hw_strobe) { n2t_st.hw_on = false; n2t_st.hw_strobe = false; }   /* 0560: strobe -> torch mode: relight */
+ 	if (!was_expired && n2t_st.expired && n2t_st.ms == 0) {
+ 		printf("NORD2 TORCH: on for %u s: turned off (kern.n2torch_max_s; a new request relights it)\n", c.max_on_s);
+ 	}
+@@ -1106,7 +1164,7 @@
+ 		bool ok = n2t_hw_on(sel, n2t_st.hw_on);
+ 		n2t_io_result(ok, "on");
+ 		if (ok) {
+-			if (!n2t_st.hw_on) { n2t_st.ons++; }
++			if (!n2t_st.hw_on) { n2t_st.ons++; n2t_publish(1, sel, mach_absolute_time(), 0, &c); }      /* 0560 */
+ 			n2t_st.hw_on = true; n2t_st.hw_sel = sel;
+ 			printf("NORD2 TORCH: on, level %u/1000%s -> ITOR %u (%u mA x 2)%s\n", n2t_st.level, n2t_st.ms ? " (flash pulse)" : "", sel,
+ 			    25u + sel * 25u / 2u, n2t_st.ms ? "" : "");
+@@ -1115,7 +1173,8 @@
+ 		bool ok = n2t_hw_off();
+ 		n2t_io_result(ok, "off");
+ 		if (ok) {
+-			n2t_st.hw_on = false; n2t_st.offs++;
++			n2t_publish(0, 0, 0, mach_absolute_time(), &c);      /* 0560 */
++			n2t_st.hw_on = false; n2t_st.hw_strobe = false; n2t_st.offs++;
+ 			uint8_t s1 = 0, s2 = 0;
+ 			(void)n2t_pmu_read(N2T_REG_FLED_STAT1, &s1); (void)n2t_pmu_read(N2T_REG_FLED_STAT2, &s2);
+ 			printf("NORD2 TORCH: off (%s) FLED_STAT %#x %#x\n", !c.mode ? "kern.n2torch=0" : n2t_st.latched ? "fault latch" :
+@@ -1148,7 +1207,7 @@
+ n2td_close(dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+ {
+ 	if (!n2t_made || minor(dev) != 0) { return ENXIO; }
+-	n2t_post(0, 0);         /* the last close (devfs calls d_close once): the owner is gone, the LED goes off */
++	n2t_post(0, 0, 0);      /* the last close (devfs calls d_close once): the owner is gone, the LED goes off */
+ 	lck_mtx_lock(n2t_lock);
+ 	n2t_opens = 0;
+ 	lck_mtx_unlock(n2t_lock);
+@@ -1158,22 +1217,37 @@
+ static int
+ n2td_write(dev_t dev, struct uio *uio, __unused int ioflag)
+ {
+-	uint8_t b[8];
+-	uint32_t level = 0, ms = 0;
++	uint8_t b[12];
++	uint32_t level = 0, ms = 0, strobe = 0;
+ 	if (!n2t_made || minor(dev) != 0) { return ENXIO; }
+ 	user_ssize_t n = uio_resid(uio);
+-	if (n != 4 && n != 8) { return EINVAL; }
++	if (n != 4 && n != 8 && n != 12) { return EINVAL; }      /* 0560: + 12-byte strobe request */
+ 	int err = uiomove((char *)b, (int)n, uio);
+ 	if (err != 0) { return err; }
+-	if (!n2t_parse(b, (unsigned)n, &level, &ms)) { return EINVAL; }
+-	n2t_post(level, ms);
++	if (n == 12 ? !n2t_parse12(b, 12, &level, &ms, &strobe) : !n2t_parse(b, (unsigned)n, &level, &ms)) { return EINVAL; }
++	n2t_post(level, ms, strobe);
+ 	if (!n2t_announced) { n2t_announced = true; printf("NORD2 TORCH: first request %u/1000%s from %s\n", level, ms ? " (pulse)" : "", "userland"); }
+ 	return 0;
+ }
+ 
++/* 0560: read() = struct n2t_status (the strobe's on / off times for the camera); a shorter buffer gets the first bytes */
++static int
++n2td_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	if (!n2t_made || minor(dev) != 0) { return ENXIO; }
++	struct n2t_status st;
++	lck_mtx_lock(n2t_lock);
++	st = n2t_pub;
++	st.magic = N2T_STATUS_MAGIC; st.version = 1;
++	lck_mtx_unlock(n2t_lock);
++	user_ssize_t n = uio_resid(uio);
++	if (n <= 0) { return 0; }
++	return uiomove((char *)&st, (int)(n < (user_ssize_t)sizeof(st) ? n : (user_ssize_t)sizeof(st)), uio);
++}
++
+ static const struct cdevsw n2td_cdevsw = {
+ 	.d_open = n2td_open, .d_close = n2td_close,
+-	.d_read = eno_rdwrt, .d_write = n2td_write, .d_ioctl = eno_ioctl,
++	.d_read = n2td_read, .d_write = n2td_write, .d_ioctl = eno_ioctl,
+ 	.d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL,
+ 	.d_select = eno_select, .d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0,
+ };
+@@ -1186,7 +1260,7 @@
+ 	lck_mtx_lock(n2t_lock);
+ 	struct n2t_cfg c = n2t_cfg_g;
+ 	lck_mtx_unlock(n2t_lock);
+-	uint32_t *field = arg2 == 0 ? &c.mode : arg2 == 1 ? &c.maxsel : arg2 == 2 ? &c.flashsel : &c.max_on_s;
++	uint32_t *field = arg2 == 0 ? &c.mode : arg2 == 1 ? &c.maxsel : arg2 == 2 ? &c.flashsel : arg2 == 3 ? &c.max_on_s : arg2 == 4 ? &c.strobe : &c.strobesel;
+ 	int v = (int)*field, changed = 0;
+ 	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
+ 	if (err != 0 || !changed) { return err; }
+@@ -1196,19 +1270,21 @@
+ 	lck_mtx_lock(n2t_lock);
+ 	n2t_cfg_g = c;
+ 	lck_mtx_unlock(n2t_lock);
+-	printf("NORD2 TORCH: sysctl %s: mode %u maxsel %u flashsel %u max_s %u\n", oidp->oid_name, c.mode, c.maxsel, c.flashsel, c.max_on_s);
++	printf("NORD2 TORCH: sysctl %s: mode %u maxsel %u flashsel %u max_s %u strobe %u strobesel %u\n", oidp->oid_name, c.mode, c.maxsel, c.flashsel,
++	    c.max_on_s, c.strobe, c.strobesel);
+ 	return 0;
+ }
+ static int
+ n2t_sysctl_stat SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(oidp, arg1, arg2)
+-	char buf[384];
++	char buf[480];
+ 	struct n2t_state s = n2t_st;            /* owner-thread fields, read without a lock: a diagnostic snapshot */
+ 	snprintf(buf, sizeof(buf), "made=%u owner=%u lit=%u sel=%u level=%u ms=%u expired=%u therm=%u bat_cC=%d latched=%u opens=%u reqs=%llu "
+-	    "ons=%llu offs=%llu timeouts=%llu flashes=%llu cooled=%llu derates=%llu therm_offs=%llu io_fails=%llu", n2t_made, n2t_owner_ready,
++	    "ons=%llu offs=%llu timeouts=%llu flashes=%llu cooled=%llu derates=%llu therm_offs=%llu io_fails=%llu strobe_now=%u strobes=%llu "
++	    "strobe_cooled=%llu strobe_as_pulse=%llu", n2t_made, n2t_owner_ready,
+ 	    s.hw_on, s.hw_sel, s.level, s.ms, s.expired, s.therm, s.therm_cc, s.latched, n2t_opens, s.reqs, s.ons, s.offs, s.timeouts, s.flashes,
+-	    s.flash_cooled, s.therm_derates, s.therm_offs, s.io_fails);
++	    s.flash_cooled, s.therm_derates, s.therm_offs, s.io_fails, s.hw_strobe, s.strobes, s.strobe_cooled, s.strobe_as_pulse);
+ 	return sysctl_io_string(req, buf, sizeof(buf), 0, NULL);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, n2torch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, n2t_sysctl_cfg, "I",
+@@ -1219,6 +1295,10 @@
+     "0496 flash pulse current ceiling, ITOR 0..14, default 14");
+ SYSCTL_PROC(_kern, OID_AUTO, n2torch_max_s, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 3, n2t_sysctl_cfg, "I",
+     "0496 torch on-time limit, s (10..1800, default 300)");
++SYSCTL_PROC(_kern, OID_AUTO, n2torch_strobe, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 4, n2t_sysctl_cfg, "I",
++    "0560 camera flash: 1 strobe requests use the MT6360 STROBE mode, 0 they become torch pulses");
++SYSCTL_PROC(_kern, OID_AUTO, n2torch_strobesel, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 5, n2t_sysctl_cfg, "I",
++    "0560 strobe current ceiling, ISTRB 0..116 (25 mA + 6.25 mA x n per channel), default 76 = 500 mA");
+ SYSCTL_PROC(_kern, OID_AUTO, n2torchstat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, n2t_sysctl_stat, "A",
+     "0496 torch state and counters");
+ 
+@@ -1246,6 +1326,8 @@
+ 	    "pulses ITOR %u <= %u ms duty 1/%u, off after %u s, thermal derate %d C / off %d C\n", major, n2t_cfg_g.maxsel,
+ 	    25u + n2t_cfg_g.maxsel * 25u / 2u, n2t_cfg_g.flashsel, N2T_FLASH_MS_MAX, N2T_FLASH_DUTY_DIV + 1, n2t_cfg_g.max_on_s,
+ 	    N2T_WARM_CC / 100, N2T_HOT_CC / 100);
++	printf("NORD2 TORCH STROBE: 0560 camera flash: strobe %s, ISTRB %u (%u mA x 2) <= %u ms, hardware timeout pulse + %u ms, read() status v1\n",
++	    n2t_cfg_g.strobe ? "on" : "off", n2t_cfg_g.strobesel, n2t_strobe_ma(n2t_cfg_g.strobesel), N2T_STROBE_MS_MAX, N2T_STRB_TO_MARGIN_MS);
+ }
+ 
+ void
+--- a/bsd/dev/nord2_torch.h
++++ b/bsd/dev/nord2_torch.h
+@@ -52,17 +52,43 @@
+ #define N2T_HOT_CLEAR_CC        4400
+ #define N2T_THERM_PERIOD_US     5000000ull
+ #define N2T_FAULT_LATCH         3u        /* consecutive I2C failures: torch disabled for the boot */
++/*
++ * 0560 (camflash-20261114): the camera flash as a real MT6360 STROBE (Android FLASHLIGHT_MODE_DUAL_FLASH, mt6360_pmu_fled.c):
++ *   FLED1_STRB_CTRL2 0x74 / FLED2_STRB_CTRL2 0x78: bit 7 UTRAL_ISTRB (fine range), bits [6:0] ISTRB: 25 mA + 6.25 mA * n (n <= 0x74 = 750 mA);
++ *   FLED_STRB_CTRL 0x73 bits [6:0] STRB_TO: the hardware ends the strobe after 64 ms + 32 ms * n (Android 20827: 2400 ms; here pulse + >= 48 ms);
++ *   FLED_EN 0x7E: STROBE off, 400 us, CS1|CS2|STROBE on (the LEDs light at once); off = CS1/CS2/STROBE cleared.
++ * Oplus 20817/20827 strobe table goes to 1200 mA per channel; here the ceiling is 750 mA per channel (fine range only) and the default
++ * 500 mA per channel (1 A for the LED), at most N2T_STROBE_MS_MAX per strobe, the same 1/5 duty cool-down as a 0496 pulse, no strobe when
++ * the battery is warm (>= 43 C: a lowest-current torch pulse instead) or hot (off).  A strobe request inside the cool-down or with
++ * kern.n2torch_strobe=0 is served as a 0496 torch pulse.
++ *   12 bytes  uint32 level (thousandths of kern.n2torch_strobesel), uint32 ms (1..N2T_STROBE_MS_MAX), uint32 flags (bit 0: strobe)
++ *   read()    struct n2t_status (below): what the LED does and WHEN it went on / off, in mach_absolute_time() units -- the camera picks
++ *             the frames whose whole exposure lies inside the strobe.
++ */
++#define N2T_REG_FLED_STRB_CTRL  0x73u
++#define N2T_REG_FLED1_STRB2     0x74u
++#define N2T_REG_FLED2_STRB2     0x78u
++#define N2T_UTRAL_ISTRB         0x80u
++#define N2T_ISTRB_MASK          0x7Fu
++#define N2T_STRB_TO_MASK        0x7Fu
++#define N2T_STRB_HW_MAX         0x74u     /* 750 mA per channel (top of the fine range) */
++#define N2T_STROBESEL_DEFAULT   0x4Cu     /* 500 mA per channel */
++#define N2T_STROBE_MS_MAX       250u
++#define N2T_STRB_TO_MARGIN_MS   48u
+ 
+ struct n2t_cfg {
+ 	uint32_t mode;        /* kern.n2torch: 1 allow, 0 off (and kept off) */
+ 	uint32_t maxsel;      /* kern.n2torch_maxsel 0..N2T_SEL_HW_MAX */
+ 	uint32_t flashsel;    /* kern.n2torch_flashsel 0..N2T_SEL_HW_MAX */
+ 	uint32_t max_on_s;    /* kern.n2torch_max_s */
++	uint32_t strobe;      /* 0560 kern.n2torch_strobe: 1 = a 12-byte strobe request uses the MT6360 STROBE mode, 0 = it becomes a 0496 pulse */
++	uint32_t strobesel;   /* 0560 kern.n2torch_strobesel: ISTRB ceiling 0..N2T_STRB_HW_MAX (25 mA + 6.25 mA x n per channel) */
+ };
+ 
+ /* a request as written by userland (seq changes on every write; level 0 = off) */
+ struct n2t_req {
+ 	uint32_t seq, level, ms;
++	uint32_t strobe;      /* 0560: 1 = strobe request (12-byte write with flag bit 0) */
+ };
+ 
+ struct n2t_state {
+@@ -82,12 +108,17 @@
+ 	uint32_t hw_sel;
+ 	/* counters */
+ 	uint64_t reqs, ons, offs, timeouts, flashes, flash_cooled, therm_derates, therm_offs, io_fails;
++	/* 0560: strobe */
++	bool     strobe;          /* the request taken is a strobe (cleared when its cool-down or the configuration turns it into a pulse) */
++	bool     hw_strobe;       /* the hardware is in STROBE mode now */
++	uint64_t strobes, strobe_cooled, strobe_as_pulse;
+ };
+ 
+ static inline void
+ n2t_cfg_default(struct n2t_cfg *c)
+ {
+ 	c->mode = 1; c->maxsel = N2T_MAXSEL_DEFAULT; c->flashsel = N2T_FLASHSEL_DEFAULT; c->max_on_s = N2T_ON_S_DEFAULT;
++	c->strobe = 1; c->strobesel = N2T_STROBESEL_DEFAULT;      /* 0560 */
+ }
+ 
+ static inline void
+@@ -98,6 +129,8 @@
+ 	if (c->flashsel > N2T_SEL_HW_MAX) { c->flashsel = N2T_SEL_HW_MAX; }
+ 	if (c->max_on_s < N2T_ON_S_MIN) { c->max_on_s = N2T_ON_S_MIN; }
+ 	if (c->max_on_s > N2T_ON_S_MAX) { c->max_on_s = N2T_ON_S_MAX; }
++	c->strobe = c->strobe ? 1u : 0u;                                   /* 0560 */
++	if (c->strobesel > N2T_STRB_HW_MAX) { c->strobesel = N2T_STRB_HW_MAX; }
+ }
+ 
+ static inline void
+@@ -135,10 +168,18 @@
+ n2t_take(struct n2t_state *s, const struct n2t_req *r, uint64_t now_us)
+ {
+ 	if (r->seq == s->seen_seq) { return; }
++	/* 0560: a pulse / strobe cut short by this request still earns its cool-down (duty <= 1/5 also for back-to-back requests) */
++	if (s->ms != 0 && s->level != 0 && !s->expired && s->req_us != 0 && now_us > s->req_us) {
++		uint64_t end = s->req_us + (uint64_t)s->ms * 1000u;
++		if (end > now_us) { end = now_us; }
++		uint64_t cool = end + (end - s->req_us) * N2T_FLASH_DUTY_DIV;
++		if (cool > s->cool_until_us) { s->cool_until_us = cool; }
++	}
+ 	s->seen_seq = r->seq; s->level = r->level; s->ms = r->ms; s->req_us = now_us; s->expired = false; s->reqs++;
++	s->strobe = r->strobe != 0 && r->ms != 0 && r->level != 0;              /* 0560 */
+ 	s->ceiling = 0xffffffffu;                                /* resolved against the configuration in n2t_decide */
+ 	if (r->ms != 0 && r->level != 0) {
+-		if (now_us < s->cool_until_us) { s->flash_cooled++; s->ceiling = 0xfffffffeu; }   /* inside the cool-down: torch current */
++		if (now_us < s->cool_until_us) { s->flash_cooled++; s->ceiling = 0xfffffffeu; if (s->strobe) { s->strobe_cooled++; s->strobe = false; } }   /* inside the cool-down: torch current */
+ 		else { s->flashes++; }
+ 	}
+ }
+@@ -172,7 +213,8 @@
+ 	if (s->ms != 0) {                                        /* flash pulse */
+ 		if (age >= (uint64_t)s->ms * 1000u) {
+ 			s->expired = true;
+-			s->cool_until_us = now_us + (uint64_t)s->ms * 1000u * N2T_FLASH_DUTY_DIV;
++			uint64_t cool = now_us + (uint64_t)s->ms * 1000u * N2T_FLASH_DUTY_DIV;    /* 0560: never shortens a running cool-down */
++			if (cool > s->cool_until_us) { s->cool_until_us = cool; }
+ 			return false;
+ 		}
+ 		*sel = n2t_level_sel(s->level, s->ceiling == 0xfffffffeu ? c->maxsel : c->flashsel);
+@@ -183,4 +225,77 @@
+ 	if (s->therm == 1) { *sel = 0; }                        /* warm: lowest current */
+ 	return true;
+ }
++/* ---- 0560: strobe ---- */
++/* 12-byte request -> level, ms, strobe flag; false = malformed */
++static inline bool
++n2t_parse12(const uint8_t *b, unsigned len, uint32_t *level, uint32_t *ms, uint32_t *strobe)
++{
++	if (len != 12) { return false; }
++	uint32_t l = (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
++	uint32_t m = (uint32_t)b[4] | (uint32_t)b[5] << 8 | (uint32_t)b[6] << 16 | (uint32_t)b[7] << 24;
++	uint32_t f = (uint32_t)b[8] | (uint32_t)b[9] << 8 | (uint32_t)b[10] << 16 | (uint32_t)b[11] << 24;
++	if (l > 1000 || (f & ~1u) != 0) { return false; }
++	if (m == 0 || m > ((f & 1u) ? N2T_STROBE_MS_MAX : N2T_FLASH_MS_MAX)) { return false; }
++	*level = l; *ms = m; *strobe = f & 1u;
++	return true;
++}
++
++/* level (1..1000) of an ISTRB ceiling -> ISTRB selector (>= 1 for a lit level), never above the ceiling */
++static inline uint32_t
++n2t_strobe_sel(uint32_t level, uint32_t ceiling)
++{
++	if (ceiling > N2T_STRB_HW_MAX) { ceiling = N2T_STRB_HW_MAX; }
++	uint32_t s = (level * ceiling + 500u) / 1000u;
++	if (s == 0 && level != 0) { s = 1; }
++	return s > ceiling ? ceiling : s;
++}
++
++/* STRB_TO selector: the hardware timeout (64 + 32 n ms) is at least ms + N2T_STRB_TO_MARGIN_MS */
++static inline uint32_t
++n2t_strobe_to_sel(uint32_t ms)
++{
++	uint32_t want = ms + N2T_STRB_TO_MARGIN_MS;
++	if (want <= 64u) { return 0; }
++	uint32_t n = (want - 64u + 31u) / 32u;
++	return n > 74u ? 74u : n;
++}
++
++/* per channel mA of an ISTRB selector (fine range) */
++static inline uint32_t
++n2t_strobe_ma(uint32_t sel)
++{
++	return 25u + sel * 25u / 4u;
++}
++
++/*
++ * The decision with its kind: 0 dark, 1 torch mode (torch or 0496 pulse) at *sel (ITOR), 2 strobe at *sel (ISTRB).  A strobe request
++ * becomes a pulse (kind 1) when kern.n2torch_strobe=0, inside the cool-down (n2t_take) or with a warm battery; expiry as n2t_decide.
++ */
++static inline uint32_t
++n2t_decide_kind(struct n2t_state *s, const struct n2t_cfg *c, uint64_t now_us, uint32_t *sel)
++{
++	bool strobe = s->strobe;
++	if (!n2t_decide(s, c, now_us, sel)) { return 0; }
++	if (strobe && c->strobe && s->therm == 0) {
++		*sel = n2t_strobe_sel(s->level, c->strobesel);
++		return 2;
++	}
++	if (strobe && s->level != 0) { s->strobe = false; s->strobe_as_pulse++; }
++	return 1;
++}
++
++/* what read() of /dev/redwood-torch gives (little endian, 64 bytes) */
++#define N2T_STATUS_MAGIC        0x5354324eu       /* "N2TS" */
++struct n2t_status {
++	uint32_t magic, version;          /* N2T_STATUS_MAGIC, 1 */
++	uint32_t seq;                     /* the last request taken by the owner thread */
++	uint32_t state;                   /* 0 dark, 1 torch mode, 2 strobe */
++	uint64_t on_time;                 /* mach_absolute_time() when the LED last went on (after the enabling write) */
++	uint64_t off_time;                /* ... when it last went off (0: not since it went on) */
++	uint32_t sel;                     /* ITOR or ISTRB selector of the lit state */
++	uint32_t flags;                   /* bit 0 strobe allowed (kern.n2torch_strobe), 1 warm, 2 hot, 3 fault latch, 4 kern.n2torch=0 */
++	uint32_t strobesel, strobe_ms_max;
++	uint32_t lit_seq;                 /* the request the on_time belongs to */
++	uint32_t reserved[3];
++};
+ #endif

@@ -1,0 +1,134 @@
+--- a/bsd/dev/nord2_gpsdl.inc
++++ b/bsd/dev/nord2_gpsdl.inc
+@@ -322,7 +322,7 @@
+ 	{ N2G_CFG_GALS_CONN2GPS, 1u << 4, 1u << 7 }, { N2G_CFG_GALS_CONN2GPS, 1u << 0, 1u << 3 },
+ 	{ N2G_CFG_GALS_GPS2CONN, 1u << 4, 1u << 7 }, { N2G_CFG_GALS_GPS2CONN, 1u << 0, 1u << 3 },
+ };
+-static const char *const n2gl_name[34] = { "", "GPS wake vote", "read conn_infra cfg page", "read conn_infra RGU page",
++static const char *const n2gl_name[37] = { "", "GPS wake vote", "read conn_infra cfg page", "read conn_infra RGU page",
+ 	"read WB_STA + GPS CSRs", "GPS EMI remap", "BGFSYS_ON_TOP power", "GP_FUNCTION_EN + BGF acks", "GALS sleep protection off",
+ 	"gps_top_off ACTIVE check", "A-die top clock", "read GPS bus (first)", "GPS CLKGEN1 DIGCK", "L1 DSP pwr_stat ON",
+ 	"read GPS RGU_ON page", "L1 power on + soft reset release", "USRT on + DSP ROM okay", "data link up (rings, DMA idle check)", "send libmnl frame 1 (A2D DMA)", "capture the DSP reply (D2A DMA)",
+@@ -333,7 +333,9 @@
+ 	"S10e RX DMA2 armed small, GPS wake vote RELEASED 3 s idle, vote back, disarm",
+ 	"S11 DSP code download (uploaded libmnl frames), post-boot command, rollback", "S11 DSP code download + HOLD (vote held, INTEN off, RX 256 B per arming)",
+ 	"S12 HOLD with the DSP in ROM (NO kernel download): libmnl boots the DSP itself over the pipe, vendor flow (0586)",
+-	"S13 pacing probe: S11 download with a 200 ms idle gap after fragment 1 (1 ms state samples), then HOLD as K=31 (0587)" };
++	"S13 pacing probe: S11 download with a 200 ms idle gap after fragment 1 (1 ms state samples), then HOLD as K=31 (0587)",
++	"S12b = K=32 + NO LNA + ladder-style RX (fresh 64 B arming before each pipe TX) + 2 s settle (0588)",
++	"S12c = K=32 + NO LNA + 2 s settle (0588)", "S12d = K=32 + ladder-style RX + 2 s settle, LNA on (0588)" };
+ /* 0357: GPS RGU_ON (bus 0x80000000 -> AP 0x18c00000) and CFG_ON (0x80001000 -> 0x18c01000), plat/v010 gps_rgu_on.h / gps_cfg_on.h */
+ #define N2G_GPS_RGU_L1_CR          0x18c00014u   /* [0] RGU_GPS_L1_ON [5] RGU_GPS_L1_SOFT_RST_B */
+ #define N2G_GPS_RGU_L1_DLY_CHAIN   0x18c00160u   /* [19:16] MEM_PDN_DELAY_DUMMY_NUM (vendor 5) */
+@@ -951,6 +953,7 @@
+ #define N2G_CSR_BUS_TIMEOUT_IRQ 0x180602d4u                     /* 0587: conn_infra host CSR, [0] == 1 = no off-domain bus hang */
+ #endif
+ static int n2gb_gap_ms;
++static uint32_t n2gq_mode;                                      /* 0588: K=34..36 HOLD variant bits (1 = no LNA, 2 = S11-style RX) */
+ static void
+ n2gb_gap_watch(int ms)
+ {
+@@ -1350,7 +1353,7 @@
+ 	    k, n2gl_name[k], g[0], g[3], g[4], g[5], g[6], g[7] >> 16, g[7] & 0xffff, g[8] >> 16, g[8] & 0xffff, ok ? "guard ok" : "GUARD REFUSES");
+ 	if (!ok) { return 0x01000000u; }
+ 	if (n2gd_hw(&n2gl_hw)) { return 0x0300u; }
+-	if ((k == 22 || k == 24 || k == 31 || k == 32 || k == 33) && n2gd.powered) { printf("NORD2 GNSS LAD %d: already held\n", k); return 1; }
++	if ((k == 22 || k == 24 || (k >= 31 && k <= 36)) && n2gd.powered) { printf("NORD2 GNSS LAD %d: already held\n", k); return 1; }
+ 	n2gl_tx_started = n2gl_rx_started = false;
+ 	n2gl_v9 = k >= 23; n2gl_rx_armed = false;                /* 0362 */
+ 	int last = k <= 19 ? k : (k == 21 ? 15 : (k == 22 || k >= 23) ? 17 : 16), rc = 0, s;
+@@ -1379,7 +1382,17 @@
+ 		printf("NORD2 GNSS LAD 24: V9 HOLD, GNSS powered, RX DMA2 armed, /dev/gpsdl0 read/write enabled (conn_infra %#x), NOT rolled back until reboot\n", n2gd.conn_hw_ver);
+ 		return 1;
+ 	}
+-	if (!rc && k == 32) {
++	if (!rc && (k == 32 || (k >= 34 && k <= 36))) {
++		/*
++		 * 0588 (gnss-20261114): K = 34..36 = K = 32 with the pipe made to look like the kernel S11 loop. gnss8a (q10jgd + gnssfix8,
++		 * poll 1 ms) died ~3 ms after libmnl's fragment 1 like hang5 (poll 10 ms): pacing excluded. libmnl's frames are byte-identical
++		 * to the kernel blob (boot proxy: "identical to the kernel blob", 0 frames unlike), and the TX register sequence is the same,
++		 * so what differs from the working S11 loop is the HOLD environment: (a) 0585 put GPIO162 in mode 2 (DSP-driven L1 eLNA)
++		 * BEFORE the download (K = 31 sets it only after the boot; never tested during a boot), (b) RX DMA2 runs one long 256 B
++		 * arming across TXs (S11 stops it and arms a fresh 64 B round right before every TX), (c) the header comes ~46 ms after the
++		 * EMI request / RESET_DONE ack (S11: 2 s pause). K = 34 removes all three, K = 35 only (a)+(c), K = 36 only (b)+(c).
++		 */
++		n2gq_mode = k == 34 ? 7u : k == 35 ? 5u : k == 36 ? 6u : 0u;   /* bit 0 = no LNA, bit 1 = ladder-style RX per TX, bit 2 = no 0587 gate sampling */
+ 		/*
+ 		 * 0586 (gnss-20261114): K = 32 = steps 1..17 (DSP ROM okay, data link up) + the S11 data-link prep WITHOUT the kernel DSP code
+ 		 * download, then the same HOLD as K = 31 (GPS wake vote held, INTEN off, RX 256 B per arming). libmnl then runs its own
+@@ -1391,8 +1404,8 @@
+ 		 * the DSP receives each boot frame exactly once, from libmnl, whose state machine sees the genuine 0xFE31/0xFE32 acks and the
+ 		 * DSP's real post-boot answer (gnssd5..7 had to fake them, and libmnl stayed idle).
+ 		 */
+-		printf("NORD2 GNSS LAD 32: about to run NEW S12 phase (%s)\n", n2gl_name[32]); delay(2000000);
+-		n2gl_rx_cap = 256; n2gl_rx_norearm = false; n2gl_rx_armed = false; n2gl_rx_total = 0; n2gl_lines = 0;
++		printf("NORD2 GNSS LAD %d: about to run NEW S12 phase (%s)\n", k, n2gl_name[k]); delay(2000000);
++		n2gl_rx_cap = (n2gq_mode & 2u) ? 64u : 256u; n2gl_rx_norearm = false; n2gl_rx_armed = false; n2gl_rx_total = 0; n2gl_lines = 0;
+ 		n2gl_show("USRT INTEN", N2G_USRT_INTEN(0)); n2gl_show("USRT STA", N2G_USRT_STA(0)); n2gl_show("USRT D2AF", N2G_USRT_D2AF(0));
+ 		n2gl_mcub_ack(true);
+ 		n2gl_o.emictl = n2gl_rd(N2G_CFG_EMI_CTL); done[25] = true;
+@@ -1404,11 +1417,13 @@
+ 			n2gd.powered = true; n2gd.hw_valid = true; n2gd.last_err = 0;
+ 			n2gd.conn_hw_ver = n2gl_rd(N2G_CONN_HW_VER);
+ 			n2gl_v9hold = true; n2gd_dl_up = true;
+-			printf("NORD2 GNSS LAD 32: S12 HOLD, DSP in ROM (no kernel download), GPS wake vote held, /dev/gpsdl0 read/write enabled for libmnl's own DSP boot, NOT rolled back until reboot\n");
++			if (k >= 34) { printf("NORD2 GNSS LAD %d: 0588 settle 2 s after the EMI request (as S11) before the pipe opens\n", k); delay(2000000); }
++			printf("NORD2 GNSS LAD %d: S12 HOLD, DSP in ROM (no kernel download), GPS wake vote held, /dev/gpsdl0 read/write enabled for libmnl's own DSP boot, NOT rolled back until reboot (0588 mode %u: LNA %s, RX %s)\n",
++			    k, n2gq_mode, (n2gq_mode & 1u) ? "NOT set" : "GPIO162 mode 2", (n2gq_mode & 2u) ? "fresh 64 B arming before each TX" : "256 B continuous");
+ 			n2gq_hb("HOLD start (0586 S12: libmnl boots the DSP)");
+-			n2gt("S12 HOLD: DSP in ROM, libmnl boots it (0586)");
+-			n2gt("LNA: GPIO162 -> mode 2 (0585)");
+-			n2gd_lna_l1_dsp_ctrl();
++			n2gt("S12 HOLD K=%d mode %u: DSP in ROM, libmnl boots it (0586/0588)", k, n2gq_mode);
++			if (!(n2gq_mode & 1u)) { n2gt("LNA: GPIO162 -> mode 2 (0585)"); n2gd_lna_l1_dsp_ctrl(); }
++			else { printf("NORD2 GNSS LNA: GPIO162 left in its boot mode (0588 K=%d)\n", k); }
+ 			return 1;
+ 		}
+ 		if (n2gl_stop) { return 0x01000000u | ((uint32_t)k << 8); }
+@@ -1603,6 +1618,9 @@
+ 	case (uint32_t)N2GD_IOC(171):
+ 	case (uint32_t)N2GD_IOC(172):                            /* 0586: S12 HOLD without the kernel DSP boot */
+ 	case (uint32_t)N2GD_IOC(173):                            /* 0587: S13 pacing probe (K=31 + 200 ms gap after fragment 1) */
++	case (uint32_t)N2GD_IOC(174):                            /* 0588: S12b/c/d (K=32 variants) */
++	case (uint32_t)N2GD_IOC(175):
++	case (uint32_t)N2GD_IOC(176):
+ 		if (n2gd_ctl & 1) { printf("NORD2 GNSS: ladder refused (sysctl kern.n2gnss bit 0)\n"); return ENODEV; }
+ 		lck_mtx_lock(&n2gd_lock);
+ 		v = n2gd_ladder((int)((uint32_t)cmd & 0xff) - 140);
+@@ -1730,7 +1748,7 @@
+ 		/* 0587: two more host CSR words per pipe call (same Wi-Fi host page, safe whenever the guard passes), so the 0583 trace
+ 		 * shows the conn_infra state at the poll rate up to a hang: CONN_SLP_PROT_CTRL (0x18060184: [5] on2off / [3] off2on
+ 		 * sleep-protection ack, [11:9] the AP2CONN enables) and BUS_TIMEOUT_IRQ (0x180602d4 [0] == 1 = no off-domain bus hang). */
+-		if (!(n2gd_ctl & 16)) {
++		if (!(n2gd_ctl & 16) && !(n2gq_mode & 4u)) {               /* 0588: K=34..36 skip it (same pipe as q10jgo/hang5) */
+ 			uint32_t slp = n2gl_hw.read32(n2gl_hw.ctx, N2G_CSR_SLP_PROT_CTRL), bto = n2gl_hw.read32(n2gl_hw.ctx, N2G_CSR_BUS_TIMEOUT_IRQ);
+ 			if ((slp != n2gq.last_slp || bto != n2gq.last_bto) && n2gq.cslog < 30) {
+ 				n2gq.cslog++;
+@@ -1752,6 +1770,19 @@
+ 	}
+ 	return EAGAIN;
+ }
++/* 0588: K = 34/36 pipe RX like the S11 loop: before every TX close the running D2A round (bytes it wrote stay in the ring for
++ * read(); nothing is consumed) and arm a fresh one (n2gl_rx_cap = 64) at the write index */
++static void
++n2gq_rx_fresh(void)
++{
++	if (n2gl_rx_armed) {
++		uint32_t w = n2gl_rx_written();
++		if (w > n2gl_rx_cur) { n2gl_rx_total += w - n2gl_rx_cur; n2gl_rx_cur = w; n2gl_rx.wr = (n2gl_rx_at + w) % N2GL_RING; }
++		n2gl_dma_stop_q(N2GL_RXCH);
++		n2gl_rx_armed = false;
++	}
++	if (!n2gl_stop) { (void)n2gl_rx_arm(false); }
++}
+ /* quiet synchronous TX (n2gl_tx without the per-register console lines) */
+ static int
+ n2gq_tx(const uint8_t *buf, uint32_t len)
+@@ -1840,6 +1871,7 @@
+ 			printf("NORD2 GNSS PIPE: about to TX write #%llu: %u bytes, id %#x (%02x %02x %02x %02x %02x %02x)\n", (unsigned long long)n2gq.wr, m,
+ 			    m >= 6 ? (uint32_t)(buf[4] | (buf[5] << 8)) : 0u, buf[0], m > 1 ? buf[1] : 0, m > 2 ? buf[2] : 0, m > 3 ? buf[3] : 0, m > 4 ? buf[4] : 0, m > 5 ? buf[5] : 0);
+ 		}
++		if (n2gq_mode & 2u) { n2gq_rx_fresh(); }               /* 0588 */
+ 		int te = n2gq_tx(buf, m);
+ 		if (te) { e = n2gl_stop ? EIO : ETIMEDOUT; break; }
+ 		n2gq.wr_bytes += m;

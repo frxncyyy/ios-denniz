@@ -1,0 +1,63 @@
+--- a/bsd/dev/nord2_gpsdl.inc
++++ b/bsd/dev/nord2_gpsdl.inc
+@@ -369,7 +369,18 @@
+ static bool n2gl_tx_started, n2gl_rx_started;
+ static int n2gd_ringwin(uint8_t **va);
+ static uint32_t n2gd_gicd_rd(uint32_t off);                    /* 0363: sweet_touch.c, read-only GICD word */          /* sweet_touch.c: maps (once) and zeroes the 64 KiB window */
+-static uint32_t n2gl_bus(uint32_t off) { return 0x78000000u + off; }   /* off from the window base (= remap base) */
++/*
++ * 0584 (gnss-20261114): GPS EMI window moved to the vendor layout. gnsstr1 (0583 trace, 06:07) died ~10 ms after an ordinary RX DMA2
++ * re-arm with no AP access pending, i.e. not on an AP register access. The vendor reserves 1 MiB for GPS and lays it out as
++ * (linux/inc/gps_dl_linux_reserved_mem.h): icap_buf 0x50000 (DSP-owned, I/Q capture) | 4 KiB pad | tx_dma_buf[2][8K+4K] |
++ * rx_dma_buf[2][8K+4K] | met_buf 32 KiB = 0x65000, remap base = start of the reserve (hal/gps_dl_conn_infra.c, bus 0x78000000,
++ * 64 MiB window). Our 0359 window at 0xDFE00000 put the TX/RX rings at remap offsets 0/0x2000 = inside the DSP's icap area, and
++ * the 1 MiB reserve the DSP may use reached DPM firmware memory at 0xDFE70000 (offset 0x70000; live.dts mblock-27-DPM-reserved)
++ * and the modem at 0xE0000000. Now: remap base 0xDFC00000 (1 MiB aligned; 0xDFC00000..0xDFE70000 is free: jpegdec ends 0xDFC00000),
++ * rings at the vendor offsets (L1 TX 0x51000, L1 RX 0x51000 + 0x2000 as before relative to the ring window), the whole first 1 MiB
++ * is free RAM, DPM is at offset 0x270000. */
++#define N2GL_RING_OFF  0x51000u
++static uint32_t n2gl_bus(uint32_t off) { return 0x78000000u + N2GL_RING_OFF + off; }   /* off from the ring window base */
+ static uint32_t n2gl_rx_used(void) { return (n2gl_rx.wr + N2GL_RING - n2gl_rx.rd) % N2GL_RING; }
+ static bool
+ n2gl_wr(uint32_t pa, uint32_t v)
+@@ -513,6 +524,7 @@
+ {	/* gps_dl_hw_set_dma_stop: STR = 0, ACKINT = 1 */
+ 	n2gl_rmw_q(N2G_DMA_START(ch), N2G_DMA_BIT, 0);
+ 	n2gl_rmw_q(N2G_DMA_ACKINT(ch), N2G_DMA_BIT, N2G_DMA_BIT);
++	(void)n2gl_rd(N2G_DMA_STATE(ch));                         /* 0584: channel state after the stop, in the 0583 trace */
+ }
+ /* arm DMA2 on all free RX ring bytes from the write index (it wraps at the ring end through WPPT/WPTO) */
+ static bool
+@@ -1108,7 +1120,7 @@
+ 		if (n2gd_ringwin(&n2gl_ring_va)) { return N2G_E_ARG; }
+ 		n2gl_rx.rd = n2gl_rx.wr = 0;
+ 		done[17] = true;
+-		n2gl_show("GPS EMI remap (want 0xdfe0)", N2G_CSR_CONN2AP_GPS_EMI);
++		n2gl_show("GPS EMI remap (want 0xdfc0, 0584)", N2G_CSR_CONN2AP_GPS_EMI);
+ 		n2gl_dma_regs("idle?", N2GL_TXCH); n2gl_dma_regs("idle?", N2GL_RXCH);
+ 		n2gl_show("USRT STA", N2G_USRT_STA(0)); n2gl_show("USRT D2AF", N2G_USRT_D2AF(0));
+ 		return n2gl_stop ? N2G_E_ARG : 0;
+--- a/bsd/dev/nord2_gnss_bind.inc
++++ b/bsd/dev/nord2_gnss_bind.inc
+@@ -118,7 +118,7 @@
+ 
+ /* GPS DMA buffers are milestone 2; until then the EMI remap points at the CONN EMI region the Wi-Fi owner already
+  * remaps (0x8a000000 in npa_persistent_window), which the GNSS DMA does not use yet (no DMA is started). */
+-#define N2GD_EMI_BASE 0xdfe00000u                     /* 0359: the GPS ring window (was the Wi-Fi CONN region 0x8a000000) */
++#define N2GD_EMI_BASE 0xdfc00000u                     /* 0584: GPS EMI remap base, vendor layout (0359: 0xdfe00000) */
+ /* 0359: GPS DMA rings in the unused physical gap 0xDA800000..0xDFE70000 (redwood_vcodec.h; below XNU's RAM window at
+  * 0x1_42000000): 64 KiB at 0xDFE00000, kernel_map Device mapping, zeroed once. */
+ #define N2GD_RING_WIN 0x10000u
+@@ -127,10 +127,10 @@
+ {
+ 	static uint8_t *w;
+ 	if (!w) {
+-		w = (uint8_t *)ml_io_map_unmappable(N2GD_EMI_BASE, N2GD_RING_WIN, VM_WIMG_IO);
++		w = (uint8_t *)ml_io_map_unmappable(N2GD_EMI_BASE + N2GL_RING_OFF, N2GD_RING_WIN, VM_WIMG_IO);   /* 0584: rings at the vendor offset */
+ 		if (!w) { printf("NORD2 GNSS: ring window map failed\n"); return ENOMEM; }
+ 		for (uint32_t i = 0; i < N2GD_RING_WIN; i += 4) { *(volatile uint32_t *)(void *)(w + i) = 0; }
+-		printf("NORD2 GNSS: ring window %#x mapped at %p, zeroed\n", N2GD_EMI_BASE, w);
++		printf("NORD2 GNSS: ring window %#x (remap base %#x + %#x, 0584) mapped at %p, zeroed\n", N2GD_EMI_BASE + N2GL_RING_OFF, N2GD_EMI_BASE, N2GL_RING_OFF, w);
+ 	}
+ 	*va = w;
+ 	return 0;

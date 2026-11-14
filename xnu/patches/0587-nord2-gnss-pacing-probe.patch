@@ -1,0 +1,166 @@
+--- a/bsd/dev/nord2_gpsdl.inc
++++ b/bsd/dev/nord2_gpsdl.inc
+@@ -322,7 +322,7 @@
+ 	{ N2G_CFG_GALS_CONN2GPS, 1u << 4, 1u << 7 }, { N2G_CFG_GALS_CONN2GPS, 1u << 0, 1u << 3 },
+ 	{ N2G_CFG_GALS_GPS2CONN, 1u << 4, 1u << 7 }, { N2G_CFG_GALS_GPS2CONN, 1u << 0, 1u << 3 },
+ };
+-static const char *const n2gl_name[33] = { "", "GPS wake vote", "read conn_infra cfg page", "read conn_infra RGU page",
++static const char *const n2gl_name[34] = { "", "GPS wake vote", "read conn_infra cfg page", "read conn_infra RGU page",
+ 	"read WB_STA + GPS CSRs", "GPS EMI remap", "BGFSYS_ON_TOP power", "GP_FUNCTION_EN + BGF acks", "GALS sleep protection off",
+ 	"gps_top_off ACTIVE check", "A-die top clock", "read GPS bus (first)", "GPS CLKGEN1 DIGCK", "L1 DSP pwr_stat ON",
+ 	"read GPS RGU_ON page", "L1 power on + soft reset release", "USRT on + DSP ROM okay", "data link up (rings, DMA idle check)", "send libmnl frame 1 (A2D DMA)", "capture the DSP reply (D2A DMA)",
+@@ -332,7 +332,8 @@
+ 	"S10c TX boot header, NO RX DMA (reply stays in the USRT FIFO), INTEN off", "S10d as S10c with USRT INTEN on (vendor)",
+ 	"S10e RX DMA2 armed small, GPS wake vote RELEASED 3 s idle, vote back, disarm",
+ 	"S11 DSP code download (uploaded libmnl frames), post-boot command, rollback", "S11 DSP code download + HOLD (vote held, INTEN off, RX 256 B per arming)",
+-	"S12 HOLD with the DSP in ROM (NO kernel download): libmnl boots the DSP itself over the pipe, vendor flow (0586)" };
++	"S12 HOLD with the DSP in ROM (NO kernel download): libmnl boots the DSP itself over the pipe, vendor flow (0586)",
++	"S13 pacing probe: S11 download with a 200 ms idle gap after fragment 1 (1 ms state samples), then HOLD as K=31 (0587)" };
+ /* 0357: GPS RGU_ON (bus 0x80000000 -> AP 0x18c00000) and CFG_ON (0x80001000 -> 0x18c01000), plat/v010 gps_rgu_on.h / gps_cfg_on.h */
+ #define N2G_GPS_RGU_L1_CR          0x18c00014u   /* [0] RGU_GPS_L1_ON [5] RGU_GPS_L1_SOFT_RST_B */
+ #define N2G_GPS_RGU_L1_DLY_CHAIN   0x18c00160u   /* [19:16] MEM_PDN_DELAY_DUMMY_NUM (vendor 5) */
+@@ -936,6 +937,53 @@
+ 	n2gb_rx_close();
+ 	return false;
+ }
++/*
++ * 0587 (gnss-20261114): K = 33 "S13 pacing probe". Every hang (hang3/4/5) came 10..20 ms after a frame reached the DSP from the
++ * HOLD pipe, where libmnl answers through n2mnld's 10 ms read poll; the same frames inside the kernel S11 loop (next frame ~1 ms
++ * after the ack) never hung (53 TX). hang5: header, 5 ms, fragment 1 (acked, 12 B), then death ~10 ms into the wait for
++ * fragment 2. Hypothesis H1: the DSP ROM loader misbehaves when the host is slow between fragments. K = 33 = K = 31 with ONE
++ * change: after fragment 1 is acked the kernel stays idle for 200 ms (RX armed for 64 B, no TX) and samples the GPS/conn_infra
++ * state every 1 ms into the 0583 trace (console line on every change, max 60), then finishes the download and HOLDs like K = 31.
++ * Hang inside the gap = H1 proven with the pre-death state in the trace; no hang = idle after fragment 1 is harmless and the
++ * killer is specific to the userland path.
++ */
++#ifndef N2G_CSR_BUS_TIMEOUT_IRQ
++#define N2G_CSR_BUS_TIMEOUT_IRQ 0x180602d4u                     /* 0587: conn_infra host CSR, [0] == 1 = no off-domain bus hang */
++#endif
++static int n2gb_gap_ms;
++static void
++n2gb_gap_watch(int ms)
++{
++	static const uint32_t pa[9] = { N2G_CSR_GPS_CFG2HOST_DBG, N2G_CSR_SLP_PROT_CTRL, N2G_CSR_BUS_TIMEOUT_IRQ, 0x18c01020u /* L1 SLP_PWR_CTL */,
++	    N2G_GPS_AON_DSLEEP_CTL, N2G_USRT_STA(0), N2G_USRT_D2AF(0), N2G_USRT_MONF(0), N2G_DMA_RLCT(N2GL_RXCH) };
++	uint32_t last[9]; int lines = 0;
++	for (int j = 0; j < 9; j++) { last[j] = 0xdeadbeefu; }
++	n2gl_rx_cap = 64; n2gl_rx_norearm = true;
++	if (!n2gl_rx_arm(false)) { return; }
++	printf("NORD2 GNSS LAD %d: S13 GAP START: fragment 1 acked, %d ms idle (no TX), state sampled every 1 ms\n", n2gl_k, ms);
++	n2gt("S13 gap start %d ms", ms);
++	int t;
++	for (t = 0; t < ms && !n2gl_stop; t++) {
++		uint32_t v[9];
++		for (int j = 0; j < 9; j++) { v[j] = n2gl_rd(pa[j]); }
++		if (n2gl_stop) { break; }
++		bool ch = false;
++		for (int j = 0; j < 9; j++) { if (v[j] != last[j]) { ch = true; } }
++		if (ch && lines < 60) {
++			lines++;
++			printf("NORD2 GNSS LAD %d: S13 t=%dms top=%#x slp=%#x bto=%#x l1slp=%#x aon=%#x sta=%#x d2af=%#x monf=%#x rlct=%#x\n", n2gl_k, t,
++			    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]);
++		}
++		for (int j = 0; j < 9; j++) { last[j] = v[j]; }
++		n2gl_rx_service(true);
++		n2gp_feed();
++		if (!n2gl_rx_armed) { n2gl_rx_arm(false); }
++		delay(1000);
++	}
++	n2gb_rx_close();
++	printf("NORD2 GNSS LAD %d: S13 GAP END after %d ms: phone alive, %u DSP frames parsed so far; continuing the download\n", n2gl_k, t, n2gp_frames);
++	n2gt("S13 gap end %d ms", t);
++}
+ /* K = 30 / 31: header (ack 0xFE31 seq 0; COMD4 x3 + header up to 3 rounds), 50 fragments (ack 0xFE32 seq k, 2 resends),
+  * the post-boot command, 3 s capture with RX re-armed (256 bytes per arming). Returns 0 on a complete boot. */
+ static int
+@@ -977,6 +1025,7 @@
+ 			printf("NORD2 GNSS LAD %d: S11 fragment %d/50 %s after %d send(s)\n", n2gl_k, k, ok ? "ACK 0xFE32" : "NO ACK", t);
+ 		}
+ 		if (!ok) { break; }
++		if (k == 1 && n2gb_gap_ms > 0) { n2gb_gap_watch(n2gb_gap_ms); }      /* 0587: K = 33 pacing probe */
+ 	}
+ 	if (n2gl_stop) { return N2G_E_ARG; }
+ 	printf("NORD2 GNSS LAD %d: S11 fragments acked %d/50 (frames parsed %u, bad checksum %u)\n", n2gl_k, acked, n2gp_frames, n2gp_bad);
+@@ -1301,7 +1350,7 @@
+ 	    k, n2gl_name[k], g[0], g[3], g[4], g[5], g[6], g[7] >> 16, g[7] & 0xffff, g[8] >> 16, g[8] & 0xffff, ok ? "guard ok" : "GUARD REFUSES");
+ 	if (!ok) { return 0x01000000u; }
+ 	if (n2gd_hw(&n2gl_hw)) { return 0x0300u; }
+-	if ((k == 22 || k == 24 || k == 31 || k == 32) && n2gd.powered) { printf("NORD2 GNSS LAD %d: already held\n", k); return 1; }
++	if ((k == 22 || k == 24 || k == 31 || k == 32 || k == 33) && n2gd.powered) { printf("NORD2 GNSS LAD %d: already held\n", k); return 1; }
+ 	n2gl_tx_started = n2gl_rx_started = false;
+ 	n2gl_v9 = k >= 23; n2gl_rx_armed = false;                /* 0362 */
+ 	int last = k <= 19 ? k : (k == 21 ? 15 : (k == 22 || k >= 23) ? 17 : 16), rc = 0, s;
+@@ -1364,18 +1413,20 @@
+ 		}
+ 		if (n2gl_stop) { return 0x01000000u | ((uint32_t)k << 8); }
+ 	}
+-	if (!rc && k >= 30 && k <= 31) {
++	if (!rc && k >= 30 && k <= 33 && k != 32) {
+ 		printf("NORD2 GNSS LAD %d: about to run NEW S11 phase (%s)\n", k, n2gl_name[k]); delay(2000000);
++		n2gb_gap_ms = k == 33 ? 200 : 0;                     /* 0587: K = 33 pacing probe */
+ 		rc = n2gb_boot(done);
++		n2gb_gap_ms = 0;
+ 		if (n2gl_stop) { return 0x01000000u | ((uint32_t)k << 8); }
+ 		if (rc) { failed = k; }
+-		if (!rc && k == 31) {
++		if (!rc && (k == 31 || k == 33)) {
+ 			/* HOLD: the GPS wake vote stays HELD (q10jr9 released it; gl9b reset), INTEN off, RX 256 B per arming */
+ 			n2gl_rx_cap = 256; n2gl_rx_norearm = false;
+ 			n2gd.powered = true; n2gd.hw_valid = true; n2gd.last_err = 0;
+ 			n2gd.conn_hw_ver = n2gl_rd(N2G_CONN_HW_VER);
+ 			n2gl_v9hold = true; n2gd_dl_up = true;
+-			printf("NORD2 GNSS LAD 31: S11 HOLD, DSP booted, GPS wake vote held, /dev/gpsdl0 read/write enabled, NOT rolled back until reboot\n");
++			printf("NORD2 GNSS LAD %d: S11 HOLD, DSP booted, GPS wake vote held, /dev/gpsdl0 read/write enabled, NOT rolled back until reboot\n", k);
+ 			n2gq_hb("HOLD start (0581 pipe: gate = Wi-Fi guard + gps_top_off ACTIVE)");
+ 			n2gt("LNA: GPIO162 -> mode 2 (0585)");
+ 			n2gd_lna_l1_dsp_ctrl();                              /* 0585: vendor gps_dl_lna_pin_ctrl(L1, dsp on) */
+@@ -1551,6 +1602,7 @@
+ 	case (uint32_t)N2GD_IOC(170):                            /* 0364: S11 boot (K=30) / boot + HOLD (K=31) */
+ 	case (uint32_t)N2GD_IOC(171):
+ 	case (uint32_t)N2GD_IOC(172):                            /* 0586: S12 HOLD without the kernel DSP boot */
++	case (uint32_t)N2GD_IOC(173):                            /* 0587: S13 pacing probe (K=31 + 200 ms gap after fragment 1) */
+ 		if (n2gd_ctl & 1) { printf("NORD2 GNSS: ladder refused (sysctl kern.n2gnss bit 0)\n"); return ENODEV; }
+ 		lck_mtx_lock(&n2gd_lock);
+ 		v = n2gd_ladder((int)((uint32_t)cmd & 0xff) - 140);
+@@ -1615,7 +1667,11 @@
+ static struct {
+ 	uint64_t rd, rd_data, rd_eagain, wr, wr_bytes, rx_bytes, guard_ref, top_bad, tx_to, mcub, last_hb_ns, t0_ns;
+ 	uint32_t last_d2af, last_d0, last_d1, last_top, last_sel, consec_ref, wlog, toplog, mlog;
++	uint32_t last_slp, last_bto, cslog;                       /* 0587 */
+ } n2gq;
++#ifndef N2G_CSR_BUS_TIMEOUT_IRQ
++#define N2G_CSR_BUS_TIMEOUT_IRQ 0x180602d4u                     /* 0587: conn_infra host CSR, [0] == 1 = no off-domain bus hang */
++#endif
+ static uint64_t
+ n2gq_ns(void)
+ {
+@@ -1671,6 +1727,18 @@
+ 			    ((sel & 0xffu) == 0x80u && (top & 0xfu) == 2u) ? "ACTIVE" : N2GQ_OBSERVE ? "NOT ACTIVE (observe only: still accessed)" : "NOT ACTIVE: GPS bus not touched");
+ 		}
+ 		n2gq.last_top = top; n2gq.last_sel = sel;
++		/* 0587: two more host CSR words per pipe call (same Wi-Fi host page, safe whenever the guard passes), so the 0583 trace
++		 * shows the conn_infra state at the poll rate up to a hang: CONN_SLP_PROT_CTRL (0x18060184: [5] on2off / [3] off2on
++		 * sleep-protection ack, [11:9] the AP2CONN enables) and BUS_TIMEOUT_IRQ (0x180602d4 [0] == 1 = no off-domain bus hang). */
++		if (!(n2gd_ctl & 16)) {
++			uint32_t slp = n2gl_hw.read32(n2gl_hw.ctx, N2G_CSR_SLP_PROT_CTRL), bto = n2gl_hw.read32(n2gl_hw.ctx, N2G_CSR_BUS_TIMEOUT_IRQ);
++			if ((slp != n2gq.last_slp || bto != n2gq.last_bto) && n2gq.cslog < 30) {
++				n2gq.cslog++;
++				printf("NORD2 GNSS PIPE: conn_infra slp_prot %#x (on2off ack %u off2on ack %u) bus_timeout_irq %#x%s\n", slp, (slp >> 5) & 1u,
++				    (slp >> 3) & 1u, bto, (bto & 1u) ? "" : " (bit0 = 0: conn_infra off bus MAY HANG)");
++			}
++			n2gq.last_slp = slp; n2gq.last_bto = bto;
++		}
+ 		if ((sel & 0xffu) != 0x80u || (top & 0xfu) != 2u) {
+ 			n2gq.top_bad++;
+ 			ok = N2GQ_OBSERVE != 0;
+--- a/bsd/dev/nord2_gnss_pwr.inc
++++ b/bsd/dev/nord2_gnss_pwr.inc
+@@ -102,6 +102,8 @@
+ 	N2G_CSR_HOST2GPS_DBG_SEL, N2G_CSR_GPS_CFG2HOST_DBG, N2G_CSR_WAKEPU_GPS, N2G_CSR_SLP_PROT_CTRL, N2G_GPS_CLKGEN1_CTL, N2G_GPS_AON_DSLEEP_CTL,
+ 	/* 0357: GPS RGU_ON L1 control/delay (bus 0x80000014/160/164) and CFG_ON L1 sleep-power state (0x80001020) */
+ 	0x18c00014u, 0x18c00160u, 0x18c00164u, 0x18c01020u,
++	/* 0587: conn_infra host CSR BUS_TIMEOUT_IRQ (0x1806_02d4 [0] == 1: no off-domain bus hang; conninfra consys_is_bus_hang step 4) */
++	0x180602d4u,
+ };
+ 
+ N2G_API int n2g_reg_allowed(uint32_t pa)

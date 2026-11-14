@@ -1,0 +1,149 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -183,6 +183,7 @@
+ #include "kern_exec_internal.h"
+ 
+ static void nord2_memgov_start_once(void);      /* 0420 */
++static void nord2_clockfloor_once(void);        /* 0530 */
+ static void nord2_memgov_note_exec(struct image_params *imgp, proc_t p);      /* 0484 */
+ 
+ extern boolean_t vm_darkwake_mode;
+@@ -5104,6 +5105,7 @@
+ 	int err;
+ 
+ 	memoryshot(VM_EXECVE, DBG_FUNC_NONE);
++	nord2_clockfloor_once();        /* 0530: before launchd, so that no daemon ever sees 1970 */
+ 	nord2_memgov_start_once();      /* 0420: the first execve is launchd's (load_init_program) */
+ 
+ 	muap.fname = uap->fname;
+@@ -8282,3 +8284,73 @@
+ 	thread_set_thread_name(th, "nord2_memgov");
+ 	thread_deallocate(th);
+ }
++
++/*
++ * ---------------------------------------------------------------- 0530 (heat-20261114): NORD2 CLOCK floor (policy: nord2_clockfloor.h)
++ * The first execve (launchd, from load_init_program: the root volume is mounted, no user process exists yet) raises the calendar from
++ * 1970 to the newest time the root volume knows.  Without it timed's first NTP answer moves the clock 56 years and dasd walks
++ * 1,993,998 budget slots through coreduetd (one A78 core busy for the whole uptime: the phone's standby heat).  One line:
++ * "NORD2 CLOCK: floor ...".  Kill switch: boot-arg n2ck=0, or n2gdv +64 (the boot line has 4 characters left: n2gdv=73 fits).
++ * kern.n2clockfloor = the seconds set (0: nothing done), kern.n2clockfloor_src = the winning source (nord2_clockfloor.h).
++ */
++#include "nord2_clockfloor.h"
++
++static uint32_t n2ck_started;
++static long long n2ck_set_secs;
++static unsigned int n2ck_set_src;
++SYSCTL_QUAD(_kern, OID_AUTO, n2clockfloor, CTLFLAG_RD | CTLFLAG_LOCKED, &n2ck_set_secs, "NORD2 CLOCK: calendar seconds set at the first exec (0 = left alone)");
++SYSCTL_UINT(_kern, OID_AUTO, n2clockfloor_src, CTLFLAG_RD | CTLFLAG_LOCKED, &n2ck_set_src, 0, "NORD2 CLOCK: 0 none, 1 patch date, 2 root volume, 3.. directories");
++
++static void
++nord2_clockfloor_once(void)
++{
++	static const char *const paths[] = { "/private/var/db", "/private/var/mobile/Library/Preferences", "/private/var/db/timed",
++		                             "/private/var/db/diagnostics/Persist" };
++	uint64_t cand[N2CK_MAX_CAND] = { 0 };
++	unsigned n = 0, src = N2CK_SRC_NONE;
++	int on = 1, gdv = 0;
++	clock_sec_t secs = 0;
++	clock_usec_t usecs = 0;
++	vfs_context_t ctx = vfs_context_kernel();
++
++	if (!OSCompareAndSwap(0, 1, &n2ck_started)) {
++		return;
++	}
++	if (!PE_parse_boot_argn("n2ck", &on, sizeof(on)) && PE_parse_boot_argn("n2gdv", &gdv, sizeof(gdv)) && (gdv & 64)) {
++		on = 0;
++	}
++	clock_get_calendar_microtime(&secs, &usecs);
++	if (rootvnode != NULLVP && vnode_mount(rootvnode) != NULL) {            /* candidate 0: the root volume's modification time */
++		struct vfs_attr vfa;
++		VFSATTR_INIT(&vfa);
++		VFSATTR_WANTED(&vfa, f_modify_time);
++		if (vfs_getattr(vnode_mount(rootvnode), &vfa, ctx) == 0 && VFSATTR_IS_SUPPORTED(&vfa, f_modify_time) && vfa.f_modify_time.tv_sec > 0) {
++			cand[n] = (uint64_t)vfa.f_modify_time.tv_sec;
++		}
++	}
++	n++;
++	for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]) && n < N2CK_MAX_CAND; i++, n++) {
++		vnode_t vp = NULLVP;
++		struct vnode_attr va;
++		if (vnode_lookup(paths[i], 0, &vp, ctx) != 0) {
++			continue;
++		}
++		VATTR_INIT(&va);
++		VATTR_WANTED(&va, va_modify_time);
++		if (vnode_getattr(vp, &va, ctx) == 0 && VATTR_IS_SUPPORTED(&va, va_modify_time) && va.va_modify_time.tv_sec > 0) {
++			cand[n] = (uint64_t)va.va_modify_time.tv_sec;
++		}
++		(void)vnode_put(vp);
++	}
++	uint64_t pick = n2ck_pick((uint64_t)secs, cand, n, &src);
++	if (on && pick > (uint64_t)secs) {
++		clock_set_calendar_microtime((clock_sec_t)pick, 0);
++		n2ck_set_secs = (long long)pick;
++		n2ck_set_src = src;
++	}
++	printf("NORD2 CLOCK: floor %s: calendar was %llu s, %s %llu s (source %u: 0 none, 1 patch date, 2 root volume, 3.. directories); "
++	    "volume %llu, dirs %llu %llu %llu %llu, patch date %llu (kill switch n2ck=0 or n2gdv +64)\n",
++	    on ? "on" : "OFF", (unsigned long long)secs, (on && pick > (uint64_t)secs) ? "set to" : "left; would be", (unsigned long long)pick, src,
++	    (unsigned long long)cand[0], (unsigned long long)cand[1], (unsigned long long)cand[2], (unsigned long long)cand[3],
++	    (unsigned long long)cand[4], (unsigned long long)N2CK_BUILD_EPOCH);
++}
+--- /dev/null
++++ b/bsd/kern/nord2_clockfloor.h
+@@ -0,0 +1,54 @@
++/*
++ * 0530 (heat-20261114): NORD2 CLOCK floor -- the policy, host-testable (test/clockfloor_test.c).
++ *
++ * The Nord 2 port has no RTC (nord2nortc=1): the calendar starts at 1970 on every boot and jumps ~56 years when timed gets
++ * NTP time.  Daemons that keep "last done" dates catch up over that jump.  Measured (unified log of 2026-11-13): dasd's
++ * _DASBudgetModulator stores lastModulation = 1970-01-01 00:00:34 at boot (the stored 2026 date is "in the future", so it
++ * is replaced by now) and after settimeofday() logs "Last modulated budgets at Thu Jan  1 01:00:34 1970, modulating for
++ * 1993998 slots": one 15-minute slot at a time, one coreduetd _DKPredictionQuery (0.45 s CPU) per 8 slots and per widget
++ * budget = coreduetd at 80-90 % of an A78 core for the rest of the uptime, every boot (cpu_resource reports since 11-01).
++ *
++ * Fix: before launchd runs, the calendar is raised to the newest trustworthy time the kernel can see: the root volume's
++ * last modification (HFS+ volume header modifyDate, kept by hfs_volupdate on every create/delete/allocation, so it follows
++ * the previous session up to its last minutes), a few directory times, and the date this patch was written.  The clock is
++ * never moved backwards and never beyond N2CK_MAX_AHEAD after the patch date (a corrupt time stamp must not win).
++ */
++#ifndef NORD2_CLOCKFLOOR_H
++#define NORD2_CLOCKFLOOR_H
++
++#include <stdint.h>
++
++#define N2CK_BUILD_EPOCH   1794528000ULL                  /* 2026-11-13 00:00:00 UTC: the date of this patch */
++#define N2CK_MAX_AHEAD     (10ULL * 366 * 86400)          /* candidates later than patch date + 10 years are ignored */
++#define N2CK_MAX_CAND      8
++#define N2CK_SRC_NONE      0u                             /* the clock was already at or past every candidate */
++#define N2CK_SRC_BUILD     1u                             /* the patch date */
++#define N2CK_SRC_CAND      2u                             /* + index into the candidate array */
++
++/*
++ * now:  calendar seconds at the call.  cand[0..n): candidate seconds (0 = not available).
++ * Returns the seconds the calendar should be set to (== now: leave it alone) and says in *src which source won.
++ */
++static inline uint64_t
++n2ck_pick(uint64_t now, const uint64_t *cand, unsigned n, unsigned *src)
++{
++	uint64_t best = N2CK_BUILD_EPOCH;
++	unsigned s = N2CK_SRC_BUILD;
++
++	for (unsigned i = 0; i < n && i < N2CK_MAX_CAND; i++) {
++		if (cand[i] > best && cand[i] <= N2CK_BUILD_EPOCH + N2CK_MAX_AHEAD) {
++			best = cand[i];
++			s = N2CK_SRC_CAND + i;
++		}
++	}
++	if (best <= now) {
++		best = now;
++		s = N2CK_SRC_NONE;
++	}
++	if (src != (unsigned *)0) {
++		*src = s;
++	}
++	return best;
++}
++
++#endif /* NORD2_CLOCKFLOOR_H */

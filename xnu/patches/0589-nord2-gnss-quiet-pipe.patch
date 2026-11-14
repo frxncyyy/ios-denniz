@@ -1,0 +1,190 @@
+--- a/bsd/dev/nord2_gpsdl.inc
++++ b/bsd/dev/nord2_gpsdl.inc
+@@ -322,7 +322,7 @@
+ 	{ N2G_CFG_GALS_CONN2GPS, 1u << 4, 1u << 7 }, { N2G_CFG_GALS_CONN2GPS, 1u << 0, 1u << 3 },
+ 	{ N2G_CFG_GALS_GPS2CONN, 1u << 4, 1u << 7 }, { N2G_CFG_GALS_GPS2CONN, 1u << 0, 1u << 3 },
+ };
+-static const char *const n2gl_name[37] = { "", "GPS wake vote", "read conn_infra cfg page", "read conn_infra RGU page",
++static const char *const n2gl_name[39] = { "", "GPS wake vote", "read conn_infra cfg page", "read conn_infra RGU page",
+ 	"read WB_STA + GPS CSRs", "GPS EMI remap", "BGFSYS_ON_TOP power", "GP_FUNCTION_EN + BGF acks", "GALS sleep protection off",
+ 	"gps_top_off ACTIVE check", "A-die top clock", "read GPS bus (first)", "GPS CLKGEN1 DIGCK", "L1 DSP pwr_stat ON",
+ 	"read GPS RGU_ON page", "L1 power on + soft reset release", "USRT on + DSP ROM okay", "data link up (rings, DMA idle check)", "send libmnl frame 1 (A2D DMA)", "capture the DSP reply (D2A DMA)",
+@@ -335,7 +335,9 @@
+ 	"S12 HOLD with the DSP in ROM (NO kernel download): libmnl boots the DSP itself over the pipe, vendor flow (0586)",
+ 	"S13 pacing probe: S11 download with a 200 ms idle gap after fragment 1 (1 ms state samples), then HOLD as K=31 (0587)",
+ 	"S12b = K=32 + NO LNA + ladder-style RX (fresh 64 B arming before each pipe TX) + 2 s settle (0588)",
+-	"S12c = K=32 + NO LNA + 2 s settle (0588)", "S12d = K=32 + ladder-style RX + 2 s settle, LNA on (0588)" };
++	"S12c = K=32 + NO LNA + 2 s settle (0588)", "S12d = K=32 + ladder-style RX + 2 s settle, LNA on (0588)",
++	"S12e = K=34 + QUIET pipe (no gate register reads, no console lines) + RX round closed/re-armed on data (S11-exact) + GPS GIC SPIs masked/logged at HOLD (0589)",
++	"S12f = S12e + GIC enable/pending/active words of the GPS SPIs traced before/after every pipe TX (0589)" };
+ /* 0357: GPS RGU_ON (bus 0x80000000 -> AP 0x18c00000) and CFG_ON (0x80001000 -> 0x18c01000), plat/v010 gps_rgu_on.h / gps_cfg_on.h */
+ #define N2G_GPS_RGU_L1_CR          0x18c00014u   /* [0] RGU_GPS_L1_ON [5] RGU_GPS_L1_SOFT_RST_B */
+ #define N2G_GPS_RGU_L1_DLY_CHAIN   0x18c00160u   /* [19:16] MEM_PDN_DELAY_DUMMY_NUM (vendor 5) */
+@@ -953,6 +955,7 @@
+ #define N2G_CSR_BUS_TIMEOUT_IRQ 0x180602d4u                     /* 0587: conn_infra host CSR, [0] == 1 = no off-domain bus hang */
+ #endif
+ static int n2gb_gap_ms;
++static void n2gq_gic_mask(void);                                /* 0589: defined with the pipe */
+ static uint32_t n2gq_mode;                                      /* 0588: K=34..36 HOLD variant bits (1 = no LNA, 2 = S11-style RX) */
+ static void
+ n2gb_gap_watch(int ms)
+@@ -1353,7 +1356,7 @@
+ 	    k, n2gl_name[k], g[0], g[3], g[4], g[5], g[6], g[7] >> 16, g[7] & 0xffff, g[8] >> 16, g[8] & 0xffff, ok ? "guard ok" : "GUARD REFUSES");
+ 	if (!ok) { return 0x01000000u; }
+ 	if (n2gd_hw(&n2gl_hw)) { return 0x0300u; }
+-	if ((k == 22 || k == 24 || (k >= 31 && k <= 36)) && n2gd.powered) { printf("NORD2 GNSS LAD %d: already held\n", k); return 1; }
++	if ((k == 22 || k == 24 || (k >= 31 && k <= 38)) && n2gd.powered) { printf("NORD2 GNSS LAD %d: already held\n", k); return 1; }
+ 	n2gl_tx_started = n2gl_rx_started = false;
+ 	n2gl_v9 = k >= 23; n2gl_rx_armed = false;                /* 0362 */
+ 	int last = k <= 19 ? k : (k == 21 ? 15 : (k == 22 || k >= 23) ? 17 : 16), rc = 0, s;
+@@ -1382,7 +1385,7 @@
+ 		printf("NORD2 GNSS LAD 24: V9 HOLD, GNSS powered, RX DMA2 armed, /dev/gpsdl0 read/write enabled (conn_infra %#x), NOT rolled back until reboot\n", n2gd.conn_hw_ver);
+ 		return 1;
+ 	}
+-	if (!rc && (k == 32 || (k >= 34 && k <= 36))) {
++	if (!rc && (k == 32 || (k >= 34 && k <= 38))) {
+ 		/*
+ 		 * 0588 (gnss-20261114): K = 34..36 = K = 32 with the pipe made to look like the kernel S11 loop. gnss8a (q10jgd + gnssfix8,
+ 		 * poll 1 ms) died ~3 ms after libmnl's fragment 1 like hang5 (poll 10 ms): pacing excluded. libmnl's frames are byte-identical
+@@ -1392,7 +1395,7 @@
+ 		 * arming across TXs (S11 stops it and arms a fresh 64 B round right before every TX), (c) the header comes ~46 ms after the
+ 		 * EMI request / RESET_DONE ack (S11: 2 s pause). K = 34 removes all three, K = 35 only (a)+(c), K = 36 only (b)+(c).
+ 		 */
+-		n2gq_mode = k == 34 ? 7u : k == 35 ? 5u : k == 36 ? 6u : 0u;   /* bit 0 = no LNA, bit 1 = ladder-style RX per TX, bit 2 = no 0587 gate sampling */
++		n2gq_mode = k == 34 ? 7u : k == 35 ? 5u : k == 36 ? 6u : k == 37 ? 47u : k == 38 ? 63u : 0u;   /* bit 0 = no LNA, bit 1 = ladder-style RX per TX, bit 2 = no 0587 gate sampling, bit 3 = quiet pipe (0589), bit 4 = GIC trace per TX (0589), bit 5 = close + re-arm the RX round as soon as bytes arrived (S11 n2gb_rx_close, 0589) */
+ 		/*
+ 		 * 0586 (gnss-20261114): K = 32 = steps 1..17 (DSP ROM okay, data link up) + the S11 data-link prep WITHOUT the kernel DSP code
+ 		 * download, then the same HOLD as K = 31 (GPS wake vote held, INTEN off, RX 256 B per arming). libmnl then runs its own
+@@ -1420,7 +1423,7 @@
+ 			if (k >= 34) { printf("NORD2 GNSS LAD %d: 0588 settle 2 s after the EMI request (as S11) before the pipe opens\n", k); delay(2000000); }
+ 			printf("NORD2 GNSS LAD %d: S12 HOLD, DSP in ROM (no kernel download), GPS wake vote held, /dev/gpsdl0 read/write enabled for libmnl's own DSP boot, NOT rolled back until reboot (0588 mode %u: LNA %s, RX %s)\n",
+ 			    k, n2gq_mode, (n2gq_mode & 1u) ? "NOT set" : "GPIO162 mode 2", (n2gq_mode & 2u) ? "fresh 64 B arming before each TX" : "256 B continuous");
+-			n2gq_hb("HOLD start (0586 S12: libmnl boots the DSP)");
++			if (n2gq_mode & 8u) { n2gq_gic_mask(); } else { n2gq_hb("HOLD start (0586 S12: libmnl boots the DSP)"); }
+ 			n2gt("S12 HOLD K=%d mode %u: DSP in ROM, libmnl boots it (0586/0588)", k, n2gq_mode);
+ 			if (!(n2gq_mode & 1u)) { n2gt("LNA: GPIO162 -> mode 2 (0585)"); n2gd_lna_l1_dsp_ctrl(); }
+ 			else { printf("NORD2 GNSS LNA: GPIO162 left in its boot mode (0588 K=%d)\n", k); }
+@@ -1621,6 +1624,8 @@
+ 	case (uint32_t)N2GD_IOC(174):                            /* 0588: S12b/c/d (K=32 variants) */
+ 	case (uint32_t)N2GD_IOC(175):
+ 	case (uint32_t)N2GD_IOC(176):
++	case (uint32_t)N2GD_IOC(177):                            /* 0589: S12e/f quiet pipe */
++	case (uint32_t)N2GD_IOC(178):
+ 		if (n2gd_ctl & 1) { printf("NORD2 GNSS: ladder refused (sysctl kern.n2gnss bit 0)\n"); return ENODEV; }
+ 		lck_mtx_lock(&n2gd_lock);
+ 		v = n2gd_ladder((int)((uint32_t)cmd & 0xff) - 140);
+@@ -1702,7 +1707,7 @@
+ {
+ 	n2gq.mcub++;
+ 	n2gt("mcub flag %#x d0 %#x d1 %#x", f, d0, d1);
+-	if (n2gd_dl_up && (f != n2gq.last_d2af || d0 != n2gq.last_d0) && n2gq.mlog < 40) {
++	if (n2gd_dl_up && !(n2gq_mode & 8u) && (f != n2gq.last_d2af || d0 != n2gq.last_d0) && n2gq.mlog < 40) {
+ 		n2gq.mlog++;
+ 		printf("NORD2 GNSS PIPE: MCUB d2a flag %#x d0 %#x d1 %#x (was %#x)\n", f, d0, d1, n2gq.last_d2af);
+ 	}
+@@ -1727,6 +1732,7 @@
+ static int
+ n2gq_gate(void)
+ {
++	if (n2gq_mode & 8u) { return n2gd_dl_up ? 0 : EIO; }    /* 0589 quiet pipe: NO register access in the gate (GPS wake vote held by the HOLD) */
+ 	uint32_t g[9] = {0};
+ 	bool ok = n2gd_wifi_guard(g) && (g[7] >> 16) == 1 && (g[8] >> 16) == 0;
+ 	if (!ok) {
+@@ -1770,6 +1776,29 @@
+ 	}
+ 	return EAGAIN;
+ }
++/* 0589: GPS SPIs 383..389 = INTID 415..421 (live.dts gps@18C00000): GICD ISENABLER12 [31] / ISENABLER13 [5:0], ISPENDR 0x230/0x234,
++ * ISACTIVER 0x330/0x334, ICENABLER 0x1b0/0x1b4. Logged at the K=37/38 HOLD and disabled if XNU had enabled any (it has no handler). */
++static void n2gd_gicd_wr(uint32_t off, uint32_t v);          /* nord2_gnss_bind.inc */
++static void
++n2gq_gic_trace(const char *what)
++{
++	n2gt("gic %s en %#x/%#x pend %#x/%#x act %#x/%#x", what, n2gd_gicd_rd(0x130), n2gd_gicd_rd(0x134), n2gd_gicd_rd(0x230), n2gd_gicd_rd(0x234),
++	    n2gd_gicd_rd(0x330), n2gd_gicd_rd(0x334));
++}
++static void
++n2gq_gic_mask(void)
++{
++	uint32_t e12 = n2gd_gicd_rd(0x130), e13 = n2gd_gicd_rd(0x134);
++	printf("NORD2 GNSS PIPE: 0589 quiet pipe; GPS GIC SPIs: isenabler12=%#x isenabler13=%#x ispendr12=%#x ispendr13=%#x isactiver12=%#x isactiver13=%#x\n",
++	    e12, e13, n2gd_gicd_rd(0x230), n2gd_gicd_rd(0x234), n2gd_gicd_rd(0x330), n2gd_gicd_rd(0x334));
++	n2gq_gic_trace("hold");
++	if ((e12 != 0xffffffffu && (e12 & (1u << 31))) || (e13 != 0xffffffffu && (e13 & 0x3fu))) {
++		if (e12 & (1u << 31)) { n2gd_gicd_wr(0x1b0, 1u << 31); }
++		if (e13 & 0x3fu) { n2gd_gicd_wr(0x1b4, e13 & 0x3fu); }
++		printf("NORD2 GNSS PIPE: 0589 GPS SPIs were ENABLED in the GIC: disabled (now isenabler12=%#x isenabler13=%#x)\n", n2gd_gicd_rd(0x130), n2gd_gicd_rd(0x134));
++		n2gq_gic_trace("masked");
++	}
++}
+ /* 0588: K = 34/36 pipe RX like the S11 loop: before every TX close the running D2A round (bytes it wrote stay in the ring for
+  * read(); nothing is consumed) and arm a fresh one (n2gl_rx_cap = 64) at the write index */
+ static void
+@@ -1815,6 +1844,7 @@
+ 	for (int t = 0; !n2gl_rx_used() && t < 1000 && !n2gl_stop; t++) {
+ 		if (n2gl_v9hold) {                                   /* 0362: pre-armed RX DMA, MCUB flags acked and logged */
+ 			n2gl_rx_service(false);
++			if ((n2gq_mode & 32u) && n2gl_rx_armed && n2gl_rx_cur > 0) { n2gq_rx_fresh(); }   /* 0589: S11 closes the round on data */
+ 			if (n2gl_rx_used() || (flag & IO_NDELAY)) { break; }
+ 			delay(1000);
+ 			if (t % 50 == 49 && n2gq_gate()) { break; }      /* 0581: blocking reads re-check the gate every 50 ms */
+@@ -1832,7 +1862,7 @@
+ 	uint32_t n = n2gl_rx_used();
+ 	if (!n) { e = (flag & IO_NDELAY) ? EAGAIN : 0; if (e) { n2gq.rd_eagain++; } goto out; }
+ 	if ((user_ssize_t)n > uio_resid(uio)) { n = (uint32_t)uio_resid(uio); }
+-	if (n2gq.rd_data < 3) { printf("NORD2 GNSS PIPE: read #%llu returns %u bytes (first data reads)\n", (unsigned long long)n2gq.rd, n); }
++	if (n2gq.rd_data < 3 && !(n2gq_mode & 8u)) { printf("NORD2 GNSS PIPE: read #%llu returns %u bytes (first data reads)\n", (unsigned long long)n2gq.rd, n); }
+ 	n2gq.rd_data++;
+ 	uint8_t tmp[256];
+ 	while (n && !e) {
+@@ -1845,7 +1875,7 @@
+ 		}
+ 	}
+ out:
+-	if (n2gq.rd) { n2gq_hb(NULL); }
++	if (n2gq.rd && !(n2gq_mode & 8u)) { n2gq_hb(NULL); }
+ 	lck_mtx_unlock(&n2gd_lock);
+ 	return e;
+ }
+@@ -1866,19 +1896,21 @@
+ 		e = uiomove((caddr_t)buf, (int)m, uio);
+ 		if (e) { break; }
+ 		n2gq.wr++;
+-		if (n2gq.wlog < 24) {
++		if (n2gq.wlog < 24 && !(n2gq_mode & 8u)) {
+ 			n2gq.wlog++;
+ 			printf("NORD2 GNSS PIPE: about to TX write #%llu: %u bytes, id %#x (%02x %02x %02x %02x %02x %02x)\n", (unsigned long long)n2gq.wr, m,
+ 			    m >= 6 ? (uint32_t)(buf[4] | (buf[5] << 8)) : 0u, buf[0], m > 1 ? buf[1] : 0, m > 2 ? buf[2] : 0, m > 3 ? buf[3] : 0, m > 4 ? buf[4] : 0, m > 5 ? buf[5] : 0);
+ 		}
+ 		if (n2gq_mode & 2u) { n2gq_rx_fresh(); }               /* 0588 */
++		if (n2gq_mode & 16u) { n2gq_gic_trace("pre"); }        /* 0589 */
+ 		int te = n2gq_tx(buf, m);
++		if (n2gq_mode & 16u) { n2gq_gic_trace("post"); }
+ 		if (te) { e = n2gl_stop ? EIO : ETIMEDOUT; break; }
+ 		n2gq.wr_bytes += m;
+ 	}
+ 	if (n2gl_stop) { n2gl_stop = false; n2gq.guard_ref++; }  /* 0581: transient; the pipe stays up */
+ out:
+-	if (n2gq.wr) { n2gq_hb(NULL); }
++	if (n2gq.wr && !(n2gq_mode & 8u)) { n2gq_hb(NULL); }
+ 	lck_mtx_unlock(&n2gd_lock);
+ 	return e;
+ }
+--- a/bsd/dev/nord2_gnss_bind.inc
++++ b/bsd/dev/nord2_gnss_bind.inc
+@@ -54,6 +54,15 @@
+ 	return ok && nwfn_native.gic_va && !(out[6] & ((1u << 23) | (1u << 26)));
+ }
+ static vm_offset_t n2gd_wifi_host(void) { return npa_native.host; }
++/* 0589: GICD write (only ICENABLER of the GPS SPIs, K=37/38 HOLD), traced */
++static void
++n2gd_gicd_wr(uint32_t off, uint32_t v)
++{
++	if (!nwfn_native.gic_va || (off != 0x1b0u && off != 0x1b4u)) { return; }
++	n2gt("W gicd+%#x := %#x", off, v);
++	*(volatile uint32_t *)(nwfn_native.gic_va + off) = v;
++	__builtin_arm_dsb(0xf);
++}
+ /* 0363: read-only GIC distributor word (ISENABLER/ISPENDR of the GPS INTIDs 415..421 = GIC SPI 383..389) */
+ static uint32_t
+ n2gd_gicd_rd(uint32_t off)

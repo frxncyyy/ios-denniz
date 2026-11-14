@@ -1,0 +1,221 @@
+--- a/bsd/dev/nord2_gpsdl.inc
++++ b/bsd/dev/nord2_gpsdl.inc
+@@ -495,6 +495,9 @@
+ 	}
+ 	return last;
+ }
++/* 0581: pipe heartbeat state (defined with the pipe below) */
++static void n2gq_mcub_note(uint32_t f, uint32_t d0, uint32_t d1);
++static void n2gq_hb(const char *why);
+ /* ack MCUB D2A flags like gps_dl_hal_mcub_flag_handler (read flag/d0/d1, write the flag back) */
+ static void
+ n2gl_mcub_ack(bool log)
+@@ -503,6 +506,7 @@
+ 	if (n2gl_stop || f == 0 || f == 0xffffffffu) { return; }
+ 	uint32_t d0 = n2gl_rd(N2G_USRT_D2A0(0)), d1 = n2gl_rd(N2G_USRT_D2A1(0));
+ 	n2gl_wr(N2G_USRT_D2AF(0), f);
++	n2gq_mcub_note(f, d0, d1);                                /* 0581: heartbeat / pipe log */
+ 	uint32_t after = n2gl_rd(N2G_USRT_D2AF(0));
+ 	if (log && n2gl_lines < 200) {
+ 		n2gl_lines++;
+@@ -1270,6 +1274,7 @@
+ 			n2gd.conn_hw_ver = n2gl_rd(N2G_CONN_HW_VER);
+ 			n2gl_v9hold = true; n2gd_dl_up = true;
+ 			printf("NORD2 GNSS LAD 31: S11 HOLD, DSP booted, GPS wake vote held, /dev/gpsdl0 read/write enabled, NOT rolled back until reboot\n");
++			n2gq_hb("HOLD start (0581 pipe: gate = Wi-Fi guard + gps_top_off ACTIVE)");
+ 			return 1;
+ 		}
+ 	}
+@@ -1480,12 +1485,115 @@
+ {
+ 	return ENODEV;
+ }
+-/* 0359: byte pipe for n2mnld after ladder 22 (HOLD with the data link up). Every register access goes through the Wi-Fi
+- * guard; a refusal returns EIO and disables the pipe. write: synchronous A2D DMA of up to 4 KiB per call. read: RX rounds
+- * (D2A DMA on TX_IND) until data, up to 1 s, or EAGAIN at once with IO_NDELAY. Link 0 (L1) only. */
++/* 0359: byte pipe for n2mnld after ladder 22 (HOLD with the data link up). write: synchronous A2D DMA of up to 4 KiB per call.
++ * read: RX rounds (D2A DMA) until data, up to 1 s, or EAGAIN at once with IO_NDELAY. Link 0 (L1) only.
++ *
++ * 0581 (gnss-20261114) pipe hardening, after gnssd3/gnssd3j (q10jfg/q10jfj, 12 Nov): both runs lost the phone (USB console
++ * cut mid-line) 1..3 s after libmnl's engine threads started, while the same K=31 HOLD with no engine process stayed up for
++ * 6 minutes (gnssd1b/gnssd2). The cause was never seen (the engine log was on the lost rootfs state). Changes:
++ *  a) every pipe call first checks, from the conn_infra HOST CSR page only (never the GPS bus): the Wi-Fi guard (quiet, rate-
++ *     limited log) and gps_top_off == ACTIVE through the host debug mux (HOST2GPS_DBG_SEL 0x80, set by ladder step 9 and kept in
++ *     HOLD; CFG2HOST_DBG [3:0] == 2). If the GPS top is not active, no GPS-bus register (USRT, BGF DMA) is accessed: an AXI
++ *     access to a powered-down GPS domain hangs the SoC, the most likely way to lose the phone without a panic line.
++ *     sysctl kern.n2gnss bit 1 = observe only (count + log, still access).
++ *  b) refusals are transient (EAGAIN) instead of disabling the pipe at the first one; the pipe goes down (EIO) only after
++ *     3000 consecutive refusals (~30 s of n2mnld's 10 ms polls).
++ *  c) write uses the quiet DMA helpers (0580 printed 5 console lines per write) and logs the first 24 writes BEFORE the DMA
++ *     ("about to TX"), so a hang shows the last frame on the console.
++ *  d) heartbeat every 2 s from the pipe calls: "NORD2 GNSS PIPE: ..." counters, last MCUB flag, gps_top_off value, refusals.
++ */
+ #ifndef IO_NDELAY
+ #define IO_NDELAY 0x0010                                        /* sys/vnode.h */
+ #endif
++#define N2GQ_OBSERVE ((n2gd_ctl & 2) != 0)                     /* sysctl kern.n2gnss bit 1 */
++static struct {
++	uint64_t rd, rd_data, rd_eagain, wr, wr_bytes, rx_bytes, guard_ref, top_bad, tx_to, mcub, last_hb_ns, t0_ns;
++	uint32_t last_d2af, last_d0, last_d1, last_top, last_sel, consec_ref, wlog, toplog, mlog;
++} n2gq;
++static uint64_t
++n2gq_ns(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns;
++}
++static void
++n2gq_mcub_note(uint32_t f, uint32_t d0, uint32_t d1)
++{
++	n2gq.mcub++;
++	if (n2gd_dl_up && (f != n2gq.last_d2af || d0 != n2gq.last_d0) && n2gq.mlog < 40) {
++		n2gq.mlog++;
++		printf("NORD2 GNSS PIPE: MCUB d2a flag %#x d0 %#x d1 %#x (was %#x)\n", f, d0, d1, n2gq.last_d2af);
++	}
++	n2gq.last_d2af = f; n2gq.last_d0 = d0; n2gq.last_d1 = d1;
++}
++static void
++n2gq_hb(const char *why)
++{
++	uint64_t ns = n2gq_ns();
++	if (!n2gq.t0_ns) { n2gq.t0_ns = ns; }
++	if (ns - n2gq.last_hb_ns < 2000000000ull && why == NULL) { return; }
++	n2gq.last_hb_ns = ns;
++	printf("NORD2 GNSS PIPE: t=%llus rd=%llu (data %llu, eagain %llu) rx=%llu B | wr=%llu (%llu B, tx timeouts %llu) | mcub=%llu last d2af %#x d0 %#x | "
++	    "top=%#x sel=%#x top_bad=%llu guard_ref=%llu consec=%u%s%s%s\n",
++	    (unsigned long long)((ns - n2gq.t0_ns) / 1000000000ull), (unsigned long long)n2gq.rd, (unsigned long long)n2gq.rd_data,
++	    (unsigned long long)n2gq.rd_eagain, (unsigned long long)n2gq.rx_bytes, (unsigned long long)n2gq.wr, (unsigned long long)n2gq.wr_bytes,
++	    (unsigned long long)n2gq.tx_to, (unsigned long long)n2gq.mcub, n2gq.last_d2af, n2gq.last_d0, n2gq.last_top, n2gq.last_sel,
++	    (unsigned long long)n2gq.top_bad, (unsigned long long)n2gq.guard_ref, n2gq.consec_ref, N2GQ_OBSERVE ? " OBSERVE-ONLY" : "",
++	    why ? " | " : "", why ? why : "");
++}
++/* 0 = go; EAGAIN = transient refusal (nothing on the GPS bus was touched); EIO = pipe taken down */
++static int
++n2gq_gate(void)
++{
++	uint32_t g[9] = {0};
++	bool ok = n2gd_wifi_guard(g) && (g[7] >> 16) == 1 && (g[8] >> 16) == 0;
++	if (!ok) {
++		n2gq.guard_ref++;
++		if (n2gq.guard_ref <= 5 || n2gq.guard_ref % 500 == 0) {
++			printf("NORD2 GNSS PIPE: Wi-Fi/conninfra guard refuses (#%llu): spm304=%#x gals504=%#x infra228=%#x infra724=%#x gic130=%#x ap=%u asleep=%u stage=%u\n",
++			    (unsigned long long)n2gq.guard_ref, g[0], g[3], g[4], g[5], g[6], g[7] >> 16, g[8] >> 16, g[8] & 0xffff);
++		}
++	} else {
++		/* conn_infra host CSR page (Wi-Fi's own mapping), safe whenever the guard passes */
++		uint32_t sel = n2gl_hw.read32(n2gl_hw.ctx, N2G_CSR_HOST2GPS_DBG_SEL);
++		uint32_t top = n2gl_hw.read32(n2gl_hw.ctx, N2G_CSR_GPS_CFG2HOST_DBG);
++		if ((top != n2gq.last_top || sel != n2gq.last_sel) && n2gq.toplog < 30) {
++			n2gq.toplog++;
++			printf("NORD2 GNSS PIPE: gps_top_off %#x (sel %#x) -> %s\n", top, sel,
++			    ((sel & 0xffu) == 0x80u && (top & 0xfu) == 2u) ? "ACTIVE" : N2GQ_OBSERVE ? "NOT ACTIVE (observe only: still accessed)" : "NOT ACTIVE: GPS bus not touched");
++		}
++		n2gq.last_top = top; n2gq.last_sel = sel;
++		if ((sel & 0xffu) != 0x80u || (top & 0xfu) != 2u) {
++			n2gq.top_bad++;
++			ok = N2GQ_OBSERVE != 0;
++		}
++	}
++	if (ok) { n2gq.consec_ref = 0; return 0; }
++	if (++n2gq.consec_ref >= 3000) {
++		n2gd_dl_up = false;
++		n2gq_hb("PIPE DOWN after 3000 consecutive refusals (EIO from now on)");
++		return EIO;
++	}
++	return EAGAIN;
++}
++/* quiet synchronous TX (n2gl_tx without the per-register console lines) */
++static int
++n2gq_tx(const uint8_t *buf, uint32_t len)
++{
++	if (!n2gl_ring_va || !len || len > N2GL_RING - 4u) { return N2G_E_ARG; }
++	uint32_t padded = (len + 3u) & ~3u;
++	for (uint32_t i = 0; i < padded; i++) { n2gl_ring_va[i] = i < len ? buf[i] : 0; }
++	__builtin_arm_dsb(0xf);
++	n2gl_tx_started = true;
++	if (!n2gl_dma_start_q(N2GL_TXCH, N2G_CON_L1_A2D, 0, 0, padded)) { return N2G_E_ARG; }
++	int i;
++	for (i = 0; i < 100000 && !n2gl_stop && !n2gl_dma_done(N2GL_TXCH); i++) { delay(1); }
++	n2gl_dma_stop_q(N2GL_TXCH);
++	if (n2gl_stop) { return N2G_E_ARG; }
++	if (i >= 100000) { n2gq.tx_to++; return 9; }
++	return 0;
++}
+ static int
+ n2gd_read(dev_t dev, struct uio *uio, int flag)
+ {
+@@ -1495,20 +1603,30 @@
+ 	int e = 0;
+ 	if (!n2gd_dl_up) { e = ENODEV; goto out; }
+ 	n2gl_k = 30; n2gl_stop = false;
++	n2gq.rd++;
++	if ((e = n2gq_gate()) != 0) { if (e == EAGAIN) { n2gq.rd_eagain++; } goto out; }
+ 	for (int t = 0; !n2gl_rx_used() && t < 1000 && !n2gl_stop; t++) {
+ 		if (n2gl_v9hold) {                                   /* 0362: pre-armed RX DMA, MCUB flags acked and logged */
+-			n2gl_rx_service(true);
++			n2gl_rx_service(false);
+ 			if (n2gl_rx_used() || (flag & IO_NDELAY)) { break; }
+ 			delay(1000);
++			if (t % 50 == 49 && n2gq_gate()) { break; }      /* 0581: blocking reads re-check the gate every 50 ms */
+ 			continue;
+ 		}
+ 		n2gl_rx_round(1000, false);
+ 		if (flag & IO_NDELAY) { break; }
+ 	}
+-	if (n2gl_stop) { n2gd_dl_up = false; e = EIO; goto out; }
++	if (n2gl_stop) {                                          /* 0581: a guard refusal inside the round is transient */
++		n2gl_stop = false;
++		n2gq.guard_ref++;
++		e = (++n2gq.consec_ref >= 3000) ? (n2gd_dl_up = false, EIO) : EAGAIN;
++		goto out;
++	}
+ 	uint32_t n = n2gl_rx_used();
+-	if (!n) { e = (flag & IO_NDELAY) ? EAGAIN : 0; goto out; }
++	if (!n) { e = (flag & IO_NDELAY) ? EAGAIN : 0; if (e) { n2gq.rd_eagain++; } goto out; }
+ 	if ((user_ssize_t)n > uio_resid(uio)) { n = (uint32_t)uio_resid(uio); }
++	if (n2gq.rd_data < 3) { printf("NORD2 GNSS PIPE: read #%llu returns %u bytes (first data reads)\n", (unsigned long long)n2gq.rd, n); }
++	n2gq.rd_data++;
+ 	uint8_t tmp[256];
+ 	while (n && !e) {
+ 		uint32_t m = n < sizeof tmp ? n : (uint32_t)sizeof tmp;
+@@ -1516,10 +1634,11 @@
+ 		e = uiomove((caddr_t)tmp, (int)m, uio);
+ 		if (!e) {
+ 			if (n2gl_v9hold) { for (uint32_t i = 0; i < m; i++) { n2gl_ring_va[N2GL_RING + (n2gl_rx.rd + i) % N2GL_RING] = N2GL_FILL; } }
+-			n2gl_rx.rd = (n2gl_rx.rd + m) % N2GL_RING; n -= m;
++			n2gl_rx.rd = (n2gl_rx.rd + m) % N2GL_RING; n -= m; n2gq.rx_bytes += m;
+ 		}
+ 	}
+ out:
++	if (n2gq.rd) { n2gq_hb(NULL); }
+ 	lck_mtx_unlock(&n2gd_lock);
+ 	return e;
+ }
+@@ -1533,13 +1652,24 @@
+ 	int e = 0;
+ 	if (!n2gd_dl_up) { e = ENODEV; goto out; }
+ 	n2gl_k = 31; n2gl_stop = false;
++	if ((e = n2gq_gate()) != 0) { goto out; }                /* nothing consumed: n2mnld retries EAGAIN */
+ 	while (uio_resid(uio) > 0 && !e) {
+ 		uint32_t m = uio_resid(uio) < (user_ssize_t)sizeof buf ? (uint32_t)uio_resid(uio) : (uint32_t)sizeof buf;
+ 		e = uiomove((caddr_t)buf, (int)m, uio);
+-		if (!e && n2gl_tx(buf, m, false)) { e = n2gl_stop ? EIO : ETIMEDOUT; }
++		if (e) { break; }
++		n2gq.wr++;
++		if (n2gq.wlog < 24) {
++			n2gq.wlog++;
++			printf("NORD2 GNSS PIPE: about to TX write #%llu: %u bytes, id %#x (%02x %02x %02x %02x %02x %02x)\n", (unsigned long long)n2gq.wr, m,
++			    m >= 6 ? (uint32_t)(buf[4] | (buf[5] << 8)) : 0u, buf[0], m > 1 ? buf[1] : 0, m > 2 ? buf[2] : 0, m > 3 ? buf[3] : 0, m > 4 ? buf[4] : 0, m > 5 ? buf[5] : 0);
++		}
++		int te = n2gq_tx(buf, m);
++		if (te) { e = n2gl_stop ? EIO : ETIMEDOUT; break; }
++		n2gq.wr_bytes += m;
+ 	}
+-	if (n2gl_stop) { n2gd_dl_up = false; }
++	if (n2gl_stop) { n2gl_stop = false; n2gq.guard_ref++; }  /* 0581: transient; the pipe stays up */
+ out:
++	if (n2gq.wr) { n2gq_hb(NULL); }
+ 	lck_mtx_unlock(&n2gd_lock);
+ 	return e;
+ }

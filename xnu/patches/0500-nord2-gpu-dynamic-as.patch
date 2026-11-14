@@ -1,0 +1,616 @@
+--- a/bsd/dev/nord2_gpu_core.h
++++ b/bsd/dev/nord2_gpu_core.h
+@@ -36,7 +36,15 @@
+ extern "C" {
+ #endif
+ 
+-#define N2C_MAX_CTX 8u          /* AS0 kernel + AS1..AS7 clients */
++/* 0500: contexts and hardware address spaces are decoupled.  The GPU has N2C_HW_AS address spaces (AS0 = the TTRX_3485 workaround / kernel
++ * context, AS1..AS7 for clients).  With dynamic AS management (default; n2c_set_as_dynamic) a client context owns its page tables for its
++ * whole life but holds a hardware AS only while it needs one: n2c_poll binds one when the context's next job is about to start and, if none
++ * is free, takes the least recently used one from a context with no job on the hardware (panfrost_mmu_as_get/put): that AS is drained
++ * (FLUSH_MEM over the whole range) and unmapped first, the new owner's TRANSTAB/MEMATTR/TRANSCFG are written with UPDATE and its TLB entries
++ * are flushed.  Static mode (the kill switch, boot-arg n2gctx=0 or n2gdv +32) is the old model: context i = AS i, at most 7 clients. */
++#define N2C_HW_AS 8u            /* hardware address spaces (AS_PRESENT is checked as well) */
++#define N2C_MAX_CTX 64u         /* 0500: software contexts (index 0 = kernel); static mode uses 0..N2C_HW_AS-1 only */
++#define N2C_AS_NONE 0xffu       /* x->as of a context that holds no hardware AS */
+ /* Handles per context.  A handle is (serial << N2C_SLOT_BITS) | slot, 32 bits in the ABI (u32 handles[]), so the slot field takes
+  * N2C_SLOT_BITS of the serial: 0105 raised the context limit from 256 to 1024 slots (backboardd held all 256 and dropped commands) and
+  * the core-wide serial, which never repeats so a stale handle cannot alias, shrank from 24 to 22 bits (4194303 buffers per boot). */
+@@ -179,13 +187,15 @@
+ 
+ struct n2c_ctx {
+         uint8_t state;
+-        uint8_t as;
++        uint8_t as;               /* hardware AS; N2C_AS_NONE while unbound (dynamic mode) */
+         bool as_live;             /* AS programmed with this context */
+         uint64_t owner;
+         uint32_t generation;
++        uint64_t as_stamp;        /* 0500: LRU stamp, set at every bind and job start */
+         struct nord2_gpu_mmu mmu;
+-        struct n2va va;
+-        struct n2c_bo *bos[N2C_MAX_BOS];
++        /* 0500: allocated at open (ops.alloc_host), NULL while the context is FREE: 64 contexts would otherwise take ~12 MiB inside n2c_core. */
++        struct n2va *va;
++        struct n2c_bo **bos;      /* N2C_MAX_BOS entries */
+         uint64_t wired, wired_limit;
+         uint64_t imported;        /* subset of wired charged to N2C_BO_IMPORTED pages */
+         uint32_t jobs;            /* jobs not yet terminal */
+@@ -284,6 +294,17 @@
+         const void *tok[N2C_RESV_MAX];
+ };
+ 
++/* 0500: address-space management counters (cumulative). */
++struct n2c_as_stats {
++        uint64_t binds;           /* AS programmed for a context (dynamic mode) */
++        uint64_t evictions;       /* AS taken from an idle context */
++        uint64_t bind_waits;      /* a job could not get an AS in this poll (every AS held by a context with work on the hardware) */
++        uint64_t bind_failures;   /* disable/configure/flush not acknowledged: reset requested */
++        uint64_t orphan_faults;   /* MMU fault on an AS no context holds */
++        uint64_t ctx_refused;     /* n2c_ctx_open found no free context */
++        uint32_t ctx_open, ctx_peak, bound;
++};
++
+ /* 0400 latency accounting, read and reset with n2c_lat_take() (all us, n2c ops.now_us):
+  *  irq   = job interrupt top half (n2c_lat_irq) -> the poll that consumed the completion;
+  *  hand  = the job's predecessor in its context finished (or, for a job submitted later, its submission) -> its first phase started;
+@@ -341,6 +362,11 @@
+         uint64_t lat_busy_since;          /* first slot taken while all were free */
+         unsigned lat_slots_busy;
+         struct n2c_lat lat;
++        /* 0500 */
++        bool as_dyn;                      /* dynamic AS management (false = static: context i is AS i) */
++        uint8_t as_owner[N2C_HW_AS];      /* context holding each AS (dynamic mode), N2C_AS_NONE = free */
++        uint64_t as_clock;
++        struct n2c_as_stats as_stats;
+ };
+ 
+ bool n2c_init(struct n2c_core *c, const struct n2c_ops *ops, void *ctx,
+@@ -395,6 +421,8 @@
+ enum n2c_error n2c_seq_state(struct n2c_core *c, unsigned ctx, uint64_t seq,
+                              bool reap, struct n2c_seq_result *res);
+ bool n2c_set_track_level(struct n2c_core *c, unsigned level);
++/* 0500: dynamic (true, n2c_init's default) or static address-space management.  Refused while any context exists. */
++bool n2c_set_as_dynamic(struct n2c_core *c, bool on);
+ /* Opt-in (boot-arg n2wm): trust write_mask as the list of buffers a job writes.  A job with write_mask == 0 keeps the conservative rule
+  * (every listed GPU_WRITE buffer).  Refused once buffers exist. */
+ bool n2c_set_wmask_inval(struct n2c_core *c, bool on);
+--- a/bsd/dev/nord2_gpu_core.c
++++ b/bsd/dev/nord2_gpu_core.c
+@@ -14,6 +14,8 @@
+ #define BO_GUARD 0x1000ull      /* unmapped page after every buffer */
+ #define JS_STATUS_BUS_FAULT 0x48u
+ 
++static void free_ctx_memory(struct n2c_core *c, struct n2c_ctx *x);
++
+ static void note(struct n2c_core *c, const char *msg)
+ {
+         if (c->ops.log)
+@@ -131,7 +133,7 @@
+         if (b->state == N2C_BO_QUARANTINED)
+                 c->stats.drained++;
+         if (b->size)
+-                (void)n2va_free(&x->va, b->va, b->size + BO_GUARD);
++                (void)n2va_free(x->va, b->va, b->size + BO_GUARD);
+         if (b->cookie && c->ops.free_owner)
+                 c->ops.free_owner(c->ctx, b->cookie);
+         x->wired = x->wired >= b->charged ? x->wired - b->charged : 0;
+@@ -257,9 +259,54 @@
+         c->next_handle = 1;
+         c->state = N2C_CORE_OFF;
+         c->lat_release_late = true;     /* 0400 */
++        c->as_dyn = true;               /* 0500 */
++        memset(c->as_owner, N2C_AS_NONE, sizeof(c->as_owner));
++        return true;
++}
++
++bool n2c_set_as_dynamic(struct n2c_core *c, bool on)
++{
++        if (!c)
++                return false;
++        for (unsigned i = 0; i < N2C_MAX_CTX; i++)
++                if (c->ctxs[i].state != N2C_CTX_FREE)
++                        return false;
++        c->as_dyn = on;
++        memset(c->as_owner, N2C_AS_NONE, sizeof(c->as_owner));
+         return true;
+ }
+ 
++/* 0500: a client context of the dynamic mode (the kernel context 0 keeps AS0 as before). */
++static bool as_dynamic_ctx(const struct n2c_core *c, unsigned idx)
++{
++        return c->as_dyn && idx != 0;
++}
++
++/* The context no longer holds its AS (the AS was disabled with an acknowledgement, or a reset unprogrammed every AS). */
++static void as_unbind(struct n2c_core *c, struct n2c_ctx *x)
++{
++        x->as_live = false;
++        unsigned idx = (unsigned)(x - c->ctxs);
++        if (!as_dynamic_ctx(c, idx))
++                return;
++        if (x->as < N2C_HW_AS && c->as_owner[x->as] == idx) {
++                c->as_owner[x->as] = N2C_AS_NONE;
++                if (c->as_stats.bound)
++                        c->as_stats.bound--;
++        }
++        x->as = N2C_AS_NONE;
++}
++
++/* After a verified reset or before power-down: no client holds an AS. */
++static void as_unbind_all(struct n2c_core *c)
++{
++        for (unsigned i = 0; i < N2C_MAX_CTX; i++)
++                if (as_dynamic_ctx(c, i) && c->ctxs[i].state != N2C_CTX_FREE)
++                        as_unbind(c, &c->ctxs[i]);
++        memset(c->as_owner, N2C_AS_NONE, sizeof(c->as_owner));
++        c->as_stats.bound = 0;
++}
++
+ bool n2c_set_wa_payload(struct n2c_core *c, const uint8_t *bytes, size_t size)
+ {
+         if (!c || c->state != N2C_CORE_OFF || c->gpu_powered ||
+@@ -327,8 +374,8 @@
+         }
+         for (unsigned i = 0; i < N2C_MAX_CTX; i++) {
+                 struct n2c_ctx *x = &c->ctxs[i];
+-                if (x->state != N2C_CTX_OPEN)
+-                        continue;
++                if (x->state != N2C_CTX_OPEN || as_dynamic_ctx(c, i))
++                        continue;       /* 0500: dynamic clients get an AS when their next job starts */
+                 x->as_live = true; /* UPDATE may commit even on timeout */
+                 if (n2hw_as_configure(c->hw, x->as, x->mmu.root_pa) != N2HW_OK) {
+                         c->state = N2C_CORE_BROKEN;
+@@ -362,6 +409,7 @@
+                         c->reset_pending = true;
+                         return N2C_E_HW;
+                 }
++                as_unbind(c, x);        /* 0500: also an AS held (disabled) by a faulted context */
+                 x->as_live = false;
+         }
+         if (c->wa_as_live && n2hw_as_disable(c->hw, 0) != N2HW_OK) {
+@@ -390,40 +438,58 @@
+         /* AS0 belongs to the workaround for the complete powered lifetime. */
+         if (kernel && (c->hw->has_issue_ttrx_3485 || c->wa_payload))
+                 return N2C_E_STATE;
+-        unsigned first = kernel ? 0 : 1, last = kernel ? 1 : N2C_MAX_CTX;
++        /* 0500: static mode keeps context index = AS number (1..7); dynamic clients take any of N2C_MAX_CTX slots. */
++        unsigned first = kernel ? 0 : 1, last = kernel ? 1 : (c->as_dyn ? N2C_MAX_CTX : N2C_HW_AS);
+         for (unsigned i = first; i < last; i++) {
+                 struct n2c_ctx *x = &c->ctxs[i];
+                 if (x->state != N2C_CTX_FREE)
+                         continue;
+-                if (c->hw->identified && !(c->hw->id.as_present & (1u << i)))
++                if (!as_dynamic_ctx(c, i) && c->hw->identified && !(c->hw->id.as_present & (1u << i)))
+                         continue;
+                 uint32_t gen = x->generation;
+                 memset(x, 0, sizeof(*x));
+                 x->generation = gen + 1;
++                if (!c->ops.alloc_host(c->ctx, N2C_MAX_BOS * sizeof(*x->bos), (void **)&x->bos) || !x->bos) {
++                        x->bos = NULL;
++                        return N2C_E_NOMEM;
++                }
++                memset(x->bos, 0, N2C_MAX_BOS * sizeof(*x->bos));
++                if (!c->ops.alloc_host(c->ctx, sizeof(*x->va), (void **)&x->va) || !x->va) {
++                        c->ops.free_host(c->ctx, x->bos, N2C_MAX_BOS * sizeof(*x->bos));
++                        x->bos = NULL;
++                        x->va = NULL;
++                        return N2C_E_NOMEM;
++                }
+                 const struct nord2_gpu_mmu_ops mops = {
+                         c->ops.alloc_table, c->ops.free_table,
+                         c->ops.flush_table, c->ops.alloc_host,
+                         c->ops.free_host, c->ops.log,
+                 };
+                 if (!nord2_gpu_mmu_init(&x->mmu, &mops, c->ctx,
+-                                        N2C_MAX_TABLES))
++                                        N2C_MAX_TABLES)) {
++                        free_ctx_memory(c, x);
+                         return N2C_E_NOMEM;
+-                if (!n2va_init(&x->va, N2C_VA_BASE, N2C_VA_LIMIT)) {
+-                        nord2_gpu_mmu_fini(&x->mmu);
++                }
++                if (!n2va_init(x->va, N2C_VA_BASE, N2C_VA_LIMIT)) {
++                        free_ctx_memory(c, x);
+                         return N2C_E_VA;
+                 }
+-                x->as = (uint8_t)i;
++                x->as = as_dynamic_ctx(c, i) ? N2C_AS_NONE : (uint8_t)i;
+                 x->owner = owner;
+                 x->wired_limit = wired_limit;
+                 x->state = N2C_CTX_OPEN;
+-                if (c->state == N2C_CORE_READY && c->gpu_powered) {
++                c->as_stats.ctx_open++;
++                if (c->as_stats.ctx_open > c->as_stats.ctx_peak)
++                        c->as_stats.ctx_peak = c->as_stats.ctx_open;
++                if (!as_dynamic_ctx(c, i) && c->state == N2C_CORE_READY && c->gpu_powered) {
+                         x->as_live = true;
+                         if (n2hw_as_configure(c->hw, x->as, x->mmu.root_pa) !=
+                             N2HW_OK) {
+                                 if (n2hw_as_disable(c->hw, x->as) == N2HW_OK) {
+                                         x->as_live = false;
+-                                        nord2_gpu_mmu_fini(&x->mmu);
++                                        free_ctx_memory(c, x);
+                                         x->state = N2C_CTX_FREE;
++                                        c->as_stats.ctx_open--;
+                                 } else {
+                                         x->state = N2C_CTX_ZOMBIE;
+                                         c->reset_pending = true;
+@@ -434,6 +500,7 @@
+                 *ctx_out = i;
+                 return N2C_OK;
+         }
++        c->as_stats.ctx_refused++;
+         return N2C_E_NO_CTX;
+ }
+ 
+@@ -562,12 +629,21 @@
+ 
+ static void free_ctx_memory(struct n2c_core *c, struct n2c_ctx *x)
+ {
+-        for (unsigned s = 0; s < N2C_MAX_BOS; s++) {
+-                struct n2c_bo *b = x->bos[s];
+-                if (b)
+-                        free_bo_memory(c, x, b);
+-        }
+-        nord2_gpu_mmu_fini(&x->mmu);
++        if (x->bos)
++                for (unsigned s = 0; s < N2C_MAX_BOS; s++) {
++                        struct n2c_bo *b = x->bos[s];
++                        if (b)
++                                free_bo_memory(c, x, b);
++                }
++        if (x->mmu.valid)
++                nord2_gpu_mmu_fini(&x->mmu);
++        /* 0500: the per-context tables go with the context */
++        if (x->bos)
++                c->ops.free_host(c->ctx, x->bos, N2C_MAX_BOS * sizeof(*x->bos));
++        if (x->va)
++                c->ops.free_host(c->ctx, x->va, sizeof(*x->va));
++        x->bos = NULL;
++        x->va = NULL;
+ }
+ 
+ /* ------------------------------------------------------------------ */
+@@ -752,14 +828,16 @@
+                                 x->state = N2C_CTX_ZOMBIE;
+                                 return N2C_E_BROKEN;
+                         }
+-                        /* The reset reprogrammed the AS; drain again. */
+-                        if (n2hw_as_disable(c->hw, x->as) != N2HW_OK) {
++                        /* The reset reprogrammed the AS (static mode; 0500 dynamic clients come out of a reset unbound); drain again. */
++                        if (x->as_live && n2hw_as_disable(c->hw, x->as) != N2HW_OK) {
+                                 x->state = N2C_CTX_ZOMBIE;
+                                 return N2C_E_BROKEN;
+                         }
+                 }
++                as_unbind(c, x);
+                 x->as_live = false;
+         }
++        as_unbind(c, x);                /* 0500: unpowered (the AS UPDATE at power-up invalidates), or an AS held disabled after a fault */
+         if (c->state == N2C_CORE_BROKEN && c->gpu_powered) {
+                 x->state = N2C_CTX_ZOMBIE;
+                 return N2C_E_BROKEN;
+@@ -774,6 +852,8 @@
+         uint32_t gen = x->generation;
+         memset(x, 0, sizeof(*x));
+         x->generation = gen;
++        if (c->as_stats.ctx_open)
++                c->as_stats.ctx_open--;
+         return N2C_OK;
+ }
+ 
+@@ -825,18 +905,18 @@
+         uint64_t size = (uint64_t)nr_pages * NORD2_GPU_PAGE_SIZE;
+         uint64_t va = 0;
+         uint64_t align = size >= (2ull << 20) ? (2ull << 20) : 0x10000ull;
+-        if (!n2va_alloc(&x->va, size + BO_GUARD, align, &va))
++        if (!n2va_alloc(x->va, size + BO_GUARD, align, &va))
+                 return N2C_E_VA;
+         struct n2c_bo *b = NULL;
+         if (!c->ops.alloc_host(c->ctx, sizeof(*b), (void **)&b) || !b) {
+-                (void)n2va_free(&x->va, va, size + BO_GUARD);
++                (void)n2va_free(x->va, va, size + BO_GUARD);
+                 return N2C_E_NOMEM;
+         }
+         memset(b, 0, sizeof(*b));
+         if (!c->ops.alloc_host(c->ctx, nr_pages * sizeof(*b->pages),
+                                (void **)&b->pages) || !b->pages) {
+                 c->ops.free_host(c->ctx, b, sizeof(*b));
+-                (void)n2va_free(&x->va, va, size + BO_GUARD);
++                (void)n2va_free(x->va, va, size + BO_GUARD);
+                 return N2C_E_NOMEM;
+         }
+         memcpy(b->pages, pages, nr_pages * sizeof(*b->pages));
+@@ -1091,8 +1171,8 @@
+         if (c->state == N2C_CORE_BROKEN)
+                 return N2C_E_BROKEN;
+         if (c->state != N2C_CORE_READY || x->state != N2C_CTX_OPEN ||
+-            !x->as_live || c->reset_pending)
+-                return N2C_E_STATE;
++            (!x->as_live && !as_dynamic_ctx(c, idx)) || c->reset_pending)
++                return N2C_E_STATE;     /* 0500: a dynamic client gets its AS in try_start */
+         if (!r || !id_out || !r->nr_handles || r->nr_handles > N2C_JOB_BOS ||
+             (r->flags & ~N2C_SUBMIT_FULL_MAINT) ||
+             (r->nr_handles < 32 && (r->write_mask >> r->nr_handles)))
+@@ -1225,10 +1305,85 @@
+         return true;
+ }
+ 
++static bool ctx_has_active(struct n2c_core *c, unsigned idx);
++
++static bool ctx_has_queued(const struct n2c_core *c, unsigned idx)
++{
++        for (unsigned i = 0; i < N2C_MAX_JOBS; i++)
++                if (c->jobs[i].ctx == idx && c->jobs[i].state == N2C_JOB_QUEUED)
++                        return true;
++        return false;
++}
++
++/* 0500 (panfrost_mmu_as_get): give context idx a hardware AS.  A free one first; else the least recently used AS of a context with nothing
++ * on the hardware (no RUNNING/STOPPING job), preferring contexts with nothing queued either.  The victim's AS is drained and unmapped
++ * (n2hw_as_disable: LOCK + FLUSH_MEM over the whole range, then UPDATE to UNMAPPED) before it is reprogrammed, so no TLB entry or walk of the
++ * victim's tables survives; the new owner's tables are written with UPDATE and its range is flushed again (FLUSH_PT).  Page tables changed
++ * while a context held no AS need no flush of their own: nothing caches them (the last flush of the AS that held them covered the whole
++ * range, and every job start cleans+invalidates the L2).  false: no AS this time (every AS busy: retried at the next poll), or the hardware
++ * did not acknowledge (reset_pending set; the reset unbinds every client). */
++static bool as_bind(struct n2c_core *c, unsigned idx)
++{
++        struct n2c_ctx *x = &c->ctxs[idx];
++        if (x->as_live)
++                return true;
++        if (!c->gpu_powered || c->state != N2C_CORE_READY || c->reset_pending)
++                return false;
++        unsigned pick = N2C_AS_NONE;
++        for (unsigned as = 1; as < N2C_HW_AS && pick == N2C_AS_NONE; as++)
++                if ((c->hw->id.as_present & (1u << as)) && c->as_owner[as] == N2C_AS_NONE)
++                        pick = as;
++        if (pick == N2C_AS_NONE) {
++                unsigned best_cls = 2;
++                uint64_t best_stamp = UINT64_MAX;
++                for (unsigned as = 1; as < N2C_HW_AS; as++) {
++                        unsigned v = c->as_owner[as];
++                        if (!(c->hw->id.as_present & (1u << as)) || v >= N2C_MAX_CTX || v == idx)
++                                continue;
++                        if (ctx_has_active(c, v))
++                                continue;               /* never evict a context with jobs on the hardware */
++                        unsigned cls = ctx_has_queued(c, v) ? 1u : 0u;
++                        if (cls < best_cls || (cls == best_cls && c->ctxs[v].as_stamp < best_stamp)) {
++                                best_cls = cls;
++                                best_stamp = c->ctxs[v].as_stamp;
++                                pick = as;
++                        }
++                }
++                if (pick == N2C_AS_NONE) {
++                        c->as_stats.bind_waits++;
++                        return false;
++                }
++                struct n2c_ctx *v = &c->ctxs[c->as_owner[pick]];
++                if (n2hw_as_disable(c->hw, pick) != N2HW_OK) {
++                        c->as_stats.bind_failures++;
++                        c->reset_pending = true;        /* the victim still counts as bound until the reset */
++                        note(c, "Nord2 GPU core: AS eviction not acknowledged; reset");
++                        return false;
++                }
++                as_unbind(c, v);
++                c->as_stats.evictions++;
++        }
++        x->as = (uint8_t)pick;
++        c->as_owner[pick] = (uint8_t)idx;
++        c->as_stats.bound++;
++        x->as_live = true;      /* UPDATE may commit even on timeout */
++        x->as_stamp = ++c->as_clock;
++        if (n2hw_as_configure(c->hw, pick, x->mmu.root_pa) != N2HW_OK ||
++            n2hw_as_flush(c->hw, pick, 0, 1ull << 44, false) != N2HW_OK) {
++                c->as_stats.bind_failures++;
++                c->reset_pending = true;
++                note(c, "Nord2 GPU core: AS bind not acknowledged; reset");
++                return false;
++        }
++        c->as_stats.binds++;
++        return true;
++}
++
+ static void try_start(struct n2c_core *c)
+ {
+         if (c->state != N2C_CORE_READY || c->reset_pending || c->hold_start)
+                 return;
++        bool nobind[N2C_MAX_CTX] = { false };   /* 0500: contexts that found no AS in this call */
+         for (;;) {
+                 /* Oldest queued job whose context has nothing older still
+                  * pending (per-context submission order across slots). */
+@@ -1247,8 +1402,11 @@
+                                 continue;
+                         /* Blocked unless it is the oldest unfinished job of its context. */
+                         bool blocked = oldest[j->ctx] != j->id;
+-                        if (c->ctxs[j->ctx].state != N2C_CTX_OPEN ||
+-                            !c->ctxs[j->ctx].as_live)
++                        if (c->ctxs[j->ctx].state != N2C_CTX_OPEN)
++                                blocked = true;
++                        else if (!c->ctxs[j->ctx].as_live && (!as_dynamic_ctx(c, j->ctx) || nobind[j->ctx]))
++                                blocked = true;
++                        else if (!c->ctxs[j->ctx].as_live && !c->gpu_powered)
+                                 blocked = true;
+                         unsigned slot = phase_slot(c, j);
+                         if (c->running[slot])
+@@ -1258,6 +1416,15 @@
+                 }
+                 if (!pick)
+                         return;
++                if (!c->ctxs[pick->ctx].as_live) {
++                        if (!as_bind(c, pick->ctx)) {
++                                if (c->reset_pending)
++                                        return;
++                                nobind[pick->ctx] = true;
++                                continue;
++                        }
++                }
++                c->ctxs[pick->ctx].as_stamp = ++c->as_clock;
+                 unsigned slot = phase_slot(c, pick);
+                 /* Serialize CPU maintenance after the older job completed,
+                  * before its successor starts.  A job that listed its
+@@ -1384,9 +1551,19 @@
+         unsigned n = n2hw_mmu_irq(c->hw, f, 16);
+         for (unsigned i = 0; i < n; i++) {
+                 c->stats.mmu_faults++;
+-                if (f[i].as >= N2C_MAX_CTX)
++                /* 0500: the AS number names the context only in static mode (and for AS0); a dynamic AS belongs to as_owner[as]. */
++                unsigned idx = f[i].as;
++                if (c->as_dyn && f[i].as != 0) {
++                        idx = f[i].as < N2C_HW_AS ? c->as_owner[f[i].as] : N2C_AS_NONE;
++                        if (idx >= N2C_MAX_CTX || !c->ctxs[idx].as_live || c->ctxs[idx].as != f[i].as) {
++                                c->as_stats.orphan_faults++;
++                                note(c, "Nord2 GPU core: MMU fault on an AS no context holds");
++                                continue;
++                        }
++                }
++                if (idx >= N2C_MAX_CTX || (!c->as_dyn && idx >= N2C_HW_AS))
+                         continue;
+-                struct n2c_ctx *x = &c->ctxs[f[i].as];
++                struct n2c_ctx *x = &c->ctxs[idx];
+                 if (x->state == N2C_CTX_FREE)
+                         continue;
+                 x->fault_status = f[i].status;
+@@ -1398,16 +1575,18 @@
+                  * as a fault instead of reaching memory. */
+                 for (unsigned k = 0; k < N2C_MAX_JOBS; k++) {
+                         struct n2c_job *j = &c->jobs[k];
+-                        if (j->ctx == f[i].as && j->state == N2C_JOB_RUNNING)
++                        if (j->ctx == idx && j->state == N2C_JOB_RUNNING)
+                                 stop_job(c, j);
+-                        if (j->ctx == f[i].as && j->state == N2C_JOB_QUEUED)
++                        if (j->ctx == idx && j->state == N2C_JOB_QUEUED)
+                                 job_finish(c, j, N2C_JOB_CANCELLED);
+                 }
+                 if (x->as_live) {
+                         if (n2hw_as_disable(c->hw, x->as) != N2HW_OK)
+                                 c->reset_pending = true;
+                         else
+-                                x->as_live = false;
++                                x->as_live = false;     /* 0500: the AS stays HELD by the faulted context (as_owner) until its stopped jobs are
++                                                         * acknowledged: as_bind never reprograms it under a job still on the hardware, then
++                                                         * lends it like any idle AS (close or LRU eviction gives it back) */
+                 }
+         }
+ }
+@@ -1531,6 +1710,8 @@
+ {
+         for (unsigned i = 0; i < N2C_MAX_CTX; i++) {
+                 struct n2c_ctx *x = &c->ctxs[i];
++                if (x->state == N2C_CTX_FREE || !x->bos)
++                        continue;       /* 0500: a FREE context has no buffer table */
+                 for (unsigned s = 0; s < N2C_MAX_BOS; s++) {
+                         struct n2c_bo *b = x->bos[s];
+                         if (b && b->state == N2C_BO_QUARANTINED)
+@@ -1539,6 +1720,8 @@
+                 if (x->state == N2C_CTX_ZOMBIE) {
+                         free_ctx_memory(c, x);
+                         x->state = N2C_CTX_FREE;
++                        if (c->as_stats.ctx_open)
++                                c->as_stats.ctx_open--;
+                 }
+         }
+ }
+@@ -1568,6 +1751,7 @@
+         lat_busy(c, n2c_now_us(c));     /* 0400 */
+         for (unsigned i = 0; i < N2C_MAX_CTX; i++)
+                 c->ctxs[i].as_live = false;
++        as_unbind_all(c);       /* 0500: dynamic clients rebind at their next job */
+         for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
+                 struct n2c_job *j = &c->jobs[i];
+                 if (j->state == N2C_JOB_RUNNING ||
+@@ -1587,7 +1771,7 @@
+         }
+         for (unsigned i = 0; i < N2C_MAX_CTX; i++) {
+                 struct n2c_ctx *x = &c->ctxs[i];
+-                if (x->state != N2C_CTX_OPEN)
++                if (x->state != N2C_CTX_OPEN || as_dynamic_ctx(c, i))
+                         continue;
+                 x->as_live = true;
+                 if (n2hw_as_configure(c->hw, x->as, x->mmu.root_pa) !=
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -183,6 +183,7 @@
+ /* 0461: runtime GPU DVFS.  Policy: bsd/dev/nord2_gov.h (n2g_gpu_*); clock: n2clk_retune (the vendor's parking switch); voltage: never touched, only OPPs the
+  * rails found at power-on already cover are used.  kern.n2gdvfs / boot-arg n2gdv: 0 off, 1 decisions logged only (default), 2 act; +4 = change the clock under a
+  * running job like the vendor does (default: job starts are held, at most 50 ms, and the clock changes in the gap).  Everything runs in tick() under the driver lock.
++ * 0500: n2gdv +32 = n2gctx=0 (static GPU address spaces, the kill switch of dynamic AS management; read in cache_scope).
+  * 0492: +8 = UI profile (n2gdv=10 acts with it, 9 logs its decisions): never below the cold-start OPP, so the clock moves between the cold-start rate and the cap and
+  * nowhere else, and while the UI animates or is touched the cap is taken at 80 % busy over 40 ms instead of 88 %.
+  * The first three switches are announced 400 ms ahead (the console is pulled by the host), the first eight are checked against the GPU's own cycle counter.  Any
+@@ -320,6 +321,12 @@
+         int rs = 1;      /* 0112: nord2_gpu_resv=0 (alias n2resv) disables the display-surface reservation selectors */
+         got = PE_parse_boot_argn("nord2_gpu_resv", &rs, sizeof(rs)); if (!got) got = PE_parse_boot_argn("n2resv", &rs, sizeof(rs));
+         n2c_set_resv_enabled(c, rs != 0);
++        /* 0500: dynamic GPU address spaces (any number of Metal clients; the 7 client AS are lent at job start).  Kill switch: boot-arg n2gctx=0,
++         * or n2gdv +32 (the boot line has 4 characters left with n2gdv=9: n2gdv=41 = the same DVFS mode with the old static AS model). */
++        { int gx = 1, gm = 0; if (!PE_parse_boot_argn("n2gctx", &gx, sizeof(gx)) && PE_parse_boot_argn("n2gdv", &gm, sizeof(gm)) && (gm & 32)) gx = 0;
++          (void)n2c_set_as_dynamic(c, gx != 0);
++          IOLog("NORD2 GPU AS: mode=%s contexts=%u hw_as=%u (kill switch n2gctx=0 or n2gdv+32 = static, 7 clients)\n", c->as_dyn ? "dynamic" : "static",
++                c->as_dyn ? N2C_MAX_CTX - 1 : N2C_HW_AS - 1, N2C_HW_AS); }
+         IOLog("NORD2 GPU: cache maintenance %s, CPU-access tracking level %d, invalidate scope %s, surface reservations %s\n", c->full_cache_maint ? "whole-context (boot-arg)" : "per-job buffer list", tr,
+               c->wmask_inval ? "declared writes (write_mask)" : "every listed GPU_WRITE buffer", rs ? "on" : "off");
+         return true;
+@@ -632,6 +639,20 @@
+         d->release();
+         thread_terminate(current_thread());
+ }
++/* 0500: address-space line, at most every 2 s and only when a counter moved: what to read on the phone (open/peak > 7 with no "context refused"). */
++static void as_emit(Nord2GPU *d) {
++        static uint64_t last_us, last_sum;
++        if (!d->core) return;
++        const n2c_as_stats &a = d->core->as_stats; const n2c_stats &s = d->core->stats;
++        uint64_t sum = a.binds + a.evictions + a.bind_waits + a.bind_failures + a.orphan_faults + a.ctx_refused + a.ctx_open + a.ctx_peak + s.mmu_faults + s.resets + s.flush_failures;
++        uint64_t t = now_us(NULL);
++        if (sum == last_sum || (last_us && t - last_us < 2000000ull)) return;
++        last_sum = sum; last_us = t;
++        IOLog("NORD2 GPU AS: mode=%s open=%u peak=%u bound=%u binds=%llu evict=%llu waits=%llu bindfail=%llu refused=%llu mmu_faults=%llu orphan=%llu resets=%llu flushfail=%llu\n",
++              d->core->as_dyn ? "dynamic" : "static", a.ctx_open, a.ctx_peak, a.bound, (unsigned long long)a.binds, (unsigned long long)a.evictions,
++              (unsigned long long)a.bind_waits, (unsigned long long)a.bind_failures, (unsigned long long)a.ctx_refused, (unsigned long long)s.mmu_faults,
++              (unsigned long long)a.orphan_faults, (unsigned long long)s.resets, (unsigned long long)s.flush_failures);
++}
+ static void lat_emit(Nord2GPU *d) {
+         n2c_lat l;
+         if (!d->core || !n2c_lat_take(d->core, &l, 2000000ull)) return;
+@@ -673,6 +694,7 @@
+                 n2c_poll(d->core);
+                 d->emitJobStats();
+                 lat_emit(d);
++                as_emit(d);      /* 0500 */
+                 d->gdvfsPoll(now_us(NULL));      /* 0461 */
+                 if (d->core->state == N2C_CORE_BROKEN) {
+                         d->ready = false; d->setProperty("Nord2GPUState", "fault-memory-pinned");
+@@ -1346,7 +1368,7 @@
+               vm_page_pageable_internal_count, vm_page_pageable_external_count, memorystatus_available_pages, c_segment_pages_compressed, vm_page_free_target);
+         if (core) {   /* 0185: released-but-still-mapped buffers (held for older jobs), live buffers, handle table fill of the fullest context */
+                 unsigned held = 0, fullest = 0;
+-                for (unsigned i = 1; i < N2C_MAX_CTX; i++) { unsigned used = 0; for (unsigned k = 0; k < N2C_MAX_BOS; k++) { struct n2c_bo *b = core->ctxs[i].bos[k]; if (b) { used++; if (!b->refs && b->state == N2C_BO_MAPPED) held++; } } if (used > fullest) fullest = used; }
++                for (unsigned i = 1; i < N2C_MAX_CTX; i++) { unsigned used = 0; if (core->ctxs[i].state == N2C_CTX_FREE || !core->ctxs[i].bos) continue; for (unsigned k = 0; k < N2C_MAX_BOS; k++) { struct n2c_bo *b = core->ctxs[i].bos[k]; if (b) { used++; if (!b->refs && b->state == N2C_BO_MAPPED) held++; } } if (used > fullest) fullest = used; }
+                 IOLog("NORD2 MEM GPU: bos_live=%llu released_held=%u fullest_handle_table=%u/%u private=%llu MiB heap=%u/%llu MiB fallback=%u imports=%u\n", (unsigned long long)core->stats.bos_live, held, fullest, (unsigned)N2C_MAX_BOS, (unsigned long long)(privateTotal() >> 20),
+                       gHeapBos, (unsigned long long)(gHeapBytes >> 20), gHeapFallback, gHeapImports);      /* 0441 */
+         }
+@@ -1756,7 +1778,23 @@
+ IOReturn Nord2GPUUserClient::ensureContext() {
+         if(!gpu->ready || gpu->stopping)return kIOReturnNotReady;
+         if(context<N2C_MAX_CTX)return kIOReturnSuccess;
+-        return io_error(n2c_ctx_open(gpu->core,(uint64_t)(uintptr_t)task,NORD2_GPU_CONTEXT_LIMIT,false,&context));
++        enum n2c_error e=n2c_ctx_open(gpu->core,(uint64_t)(uintptr_t)task,NORD2_GPU_CONTEXT_LIMIT,false,&context);
++        if(e==N2C_E_NO_CTX){
++                /* 0500: "no free context" is a refusal, not "not ready": NoResources (ENOMEM in libredwoodair's kerr) ends its ALLOC at once
++                 * instead of the 100 x 100 ms EIO retry loop that blocked the process ~10 s (FrontBoard watchdog kills). */
++                const n2c_as_stats &st=gpu->core->as_stats;
++                if(st.ctx_refused<=16||!(st.ctx_refused&63)){char name[17]={};proc_selfname(name,sizeof(name));
++                        IOLog("NORD2 GPU AS: context refused pid=%d(%s) open=%u peak=%u refused=%llu mode=%s\n",proc_selfpid(),name,st.ctx_open,st.ctx_peak,
++                              (unsigned long long)st.ctx_refused,gpu->core->as_dyn?"dynamic":"static");}
++                return kIOReturnNoResources;
++        }
++        static unsigned peak_logged;
++        if(e==N2C_OK&&gpu->core->as_stats.ctx_open>N2C_HW_AS-1&&gpu->core->as_stats.ctx_open>peak_logged){
++                peak_logged=gpu->core->as_stats.ctx_open;char name[17]={};proc_selfname(name,sizeof(name));
++                IOLog("NORD2 GPU AS: context %u opened pid=%d(%s): %u client contexts open (more than the %u hardware client AS)\n",context,proc_selfpid(),name,
++                      gpu->core->as_stats.ctx_open,N2C_HW_AS-1);
++        }
++        return io_error(e);
+ }
+ void Nord2GPUUserClient::closeContext() {
+         if(!lock)return;
