@@ -1,0 +1,253 @@
+--- a/bsd/dev/nord2_gpu_core.c
++++ b/bsd/dev/nord2_gpu_core.c
+@@ -49,6 +49,9 @@
+                 return false;
+         rb_wr(hw, N2HW_JS_REG(slot, N2HW_JS_HEAD_NEXT_LO), 0u);
+         rb_wr(hw, N2HW_JS_REG(slot, N2HW_JS_HEAD_NEXT_HI), 0u);
++        /* 0668: the chain taken back was the last one written: give its JOB_CHAIN_FLAG back, so the next chain again carries the flag
++         * opposite to the current one (else a flag-targeted stop of a current chain that just completed would hit the next chain) */
++        hw->job_chain_flag[slot] = !hw->job_chain_flag[slot];
+         if (head)
+                 *head = h;
+         return true;
+@@ -1751,6 +1754,22 @@
+                         }
+                 }
+                 c->ctxs[pick->ctx].as_stamp = ++c->as_clock;
++                if (c->cores_off) {             /* 0666: shader cores were powered down while idle */
++                        uint64_t tp = n2c_now_us(c);
++                        if (n2hw_power_on_cores(c->hw, c->hw->id.shader_present) != N2HW_OK) {
++                                c->prof.pg_fail++;
++                                c->reset_pending = true;
++                                note(c, "Nord2 GPU core: shader power-up failed; reset");
++                                return;
++                        }
++                        uint64_t t1p = n2c_now_us(c);
++                        c->cores_off = false;
++                        c->prof.pg_ons++;
++                        if (t1p - tp > c->prof.pg_on_max_us)
++                                c->prof.pg_on_max_us = (uint32_t)(t1p - tp);
++                        if (t1p > c->off_since_us)
++                                c->prof.pg_off_us += t1p - c->off_since_us;
++                }
+                 unsigned slot = phase_slot(c, pick);
+                 /* Serialize CPU maintenance after the older job completed,
+                  * before its successor starts.  A job that listed its
+@@ -2073,6 +2092,31 @@
+         if (c->reset_pending)
+                 (void)n2c_reset(c);
+         try_start(c);
++        /* 0666: no job on the hardware or waiting -> after pg_idle_us power the shader cores down (L2 cleaned and kept on, kbase-like) */
++        if (c->pg_on && c->state == N2C_CORE_READY && c->gpu_powered && !c->reset_pending && !c->hold_start) {
++                bool work = false;
++                for (unsigned i = 0; i < N2C_MAX_JOBS && !work; i++) {
++                        uint8_t st = c->jobs[i].state;
++                        work = st == N2C_JOB_QUEUED || st == N2C_JOB_RUNNING || st == N2C_JOB_STOPPING;
++                }
++                uint64_t tn = n2c_now_us(c);
++                if (work || c->cores_off)
++                        c->idle_since_us = 0;
++                else if (!c->idle_since_us)
++                        c->idle_since_us = tn ? tn : 1;
++                else if (tn - c->idle_since_us >= c->pg_idle_us) {
++                        if (n2hw_power_off_cores(c->hw) == N2HW_OK) {
++                                c->cores_off = true;
++                                c->off_since_us = tn;
++                                c->prof.pg_offs++;
++                        } else {
++                                c->prof.pg_fail++;
++                                c->pg_on = false;       /* do not try again this boot */
++                                note(c, "Nord2 GPU core: shader power-down failed; gating off");
++                        }
++                        c->idle_since_us = 0;
++                }
++        }
+         /* 0400: the jobs completed above drop their buffer references only now, with the next job already on the GPU: the teardown of
+          * released buffers (MMU unmap, AS flush, owner release) used to run between a completion and the start of its successor. */
+         bool due = false;
+@@ -2215,6 +2259,7 @@
+         for (unsigned i = 0; i < N2C_MAX_CTX; i++)
+                 resv_drop_ctx(c, i);          /* a reset ends everything the frames were waiting for */
+         c->reset_pending = false;
++        c->cores_off = false;           /* 0666: the reset powers them up below */
+         if (n2hw_apply_quirks(c->hw) != N2HW_OK ||
+             n2hw_power_on_l2(c->hw) != N2HW_OK || wa_start(c) != N2C_OK ||
+             n2hw_power_on_cores(c->hw, c->hw->id.shader_present) != N2HW_OK) {
+--- a/bsd/dev/nord2_gpu_core.h
++++ b/bsd/dev/nord2_gpu_core.h
+@@ -363,6 +363,8 @@
+         uint32_t hist[2][7];              /* run time per slot 0/1: <100 <250 <500 <1000 <4000 <16000 >=16000 us */
+         uint64_t preclean_us;             /* time spent cleaning outside the lock */
+         uint32_t full_jobs, truncated_jobs, precise_jobs, jobs;
++        uint32_t pg_offs, pg_ons, pg_on_max_us, pg_fail;               /* 0666: shader-core power-downs / -ups, slowest power-up, failures */
++        uint64_t pg_off_us;                                            /* 0666: time with the shader cores off */
+ };
+ 
+ struct n2c_core {
+@@ -382,6 +384,10 @@
+         bool pipe;                /* 0632: precise jobs may overtake older non-conflicting fragment jobs of their context (kill switch: false) */
+         bool preclean;            /* 0661: CPU cleans of listed buffers run at submit in the submitting thread, outside the lock (kill switch: false) */
+         bool prio_on;             /* 0662: compositor-first pick, NEXT take-back, job-record reserve (kill switch: false) */
++        bool pg_on;               /* 0666: power the shader cores down after pg_idle_us without work (kbase: 25 x 400 us on MT6893) */
++        uint32_t pg_idle_us;
++        bool cores_off;
++        uint64_t idle_since_us, off_since_us;
+         /* 0660 telemetry, read and cleared by n2c_prof_take every 2 s */
+         struct n2c_prof prof;
+         struct n2c_bo *quarantine[N2C_QUARANTINE];
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -226,6 +226,16 @@
+ static int gCtxPid[N2C_MAX_CTX];
+ static uint64_t gLockWaitSumUs, gLockHoldSumUs, gBhWaitSumUs, gBhWaitN, gBhPollSumUs;      /* 0660 */
+ static int gIrqCpu = -1, gBhCpu = -1;       /* 0663 */
++/* 0665 (step C): kern.n2guv / boot-arg n2guv=0 = VGPU stays at the boot chain's 750 mV for every OPP <= 836 MHz; otherwise each OPP runs at the vendor
++ * table voltage + kern.n2guvm (default 12.5 mV), raised before the clock goes up and lowered after it came down (0633's order and rail code); a GPU
++ * fault / reset / timeout within 10 s of a lowering puts the boot rails back for the rest of the boot.
++ * 0666 (step C): kern.n2gpg / boot-arg n2gpg=0 = the shader cores stay powered; otherwise they are powered down after kern.n2gpgus (10000 us)
++ * without GPU work and up again before the next job (kbase on MT6893: 25 x 400 us). */
++static int gUv = 1, gUvMargin = 12500, gPg = 1, gPgApplied = 1, gPgIdleUs = 10000;
++SYSCTL_INT(_kern, OID_AUTO, n2guv, CTLFLAG_RW | CTLFLAG_LOCKED, &gUv, 0, "0665: GPU per-OPP vendor voltage");
++SYSCTL_INT(_kern, OID_AUTO, n2guvm, CTLFLAG_RW | CTLFLAG_LOCKED, &gUvMargin, 0, "0665: margin above the vendor VGPU, uV (0..50000)");
++SYSCTL_INT(_kern, OID_AUTO, n2gpg, CTLFLAG_RW | CTLFLAG_LOCKED, &gPg, 0, "0666: GPU shader-core power gating when idle");
++SYSCTL_INT(_kern, OID_AUTO, n2gpgus, CTLFLAG_RW | CTLFLAG_LOCKED, &gPgIdleUs, 0, "0666: idle time before the shader cores are powered down, us");
+ SYSCTL_INT(_kern, OID_AUTO, n2gpipe, CTLFLAG_RW | CTLFLAG_LOCKED, &gPipe, 0, "0632: precise GPU jobs may overlap older fragment jobs of their context (1 on, 0 off)");
+ SYSCTL_INT(_kern, OID_AUTO, n2gjsnext, CTLFLAG_RW | CTLFLAG_LOCKED, &gJsNext, 0, "0630: GPU JS NEXT pipelining (1 on, 0 no new NEXT writes)");
+ SYSCTL_INT(_kern, OID_AUTO, n2gpu_lat, CTLFLAG_RW | CTLFLAG_LOCKED, &gLatMode, 0, "0400: GPU latency changes off-mask: 1 BH thread, 2 late release, 4 zero skip, 8 deferred owner free");
+@@ -253,6 +263,8 @@
+         unsigned sw2, depthMax, depthLast;
+         /* 0633: highest OPP the rails cover NOW (max_idx may be higher when the voltage can be raised for it); raised = at 800/800 mV */
+         unsigned covered, voltOps, voltErr; bool raised; uint32_t bootVg, bootVs;
++        /* 0665: the rails now, the one-time per-OPP step at boot, its fault watchdog */
++        uint32_t curVg, curVs; bool uvDone, uvFailed; uint64_t uvWdUs, uvWdCount;
+         uint64_t atMs[N2G_GPU_NOPP], lastMs2;
+ } gGdv;
+ /* 0631: kern.n2gprof: 0 = the 0461/0492 policy, 1 = fast ramp (654 MHz floor, straight to the thermal cap when the GPU is hot, back after 500 ms),
+@@ -405,6 +417,9 @@
+           v = 1; if (PE_parse_boot_argn("n2gv4", &v, sizeof(v))) gV4 = v != 0;
+           v = 1; if (PE_parse_boot_argn("n2gpr", &v, sizeof(v))) gPrio = v != 0; c->prio_on = gPrio != 0; gPrioApplied = gPrio;
+           v = 1; if (PE_parse_boot_argn("n2girq", &v, sizeof(v))) gIrqBig = v != 0;
++          v = 1; if (PE_parse_boot_argn("n2guv", &v, sizeof(v))) gUv = v != 0;
++          v = 1; if (PE_parse_boot_argn("n2gpg", &v, sizeof(v))) gPg = v != 0; c->pg_on = gPg != 0; c->pg_idle_us = (uint32_t)gPgIdleUs; gPgApplied = gPg;
++          IOLog("NORD2 GPU POWER: per-OPP voltage %s (margin %d uV), shader-core gating %s after %d us idle (n2guv=0 / n2gpg=0 off)\n", gUv ? "on" : "off", gUvMargin, gPg ? "on" : "off", gPgIdleUs);
+           IOLog("NORD2 GPUPROF: step A on: preclean=%d abi_v4=%d prio=%d irq_big=%d (boot-args n2gpc/n2gv4/n2gpr/n2girq =0 to switch off)\n", gPreclean, gV4, gPrio, gIrqBig); }
+         IOLog("NORD2 GPU: cache maintenance %s, CPU-access tracking level %d, invalidate scope %s, surface reservations %s\n", c->full_cache_maint ? "whole-context (boot-arg)" : "per-job buffer list", tr,
+               c->wmask_inval ? "declared writes (write_mask)" : "every listed GPU_WRITE buffer", rs ? "on" : "off");
+@@ -482,6 +497,7 @@
+         static int pmicRead(void *);   /* 0116: one PMIC register read on the PWRAP owner thread (CPU DVFS init voltages) */
+         static int railSet(void *);    /* 0633: n2rail_set on the PWRAP owner thread (input thread) */
+         bool gdvfsVolt(uint32_t vg, uint32_t vs, const char *why);      /* 0633 */
++        uint32_t gdvfsOppVg(unsigned idx);                              /* 0665 */
+         /* Optional job interrupt (boot-arg nord2_gpu_irq=1; polling stays the fallback). */
+         bool irqWanted = false, irqTried = false, irqArmed = false;
+         uint32_t irqSpi = NORD2_GPU_JOB_SPI_DEFAULT, irqIntid = 0, irqLearnMisses = 0;
+@@ -785,6 +801,8 @@
+                       pf.clean_pages[N2C_CR_FULLHARD] * 4, pf.clean_pages[N2C_CR_LEGACY] * 4, pf.clean_pages[N2C_CR_IMPLICIT] * 4, pf.clean_pages[N2C_CR_DIRTY] * 4,
+                       pf.clean_pages[N2C_CR_FULL] * 4, pf.clean_pages[N2C_CR_PRESUBMIT] * 4, pf.clean_max_pages * 4, pf.inval_pages * 4, pf.preclean_us,
+                       pf.jobs, pf.full_jobs, pf.truncated_jobs, pf.precise_jobs);
++                IOLog("NORD2 GPUPROF PWR: pg=%u offs=%u ons=%u on_max_us=%u off_ms=%llu fail=%u vgpu_uv=%u vsram_uv=%u uv=%d uv_failed=%u\n", (unsigned)d->core->pg_on, pf.pg_offs, pf.pg_ons,
++                      pf.pg_on_max_us, pf.pg_off_us / 1000, pf.pg_fail, gGdv.curVg, gGdv.curVs, gUv, (unsigned)gGdv.uvFailed);
+                 IOLog("NORD2 GPUPROF DRV: lock_wait_avg_us=%llu lock_hold_avg_us=%llu bh_wake_avg_us=%llu bh_poll_avg_us=%llu irq_cpu=%d bh_cpu=%d prio=%u evict=%u aged=%u reserve=%u\n",
+                       gLockCalls ? gLockWaitSumUs / gLockCalls : 0ull, gLockCalls ? gLockHoldSumUs / gLockCalls : 0ull, gBhWaitN ? gBhWaitSumUs / gBhWaitN : 0ull,
+                       gBhRuns ? gBhPollSumUs / gBhRuns : 0ull, gIrqCpu, gBhCpu, (unsigned)d->core->prio_on, l.pr_evicted, l.pr_aged, l.pr_reserved);
+@@ -818,6 +836,10 @@
+                 if (gPipe != gPipeApplied) { d->core->pipe = gPipe != 0; gPipeApplied = gPipe; }   /* 0632 */
+                 if (gPreclean != gPrecleanApplied) { d->core->preclean = gPreclean != 0; gPrecleanApplied = gPreclean; }   /* 0661 */
+                 if (gPrio != gPrioApplied) { d->core->prio_on = gPrio != 0; gPrioApplied = gPrio; }   /* 0662 */
++                if (gPg != gPgApplied || d->core->pg_idle_us != (uint32_t)gPgIdleUs) {      /* 0666 */
++                        if (gPgIdleUs < 1000) gPgIdleUs = 1000;
++                        d->core->pg_on = gPg != 0; d->core->pg_idle_us = (uint32_t)gPgIdleUs; gPgApplied = gPg;
++                }
+                 if (gJsNext != gJsNextApplied) { (void)n2c_set_jsnext(d->core, gJsNext != 0); gJsNext = gJsNextApplied = d->core->jsnext ? 1 : 0; }   /* 0630 */
+                 n2c_poll(d->core);
+                 d->emitJobStats();
+@@ -1396,6 +1418,19 @@
+         q->rc = (int)n2rail_set(&q->d->rail, q->vg, q->vs);
+         return q->rc;
+ }
++/* 0665: VGPU of OPP idx: vendor table (PTPOD-off, max of segments) + kern.n2guvm, within [650 mV, the boot chain's VGPU]; 886 MHz = 800 mV (0633) */
++uint32_t Nord2GPU::gdvfsOppVg(unsigned idx) {
++        auto &v = gGdv;
++        if (idx >= 5u) return 800000u;
++        if (!gUv || v.uvFailed || v.bootVg != 750000u || v.bootVs != 750000u) return v.bootVg;
++        unsigned oi = 0;
++        if (!n2rail_opp_index_exact(n2g_gpu_khz[idx], &oi)) return v.bootVg;
++        int m = gUvMargin < 0 ? 0 : gUvMargin > 50000 ? 50000 : gUvMargin;
++        uint32_t t = n2rail_opp_table[oi].vgpu_uv + (uint32_t)m;      /* table in uV (OPP() scales mV x 100) */
++        if (t < N2RAIL_SET_VGPU_MIN_UV) t = N2RAIL_SET_VGPU_MIN_UV;
++        if (t > v.bootVg) t = v.bootVg;
++        return n2rail_vgpu_uv(n2rail_vgpu_sel_for_uv(t), &t) ? t : v.bootVg;      /* the regulator's step (6.25 mV, rounded up) */
++}
+ bool Nord2GPU::gdvfsVolt(uint32_t vg, uint32_t vs, const char *why) {
+         auto &v = gGdv;
+         RailSetReq q = { this, vg, vs, -1 };
+@@ -1444,23 +1479,30 @@
+         v.pend = -1;
+         if (to != v.boot && (v.failed || (gGdvfs & 3) != 2 || to > v.g.cap)) { core->hold_start = false; n2c_poll(core); return; }      /* switched off or capped since it was announced */
+         enum n2clk_error e = N2CLK_E_PLL_RANGE;
+-        /* 0633: voltage before frequency on the way up */
+-        if (to > v.covered) {
+-                if (!gVolt || to != 5u || !gdvfsVolt(800000u, 800000u, "raise for 886 MHz")) {
++        /* 0633 / 0665: voltage before frequency on the way up (the OPP's voltage: vendor table + margin, 800/800 mV for 886) */
++        uint32_t vt = gdvfsOppVg(to), vst = vt > v.bootVs ? vt : v.bootVs;
++        if (to > v.covered || vt > v.curVg) {
++                if ((to == 5u && !gVolt) || !gdvfsVolt(vt, vst, to == 5u ? "raise for 886 MHz" : "raise before the clock")) {
+                         core->hold_start = false;
+-                        if (to == 5u) { v.g.max_idx = (uint8_t)v.covered; IOLog("NORD2 GDVFS VOLT: no raise: 886 MHz off until reboot\n"); }
++                        if (to == 5u) { v.g.max_idx = (uint8_t)(v.covered < 4u ? v.covered : 4u); IOLog("NORD2 GDVFS VOLT: no raise: 886 MHz off until reboot\n"); }
+                         n2c_poll(core); return;
+                 }
+-                v.covered = 5; v.raised = true;
++                v.curVg = vt; v.curVs = vst; v.covered = n2g_gpu_max_idx(vt, vst); v.raised = vt > v.bootVg;
+         }
+         if (to <= v.g.max_idx && to <= v.covered && n2rail_opp_index_exact(khz, &oi)) e = n2clk_retune(&clk, khz, n2rail_opp_table[oi].posdiv_power);
+         uint64_t t1 = now_us(NULL);
+         bool ok = e == N2CLK_OK;
+         if (ok && v.switches < 8) { meas = gdvfsMeasure(khz); ok = (uint64_t)meas * 100u >= (uint64_t)khz * 95u && (uint64_t)meas * 100u <= (uint64_t)khz * 105u; }
+-        /* 0633: frequency before voltage on the way down (also after a failed switch that left the clock below 886) */
+-        if (v.raised && n2rail_mfgpll_khz(read_bank(&clocks[N2CLK_APMIXED], N2CLK_MFGPLL_CON1)) <= 836000u) {
+-                if (gdvfsVolt(v.bootVg, v.bootVs, "back to the boot rails")) { v.raised = false; v.covered = 4; }
+-                else { v.g.max_idx = 5; v.covered = 5; }      /* left high: safe for every OPP, keep it */
++        /* 0633 / 0665: frequency before voltage on the way down (also after a failed switch): the voltage of the OPP the PLL really runs */
++        {
++                int pi2 = n2g_gpu_index(n2rail_mfgpll_khz(read_bank(&clocks[N2CLK_APMIXED], N2CLK_MFGPLL_CON1)));
++                uint32_t vl = gdvfsOppVg(pi2 >= 0 ? (unsigned)pi2 : v.boot), vls = vl > v.bootVs ? vl : v.bootVs;
++                if (pi2 >= 0 && vl < v.curVg) {
++                        if (gdvfsVolt(vl, vls, vl == v.bootVg ? "back to the boot rails" : "lower after the clock")) {
++                                v.curVg = vl; v.curVs = vls; v.covered = n2g_gpu_max_idx(vl, vls); v.raised = vl > v.bootVg;
++                                if (vl < v.bootVg) { v.uvWdUs = now_us(NULL) + 10000000ull; v.uvWdCount = core->stats.faulted + core->stats.resets + core->stats.timeouts; }
++                        }      /* else left high: safe for every lower OPP */
++                }
+         }
+         core->hold_start = false;
+         if (ok) {
+@@ -1496,13 +1538,28 @@
+                 v.boot = bi < 0 ? 0u : (unsigned)bi;
+                 v.g.cur = (uint8_t)v.boot;
+                 v.g.max_idx = (uint8_t)(rails ? n2g_gpu_max_idx(vg, vs) : v.boot);
+-                v.covered = v.g.max_idx; v.bootVg = vg; v.bootVs = vs;
++                v.covered = v.g.max_idx; v.bootVg = vg; v.bootVs = vs; v.curVg = vg; v.curVs = vs;      /* 0665 */
+                 if (gVolt && rails && vg == 750000u && vs == 750000u && v.g.max_idx == 4u) v.g.max_idx = 5;      /* 0633: 886 with a live raise */
+                 v.failed = v.dead = !rails || bi < 0 || !clk.mux_on || !clk.cg_on || v.g.max_idx < v.boot;
+                 IOLog("NORD2 GDVFS: kern.n2gdvfs=%d (0 off, 1 decisions only, 2 act, +4 no idle wait, +8 UI profile), cold-start %u kHz, rails VGPU %u uV / VSRAM %u uV cover up to %u kHz%s\n", gGdvfs, clk.after.khz, vg, vs,
+                       n2g_gpu_khz[v.g.max_idx], v.dead ? ": NOT usable (rails unread, or the clock is not an exact OPP): decisions only" : "");
+         }
+         if (v.pend >= 0) gdvfsSwitch(now);
++        /* 0665: once at boot, the OPP the GPU runs (654 MHz) goes to its vendor voltage; a fault within 10 s of any lowering -> boot rails for good */
++        if (!v.dead && v.pend < 0 && gUv && !v.uvDone && !v.uvFailed && v.bootVg == 750000u && v.bootVs == 750000u) {
++                v.uvDone = true;
++                int pi3 = n2g_gpu_index(n2rail_mfgpll_khz(read_bank(&clocks[N2CLK_APMIXED], N2CLK_MFGPLL_CON1)));
++                uint32_t t = gdvfsOppVg(pi3 >= 0 ? (unsigned)pi3 : v.boot);
++                if (pi3 >= 0 && t < v.curVg && gdvfsVolt(t, v.curVs, "per-OPP voltage (vendor table)")) {
++                        v.curVg = t; v.covered = n2g_gpu_max_idx(t, v.curVs);
++                        v.uvWdUs = now + 10000000ull; v.uvWdCount = core->stats.faulted + core->stats.resets + core->stats.timeouts;
++                }
++        }
++        if (v.uvWdUs && now < v.uvWdUs && !v.uvFailed && core->stats.faulted + core->stats.resets + core->stats.timeouts != v.uvWdCount) {
++                v.uvFailed = true; v.uvWdUs = 0;
++                IOLog("NORD2 GDVFS VOLT: a GPU fault / reset / timeout within 10 s of a voltage step at %u uV: back to the boot rails, per-OPP voltage off\n", v.curVg);
++                if (v.curVg < v.bootVg && gdvfsVolt(v.bootVg, v.bootVs, "fault fallback")) { v.curVg = v.bootVg; v.curVs = v.bootVs; v.covered = n2g_gpu_max_idx(v.bootVg, v.bootVs); }
++        }
+         if (v.lastUs && now - v.lastUs < N2G_GPU_POLL_MS * 1000ull) return;
+         uint64_t busy = v.busyBase + core->lat.busy_us + (core->lat_slots_busy && now > core->lat_busy_since ? now - core->lat_busy_since : 0ull);
+         unsigned pm = v.lastUs && busy >= v.lastBusy ? (unsigned)((busy - v.lastBusy) * 1000ull / (now - v.lastUs)) : 0u;

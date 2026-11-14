@@ -1,0 +1,241 @@
+--- a/bsd/dev/nord2_dvfs.h
++++ b/bsd/dev/nord2_dvfs.h
+@@ -220,6 +220,62 @@
+ 	return cur_mode;
+ }
+ 
++/*
++ * 0641 (cpu-20261114): CPU platform parity with the vendor kernel, three independent bits of n2p_mode (0 = the pre-0641 behaviour bit for bit).
++ *   N2P_COL  the CCI (DSU/L3 + interconnect) row follows the FASTER big cluster.  Before, the CCI column was the B row alone, so with the UI floors
++ *            (L 2200 MHz on cpu4-6 where the UI threads run, B 1998 MHz) the CCI sat at row 8 = 1021 MHz.  The column is now the B row whose clock is
++ *            the first at or above max(L clock, B clock) (L 2200 -> B row 5 = 2284 -> CCI row 6 = 1182 MHz).  Every row this can select was already
++ *            selected by the old rule for some B row (rows 1..10, same 1000 mV LL/CCI rail).
++ *   N2P_LL   the LL cluster (cpu0-3, A55) at row 0 = 2000 MHz instead of the bootloader row 1 = 1800 MHz (vendor table: 160 x 6.25 mV = 1000 mV, the
++ *            voltage the shared LL/CCI rail already measures at boot).  Checked once by the CPU clock measurement; a miss puts row 1 back for the boot.
++ *   N2P_PERF the vendor CCI 'perf' half of the map (rows 16..31; mtk_cm_mgr_platform.c sets it for 100 ms on every cm_mgr perf hint through
++ *            mt_cpufreq_update_cci_mode(1)) while the UI animates, is touched or janks.  Its fastest row is CCI row 0 = 1700 MHz at the same 1000 mV.
++ * The DVFS thread sets n2p_mode after the bring-up (the bring-up itself runs with 0) and n2p_perf_now on every governor tick.
++ */
++#define N2P_COL   1u
++#define N2P_LL    2u
++#define N2P_PERF  4u
++static unsigned n2p_mode;
++static bool n2p_perf_now;
++static int n2p_cci_last = -1;          /* CCI row last stored by n2d_goto_row / n2d_set_row_fast / n2p_cci_refresh, -1 = not known */
++
++/* B row (0 = 3000 MHz .. 15) whose clock is the slowest still at or above mhz; 0 when none is */
++static inline unsigned
++n2p_b_row_for(unsigned mhz)
++{
++	for (unsigned i = N2DV_NR_FREQ; i-- > 0;) {
++		if (n2dv_l1_pvt[N2DV_NR_FREQ * N2DV_B + i][0] >= mhz) {
++			return i;
++		}
++	}
++	return 0;
++}
++
++/* the CCI row for the cluster rows r (LL, L, B) under n2p_mode / n2p_perf_now; n2p_mode == 0 is exactly n2dv_cci_row(r[LL], r[B]) */
++static inline uint32_t
++n2p_cci_for(const uint8_t r[3])
++{
++	unsigned ll = r[N2DV_LL] & 15u, col = r[N2DV_B] & 15u;
++	if (n2p_mode & N2P_COL) {
++		unsigned lmhz = n2dv_l1_pvt[N2DV_NR_FREQ * N2DV_L + (r[N2DV_L] & 15u)][0], bmhz = n2dv_l1_pvt[N2DV_NR_FREQ * N2DV_B + col][0];
++		col = n2p_b_row_for(lmhz > bmhz ? lmhz : bmhz);
++	}
++	if ((n2p_mode & N2P_PERF) && n2p_perf_now) {
++		return n2dv_l1_cci[16u + ll][col];
++	}
++	return n2dv_l1_cci[ll][col];
++}
++
++/* whether the CCI store goes before the cluster store: a faster CCI first, a slower one last; ties follow the cluster direction (the pre-0641 order) */
++static inline bool
++n2p_cci_first(uint32_t cci, int cur_cci, bool cluster_faster)
++{
++	if (cur_cci < 0) {
++		return cluster_faster;
++	}
++	return cluster_faster ? (int)cci <= cur_cci : (int)cci < cur_cci;
++}
++
+ /* Announce a hardware access and give the host time to pull the line before it happens. */
+ static inline void
+ n2d_trace(const struct n2d_ops *o, void *ctx, unsigned what, unsigned b, unsigned c)
+@@ -266,15 +322,17 @@
+ 	/* The CCI request follows the vendor CCI map [LL row][B row] (assumption: README 12.7); faster uncore first, slower uncore last. */
+ 	uint8_t next[3] = { st->cur[0], st->cur[1], st->cur[2] };
+ 	next[c] = (uint8_t)row;
+-	uint32_t cci = n2dv_cci_row(next[N2DV_LL], next[N2DV_B]);
+-	if (row < st->cur[c]) {
++	uint32_t cci = n2p_cci_for(next);                                     /* 0641: == n2dv_cci_row(LL, B) while n2p_mode is 0 (the bring-up) */
++	bool first = n2p_cci_first(cci, n2p_cci_last, row < st->cur[c]);
++	if (first) {
+ 		o->w32(ctx, N2DV_OFF_REQ + 4 * N2DV_CCI, cci);
+ 	}
+ 	o->w32(ctx, N2DV_OFF_PPM_LIMIT + 4 * c, (uint32_t)row << 16 | row);
+ 	o->w32(ctx, N2DV_OFF_REQ + 4 * c, row);
+-	if (row >= st->cur[c]) {
++	if (!first) {
+ 		o->w32(ctx, N2DV_OFF_REQ + 4 * N2DV_CCI, cci);
+ 	}
++	n2p_cci_last = (int)cci;
+ 	unsigned want = n2d_row_mhz(c, row), m = 0;
+ 	for (unsigned t = 0; t < N2D_SETTLE_TRIES; t++) {
+ 		o->sleep_ms(ctx, N2D_SETTLE_MS);
+@@ -591,15 +649,17 @@
+ 		unsigned step = st->cur[c] > row ? (unsigned)st->cur[c] - 1u : (unsigned)st->cur[c] + 1u;
+ 		uint8_t next[3] = { st->cur[0], st->cur[1], st->cur[2] };
+ 		next[c] = (uint8_t)step;
+-		uint32_t cci = n2dv_cci_row(next[N2DV_LL], next[N2DV_B]);
+-		if (step < st->cur[c]) {
++		uint32_t cci = n2p_cci_for(next);                                 /* 0641 */
++		bool first = n2p_cci_first(cci, n2p_cci_last, step < st->cur[c]);
++		if (first) {
+ 			o->w32(ctx, N2DV_OFF_REQ + 4 * N2DV_CCI, cci);
+ 		}
+ 		o->w32(ctx, N2DV_OFF_PPM_LIMIT + 4 * c, (uint32_t)step << 16 | step);
+ 		o->w32(ctx, N2DV_OFF_REQ + 4 * c, step);
+-		if (step >= st->cur[c]) {
++		if (!first) {
+ 			o->w32(ctx, N2DV_OFF_REQ + 4 * N2DV_CCI, cci);
+ 		}
++		n2p_cci_last = (int)cci;
+ 		st->cur[c] = (uint8_t)step;
+ 		if (st->cur[c] != row) {
+ 			o->sleep_ms(ctx, N2D_GOV_STEP_MS);
+@@ -607,6 +667,22 @@
+ 	}
+ }
+ 
++/* 0641: store the CCI row the current cluster rows ask for when it differs from the last one stored (n2p_mode or n2p_perf_now changed).  true = stored. */
++static inline bool
++n2p_cci_refresh(const struct n2d_ops *o, void *ctx, const struct n2d_state *st)
++{
++	if (st->stopped || !st->inited) {
++		return false;
++	}
++	uint32_t cci = n2p_cci_for(st->cur);
++	if (n2p_cci_last == (int)cci) {
++		return false;
++	}
++	o->w32(ctx, N2DV_OFF_REQ + 4 * N2DV_CCI, cci);
++	n2p_cci_last = (int)cci;
++	return true;
++}
++
+ static inline void
+ n2d_gov_init(const struct n2d_ops *o, void *ctx, const struct n2d_state *st, struct n2d_gov *g)
+ {
+--- a/bsd/dev/nord2_cpufreq.c
++++ b/bsd/dev/nord2_cpufreq.c
+@@ -954,6 +954,75 @@
+ 	    r.shu_lv, r.pll_id, r.sdmpcw, r.prediv, r.posdiv, r.ckdiv4, r.pll_md, r.cldiv2, r.fbksel, r.dqopen, r.raw, r.mbps, r.mbps * 8u);
+ }
+ 
++/*
++ * 0641 (cpu-20261114): platform parity bits of nord2_dvfs.h (N2P_COL | N2P_LL | N2P_PERF), applied by the policy loop (kern.n2dvfs_mode >= 2) only.
++ * kern.n2cpuplat (run time) = the bits; boot default 7 (all), n2gdv +16 = 1 (CCI column only;
++ * n2gdv=25 fits the boot line; every other bit up to 65536 belongs to 0461-0633).  Full off = the chain without 0641.
++ * LL boost and the CCI perf half are dropped from thermal level 2 (battery 43.0 C) on and come back below it (ladder hysteresis).
++ * Every 2 s, next to the DECISION line: 'NORD2 CPUPLAT: mode= ll=MHz cci=MHz(row) perf=on|off | 2s: perf_ms= ll_fast_ms= cci_writes= ll_moves= | ll_bad='.
++ */
++static int nord2_cpuplat = -1;          /* -1 until the DVFS thread sets the boot default */
++SYSCTL_INT(_kern, OID_AUTO, n2cpuplat, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_cpuplat, 0, "0641: 1 CCI follows the faster big cluster, 2 LL at 2000 MHz, 4 CCI perf map while animating/touched");
++static struct {
++	bool ll_checked, ll_bad;
++	unsigned perf_ms, ll_fast_ms, cci_writes, ll_moves;
++	uint64_t last_ms;
++} n2p_st;
++
++static void
++n2p_tick(const struct n2d_ops *o, struct n2d_state *st, const struct n2s_gov *g, bool act)
++{
++	unsigned want_mode = nord2_cpuplat < 0 ? 0u : ((unsigned)nord2_cpuplat & (N2P_COL | N2P_LL | N2P_PERF));
++	uint64_t now = n2dv_now_ms(NULL);
++	unsigned dt = n2p_st.last_ms != 0 && now > n2p_st.last_ms && now - n2p_st.last_ms < 1000u ? (unsigned)(now - n2p_st.last_ms) : 0u;
++	n2p_st.last_ms = now;
++	if (!act || st->stopped || !st->inited) {
++		want_mode = 0;                                                     /* the 0172 governor or nothing acts: the pre-0641 CCI rule */
++	}
++	bool cool = g->th.level < 2u;
++	n2p_mode = want_mode;
++	n2p_perf_now = (want_mode & N2P_PERF) && cool && g->act.cls >= N2G_ANIM;
++	if (st->stopped || !st->inited) {
++		return;
++	}
++	unsigned ll_want = (want_mode & N2P_LL) && cool && !n2p_st.ll_bad ? 0u : st->orig[N2DV_LL];
++	if (st->cur[N2DV_LL] != ll_want) {
++		n2d_set_row_fast(o, NULL, st, N2DV_LL, ll_want);                  /* one row (1 <-> 0), CCI order included */
++		n2p_st.ll_moves++;
++		if (ll_want == 0 && !n2p_st.ll_checked) {
++			n2cf_sleep_ms(NULL, 20);
++			unsigned m = nord2_cpu_mhz(n2d_first_cpu[N2DV_LL]), want = n2d_row_mhz(N2DV_LL, 0);
++			n2p_st.ll_checked = true;
++			if (!n2d_within_pct(m, want, N2D_CLOCK_PCT)) {
++				n2p_st.ll_bad = true;
++				n2d_set_row_fast(o, NULL, st, N2DV_LL, st->orig[N2DV_LL]);
++				printf("NORD2 CPUPLAT: LL row 0 (%u MHz) NOT reached (cpu0 measures %u MHz): row %u back, LL boost off for this boot\n", want, m, st->orig[N2DV_LL]);
++			} else {
++				printf("NORD2 CPUPLAT: LL row 0 verified: cpu0 measures %u MHz (asked %u MHz, was %u MHz)\n", m, want, n2d_row_mhz(N2DV_LL, st->orig[N2DV_LL]));
++			}
++		}
++	}
++	if (n2p_cci_refresh(o, NULL, st)) {
++		n2p_st.cci_writes++;
++	}
++	if (n2p_perf_now) {
++		n2p_st.perf_ms += dt;
++	}
++	if (st->cur[N2DV_LL] == 0 && st->orig[N2DV_LL] != 0) {
++		n2p_st.ll_fast_ms += dt;
++	}
++}
++
++static void
++n2p_print(const struct n2d_state *st)
++{
++	int row = n2p_cci_last;
++	printf("NORD2 CPUPLAT: mode=%u ll=%uMHz cci=%dMHz(row %d) perf=%s | 2s: perf_ms=%u ll_fast_ms=%u cci_writes=%u ll_moves=%u | ll_bad=%u\n", n2p_mode,
++	    n2d_row_mhz(N2DV_LL, st->cur[N2DV_LL]), row >= 0 && row < 16 ? (int)n2d_row_mhz(N2DV_CCI, (unsigned)row) : -1, row, n2p_perf_now ? "on" : "off",
++	    n2p_st.perf_ms, n2p_st.ll_fast_ms, n2p_st.cci_writes, n2p_st.ll_moves, n2p_st.ll_bad);
++	n2p_st.perf_ms = n2p_st.ll_fast_ms = n2p_st.cci_writes = n2p_st.ll_moves = 0;
++}
++
+ static void
+ n2dvfs_main(void)
+ {
+@@ -996,6 +1065,13 @@
+ 		n2s_init(&st, &sg);
+ 		printf("NORD2 DVFS sched: kern.n2dvfs_mode=%d (0 old governor, 1 + decisions logged, 2 new policy acts, 3 pinned at the cap), tick %u ms, idle rows L %u B %u\n", nord2_dvfs_mode, N2G_CPU_TICK_MS,
+ 		    sg.cl[0].slowest, sg.cl[1].slowest);
++		{                                                          /* 0641 */
++			int gm = 0;
++			(void)PE_parse_boot_argn("n2gdv", &gm, sizeof(gm));
++			nord2_cpuplat = (gm & 16) ? (int)N2P_COL : (int)(N2P_COL | N2P_LL | N2P_PERF);
++			printf("NORD2 CPUPLAT: on, kern.n2cpuplat=%d (1 CCI follows the faster big cluster, 2 LL 2000 MHz, 4 CCI perf map while animating/touched; "
++			    "n2gdv +16 = 1); LL boot row %u (%u MHz), CCI row now %d\n", nord2_cpuplat, st.orig[N2DV_LL], n2d_row_mhz(N2DV_LL, st.orig[N2DV_LL]), n2p_cci_last);
++		}
+ 		while (!st.stopped && st.inited) {
+ 			int mode = nord2_dvfs_mode;
+ 			if (nord2_dram_probe == 1) {                       /* 0462 */
+@@ -1005,13 +1081,17 @@
+ 			if (mode <= 0) {                                   /* exactly the 0172 loop */
+ 				n2cf_sleep_ms(NULL, N2D_GOV_TICK_MS);
+ 				n2d_gov_tick(&n2dv_ops, NULL, &cfg, &st, &gov);
++				n2p_tick(&n2dv_ops, &st, &sg, false);              /* 0641: back to the pre-0641 rows/CCI rule */
+ 				continue;
+ 			}
+ 			n2cf_sleep_ms(NULL, N2G_CPU_TICK_MS);
+ 			sg.pin = mode >= 3;
+-			if (n2s_tick(&n2dv_ops, &n2s_kops, NULL, &cfg, &st, &gov, &sg, mode >= 2)) {
++			bool slow_tick = n2s_tick(&n2dv_ops, &n2s_kops, NULL, &cfg, &st, &gov, &sg, mode >= 2);
++			n2p_tick(&n2dv_ops, &st, &sg, mode >= 2);                  /* 0641 */
++			if (slow_tick) {
+ 				struct n2g_hints h;
+ 				n2s_print(&st, &sg, mode);
++				n2p_print(&st);
+ 				nord2_dvfs_hints(&h);
+ 				n2s_report_done(&sg, &h);
+ 			}

@@ -1,0 +1,248 @@
+--- a/bsd/dev/nord2_gpu_rail.h
++++ b/bsd/dev/nord2_gpu_rail.h
+@@ -131,6 +131,14 @@
+ enum n2rail_error n2rail_on(struct n2rail *r, const struct n2rail_point *pt);
+ /* VGPU then VSRAM; only what this module changed. */
+ enum n2rail_error n2rail_off(struct n2rail *r);
++/* 0633: live voltage change of powered rails (the vendor's __mt_gpufreq_volt_switch): VSRAM is raised before VGPU and lowered after it,
++ * every write is read back and the DA (actual) selector checked after the vendor settle time (rising dV/12.5 mV/us + 9/8 us, falling
++ * dV/5 mV/us + 9/8 us).  Limits: VGPU 650..800 mV, VSRAM 750..800 mV (the sign-off table's range above the 654 MHz OPP), VSRAM - VGPU within
++ * BUCK_DIFF at every step.  The first change remembers the original selectors, so n2rail_off/undo still restore what the boot chain left.
++ * An error leaves r->uncertain set (no further rail work). */
++#define N2RAIL_SET_VGPU_MIN_UV 650000u
++#define N2RAIL_SET_VSRAM_MIN_UV 750000u
++enum n2rail_error n2rail_set(struct n2rail *r, uint32_t vgpu_uv, uint32_t vsram_uv);
+ const char *n2rail_error_string(enum n2rail_error e);
+ 
+ #ifdef __cplusplus
+--- a/bsd/dev/nord2_gpu_rail.c
++++ b/bsd/dev/nord2_gpu_rail.c
+@@ -334,6 +334,110 @@
+         return N2RAIL_OK;
+ }
+ 
++static unsigned fall_settle_us(uint32_t delta_uv, unsigned fixed)
++{
++        /* __calculate_v{gpu,sram}_settletime(falling): dV / 5 mV + c. */
++        return delta_uv / 5000u + fixed;
++}
++
++static bool set_diff_ok(uint32_t vgpu, uint32_t vsram)
++{
++        int32_t d = (int32_t)vsram - (int32_t)vgpu;
++        return d <= N2RAIL_BUCK_DIFF_MAX_UV && d >= N2RAIL_BUCK_DIFF_MIN_UV;
++}
++
++static enum n2rail_error set_vsram(struct n2rail *r, uint8_t sel, uint32_t from_uv, uint32_t to_uv)
++{
++        if (!r->vsram_raised && !r->vsram_enabled_by_us) {
++                uint16_t elr = 0;
++                if (r->ops.mt6359_read(r->ctx, N2RAIL_VSRAM_ELR, &elr))
++                        return N2RAIL_E_IO;
++                r->vsram_orig_elr = (uint16_t)(elr & 0x7fu);
++        }
++        enum n2rail_error e = upd16(r, N2RAIL_VSRAM_ELR, 0x007f, sel);
++        if (e != N2RAIL_OK)
++                return e;
++        r->vsram_raised = sel != r->vsram_orig_elr;
++        r->ops.udelay(r->ctx, to_uv > from_uv ? rise_settle_us(to_uv - from_uv, 8) : fall_settle_us(from_uv - to_uv, 8));
++        uint16_t vosel1 = 0;
++        if (r->ops.mt6359_read(r->ctx, N2RAIL_VSRAM_VOSEL1, &vosel1))
++                return N2RAIL_E_IO;
++        return ((vosel1 >> 8) & 0x7fu) == sel ? N2RAIL_OK : N2RAIL_E_VERIFY;
++}
++
++static enum n2rail_error set_vgpu(struct n2rail *r, uint8_t sel, uint32_t from_uv, uint32_t to_uv)
++{
++        if (!r->vgpu_raised && !r->vgpu_enabled_by_us) {
++                uint8_t v = 0;
++                if (r->ops.mt6315_read(r->ctx, N2RAIL_VGPU_VOSEL, &v))
++                        return N2RAIL_E_IO;
++                r->vgpu_orig_sel = v;
++        }
++        enum n2rail_error e = upd8(r, N2RAIL_VGPU_VOSEL, 0xff, sel);
++        if (e != N2RAIL_OK)
++                return e;
++        r->vgpu_raised = sel != r->vgpu_orig_sel;
++        r->ops.udelay(r->ctx, to_uv > from_uv ? rise_settle_us(to_uv - from_uv, 9) : fall_settle_us(from_uv - to_uv, 9));
++        uint8_t da = 0;
++        if (r->ops.mt6315_read(r->ctx, N2RAIL_VGPU_DA_VOSEL, &da))
++                return N2RAIL_E_IO;
++        return da == sel ? N2RAIL_OK : N2RAIL_E_VERIFY;
++}
++
++enum n2rail_error n2rail_set(struct n2rail *r, uint32_t vgpu_uv, uint32_t vsram_uv)
++{
++        if (!r)
++                return N2RAIL_E_ARGS;
++        if (!r->on || r->uncertain)
++                return N2RAIL_E_STATE;
++        if (vgpu_uv < N2RAIL_SET_VGPU_MIN_UV || vgpu_uv > n2rail_opp_table[0].vgpu_uv ||
++            vsram_uv < N2RAIL_SET_VSRAM_MIN_UV || vsram_uv > n2rail_opp_table[0].vsram_uv)
++                return N2RAIL_E_OVERVOLT;
++        uint8_t gsel = n2rail_vgpu_sel_for_uv(vgpu_uv), ssel = n2rail_vsram_sel_for_uv(vsram_uv);
++        uint32_t g_new = 0, s_new = 0;
++        if (!n2rail_vgpu_uv(gsel, &g_new) || !n2rail_vsram_uv(ssel, &s_new) ||
++            g_new > n2rail_opp_table[0].vgpu_uv || s_new > n2rail_opp_table[0].vsram_uv)
++                return N2RAIL_E_SELECTOR;
++        r->step = 20;
++        uint8_t g_sel_now = 0, en = 0;
++        uint16_t elr = 0, mon = 0;
++        if (r->ops.mt6315_read(r->ctx, N2RAIL_VGPU_DA_VOSEL, &g_sel_now) || r->ops.mt6315_read(r->ctx, N2RAIL_VGPU_DA_EN, &en) ||
++            r->ops.mt6359_read(r->ctx, N2RAIL_VSRAM_ELR, &elr) || r->ops.mt6359_read(r->ctx, N2RAIL_VSRAM_MON, &mon))
++                return N2RAIL_E_IO;
++        uint32_t g_now = 0, s_now = 0;
++        if (!(en & 1u) || !(mon & 1u))
++                return N2RAIL_E_STATE;          /* a rail that is not on is not changed here */
++        if (!n2rail_vgpu_uv(g_sel_now, &g_now) || !n2rail_vsram_uv((uint8_t)(elr & 0x7fu), &s_now))
++                return N2RAIL_E_SELECTOR;
++        /* every intermediate state within BUCK_DIFF: VSRAM up first, VGPU, VSRAM down last */
++        uint32_t s_mid = s_new > s_now ? s_new : s_now;
++        if (!set_diff_ok(g_now, s_mid) || !set_diff_ok(g_new, s_mid) || !set_diff_ok(g_new, s_new))
++                return N2RAIL_E_DIFF;
++        enum n2rail_error e = N2RAIL_OK;
++        if (s_new > s_now) {
++                r->step = 21;
++                e = set_vsram(r, ssel, s_now, s_new);
++        }
++        if (e == N2RAIL_OK && g_new != g_now) {
++                r->step = 22;
++                e = set_vgpu(r, gsel, g_now, g_new);
++        }
++        if (e == N2RAIL_OK && s_new < s_now) {
++                r->step = 23;
++                e = set_vsram(r, ssel, s_now, s_new);
++        }
++        if (e != N2RAIL_OK) {
++                r->uncertain = true;
++                note(r, "Nord2 GPU rail: live voltage change failed; rails uncertain");
++                return e;
++        }
++        r->step = 24;
++        r->point.vgpu_uv = g_new;
++        r->point.vsram_uv = s_new;
++        (void)n2rail_capture(r, &r->after);
++        return N2RAIL_OK;
++}
++
+ enum n2rail_error n2rail_off(struct n2rail *r)
+ {
+         if (!r)
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -208,6 +208,8 @@
+         /* 0631: fast-ramp profile; gs/fs = its shadow (decisions applied to a model clock, never to the GPU), fa = its state when it acts */
+         struct n2g_gpu gs; struct n2g_gfast fs, fa;
+         unsigned sw2, depthMax, depthLast;
++        /* 0633: highest OPP the rails cover NOW (max_idx may be higher when the voltage can be raised for it); raised = at 800/800 mV */
++        unsigned covered, voltOps, voltErr; bool raised; uint32_t bootVg, bootVs;
+         uint64_t atMs[N2G_GPU_NOPP], lastMs2;
+ } gGdv;
+ /* 0631: kern.n2gprof: 0 = the 0461/0492 policy, 1 = fast ramp (654 MHz floor, straight to the thermal cap when the GPU is hot, back after 500 ms),
+@@ -215,6 +217,10 @@
+  * It only moves the clock when kern.n2gdvfs acts (mode 2, e.g. n2gdv=8202 or 16394); in decisions-only mode the fast profile still runs
+  * as a shadow and prints NORD2 GDVFS2 (what it would have done). */
+ static int gGprof = 0;
++/* 0633: kern.n2gvolt (boot: n2gdv +65536): 1 = the 886 MHz vendor OPP is allowed (thermal level 0 only), its 800/800 mV raised on the PWRAP owner
++ * thread before the clock goes up and lowered after it comes down (the vendor order); 0 = the rails stay as the boot chain left them (<= 836). */
++static int gVolt = 0;
++SYSCTL_INT(_kern, OID_AUTO, n2gvolt, CTLFLAG_RW | CTLFLAG_LOCKED, &gVolt, 0, "0633: 1 = GPU 886 MHz with a live VGPU/VSRAM raise to 800 mV (acts only with kern.n2gdvfs mode 2)");
+ SYSCTL_INT(_kern, OID_AUTO, n2gprof, CTLFLAG_RW | CTLFLAG_LOCKED, &gGprof, 0, "0631: GPU DVFS profile 0 = 0461/0492, 1 = fast ramp, 2 = performance (acts only with kern.n2gdvfs mode 2)");
+ /* Owners of torn-down buffers (unwire + release of up to 32 MiB, ms) are pushed here by the core's free_owner and released by a thread call,
+  * after the GPU pages were unmapped and flushed: nothing the GPU can reach is freed later than before, only the CPU-side release moves. */
+@@ -426,6 +432,8 @@
+         bool surfaceBusy(void *surface);
+         void surfaceBusyWhy(void *surface, uint32_t *match, uint64_t *oldestAgeUs, uint64_t *oldestId, uint32_t *oldestState, uint32_t *inflight, uint32_t *queued, uint32_t *resv);
+         static int pmicRead(void *);   /* 0116: one PMIC register read on the PWRAP owner thread (CPU DVFS init voltages) */
++        static int railSet(void *);    /* 0633: n2rail_set on the PWRAP owner thread (input thread) */
++        bool gdvfsVolt(uint32_t vg, uint32_t vs, const char *why);      /* 0633 */
+         /* Optional job interrupt (boot-arg nord2_gpu_irq=1; polling stays the fallback). */
+         bool irqWanted = false, irqTried = false, irqArmed = false;
+         uint32_t irqSpi = NORD2_GPU_JOB_SPI_DEFAULT, irqIntid = 0, irqLearnMisses = 0;
+@@ -760,7 +768,7 @@
+         int lm = 0; if (PE_parse_boot_argn("nord2_lvts_mask", &lm, sizeof(lm)) && lm > 0 && (lm & ~(int)N2LVTS_MASK_ALL) == 0) lvtsMask = (uint32_t)lm;
+         int lc = 0; if (PE_parse_boot_argn("nord2_lvts_max_c", &lc, sizeof(lc)) && lc >= 30 && lc <= 100) lvtsMaxC = lc;
+         if (lvtsMode) IOLog("NORD2 GPU: LVTS thermal sensing requested: mode %u mask %x cold-start guard %d C\n", lvtsMode, lvtsMask, lvtsMaxC);
+-        { int gm = 0; if (PE_parse_boot_argn("n2gdv", &gm, sizeof(gm))) { gGdvfs = gm & 15; gGprof = (gm & 16384) ? 2 : (gm & 8192) ? 1 : 0; } }      /* 0631 */      /* 0461, 0492: +8; +16 belongs to nord2_cpufreq.c (0493: DRAM rate probe and watch) */
++        { int gm = 0; if (PE_parse_boot_argn("n2gdv", &gm, sizeof(gm))) { gGdvfs = gm & 15; gGprof = (gm & 16384) ? 2 : (gm & 8192) ? 1 : 0; gVolt = (gm & 65536) ? 1 : 0; } }      /* 0631, 0633 */      /* 0461, 0492: +8; +16 belongs to nord2_cpufreq.c (0493: DRAM rate probe and watch) */
+         int irq = 1; PE_parse_boot_argn("nord2_gpu_irq", &irq, sizeof(irq)); irqWanted = irq == 1;   /* 0132: on by default (confirmed on the phone: SPI 364 / intid 396 asserts with the job line); nord2_gpu_irq=0 turns it off, which also frees the 16 characters the boot line needed for it */
+         int spi = 0; if (PE_parse_boot_argn("nord2_gpu_irq_spi", &spi, sizeof(spi)) && spi >= 32 && spi <= 900) irqSpi = (uint32_t)spi;
+         if (irqWanted) IOLog("NORD2 GPU: job interrupt requested (spi %u), polling remains the fallback\n", irqSpi);
+@@ -1261,6 +1269,29 @@
+         ckCycles = cyc; ckStamp = st; ckUs = t;
+ }
+ /* 0461: the shader cores' real clock over 500 us (CYCLE_COUNT, as clockCheck); up to three tries, the first within 5 % of khz wins.  Lock held, GPU idle or held. */
++/* 0633: rail change on the PWRAP owner thread (sweet_touch's input thread polls the queue), like power-on.  Called from tick() under the lock
++ * with job starts held; the input thread needs neither lock.  Any failure: rails marked uncertain by the rail module, GPU DVFS stops. */
++struct RailSetReq { Nord2GPU *d; uint32_t vg, vs; int rc; };
++int Nord2GPU::railSet(void *p) {
++        RailSetReq *q = (RailSetReq *)p;
++        q->rc = (int)n2rail_set(&q->d->rail, q->vg, q->vs);
++        return q->rc;
++}
++bool Nord2GPU::gdvfsVolt(uint32_t vg, uint32_t vs, const char *why) {
++        auto &v = gGdv;
++        RailSetReq q = { this, vg, vs, -1 };
++        int result = -1;
++        uint64_t t0 = now_us(NULL);
++        n2owner_wait wait = { now_ms, sleep_ms, NULL };
++        bool ok = n2owner_ready(&gpu_owner_queue) && n2owner_call(&gpu_owner_queue, Nord2GPU::railSet, &q, &wait, 1000, &result) && !result && q.rc == 0;
++        v.voltOps++;
++        const struct n2rail_snapshot &a = rail.after;
++        if (v.voltOps <= 16 || !ok)
++                IOLog("NORD2 GDVFS VOLT: %s %u/%u mV %s in %llu us (rail step %u, uncertain %u, VGPU da_sel %02x, VSRAM vosel1 %04x)\n", why, vg / 1000, vs / 1000,
++                      ok ? "ok" : n2rail_error_string((enum n2rail_error)q.rc), now_us(NULL) - t0, rail.step, (unsigned)rail.uncertain, a.vgpu_da_vosel, a.vsram_vosel1);
++        if (!ok) { v.voltErr++; if (rail.uncertain) { v.failed = true; v.dead = true; } }
++        return ok;
++}
+ uint32_t Nord2GPU::gdvfsMeasure(uint32_t khz) {
+         uint32_t got = 0;
+         write_bank(&gpu, 0x30, 5u);
+@@ -1294,10 +1325,24 @@
+         v.pend = -1;
+         if (to != v.boot && (v.failed || (gGdvfs & 3) != 2 || to > v.g.cap)) { core->hold_start = false; n2c_poll(core); return; }      /* switched off or capped since it was announced */
+         enum n2clk_error e = N2CLK_E_PLL_RANGE;
+-        if (to <= v.g.max_idx && n2rail_opp_index_exact(khz, &oi)) e = n2clk_retune(&clk, khz, n2rail_opp_table[oi].posdiv_power);
++        /* 0633: voltage before frequency on the way up */
++        if (to > v.covered) {
++                if (!gVolt || to != 5u || !gdvfsVolt(800000u, 800000u, "raise for 886 MHz")) {
++                        core->hold_start = false;
++                        if (to == 5u) { v.g.max_idx = (uint8_t)v.covered; IOLog("NORD2 GDVFS VOLT: no raise: 886 MHz off until reboot\n"); }
++                        n2c_poll(core); return;
++                }
++                v.covered = 5; v.raised = true;
++        }
++        if (to <= v.g.max_idx && to <= v.covered && n2rail_opp_index_exact(khz, &oi)) e = n2clk_retune(&clk, khz, n2rail_opp_table[oi].posdiv_power);
+         uint64_t t1 = now_us(NULL);
+         bool ok = e == N2CLK_OK;
+         if (ok && v.switches < 8) { meas = gdvfsMeasure(khz); ok = (uint64_t)meas * 100u >= (uint64_t)khz * 95u && (uint64_t)meas * 100u <= (uint64_t)khz * 105u; }
++        /* 0633: frequency before voltage on the way down (also after a failed switch that left the clock below 886) */
++        if (v.raised && n2rail_mfgpll_khz(read_bank(&clocks[N2CLK_APMIXED], N2CLK_MFGPLL_CON1)) <= 836000u) {
++                if (gdvfsVolt(v.bootVg, v.bootVs, "back to the boot rails")) { v.raised = false; v.covered = 4; }
++                else { v.g.max_idx = 5; v.covered = 5; }      /* left high: safe for every OPP, keep it */
++        }
+         core->hold_start = false;
+         if (ok) {
+                 n2g_gpu_applied(&v.g, to, t1 / 1000);
+@@ -1331,6 +1376,8 @@
+                 v.boot = bi < 0 ? 0u : (unsigned)bi;
+                 v.g.cur = (uint8_t)v.boot;
+                 v.g.max_idx = (uint8_t)(rails ? n2g_gpu_max_idx(vg, vs) : v.boot);
++                v.covered = v.g.max_idx; v.bootVg = vg; v.bootVs = vs;
++                if (gVolt && rails && vg == 750000u && vs == 750000u && v.g.max_idx == 4u) v.g.max_idx = 5;      /* 0633: 886 with a live raise */
+                 v.failed = v.dead = !rails || bi < 0 || !clk.mux_on || !clk.cg_on || v.g.max_idx < v.boot;
+                 IOLog("NORD2 GDVFS: kern.n2gdvfs=%d (0 off, 1 decisions only, 2 act, +4 no idle wait, +8 UI profile), cold-start %u kHz, rails VGPU %u uV / VSRAM %u uV cover up to %u kHz%s\n", gGdvfs, clk.after.khz, vg, vs,
+                       n2g_gpu_khz[v.g.max_idx], v.dead ? ": NOT usable (rails unread, or the clock is not an exact OPP): decisions only" : "");
+@@ -1393,9 +1440,9 @@
+                       n2rail_mfgpll_khz(read_bank(&clocks[N2CLK_APMIXED], N2CLK_MFGPLL_CON1)), (read_bank(&clocks[N2CLK_TOPCK], N2CLK_CFG_5) >> N2CLK_MFG_MUX_SHIFT) & N2CLK_MFG_MUX_MASK,
+                       v.polls ? v.busySum / v.polls : 0ull, v.busyMax, v.g.u_down, wn[v.g.why % N2G_NWHY], v.th.level, v.bat, v.switches, v.gapMiss, v.errors);
+         if (mode)       /* 0631: the fast profile as a shadow (or, with kern.n2gprof 1/2 and mode 2, what acts): time per OPP since the last line */
+-                IOLog("NORD2 GDVFS2: prof=%d shadow_fast cur=%u want=%u cap=%u switches=%u ms_at 512/654/805/836=%llu/%llu/%llu/%llu depth=%u/%u\n", gGprof,
+-                      n2g_gpu_khz[v.gs.cur], n2g_gpu_khz[v.gs.want], n2g_gpu_khz[v.gs.cap], v.sw2, v.atMs[1], v.atMs[2], v.atMs[3], v.atMs[4],
+-                      v.depthLast, v.depthMax);
++                IOLog("NORD2 GDVFS2: prof=%d shadow_fast cur=%u want=%u cap=%u switches=%u ms_at 512/654/805/836/886=%llu/%llu/%llu/%llu/%llu depth=%u/%u volt=%d covered=%u raised=%u ops=%u err=%u\n", gGprof,
++                      n2g_gpu_khz[v.gs.cur], n2g_gpu_khz[v.gs.want], n2g_gpu_khz[v.gs.cap], v.sw2, v.atMs[1], v.atMs[2], v.atMs[3], v.atMs[4], v.atMs[5],
++                      v.depthLast, v.depthMax, gVolt, n2g_gpu_khz[v.covered % N2G_GPU_NOPP], (unsigned)v.raised, v.voltOps, v.voltErr);
+         for (unsigned i = 0; i < N2G_GPU_NOPP; i++) v.atMs[i] = 0;
+         v.depthMax = 0;
+         v.busySum = 0; v.polls = v.busyMax = 0;

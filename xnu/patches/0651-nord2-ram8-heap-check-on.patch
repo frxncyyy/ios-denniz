@@ -1,0 +1,45 @@
+--- a/iokit/Kernel/arm/sweet_gfx_heap.h
++++ b/iokit/Kernel/arm/sweet_gfx_heap.h
+@@ -29,6 +29,9 @@
+  *   lb0  0x40400000..0x47C00000  the loader's own boot area: Image/stub at 0x40080000/0x40280000 (kept: chain-back target), SWEETXNU
+  *        payload 0x43744000 (copied into XNU's window before __start), stock DTB 0x47C80000 (kept: 0x47C00000..0x47E00000, the Wi-Fi
+  *        driver maps 1 MiB from it at run time).
++ * 0651 (stage b): the CHECK regions mb11b/mb12/mb13b ON by default (kern.n2heap_check = 1), each with a guard band to the neighbour whose real
++ * extent is not known (SCP DRAM / ccci / ap_md_nc_smem / SCP-reserved).  0419 probed exactly these ranges FREE (canary, 10 min of use);
++ * the 30 s scrub still switches a region off at the first foreign write.
+  * Everything else of the 8 GiB is firmware (TEE, ATF, GenieZone, SSPM/MCUPM/SPM/SCP/ADSP/DPM/PICACHU, vpu, pstore), the running modem
+  * (ccci, ap_md_nc_smem, md_mem_usage 0xE0000000..0x100000000), the LK framebuffer, or a device pool of ours (Wi-Fi, vcodec, cameras,
+  * JPEG, GNSS, DVFS/SCP shares): ram8-20261114/tools/memmap.py prints the full table and checks this one against it.
+@@ -46,7 +49,7 @@
+ #define SWEET_GFX_HEAP_F_NOPHYS 1u              /* never a physical OVL address (IOVA window numbers) */
+ #define SWEET_GFX_HEAP_F_POOLHI 2u              /* 0650: the display pool's upper part: only while the pool is limited to SWEET_GFX_HEAP_POOL_KEEP */
+ #define SWEET_GFX_HEAP_POOL_KEEP 0x1000000ull   /* 0650: bytes the display pool keeps (from its base) when it lends its upper part */
+-#define SWEET_GFX_HEAP_NGRAN    25304u          /* sum of the regions' granules (host test + check in sweet_heap_start); 0440: 15945 */
++#define SWEET_GFX_HEAP_NGRAN    25248u          /* sum of the regions' granules (host test + check in sweet_heap_start); 0650: 25304, 0440: 15945 */
+ #define SWEET_GFX_HEAP_WORDS    ((SWEET_GFX_HEAP_NGRAN + 63u) / 64u)
+ #define SWEET_GFX_HEAP_FAIL     0xffffffffu
+ #define SWEET_GFX_HEAP_ALL      ((1u << SWEET_GFX_HEAP_NREG) - 1u)
+@@ -63,9 +66,9 @@
+ 	{ 0x70200000ull, 0x03e00000ull, SWEET_GFX_HEAP_SAFE,  0,                       "mb6b"  },   /* 62 MiB, DVFS share end .. adsp */
+ 	{ 0x74e30000ull, 0x00fd0000ull, SWEET_GFX_HEAP_SAFE,  0,                       "mb7"   },   /* 15.8 MiB, adsp end .. SPM */
+ 	{ 0x80000000ull, 0x09000000ull, SWEET_GFX_HEAP_SAFE,  0,                       "mb11a" },   /* 144 MiB, .. SCP DRAM */
+-	{ 0x89320000ull, 0x00ce0000ull, SWEET_GFX_HEAP_CHECK, 0,                       "mb11b" },   /* 12.9 MiB, SCP DRAM end .. ccci */
+-	{ 0x8d560000ull, 0x00aa0000ull, SWEET_GFX_HEAP_CHECK, 0,                       "mb12"  },   /* 10.6 MiB, ccci end .. ap_md_nc_smem */
+-	{ 0x91000000ull, 0x0ea00000ull, SWEET_GFX_HEAP_CHECK, SWEET_GFX_HEAP_F_NOPHYS, "mb13b" },   /* 234 MiB, Wi-Fi pool end (+16 MiB) .. SCP-reserved */
++	{ 0x89400000ull, 0x00c00000ull, SWEET_GFX_HEAP_CHECK, 0,                       "mb11b" },   /* 0651: 12 MiB (SCP DRAM end + 0.9 MiB guard .. ccci) */
++	{ 0x8d600000ull, 0x00900000ull, SWEET_GFX_HEAP_CHECK, 0,                       "mb12"  },   /* 0651: 9 MiB (ccci end + 0.6 MiB .. ap_md_nc_smem - 1 MiB) */
++	{ 0x91000000ull, 0x0e900000ull, SWEET_GFX_HEAP_CHECK, SWEET_GFX_HEAP_F_NOPHYS, "mb13b" },   /* 0651: 233 MiB, Wi-Fi pool end (+16 MiB) .. SCP-reserved - 1 MiB */
+ 	{ 0xb8000000ull, 0x056c0000ull, SWEET_GFX_HEAP_SAFE,  0,                       "mb14b" },   /* 86.75 MiB, RWVC end .. vpu_binary */
+ 	{ 0xc1000000ull, 0x0f000000ull, SWEET_GFX_HEAP_SAFE,  SWEET_GFX_HEAP_F_POOLHI, "dph"   },   /* 0650: 240 MiB, display pool + 16 MiB .. cameras */
+ 	{ 0x23e000000ull, 0x01ff0000ull, SWEET_GFX_HEAP_SAFE, 0,                       "top"   },   /* 0650: 31.9 MiB, XNU window end .. dramc-rk1 granule */
+--- a/iokit/Kernel/arm/sweet_gfx_heap_kern.inc
++++ b/iokit/Kernel/arm/sweet_gfx_heap_kern.inc
+@@ -38,7 +38,7 @@
+ #define SWEET_HEAP_TICK_S               30u
+ 
+ static int           sweet_heap_on = 1;         /* kern.n2heap */
+-static int           sweet_heap_check;          /* kern.n2heap_check */
++static int           sweet_heap_check = 1;      /* kern.n2heap_check (0651: default 1 = the CHECK regions too; 0440/0650: 0) */
+ static int           sweet_heap_gpu = 1;        /* kern.n2heap_gpu */
+ static uint32_t      sweet_heap_mask = SWEET_GFX_HEAP_ALL;      /* kern.n2heap_mask */
+ static uint32_t      sweet_heap_cap_mib = 2048;  /* kern.n2heap_cap_mib (0650: all 13 regions = 1581 MiB; 0440: 1024 for 996) */

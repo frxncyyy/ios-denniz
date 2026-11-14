@@ -1,0 +1,489 @@
+--- a/bsd/dev/nord2_gpu_core.h
++++ b/bsd/dev/nord2_gpu_core.h
+@@ -226,6 +226,8 @@
+         uint64_t head_at_fault;
+         bool released;            /* references dropped */
+         bool release_due;         /* 0400: terminal in this n2c_poll, references dropped after try_start */
++        bool in_next;             /* 0630: RUNNING but written to the slot's NEXT registers behind running[slot] (not started yet as far as we know) */
++        bool chain_flag;          /* 0630: JOB_CHAIN_FLAG it was started with (flag-targeted stops) */
+ };
+ 
+ struct n2c_submit {
+@@ -318,6 +320,10 @@
+         uint64_t irq_sum, hand_sum, phase_sum, depth_sum, rel_sum, busy_us, submits;
+         uint32_t kind[4], same_slot, deferred;
+         uint64_t window_start_us;
++        /* 0630 (JS NEXT pipelining): chains written behind a running one: same context and slot (hardware keeps the order) / another context;
++         * moved up at a completion; taken back (failure of the chain ahead, MMU kill, close); flag-targeted stops; completions that found
++         * fewer chains done than expected (kbase 'spurious'); handoffs at zero cost (the successor was already in NEXT). */
++        uint32_t nx_same, nx_cross, nx_promoted, nx_evicted, nx_stops, nx_spurious, nx_two;
+ };
+ 
+ struct n2c_core {
+@@ -330,7 +336,10 @@
+         struct n2c_ctx ctxs[N2C_MAX_CTX];
+         struct n2c_job jobs[N2C_MAX_JOBS];
+         uint64_t next_job_id;
+-        uint64_t running[16];     /* job id per hardware slot */
++        uint64_t running[16];     /* job id per hardware slot (0630: the chain in the slot's current registers, or the older of two) */
++        uint64_t next[16];        /* 0630: job id written to the slot's NEXT registers behind running[slot] (0 = none) */
++        bool jsnext;              /* 0630: write a second chain to NEXT while one runs (kill switch: false = one chain per slot, the old path) */
++        bool jsnext_rb;           /* 0630: completions are read the two-chain way (set with jsnext before the first job; stays on if jsnext is cleared later) */
+         struct n2c_bo *quarantine[N2C_QUARANTINE];
+         unsigned nr_quarantine;
+         uint32_t next_handle;
+@@ -423,6 +432,25 @@
+ bool n2c_set_track_level(struct n2c_core *c, unsigned level);
+ /* 0500: dynamic (true, n2c_init's default) or static address-space management.  Refused while any context exists. */
+ bool n2c_set_as_dynamic(struct n2c_core *c, bool on);
++/* 0630: JS NEXT pipelining.  Before the first job: on/off for good (off = the pre-0630 code paths bit for bit).  Later: only stops or
++ * resumes writing new chains to NEXT (completions keep the two-chain reading). */
++bool n2c_set_jsnext(struct n2c_core *c, bool on);
++/* 0630: one slot's completion read the kbase_job_done way (nord2_gpu_core.c n2hw_job_irq_rb). */
++struct n2hw_job_event_rb {
++        unsigned slot;
++        bool done, failed;
++        uint32_t status;    /* JS_STATUS when failed (0 -> 0x04 TERMINATED), else 0 */
++        uint64_t head;      /* JS_HEAD at the time of the IRQ */
++        bool cur_active;    /* JOB_IRQ_JS_STATE bit n after the clear (+ a failure raised after RAWSTAT was read: reported next round) */
++        bool next_busy;     /* JOB_IRQ_JS_STATE bit 16+n after the clear: a chain still waits in the NEXT registers */
++        bool evicted;       /* the NEXT chain was taken back (only on a failure, only if next_head[slot] was given) */
++        uint64_t evicted_head;
++};
++#ifdef N2C_HW_RB_EXTERN
++void n2hw_js_stop_chain(struct n2hw *hw, unsigned slot, bool hard, bool flag);
++bool n2hw_js_evict_next(struct n2hw *hw, unsigned slot, uint64_t *head);
++unsigned n2hw_job_irq_rb(struct n2hw *hw, const uint64_t *next_head, struct n2hw_job_event_rb *events, unsigned max_events);
++#endif
+ /* Opt-in (boot-arg n2wm): trust write_mask as the list of buffers a job writes.  A job with write_mask == 0 keeps the conservative rule
+  * (every listed GPU_WRITE buffer).  Refused once buffers exist. */
+ bool n2c_set_wmask_inval(struct n2c_core *c, bool on);
+--- a/bsd/dev/nord2_gpu_core.c
++++ b/bsd/dev/nord2_gpu_core.c
+@@ -16,6 +16,81 @@
+ 
+ static void free_ctx_memory(struct n2c_core *c, struct n2c_ctx *x);
+ 
++/* 0630: register side of two chains per slot.  nord2_gpu_hw.o is a CI archive member that this port never rebuilds, so these live here and
++ * use the same n2hw ops (the host model test builds the core with N2C_HW_RB_EXTERN and supplies its own). */
++#ifndef N2C_HW_RB_EXTERN
++static uint32_t rb_rd(struct n2hw *hw, uint32_t off) { return hw->ops.read(hw->ctx, off); }
++static void rb_wr(struct n2hw *hw, uint32_t off, uint32_t v) { hw->ops.write(hw->ctx, off, v); }
++static uint64_t rb_rd64(struct n2hw *hw, uint32_t lo) { return (uint64_t)rb_rd(hw, lo) | ((uint64_t)rb_rd(hw, lo + 4) << 32); }
++
++/* JS_COMMAND HARD/SOFT_STOP_0/1: stops the CURRENT chain only if its JOB_CHAIN_FLAG equals flag (kbasep_job_slot_soft_or_hard_stop_do_action
++ * with JOBCHAIN_DISAMBIGUATION, a tTRx feature in the vendor r32p1 mali_base_hwconfig_features.h), so a chain that moved up from NEXT is
++ * never hit by a stop meant for the one before it. */
++static void n2hw_js_stop_chain(struct n2hw *hw, unsigned slot, bool hard, bool flag)
++{
++        if (!hw || slot >= 16)
++                return;
++        uint32_t cmd = flag ? (hard ? N2HW_JS_CMD_HARD_STOP_1 : N2HW_JS_CMD_SOFT_STOP_1)
++                            : (hard ? N2HW_JS_CMD_HARD_STOP_0 : N2HW_JS_CMD_SOFT_STOP_0);
++        rb_wr(hw, N2HW_JS_REG(slot, N2HW_JS_COMMAND), cmd);
++}
++
++/* Take back a chain in the NEXT registers that has not started (kbase_backend_soft_hard_stop_slot / kbase_gpu_irq_evict): NOP into
++ * JS_COMMAND_NEXT, then a JS_HEAD_NEXT that still holds the chain = it never started (returned, then cleared); 0 = it started. */
++static bool n2hw_js_evict_next(struct n2hw *hw, unsigned slot, uint64_t *head)
++{
++        if (head)
++                *head = 0;
++        if (!hw || slot >= 16)
++                return false;
++        rb_wr(hw, N2HW_JS_REG(slot, N2HW_JS_COMMAND_NEXT), 0u);
++        uint64_t h = rb_rd64(hw, N2HW_JS_REG(slot, N2HW_JS_HEAD_NEXT_LO));
++        if (!h)
++                return false;
++        rb_wr(hw, N2HW_JS_REG(slot, N2HW_JS_HEAD_NEXT_LO), 0u);
++        rb_wr(hw, N2HW_JS_REG(slot, N2HW_JS_HEAD_NEXT_HI), 0u);
++        if (head)
++                *head = h;
++        return true;
++}
++
++/* kbase_job_done's register sequence per slot: status/head; on a failure the NEXT chain is evicted BEFORE the bits are cleared (the failed
++ * chain halts the slot until then, so it cannot have started); clear; JOB_IRQ_JS_STATE; a failure raised after RAWSTAT was read counts as
++ * still active (the next round reports it). */
++static unsigned n2hw_job_irq_rb(struct n2hw *hw, const uint64_t *next_head, struct n2hw_job_event_rb *events, unsigned max_events)
++{
++        if (!hw || !events || !max_events)
++                return 0;
++        uint32_t raw = rb_rd(hw, N2HW_JOB_IRQ_RAWSTAT);
++        unsigned n = 0;
++        for (unsigned slot = 0; slot < 16 && n < max_events; slot++) {
++                uint32_t done = 1u << slot, failed = 1u << (slot + 16);
++                if (!(raw & (done | failed)))
++                        continue;
++                struct n2hw_job_event_rb *ev = &events[n++];
++                ev->slot = slot;
++                ev->done = (raw & done) != 0;
++                ev->failed = (raw & failed) != 0;
++                ev->status = ev->failed ? rb_rd(hw, N2HW_JS_REG(slot, N2HW_JS_STATUS)) : 0;
++                if (ev->failed && ev->status == 0)
++                        ev->status = 0x04;
++                ev->head = rb_rd64(hw, N2HW_JS_REG(slot, N2HW_JS_HEAD_LO));
++                ev->evicted = false;
++                ev->evicted_head = 0;
++                if (ev->failed && next_head && next_head[slot])
++                        ev->evicted = n2hw_js_evict_next(hw, slot, &ev->evicted_head);
++                rb_wr(hw, N2HW_JOB_IRQ_CLEAR, raw & (done | failed));
++                uint32_t active = rb_rd(hw, N2HW_JOB_IRQ_JS_STATE);
++                ev->cur_active = (active >> slot) & 1u;
++                ev->next_busy = (active >> (slot + 16)) & 1u;
++                if (!ev->cur_active && !ev->failed && ((rb_rd(hw, N2HW_JOB_IRQ_RAWSTAT) >> (slot + 16)) & 1u))
++                        ev->cur_active = true;
++        }
++        return n;
++}
++#endif
++
++
+ static void note(struct n2c_core *c, const char *msg)
+ {
+         if (c->ops.log)
+@@ -276,6 +351,22 @@
+         return true;
+ }
+ 
++bool n2c_set_jsnext(struct n2c_core *c, bool on)
++{
++        if (!c)
++                return false;
++        bool idle = c->next_job_id == 1;        /* no job was ever submitted */
++        if (idle) {
++                c->jsnext = on;
++                c->jsnext_rb = on;
++                return true;
++        }
++        if (on && !c->jsnext_rb)
++                return false;                   /* completions are read the one-chain way: NEXT stays unused until reboot */
++        c->jsnext = on;
++        return true;
++}
++
+ /* 0500: a client context of the dynamic mode (the kernel context 0 keeps AS0 as before). */
+ static bool as_dynamic_ctx(const struct n2c_core *c, unsigned idx)
+ {
+@@ -622,7 +713,32 @@
+ {
+         if (j->state != N2C_JOB_RUNNING)
+                 return;
+-        n2hw_js_stop(c->hw, j->slot, true);
++        if (!c->jsnext_rb) {
++                n2hw_js_stop(c->hw, j->slot, true);
++                j->state = N2C_JOB_STOPPING;
++                j->stop_ms = now(c);
++                return;
++        }
++        /* 0630.  A chain still in the NEXT registers is taken back if it has not started: it never ran, so it is CANCELLED (callers are
++         * the MMU-fault kill and close, which cancel the context's queued jobs as well; a deadline never applies to a chain in NEXT).
++         * If it did start, the chain ahead of it is complete and it is the slot's current chain: the flag-targeted stop reaches it alone. */
++        if (j->in_next && j->slot < 16 && c->next[j->slot] == j->id) {
++                uint64_t head = 0;
++                if (n2hw_js_evict_next(c->hw, j->slot, &head)) {
++                        c->next[j->slot] = 0;
++                        j->in_next = false;
++                        c->lat.nx_evicted++;
++                        if (head != j->heads[j->phase]) {
++                                c->reset_pending = true;        /* not the chain we wrote: only a reset says what runs */
++                                note(c, "Nord2 GPU core: NEXT eviction returned an unknown chain; reset");
++                        }
++                        job_finish(c, j, N2C_JOB_CANCELLED);
++                        return;
++                }
++        }
++        /* The current chain (or the NEXT one that started): HARD_STOP_0/1 with its own JOB_CHAIN_FLAG never hits the other chain. */
++        n2hw_js_stop_chain(c->hw, j->slot, true, j->chain_flag);
++        c->lat.nx_stops++;
+         j->state = N2C_JOB_STOPPING;
+         j->stop_ms = now(c);
+ }
+@@ -1379,6 +1495,16 @@
+         return true;
+ }
+ 
++static const struct n2c_job *job_by_id_c(const struct n2c_core *c, uint64_t id)
++{
++        if (!id)
++                return NULL;
++        for (unsigned i = 0; i < N2C_MAX_JOBS; i++)
++                if (c->jobs[i].state != N2C_JOB_FREE && c->jobs[i].id == id)
++                        return &c->jobs[i];
++        return NULL;
++}
++
+ static void try_start(struct n2c_core *c)
+ {
+         if (c->state != N2C_CORE_READY || c->reset_pending || c->hold_start)
+@@ -1388,13 +1514,20 @@
+                 /* Oldest queued job whose context has nothing older still
+                  * pending (per-context submission order across slots). */
+                 struct n2c_job *pick = NULL;
++                bool pick_next = false;
+                 uint64_t oldest[N2C_MAX_CTX] = { 0 };
++                uint64_t second[N2C_MAX_CTX] = { 0 };   /* 0630: second oldest unfinished job of each context */
+                 for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
+                         const struct n2c_job *o = &c->jobs[i];
+-                        if ((o->state == N2C_JOB_QUEUED || o->state == N2C_JOB_RUNNING ||
+-                             o->state == N2C_JOB_STOPPING) &&
+-                            (!oldest[o->ctx] || o->id < oldest[o->ctx]))
++                        if (!(o->state == N2C_JOB_QUEUED || o->state == N2C_JOB_RUNNING ||
++                              o->state == N2C_JOB_STOPPING))
++                                continue;
++                        if (!oldest[o->ctx] || o->id < oldest[o->ctx]) {
++                                second[o->ctx] = oldest[o->ctx];
+                                 oldest[o->ctx] = o->id;
++                        } else if (!second[o->ctx] || o->id < second[o->ctx]) {
++                                second[o->ctx] = o->id;
++                        }
+                 }
+                 for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
+                         struct n2c_job *j = &c->jobs[i];
+@@ -1402,17 +1535,37 @@
+                                 continue;
+                         /* Blocked unless it is the oldest unfinished job of its context. */
+                         bool blocked = oldest[j->ctx] != j->id;
++                        bool ctx_ok = true;
+                         if (c->ctxs[j->ctx].state != N2C_CTX_OPEN)
+-                                blocked = true;
++                                ctx_ok = false;
+                         else if (!c->ctxs[j->ctx].as_live && (!as_dynamic_ctx(c, j->ctx) || nobind[j->ctx]))
+-                                blocked = true;
++                                ctx_ok = false;
+                         else if (!c->ctxs[j->ctx].as_live && !c->gpu_powered)
++                                ctx_ok = false;
++                        if (!ctx_ok)
+                                 blocked = true;
+                         unsigned slot = phase_slot(c, j);
+-                        if (c->running[slot])
+-                                blocked = true;
+-                        if (!blocked && (!pick || j->id < pick->id))
++                        bool to_next = false;
++                        if (c->running[slot]) {
++                                /* 0630: the slot runs a chain; this one may wait in its NEXT registers when the hardware order is enough:
++                                 * (cross) it is the oldest unfinished job of its context and the running chain belongs to another one, or
++                                 * (same) the only older unfinished job of its context is that running chain itself (one slot runs its chains
++                                 * in order, each ending with a cache clean and the next starting with clean+invalidate, as kbase relies on
++                                 * for same-slot dependencies).  Never behind a stopping chain or a render job (two phases on two slots). */
++                                to_next = !blocked || (oldest[j->ctx] == c->running[slot] && second[j->ctx] == j->id);
++                                if (!c->jsnext || !ctx_ok || c->next[slot] || j->kind == N2C_JOB_RENDER)
++                                        to_next = false;
++                                if (to_next) {
++                                        const struct n2c_job *f = job_by_id_c(c, c->running[slot]);
++                                        if (!f || f->state != N2C_JOB_RUNNING || f->in_next || f->kind == N2C_JOB_RENDER)
++                                                to_next = false;
++                                }
++                                blocked = !to_next;
++                        }
++                        if (!blocked && (!pick || j->id < pick->id)) {
+                                 pick = j;
++                                pick_next = to_next;
++                        }
+                 }
+                 if (!pick)
+                         return;
+@@ -1477,12 +1630,23 @@
+                         continue;
+                 }
+                 pick->slot = slot;
++                pick->chain_flag = c->hw->job_chain_flag[slot];   /* n2hw_js_start set JOB_CHAIN_FLAG iff the toggle was clear, then flipped it */
++                pick->state = N2C_JOB_RUNNING;
++                pick->started_ms = now(c);
++                if (pick_next) {
++                        /* 0630: waits behind running[slot]; start time, deadline and latency accounting begin when it moves up */
++                        pick->in_next = true;
++                        c->next[slot] = pick->id;
++                        if (oldest[pick->ctx] == c->running[slot])
++                                c->lat.nx_same++;
++                        else
++                                c->lat.nx_cross++;
++                        continue;
++                }
+                 if (!pick->t_started) {
+                         pick->t_started = true;
+                         pick->t_start_us = n2c_now_us(c);
+                 }
+-                pick->state = N2C_JOB_RUNNING;
+-                pick->started_ms = now(c);
+                 c->running[slot] = pick->id;
+                 lat_started(c, pick, slot);
+         }
+@@ -1498,8 +1662,117 @@
+         return NULL;
+ }
+ 
++/* 0630: one chain of slot s ended (oldest first: running[s]); the NEXT chain, if any, moves up.  failed/status: how it ended. */
++static void rb_complete(struct n2c_core *c, unsigned s, bool failed, uint32_t status, uint64_t head, uint64_t t_hw)
++{
++        struct n2c_job *j = job_by_id(c, c->running[s]);
++        c->running[s] = c->next[s];
++        c->next[s] = 0;
++        struct n2c_job *up = job_by_id(c, c->running[s]);
++        if (up) {
++                up->in_next = false;
++                c->lat.nx_promoted++;
++                if (up->state == N2C_JOB_RUNNING) {
++                        up->started_ms = now(c);
++                        if (!up->t_started) {
++                                up->t_started = true;
++                                up->t_start_us = t_hw ? t_hw : n2c_now_us(c);
++                        }
++                }
++                if (up->ctx < N2C_MAX_CTX)
++                        c->lat_done_us[up->ctx] = 0;
++                N2C_LAT_ACC(hand_n, hand_sum, hand_max, 0);     /* the handoff cost nothing: the chain was already in NEXT */
++        } else if (c->running[s]) {
++                c->running[s] = 0;
++                note(c, "Nord2 GPU core: NEXT chain without a job");
++        }
++        if (!j) {
++                note(c, "Nord2 GPU core: job IRQ without a job");
++                return;
++        }
++        if (j->ctx < N2C_MAX_CTX && !(up && up->ctx == j->ctx)) {
++                c->lat_done_us[j->ctx] = t_hw ? t_hw : 1;
++                c->lat_done_slot[j->ctx] = (uint8_t)s;
++        }
++        if (!failed && j->state == N2C_JOB_RUNNING) {
++                if (j->kind == N2C_JOB_RENDER && j->phase == 0) {
++                        j->phase = 1;
++                        j->state = N2C_JOB_QUEUED;
++                        return;
++                }
++                job_finish(c, j, N2C_JOB_DONE);
++                return;
++        }
++        j->status = failed ? status : 0x03u;
++        j->head_at_fault = head;
++        if (failed && status == JS_STATUS_BUS_FAULT && c->hw->has_issue_ttrx_3076)
++                c->reset_pending = true; /* corrupt state: reset */
++        job_finish(c, j, N2C_JOB_FAULTED);
++}
++
++/* 0630: completions of slots that may hold two chains (kbase_job_done).  nr_done = chains we put in the slot - the one still current -
++ * the one still waiting in NEXT; every chain but the last reported here passed (a failed chain halts its slot until its bit is cleared). */
++static void handle_job_irqs_rb(struct n2c_core *c)
++{
++        struct n2hw_job_event_rb ev[16];
++        uint64_t nh[16];
++        for (unsigned s = 0; s < 16; s++) {
++                const struct n2c_job *q = c->next[s] ? job_by_id_c(c, c->next[s]) : NULL;
++                nh[s] = q ? q->heads[q->phase] : 0;
++        }
++        unsigned n = n2hw_job_irq_rb(c->hw, nh, ev, 16);
++        uint64_t t = n ? n2c_now_us(c) : 0, irq = c->lat_irq_us, t_hw = t;
++        c->lat_irq_us = 0;
++        if (n && irq && irq <= t) {
++                N2C_LAT_ACC(irq_n, irq_sum, irq_max, t - irq);
++                t_hw = irq;
++        }
++        for (unsigned i = 0; i < n; i++) {
++                unsigned s = ev[i].slot;
++                if (s >= 16)
++                        continue;
++                if (ev[i].evicted) {
++                        struct n2c_job *q = job_by_id(c, c->next[s]);
++                        c->next[s] = 0;
++                        c->lat.nx_evicted++;
++                        if (q) {
++                                q->in_next = false;
++                                if (q->state == N2C_JOB_RUNNING)
++                                        q->state = N2C_JOB_QUEUED;      /* never started: back in the queue, in order */
++                                else if (q->state == N2C_JOB_STOPPING)
++                                        job_finish(c, q, N2C_JOB_CANCELLED);
++                        }
++                        if (!q || ev[i].evicted_head != nh[s]) {
++                                c->reset_pending = true;
++                                note(c, "Nord2 GPU core: NEXT eviction returned an unknown chain; reset");
++                        }
++                }
++                int submitted = (c->running[s] ? 1 : 0) + (c->next[s] ? 1 : 0);
++                int nr_done = submitted - (ev[i].cur_active ? 1 : 0) - (ev[i].next_busy && c->next[s] ? 1 : 0);
++                if (nr_done <= 0) {
++                        c->lat.nx_spurious++;
++                        if (!submitted)
++                                note(c, "Nord2 GPU core: job IRQ without a job");
++                        continue;
++                }
++                if (nr_done > 1)
++                        c->lat.nx_two++;
++                while (nr_done > 0) {
++                        bool last = nr_done == 1;
++                        rb_complete(c, s, last ? ev[i].failed : false, last ? ev[i].status : 0, ev[i].head, t_hw);
++                        nr_done--;
++                }
++        }
++        if (n)
++                lat_busy(c, t);
++}
++
+ static void handle_job_irqs(struct n2c_core *c)
+ {
++        if (c->jsnext_rb) {
++                handle_job_irqs_rb(c);
++                return;
++        }
+         struct n2hw_job_event ev[16];
+         unsigned n = n2hw_job_irq(c->hw, ev, 16);
+         /* 0400: hardware completion time = the interrupt top half's stamp when there is one, else now (polling) */
+@@ -1596,7 +1869,7 @@
+         uint64_t t = now(c);
+         for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
+                 struct n2c_job *j = &c->jobs[i];
+-                if (j->state == N2C_JOB_RUNNING &&
++                if (j->state == N2C_JOB_RUNNING && !j->in_next &&        /* 0630: a chain waiting in NEXT has not started */
+                     t - j->started_ms >= N2C_JOB_TIMEOUT_MS) {
+                         c->stats.timeouts++;
+                         stop_job(c, j);
+@@ -1748,6 +2021,7 @@
+         /* The completed reset stopped every bus master: running work is
+          * over and every TLB/walk cache is gone. */
+         memset(c->running, 0, sizeof(c->running));
++        memset(c->next, 0, sizeof(c->next));    /* 0630: a chain in NEXT is finished below like a running one (RESET) */
+         lat_busy(c, n2c_now_us(c));     /* 0400 */
+         for (unsigned i = 0; i < N2C_MAX_CTX; i++)
+                 c->ctxs[i].as_live = false;
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -179,6 +179,8 @@
+  *   1 no bottom-half thread (the interrupt kicks the workloop timer as in 0140)    2 buffers released before the next job starts (pre-0400 order)
+  *   4 every pageable allocation zeroed again after prepare() (pre-0400)            8 buffer owners released inline under the GPU lock (pre-0400) */
+ static int gLatMode = 0;
++static int gJsNext = 1, gJsNextApplied = 1;      /* 0630 */
++SYSCTL_INT(_kern, OID_AUTO, n2gjsnext, CTLFLAG_RW | CTLFLAG_LOCKED, &gJsNext, 0, "0630: GPU JS NEXT pipelining (1 on, 0 no new NEXT writes)");
+ SYSCTL_INT(_kern, OID_AUTO, n2gpu_lat, CTLFLAG_RW | CTLFLAG_LOCKED, &gLatMode, 0, "0400: GPU latency changes off-mask: 1 BH thread, 2 late release, 4 zero skip, 8 deferred owner free");
+ /* 0461: runtime GPU DVFS.  Policy: bsd/dev/nord2_gov.h (n2g_gpu_*); clock: n2clk_retune (the vendor's parking switch); voltage: never touched, only OPPs the
+  * rails found at power-on already cover are used.  kern.n2gdvfs / boot-arg n2gdv: 0 off, 1 decisions logged only (default), 2 act; +4 = change the clock under a
+@@ -327,6 +329,12 @@
+           (void)n2c_set_as_dynamic(c, gx != 0);
+           IOLog("NORD2 GPU AS: mode=%s contexts=%u hw_as=%u (kill switch n2gctx=0 or n2gdv+32 = static, 7 clients)\n", c->as_dyn ? "dynamic" : "static",
+                 c->as_dyn ? N2C_MAX_CTX - 1 : N2C_HW_AS - 1, N2C_HW_AS); }
++        /* 0630: JS NEXT pipelining (a second chain waits in the slot's NEXT registers: same context on the same slot, or another context).
++         * Kill switch: boot-arg n2jn=0, or n2gdv +4096 (n2gdv=4105 = the n2gdv=9 image without it): one chain per slot, the pre-0630 paths.
++         * Run time: sysctl kern.n2gjsnext=0 stops new NEXT writes (only if it was on at boot can it be turned on again). */
++        { int jn = 1, gm = 0; if (!PE_parse_boot_argn("n2jn", &jn, sizeof(jn)) && PE_parse_boot_argn("n2gdv", &gm, sizeof(gm)) && (gm & 4096)) jn = 0;
++          (void)n2c_set_jsnext(c, jn != 0); gJsNext = c->jsnext ? 1 : 0; gJsNextApplied = gJsNext;
++          IOLog("NORD2 GPU JSNEXT: %s (kill switch n2jn=0 or n2gdv+4096; sysctl kern.n2gjsnext)\n", c->jsnext ? "on" : "off"); }
+         IOLog("NORD2 GPU: cache maintenance %s, CPU-access tracking level %d, invalidate scope %s, surface reservations %s\n", c->full_cache_maint ? "whole-context (boot-arg)" : "per-job buffer list", tr,
+               c->wmask_inval ? "declared writes (write_mask)" : "every listed GPU_WRITE buffer", rs ? "on" : "off");
+         return true;
+@@ -666,6 +674,10 @@
+         IOLog("NORD2 GPU LAT2: mode=%d bh=%u runs=%u wake_max_us=%u poll_max_us=%u lock calls=%u wait_max_us=%u hold_max_us=%u sel=%u owners q=%u freed=%u KiB=%u drain_max_us=%u zero skip=%u MiB=%u vfail=%u full=%u\n",
+               gLatMode, (unsigned)gBhOn, gBhRuns, gBhWaitMaxUs, gBhPollMaxUs, gLockCalls, gLockWaitMaxUs, gLockHoldMaxUs, gLockHoldSel,
+               gOwnerQueued, gOwnerFreed, gOwnerKiB, gOwnerDrainMaxUs, gZeroSkip, gZeroSkipMiB, gZeroVerifyFail, gZeroFull);
++        if (d->core->jsnext_rb)     /* 0630: what to read: same+cross = chains that waited in NEXT; promoted = handoffs without a software turn */
++                IOLog("NORD2 GPU LAT3: jsnext=%u next_same=%u next_cross=%u promoted=%u evicted=%u stops=%u two_done=%u spurious=%u hand0_share_pm=%llu\n",
++                      (unsigned)d->core->jsnext, l.nx_same, l.nx_cross, l.nx_promoted, l.nx_evicted, l.nx_stops, l.nx_two, l.nx_spurious,
++                      l.hand_n ? (unsigned long long)l.nx_promoted * 1000ull / l.hand_n : 0ull);
+         gBhRuns = gBhWaitMaxUs = gBhPollMaxUs = 0; gLockCalls = gLockWaitMaxUs = gLockHoldMaxUs = gLockHoldSel = 0;
+         gOwnerDrainMaxUs = 0;
+ }
+@@ -691,6 +703,7 @@
+         n2_sys_telemetry(now_us(NULL));
+         if (d->ready) {
+                 d->core->lat_release_late = !(gLatMode & 2);   /* 0400 */
++                if (gJsNext != gJsNextApplied) { (void)n2c_set_jsnext(d->core, gJsNext != 0); gJsNext = gJsNextApplied = d->core->jsnext ? 1 : 0; }   /* 0630 */
+                 n2c_poll(d->core);
+                 d->emitJobStats();
+                 lat_emit(d);

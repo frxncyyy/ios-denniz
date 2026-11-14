@@ -1,0 +1,72 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -333,6 +333,11 @@
+ 	uint64_t            fHbPeriodUs;              /* the heartbeat period: a slow filter of the TE period */
+ 	/* 0397: pacing (fPaceWin per stat window, fPaceCum since boot / kern.n2fbpacereset), 90 Hz guard, true transfer bounds */
+ 	struct sweet_fb_pace fPaceWin, fPaceCum;
++	/* 0621 (perf-20261114): stutter events for the log analyser (present thread only, no lock): every present interval of 2+ panel
++	 * refreshes inside an animation (gap <= SWEET_FB_PACE_IDLE_US) with its uptime in ms, the number of refreshes and why (r = the
++	 * swap was there in time: presenter / TE / GPU fence lost it; n = CoreAnimation delivered late), and presents per second. */
++	uint64_t fJankT[12]; uint16_t fJankK[12]; char fJankWhy[12]; uint32_t fJankN, fJankLost;
++	uint64_t fSecT0Us, fSecFirstUs; uint16_t fSecCnt[8]; uint32_t fSecN, fSecCur;
+ 	struct sweet_fb_p90  fP90;
+ 	uint64_t            fXferWaitAbs;             /* last poll that saw the transfer still running (xferStart: its start) */
+ 	uint64_t            fWorkArrUs, fNextArrUs;   /* arrival of the swap being presented / prepared */
+@@ -1077,6 +1082,7 @@
+ 	fTeLeadUs = SWEET_FB_TE_LEAD_US_DEFAULT;
+ 	fTwMinUs = 6800; fCtlEmaUs = 0; fTickCorrUs = 0; fTickCorrSumUs = 0; fDzWaits = 0; fSafeStarts = 0; fPhBin[0] = fPhBin[1] = fPhBin[2] = 0; fHbPeriodUs = 0;
+ 	sweet_fb_pace_reset(&fPaceWin); sweet_fb_pace_reset(&fPaceCum); bzero(&fP90, sizeof(fP90));      /* 0397 */
++	fJankN = 0; fJankLost = 0; fSecT0Us = 0; fSecFirstUs = 0; fSecN = 0; fSecCur = 0;      /* 0621 */
+ 	fXferWaitAbs = 0; fWorkArrUs = fNextArrUs = 0; fXferUnd = false; fPanelReq = 0; fPaceResetReq = 0;
+ 	fHwBackoffMode = fHwBackoffGen = fHwBackoffN = fHwRaceTotalRunMax = 0; fHwBackoffUntilUs = 0;
+ 	IOLog("NORD2 FB PACE: 0397 pacing counters on (sysctl kern.n2fbpace, kern.n2fbpacereset=1, kern.n2panelhz 90/60); 90 Hz guard: "
+@@ -2014,6 +2020,28 @@
+ 		IOLog("NORD2 FB PACE: counters reset (kern.n2fbpacereset)\n");
+ 	}
+ 	uint64_t P = fTePeriodUs ? fTePeriodUs : SWEET_FB_VSYNC_US;
++	{   /* 0621: stutter events and presents per second (before the push moves last_push_us) */
++		uint64_t lp = fPaceWin.last_push_us;
++		if (lp != 0 && nowUs > lp && nowUs - lp <= SWEET_FB_PACE_IDLE_US) {
++			uint32_t k = sweet_fb_pace_periods(nowUs - lp, P);
++			if (k >= 2) {
++				if (fJankN < 12) {
++					fJankT[fJankN] = nowUs / 1000; fJankK[fJankN] = (uint16_t)(k > 0xffffu ? 0xffffu : k);
++					fJankWhy[fJankN] = (fWorkArrUs != 0 && fWorkArrUs + P / 2 <= lp + P) ? 'r' : 'n';
++					fJankN++;
++				} else {
++					fJankLost++;
++				}
++			}
++		}
++		if (fSecT0Us == 0 || nowUs >= fSecT0Us + 8000000ull) { fSecT0Us = nowUs; fSecCur = 0; }      /* long idle: a new grid */
++		while (nowUs >= fSecT0Us + 1000000ull) {
++			if (fSecN == 0) { fSecFirstUs = fSecT0Us; }
++			if (fSecN < 8) { fSecCnt[fSecN++] = (uint16_t)(fSecCur > 0xffffu ? 0xffffu : fSecCur); }
++			fSecCur = 0; fSecT0Us += 1000000ull;
++		}
++		fSecCur++;
++	}
+ 	sweet_fb_pace_push(&fPaceWin, nowUs, P, fWorkArrUs);
+ 	sweet_fb_pace_push(&fPaceCum, nowUs, P, fWorkArrUs);
+ }
+@@ -2201,6 +2229,20 @@
+ 				(void)sweet_fb_pace_format(&fPaceWin, pb, sizeof(pb), fTePeriodUs, sweet_fb_abs_to_us(fPeriodAbs), fModeState);
+ 				IOLog("NORD2 FB PACE: %s p90_reverts=%u retries=%u spurious_slow=%llu | hw_backoffs=%u race_run_max=%u alias_reads=%llu alias_inv_us=%llu\n", pb,
+ 				    fP90.reverts, fP90.retries, fP90.spurious_slow, fHwBackoffN, fHwRaceTotalRunMax, fPoolAliasReads, fPoolAliasInvUs);
++				if (fJankN != 0) {      /* 0621 */
++					char jb[200]; size_t jn = 0; jb[0] = 0;
++					for (uint32_t i = 0; i < fJankN && jn < sizeof(jb) - 24; i++) {
++						jn += snprintf(jb + jn, sizeof(jb) - jn, "%s%llu:%u%c", i ? "," : "", fJankT[i], fJankK[i], fJankWhy[i]);
++					}
++					IOLog("NORD2 JANK: n=%u lost=%u ev=%s\n", fJankN, fJankLost, jb);
++					fJankN = 0; fJankLost = 0;
++				}
++				if (fSecN != 0) {
++					char sb[80]; size_t sn = 0; sb[0] = 0;
++					for (uint32_t i = 0; i < fSecN; i++) { sn += snprintf(sb + sn, sizeof(sb) - sn, "%s%u", i ? "/" : "", fSecCnt[i]); }
++					IOLog("NORD2 PERF T: t_ms=%llu pres=%s\n", fSecFirstUs / 1000, sb);
++					fSecN = 0;
++				}
+ 				uint64_t lp = fPaceWin.last_push_us, la = fPaceWin.last_arr_us;
+ 				IOLockLock(fLock);
+ 				sweet_fb_pace_reset(&fPaceWin);

@@ -1,0 +1,124 @@
+--- a/bsd/dev/nord2_gov.h
++++ b/bsd/dev/nord2_gov.h
+@@ -399,6 +399,55 @@
+ 	g->last_switch_ms = now_ms;
+ }
+ 
++/* 0631: "fast ramp" GPU profile (n2gdv +8192 acts with it; its decisions are always computed and logged as a shadow, GDVFS2 line).
++ * Inputs every 20 ms poll: the last sample's busy (not the 40 ms average), the GPU queue depth (unfinished jobs of every context) and the
++ * UI boost (animation / touch).  Up: straight to the cap as soon as the GPU is "hot" (busy >= 50 %, or >= 30 % with >= 6 jobs queued, or
++ * >= 35 % while the UI animates or is touched; performance mode = always hot).  Down: straight to the floor only after 500 ms without a hot
++ * sample and 500 ms after the last switch (few switches: every switch holds job starts until the slots drain).  Cap = the same thermal
++ * ladder as 0461 (battery: < 41 C the rails' cap 836 MHz, 41 C 805, 43 C 654, 45 C 512, 47 C 350) and never above the OPP the rails cover;
++ * floor = min_idx (the cold-start OPP with the UI profile) unless the thermal cap is lower. */
++#define N2G_GF_UP_PM       500u
++#define N2G_GF_DEPTH       6u
++#define N2G_GF_DEPTH_PM    300u
++#define N2G_GF_BOOST_PM    350u
++#define N2G_GF_HOLD_MS     500u
++struct n2g_gfast { uint64_t hot_ms; bool perf; };
++
++static inline unsigned
++n2g_gpu_decide_fast(struct n2g_gpu *g, struct n2g_gfast *f, uint64_t now_ms, bool boost, unsigned therm_level, unsigned depth)
++{
++	unsigned cap = g->max_idx, cur = g->cur, floor = g->min_idx, want = cur, why = N2G_W_HOLD;
++	uint32_t tk = n2g_gpu_therm_khz[therm_level < N2G_TH_LEVELS ? therm_level : N2G_TH_LEVELS - 1u];
++	while (cap > 0 && n2g_gpu_khz[cap] > tk) {
++		cap--;
++	}
++	if (floor > cap) {
++		floor = cap;
++	}
++	g->cap = (uint8_t)cap; g->floor = (uint8_t)floor;
++	unsigned u = g->n ? g->u[(g->n - 1u) % N2G_HIST] : 0u;
++	bool hot = f->perf || u >= N2G_GF_UP_PM || (depth >= N2G_GF_DEPTH && u >= N2G_GF_DEPTH_PM) || (boost && u >= N2G_GF_BOOST_PM);
++	if (hot) {
++		f->hot_ms = now_ms ? now_ms : 1u;
++	}
++	bool rate_ok = now_ms - g->last_switch_ms >= N2G_GPU_RATE_MS;
++	if (cur > cap) {
++		want = cap; why = N2G_W_THERM;                    /* at once */
++	} else if (hot && cur < cap) {
++		if (rate_ok) {
++			want = cap; why = f->perf ? N2G_W_FLOOR : N2G_W_UP;
++		}
++	} else if (cur < floor) {
++		if (rate_ok) {
++			want = floor; why = N2G_W_FLOOR;
++		}
++	} else if (!hot && cur > floor && now_ms - f->hot_ms >= N2G_GF_HOLD_MS && now_ms - g->last_switch_ms >= N2G_GF_HOLD_MS) {
++		want = floor; why = N2G_W_DOWN;
++	}
++	g->want = (uint8_t)want; g->why = (uint8_t)why;
++	return want;
++}
++
+ /* what the GPU side tells the 2 s DECISION line (written by Nord2GPU.cpp, 0461; all zero without it) */
+ struct n2g_gpu_report { uint32_t want_khz, cur_khz, cap_khz, busy_pm, mode, why, switches, errors; };
+ #endif
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -201,7 +201,17 @@
+         uint64_t armUs, retryUs, busyBase, lastBusy, lastUs, slowUs, wdUs, wdCount, boostMs, busySum;
+         uint32_t swaps[N2G_HIST];
+         unsigned nsw, boot, switches, announced, gapMiss, errors, busyMax, polls;
++        /* 0631: fast-ramp profile; gs/fs = its shadow (decisions applied to a model clock, never to the GPU), fa = its state when it acts */
++        struct n2g_gpu gs; struct n2g_gfast fs, fa;
++        unsigned sw2, depthMax, depthLast;
++        uint64_t atMs[N2G_GPU_NOPP], lastMs2;
+ } gGdv;
++/* 0631: kern.n2gprof: 0 = the 0461/0492 policy, 1 = fast ramp (654 MHz floor, straight to the thermal cap when the GPU is hot, back after 500 ms),
++ * 2 = performance (always the thermal cap: 836 MHz below 41 C battery, 805 / 654 / 512 / 350 above).  Boot: n2gdv +8192 = 1, +16384 = 2.
++ * It only moves the clock when kern.n2gdvfs acts (mode 2, e.g. n2gdv=8202 or 16394); in decisions-only mode the fast profile still runs
++ * as a shadow and prints NORD2 GDVFS2 (what it would have done). */
++static int gGprof = 0;
++SYSCTL_INT(_kern, OID_AUTO, n2gprof, CTLFLAG_RW | CTLFLAG_LOCKED, &gGprof, 0, "0631: GPU DVFS profile 0 = 0461/0492, 1 = fast ramp, 2 = performance (acts only with kern.n2gdvfs mode 2)");
+ /* Owners of torn-down buffers (unwire + release of up to 32 MiB, ms) are pushed here by the core's free_owner and released by a thread call,
+  * after the GPU pages were unmapped and flushed: nothing the GPU can reach is freed later than before, only the CPU-side release moves. */
+ static BufferOwner *volatile gOwnerList;
+@@ -742,7 +752,7 @@
+         int lm = 0; if (PE_parse_boot_argn("nord2_lvts_mask", &lm, sizeof(lm)) && lm > 0 && (lm & ~(int)N2LVTS_MASK_ALL) == 0) lvtsMask = (uint32_t)lm;
+         int lc = 0; if (PE_parse_boot_argn("nord2_lvts_max_c", &lc, sizeof(lc)) && lc >= 30 && lc <= 100) lvtsMaxC = lc;
+         if (lvtsMode) IOLog("NORD2 GPU: LVTS thermal sensing requested: mode %u mask %x cold-start guard %d C\n", lvtsMode, lvtsMask, lvtsMaxC);
+-        { int gm = 0; if (PE_parse_boot_argn("n2gdv", &gm, sizeof(gm))) gGdvfs = gm & 15; }      /* 0461, 0492: +8; +16 belongs to nord2_cpufreq.c (0493: DRAM rate probe and watch) */
++        { int gm = 0; if (PE_parse_boot_argn("n2gdv", &gm, sizeof(gm))) { gGdvfs = gm & 15; gGprof = (gm & 16384) ? 2 : (gm & 8192) ? 1 : 0; } }      /* 0631 */      /* 0461, 0492: +8; +16 belongs to nord2_cpufreq.c (0493: DRAM rate probe and watch) */
+         int irq = 1; PE_parse_boot_argn("nord2_gpu_irq", &irq, sizeof(irq)); irqWanted = irq == 1;   /* 0132: on by default (confirmed on the phone: SPI 364 / intid 396 asserts with the job line); nord2_gpu_irq=0 turns it off, which also frees the 16 characters the boot line needed for it */
+         int spi = 0; if (PE_parse_boot_argn("nord2_gpu_irq_spi", &spi, sizeof(spi)) && spi >= 32 && spi <= 900) irqSpi = (uint32_t)spi;
+         if (irqWanted) IOLog("NORD2 GPU: job interrupt requested (spi %u), polling remains the fallback\n", irqSpi);
+@@ -1335,7 +1345,22 @@
+         n2g_gpu_sample(&v.g, pm);
+         v.g.min_idx = (uint8_t)((gGdvfs & 8) ? v.boot : 0u); v.g.up_boost_pm = (uint16_t)((gGdvfs & 8) ? 800u : 0u);      /* 0492: UI profile */
+         v.busySum += pm; v.polls++; if (pm > v.busyMax) v.busyMax = pm;
+-        unsigned want = n2g_gpu_decide(&v.g, ms, v.boostMs && ms - v.boostMs < N2G_ANIM_MS, v.th.level);
++        bool uiBoost = v.boostMs && ms - v.boostMs < N2G_ANIM_MS;
++        /* 0631: queue depth = unfinished jobs of every context; the fast profile's shadow runs on every poll */
++        unsigned depth = 0;
++        for (unsigned i = 0; i < N2C_MAX_CTX; i++) if (core->ctxs[i].state != N2C_CTX_FREE) depth += core->ctxs[i].jobs;
++        v.depthLast = depth; if (depth > v.depthMax) v.depthMax = depth;
++        if (!v.lastMs2) { v.gs.cur = v.g.cur; v.lastMs2 = ms; }
++        n2g_gpu_sample(&v.gs, pm);
++        v.gs.max_idx = v.g.max_idx; v.gs.min_idx = (uint8_t)v.boot;
++        v.atMs[v.gs.cur % N2G_GPU_NOPP] += ms - v.lastMs2; v.lastMs2 = ms;
++        unsigned want2 = n2g_gpu_decide_fast(&v.gs, &v.fs, ms, uiBoost, v.th.level, depth);
++        if (want2 != v.gs.cur) { n2g_gpu_applied(&v.gs, want2, ms); v.sw2++; }
++        unsigned want;
++        if (gGprof == 1 || gGprof == 2) {
++                v.g.min_idx = (uint8_t)v.boot; v.fa.perf = gGprof == 2;
++                want = n2g_gpu_decide_fast(&v.g, &v.fa, ms, uiBoost, v.th.level, depth);
++        } else want = n2g_gpu_decide(&v.g, ms, uiBoost, v.th.level);
+         if (v.wdUs && now < v.wdUs && !v.failed && core->stats.faulted + core->stats.resets + core->stats.timeouts != v.wdCount) {
+                 IOLog("NORD2 GDVFS FALLBACK: a job fault, reset or timeout within 500 ms of a switch to %u kHz: back to the cold-start OPP, no more switching\n", n2g_gpu_khz[v.g.cur]);
+                 v.failed = true; v.errors++;
+@@ -1359,6 +1384,12 @@
+                       v.dead ? " DEAD" : (v.failed ? " FAILED" : ""), n2g_gpu_khz[v.g.cur], n2g_gpu_khz[want], n2g_gpu_khz[v.g.cap], n2g_gpu_khz[v.g.floor],
+                       n2rail_mfgpll_khz(read_bank(&clocks[N2CLK_APMIXED], N2CLK_MFGPLL_CON1)), (read_bank(&clocks[N2CLK_TOPCK], N2CLK_CFG_5) >> N2CLK_MFG_MUX_SHIFT) & N2CLK_MFG_MUX_MASK,
+                       v.polls ? v.busySum / v.polls : 0ull, v.busyMax, v.g.u_down, wn[v.g.why % N2G_NWHY], v.th.level, v.bat, v.switches, v.gapMiss, v.errors);
++        if (mode)       /* 0631: the fast profile as a shadow (or, with kern.n2gprof 1/2 and mode 2, what acts): time per OPP since the last line */
++                IOLog("NORD2 GDVFS2: prof=%d shadow_fast cur=%u want=%u cap=%u switches=%u ms_at 512/654/805/836=%llu/%llu/%llu/%llu depth=%u/%u\n", gGprof,
++                      n2g_gpu_khz[v.gs.cur], n2g_gpu_khz[v.gs.want], n2g_gpu_khz[v.gs.cap], v.sw2, v.atMs[1], v.atMs[2], v.atMs[3], v.atMs[4],
++                      v.depthLast, v.depthMax);
++        for (unsigned i = 0; i < N2G_GPU_NOPP; i++) v.atMs[i] = 0;
++        v.depthMax = 0;
+         v.busySum = 0; v.polls = v.busyMax = 0;
+ }
+ /* patch 0123 (n2pf=1): hardware counters, v2.  The v1 sampler (0122) spun up to 20 ms with the driver lock held and, after its first sample timeout, left the job

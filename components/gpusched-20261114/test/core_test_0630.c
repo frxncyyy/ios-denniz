@@ -1,0 +1,305 @@
+/* 0630 (gpusched-20261114) host tests for nord2_gpu_core.c: JS NEXT pipelining (a second chain written to a slot's NEXT registers).
+ * Hardware model: each job slot has a CURRENT and a NEXT chain.  A chain written while the slot is idle starts at once; a chain in NEXT
+ * starts the moment the current one completes successfully; a failed (or stopped) chain halts the slot until its JOB_IRQ bit is cleared
+ * (kbase_job_done's model); RAWSTAT has one done and one failed bit per slot (two completions before the IRQ is read leave one bit);
+ * JS_STATE = current active | NEXT waiting.  HARD_STOP_0/1 hit the current chain only if its JOB_CHAIN_FLAG matches.  NOP in COMMAND_NEXT
+ * takes a waiting chain back.  Races are injected: a chain may complete between the IRQ clear and the JS_STATE read, and a stop may land
+ * later than it was asked for.
+ * Invariants after every step: per context at most one chain executing and chains start in job-id order (the scheduling contract the
+ * pre-0630 core gave); no AS is reprogrammed while a current or NEXT chain uses it (except the disable of a faulting context); every job the
+ * core calls DONE had its final chain complete without error in the model; running/next agree with the model; never a NEXT write while
+ * NEXT is busy.  Random runs with pipelining on and off (kill switch: the old one-chain IRQ path is exercised by the same model). */
+#include "nord2_gpu_core.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL %s:%d: %s (step %u, in %s)\n",__func__,__LINE__,#x,g_step,g_where); exit(1); } } while(0)
+static unsigned g_step; static const char *g_where = "";
+static uint64_t rs = 1;
+static unsigned rnd(unsigned n) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (unsigned)(rs % n); }
+
+struct chain { bool v; uint64_t head, job; unsigned as, ctx, phase; bool flag; int stop_pending; };
+struct slotm { struct chain cur, nxt; bool halted; bool tog; uint32_t status; uint64_t head; };
+#define IDS 65536u
+struct model {
+ uint64_t time, us_extra; unsigned owners, table_live, resets, starts, next_writes, busy_writes, evicts, stops;
+ bool fail_disable, fault_ready; struct n2hw_mmu_fault fault;
+ void *tables[4096];
+ uint64_t as_root[16];
+ struct slotm sl[16]; uint32_t raw;
+ uint64_t ok_id[IDS]; uint8_t ok_phase_mask[IDS];      /* chains that completed without error, per job id and phase */
+ uint64_t last_start[128];                            /* per context: last job id started */
+ bool race;                                           /* inject completions between the IRQ clear and the JS_STATE read */
+ unsigned races, two_done;
+ uint64_t stopped[64]; unsigned nstopped;           /* jobs whose chain a stop command ended or marked */
+};
+static struct model m;
+static struct n2c_core core;
+static struct n2hw hw;
+
+static bool alloc_table(void *c,uint64_t *pa,void **cpu){(void)c;for(unsigned i=0;i<4096;i++)if(!m.tables[i]){m.tables[i]=aligned_alloc(4096,4096);CHECK(m.tables[i]);memset(m.tables[i],0,4096);*pa=0x80000000ull+i*4096ull;*cpu=m.tables[i];m.table_live++;return true;}return false;}
+static void free_table(void*c,uint64_t pa,void*cpu){(void)c;unsigned i=(unsigned)((pa-0x80000000ull)/4096);CHECK(i<4096&&m.tables[i]==cpu);free(cpu);m.tables[i]=NULL;m.table_live--;}
+static void flush_table(void*c,uint64_t pa,size_t n){(void)c;(void)pa;(void)n;}
+static bool alloc_host(void*c,size_t n,void**p){(void)c;*p=calloc(1,n);return *p!=NULL;}
+static void free_host(void*c,void*p,size_t n){(void)c;(void)n;free(p);}
+static void sync_page(void*c,uint64_t pa,void*p,size_t n,bool to){(void)c;(void)pa;(void)to;CHECK(p&&n==4096);m.us_extra+=1;}
+static void free_owner(void*c,void*p){(void)c;free(p);m.owners++;}
+static uint64_t now(void*c){(void)c;return m.time;}
+static uint64_t now_us(void*c){(void)c;return m.time*1000+m.us_extra;}
+
+static void as_hw_check_idle(unsigned as){for(unsigned s=0;s<16;s++){CHECK(!(m.sl[s].cur.v&&m.sl[s].cur.as==as));CHECK(!(m.sl[s].nxt.v&&m.sl[s].nxt.as==as));}}
+enum n2hw_error n2hw_as_configure(struct n2hw*h,unsigned as,uint64_t root){(void)h;CHECK(root&&as<16);as_hw_check_idle(as);m.as_root[as]=root;return N2HW_OK;}
+enum n2hw_error n2hw_as_flush(struct n2hw*h,unsigned as,uint64_t va,uint64_t n,bool mem){(void)h;(void)va;(void)mem;CHECK(n&&as<16);return N2HW_OK;}
+enum n2hw_error n2hw_as_disable(struct n2hw*h,unsigned as){(void)h;CHECK(as<16);if(m.fail_disable)return N2HW_E_AS_TIMEOUT;
+ bool faulted=false;for(unsigned i=0;i<N2C_MAX_CTX;i++)if(core.ctxs[i].as_live&&core.ctxs[i].as==as&&core.ctxs[i].state==N2C_CTX_FAULTED)faulted=true;
+ if(!faulted)as_hw_check_idle(as);m.as_root[as]=0;return N2HW_OK;}
+
+/* a chain starts executing in the CURRENT registers */
+static void on_start(unsigned s){
+ struct chain *c=&m.sl[s].cur;
+ for(unsigned t=0;t<16;t++) if(t!=s&&m.sl[t].cur.v) CHECK(m.sl[t].cur.ctx!=c->ctx);      /* one chain per context executes */
+ CHECK(c->job>=m.last_start[c->ctx]); m.last_start[c->ctx]=c->job;                     /* in job-id order (a render's 2nd phase: same id) */
+ CHECK(m.as_root[c->as]!=0);
+ m.starts++;
+}
+static void promote(unsigned s){struct slotm*q=&m.sl[s];if(!q->cur.v&&!q->halted&&q->nxt.v){q->cur=q->nxt;q->nxt.v=false;q->cur.stop_pending=0;on_start(s);}}
+static void chain_end(unsigned s,bool failed,uint32_t status){
+ struct slotm*q=&m.sl[s];CHECK(q->cur.v);q->head=q->cur.head;
+ if(!failed){unsigned k=(unsigned)(q->cur.job%IDS);if(m.ok_id[k]!=q->cur.job){m.ok_id[k]=q->cur.job;m.ok_phase_mask[k]=0;}m.ok_phase_mask[k]|=(uint8_t)(1u<<q->cur.phase);
+  if(m.raw&(1u<<s))m.two_done++;m.raw|=1u<<s;q->cur.v=false;promote(s);}
+ else{m.raw|=1u<<(s+16);q->status=status;q->halted=true;q->cur.v=false;}
+}
+enum n2hw_error n2hw_js_start(struct n2hw*h,unsigned s,unsigned as,uint64_t head,uint64_t aff){(void)h;CHECK(head&&aff&&s<16);
+ struct slotm*q=&m.sl[s];if(q->nxt.v){m.busy_writes++;return N2HW_E_SLOT_BUSY;}
+ const struct n2c_job*jj=NULL;for(unsigned i=0;i<N2C_MAX_JOBS;i++){const struct n2c_job*j=&core.jobs[i];
+  if(j->state==N2C_JOB_QUEUED&&j->heads[j->phase]==head&&core.ctxs[j->ctx].as==as&&core.ctxs[j->ctx].as_live&&core.ctxs[j->ctx].mmu.root_pa==m.as_root[as]&&(!jj||j->id<jj->id))jj=j;}   /* the core starts the oldest eligible */
+ CHECK(jj);
+ if(q->cur.v||q->halted)m.next_writes++;
+ q->nxt=(struct chain){.v=true,.head=head,.job=jj->id,.as=as,.ctx=jj->ctx,.phase=jj->phase,.flag=!q->tog};
+ hw.job_chain_flag[s]=!hw.job_chain_flag[s];CHECK(q->nxt.flag==hw.job_chain_flag[s]);q->tog=!q->tog;
+ promote(s);return N2HW_OK;}
+static void stop_cur(unsigned s){struct slotm*q=&m.sl[s];if(!q->cur.v)return;if(m.nstopped<64)m.stopped[m.nstopped++]=q->cur.job;if(rnd(2)){chain_end(s,true,0x03);}else q->cur.stop_pending=1;}
+void n2hw_js_stop(struct n2hw*h,unsigned s,bool hard){(void)h;CHECK(hard&&s<16);m.stops++;stop_cur(s);}
+void n2hw_js_stop_chain(struct n2hw*h,unsigned s,bool hard,bool flag){(void)h;CHECK(hard&&s<16);m.stops++;if(m.sl[s].cur.v&&m.sl[s].cur.flag==flag)stop_cur(s);}
+bool n2hw_js_evict_next(struct n2hw*h,unsigned s,uint64_t*head){(void)h;CHECK(s<16);*head=0;struct slotm*q=&m.sl[s];if(!q->nxt.v)return false;*head=q->nxt.head;q->nxt.v=false;m.evicts++;return true;}
+static void gpu_step(unsigned s,bool fail){struct slotm*q=&m.sl[s];if(!q->cur.v||q->halted)return;
+ if(q->cur.stop_pending&&rnd(2)){chain_end(s,true,0x03);return;}
+ chain_end(s,fail,0x40);}
+unsigned n2hw_job_irq_rb(struct n2hw*h,const uint64_t*nh,struct n2hw_job_event_rb*ev,unsigned max){(void)h;CHECK(max>=16);unsigned n=0;uint32_t raw=m.raw;
+ for(unsigned s=0;s<16;s++){uint32_t d=1u<<s,f=1u<<(s+16);if(!(raw&(d|f)))continue;struct slotm*q=&m.sl[s];struct n2hw_job_event_rb*e=&ev[n++];memset(e,0,sizeof(*e));
+  e->slot=s;e->done=(raw&d)!=0;e->failed=(raw&f)!=0;e->status=e->failed?q->status:0;e->head=q->head;
+  if(e->failed&&nh[s]){CHECK(nh[s]==0||q->nxt.v==false||q->nxt.head==nh[s]);e->evicted=n2hw_js_evict_next(h,s,&e->evicted_head);}
+  m.raw&=~(raw&(d|f));if(raw&f)q->halted=false;promote(s);
+  if(m.race&&rnd(4)==0&&q->cur.v){m.races++;gpu_step(s,rnd(3)==0);}       /* completes after the clear, before JS_STATE */
+  e->cur_active=q->cur.v;e->next_busy=q->nxt.v;
+  if(!e->cur_active&&!e->failed&&(m.raw>>(s+16)&1u))e->cur_active=true;}
+ return n;}
+/* the one-chain path (kill switch): exactly what nord2_gpu_hw.c n2hw_job_irq reports */
+unsigned n2hw_job_irq(struct n2hw*h,struct n2hw_job_event*ev,unsigned max){(void)h;unsigned n=0;uint32_t raw=m.raw;
+ for(unsigned s=0;s<16&&n<max;s++){uint32_t d=1u<<s,f=1u<<(s+16);if(!(raw&(d|f)))continue;struct slotm*q=&m.sl[s];CHECK(!q->nxt.v);
+  ev[n].slot=s;ev[n].failed=(raw&f)!=0;ev[n].status=ev[n].failed?q->status:0;ev[n].head=q->head;n++;m.raw&=~(raw&(d|f));if(raw&f)q->halted=false;}
+ return n;}
+unsigned n2hw_mmu_irq(struct n2hw*h,struct n2hw_mmu_fault*f,unsigned cap){(void)h;CHECK(cap);if(!m.fault_ready)return 0;*f=m.fault;m.fault_ready=false;return 1;}
+enum n2hw_error n2hw_reset(struct n2hw*h){(void)h;m.resets++;for(unsigned s=0;s<16;s++){m.sl[s].cur.v=m.sl[s].nxt.v=false;m.sl[s].halted=false;}m.raw=0;memset(m.as_root,0,sizeof(m.as_root));return N2HW_OK;}
+enum n2hw_error n2hw_dummy_job_wa(struct n2hw*h){h->wa_complete=true;h->wa_runs++;return N2HW_OK;}
+enum n2hw_error n2hw_power_on_l2(struct n2hw*h){h->l2_on=true;return N2HW_OK;}
+enum n2hw_error n2hw_apply_quirks(struct n2hw*h){(void)h;return N2HW_OK;}
+enum n2hw_error n2hw_power_on_cores(struct n2hw*h,uint64_t mask){h->shaders_on=mask;h->l2_on=true;return N2HW_OK;}
+
+static bool g_started;
+static void gpu_step(unsigned s,bool fail);
+static void teardown(void){      /* the previous scenario's contexts: finish their chains, close them (frees every buffer and table) */
+ if(!g_started)return;
+ for(unsigned r=0;r<1000;r++){bool any=false;
+  for(unsigned s=0;s<16;s++)if(m.sl[s].cur.v&&!m.sl[s].halted){gpu_step(s,false);any=true;}
+  n2c_poll(&core);
+  for(unsigned i=1;i<N2C_MAX_CTX;i++)if(core.ctxs[i].state!=N2C_CTX_FREE){any=true;if(n2c_ctx_close(&core,i)!=N2C_OK)m.time++;}
+  if(!any)break;}
+ for(unsigned i=1;i<N2C_MAX_CTX;i++)CHECK(core.ctxs[i].state==N2C_CTX_FREE);
+ g_started=false;
+}
+static void init(bool jsnext){
+ teardown();g_started=true;
+ for(unsigned i=0;i<4096;i++)if(m.tables[i])free(m.tables[i]);
+ memset(&m,0,sizeof(m));memset(&hw,0,sizeof(hw));hw.identified=hw.slots_valid=hw.l2_on=true;
+ hw.id.as_present=255;hw.id.shader_present=hw.shaders_on=1;hw.slot_fragment=0;hw.slot_compute=hw.slot_vertex_tiler=1;
+ struct n2c_ops ops={alloc_table,free_table,flush_table,alloc_host,free_host,sync_page,free_owner,now,NULL,now_us,NULL};
+ CHECK(n2c_init(&core,&ops,&m,&hw));CHECK(!core.jsnext&&!core.jsnext_rb);CHECK(n2c_set_jsnext(&core,jsnext));CHECK(n2c_start(&core)==N2C_OK);
+}
+static unsigned context(void){unsigned c;CHECK(n2c_ctx_open(&core,123,64ull<<20,false,&c)==N2C_OK);return c;}
+static enum n2c_error map_pages(unsigned c,unsigned n,uint32_t*h,uint64_t*va){
+ struct n2c_page*p=calloc(n,sizeof(*p));CHECK(p);void*owner=calloc(n,4096);CHECK(owner);
+ for(unsigned i=0;i<n;i++){p[i].pa=0x90000000ull+4096ull*i;p[i].cpu=(char*)owner+4096ull*i;}
+ bool adopted=false;enum n2c_error e=n2c_bo_map(&core,c,p,n,N2C_BO_GPU_READ|N2C_BO_GPU_WRITE|N2C_BO_GPU_EXEC,owner,n*4096ull,h,va,&adopted);
+ free(p);if(!adopted)free(owner);return e;}
+static uint64_t submit(unsigned c,uint32_t h,uint64_t va,unsigned kind){
+ struct n2c_submit s={0};s.kind=kind;s.nr_handles=1;s.handles[0]=h;s.write_mask=1;
+ s.heads[0]=kind==N2C_JOB_FRAGMENT?0:va;s.heads[1]=kind==N2C_JOB_COMPUTE?0:va+128;
+ uint64_t id;CHECK(n2c_submit(&core,c,&s,&id)==N2C_OK);return id;}
+static const struct n2c_job*job(uint64_t id){for(unsigned i=0;i<N2C_MAX_JOBS;i++)if(core.jobs[i].state!=N2C_JOB_FREE&&core.jobs[i].id==id)return &core.jobs[i];return NULL;}
+static unsigned st(uint64_t id){const struct n2c_job*j=job(id);return j?j->state:0xff;}
+static void poll(void){n2c_poll(&core);}
+
+static void inv(void){
+ for(unsigned s=0;s<16;s++){
+  if(core.next[s])CHECK(core.running[s]);
+  struct slotm*q=&m.sl[s];
+  if(q->nxt.v){CHECK(core.next[s]==q->nxt.job);const struct n2c_job*j=job(q->nxt.job);CHECK(j&&j->in_next&&(j->state==N2C_JOB_RUNNING||j->state==N2C_JOB_STOPPING));}
+  if(q->cur.v){CHECK(core.running[s]==q->cur.job||core.next[s]==q->cur.job);const struct n2c_job*j=job(q->cur.job);CHECK(j&&(j->state==N2C_JOB_RUNNING||j->state==N2C_JOB_STOPPING));}
+  if(core.running[s]){const struct n2c_job*j=job(core.running[s]);CHECK(j&&(j->state==N2C_JOB_RUNNING||j->state==N2C_JOB_STOPPING)&&!j->in_next&&j->slot==s);}
+  if(core.next[s]){const struct n2c_job*j=job(core.next[s]);CHECK(j&&j->in_next&&j->slot==s);}
+ }
+ for(unsigned i=0;i<N2C_MAX_JOBS;i++){const struct n2c_job*j=&core.jobs[i];
+  if(j->state==N2C_JOB_RUNNING||j->state==N2C_JOB_STOPPING){bool found=false;for(unsigned s=0;s<16;s++)found|=core.running[s]==j->id||core.next[s]==j->id;CHECK(found);}
+  if(j->state==N2C_JOB_QUEUED)CHECK(!j->in_next);
+  if(j->state==N2C_JOB_DONE){unsigned k=(unsigned)(j->id%IDS);unsigned last=j->kind==N2C_JOB_COMPUTE?0:1;CHECK(m.ok_id[k]==j->id&&(m.ok_phase_mask[k]>>last&1u));
+   if(j->kind==N2C_JOB_RENDER)CHECK(m.ok_phase_mask[k]&1u);}
+ }
+ CHECK(m.busy_writes==0);
+ /* a stop command only ever ends a chain the core is stopping (or reset / closed / gave up on): never a chain that moved up from NEXT */
+ for(unsigned i=0;i<m.nstopped;i++){unsigned x=st(m.stopped[i]);CHECK(x!=N2C_JOB_RUNNING&&x!=N2C_JOB_QUEUED&&x!=N2C_JOB_DONE);}
+ m.nstopped=0;
+}
+
+/* T1 cross: B's compute waits in NEXT behind A's; A completes -> B moves up with no software turn; one IRQ reports A only. */
+static void t_cross(void){g_where=__func__;
+ init(true);unsigned a=context(),b=context();uint32_t ha,hb;uint64_t va,vb;CHECK(map_pages(a,1,&ha,&va)==N2C_OK&&map_pages(b,1,&hb,&vb)==N2C_OK);
+ uint64_t x=submit(a,ha,va,N2C_JOB_COMPUTE),y=submit(b,hb,vb,N2C_JOB_COMPUTE);
+ CHECK(core.running[1]==x&&core.next[1]==y&&job(y)->in_next&&m.next_writes==1&&core.lat.nx_cross==1);inv();
+ gpu_step(1,false);CHECK(m.sl[1].cur.v&&m.sl[1].cur.job==y);   /* hardware moved y up at once */
+ poll();CHECK(st(x)==N2C_JOB_DONE&&core.running[1]==y&&!core.next[1]&&!job(y)->in_next&&core.lat.nx_promoted==1);inv();
+ gpu_step(1,false);poll();CHECK(st(y)==N2C_JOB_DONE&&!core.running[1]);inv();
+ /* both complete before the IRQ is read: one done bit, nr_done = 2 */
+ x=submit(a,ha,va,N2C_JOB_COMPUTE);y=submit(b,hb,vb,N2C_JOB_COMPUTE);gpu_step(1,false);gpu_step(1,false);CHECK(m.two_done==1);
+ poll();CHECK(st(x)==N2C_JOB_DONE&&st(y)==N2C_JOB_DONE&&core.lat.nx_two==1&&!core.running[1]&&!core.next[1]);inv();
+}
+/* T2 same context, same slot: the 2nd compute waits in NEXT; the 1st fails -> the 2nd is taken back before the clear, requeued, runs after. */
+static void t_same_fail(void){g_where=__func__;
+ init(true);unsigned a=context();uint32_t h;uint64_t v;CHECK(map_pages(a,1,&h,&v)==N2C_OK);
+ uint64_t x=submit(a,h,v,N2C_JOB_COMPUTE),y=submit(a,h,v,N2C_JOB_COMPUTE),z=submit(a,h,v,N2C_JOB_COMPUTE);
+ CHECK(core.running[1]==x&&core.next[1]==y&&st(z)==N2C_JOB_QUEUED&&core.lat.nx_same==1);inv();
+ gpu_step(1,true);CHECK(m.sl[1].halted&&m.sl[1].nxt.v);        /* failed chain halts the slot: y must not start */
+ poll();CHECK(st(x)==N2C_JOB_FAULTED&&m.evicts==1);
+ CHECK(core.running[1]==y&&core.next[1]==z);inv();               /* y back in the queue and restarted at once, z behind it */
+ gpu_step(1,false);gpu_step(1,false);poll();CHECK(st(y)==N2C_JOB_DONE&&st(z)==N2C_JOB_DONE);inv();
+ /* alternating compute/fragment of one context (the Maps pattern): never two chains of the context at once, no NEXT write */
+ unsigned w=m.next_writes;uint64_t ids[8];for(unsigned i=0;i<8;i++)ids[i]=submit(a,h,v,i&1?N2C_JOB_FRAGMENT:N2C_JOB_COMPUTE);
+ for(unsigned i=0;i<8;i++){unsigned s=i&1?0:1;CHECK(core.running[s]==ids[i]&&!core.running[s^1]);gpu_step(s,false);poll();inv();}
+ for(unsigned i=0;i<8;i++)CHECK(st(ids[i])==N2C_JOB_DONE);CHECK(m.next_writes==w);
+}
+/* T3 race: current done, NEXT moves up and fails before the clear: reported in the following round, attributed to the 2nd job. */
+static void t_race(void){g_where=__func__;
+ init(true);unsigned a=context(),b=context();uint32_t ha,hb;uint64_t va,vb;CHECK(map_pages(a,1,&ha,&va)==N2C_OK&&map_pages(b,1,&hb,&vb)==N2C_OK);
+ uint64_t x=submit(a,ha,va,N2C_JOB_COMPUTE),y=submit(b,hb,vb,N2C_JOB_COMPUTE);
+ gpu_step(1,false);            /* x done (done bit), y current */
+ /* emulate: kbase's race - y fails after RAWSTAT was read: our model reads raw first, so inject via m.race with a forced failure */
+ m.race=true;uint64_t save=rs;for(;;){rs=save;unsigned r1=rnd(4),r2=rnd(3);if(r1==0&&r2==0)break;save=rs;}rs=save;
+ poll();m.race=false;
+ CHECK(st(x)==N2C_JOB_DONE);
+ if(st(y)==N2C_JOB_RUNNING){poll();}
+ CHECK(st(y)==N2C_JOB_FAULTED&&!core.running[1]&&m.races==1);inv();
+}
+/* T4 MMU fault on a context whose chain waits in NEXT behind another context: taken back and cancelled; the running one is untouched. */
+static void t_mmu(void){g_where=__func__;
+ init(true);unsigned a=context(),b=context();uint32_t ha,hb;uint64_t va,vb;CHECK(map_pages(a,1,&ha,&va)==N2C_OK&&map_pages(b,1,&hb,&vb)==N2C_OK);
+ uint64_t x=submit(a,ha,va,N2C_JOB_COMPUTE),y=submit(b,hb,vb,N2C_JOB_COMPUTE);
+ m.fault=(struct n2hw_mmu_fault){.as=core.ctxs[b].as,.status=0xc1};m.fault_ready=true;poll();
+ CHECK(st(y)==N2C_JOB_CANCELLED&&!core.next[1]&&m.evicts==1&&core.running[1]==x&&m.sl[1].cur.v&&m.sl[1].cur.job==x&&!m.sl[1].nxt.v);inv();
+ gpu_step(1,false);poll();CHECK(st(x)==N2C_JOB_DONE);inv();
+ /* the NEXT chain already started when the fault is handled (front complete, IRQ not read): flag-targeted stop hits it alone */
+ x=submit(a,ha,va,N2C_JOB_COMPUTE);unsigned c3=context();uint32_t hc;uint64_t vc;CHECK(map_pages(c3,1,&hc,&vc)==N2C_OK);
+ y=submit(c3,hc,vc,N2C_JOB_COMPUTE);CHECK(core.next[1]==y);gpu_step(1,false);CHECK(m.sl[1].cur.job==y);
+ m.fault=(struct n2hw_mmu_fault){.as=core.ctxs[c3].as,.status=0xc1};m.fault_ready=true;poll();   /* poll first reads x's done, y moves up, then fault */
+ CHECK(st(x)==N2C_JOB_DONE);
+ for(unsigned k=0;k<4&&st(y)!=N2C_JOB_FAULTED;k++){gpu_step(1,false);poll();}
+ CHECK(st(y)==N2C_JOB_FAULTED);inv();
+}
+/* T5 deadline of the front with a NEXT chain: targeted stop, the stop halts the slot, NEXT taken back, requeued and run. */
+static void t_timeout(void){g_where=__func__;
+ init(true);unsigned a=context(),b=context();uint32_t ha,hb;uint64_t va,vb;CHECK(map_pages(a,1,&ha,&va)==N2C_OK&&map_pages(b,1,&hb,&vb)==N2C_OK);
+ uint64_t x=submit(a,ha,va,N2C_JOB_COMPUTE),y=submit(b,hb,vb,N2C_JOB_COMPUTE);
+ m.time+=N2C_JOB_TIMEOUT_MS+1;poll();CHECK(st(y)==N2C_JOB_RUNNING&&job(y)->in_next);   /* no deadline for the chain in NEXT */
+ for(unsigned k=0;k<3&&st(x)!=N2C_JOB_FAULTED;k++){if(m.sl[1].cur.v&&m.sl[1].cur.job==x&&m.sl[1].cur.stop_pending)chain_end(1,true,0x03);poll();}
+ CHECK(st(x)==N2C_JOB_FAULTED&&m.evicts==1&&core.running[1]==y&&!job(y)->in_next);inv();
+ gpu_step(1,false);poll();CHECK(st(y)==N2C_JOB_DONE);inv();
+ /* close a context whose job waits in NEXT */
+ x=submit(a,ha,va,N2C_JOB_COMPUTE);y=submit(b,hb,vb,N2C_JOB_COMPUTE);CHECK(core.next[1]==y);
+ CHECK(n2c_ctx_close(&core,b)==N2C_OK);CHECK(!core.next[1]&&!m.sl[1].nxt.v);inv();
+ gpu_step(1,false);poll();CHECK(st(x)==N2C_JOB_DONE);inv();
+ /* close the context of the FRONT chain after it completed and the NEXT chain (another context) moved up, IRQ not read yet: the stop
+  * of the front must not end the other context's chain (flag-targeted) */
+ unsigned c4=context();uint32_t h4;uint64_t v4;CHECK(map_pages(c4,1,&h4,&v4)==N2C_OK);
+ x=submit(a,ha,va,N2C_JOB_COMPUTE);y=submit(c4,h4,v4,N2C_JOB_COMPUTE);CHECK(core.next[1]==y);
+ gpu_step(1,false);CHECK(m.sl[1].cur.job==y);
+ enum n2c_error e=n2c_ctx_close(&core,a);CHECK(e==N2C_OK||e==N2C_E_BUSY);
+ for(unsigned k=0;k<4&&e!=N2C_OK;k++){poll();e=n2c_ctx_close(&core,a);}
+ CHECK(e==N2C_OK&&m.sl[1].cur.v&&m.sl[1].cur.job==y&&st(y)==N2C_JOB_RUNNING);inv();
+ gpu_step(1,false);poll();CHECK(st(y)==N2C_JOB_DONE);inv();
+}
+/* T6 kill switch: no NEXT write ever, the one-chain IRQ path; and the setter refuses to turn on after the first job. */
+static void t_kill(void){g_where=__func__;
+ init(false);unsigned a=context(),b=context();uint32_t ha,hb;uint64_t va,vb;CHECK(map_pages(a,1,&ha,&va)==N2C_OK&&map_pages(b,1,&hb,&vb)==N2C_OK);
+ uint64_t x=submit(a,ha,va,N2C_JOB_COMPUTE),y=submit(b,hb,vb,N2C_JOB_COMPUTE);
+ CHECK(core.running[1]==x&&!core.next[1]&&st(y)==N2C_JOB_QUEUED&&m.next_writes==0);CHECK(!n2c_set_jsnext(&core,true));
+ gpu_step(1,false);poll();CHECK(st(x)==N2C_JOB_DONE&&core.running[1]==y);gpu_step(1,false);poll();CHECK(st(y)==N2C_JOB_DONE);
+ /* turned off at run time after being on: completions stay two-chain, no new NEXT write */
+ init(true);a=context();b=context();CHECK(map_pages(a,1,&ha,&va)==N2C_OK&&map_pages(b,1,&hb,&vb)==N2C_OK);
+ x=submit(a,ha,va,N2C_JOB_COMPUTE);y=submit(b,hb,vb,N2C_JOB_COMPUTE);CHECK(core.next[1]==y);
+ CHECK(n2c_set_jsnext(&core,false)&&core.jsnext_rb);uint64_t z=submit(a,ha,va,N2C_JOB_COMPUTE);(void)z;
+ gpu_step(1,false);poll();CHECK(st(x)==N2C_JOB_DONE&&core.running[1]==y&&!core.next[1]);inv();
+ CHECK(n2c_set_jsnext(&core,true));
+}
+
+#define P 12
+#define PB 4
+struct proc{bool open;unsigned c;uint32_t h[PB];uint64_t va[PB];unsigned nb;uint64_t last;};
+static void t_random(unsigned steps,uint64_t seed,bool jsnext,bool race){g_where=__func__;
+ init(jsnext);rs=seed;m.race=race;struct proc p[P];memset(p,0,sizeof(p));
+ unsigned long submitted=0,closes=0,faults=0,fails=0;
+ for(g_step=0;g_step<steps;g_step++){
+  unsigned a=rnd(100),k=rnd(P);struct proc*q=&p[k];
+  if(a<4){if(!q->open){CHECK(n2c_ctx_open(&core,k,64ull<<20,false,&q->c)==N2C_OK);q->open=true;q->nb=0;q->last=0;}}
+  else if(a<6){if(q->open){enum n2c_error e=n2c_ctx_close(&core,q->c);CHECK(e==N2C_OK||e==N2C_E_BUSY);if(e==N2C_OK){q->open=false;closes++;}}}
+  else if(a<14){if(q->open&&q->nb<PB&&core.ctxs[q->c].state==N2C_CTX_OPEN){enum n2c_error e=map_pages(q->c,1+rnd(2),&q->h[q->nb],&q->va[q->nb]);if(e==N2C_OK)q->nb++;else CHECK(e==N2C_E_STATE||e==N2C_E_HW);}}
+  else if(a<18){if(q->open&&q->nb){unsigned i=rnd(q->nb);enum n2c_error e=n2c_bo_release(&core,q->c,q->h[i]);CHECK(e==N2C_OK||e==N2C_E_BUSY);q->h[i]=q->h[--q->nb];q->va[i]=q->va[q->nb];}}
+  else if(a<50){if(q->open&&q->nb&&core.ctxs[q->c].state==N2C_CTX_OPEN&&!core.reset_pending){
+    unsigned i=rnd(q->nb),r=rnd(10),kind=r<5?N2C_JOB_COMPUTE:r<9?N2C_JOB_FRAGMENT:N2C_JOB_RENDER;
+    struct n2c_submit s={0};s.kind=kind;s.nr_handles=1;s.handles[0]=q->h[i];s.write_mask=1;
+    s.heads[0]=kind==N2C_JOB_FRAGMENT?0:q->va[i];s.heads[1]=kind==N2C_JOB_COMPUTE?0:q->va[i]+128;
+    uint64_t id;enum n2c_error e=n2c_submit(&core,q->c,&s,&id);CHECK(e==N2C_OK||e==N2C_E_BUSY);if(e==N2C_OK){q->last=id;submitted++;}}}
+  else if(a<84){unsigned s=rnd(2);bool f=rnd(25)==0;if(m.sl[s].cur.v&&!m.sl[s].halted){if(f)fails++;gpu_step(s,f);}if(rnd(3))poll();}
+  else if(a<88){if(q->open&&q->last){struct n2c_seq_result r;CHECK(n2c_seq_state(&core,q->c,q->last,true,&r)==N2C_OK);}}
+  else if(a<90){if(rnd(6))continue;unsigned as=1+rnd(7);m.fault=(struct n2hw_mmu_fault){.as=as,.status=0xc1};m.fault_ready=true;faults++;poll();}
+  else if(a<91){if(rnd(8)==0){m.fail_disable=true;poll();m.fail_disable=false;poll();}}
+  else{m.time+=rnd(60)==0?N2C_JOB_TIMEOUT_MS+1:1+rnd(3);poll();}
+  CHECK(core.state==N2C_CORE_READY);inv();
+ }
+ for(unsigned round=0;round<200000;round++){
+  bool busy=false;for(unsigned s=0;s<2;s++)if(m.sl[s].cur.v&&!m.sl[s].halted){gpu_step(s,false);busy=true;}
+  poll();
+  unsigned pend=0;for(unsigned i=0;i<N2C_MAX_JOBS;i++){uint8_t x=core.jobs[i].state;if(x==N2C_JOB_QUEUED||x==N2C_JOB_RUNNING||x==N2C_JOB_STOPPING)pend++;}
+  if(!busy&&!pend&&!m.raw)break;
+  if(!busy){m.time++;poll();}
+  inv();
+ }
+ for(unsigned i=0;i<N2C_MAX_JOBS;i++){uint8_t x=core.jobs[i].state;CHECK(x!=N2C_JOB_QUEUED&&x!=N2C_JOB_RUNNING&&x!=N2C_JOB_STOPPING);}
+ for(unsigned i=0;i<P;i++)if(p[i].open){for(unsigned b=0;b<p[i].nb;b++)CHECK(n2c_bo_release(&core,p[i].c,p[i].h[b])==N2C_OK);CHECK(n2c_ctx_close(&core,p[i].c)==N2C_OK);}
+ CHECK(!m.table_live);
+ printf("random jsnext=%d race=%d seed %#llx: %u steps, %lu submitted, %llu completed, %llu faulted, %llu cancelled, %llu resets, %lu closes, %lu MMU faults, %lu failed chains;"
+        " NEXT writes %u (same %u cross %u) promoted %u evicted %u stops %u two-done %u races %u, model starts %u\n",
+        jsnext,race,(unsigned long long)seed,steps,submitted,(unsigned long long)core.stats.completed,(unsigned long long)core.stats.faulted,(unsigned long long)core.stats.cancelled,
+        (unsigned long long)core.stats.resets,closes,faults,fails,m.next_writes,core.lat.nx_same,core.lat.nx_cross,core.lat.nx_promoted,core.lat.nx_evicted,core.lat.nx_stops,
+        core.lat.nx_two,m.races,m.starts);
+ if(jsnext)CHECK(m.next_writes>0&&core.lat.nx_promoted>0);else CHECK(m.next_writes==0);
+}
+int main(int argc,char**argv){
+ unsigned steps=argc>1?(unsigned)atoi(argv[1]):200000;
+ t_cross();t_same_fail();t_race();t_mmu();t_timeout();t_kill();
+ printf("0630 targeted: cross-context NEXT + two-done IRQ, same-context NEXT + failure eviction + requeue, Maps c/f pattern unchanged, done-then-fail race, MMU kill of a NEXT chain (not started / started), front deadline with NEXT, close with NEXT, kill switch + run-time off PASS\n");
+ static const uint64_t seeds[]={0x9e3779b97f4a7c15ull,0x123456789abcdefull,0xfeedfacecafebeefull};
+ for(unsigned i=0;i<3;i++)t_random(steps,seeds[i],true,true);
+ t_random(steps,0x0630063006300630ull,true,false);
+ t_random(steps,0x5eed5eed5eed5eedull,false,false);
+ teardown();printf("CORE_0630_HOST_TESTS_OK\n");fflush(stdout);
+ return 0;
+}

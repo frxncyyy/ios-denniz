@@ -1,0 +1,251 @@
+--- a/bsd/dev/nord2_gpu_core.h
++++ b/bsd/dev/nord2_gpu_core.h
+@@ -174,6 +174,8 @@
+          * one clean (the kernel's zero fill) and no maintenance after that. */
+         bool cpu_dirty;           /* CPU lines may be dirty: clean before the GPU reads */
+         uint32_t dirty_gen;       /* 0661: bumped whenever cpu_dirty is set (a clean done outside the lock is kept only if nothing set it meanwhile) */
++        uint64_t clean_seq;       /* 0664: c->clean_seq of its last CPU clean (the GPU L2 may hold older lines until an L2 invalidate covers it) */
++        bool l2_dirty;            /* 0664: written by a chain that ended without an L2 clean (GPU-private at that time) */
+         bool cpu_visible;         /* the CPU can read/write it: user mapping handed out, or an imported surface */
+         bool explicit_track;      /* visible, but CPU access is bracketed by acquire/dirty calls (level 2) */
+         bool gpu_dirty;           /* tracked: GPU wrote it since the last acquire */
+@@ -243,6 +245,11 @@
+         uint32_t touch_mask[N2C_MASK_WORDS];      /* 0632 (0661: 128 bits) */
+         bool prep;                /* 0661: QUEUED but not startable yet: its CPU clean runs in the submitting thread outside the lock */
+         bool precleaned;          /* 0661: that clean is done; try_start does not clean again */
++        bool start_inv;           /* 0664: started with an L2 clean+invalidate (covers CPU cleans up to inv_seq) */
++        bool end_skip;            /* 0664: ended without an L2 clean (writes only GPU-private buffers) */
++        uint64_t inv_seq;
++        uint32_t flush_id;        /* 0664: LATEST_FLUSH sampled after the job's CPU cleans (flush reduction) */
++        bool flush_id_valid;
+         bool chain_flag;          /* 0630: JOB_CHAIN_FLAG it was started with (flag-targeted stops) */
+ };
+ 
+@@ -363,6 +370,7 @@
+         uint32_t hist[2][7];              /* run time per slot 0/1: <100 <250 <500 <1000 <4000 <16000 >=16000 us */
+         uint64_t preclean_us;             /* time spent cleaning outside the lock */
+         uint32_t full_jobs, truncated_jobs, precise_jobs, jobs;
++        uint32_t l2_inv, l2_keep, end_clean, end_skip, l2_cleans;     /* 0664: start flushes with / without L2 invalidate, end flushes, explicit L2 cleans */
+ };
+ 
+ struct n2c_core {
+@@ -382,6 +390,9 @@
+         bool pipe;                /* 0632: precise jobs may overtake older non-conflicting fragment jobs of their context (kill switch: false) */
+         bool preclean;            /* 0661: CPU cleans of listed buffers run at submit in the submitting thread, outside the lock (kill switch: false) */
+         bool prio_on;             /* 0662: compositor-first pick, NEXT take-back, job-record reserve (kill switch: false) */
++        bool l2pol;               /* 0664: kbase-style L2 policy (kill switch: false = START clean+invalidate / END clean on every chain, the CI start) */
++        uint64_t clean_seq;       /* 0664: CPU cleans so far */
++        uint64_t l2_done_seq;     /* 0664: every CPU clean up to this one is covered by a completed L2 invalidate */
+         /* 0660 telemetry, read and cleared by n2c_prof_take every 2 s */
+         struct n2c_prof prof;
+         struct n2c_bo *quarantine[N2C_QUARANTINE];
+@@ -509,7 +520,16 @@
+ void n2hw_js_stop_chain(struct n2hw *hw, unsigned slot, bool hard, bool flag);
+ bool n2hw_js_evict_next(struct n2hw *hw, unsigned slot, uint64_t *head);
+ unsigned n2hw_job_irq_rb(struct n2hw *hw, const uint64_t *next_head, struct n2hw_job_event_rb *events, unsigned max_events);
++/* 0664 */
++uint32_t n2c_latest_flush(struct n2hw *hw);
++enum n2hw_error n2c_js_start_cfg(struct n2hw *hw, unsigned slot, unsigned as, uint64_t head, uint64_t affinity, uint32_t flush_cfg, bool flush_reduction, uint32_t flush_id);
+ #endif
++/* 0664: JS_CONFIG flush fields (vendor r32p1 mali_kbase_gpu_regmap_jm.h); tTRx has FLUSH_REDUCTION, CLEAN_ONLY_SAFE, FLUSH_INV_SHADER_OTHER */
++#define N2C_JS_START_INV_SHADER_OTHER (2u << 8)
++#define N2C_JS_START_CLEAN_INVALIDATE (3u << 8)
++#define N2C_JS_END_NO_ACTION 0u
++#define N2C_JS_END_CLEAN (1u << 12)
++#define N2C_JS_ENABLE_FLUSH_REDUCTION (1u << 14)
+ /* Opt-in (boot-arg n2wm): trust write_mask as the list of buffers a job writes.  A job with write_mask == 0 keeps the conservative rule
+  * (every listed GPU_WRITE buffer).  Refused once buffers exist. */
+ bool n2c_set_wmask_inval(struct n2c_core *c, bool on);
+--- a/bsd/dev/nord2_gpu_core.c
++++ b/bsd/dev/nord2_gpu_core.c
+@@ -57,6 +57,39 @@
+ /* kbase_job_done's register sequence per slot: status/head; on a failure the NEXT chain is evicted BEFORE the bits are cleared (the failed
+  * chain halts the slot until then, so it cannot have started); clear; JOB_IRQ_JS_STATE; a failure raised after RAWSTAT was read counts as
+  * still active (the next round reports it). */
++/* 0664: LATEST_FLUSH (GPU_CONTROL 0x38) and the job start of nord2_gpu_hw.c n2hw_js_start with a chosen flush configuration (kbase_job_hw_submit:
++ * FLUSH_REDUCTION + JS_FLUSH_ID_NEXT, START INV_SHADER_OTHER or CLEAN_INVALIDATE, END NO_ACTION or CLEAN).  Same checks, same chain-flag toggle. */
++uint32_t n2c_latest_flush(struct n2hw *hw)
++{
++        return rb_rd(hw, N2HW_LATEST_FLUSH);
++}
++
++enum n2hw_error n2c_js_start_cfg(struct n2hw *hw, unsigned slot, unsigned as, uint64_t head, uint64_t affinity, uint32_t flush_cfg, bool flush_reduction, uint32_t flush_id)
++{
++        if (!hw || !hw->identified || !hw->slots_valid)
++                return N2HW_E_NOT_IDENTIFIED;
++        if (slot >= 16 || !(hw->id.js_present & (1u << slot)) || as >= 16 || !(hw->id.as_present & (1u << as)) || !head || (head & 0x3fu) ||
++            head >= (1ull << 48) || !affinity || (affinity & ~hw->shaders_on))
++                return N2HW_E_ARGS;
++        if (hw->has_issue_ttrx_3485 && !hw->wa_complete)
++                return N2HW_E_REVISION_WA;
++        if (rb_rd(hw, N2HW_JS_REG(slot, N2HW_JS_COMMAND_NEXT)))
++                return N2HW_E_SLOT_BUSY;
++        uint32_t cfg = as | flush_cfg | N2HW_JS_CFG_THREAD_PRI(8) | (flush_reduction ? N2C_JS_ENABLE_FLUSH_REDUCTION : 0u);
++        if (!hw->job_chain_flag[slot])
++                cfg |= N2HW_JS_CFG_JOB_CHAIN_FLAG;
++        hw->job_chain_flag[slot] = !hw->job_chain_flag[slot];
++        rb_wr(hw, N2HW_JS_REG(slot, N2HW_JS_HEAD_NEXT_LO), (uint32_t)head);
++        rb_wr(hw, N2HW_JS_REG(slot, N2HW_JS_HEAD_NEXT_HI), (uint32_t)(head >> 32));
++        rb_wr(hw, N2HW_JS_REG(slot, N2HW_JS_AFFINITY_NEXT_LO), (uint32_t)affinity);
++        rb_wr(hw, N2HW_JS_REG(slot, N2HW_JS_AFFINITY_NEXT_HI), (uint32_t)(affinity >> 32));
++        rb_wr(hw, N2HW_JS_REG(slot, N2HW_JS_CONFIG_NEXT), cfg);
++        if (flush_reduction)
++                rb_wr(hw, N2HW_JS_REG(slot, N2HW_JS_FLUSH_ID_NEXT), flush_id);
++        rb_wr(hw, N2HW_JS_REG(slot, N2HW_JS_COMMAND_NEXT), N2HW_JS_CMD_START);
++        return N2HW_OK;
++}
++
+ static unsigned n2hw_job_irq_rb(struct n2hw *hw, const uint64_t *next_head, struct n2hw_job_event_rb *events, unsigned max_events)
+ {
+         if (!hw || !events || !max_events)
+@@ -618,8 +651,10 @@
+         for (unsigned p = 0; p < b->nr_pages; p++)
+                 c->ops.sync(c->ctx, b->pages[p].pa, b->pages[p].cpu,
+                             NORD2_GPU_PAGE_SIZE, to_device);
+-        if (to_device)
++        if (to_device) {
+                 c->stats.cache_clean_pages += b->nr_pages;
++                b->clean_seq = ++c->clean_seq;        /* 0664 */
++        }
+         else
+                 c->stats.cache_inval_pages += b->nr_pages;
+ }
+@@ -693,6 +728,22 @@
+         } else if (state == N2C_JOB_CANCELLED) {
+                 c->stats.cancelled++;
+         }
++        /* 0664: what the chain did to the L2 (only a completed chain proves its start flush ran) */
++        if (state == N2C_JOB_DONE && j->start_inv && j->inv_seq > c->l2_done_seq)
++                c->l2_done_seq = j->inv_seq;
++        if ((state == N2C_JOB_DONE || state == N2C_JOB_FAULTED) && j->end_skip) {
++                bool now_visible = false;
++                for (unsigned i = 0; i < j->nr_bos; i++)
++                        if (n2c_mask_bit(j->write_mask, i) || n2c_mask_bit(j->touch_mask, i)) {
++                                j->bos[i]->l2_dirty = true;
++                                now_visible |= j->bos[i]->cpu_visible || (j->bos[i]->flags & N2C_BO_IMPORTED);
++                        }
++                if (now_visible && c->gpu_powered) {     /* became CPU-visible while the chain ran: clean the L2 before the completion is seen */
++                        c->prof.l2_cleans++;
++                        if (n2hw_cache_clean_inv(c->hw) != N2HW_OK)
++                                c->reset_pending = true;
++                }
++        }
+         /* 0660: per-context GPU time and queue wait, run-time histogram per slot, invalidated pages */
+         if ((state == N2C_JOB_DONE || state == N2C_JOB_FAULTED) && j->t_started && j->ctx < N2C_MAX_CTX) {
+                 uint64_t end = j->t_end_us ? j->t_end_us : n2c_now_us(c);
+@@ -1231,6 +1282,12 @@
+                 return N2C_E_STATE;                 /* promised never to be CPU-visible */
+         if (b->cpu_visible)
+                 return N2C_OK;
++        if (b->l2_dirty && c->gpu_powered) {        /* 0664: written by a chain that skipped its end clean: push the L2 to DRAM first */
++                c->prof.l2_cleans++;
++                if (n2hw_cache_clean_inv(c->hw) != N2HW_OK)
++                        c->reset_pending = true;
++        }
++        b->l2_dirty = false;
+         b->cpu_visible = true;
+         b->cpu_dirty = true;                        /* the CPU may write at any time from now on */
+         b->dirty_gen++;
+@@ -1796,9 +1853,41 @@
+                 }
+                 pick->clean_pages += (uint32_t)(c->stats.cache_clean_pages - clean_before);
+                 pick->clean_us += (uint32_t)(n2c_now_us(c) - t_clean);
+-                enum n2hw_error e = n2hw_js_start(c->hw, slot,
+-                        c->ctxs[pick->ctx].as, pick->heads[pick->phase],
+-                        c->hw->shaders_on);
++                enum n2hw_error e;
++                if (c->l2pol) {
++                        /* 0664: L2 clean+invalidate at the start only when a buffer the chain may read was cleaned by the CPU after the last completed
++                         * L2 invalidate, is an import (written by other masters), or the list is not complete; otherwise only the per-core caches
++                         * (INV_SHADER_OTHER, kbase's choice for a context switch).  End without an L2 clean only for a precise chain that touches no
++                         * CPU-visible or imported buffer (its buffers are marked l2_dirty: an L2 clean precedes any later CPU visibility). */
++                        bool need_inv = pick->full_maint || !c->ctxs[pick->ctx].bos;
++                        bool keep_end = pick->precise && !pick->full_maint;
++                        for (unsigned i = 0; i < pick->nr_bos; i++) {
++                                const struct n2c_bo *b = pick->bos[i];
++                                if (pick->precise && !n2c_mask_bit(pick->touch_mask, i))
++                                        continue;
++                                if ((b->flags & N2C_BO_IMPORTED) || b->clean_seq > c->l2_done_seq)
++                                        need_inv = true;
++                                if ((b->flags & N2C_BO_IMPORTED) || b->cpu_visible)
++                                        keep_end = false;
++                        }
++                        uint32_t fc = (need_inv ? N2C_JS_START_CLEAN_INVALIDATE : N2C_JS_START_INV_SHADER_OTHER) |
++                                      (keep_end ? N2C_JS_END_NO_ACTION : N2C_JS_END_CLEAN);
++                        pick->start_inv = need_inv;
++                        pick->inv_seq = c->clean_seq;
++                        pick->end_skip = keep_end;
++                        /* flush reduction: the id is taken now, after every CPU clean the chain may depend on (also cleans done for other jobs
++                         * of the context); the hardware then skips this start invalidate only if another one ran in between (a chain in NEXT) */
++                        pick->flush_id = n2c_latest_flush(c->hw);
++                        pick->flush_id_valid = true;
++                        if (need_inv) c->prof.l2_inv++; else c->prof.l2_keep++;
++                        if (keep_end) c->prof.end_skip++; else c->prof.end_clean++;
++                        e = n2c_js_start_cfg(c->hw, slot, c->ctxs[pick->ctx].as, pick->heads[pick->phase], c->hw->shaders_on, fc,
++                                             need_inv, pick->flush_id);
++                } else {
++                        e = n2hw_js_start(c->hw, slot,
++                                c->ctxs[pick->ctx].as, pick->heads[pick->phase],
++                                c->hw->shaders_on);
++                }
+                 if (e != N2HW_OK) {
+                         pick->status = 0xffffffffu;
+                         job_finish(c, pick, N2C_JOB_FAULTED);
+@@ -2189,6 +2278,8 @@
+         for (unsigned s = 0; s < 16; s++)
+                 if (c->running[s])
+                         n2hw_js_stop(c->hw, s, true);
++        if (c->l2pol)
++                (void)n2hw_cache_clean_inv(c->hw);       /* 0664: chains that skipped their end clean left GPU writes in the L2: save them if it answers */
+         if (n2hw_reset(c->hw) != N2HW_OK) {
+                 c->stats.reset_failures++;
+                 c->state = N2C_CORE_BROKEN;
+@@ -2341,6 +2432,7 @@
+                 }
+                 prof_clean(c, b, N2C_CR_PRESUBMIT);
+                 c->stats.cache_clean_pages += b->nr_pages;
++                b->clean_seq = ++c->clean_seq;        /* 0664 */
+                 b->cpu_dirty = b->cpu_visible && !b->explicit_track;
+         }
+         j->clean_pages += (uint32_t)p->pages;
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -219,6 +219,9 @@
+  *   kern.n2gprio / n2gpr=0       0662: compositor-first pick, NEXT take-back, 16 job records reserved for backboardd (0 = FIFO by job id)
+  *   n2girq=0                     0663: GPU interrupt and bottom half stay where they were (no move to the big cluster; boot only) */
+ static int gPreclean = 1, gPrecleanApplied = 1, gV4 = 1, gPrio = 1, gPrioApplied = 1, gIrqBig = 1;
++/* 0664 (step B): kern.n2gl2 / boot-arg n2gl2=0 = every chain starts with an L2 clean+invalidate and ends with an L2 clean again (the CI start path) */
++static int gL2 = 1, gL2Applied = 1;
++SYSCTL_INT(_kern, OID_AUTO, n2gl2, CTLFLAG_RW | CTLFLAG_LOCKED, &gL2, 0, "0664: kbase-style GPU L2 flush policy");
+ SYSCTL_INT(_kern, OID_AUTO, n2gpreclean, CTLFLAG_RW | CTLFLAG_LOCKED, &gPreclean, 0, "0661: CPU cleans at submit outside the GPU lock");
+ SYSCTL_INT(_kern, OID_AUTO, n2gv4, CTLFLAG_RW | CTLFLAG_LOCKED, &gV4, 0, "0661: accept GPU submit ABI v4 (128 buffers)");
+ SYSCTL_INT(_kern, OID_AUTO, n2gprio, CTLFLAG_RW | CTLFLAG_LOCKED, &gPrio, 0, "0662: compositor-first GPU scheduling");
+@@ -405,6 +408,8 @@
+           v = 1; if (PE_parse_boot_argn("n2gv4", &v, sizeof(v))) gV4 = v != 0;
+           v = 1; if (PE_parse_boot_argn("n2gpr", &v, sizeof(v))) gPrio = v != 0; c->prio_on = gPrio != 0; gPrioApplied = gPrio;
+           v = 1; if (PE_parse_boot_argn("n2girq", &v, sizeof(v))) gIrqBig = v != 0;
++          v = 1; if (PE_parse_boot_argn("n2gl2", &v, sizeof(v))) gL2 = v != 0; c->l2pol = gL2 != 0; gL2Applied = gL2;
++          IOLog("NORD2 GPU L2: policy %s (start: invalidate only after CPU cleans / imports; end: no clean for GPU-private chains; n2gl2=0 / kern.n2gl2 off)\n", gL2 ? "on" : "off");
+           IOLog("NORD2 GPUPROF: step A on: preclean=%d abi_v4=%d prio=%d irq_big=%d (boot-args n2gpc/n2gv4/n2gpr/n2girq =0 to switch off)\n", gPreclean, gV4, gPrio, gIrqBig); }
+         IOLog("NORD2 GPU: cache maintenance %s, CPU-access tracking level %d, invalidate scope %s, surface reservations %s\n", c->full_cache_maint ? "whole-context (boot-arg)" : "per-job buffer list", tr,
+               c->wmask_inval ? "declared writes (write_mask)" : "every listed GPU_WRITE buffer", rs ? "on" : "off");
+@@ -785,6 +790,8 @@
+                       pf.clean_pages[N2C_CR_FULLHARD] * 4, pf.clean_pages[N2C_CR_LEGACY] * 4, pf.clean_pages[N2C_CR_IMPLICIT] * 4, pf.clean_pages[N2C_CR_DIRTY] * 4,
+                       pf.clean_pages[N2C_CR_FULL] * 4, pf.clean_pages[N2C_CR_PRESUBMIT] * 4, pf.clean_max_pages * 4, pf.inval_pages * 4, pf.preclean_us,
+                       pf.jobs, pf.full_jobs, pf.truncated_jobs, pf.precise_jobs);
++                IOLog("NORD2 GPUPROF L2: pol=%u start_inv=%u start_keep=%u end_clean=%u end_skip=%u l2_cleans=%u\n", (unsigned)d->core->l2pol, pf.l2_inv, pf.l2_keep,
++                      pf.end_clean, pf.end_skip, pf.l2_cleans);
+                 IOLog("NORD2 GPUPROF DRV: lock_wait_avg_us=%llu lock_hold_avg_us=%llu bh_wake_avg_us=%llu bh_poll_avg_us=%llu irq_cpu=%d bh_cpu=%d prio=%u evict=%u aged=%u reserve=%u\n",
+                       gLockCalls ? gLockWaitSumUs / gLockCalls : 0ull, gLockCalls ? gLockHoldSumUs / gLockCalls : 0ull, gBhWaitN ? gBhWaitSumUs / gBhWaitN : 0ull,
+                       gBhRuns ? gBhPollSumUs / gBhRuns : 0ull, gIrqCpu, gBhCpu, (unsigned)d->core->prio_on, l.pr_evicted, l.pr_aged, l.pr_reserved);
+@@ -818,6 +825,10 @@
+                 if (gPipe != gPipeApplied) { d->core->pipe = gPipe != 0; gPipeApplied = gPipe; }   /* 0632 */
+                 if (gPreclean != gPrecleanApplied) { d->core->preclean = gPreclean != 0; gPrecleanApplied = gPreclean; }   /* 0661 */
+                 if (gPrio != gPrioApplied) { d->core->prio_on = gPrio != 0; gPrioApplied = gPrio; }   /* 0662 */
++                if (gL2 != gL2Applied) {      /* 0664: switching off first pushes whatever the L2 still holds */
++                        if (!gL2 && d->core->gpu_powered) (void)n2hw_cache_clean_inv(&d->hw);
++                        d->core->l2pol = gL2 != 0; gL2Applied = gL2;
++                }
+                 if (gJsNext != gJsNextApplied) { (void)n2c_set_jsnext(d->core, gJsNext != 0); gJsNext = gJsNextApplied = d->core->jsnext ? 1 : 0; }   /* 0630 */
+                 n2c_poll(d->core);
+                 d->emitJobStats();

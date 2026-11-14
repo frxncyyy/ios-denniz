@@ -1,0 +1,60 @@
+--- a/bsd/dev/nord2_gpsdl.inc
++++ b/bsd/dev/nord2_gpsdl.inc
+@@ -97,10 +97,42 @@
+ 	__builtin_arm_dsb(0xf);
+ }
+ static void n2gt(const char *fmt, ...) __printflike(1, 2);
++/* 0658 (gpusched-20261114, ram8c debug images only): the console zone holds the TAIL of the kernel log instead of the GNSS trace.
++ * pmsg (0x48160000) keeps only the FIRST 64 KiB of a boot (sweet_early.c), so a hang after ~20 s left no evidence.  A kernel thread
++ * copies every new byte of the 4 MiB live stream (nord2_log_stream_*) into this circular zone every 100 ms; after a WDT reset the
++ * rescue shows the last ~256 KiB of the log in /sys/fs/pstore/console-ramoops-0.  GNSS "GT" lines are off in this mode. */
++extern void nord2_log_stream_info(uint32_t info[2]);
++extern uint32_t nord2_log_stream_read(uint32_t offset, uint8_t *out, uint32_t max);
++extern void IOSleep(unsigned int milliseconds);
++extern kern_return_t kernel_thread_start(thread_continue_t continuation, void *parameter, thread_t *new_thread);
++static uint8_t n2gt_tail_buf[4096];
++static void
++n2gt_tail_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint32_t done = 0, cap = N2GT_SIZE - 12u, beats = 0;
++	for (;;) {
++		uint32_t info[2];
++		nord2_log_stream_info(info);
++		uint32_t size = info[1];
++		if (size > done && size - done > cap) { done = size - cap; }
++		while (done < size) {
++			uint32_t n = nord2_log_stream_read(done, n2gt_tail_buf, sizeof n2gt_tail_buf);
++			if (n == 0) { break; }
++			n2gt_put((const char *)n2gt_tail_buf, n);
++			done += n;
++		}
++		if (size >= info[0] && (++beats % 50u) == 0) {     /* stream full (4 MiB): it no longer grows; say so every 5 s */
++			static const char full[] = "\nNORD2 TAIL: live stream full, tail frozen\n";
++			n2gt_put(full, sizeof full - 1);
++		}
++		IOSleep(100);
++	}
++}
++
+ static void
+ n2gt(const char *fmt, ...)
+ {
+-	if (!n2gt_va || (n2gd_ctl & 8)) { return; }
++	if (!n2gt_va || (n2gd_ctl & 8) || 1) { return; }      /* 0658: zone = log tail */
+ 	char line[160];
+ 	uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+ 	int k = snprintf(line, sizeof line, "GT %u %llu ", ++n2gt_seq, (unsigned long long)(ns / 1000000ull));
+@@ -125,6 +157,13 @@
+ 	__builtin_arm_dsb(0xf);
+ 	printf("NORD2 GNSS TRACE: persistent register trace in the ramoops console zone %#x (+%#x), old header sig %#x start %u size %u\n",
+ 	    N2GT_PA, N2GT_SIZE, osig, ost, osz);
++	{
++		thread_t th = THREAD_NULL;
++		if (kernel_thread_start(n2gt_tail_thread, NULL, &th) == KERN_SUCCESS) {
++			thread_deallocate(th);
++			printf("NORD2 TAIL: 0658 console zone %#x = last %u KiB of the kernel log (100 ms), GNSS trace off\n", N2GT_PA, (N2GT_SIZE - 12u) >> 10);
++		}
++	}
+ 	n2gt("boot: GNSS trace on (0583)");
+ 	/* 0591: link-time addresses of a few GNSS functions, so the per-CPU last PCs that the stock kernel prints after a WDT reset
+ 	 * (/proc/aed/reboot-reason in the rescue) can be symbolised against kernel.development (slide = runtime - nm address) */

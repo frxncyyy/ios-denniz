@@ -1,0 +1,272 @@
+--- a/bsd/dev/nord2_gpu_transport.h
++++ b/bsd/dev/nord2_gpu_transport.h
+@@ -52,6 +52,18 @@
+         uint32_t handles[32];
+ };
+ 
++/* 0632 ABI v3 = v2 + flags (bit 1 = N2C_SUBMIT_PRECISE) + touch_mask; a kernel without 0632 refuses version 3 (kIOReturnBadArgument) and the
++ * client falls back to v2. */
++#define NORD2_GPU_TRANSPORT_VERSION3 3u
++struct nord2_gpu_submit_request3 {
++        uint32_t version, kind;
++        uint64_t heads[2];
++        uint32_t nr_handles, write_mask;
++        uint32_t handles[32];
++        uint32_t flags, touch_mask;
++        uint32_t reserved[2];
++};
++
+ struct nord2_gpu_hwinfo {
+         uint32_t version;
+         uint32_t thread_max_threads, thread_max_workgroup_size, thread_max_barrier, thread_features, coherency_features;
+@@ -279,8 +291,9 @@
+         case NORD2_GPU_SEL_PROBE: break;
+         case NORD2_GPU_SEL_RESET: expected_no = 1; break;
+         case NORD2_GPU_SEL_IMPORT_SURFACE: expected_ni = 4; expected_no = 3; break;
+-        case NORD2_GPU_SEL_SUBMIT_JM:
+-                expected_si = sizeof(struct nord2_gpu_submit_request);
++        case NORD2_GPU_SEL_SUBMIT_JM:   /* 0632: v2, or v3 (nord2_gpu_submit_request3) */
++                expected_si = si == sizeof(struct nord2_gpu_submit_request3) ? sizeof(struct nord2_gpu_submit_request3)
++                                                                             : sizeof(struct nord2_gpu_submit_request);
+                 expected_no = 1; break;
+         case NORD2_GPU_SEL_SYNC: expected_ni = 2; break;
+         case NORD2_GPU_SEL_SURFACE_RESERVE:
+--- a/bsd/dev/nord2_gpu_core.h
++++ b/bsd/dev/nord2_gpu_core.h
+@@ -227,6 +227,8 @@
+         bool released;            /* references dropped */
+         bool release_due;         /* 0400: terminal in this n2c_poll, references dropped after try_start */
+         bool in_next;             /* 0630: RUNNING but written to the slot's NEXT registers behind running[slot] (not started yet as far as we know) */
++        bool precise;             /* 0632: N2C_SUBMIT_PRECISE and a complete list (not full_maint) */
++        uint32_t touch_mask;      /* 0632 */
+         bool chain_flag;          /* 0630: JOB_CHAIN_FLAG it was started with (flag-targeted stops) */
+ };
+ 
+@@ -237,6 +239,7 @@
+         uint32_t handles[N2C_JOB_BOS];
+         uint32_t write_mask;      /* bit i: GPU may write handles[i] */
+         uint32_t flags;           /* N2C_SUBMIT_* */
++        uint32_t touch_mask;      /* 0632, with N2C_SUBMIT_PRECISE: bit i = this chain accesses handles[i] (the others are listed for lifetime only) */
+ };
+ 
+ /* The handle list is only a hint: the chain may reach buffers that are not
+@@ -245,6 +248,11 @@
+  * the listed ones.  A list that fills N2C_JOB_BOS is treated the same way,
+  * because a producer that ran out of slots cannot list everything. */
+ #define N2C_SUBMIT_FULL_MAINT (1u << 0)
++/* 0632: the producer (gpupipe1 userland) declares per chain what it touches (touch_mask) and writes (write_mask, a subset), from Mesa's
++ * per-stage access flags, and gives every render pass its own tiler heap of a rotation marked as written.  Such a job may start while older
++ * FRAGMENT jobs of its context still run or wait, when no buffer one of them writes is touched by the other (kbase-style overlap of pass
++ * k+1's vertex/tiler with pass k's fragment). */
++#define N2C_SUBMIT_PRECISE (1u << 1)
+ 
+ /* Job timing aggregated over a window; read and reset with n2c_timing_take().
+  * queue = submit -> first phase start (includes the pre-job clean),
+@@ -324,6 +332,7 @@
+          * moved up at a completion; taken back (failure of the chain ahead, MMU kill, close); flag-targeted stops; completions that found
+          * fewer chains done than expected (kbase 'spurious'); handoffs at zero cost (the successor was already in NEXT). */
+         uint32_t nx_same, nx_cross, nx_promoted, nx_evicted, nx_stops, nx_spurious, nx_two;
++        uint32_t ov_starts, ov_blocked, precise_jobs;   /* 0632: jobs started past older fragment jobs; precise jobs held by a conflict; precise submits */
+ };
+ 
+ struct n2c_core {
+@@ -340,6 +349,7 @@
+         uint64_t next[16];        /* 0630: job id written to the slot's NEXT registers behind running[slot] (0 = none) */
+         bool jsnext;              /* 0630: write a second chain to NEXT while one runs (kill switch: false = one chain per slot, the old path) */
+         bool jsnext_rb;           /* 0630: completions are read the two-chain way (set with jsnext before the first job; stays on if jsnext is cleared later) */
++        bool pipe;                /* 0632: precise jobs may overtake older non-conflicting fragment jobs of their context (kill switch: false) */
+         struct n2c_bo *quarantine[N2C_QUARANTINE];
+         unsigned nr_quarantine;
+         uint32_t next_handle;
+--- a/bsd/dev/nord2_gpu_core.c
++++ b/bsd/dev/nord2_gpu_core.c
+@@ -660,6 +660,8 @@
+                                 struct n2c_bo *b = j->bos[i];
+                                 if (!(b->flags & N2C_BO_GPU_WRITE))
+                                         continue;
++                                if (j->precise && !((j->touch_mask >> i) & 1u))
++                                        continue;       /* 0632: this chain never accessed it */
+                                 if (c->wmask_inval && j->write_mask && !((j->write_mask >> i) & 1u)) {
+                                         /* The job declared what it writes and this buffer is not in it: no CPU line of it can be stale because of this job. */
+                                         c->stats.cache_skip_wmask_pages += b->nr_pages;
+@@ -1290,7 +1292,7 @@
+             (!x->as_live && !as_dynamic_ctx(c, idx)) || c->reset_pending)
+                 return N2C_E_STATE;     /* 0500: a dynamic client gets its AS in try_start */
+         if (!r || !id_out || !r->nr_handles || r->nr_handles > N2C_JOB_BOS ||
+-            (r->flags & ~N2C_SUBMIT_FULL_MAINT) ||
++            (r->flags & ~(N2C_SUBMIT_FULL_MAINT | N2C_SUBMIT_PRECISE)) ||
+             (r->nr_handles < 32 && (r->write_mask >> r->nr_handles)))
+                 return N2C_E_ARGS;
+         bool need0 = r->kind == N2C_JOB_COMPUTE || r->kind == N2C_JOB_RENDER;
+@@ -1339,6 +1341,17 @@
+         j->t_submit_us = n2c_now_us(c);
+         j->full_hard = c->full_cache_maint || (r->flags & N2C_SUBMIT_FULL_MAINT);
+         j->full_maint = j->full_hard || r->nr_handles >= N2C_JOB_BOS;
++        /* 0632: a declared access set; the chain's own head buffer always counts as touched */
++        j->precise = (r->flags & N2C_SUBMIT_PRECISE) && !j->full_maint;
++        if (j->precise) {
++                uint32_t all = r->nr_handles >= 32 ? 0xffffffffu : ((1u << r->nr_handles) - 1u);
++                j->touch_mask = (r->touch_mask | r->write_mask) & all;
++                uint64_t head = r->heads[need0 ? 0 : 1];
++                for (unsigned i = 0; i < r->nr_handles; i++)
++                        if (head >= bos[i]->va && head - bos[i]->va < bos[i]->size)
++                                j->touch_mask |= 1u << i;
++                c->lat.precise_jobs++;
++        }
+         for (unsigned i = 0; i < r->nr_handles; i++) {
+                 struct n2c_bo *b = bos[i];
+                 j->bos[i] = b;
+@@ -1505,6 +1518,47 @@
+         return NULL;
+ }
+ 
++/* 0632: two jobs of one context conflict when a buffer one of them writes is touched by the other (by buffer identity). */
++static bool jobs_conflict(const struct n2c_job *a, const struct n2c_job *b)
++{
++        for (unsigned i = 0; i < a->nr_bos; i++) {
++                if (!((a->touch_mask >> i) & 1u))
++                        continue;
++                bool aw = (a->write_mask >> i) & 1u;
++                for (unsigned k = 0; k < b->nr_bos; k++) {
++                        if (b->bos[k] != a->bos[i] || !((b->touch_mask >> k) & 1u))
++                                continue;
++                        if (aw || ((b->write_mask >> k) & 1u))
++                                return true;
++                }
++        }
++        return false;
++}
++
++/* 0632: j (a precise vertex/tiler/compute job, JS1) may start although older jobs of its context are unfinished, when every one of those is a
++ * precise FRAGMENT job (JS0; at most four) that conflicts with nothing j touches.  Pass k's fragment then overlaps pass k+1's vertex/tiler as
++ * with kbase; pass k+1's fragment still waits for pass k's (same slot, in order) and for its own vertex/tiler job (older, unfinished). */
++#define N2C_OVERTAKE_MAX 4u
++static bool may_overtake(struct n2c_core *c, const struct n2c_job *j)
++{
++        if (!c->pipe || !j->precise || j->kind != N2C_JOB_COMPUTE)
++                return false;
++        unsigned n = 0;
++        for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
++                const struct n2c_job *o = &c->jobs[i];
++                if (o == j || o->ctx != j->ctx || o->id > j->id ||
++                    !(o->state == N2C_JOB_QUEUED || o->state == N2C_JOB_RUNNING || o->state == N2C_JOB_STOPPING))
++                        continue;
++                if (!o->precise || o->kind != N2C_JOB_FRAGMENT || o->state == N2C_JOB_STOPPING || ++n > N2C_OVERTAKE_MAX)
++                        return false;
++                if (jobs_conflict(o, j) || jobs_conflict(j, o)) {
++                        c->lat.ov_blocked++;
++                        return false;
++                }
++        }
++        return n > 0;
++}
++
+ static void try_start(struct n2c_core *c)
+ {
+         if (c->state != N2C_CORE_READY || c->reset_pending || c->hold_start)
+@@ -1514,7 +1568,7 @@
+                 /* Oldest queued job whose context has nothing older still
+                  * pending (per-context submission order across slots). */
+                 struct n2c_job *pick = NULL;
+-                bool pick_next = false;
++                bool pick_next = false, pick_ov = false;
+                 uint64_t oldest[N2C_MAX_CTX] = { 0 };
+                 uint64_t second[N2C_MAX_CTX] = { 0 };   /* 0630: second oldest unfinished job of each context */
+                 for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
+@@ -1533,9 +1587,12 @@
+                         struct n2c_job *j = &c->jobs[i];
+                         if (j->state != N2C_JOB_QUEUED)
+                                 continue;
+-                        /* Blocked unless it is the oldest unfinished job of its context. */
++                        /* Blocked unless it is the oldest unfinished job of its context (0632: or may overtake older fragment jobs). */
++                        bool overtake = false;
+                         bool blocked = oldest[j->ctx] != j->id;
+                         bool ctx_ok = true;
++                        if (blocked && may_overtake(c, j))
++                                blocked = false, overtake = true;
+                         if (c->ctxs[j->ctx].state != N2C_CTX_OPEN)
+                                 ctx_ok = false;
+                         else if (!c->ctxs[j->ctx].as_live && (!as_dynamic_ctx(c, j->ctx) || nobind[j->ctx]))
+@@ -1565,6 +1622,7 @@
+                         if (!blocked && (!pick || j->id < pick->id)) {
+                                 pick = j;
+                                 pick_next = to_next;
++                                pick_ov = overtake;
+                         }
+                 }
+                 if (!pick)
+@@ -1608,6 +1666,8 @@
+                                         struct n2c_bo *b = pick->bos[i];
+                                         if (b->state != N2C_BO_MAPPED)
+                                                 continue;
++                                        if (pick->precise && !((pick->touch_mask >> i) & 1u))
++                                                continue;       /* 0632: listed for lifetime only; the chain that touches it cleans it */
+                                         if (c->track_level == N2C_TRACK_LEGACY || b->cpu_dirty) {
+                                                 bo_cache_sync(c, b, true);
+                                                 b->cpu_dirty = b->cpu_visible && !b->explicit_track;
+@@ -1629,6 +1689,8 @@
+                                 c->reset_pending = true;
+                         continue;
+                 }
++                if (pick_ov)
++                        c->lat.ov_starts++;
+                 pick->slot = slot;
+                 pick->chain_flag = c->hw->job_chain_flag[slot];   /* n2hw_js_start set JOB_CHAIN_FLAG iff the toggle was clear, then flipped it */
+                 pick->state = N2C_JOB_RUNNING;
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -180,6 +180,10 @@
+  *   4 every pageable allocation zeroed again after prepare() (pre-0400)            8 buffer owners released inline under the GPU lock (pre-0400) */
+ static int gLatMode = 0;
+ static int gJsNext = 1, gJsNextApplied = 1;      /* 0630 */
++/* 0632: precise jobs (ABI v3 from the gpupipe1 userland) may overtake older non-conflicting fragment jobs of their context.  Kill switch:
++ * boot-arg n2gp=0 or n2gdv +32768 (v3 still accepted, the flags ignored: every job serial again); sysctl kern.n2gpipe=0 at run time. */
++static int gPipe = 1, gPipeApplied = 1, gPipeAbi = 1;
++SYSCTL_INT(_kern, OID_AUTO, n2gpipe, CTLFLAG_RW | CTLFLAG_LOCKED, &gPipe, 0, "0632: precise GPU jobs may overlap older fragment jobs of their context (1 on, 0 off)");
+ SYSCTL_INT(_kern, OID_AUTO, n2gjsnext, CTLFLAG_RW | CTLFLAG_LOCKED, &gJsNext, 0, "0630: GPU JS NEXT pipelining (1 on, 0 no new NEXT writes)");
+ SYSCTL_INT(_kern, OID_AUTO, n2gpu_lat, CTLFLAG_RW | CTLFLAG_LOCKED, &gLatMode, 0, "0400: GPU latency changes off-mask: 1 BH thread, 2 late release, 4 zero skip, 8 deferred owner free");
+ /* 0461: runtime GPU DVFS.  Policy: bsd/dev/nord2_gov.h (n2g_gpu_*); clock: n2clk_retune (the vendor's parking switch); voltage: never touched, only OPPs the
+@@ -345,6 +349,9 @@
+         { int jn = 1, gm = 0; if (!PE_parse_boot_argn("n2jn", &jn, sizeof(jn)) && PE_parse_boot_argn("n2gdv", &gm, sizeof(gm)) && (gm & 4096)) jn = 0;
+           (void)n2c_set_jsnext(c, jn != 0); gJsNext = c->jsnext ? 1 : 0; gJsNextApplied = gJsNext;
+           IOLog("NORD2 GPU JSNEXT: %s (kill switch n2jn=0 or n2gdv+4096; sysctl kern.n2gjsnext)\n", c->jsnext ? "on" : "off"); }
++        { int gp = 1, gm = 0; if (!PE_parse_boot_argn("n2gp", &gp, sizeof(gp)) && PE_parse_boot_argn("n2gdv", &gm, sizeof(gm)) && (gm & 32768)) gp = 0;
++          c->pipe = gp != 0; gPipeAbi = gp != 0; gPipe = gPipeApplied = gp != 0;
++          IOLog("NORD2 GPU PIPE: %s (pass overlap for precise ABI-v3 jobs; kill switch n2gp=0 or n2gdv+32768; sysctl kern.n2gpipe)\n", c->pipe ? "on" : "off"); }
+         IOLog("NORD2 GPU: cache maintenance %s, CPU-access tracking level %d, invalidate scope %s, surface reservations %s\n", c->full_cache_maint ? "whole-context (boot-arg)" : "per-job buffer list", tr,
+               c->wmask_inval ? "declared writes (write_mask)" : "every listed GPU_WRITE buffer", rs ? "on" : "off");
+         return true;
+@@ -685,9 +692,9 @@
+               gLatMode, (unsigned)gBhOn, gBhRuns, gBhWaitMaxUs, gBhPollMaxUs, gLockCalls, gLockWaitMaxUs, gLockHoldMaxUs, gLockHoldSel,
+               gOwnerQueued, gOwnerFreed, gOwnerKiB, gOwnerDrainMaxUs, gZeroSkip, gZeroSkipMiB, gZeroVerifyFail, gZeroFull);
+         if (d->core->jsnext_rb)     /* 0630: what to read: same+cross = chains that waited in NEXT; promoted = handoffs without a software turn */
+-                IOLog("NORD2 GPU LAT3: jsnext=%u next_same=%u next_cross=%u promoted=%u evicted=%u stops=%u two_done=%u spurious=%u hand0_share_pm=%llu\n",
++                IOLog("NORD2 GPU LAT3: jsnext=%u next_same=%u next_cross=%u promoted=%u evicted=%u stops=%u two_done=%u spurious=%u hand0_share_pm=%llu pipe=%u precise=%u overlap=%u held=%u\n",
+                       (unsigned)d->core->jsnext, l.nx_same, l.nx_cross, l.nx_promoted, l.nx_evicted, l.nx_stops, l.nx_two, l.nx_spurious,
+-                      l.hand_n ? (unsigned long long)l.nx_promoted * 1000ull / l.hand_n : 0ull);
++                      l.hand_n ? (unsigned long long)l.nx_promoted * 1000ull / l.hand_n : 0ull, (unsigned)d->core->pipe, l.precise_jobs, l.ov_starts, l.ov_blocked);
+         gBhRuns = gBhWaitMaxUs = gBhPollMaxUs = 0; gLockCalls = gLockWaitMaxUs = gLockHoldMaxUs = gLockHoldSel = 0;
+         gOwnerDrainMaxUs = 0;
+ }
+@@ -713,6 +720,7 @@
+         n2_sys_telemetry(now_us(NULL));
+         if (d->ready) {
+                 d->core->lat_release_late = !(gLatMode & 2);   /* 0400 */
++                if (gPipe != gPipeApplied) { d->core->pipe = gPipe != 0; gPipeApplied = gPipe; }   /* 0632 */
+                 if (gJsNext != gJsNextApplied) { (void)n2c_set_jsnext(d->core, gJsNext != 0); gJsNext = gJsNextApplied = d->core->jsnext ? 1 : 0; }   /* 0630 */
+                 n2c_poll(d->core);
+                 d->emitJobStats();
+@@ -1948,9 +1956,12 @@
+                 result=gpu->compute(context,&r,&id);if(result==kIOReturnSuccess){a->scalarOutput[0]=id;a->scalarOutputCount=1;}break;
+         }
+         case NORD2_GPU_SEL_SUBMIT_JM: {
+-                nord2_gpu_submit_request r;memcpy(&r,a->structureInput,sizeof(r));if(r.version!=2){result=kIOReturnBadArgument;break;}
++                nord2_gpu_submit_request3 r;bzero(&r,sizeof(r));memcpy(&r,a->structureInput,a->structureInputSize<sizeof(r)?a->structureInputSize:sizeof(r));
++                bool v3=a->structureInputSize==sizeof(nord2_gpu_submit_request3);      /* 0632 */
++                if(v3?(r.version!=3||(r.flags&~(uint32_t)N2C_SUBMIT_PRECISE)||r.reserved[0]||r.reserved[1]):r.version!=2){result=kIOReturnBadArgument;break;}
+                 struct n2c_submit sub={};sub.kind=r.kind;sub.nr_handles=r.nr_handles;sub.heads[0]=r.heads[0];sub.heads[1]=r.heads[1];
+                 sub.write_mask=r.write_mask;memcpy(sub.handles,r.handles,sizeof(sub.handles));uint64_t id;
++                if(v3&&gPipeAbi){sub.flags=r.flags;sub.touch_mask=r.touch_mask;}
+                 result=io_error(n2c_submit(gpu->core,context,&sub,&id));if(result==kIOReturnSuccess){fence_record(gpu->core,context,&sub,id);a->scalarOutput[0]=id;a->scalarOutputCount=1;if(gpu->irqState==NORD2_IRQ_ACTIVE)gpu->irqArm();}break;
+         }
+         case NORD2_GPU_SEL_WAIT: {

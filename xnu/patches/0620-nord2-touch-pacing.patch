@@ -1,0 +1,112 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -39,6 +39,20 @@
+ static unsigned ni_events;
+ static struct n2ir ni_rate;      /* 0407: input thread only */
+ static uint32_t ni_moves;        /* 0407: HID events of the last ni_report */
++/*
++ * 0620 (perf-20261114): touch sampling.  The FT3518 is read over bit-banged I2C0 by this thread: 62 bytes with 3 x delay(4) per bit
++ * = ~7.4 ms of spinning per report, then ni_wait(10) -> one report every ~18.7 ms = ~53 Hz while the panel shows 89 Hz (capture
++ * perf1a: INPUT RATE gap_avg 18.5-18.7 ms, read_avg 7.3-7.4 ms, gaps to 36 ms): a finger-driven scroll moves the content on some
++ * frames and not on others (judder) and every report is up to ~19 ms old.  With 0620, while a finger is down and only for the touch
++ * reads: half-bit delay n2tp_half_us (default 2 us = ~2x faster; the FT3518 is a 400 kHz part and SCL stretching is still honoured),
++ * and the loop period is n2tp_period_us measured from the start of the iteration (default 8000 us = 125 Hz) instead of 10 ms after
++ * the work.  Every other bus (MT6360 torch, AW8697 haptics, slider) keeps delay(4).  Safety: 8 touch read errors in fast mode put the
++ * half-bit delay back to 4 us for the boot ('NORD2 INPUT PACE: ... back to 4 us').
++ * Kill switch: boot-arg n2gdv +2048 (n2gdv=2057) or n2tp=0 = the old timing; sysctl kern.n2tpace 0/1, kern.n2tp_half_us 1..4,
++ * kern.n2tp_period_us 4000..10000 (run time).  Line 'NORD2 INPUT PACE:' at start and next to every 'NORD2 INPUT RATE:'.
++ */
++static uint32_t n2tp_on = 1, n2tp_half_us = 2, n2tp_period_us = 8000, n2tp_fast_errors, n2tp_fallbacks;
++static volatile uint32_t ni_half_us = 4;      /* half-bit delay of ni_line (input thread only) */
+ 
+ static uint64_t
+ ni_now_us(void)
+@@ -106,7 +120,7 @@
+ ni_line(unsigned pin, bool high)
+ {
+ 	ni_gpio_bit(pin, 0, !high); /* DOUT fixed at zero: release or pull low. */
+-	delay(4);
++	delay(ni_half_us);      /* 0620: 4 us, or n2tp_half_us during a touch read */
+ }
+ 
+ static bool
+@@ -908,6 +922,13 @@
+ 	printf("NORD2 INPUT: FT3518 id=%02x:%02x ready=%d powered=%d idle=%d stage=%u irq=%d; TOPSTATUS=%#x ok=%d\n",
+ 	    a, b, touch_ok, powered, bus_idle, ni_stage, ni_level(NI_IRQ), top, key_ok);
+ 	printf("NORD2 INPUT: software I2C0, x4 coordinates, PMIC power/up and GPIO155 down; poll=10ms\n");
++	{   /* 0620 */
++		uint32_t tp = 1; int gdv = 0;
++		if (!PE_parse_boot_argn("n2tp", &tp, sizeof(tp)) && PE_parse_boot_argn("n2gdv", &gdv, sizeof(gdv)) && (gdv & 2048)) { tp = 0; }
++		n2tp_on = tp ? 1 : 0;
++		printf("NORD2 INPUT PACE: on=%u half_us=%u period_us=%u (0620; finger down only; off: n2gdv +2048 / n2tp=0 / kern.n2tpace=0)\n",
++		    n2tp_on, n2tp_half_us, n2tp_period_us);
++	}
+ 	/* Publish retained maps only after this owner finishes initial GPIO writes. */
+ 	nah_native_publish_ready();
+ 	ns_probe(); /* alert slider: publishes the boot ring/silent state */
+@@ -917,6 +938,7 @@
+ 	unsigned errors = 0, ticks = 0, key_errors = 0, slider_ticks = 0;
+ 	int state[3] = {0}, previous[3] = {-1, -1, -1};
+ 	for (;;) {
++        uint64_t n2tp_it0 = ni_now_us();      /* 0620: start of this iteration */
+         extern void nord2_gpu_owner_poll(void);
+         nord2_gpu_owner_poll(); /* serialized GPU PMIC work */
+         nord2_audio_owner_poll(); /* 0280: serialized MT6359 call-audio work */
+@@ -945,7 +967,15 @@
+ 			previous[k] = now[k];
+ 		}
+ 		if (touch_ok && (ni_active || !ni_level(NI_IRQ) || (++ticks % 10) == 0)) {
+-			if (!ni_touch()) {
++			uint32_t half = n2tp_on && n2tp_half_us >= 1 && n2tp_half_us < 4 ? n2tp_half_us : 4;      /* 0620 */
++			ni_half_us = half;
++			bool touch_read = ni_touch();
++			ni_half_us = 4;
++			if (!touch_read && half < 4 && ++n2tp_fast_errors >= 8) {      /* 0620: the bus does not take the fast timing */
++				n2tp_half_us = 4; n2tp_fallbacks++; n2tp_fast_errors = 0;
++				printf("NORD2 INPUT PACE: 8 touch read errors at half_us=%u: back to 4 us for this boot (fallbacks %u)\n", half, n2tp_fallbacks);
++			}
++			if (!touch_read) {
+ 				n2ir_error(&ni_rate);      /* 0407 */
+ 				if ((errors++ % 100) == 0) {
+ 					printf("NORD2 INPUT: touch report error irq=%d scl=%d sda=%d\n",
+@@ -958,7 +988,11 @@
+ 			uint64_t nu = ni_now_us();
+ 			if (ni_rate.win_start_us == 0) { n2ir_reset(&ni_rate, nu); }
+ 			int due = n2ir_due(&ni_rate, nu);
+-			if (due > 0) { char rb[256]; (void)n2ir_format(&ni_rate, nu, rb, sizeof(rb)); printf("NORD2 INPUT RATE: %s\n", rb); }
++			if (due > 0) {
++				char rb[256]; (void)n2ir_format(&ni_rate, nu, rb, sizeof(rb)); printf("NORD2 INPUT RATE: %s\n", rb);
++				printf("NORD2 INPUT PACE: on=%u half_us=%u period_us=%u fast_errors=%u fallbacks=%u\n", n2tp_on, n2tp_half_us, n2tp_period_us,
++				    n2tp_fast_errors, n2tp_fallbacks);      /* 0620 */
++			}
+ 			if (due != 0) { n2ir_reset(&ni_rate, nu); }
+ 		}
+ 		if ((++slider_ticks % 10) == 0) { ns_poll(); }
+@@ -966,7 +1000,16 @@
+ 		if (powered) { n2t_service(); }   /* 0496: torch requests from /dev/redwood-torch (MT6360 FLED, same I2C5 bus) */
+ 		n2h_service();     /* 0610: iOS Actuator envelope -> AW8697 CONT drive, limits, watchdog (I2C9) */
+ 		n2rtc_service();   /* 0540: calendar -> MT6359P RTC when the calendar moved (one deadline compare per tick) */
+-		ni_wait(10);
++		if (n2tp_on && touch_ok && ni_active) {      /* 0620: a finger is down: fixed period from the start of the iteration */
++			uint32_t per = n2tp_period_us < 4000 ? 4000 : n2tp_period_us > 10000 ? 10000 : n2tp_period_us;
++			uint64_t el = ni_now_us() - n2tp_it0, wait_us = el + 1000 < per ? per - el : 1000;
++			uint64_t deadline;
++			clock_interval_to_deadline((uint32_t)wait_us, NSEC_PER_USEC, &deadline);
++			(void)assert_wait_deadline(&ni_chan, THREAD_UNINT, deadline);
++			thread_block(THREAD_CONTINUE_NULL);
++		} else {
++			ni_wait(10);
++		}
+ 	}
+ }
+ 
+@@ -1306,6 +1349,9 @@
+     "0560 camera flash: 1 strobe requests use the MT6360 STROBE mode, 0 they become torch pulses");
+ SYSCTL_PROC(_kern, OID_AUTO, n2torch_strobesel, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 5, n2t_sysctl_cfg, "I",
+     "0560 strobe current ceiling, ISTRB 0..116 (25 mA + 6.25 mA x n per channel), default 76 = 500 mA");
++SYSCTL_UINT(_kern, OID_AUTO, n2tpace, CTLFLAG_RW | CTLFLAG_LOCKED, &n2tp_on, 0, "0620 touch pacing: 0 old timing, 1 fast reads + fixed period");
++SYSCTL_UINT(_kern, OID_AUTO, n2tp_half_us, CTLFLAG_RW | CTLFLAG_LOCKED, &n2tp_half_us, 0, "0620: half-bit delay of the touch reads, 1..3 us (4 = old)");
++SYSCTL_UINT(_kern, OID_AUTO, n2tp_period_us, CTLFLAG_RW | CTLFLAG_LOCKED, &n2tp_period_us, 0, "0620: loop period while a finger is down, 4000..10000 us");
+ SYSCTL_PROC(_kern, OID_AUTO, n2torchstat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, n2t_sysctl_stat, "A",
+     "0496 torch state and counters");
+ 

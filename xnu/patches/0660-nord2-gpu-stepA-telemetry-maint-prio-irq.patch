@@ -1,0 +1,835 @@
+--- a/bsd/dev/nord2_gpu_transport.h
++++ b/bsd/dev/nord2_gpu_transport.h
+@@ -64,6 +64,19 @@
+         uint32_t reserved[2];
+ };
+ 
++/* 0661 ABI v4: up to 128 handles, 128-bit write/touch masks; flags bit 1 = precise, bit 2 = truncated (the producer had more buffers than
++ * it could list).  A kernel without 0661 refuses version 4 (kIOReturnBadArgument); the client then falls back to v3 / v2. */
++#define NORD2_GPU_TRANSPORT_VERSION4 4u
++#define NORD2_GPU_SUBMIT4_MAX 128u
++struct nord2_gpu_submit_request4 {
++        uint32_t version, kind;
++        uint64_t heads[2];
++        uint32_t nr_handles, flags;
++        uint32_t write_mask[4], touch_mask[4];
++        uint32_t handles[128];
++        uint32_t reserved[2];
++};
++
+ struct nord2_gpu_hwinfo {
+         uint32_t version;
+         uint32_t thread_max_threads, thread_max_workgroup_size, thread_max_barrier, thread_features, coherency_features;
+@@ -293,6 +306,7 @@
+         case NORD2_GPU_SEL_IMPORT_SURFACE: expected_ni = 4; expected_no = 3; break;
+         case NORD2_GPU_SEL_SUBMIT_JM:   /* 0632: v2, or v3 (nord2_gpu_submit_request3) */
+                 expected_si = si == sizeof(struct nord2_gpu_submit_request3) ? sizeof(struct nord2_gpu_submit_request3)
++                            : si == sizeof(struct nord2_gpu_submit_request4) ? sizeof(struct nord2_gpu_submit_request4)      /* 0661 */
+                                                                              : sizeof(struct nord2_gpu_submit_request);
+                 expected_no = 1; break;
+         case NORD2_GPU_SEL_SYNC: expected_ni = 2; break;
+--- a/bsd/dev/nord2_gpu_core.h
++++ b/bsd/dev/nord2_gpu_core.h
+@@ -54,7 +54,11 @@
+ #define N2C_HANDLE_SERIAL_MAX (0xffffffffu >> N2C_SLOT_BITS)
+ #define N2C_MAX_JOBS 128u       /* records across the device */
+ #define N2C_CTX_JOBS 96u        /* in-flight (not yet reaped) jobs per context */
+-#define N2C_JOB_BOS 32u
++/* 0661: 128 buffers per job (was 32: backboardd's lists did not fit, so every compositor job took whole-context maintenance and was never
++ * precise).  Masks are N2C_MASK_WORDS x 32 bits; n2c_submit keeps write_mask / touch_mask for bits 0..31 and *_hi[] for 32..127. */
++#define N2C_JOB_BOS 128u
++#define N2C_MASK_WORDS (N2C_JOB_BOS / 32u)
++static inline bool n2c_mask_bit(const uint32_t *m, unsigned i) { return (m[i >> 5] >> (i & 31u)) & 1u; }
+ #define N2C_MAX_TABLES 1024u    /* page tables per context (2 GiB of L3) */
+ #define N2C_QUARANTINE 64u
+ #define N2C_VA_BASE 0x0000001000000000ull
+@@ -169,6 +173,7 @@
+         /* CPU cache tracking (track_level >= 1).  A buffer the CPU can never touch needs
+          * one clean (the kernel's zero fill) and no maintenance after that. */
+         bool cpu_dirty;           /* CPU lines may be dirty: clean before the GPU reads */
++        uint32_t dirty_gen;       /* 0661: bumped whenever cpu_dirty is set (a clean done outside the lock is kept only if nothing set it meanwhile) */
+         bool cpu_visible;         /* the CPU can read/write it: user mapping handed out, or an imported surface */
+         bool explicit_track;      /* visible, but CPU access is bracketed by acquire/dirty calls (level 2) */
+         bool gpu_dirty;           /* tracked: GPU wrote it since the last acquire */
+@@ -202,7 +207,14 @@
+         uint32_t retained;        /* 0187: released buffers still held for older jobs */
+         uint32_t fault_status;
+         uint64_t fault_address;
+-};
++        /* 0660 telemetry: GPU time of the context's jobs since the last n2c_prof_take, queue wait sum / max, jobs */
++        uint64_t prof_run_us, prof_q_us;
++        uint32_t prof_q_max_us, prof_jobs;
++        uint8_t prio;             /* 0662: N2C_PRIO_* (set at open by the IOKit layer from the process name) */
++};
++#define N2C_PRIO_LOW 0u
++#define N2C_PRIO_NORMAL 1u
++#define N2C_PRIO_HIGH 2u
+ 
+ struct n2c_job {
+         uint64_t id;
+@@ -214,7 +226,7 @@
+         unsigned slot;            /* slot of the current phase */
+         struct n2c_bo *bos[N2C_JOB_BOS];
+         unsigned nr_bos;
+-        uint32_t write_mask;
++        uint32_t write_mask[N2C_MASK_WORDS];      /* 0661: 128 bits */
+         bool full_maint;          /* cache maintenance covers the whole context */
+         bool full_hard;           /* ... unconditionally (rollback valve or explicit flag), not just because the list was full */
+         /* Timing (us, n2c ops.now_us), set by submit / try_start / job_finish. */
+@@ -228,7 +240,9 @@
+         bool release_due;         /* 0400: terminal in this n2c_poll, references dropped after try_start */
+         bool in_next;             /* 0630: RUNNING but written to the slot's NEXT registers behind running[slot] (not started yet as far as we know) */
+         bool precise;             /* 0632: N2C_SUBMIT_PRECISE and a complete list (not full_maint) */
+-        uint32_t touch_mask;      /* 0632 */
++        uint32_t touch_mask[N2C_MASK_WORDS];      /* 0632 (0661: 128 bits) */
++        bool prep;                /* 0661: QUEUED but not startable yet: its CPU clean runs in the submitting thread outside the lock */
++        bool precleaned;          /* 0661: that clean is done; try_start does not clean again */
+         bool chain_flag;          /* 0630: JOB_CHAIN_FLAG it was started with (flag-targeted stops) */
+ };
+ 
+@@ -240,6 +254,8 @@
+         uint32_t write_mask;      /* bit i: GPU may write handles[i] */
+         uint32_t flags;           /* N2C_SUBMIT_* */
+         uint32_t touch_mask;      /* 0632, with N2C_SUBMIT_PRECISE: bit i = this chain accesses handles[i] (the others are listed for lifetime only) */
++        uint32_t write_mask_hi[N2C_MASK_WORDS - 1u];      /* 0661: bits 32..127 */
++        uint32_t touch_mask_hi[N2C_MASK_WORDS - 1u];
+ };
+ 
+ /* The handle list is only a hint: the chain may reach buffers that are not
+@@ -253,6 +269,9 @@
+  * FRAGMENT jobs of its context still run or wait, when no buffer one of them writes is touched by the other (kbase-style overlap of pass
+  * k+1's vertex/tiler with pass k's fragment). */
+ #define N2C_SUBMIT_PRECISE (1u << 1)
++/* 0661: the producer had more buffers than it could list: whole-context maintenance under the tracking rule (what a full list meant before),
++ * never precise.  The IOKit layer sets it for v2/v3 requests that carry the old maximum of 32 handles. */
++#define N2C_SUBMIT_TRUNCATED (1u << 2)
+ 
+ /* Job timing aggregated over a window; read and reset with n2c_timing_take().
+  * queue = submit -> first phase start (includes the pre-job clean),
+@@ -332,7 +351,18 @@
+          * moved up at a completion; taken back (failure of the chain ahead, MMU kill, close); flag-targeted stops; completions that found
+          * fewer chains done than expected (kbase 'spurious'); handoffs at zero cost (the successor was already in NEXT). */
+         uint32_t nx_same, nx_cross, nx_promoted, nx_evicted, nx_stops, nx_spurious, nx_two;
+-        uint32_t ov_starts, ov_blocked, precise_jobs;   /* 0632: jobs started past older fragment jobs; precise jobs held by a conflict; precise submits */
++        uint32_t ov_starts, ov_blocked, precise_jobs;
++        uint32_t pr_evicted, pr_aged, pr_reserved;     /* 0662: lower-class NEXT chains taken back for a high one; jobs promoted by age; submits refused to keep the reserve */   /* 0632: jobs started past older fragment jobs; precise jobs held by a conflict; precise submits */
++};
++
++/* 0660 telemetry (kept outside n2c_core so C++ sees the same name) */
++struct n2c_prof {
++        uint64_t clean_pages[6];          /* by reason: N2C_CR_* */
++        uint32_t clean_max_pages;         /* biggest single buffer cleaned */
++        uint64_t inval_pages;
++        uint32_t hist[2][7];              /* run time per slot 0/1: <100 <250 <500 <1000 <4000 <16000 >=16000 us */
++        uint64_t preclean_us;             /* time spent cleaning outside the lock */
++        uint32_t full_jobs, truncated_jobs, precise_jobs, jobs;
+ };
+ 
+ struct n2c_core {
+@@ -350,6 +380,10 @@
+         bool jsnext;              /* 0630: write a second chain to NEXT while one runs (kill switch: false = one chain per slot, the old path) */
+         bool jsnext_rb;           /* 0630: completions are read the two-chain way (set with jsnext before the first job; stays on if jsnext is cleared later) */
+         bool pipe;                /* 0632: precise jobs may overtake older non-conflicting fragment jobs of their context (kill switch: false) */
++        bool preclean;            /* 0661: CPU cleans of listed buffers run at submit in the submitting thread, outside the lock (kill switch: false) */
++        bool prio_on;             /* 0662: compositor-first pick, NEXT take-back, job-record reserve (kill switch: false) */
++        /* 0660 telemetry, read and cleared by n2c_prof_take every 2 s */
++        struct n2c_prof prof;
+         struct n2c_bo *quarantine[N2C_QUARANTINE];
+         unsigned nr_quarantine;
+         uint32_t next_handle;
+@@ -445,6 +479,21 @@
+ /* 0630: JS NEXT pipelining.  Before the first job: on/off for good (off = the pre-0630 code paths bit for bit).  Later: only stops or
+  * resumes writing new chains to NEXT (completions keep the two-chain reading). */
+ bool n2c_set_jsnext(struct n2c_core *c, bool on);
++/* 0660: clean reasons */
++enum { N2C_CR_FULLHARD = 0, N2C_CR_LEGACY, N2C_CR_IMPLICIT, N2C_CR_DIRTY, N2C_CR_FULL, N2C_CR_PRESUBMIT };
++void n2c_prof_take(struct n2c_core *c, struct n2c_prof *out);
++/* 0661: two-phase submit.  When n2c_submit returns a job with j->prep set, the caller (holding the lock) calls n2c_prep_begin, drops the lock,
++ * runs n2c_prep_run (pure CPU cache cleans of buffers the job holds references on), takes the lock again and calls n2c_prep_commit.  The job is
++ * not startable in between; nothing else frees or cancels it (an MMU fault leaves it to the commit). */
++#define N2C_PREP_MAX N2C_JOB_BOS
++struct n2c_prep { unsigned n; struct n2c_bo *bo[N2C_PREP_MAX]; uint32_t gen[N2C_PREP_MAX]; uint8_t reason[N2C_PREP_MAX]; uint64_t pages, us; };
++bool n2c_prep_begin(struct n2c_core *c, unsigned idx, uint64_t id, struct n2c_prep *p);
++void n2c_prep_run(struct n2c_core *c, struct n2c_prep *p);
++void n2c_prep_commit(struct n2c_core *c, unsigned idx, uint64_t id, struct n2c_prep *p);
++/* 0662 */
++bool n2c_ctx_set_prio(struct n2c_core *c, unsigned idx, unsigned prio);
++#define N2C_AGE_HIGH_US 50000u    /* a job waiting longer than this is picked like a compositor job */
++#define N2C_RESERVE_HIGH 16u      /* job records kept free for the compositor */
+ /* 0630: one slot's completion read the kbase_job_done way (nord2_gpu_core.c n2hw_job_irq_rb). */
+ struct n2hw_job_event_rb {
+         unsigned slot;
+--- a/bsd/dev/nord2_gpu_core.c
++++ b/bsd/dev/nord2_gpu_core.c
+@@ -660,9 +660,12 @@
+                                 struct n2c_bo *b = j->bos[i];
+                                 if (!(b->flags & N2C_BO_GPU_WRITE))
+                                         continue;
+-                                if (j->precise && !((j->touch_mask >> i) & 1u))
++                                if (j->precise && !n2c_mask_bit(j->touch_mask, i))
+                                         continue;       /* 0632: this chain never accessed it */
+-                                if (c->wmask_inval && j->write_mask && !((j->write_mask >> i) & 1u)) {
++                                bool any_w = false;
++                                for (unsigned w = 0; w < N2C_MASK_WORDS; w++)
++                                        any_w |= j->write_mask[w] != 0;
++                                if (c->wmask_inval && any_w && !n2c_mask_bit(j->write_mask, i)) {
+                                         /* The job declared what it writes and this buffer is not in it: no CPU line of it can be stale because of this job. */
+                                         c->stats.cache_skip_wmask_pages += b->nr_pages;
+                                         continue;
+@@ -690,6 +693,23 @@
+         } else if (state == N2C_JOB_CANCELLED) {
+                 c->stats.cancelled++;
+         }
++        /* 0660: per-context GPU time and queue wait, run-time histogram per slot, invalidated pages */
++        if ((state == N2C_JOB_DONE || state == N2C_JOB_FAULTED) && j->t_started && j->ctx < N2C_MAX_CTX) {
++                uint64_t end = j->t_end_us ? j->t_end_us : n2c_now_us(c);
++                uint64_t run = end >= j->t_start_us ? end - j->t_start_us : 0, q = j->t_start_us >= j->t_submit_us ? j->t_start_us - j->t_submit_us : 0;
++                struct n2c_ctx *px = &c->ctxs[j->ctx];
++                px->prof_run_us += run;
++                px->prof_q_us += q;
++                px->prof_jobs++;
++                if (q > px->prof_q_max_us)
++                        px->prof_q_max_us = (uint32_t)(q > 0xffffffffull ? 0xffffffffull : q);
++                static const uint32_t lim[6] = { 100, 250, 500, 1000, 4000, 16000 };
++                unsigned bk = 0;
++                while (bk < 6 && run >= lim[bk])
++                        bk++;
++                c->prof.hist[j->slot == 0 ? 0 : 1][bk]++;
++                c->prof.inval_pages += j->inval_pages;
++        }
+         /* 0400: a completion seen by handle_job_irqs keeps its references until n2c_poll started the next job (job_release_due);
+          * every other caller (MMU fault, reset, close, start failure) releases at once as before. */
+         if (c->lat_in_irq && c->lat_release_late) {
+@@ -1091,6 +1111,7 @@
+         b->refs = 1;
+         b->handle_live = true;
+         b->cpu_dirty = true;                        /* the kernel zero fill / initial CPU writes */
++        b->dirty_gen++;
+         b->cpu_visible = (flags & N2C_BO_IMPORTED) != 0;
+         b->state = N2C_BO_MAPPED;
+         b->mapped_size = (uint64_t)mapped * NORD2_GPU_PAGE_SIZE;
+@@ -1212,6 +1233,7 @@
+                 return N2C_OK;
+         b->cpu_visible = true;
+         b->cpu_dirty = true;                        /* the CPU may write at any time from now on */
++        b->dirty_gen++;
+         if (b->gpu_written && !(b->flags & N2C_BO_CPU_UNCACHED)) {
+                 /* A speculative fill of the kernel alias could have cached pre-GPU contents while the
+                  * buffer was invisible; drop it once before the CPU can look. */
+@@ -1239,6 +1261,7 @@
+         if (!b)
+                 return e;
+         b->cpu_dirty = true;
++        b->dirty_gen++;
+         return N2C_OK;
+ }
+ 
+@@ -1292,9 +1315,17 @@
+             (!x->as_live && !as_dynamic_ctx(c, idx)) || c->reset_pending)
+                 return N2C_E_STATE;     /* 0500: a dynamic client gets its AS in try_start */
+         if (!r || !id_out || !r->nr_handles || r->nr_handles > N2C_JOB_BOS ||
+-            (r->flags & ~(N2C_SUBMIT_FULL_MAINT | N2C_SUBMIT_PRECISE)) ||
+-            (r->nr_handles < 32 && (r->write_mask >> r->nr_handles)))
++            (r->flags & ~(N2C_SUBMIT_FULL_MAINT | N2C_SUBMIT_PRECISE | N2C_SUBMIT_TRUNCATED)))
+                 return N2C_E_ARGS;
++        /* 0661: 128-bit masks (bits 0..31 in write_mask / touch_mask, the rest in *_hi) */
++        uint32_t wm[N2C_MASK_WORDS] = { r->write_mask }, tm[N2C_MASK_WORDS] = { r->touch_mask };
++        for (unsigned w = 1; w < N2C_MASK_WORDS; w++) {
++                wm[w] = r->write_mask_hi[w - 1];
++                tm[w] = r->touch_mask_hi[w - 1];
++        }
++        for (unsigned i = r->nr_handles; i < N2C_JOB_BOS; i++)
++                if (n2c_mask_bit(wm, i))
++                        return N2C_E_ARGS;
+         bool need0 = r->kind == N2C_JOB_COMPUTE || r->kind == N2C_JOB_RENDER;
+         bool need1 = r->kind == N2C_JOB_RENDER || r->kind == N2C_JOB_FRAGMENT;
+         if (!need0 && !need1)
+@@ -1309,7 +1340,7 @@
+                 for (unsigned k = 0; k < i; k++)
+                         if (bos[k] == bos[i])
+                                 return N2C_E_ARGS;
+-                if ((r->write_mask & (1u << i)) &&
++                if (n2c_mask_bit(wm, i) &&
+                     !(bos[i]->flags & N2C_BO_GPU_WRITE))
+                         return N2C_E_ARGS;
+         }
+@@ -1318,6 +1349,15 @@
+                 return N2C_E_RANGE;
+         if (x->jobs >= N2C_CTX_JOBS)
+                 return N2C_E_BUSY; /* per-context in-flight window */
++        if (c->prio_on && x->prio < N2C_PRIO_HIGH) {      /* 0662: keep N2C_RESERVE_HIGH records for the compositor */
++                unsigned free_records = 0;
++                for (unsigned i = 0; i < N2C_MAX_JOBS; i++)
++                        free_records += c->jobs[i].state == N2C_JOB_FREE;
++                if (free_records <= N2C_RESERVE_HIGH) {
++                        c->lat.pr_reserved++;
++                        return N2C_E_BUSY;
++                }
++        }
+         struct n2c_job *j = NULL;
+         for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
+                 if (c->jobs[i].state == N2C_JOB_FREE) {
+@@ -1337,21 +1377,31 @@
+         j->heads[1] = r->heads[1];
+         j->phase = need0 ? 0 : 1;
+         j->nr_bos = r->nr_handles;
+-        j->write_mask = r->write_mask;
++        for (unsigned w = 0; w < N2C_MASK_WORDS; w++)
++                j->write_mask[w] = wm[w];
+         j->t_submit_us = n2c_now_us(c);
+         j->full_hard = c->full_cache_maint || (r->flags & N2C_SUBMIT_FULL_MAINT);
+-        j->full_maint = j->full_hard || r->nr_handles >= N2C_JOB_BOS;
++        j->full_maint = j->full_hard || r->nr_handles >= N2C_JOB_BOS || (r->flags & N2C_SUBMIT_TRUNCATED);
+         /* 0632: a declared access set; the chain's own head buffer always counts as touched */
+         j->precise = (r->flags & N2C_SUBMIT_PRECISE) && !j->full_maint;
+         if (j->precise) {
+-                uint32_t all = r->nr_handles >= 32 ? 0xffffffffu : ((1u << r->nr_handles) - 1u);
+-                j->touch_mask = (r->touch_mask | r->write_mask) & all;
++                for (unsigned i = 0; i < r->nr_handles; i++)
++                        if (n2c_mask_bit(tm, i) || n2c_mask_bit(wm, i))
++                                j->touch_mask[i >> 5] |= 1u << (i & 31u);
+                 uint64_t head = r->heads[need0 ? 0 : 1];
+                 for (unsigned i = 0; i < r->nr_handles; i++)
+                         if (head >= bos[i]->va && head - bos[i]->va < bos[i]->size)
+-                                j->touch_mask |= 1u << i;
++                                j->touch_mask[i >> 5] |= 1u << (i & 31u);
+                 c->lat.precise_jobs++;
++                c->prof.precise_jobs++;
+         }
++        c->prof.jobs++;
++        if (j->full_maint)
++                c->prof.full_jobs++;
++        if (r->flags & N2C_SUBMIT_TRUNCATED)
++                c->prof.truncated_jobs++;
++        /* 0661: the CPU clean of a listed (not whole-context) job runs in the submitting thread, outside the lock (n2c_prep_*) */
++        j->prep = c->preclean && !j->full_maint && (need0 || r->kind == N2C_JOB_FRAGMENT);
+         for (unsigned i = 0; i < r->nr_handles; i++) {
+                 struct n2c_bo *b = bos[i];
+                 j->bos[i] = b;
+@@ -1522,13 +1572,13 @@
+ static bool jobs_conflict(const struct n2c_job *a, const struct n2c_job *b)
+ {
+         for (unsigned i = 0; i < a->nr_bos; i++) {
+-                if (!((a->touch_mask >> i) & 1u))
++                if (!n2c_mask_bit(a->touch_mask, i))
+                         continue;
+-                bool aw = (a->write_mask >> i) & 1u;
++                bool aw = n2c_mask_bit(a->write_mask, i);
+                 for (unsigned k = 0; k < b->nr_bos; k++) {
+-                        if (b->bos[k] != a->bos[i] || !((b->touch_mask >> k) & 1u))
++                        if (b->bos[k] != a->bos[i] || !n2c_mask_bit(b->touch_mask, k))
+                                 continue;
+-                        if (aw || ((b->write_mask >> k) & 1u))
++                        if (aw || n2c_mask_bit(b->write_mask, k))
+                                 return true;
+                 }
+         }
+@@ -1559,11 +1609,43 @@
+         return n > 0;
+ }
+ 
++static struct n2c_job *job_by_id(struct n2c_core *c, uint64_t id);
++
++/* 0662: pick class: the context's priority, a job waiting longer than N2C_AGE_HIGH_US counts as high (no starvation) */
++static unsigned pick_class(const struct n2c_core *c, const struct n2c_job *j, uint64_t now)
++{
++        if (!c->prio_on)
++                return 0;
++        if (now >= j->t_submit_us && now - j->t_submit_us >= N2C_AGE_HIGH_US)
++                return N2C_PRIO_HIGH;
++        return c->ctxs[j->ctx].prio;
++}
++
++/* 0660: why a buffer is cleaned before a listed job (-1 = it is not) */
++static int clean_reason(const struct n2c_core *c, const struct n2c_bo *b)
++{
++        if (c->track_level == N2C_TRACK_LEGACY)
++                return N2C_CR_LEGACY;
++        if (!b->cpu_dirty)
++                return -1;
++        return (b->cpu_visible && !b->explicit_track) ? N2C_CR_IMPLICIT : N2C_CR_DIRTY;
++}
++
++static void prof_clean(struct n2c_core *c, const struct n2c_bo *b, int reason)
++{
++        if (reason < 0 || (b->flags & N2C_BO_CPU_UNCACHED))
++                return;
++        c->prof.clean_pages[reason] += b->nr_pages;
++        if (b->nr_pages > c->prof.clean_max_pages)
++                c->prof.clean_max_pages = b->nr_pages;
++}
++
+ static void try_start(struct n2c_core *c)
+ {
+         if (c->state != N2C_CORE_READY || c->reset_pending || c->hold_start)
+                 return;
+         bool nobind[N2C_MAX_CTX] = { false };   /* 0500: contexts that found no AS in this call */
++        unsigned evictions = 0;                 /* 0662: NEXT take-backs in this call (bounded) */
+         for (;;) {
+                 /* Oldest queued job whose context has nothing older still
+                  * pending (per-context submission order across slots). */
+@@ -1583,9 +1665,12 @@
+                                 second[o->ctx] = o->id;
+                         }
+                 }
+-                for (unsigned i = 0; i < N2C_MAX_JOBS; i++) {
++                uint64_t tnow = c->prio_on ? n2c_now_us(c) : 0;
++                unsigned pick_cls = 0;
++                bool evicted = false;
++                for (unsigned i = 0; i < N2C_MAX_JOBS && !evicted; i++) {
+                         struct n2c_job *j = &c->jobs[i];
+-                        if (j->state != N2C_JOB_QUEUED)
++                        if (j->state != N2C_JOB_QUEUED || j->prep)       /* 0661: a job in prep waits for its commit */
+                                 continue;
+                         /* Blocked unless it is the oldest unfinished job of its context (0632: or may overtake older fragment jobs). */
+                         bool overtake = false;
+@@ -1603,6 +1688,31 @@
+                                 blocked = true;
+                         unsigned slot = phase_slot(c, j);
+                         bool to_next = false;
++                        unsigned cls = pick_class(c, j, tnow);
++                        /* 0662: a waiting higher-class job takes back a not-yet-started lower-class chain of another context from NEXT */
++                        if (c->prio_on && c->jsnext && !blocked && ctx_ok && evictions < 2 && j->kind != N2C_JOB_RENDER && c->running[slot] && c->next[slot]) {
++                                struct n2c_job *q = job_by_id(c, c->next[slot]);
++                                const struct n2c_job *f = job_by_id_c(c, c->running[slot]);
++                                uint64_t head = 0;
++                                /* only when j can take the NEXT registers right after (else q would go back there and be taken again) */
++                                if (f && f->state == N2C_JOB_RUNNING && !f->in_next && f->kind != N2C_JOB_RENDER &&
++                                    q && q->in_next && q->state == N2C_JOB_RUNNING && q->ctx != j->ctx && pick_class(c, q, tnow) < cls &&
++                                    n2hw_js_evict_next(c->hw, slot, &head)) {
++                                        c->next[slot] = 0;
++                                        q->in_next = false;
++                                        q->state = N2C_JOB_QUEUED;
++                                        c->lat.pr_evicted++;
++                                        c->lat.nx_evicted++;
++                                        if (head != q->heads[q->phase]) {
++                                                c->reset_pending = true;
++                                                note(c, "Nord2 GPU core: NEXT eviction returned an unknown chain; reset");
++                                                return;
++                                        }
++                                        evicted = true;         /* pick again with the slot's NEXT free */
++                                        evictions++;
++                                        continue;
++                                }
++                        }
+                         if (c->running[slot]) {
+                                 /* 0630: the slot runs a chain; this one may wait in its NEXT registers when the hardware order is enough:
+                                  * (cross) it is the oldest unfinished job of its context and the running chain belongs to another one, or
+@@ -1619,14 +1729,19 @@
+                                 }
+                                 blocked = !to_next;
+                         }
+-                        if (!blocked && (!pick || j->id < pick->id)) {
++                        if (!blocked && (!pick || cls > pick_cls || (cls == pick_cls && j->id < pick->id))) {
+                                 pick = j;
++                                pick_cls = cls;
+                                 pick_next = to_next;
+                                 pick_ov = overtake;
+                         }
+                 }
++                if (evicted)
++                        continue;
+                 if (!pick)
+                         return;
++                if (c->prio_on && pick_cls == N2C_PRIO_HIGH && c->ctxs[pick->ctx].prio < N2C_PRIO_HIGH)
++                        c->lat.pr_aged++;
+                 if (!c->ctxs[pick->ctx].as_live) {
+                         if (!as_bind(c, pick->ctx)) {
+                                 if (c->reset_pending)
+@@ -1645,7 +1760,7 @@
+                  * context. */
+                 uint64_t t_clean = n2c_now_us(c);
+                 uint64_t clean_before = c->stats.cache_clean_pages;
+-                if (pick->phase == 0 || pick->kind == N2C_JOB_FRAGMENT) {
++                if ((pick->phase == 0 || pick->kind == N2C_JOB_FRAGMENT) && !pick->precleaned) {      /* 0661: precleaned at submit */
+                         if (pick->full_maint) {
+                                 c->stats.cache_full_jobs++;
+                                 for (unsigned i = 0; i < N2C_MAX_BOS; i++) {
+@@ -1655,6 +1770,7 @@
+                                         /* A list that was only too long (not the rollback valve) covers the whole context under the same
+                                          * tracking rule as a listed buffer: a buffer the CPU never mapped is clean after its first sync. */
+                                         if (pick->full_hard || c->track_level == N2C_TRACK_LEGACY || b->cpu_dirty) {
++                                                prof_clean(c, b, pick->full_hard ? N2C_CR_FULLHARD : N2C_CR_FULL);
+                                                 bo_cache_sync(c, b, true);
+                                                 b->cpu_dirty = b->cpu_visible && !b->explicit_track;
+                                         } else if (!(b->flags & N2C_BO_CPU_UNCACHED)) {
+@@ -1666,9 +1782,10 @@
+                                         struct n2c_bo *b = pick->bos[i];
+                                         if (b->state != N2C_BO_MAPPED)
+                                                 continue;
+-                                        if (pick->precise && !((pick->touch_mask >> i) & 1u))
++                                        if (pick->precise && !n2c_mask_bit(pick->touch_mask, i))
+                                                 continue;       /* 0632: listed for lifetime only; the chain that touches it cleans it */
+                                         if (c->track_level == N2C_TRACK_LEGACY || b->cpu_dirty) {
++                                                prof_clean(c, b, clean_reason(c, b));
+                                                 bo_cache_sync(c, b, true);
+                                                 b->cpu_dirty = b->cpu_visible && !b->explicit_track;
+                                         } else if (!(b->flags & N2C_BO_CPU_UNCACHED)) {
+@@ -1912,7 +2029,7 @@
+                         struct n2c_job *j = &c->jobs[k];
+                         if (j->ctx == idx && j->state == N2C_JOB_RUNNING)
+                                 stop_job(c, j);
+-                        if (j->ctx == idx && j->state == N2C_JOB_QUEUED)
++                        if (j->ctx == idx && j->state == N2C_JOB_QUEUED && !j->prep)      /* 0661: a job in prep is cancelled by its commit */
+                                 job_finish(c, j, N2C_JOB_CANCELLED);
+                 }
+                 if (x->as_live) {
+@@ -2142,3 +2259,98 @@
+         }
+         return "unknown";
+ }
++
++/* ------------------------------------------------------------------ */
++/* 0660 telemetry, 0661 two-phase submit clean, 0662 priorities        */
++
++void n2c_prof_take(struct n2c_core *c, struct n2c_prof *out)
++{
++        if (!c || !out)
++                return;
++        *out = c->prof;
++        memset(&c->prof, 0, sizeof(c->prof));
++}
++
++bool n2c_ctx_set_prio(struct n2c_core *c, unsigned idx, unsigned prio)
++{
++        struct n2c_ctx *x = c ? ctx_at(c, idx) : NULL;
++        if (!x || prio > N2C_PRIO_HIGH)
++                return false;
++        x->prio = (uint8_t)prio;
++        return true;
++}
++
++/* Under the lock: the buffers job id will clean (the same rule as try_start's listed path), their dirty generations; false = nothing to do
++ * (the job is then committed at once by the caller). */
++bool n2c_prep_begin(struct n2c_core *c, unsigned idx, uint64_t id, struct n2c_prep *p)
++{
++        if (!c || !p)
++                return false;
++        p->n = 0;
++        p->pages = 0;
++        p->us = 0;
++        struct n2c_job *j = job_by_id(c, id);
++        if (!j || j->ctx != idx || !j->prep || j->state != N2C_JOB_QUEUED)
++                return false;
++        for (unsigned i = 0; i < j->nr_bos && p->n < N2C_PREP_MAX; i++) {
++                struct n2c_bo *b = j->bos[i];
++                if (b->state != N2C_BO_MAPPED || (b->flags & N2C_BO_CPU_UNCACHED))
++                        continue;
++                if (j->precise && !n2c_mask_bit(j->touch_mask, i))
++                        continue;
++                int r = clean_reason(c, b);
++                if (r < 0) {
++                        c->stats.cache_skip_clean_pages += b->nr_pages;
++                        continue;
++                }
++                p->bo[p->n] = b;
++                p->gen[p->n] = b->dirty_gen;
++                p->reason[p->n] = (uint8_t)r;
++                p->n++;
++                p->pages += b->nr_pages;
++        }
++        return p->n != 0;
++}
++
++/* Without the lock: pure CPU cache maintenance of pages the job holds references on (nothing frees them before the commit). */
++void n2c_prep_run(struct n2c_core *c, struct n2c_prep *p)
++{
++        uint64_t t0 = n2c_now_us(c);
++        for (unsigned k = 0; k < p->n; k++) {
++                struct n2c_bo *b = p->bo[k];
++                for (unsigned pg = 0; pg < b->nr_pages; pg++)
++                        c->ops.sync(c->ctx, b->pages[pg].pa, b->pages[pg].cpu, NORD2_GPU_PAGE_SIZE, true);
++        }
++        p->us = n2c_now_us(c) - t0;
++}
++
++/* Under the lock again: a buffer marked dirty meanwhile (its generation moved) keeps its mark and the job cleans in try_start as before;
++ * otherwise the tracking rule of try_start applies and the job starts without a second clean.  A context that faulted or closed meanwhile:
++ * the job is cancelled here. */
++void n2c_prep_commit(struct n2c_core *c, unsigned idx, uint64_t id, struct n2c_prep *p)
++{
++        struct n2c_job *j = c ? job_by_id(c, id) : NULL;
++        if (!j || j->ctx != idx || !j->prep)
++                return;
++        bool all = true;
++        for (unsigned k = 0; k < p->n; k++) {
++                struct n2c_bo *b = p->bo[k];
++                if (b->dirty_gen != p->gen[k]) {
++                        all = false;
++                        continue;
++                }
++                prof_clean(c, b, N2C_CR_PRESUBMIT);
++                c->stats.cache_clean_pages += b->nr_pages;
++                b->cpu_dirty = b->cpu_visible && !b->explicit_track;
++        }
++        j->clean_pages += (uint32_t)p->pages;
++        j->clean_us += (uint32_t)p->us;
++        c->prof.preclean_us += p->us;
++        j->prep = false;
++        j->precleaned = all;
++        if (c->ctxs[idx].state != N2C_CTX_OPEN && j->state == N2C_JOB_QUEUED) {
++                job_finish(c, j, N2C_JOB_CANCELLED);
++                return;
++        }
++        n2c_poll(c);
++}
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -31,7 +31,23 @@
+ #include "sweet_surface_use.h" /* 0398: GPU use-count holds by job */
+ #include <sys/sysctl.h>        /* 0400: kern.n2gpu_lat */
+ #include <kern/thread_call.h>   /* 0400: buffer owners released off the GPU lock */
+-extern "C" kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);   /* 0400: osfmk/kern/thread.c (MACH_KERNEL_PRIVATE header) */
++extern "C" kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);
++/* 0663: move the GPU interrupt and the bottom half to the big cluster (osfmk sched_prim / machine routines, used the same way by nord2_cpufreq.c) */
++extern "C" processor_t cpu_to_processor(int cpu);
++extern "C" processor_t thread_bind(processor_t processor);
++extern "C" int cpu_number(void);
++#define N2_IRQ_CPU 4      /* first core of the A78 cluster cpu4-6 (nord2_cpufreq.c: cluster "l"; cpu7 is the prime core 0642 gives to app threads) */
++#define N2_BH_CPU 5
++static bool n2_bind_cpu(int cpu) {      /* bind the calling thread to cpu and move there; false = not possible (left unbound) */
++        processor_t p = cpu_to_processor(cpu);
++        if (p == PROCESSOR_NULL) return false;
++        (void)thread_bind(p);
++        (void)thread_block(THREAD_CONTINUE_NULL);
++        if (cpu_number() == cpu) return true;
++        (void)thread_bind(PROCESSOR_NULL);
++        (void)thread_block(THREAD_CONTINUE_NULL);
++        return false;
++}   /* 0400: osfmk/kern/thread.c (MACH_KERNEL_PRIVATE header) */
+ /* 0441 (gfxheap-20261113): the 0440 graphics heap (SweetSurface.cpp, sweet_gfx_heap_kern.inc): GPU-only buffers >= 64 KiB (ALLOC flags == 2) out of
+  * the low-bank heap instead of XNU pages, and imports of heap surfaces.  Heap buffers are left out of the global private total (privateTotal, so out of
+  * the 0417/0418 GPU budget too); the per-context limits still count them.  kern.n2heap_gpu = 0 (or kern.n2heap = 0) turns the placement off. */
+@@ -197,6 +213,19 @@
+ /* 0632: precise jobs (ABI v3 from the gpupipe1 userland) may overtake older non-conflicting fragment jobs of their context.  Kill switch:
+  * boot-arg n2gp=0 or n2gdv +32768 (v3 still accepted, the flags ignored: every job serial again); sysctl kern.n2gpipe=0 at run time. */
+ static int gPipe = 1, gPipeApplied = 1, gPipeAbi = 1;
++/* 0660..0663 (step A of GPU_PERF_ANALYSIS.md).  The n2gdv bits are spent: each piece has a short boot-arg (default on) and a sysctl.
++ *   kern.n2gpreclean / n2gpc=0   0661: CPU cleans of listed buffers in the submitting thread outside the GPU lock (0 = in the bottom half, as before)
++ *   kern.n2gv4 / n2gv4=0         0661: ABI v4 (128 handles) refused -> clients fall back to v3/v2 (lists of 32 = truncated)
++ *   kern.n2gprio / n2gpr=0       0662: compositor-first pick, NEXT take-back, 16 job records reserved for backboardd (0 = FIFO by job id)
++ *   n2girq=0                     0663: GPU interrupt and bottom half stay where they were (no move to the big cluster; boot only) */
++static int gPreclean = 1, gPrecleanApplied = 1, gV4 = 1, gPrio = 1, gPrioApplied = 1, gIrqBig = 1;
++SYSCTL_INT(_kern, OID_AUTO, n2gpreclean, CTLFLAG_RW | CTLFLAG_LOCKED, &gPreclean, 0, "0661: CPU cleans at submit outside the GPU lock");
++SYSCTL_INT(_kern, OID_AUTO, n2gv4, CTLFLAG_RW | CTLFLAG_LOCKED, &gV4, 0, "0661: accept GPU submit ABI v4 (128 buffers)");
++SYSCTL_INT(_kern, OID_AUTO, n2gprio, CTLFLAG_RW | CTLFLAG_LOCKED, &gPrio, 0, "0662: compositor-first GPU scheduling");
++static char gCtxName[N2C_MAX_CTX][17];      /* 0660: process name / pid of each context (set at open) */
++static int gCtxPid[N2C_MAX_CTX];
++static uint64_t gLockWaitSumUs, gLockHoldSumUs, gBhWaitSumUs, gBhWaitN, gBhPollSumUs;      /* 0660 */
++static int gIrqCpu = -1, gBhCpu = -1;       /* 0663 */
+ SYSCTL_INT(_kern, OID_AUTO, n2gpipe, CTLFLAG_RW | CTLFLAG_LOCKED, &gPipe, 0, "0632: precise GPU jobs may overlap older fragment jobs of their context (1 on, 0 off)");
+ SYSCTL_INT(_kern, OID_AUTO, n2gjsnext, CTLFLAG_RW | CTLFLAG_LOCKED, &gJsNext, 0, "0630: GPU JS NEXT pipelining (1 on, 0 no new NEXT writes)");
+ SYSCTL_INT(_kern, OID_AUTO, n2gpu_lat, CTLFLAG_RW | CTLFLAG_LOCKED, &gLatMode, 0, "0400: GPU latency changes off-mask: 1 BH thread, 2 late release, 4 zero skip, 8 deferred owner free");
+@@ -285,7 +314,7 @@
+ }
+ static bool fence_writes(void *ctx, unsigned i, uint32_t sid) {
+         const struct n2c_job *j = &((struct n2c_core *)ctx)->jobs[i];
+-        for (unsigned k = 0; k < j->nr_bos && k < N2C_JOB_BOS; k++) if (((j->write_mask >> k) & 1u) && fence_sid(j->bos[k]) == sid) return true;
++        for (unsigned k = 0; k < j->nr_bos && k < N2C_JOB_BOS; k++) if (n2c_mask_bit(j->write_mask, k) && fence_sid(j->bos[k]) == sid) return true;
+         return false;
+ }
+ static struct n2gf_jobs fence_jobs(struct n2c_core *c) { struct n2gf_jobs v = { c, N2C_MAX_JOBS, fence_unfinished, fence_writes }; return v; }
+@@ -328,7 +357,7 @@
+ static void fence_record(struct n2c_core *c, unsigned ctx, const struct n2c_submit *sub, uint64_t id) {
+         struct n2gf_jobs v = fence_jobs(c);
+         for (unsigned k = 0; k < sub->nr_handles && k < N2C_JOB_BOS; k++)
+-                if ((sub->write_mask >> k) & 1u) n2gf_record(&gFence, &v, c->next_job_id, fence_sid(n2c_bo_lookup(c, ctx, sub->handles[k])), id);
++                if (k < 32 ? ((sub->write_mask >> k) & 1u) : ((sub->write_mask_hi[(k >> 5) - 1] >> (k & 31u)) & 1u)) n2gf_record(&gFence, &v, c->next_job_id, fence_sid(n2c_bo_lookup(c, ctx, sub->handles[k])), id);
+         usehold_record(c, ctx, sub, id);        /* 0398 */
+ }
+ static bool alloc_host(void *, size_t bytes, void **p) {
+@@ -372,6 +401,11 @@
+         { int gp = 1, gm = 0; if (!PE_parse_boot_argn("n2gp", &gp, sizeof(gp)) && PE_parse_boot_argn("n2gdv", &gm, sizeof(gm)) && (gm & 32768)) gp = 0;
+           c->pipe = gp != 0; gPipeAbi = gp != 0; gPipe = gPipeApplied = gp != 0;
+           IOLog("NORD2 GPU PIPE: %s (pass overlap for precise ABI-v3 jobs; kill switch n2gp=0 or n2gdv+32768; sysctl kern.n2gpipe)\n", c->pipe ? "on" : "off"); }
++        { int v = 1; if (PE_parse_boot_argn("n2gpc", &v, sizeof(v))) gPreclean = v != 0; c->preclean = gPreclean != 0; gPrecleanApplied = gPreclean;
++          v = 1; if (PE_parse_boot_argn("n2gv4", &v, sizeof(v))) gV4 = v != 0;
++          v = 1; if (PE_parse_boot_argn("n2gpr", &v, sizeof(v))) gPrio = v != 0; c->prio_on = gPrio != 0; gPrioApplied = gPrio;
++          v = 1; if (PE_parse_boot_argn("n2girq", &v, sizeof(v))) gIrqBig = v != 0;
++          IOLog("NORD2 GPUPROF: step A on: preclean=%d abi_v4=%d prio=%d irq_big=%d (boot-args n2gpc/n2gv4/n2gpr/n2girq =0 to switch off)\n", gPreclean, gV4, gPrio, gIrqBig); }
+         IOLog("NORD2 GPU: cache maintenance %s, CPU-access tracking level %d, invalidate scope %s, surface reservations %s\n", c->full_cache_maint ? "whole-context (boot-arg)" : "per-job buffer list", tr,
+               c->wmask_inval ? "declared writes (write_mask)" : "every listed GPU_WRITE buffer", rs ? "on" : "off");
+         return true;
+@@ -665,6 +699,7 @@
+ }
+ static void bh_main(void *p, wait_result_t) {
+         Nord2GPU *d = (Nord2GPU *)p;
++        if (gIrqBig && n2_bind_cpu(N2_BH_CPU)) gBhCpu = N2_BH_CPU;      /* 0663: the bottom half next to the interrupt, on the big cluster */
+         for (;;) {
+                 assert_wait((event_t)&gBhPending, THREAD_UNINT);
+                 if (__atomic_load_n(&gBhPending, __ATOMIC_ACQUIRE) || gBhExit) clear_wait(current_thread(), THREAD_AWAKENED);
+@@ -685,6 +720,8 @@
+                 IOLockUnlock(d->lock);
+                 if (kick && t0 >= kick && t0 - kick > gBhWaitMaxUs) gBhWaitMaxUs = (uint32_t)(t0 - kick);
+                 if (t2 - t1 > gBhPollMaxUs) gBhPollMaxUs = (uint32_t)(t2 - t1);
++                if (kick && t0 >= kick) { gBhWaitSumUs += t0 - kick; gBhWaitN++; }      /* 0660 */
++                gBhPollSumUs += t2 - t1;
+         }
+         d->release();
+         thread_terminate(current_thread());
+@@ -720,6 +757,39 @@
+                 IOLog("NORD2 GPU LAT3: jsnext=%u next_same=%u next_cross=%u promoted=%u evicted=%u stops=%u two_done=%u spurious=%u hand0_share_pm=%llu pipe=%u precise=%u overlap=%u held=%u\n",
+                       (unsigned)d->core->jsnext, l.nx_same, l.nx_cross, l.nx_promoted, l.nx_evicted, l.nx_stops, l.nx_two, l.nx_spurious,
+                       l.hand_n ? (unsigned long long)l.nx_promoted * 1000ull / l.hand_n : 0ull, (unsigned)d->core->pipe, l.precise_jobs, l.ov_starts, l.ov_blocked);
++        /* 0660 (T1): per-context GPU time (top 4), run-time histogram per slot, CPU clean volume by reason, driver path averages.  Short lines: the
++         * console cuts long ones.  gpuprof.py (gpusched-20261114/tools) reads them. */
++        {
++                struct n2c_prof pf; n2c_prof_take(d->core, &pf);
++                unsigned top[4] = { N2C_MAX_CTX, N2C_MAX_CTX, N2C_MAX_CTX, N2C_MAX_CTX };
++                for (unsigned i = 0; i < N2C_MAX_CTX; i++) {
++                        const struct n2c_ctx *x = &d->core->ctxs[i];
++                        if (x->state == N2C_CTX_FREE || !x->prof_jobs) continue;
++                        for (unsigned k = 0; k < 4; k++) {
++                                if (top[k] == N2C_MAX_CTX || x->prof_run_us > d->core->ctxs[top[k]].prof_run_us) {
++                                        for (unsigned m = 3; m > k; m--) top[m] = top[m - 1];
++                                        top[k] = i; break;
++                                }
++                        }
++                }
++                for (unsigned k = 0; k < 4 && top[k] < N2C_MAX_CTX; k++) {
++                        const struct n2c_ctx *x = &d->core->ctxs[top[k]];
++                        IOLog("NORD2 GPUPROF CTX: rank=%u name=%s pid=%d prio=%u run_us=%llu q_us=%llu qmax_us=%u jobs=%u win_ms=%llu\n", k, gCtxName[top[k]][0] ? gCtxName[top[k]] : "?",
++                              gCtxPid[top[k]], (unsigned)x->prio, x->prof_run_us, x->prof_q_us, x->prof_q_max_us, x->prof_jobs, w / 1000);
++                }
++                for (unsigned i = 0; i < N2C_MAX_CTX; i++) { struct n2c_ctx *x = &d->core->ctxs[i]; x->prof_run_us = x->prof_q_us = 0; x->prof_q_max_us = x->prof_jobs = 0; }
++                IOLog("NORD2 GPUPROF HIST: s0_100=%u s0_250=%u s0_500=%u s0_1k=%u s0_4k=%u s0_16k=%u s0_big=%u s1_100=%u s1_250=%u s1_500=%u s1_1k=%u s1_4k=%u s1_16k=%u s1_big=%u\n",
++                      pf.hist[0][0], pf.hist[0][1], pf.hist[0][2], pf.hist[0][3], pf.hist[0][4], pf.hist[0][5], pf.hist[0][6],
++                      pf.hist[1][0], pf.hist[1][1], pf.hist[1][2], pf.hist[1][3], pf.hist[1][4], pf.hist[1][5], pf.hist[1][6]);
++                IOLog("NORD2 GPUPROF MAINT: cl_fullhard=%llu cl_legacy=%llu cl_implicit=%llu cl_dirty=%llu cl_full=%llu cl_presub=%llu cl_max_kib=%u inv_kib=%llu presub_us=%llu jobs=%u full=%u trunc=%u precise=%u\n",
++                      pf.clean_pages[N2C_CR_FULLHARD] * 4, pf.clean_pages[N2C_CR_LEGACY] * 4, pf.clean_pages[N2C_CR_IMPLICIT] * 4, pf.clean_pages[N2C_CR_DIRTY] * 4,
++                      pf.clean_pages[N2C_CR_FULL] * 4, pf.clean_pages[N2C_CR_PRESUBMIT] * 4, pf.clean_max_pages * 4, pf.inval_pages * 4, pf.preclean_us,
++                      pf.jobs, pf.full_jobs, pf.truncated_jobs, pf.precise_jobs);
++                IOLog("NORD2 GPUPROF DRV: lock_wait_avg_us=%llu lock_hold_avg_us=%llu bh_wake_avg_us=%llu bh_poll_avg_us=%llu irq_cpu=%d bh_cpu=%d prio=%u evict=%u aged=%u reserve=%u\n",
++                      gLockCalls ? gLockWaitSumUs / gLockCalls : 0ull, gLockCalls ? gLockHoldSumUs / gLockCalls : 0ull, gBhWaitN ? gBhWaitSumUs / gBhWaitN : 0ull,
++                      gBhRuns ? gBhPollSumUs / gBhRuns : 0ull, gIrqCpu, gBhCpu, (unsigned)d->core->prio_on, l.pr_evicted, l.pr_aged, l.pr_reserved);
++                gLockWaitSumUs = gLockHoldSumUs = gBhWaitSumUs = gBhWaitN = gBhPollSumUs = 0;
++        }
+         gBhRuns = gBhWaitMaxUs = gBhPollMaxUs = 0; gLockCalls = gLockWaitMaxUs = gLockHoldMaxUs = gLockHoldSel = 0;
+         gOwnerDrainMaxUs = 0;
+ }
+@@ -746,6 +816,8 @@
+         if (d->ready) {
+                 d->core->lat_release_late = !(gLatMode & 2);   /* 0400 */
+                 if (gPipe != gPipeApplied) { d->core->pipe = gPipe != 0; gPipeApplied = gPipe; }   /* 0632 */
++                if (gPreclean != gPrecleanApplied) { d->core->preclean = gPreclean != 0; gPrecleanApplied = gPreclean; }   /* 0661 */
++                if (gPrio != gPrioApplied) { d->core->prio_on = gPrio != 0; gPrioApplied = gPrio; }   /* 0662 */
+                 if (gJsNext != gJsNextApplied) { (void)n2c_set_jsnext(d->core, gJsNext != 0); gJsNext = gJsNextApplied = d->core->jsnext ? 1 : 0; }   /* 0630 */
+                 n2c_poll(d->core);
+                 d->emitJobStats();
+@@ -931,7 +1003,7 @@
+                         if (j->state != N2C_JOB_QUEUED && j->state != N2C_JOB_RUNNING && j->state != N2C_JOB_STOPPING) continue;
+                         for (unsigned k = 0; k < j->nr_bos && !busy; k++) {
+                                 const struct n2c_bo *b = j->bos[k];
+-                                busy = ((j->write_mask >> k) & 1u) && (b->flags & N2C_BO_IMPORTED) && b->cookie &&
++                                busy = n2c_mask_bit(j->write_mask, k) && (b->flags & N2C_BO_IMPORTED) && b->cookie &&
+                                        ((BufferOwner *)b->cookie)->surface == (SweetSurface *)surface;
+                         }
+                 }
+@@ -956,7 +1028,7 @@
+                         bool m = false;
+                         for (unsigned k = 0; k < j->nr_bos && !m; k++) {
+                                 const struct n2c_bo *b = j->bos[k];
+-                                m = ((j->write_mask >> k) & 1u) && (b->flags & N2C_BO_IMPORTED) && b->cookie &&
++                                m = n2c_mask_bit(j->write_mask, k) && (b->flags & N2C_BO_IMPORTED) && b->cookie &&
+                                     ((BufferOwner *)b->cookie)->surface == (SweetSurface *)surface;
+                         }
+                         if (!m) continue;
+@@ -1056,10 +1128,15 @@
+         struct nord2_gic_ops g = { gic_rd32, gic_wr32, gic_rd64, gic_wr64, &gicd };
+         irqIntid = nord2_gic_intid_for_spi(irqSpi);
+         bool ok;
++        /* 0663: run this on a big core, so the SPI is routed there (it was the PE that happened to run irqSetup, often a little core) */
++        bool moved = gIrqBig && n2_bind_cpu(N2_IRQ_CPU);
+         disable_preemption();   /* the SPI is routed to, and the handler installed on, the PE running this code */
++        gIrqCpu = cpu_number();
+         ok = nord2_gic_spi_configure(&g, irqIntid, nord2_gic_irouter_for_mpidr(__builtin_arm_rsr64("MPIDR_EL1")), NORD2_GPU_IRQ_PRIORITY);
+         if (ok) { irqOwner = this; ml_install_interrupt_handler(this, 0, this, (IOInterruptHandler)irqDispatch, NULL); }
+         enable_preemption();
++        if (moved) { (void)thread_bind(PROCESSOR_NULL); (void)thread_block(THREAD_CONTINUE_NULL); }
++        IOLog("NORD2 GPU IRQ: routed to cpu %d (%s)\n", gIrqCpu, moved ? "big cluster, 0663" : "the configuring cpu");
+         irqState = ok ? NORD2_IRQ_LEARN : NORD2_IRQ_FAILED;
+         IOLog("NORD2 GPU IRQ: spi=%u intid=%u configure=%s state=%s\n", irqSpi, irqIntid, ok ? "ok" : "refused",
+               ok ? "learning (SPI stays disabled until seen pending)" : "polling");
+@@ -1604,6 +1681,15 @@
+         IOLog("NORD2 PRFCNT C lat0_127=%llu lat128_191=%llu lat192_255=%llu lat256_319=%llu lat320_383=%llu\n", ms[37], ms[38], ms[39], ms[40], ms[41]);
+         IOLog("NORD2 PRFCNT D frag=%llu exec=%llu fpk=%llu quads=%llu warps=%llu ptiles=%llu fma=%llu\n", sh[4], sh[26], sh[7], sh[11], sh[9], sh[18], sh[27]);
+         IOLog("NORD2 PRFCNT E texflit=%llu texdfch=%llu texstall=%llu texstarve=%llu rdtex=%llu wrtib=%llu rdftc=%llu\n", sh[35], sh[36], sh[37], sh[38], sh[58], sh[62], sh[54]);
++        /* 0660 (T1a): the counter indices of GPU_PERF_ANALYSIS.md 4.5 (Mesa G77.xml) */
++        IOLog("NORD2 PRFCNT F js0j=%llu js0t=%llu js0wr=%llu js0wi=%llu js0wd=%llu js0wf=%llu js1j=%llu js1wr=%llu js1wi=%llu js1wd=%llu js1wf=%llu js2=%llu\n",
++              jm[8], jm[9], jm[12], jm[13], jm[14], jm[15], jm[16], jm[20], jm[21], jm[22], jm[23], jm[26]);
++        IOLog("NORD2 PRFCNT G tri=%llu vis=%llu cull=%llu clip=%llu tbrd=%llu tbwr=%llu mmu=%llu rdstall=%llu xrd=%llu xwr=%llu arq1=%llu arq2=%llu arq3=%llu\n",
++              ti[6], ti[11], ti[12], ti[13], ti[17], ti[19], ms[4], ms[17], ms[29], ms[42], ms[34], ms[35], ms[36]);
++        IOLog("NORD2 PRFCNT H ezt=%llu ezk=%llu lzt=%llu lzk=%llu r64=%llu te=%llu fpkk=%llu comp=%llu cstarv=%llu astarv=%llu blsh=%llu icm=%llu\n",
++              sh[12], sh[14], sh[15], sh[16], sh[17], sh[19], sh[20], sh[22], sh[25], sh[33], sh[34], sh[32]);
++        IOLog("NORD2 PRFCNT I lsrf=%llu lsrs=%llu lsw=%llu rdlsc=%llu rdlscx=%llu rdtexx=%llu rdftcx=%llu v32=%llu v16=%llu\n",
++              sh[44], sh[45], sh[46], sh[56], sh[57], sh[59], sh[55], sh[50], sh[51]);
+ }
+ void Nord2GPU::budgetReject(const char *what, unsigned c, uint64_t request, uint64_t limit) {
+         uint64_t t = now_ms(NULL);
+@@ -1931,6 +2017,13 @@
+                               (unsigned long long)st.ctx_refused,gpu->core->as_dyn?"dynamic":"static");}
+                 return kIOReturnNoResources;
+         }
++        if(e==N2C_OK&&context<N2C_MAX_CTX){      /* 0662: compositor first; 0660: the name for the per-context GPU time lines */
++                char name[17]={};proc_selfname(name,sizeof(name));memcpy(gCtxName[context],name,sizeof(gCtxName[0]));gCtxPid[context]=proc_selfpid();
++                unsigned pr=N2C_PRIO_NORMAL;
++                if(!strncmp(name,"backboardd",16))pr=N2C_PRIO_HIGH;
++                else if(!strncmp(name,"mediaserverd",16)||!strncmp(name,"VTDecoderXPCSer",16)||!strncmp(name,"VTEncoderXPCSer",16))pr=N2C_PRIO_LOW;
++                (void)n2c_ctx_set_prio(gpu->core,context,pr);
++        }
+         static unsigned peak_logged;
+         if(e==N2C_OK&&gpu->core->as_stats.ctx_open>N2C_HW_AS-1&&gpu->core->as_stats.ctx_open>peak_logged){
+                 peak_logged=gpu->core->as_stats.ctx_open;char name[17]={};proc_selfname(name,sizeof(name));
+@@ -2047,13 +2140,37 @@
+                 result=gpu->compute(context,&r,&id);if(result==kIOReturnSuccess){a->scalarOutput[0]=id;a->scalarOutputCount=1;}break;
+         }
+         case NORD2_GPU_SEL_SUBMIT_JM: {
+-                nord2_gpu_submit_request3 r;bzero(&r,sizeof(r));memcpy(&r,a->structureInput,a->structureInputSize<sizeof(r)?a->structureInputSize:sizeof(r));
+-                bool v3=a->structureInputSize==sizeof(nord2_gpu_submit_request3);      /* 0632 */
+-                if(v3?(r.version!=3||(r.flags&~(uint32_t)N2C_SUBMIT_PRECISE)||r.reserved[0]||r.reserved[1]):r.version!=2){result=kIOReturnBadArgument;break;}
+-                struct n2c_submit sub={};sub.kind=r.kind;sub.nr_handles=r.nr_handles;sub.heads[0]=r.heads[0];sub.heads[1]=r.heads[1];
+-                sub.write_mask=r.write_mask;memcpy(sub.handles,r.handles,sizeof(sub.handles));uint64_t id;
+-                if(v3&&gPipeAbi){sub.flags=r.flags;sub.touch_mask=r.touch_mask;}
+-                result=io_error(n2c_submit(gpu->core,context,&sub,&id));if(result==kIOReturnSuccess){fence_record(gpu->core,context,&sub,id);a->scalarOutput[0]=id;a->scalarOutputCount=1;if(gpu->irqState==NORD2_IRQ_ACTIVE)gpu->irqArm();}break;
++                struct n2c_submit sub={};uint64_t id;
++                if(a->structureInputSize==sizeof(nord2_gpu_submit_request4)){      /* 0661: v4, 128 handles */
++                        const nord2_gpu_submit_request4 *r4=(const nord2_gpu_submit_request4 *)a->structureInput;
++                        if(r4->version!=4||r4->nr_handles>NORD2_GPU_SUBMIT4_MAX||(r4->flags&~(uint32_t)(N2C_SUBMIT_PRECISE|N2C_SUBMIT_TRUNCATED))||r4->reserved[0]||r4->reserved[1]||!gV4){result=kIOReturnBadArgument;break;}
++                        sub.kind=r4->kind;sub.nr_handles=r4->nr_handles;sub.heads[0]=r4->heads[0];sub.heads[1]=r4->heads[1];
++                        memcpy(sub.handles,r4->handles,sizeof(uint32_t)*r4->nr_handles);
++                        sub.write_mask=r4->write_mask[0];for(unsigned w=1;w<4;w++)sub.write_mask_hi[w-1]=r4->write_mask[w];
++                        sub.flags=r4->flags&N2C_SUBMIT_TRUNCATED;
++                        if(gPipeAbi){sub.flags|=r4->flags&N2C_SUBMIT_PRECISE;sub.touch_mask=r4->touch_mask[0];for(unsigned w=1;w<4;w++)sub.touch_mask_hi[w-1]=r4->touch_mask[w];}
++                }else{
++                        nord2_gpu_submit_request3 r;bzero(&r,sizeof(r));memcpy(&r,a->structureInput,a->structureInputSize<sizeof(r)?a->structureInputSize:sizeof(r));
++                        bool v3=a->structureInputSize==sizeof(nord2_gpu_submit_request3);      /* 0632 */
++                        if(v3?(r.version!=3||(r.flags&~(uint32_t)N2C_SUBMIT_PRECISE)||r.reserved[0]||r.reserved[1]):r.version!=2){result=kIOReturnBadArgument;break;}
++                        if(r.nr_handles>32){result=kIOReturnBadArgument;break;}
++                        sub.kind=r.kind;sub.nr_handles=r.nr_handles;sub.heads[0]=r.heads[0];sub.heads[1]=r.heads[1];
++                        sub.write_mask=r.write_mask;memcpy(sub.handles,r.handles,sizeof(r.handles));
++                        if(v3&&gPipeAbi){sub.flags=r.flags;sub.touch_mask=r.touch_mask;}
++                        if(r.nr_handles==32)sub.flags|=N2C_SUBMIT_TRUNCATED;      /* 0661: the old maximum = the producer may have dropped buffers */
++                }
++                result=io_error(n2c_submit(gpu->core,context,&sub,&id));if(result==kIOReturnSuccess){fence_record(gpu->core,context,&sub,id);a->scalarOutput[0]=id;a->scalarOutputCount=1;
++                        /* 0661: the job's CPU clean runs here, in the submitting thread, with the GPU lock dropped (the per-connection lock stays held, so
++                         * this client can neither close nor release meanwhile; the job holds references on every buffer it cleans) */
++                        const struct n2c_job *pj=NULL;for(unsigned i=0;i<N2C_MAX_JOBS;i++)if(gpu->core->jobs[i].state==N2C_JOB_QUEUED&&gpu->core->jobs[i].id==id)pj=&gpu->core->jobs[i];
++                        if(pj&&pj->prep){
++                                struct n2c_prep *pp=(struct n2c_prep *)IOMallocData(sizeof(struct n2c_prep));
++                                if(pp&&n2c_prep_begin(gpu->core,context,id,pp)){IOLockUnlock(gpu->lock);n2c_prep_run(gpu->core,pp);IOLockLock(gpu->lock);}
++                                else if(pp){pp->n=0;pp->pages=0;pp->us=0;}
++                                if(pp){n2c_prep_commit(gpu->core,context,id,pp);IOFreeData(pp,sizeof(struct n2c_prep));}
++                                else{struct n2c_prep none;none.n=0;none.pages=0;none.us=0;n2c_prep_commit(gpu->core,context,id,&none);}
++                        }
++                        if(gpu->irqState==NORD2_IRQ_ACTIVE)gpu->irqArm();}break;
+         }
+         case NORD2_GPU_SEL_WAIT: {
+                 if(a->scalarInput[1]>5000){result=kIOReturnBadArgument;break;}
+@@ -2143,6 +2260,7 @@
+         if(sel!=NORD2_GPU_SEL_WAIT && sel!=NORD2_GPU_SEL_WAIT_SEQ && sel!=NORD2_GPU_SEL_ALLOC){   /* 0400: lock wait / hold (these three drop the GPU lock) */
+                 uint64_t lk2=now_us(NULL);gLockCalls++;
+                 if(lk1-lk0>gLockWaitMaxUs)gLockWaitMaxUs=(uint32_t)(lk1-lk0);
++                gLockWaitSumUs+=lk1-lk0;gLockHoldSumUs+=lk2-lk1;      /* 0660 */
+                 if(lk2-lk1>gLockHoldMaxUs){gLockHoldMaxUs=(uint32_t)(lk2-lk1);gLockHoldSel=sel;}
+         }
+         IOLockUnlock(gpu->lock);if(clientHeld)IOLockUnlock(lock);return result;

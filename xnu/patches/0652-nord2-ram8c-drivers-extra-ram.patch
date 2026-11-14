@@ -1,0 +1,47 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -156,9 +156,11 @@
+ static volatile int gSocCc, gGpuCc;
+ static volatile bool gSocOk, gGpuOk, gSocApprox;
+ static volatile uint64_t gSocMs;
++extern "C" uint64_t nord2_ram_managed_end(uint64_t pa);     /* 0652 (arm_vm_init.c): XNU RAM = the window or an extra range */
+ static bool valid_ram(uint64_t pa) {
+-        return !(pa & 4095) && gPhysSize >= 4096 && pa >= gPhysBase &&
+-               pa - gPhysBase <= gPhysSize - 4096 && pa < (1ull << 40);
++        if (!(pa & 4095) && gPhysSize >= 4096 && pa >= gPhysBase && pa - gPhysBase <= gPhysSize - 4096 && pa < (1ull << 40)) return true;
++        uint64_t end = (pa & 4095) ? 0 : nord2_ram_managed_end(pa);    /* 0652: pages of the extra ranges are ordinary XNU pages too */
++        return end != 0 && pa + 4096 <= end && pa < (1ull << 40);
+ }
+ struct BufferOwner {
+         uint8_t madv;       /* 0481: N2MADV_F_* (nord2_gpu_madv.h), under Nord2GPU::lock until the owner is detached */
+--- a/iokit/Kernel/arm/sweet_fb_iommu_hw.h
++++ b/iokit/Kernel/arm/sweet_fb_iommu_hw.h
+@@ -17,6 +17,7 @@
+ 
+ extern "C" {
+ extern unsigned long gPhysBase, gPhysSize;
++uint64_t nord2_ram_managed_end(uint64_t pa);    /* 0652 (arm_vm_init.c): end of the XNU RAM run (window or extra range) holding pa, 0 = not XNU RAM */
+ vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+ }
+@@ -275,6 +276,7 @@
+ n2io_ram(uint64_t pa)
+ {
+ 	return !(pa & 0xfffu) && ((pa >= gPhysBase && pa + 0x1000u <= (uint64_t)gPhysBase + gPhysSize) || sweet_fb_hw_pool_contains(pa, 0x1000u) ||
++	    (nord2_ram_managed_end(pa) >= pa + 0x1000u) ||     /* 0652: XNU pages of the extra ranges */
+ 	    sweet_heap_page_ok(pa));      /* 0440: graphics-heap pages (only ever reached through an IOVA PTE, never as a physical OVL address) */
+ }
+ 
+--- a/iokit/Kernel/arm/sweet_fb_iommu_wod.inc
++++ b/iokit/Kernel/arm/sweet_fb_iommu_wod.inc
+@@ -52,7 +52,9 @@
+ 	for (uint64_t off = 0; off < bytes;) {          /* through the physical aperture, one contiguous run at a time */
+ 		IOByteCount sl = 0;
+ 		uint64_t pa = buf->getPhysicalSegment((IOByteCount)off, &sl, kIOMemoryMapperNone);
+-		if (sl == 0 || pa < gPhysBase || pa - gPhysBase >= gPhysSize || sl > gPhysSize - (pa - gPhysBase)) { break; }
++		uint64_t run_end = nord2_ram_managed_end(pa);    /* 0652: window or extra range (a run may cross from one into the next) */
++		if (sl == 0 || run_end == 0) { break; }
++		if (sl > run_end - pa) { sl = (IOByteCount)(run_end - pa); }
+ 		if (sl > bytes - off) { sl = (IOByteCount)(bytes - off); }
+ 		CleanPoC_DcacheRegion(ml_static_ptovirt((vm_offset_t)pa), (size_t)sl);
+ 		off += sl;

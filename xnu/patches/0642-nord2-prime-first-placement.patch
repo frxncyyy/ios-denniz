@@ -1,0 +1,64 @@
+--- a/bsd/dev/nord2_dvfs_sched.h
++++ b/bsd/dev/nord2_dvfs_sched.h
+@@ -27,10 +27,15 @@
+ 	bool pin;                            /* mode 3: both clusters at the cap the thermal ladder allows, whatever the load (the A/B reference) */
+ };
+ 
++static bool n2s_prime_floors = true;     /* 0642: false = the 0460 floors (set before n2s_init) */
++
+ static inline void
+ n2s_init(const struct n2d_state *st, struct n2s_gov *g)
+ {
+-	static const uint16_t fl[2][N2G_NCLASS] = { { 0, 2200, 2354, 2354, 0 }, { 0, 1998, 2463, 2463, 0 } };      /* idle, UI, animation, touch, (jank = cap) */
++	/* idle, UI, animation, touch, (jank = cap).  0642: B (cpu7, the prime core that 0642's placement now fills first) gets floors at least as fast as L's
++	 * (was 1998 / 2463 / 2463 = slower than L's 2200 / 2354 / 2354, so a UI thread moved to cpu7 would have run slower than on cpu4). */
++	static const uint16_t fl[2][N2G_NCLASS] = { { 0, 2200, 2354, 2354, 0 }, { 0, 2463, 2713, 2713, 0 } };
++	static const uint16_t fl_0460[2][N2G_NCLASS] = { { 0, 2200, 2354, 2354, 0 }, { 0, 1998, 2463, 2463, 0 } };
+ 	static const uint16_t th[2][N2G_TH_LEVELS] = { { 0, 2354, 2200, 1740, 0 }, { 0, 2713, 2463, 1998, 0 } };
+ 	static const uint16_t hi[2] = { 2200, 2463 };
+ 	for (unsigned k = 0; k < sizeof(*g); k++) {
+@@ -47,7 +52,7 @@
+ 		cl->ncpu = k == 0 ? 3 : 1;
+ 		cl->hispeed_mhz = hi[k];
+ 		for (unsigned i = 0; i < N2G_NCLASS; i++) {
+-			cl->floor_mhz[i] = fl[k][i];
++			cl->floor_mhz[i] = n2s_prime_floors ? fl[k][i] : fl_0460[k][i];
+ 		}
+ 		for (unsigned i = 0; i < N2G_TH_LEVELS; i++) {
+ 			cl->therm_mhz[i] = th[k][i];
+--- a/bsd/dev/nord2_cpufreq.c
++++ b/bsd/dev/nord2_cpufreq.c
+@@ -52,6 +52,7 @@
+ 
+ extern unsigned nord2_cpu_mhz(int cpu);                                                /* nord2_sched.c (0099) */
+ extern int nord2_sched_mode;                                                            /* nord2_sched.c (0099): placement mode bits */
++extern int nord2_sched_prime;                                                           /* nord2_sched.c (0642): eligible threads take the prime core first */
+ extern bool nord2_battery_temperature_cC(int *centi);                                  /* Nord2GPU.cpp */
+ extern int nord2_cpu_util_permille(int cpu);                                            /* Nord2GPU.cpp (0172): busy permille over the last ~100 ms */
+ extern int nord2_gpu_pmic_ready(void);  /* Nord2GPU.cpp (0142): the GPU driver is ready and its PMIC owner thread answers */
+@@ -956,7 +957,7 @@
+ 
+ /*
+  * 0641 (cpu-20261114): platform parity bits of nord2_dvfs.h (N2P_COL | N2P_LL | N2P_PERF), applied by the policy loop (kern.n2dvfs_mode >= 2) only.
+- * kern.n2cpuplat (run time) = the bits; boot default 7 (all), n2gdv +16 = 1 (CCI column only;
++ * kern.n2cpuplat (run time) = the bits; boot default 7 (all), n2gdv +16 = 1 (CCI column only; with 0642 also prime-first placement and the B floors off;
+  * n2gdv=25 fits the boot line; every other bit up to 65536 belongs to 0461-0633).  Full off = the chain without 0641.
+  * LL boost and the CCI perf half are dropped from thermal level 2 (battery 43.0 C) on and come back below it (ladder hysteresis).
+  * Every 2 s, next to the DECISION line: 'NORD2 CPUPLAT: mode= ll=MHz cci=MHz(row) perf=on|off | 2s: perf_ms= ll_fast_ms= cci_writes= ll_moves= | ll_bad='.
+@@ -1062,6 +1063,16 @@
+ 		/* 0460 */
+ 		static struct n2s_gov sg;
+ 		uint64_t last_old = 0;
++		{                                                          /* 0642: prime-first placement + B floors, off with the conservative bit */
++			int gm = 0;
++			(void)PE_parse_boot_argn("n2gdv", &gm, sizeof(gm));
++			if (gm & 16) {
++				nord2_sched_prime = 0;
++				n2s_prime_floors = false;
++			}
++			printf("NORD2 CPUPLAT: prime-first placement %s (kern n2prime=%d), B floors ui/anim/touch %s MHz\n", nord2_sched_prime ? "on" : "off",
++			    nord2_sched_prime, n2s_prime_floors ? "2463/2713/2713" : "1998/2463/2463 (0460)");
++		}
+ 		n2s_init(&st, &sg);
+ 		printf("NORD2 DVFS sched: kern.n2dvfs_mode=%d (0 old governor, 1 + decisions logged, 2 new policy acts, 3 pinned at the cap), tick %u ms, idle rows L %u B %u\n", nord2_dvfs_mode, N2G_CPU_TICK_MS,
+ 		    sg.cl[0].slowest, sg.cl[1].slowest);

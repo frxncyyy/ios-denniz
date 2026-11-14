@@ -1,0 +1,336 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -142,6 +142,20 @@
+         b->p = (volatile uint32_t *)ml_io_map(pa, bytes);
+         return b->p != NULL;
+ }
++/* 0643: LVTS banks through ml_io_map_unmappable (no io_submap page; the io_submap has only 3 free pages). */
++extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);   /* osfmk/arm/machine_routines.h (kernel-private) */
++#ifndef VM_WIMG_IO
++#define VM_WIMG_IO 0x7u        /* osfmk/arm/memory_types.h: VM_MEM_COHERENT | VM_MEM_NOT_CACHEABLE | VM_MEM_GUARDED (what ml_io_map uses) */
++#endif
++static bool map_bank_um(Bank *b, uint64_t pa, unsigned bytes) {
++        b->bytes = bytes;
++        b->p = (volatile uint32_t *)ml_io_map_unmappable(pa, bytes, VM_WIMG_IO);
++        return b->p != NULL;
++}
++/* 0643: SoC temperature cache, written by the GPU worker thread every 2 s (Nord2GPU::lvtsTick), read by nord2_cpufreq.c and the GPU ladder */
++static volatile int gSocCc, gGpuCc;
++static volatile bool gSocOk, gGpuOk, gSocApprox;
++static volatile uint64_t gSocMs;
+ static bool valid_ram(uint64_t pa) {
+         return !(pa & 4095) && gPhysSize >= 4096 && pa >= gPhysBase &&
+                pa - gPhysBase <= gPhysSize - 4096 && pa < (1ull << 40);
+@@ -441,11 +455,14 @@
+         struct nord2_irq_guard irqGuard = {};
+         volatile uint32_t irqFlag = 0, irqTops = 0;
+         uint32_t irqSleeps = 0, irqTimeouts = 0;
+-        /* LVTS thermal sensing (boot-arg nord2_lvts=1 read-only | 2 start the GPU controller | 3 also open the clock gate). */
++        /* LVTS thermal sensing (boot-arg nord2_lvts=1 read-only | 2 start the GPU controller | 3 also open the clock gate | 4 auto (0643 default):
++         * read-only when the controllers already sense, else start them (never the clock gate); n2gdv +16 = off). */
+         struct n2lvts lvts = {};
+         Bank lvtsAp = {}, lvtsMcu = {};
+         unsigned lvtsMode = 0, lvtsState = 0;     /* state: 0 off, 1 reading, 2 started by us, 3 failed */
+         uint32_t lvtsMask = N2LVTS_MASK_GPU; int lvtsMaxC = 65; bool lvtsTried = false;
++        uint64_t lvtsLastMs = 0;                  /* 0643 */
++        void lvtsTick(uint64_t nowMs);
+         void lvtsSetup();
+         bool lvtsGpu(int32_t *mC);
+         int lvtsHottest(uint32_t mask);
+@@ -764,7 +781,10 @@
+         int opt = 0; PE_parse_boot_argn("nord2_gpu", &opt, sizeof(opt)); enabled = opt == 1;
+         int stats = 1; PE_parse_boot_argn("nord2_gpu_stats", &stats, sizeof(stats)); jobStats = stats != 0;
+         if (!PE_parse_boot_argn("n2pf", &pfMode, sizeof(pfMode))) pfMode = 0;
+-        int lv = 0; if (!PE_parse_boot_argn("nord2_lvts", &lv, sizeof(lv))) (void)PE_parse_boot_argn("n2lvts", &lv, sizeof(lv)); lvtsMode = (lv >= 1 && lv <= 3) ? (unsigned)lv : 0;
++        /* 0643: default mode 4 (auto) on the CPU-big, CPU-big2, CPU-little and GPU controllers; n2gdv +16 = LVTS off and the battery-only ladder */
++        int lv = 4; { int gm = 0; if (PE_parse_boot_argn("n2gdv", &gm, sizeof(gm)) && (gm & 16)) { lv = 0; n2g_therm_soc_off = true; } }
++        if (!PE_parse_boot_argn("nord2_lvts", &lv, sizeof(lv))) (void)PE_parse_boot_argn("n2lvts", &lv, sizeof(lv)); lvtsMode = (lv >= 1 && lv <= 4) ? (unsigned)lv : 0;
++        if (lvtsMode == 4) lvtsMask = 0x17u;
+         int lm = 0; if (PE_parse_boot_argn("nord2_lvts_mask", &lm, sizeof(lm)) && lm > 0 && (lm & ~(int)N2LVTS_MASK_ALL) == 0) lvtsMask = (uint32_t)lm;
+         int lc = 0; if (PE_parse_boot_argn("nord2_lvts_max_c", &lc, sizeof(lc)) && lc >= 30 && lc <= 100) lvtsMaxC = lc;
+         if (lvtsMode) IOLog("NORD2 GPU: LVTS thermal sensing requested: mode %u mask %x cold-start guard %d C\n", lvtsMode, lvtsMask, lvtsMaxC);
+@@ -1123,15 +1143,18 @@
+         lvtsTried = true;
+         if (!lvtsMode) return;
+         n2lvts_ops o = { lvtsRd, lvtsWr, delay_us, log_msg };
+-        if (!map_bank(&lvtsAp, N2LVTS_AP_PHYS, N2LVTS_BLOCK_BYTES) ||
+-            ((lvtsMask & 7u) && !map_bank(&lvtsMcu, N2LVTS_MCU_PHYS, N2LVTS_BLOCK_BYTES)) || !n2lvts_init(&lvts, &o, this)) {
++        if (!map_bank_um(&lvtsAp, N2LVTS_AP_PHYS, N2LVTS_BLOCK_BYTES) ||
++            ((lvtsMask & 7u) && !map_bank_um(&lvtsMcu, N2LVTS_MCU_PHYS, N2LVTS_BLOCK_BYTES)) || !n2lvts_init(&lvts, &o, this)) {
+                 lvtsState = 3; IOLog("NORD2 GPU LVTS: cannot map thermal controllers\n"); return;
+         }
+         int golden = 0;
+         if (PE_parse_boot_argn("nord2_lvts_golden", &golden, sizeof(golden)) && golden > 0) lvts.cal.golden = (uint32_t)golden;
+         enum n2lvts_error e = N2LVTS_OK;
+-        if (lvtsMode >= 2) {
+-                e = n2lvts_start(&lvts, lvtsMask, lvtsMode >= 3);
++        unsigned pre = lvtsMode == 4 ? n2lvts_read(&lvts, lvtsMask) : 0u;     /* 0643 auto: already sensing (read-only, gate checked) -> no writes */
++        if (lvtsMode == 4 && pre) {
++                lvtsState = 1;
++        } else if (lvtsMode >= 2) {
++                e = n2lvts_start(&lvts, lvtsMask, lvtsMode == 3);
+                 if (e == N2LVTS_OK) {
+                         lvtsState = 2;
+                         for (unsigned i = 0; i < 40; i++) {            /* first sensor interval is ~20 ms; allow 200 ms */
+@@ -1142,9 +1165,12 @@
+         } else lvtsState = 1;
+         n2lvts_probe probe = {}; bool pr = (n2lvts_probe_ctrl(&lvts, N2LVTS_CTRL_GPU, &probe) == N2LVTS_OK);
+         unsigned good = n2lvts_read(&lvts, lvtsMask);
+-        IOLog("NORD2 GPU LVTS: mode=%u mask=%x start=%s state=%u gate_open=%u cal=%s valid_sensors=%u gpu_ctrl clken=%x monctl0=%x id=%x msr0=%x step=%u\n",
++        IOLog("NORD2 GPU LVTS: mode=%u mask=%x start=%s state=%u gate_open=%u cal=%s valid_sensors=%u gpu_ctrl clken=%x monctl0=%x id=%x msr0=%x step=%u pre=%u\n",
+               lvtsMode, lvtsMask, n2lvts_error_string(e), lvtsState, pr ? 1u : (unsigned)probe.gate_open,
+-              lvts.cal.defaulted ? "default(approx)" : "efuse", good, probe.clken, probe.monctl0, probe.id, probe.msr[0], lvts.step);
++              lvts.cal.defaulted ? "default(approx)" : "efuse", good, probe.clken, probe.monctl0, probe.id, probe.msr[0], lvts.step, pre);
++        for (unsigned c = 0; c < N2LVTS_CTRL_COUNT; c++) if (lvtsMask & (1u << c))     /* 0643: every sensor once */
++                for (unsigned j = 0; j < n2lvts_ctrl[c].nsens; j++) { unsigned sn = n2lvts_ctrl[c].first_sensor + j;
++                        IOLog("NORD2 GPU LVTS: %s sensor %u raw %x %s %d mC\n", n2lvts_ctrl[c].role, sn, lvts.raw[sn], lvts.temp_ok[sn] ? "ok" : "invalid", (int)lvts.temp_mC[sn]); }
+ }
+ bool Nord2GPU::lvtsGpu(int32_t *mC) {
+         if (!lvtsMode || lvtsState == 3 || !lvtsState) return false;
+@@ -1163,6 +1189,22 @@
+                 }
+         return best;
+ }
++/* 0643: every 2 s on the GPU worker thread: the hottest valid sensor of lvtsMask and the GPU sensor into the cache (the only LVTS reader after setup). */
++void Nord2GPU::lvtsTick(uint64_t nowMs) {
++        if (!lvtsMode || !lvtsTried || lvtsState == 0 || lvtsState == 3) return;
++        if (lvtsLastMs && nowMs - lvtsLastMs < 2000) return;
++        lvtsLastMs = nowMs ? nowMs : 1;
++        int hot = lvtsHottest(lvtsMask);
++        int32_t gmC = 0; bool g = lvtsGpu(&gmC);
++        gGpuOk = g; gGpuCc = g ? gmC / 10 : 0;
++        gSocApprox = lvts.cal.defaulted;
++        gSocCc = hot; gSocOk = hot != (int)0x80000000; gSocMs = nowMs;
++}
++extern "C" bool nord2_soc_temperature_cC(int *centi, bool *approx) {
++        uint64_t t = gSocMs, n = now_ms(NULL);
++        if (!gSocOk || !t || n < t || n - t > 5000) return false;
++        *centi = gSocCc; if (approx) *approx = gSocApprox; return true;
++}
+ /* Battery fuel-gauge temperature (centi-C) from the SweetBattery power source, if it is a real
+  * measurement; the SoC/GPU thermal sensors (LVTS) are not driven by this port. */
+ static bool battery_temperature(int *centi) {
+@@ -1214,8 +1256,8 @@
+         uint32_t mux = (read_bank(&clocks[N2CLK_TOPCK], N2CLK_CFG_5) >> N2CLK_MFG_MUX_SHIFT) & N2CLK_MFG_MUX_MASK;
+         int bat = 0; bool bat_ok = battery_temperature(&bat);
+         if (lvtsMode && !lvtsTried) lvtsSetup();
+-        int32_t gmC = 0; bool gpu_ok = lvtsGpu(&gmC);
+-        int hot = (lvtsMode && lvtsState && lvtsState != 3) ? lvtsHottest(lvtsMask) : (int)0x80000000;
++        int32_t gmC = gGpuCc * 10; bool gpu_ok = gGpuOk;                       /* 0643: the cache of lvtsTick (no LVTS access from client threads) */
++        int hot = gSocOk ? gSocCc : (int)0x80000000;
+         uint32_t n = t.jobs ? t.jobs : 1, w = waitN ? waitN : 1;
+         /* 0131: three short lines instead of one of ~900 characters, which the console cut after about 500 (the cache tracking and reservation fields were lost). */
+         IOLog("NORD2 GPU JOBS: n=%u fault=%u full=%u win_ms=%llu q_us=%llu/%u run_us=%llu/%u tot_us=%llu/%u clean_us=%llu/%u inv_us=%llu/%u clean_KiB=%llu inv_KiB=%llu\n",
+@@ -1363,6 +1405,7 @@
+ void Nord2GPU::gdvfsPoll(uint64_t now) {
+         static const char *const wn[N2G_NWHY] = { "hold", "util", "floor", "burst", "heavy", "therm", "rate", "up", "down", "boost" };
+         auto &v = gGdv;
++        lvtsTick(now / 1000);                    /* 0643: before any early return (GPU idle/off still updates the SoC temperature) */
+         int mode = gGdvfs & 3;
+         if (!core || core->state != N2C_CORE_READY || !board.powered) { if (core) core->hold_start = false; v.pend = -1; return; }
+         if (!v.init) {
+@@ -1391,7 +1434,8 @@
+         if (first) return;
+         uint64_t ms = now / 1000;
+         bool slow = !v.slowUs || now - v.slowUs >= 2000000ull;
+-        if (slow) { int c = 0; bool okb = battery_temperature(&c); (void)n2g_therm_update(&v.th, okb, c); v.bat = okb ? c : -1; }
++        if (slow) { int c = 0, sc = 0; bool ap = false; bool okb = battery_temperature(&c), oks = nord2_soc_temperature_cC(&sc, &ap);
++                    (void)n2g_therm_update2(&v.th, okb, c, oks, sc, ap); v.bat = okb ? c : -1; }      /* 0643: battery + SoC ladder */
+         struct n2g_hints h = {};
+         nord2_dvfs_hints(&h);
+         uint32_t old = v.nsw >= 5 ? v.swaps[(v.nsw - 5) % N2G_HIST] : h.swaps;
+--- a/bsd/dev/nord2_gov.h
++++ b/bsd/dev/nord2_gov.h
+@@ -50,6 +50,65 @@
+ 	return lv;
+ }
+ 
++/*
++ * 0643 (cpu-20261114): the ladder level from the battery gauge AND the SoC sensors (LVTS, hottest of the CPU-big/CPU-little/GPU controllers).
++ *   SoC reading usable: battery steps 43.0 / 44.5 / 45.5 / 46.0 C (were 41 / 43 / 45 / 47) and SoC steps 85 / 90 / 95 / 100 C junction (vendor MT6893
++ *   CPU/GPU throttle trips are ~95-100 C; +10 C is added to the SoC reading while its calibration is the vendor default instead of the efuse).
++ *   SoC reading not usable: the old battery steps, except that level 4 (slowest rows) now starts at 46.0 C (was 47.0): the battery never runs above 46 C
++ *   with fast clocks.  A SoC reading counts only between battery - 15 C and 125 C (anything else is a decode problem, not a temperature).
++ * The level only goes down when every source allows it (hysteresis: battery 1 C, SoC 3 C).  kill: n2g_therm_soc_off (Nord2GPU / nord2_cpufreq: n2gdv +16).
++ */
++#define N2G_TH_SOC_HYST_CC 300
++static bool n2g_therm_soc_off;
++
++static inline unsigned
++n2g_therm_from(const int up[4], int hyst, int x, unsigned prev)
++{
++	unsigned lv = prev;
++	while (lv < 4u && x >= up[lv]) {
++		lv++;
++	}
++	while (lv > 0u && x < up[lv - 1u] - hyst) {
++		lv--;
++	}
++	return lv;
++}
++
++/* the SoC reading (centi-C) the ladder uses, or false when it is not usable next to this battery reading */
++static inline bool
++n2g_therm_soc_usable(bool soc_ok, int soc_cc, bool soc_approx, bool bat_ok, int bat_cc, int *eff)
++{
++	if (!soc_ok || n2g_therm_soc_off || soc_cc > 12500 || (bat_ok && soc_cc < bat_cc - 1500)) {
++		return false;
++	}
++	*eff = soc_cc + (soc_approx ? 1000 : 0);
++	return true;
++}
++
++static inline unsigned
++n2g_therm_update2(struct n2g_therm *t, bool bat_ok, int bat_cc, bool soc_ok, int soc_cc, bool soc_approx)
++{
++	static const int bat_soc[4] = { 4300, 4450, 4550, 4600 }, bat_only[4] = { 4100, 4300, 4500, 4600 }, soc_up[4] = { 8500, 9000, 9500, 10000 };
++	int eff = 0;
++	bool soc = n2g_therm_soc_usable(soc_ok, soc_cc, soc_approx, bat_ok, bat_cc, &eff);
++	if (!bat_ok && !soc) {
++		return t->level;                                  /* nothing readable: keep the level (never read: minimum clocks) */
++	}
++	unsigned prev = t->seen ? t->level : 0u, lv = 0;
++	if (bat_ok) {
++		lv = n2g_therm_from(soc ? bat_soc : bat_only, N2G_TH_HYST_CC, bat_cc, prev);
++	}
++	if (soc) {
++		unsigned ls = n2g_therm_from(soc_up, N2G_TH_SOC_HYST_CC, eff, prev);
++		lv = ls > lv ? ls : lv;
++	}
++	t->level = (uint8_t)lv; t->seen = true;
++	if (bat_ok) {
++		t->cc = bat_cc;
++	}
++	return lv;
++}
++
+ /* ---- activity hints: swaps (CoreAnimation) and touches ---- */
+ #define N2G_SWAP_GAP_US   100000u      /* a longer pause ends the burst: not a late frame */
+ #define N2G_SWAP_MIN_US   8000u
+--- a/bsd/dev/nord2_dvfs_sched.h
++++ b/bsd/dev/nord2_dvfs_sched.h
+@@ -10,10 +10,12 @@
+ #include "nord2_gov.h"
+ 
+ #define N2S_L_LADDER 100      /* log code: a = thermal level 0..4, b = battery cC, c = gauge readable, d = fastest allowed row L | B << 8 */
++#define N2S_L_SOC    101      /* 0643: a = thermal level, b = SoC cC + 100000 (0 = not readable), c = 1 calibration approximate, d = 1 used by the ladder */
+ 
+ struct n2s_ops {
+ 	void (*ticks)(void *ctx, int cpu, uint32_t *busy, uint32_t *total);      /* cumulative 10 ms ticks of one CPU: user + system, and those plus idle */
+ 	void (*hints)(void *ctx, struct n2g_hints *h);
++	bool (*soc)(void *ctx, int *centi_c, bool *approx);                      /* 0643: hottest LVTS sensor, false = none (may be NULL) */
+ };
+ 
+ struct n2s_gov {
+@@ -25,6 +27,8 @@
+ 	uint32_t lates0;
+ 	bool acted;
+ 	bool pin;                            /* mode 3: both clusters at the cap the thermal ladder allows, whatever the load (the A/B reference) */
++	bool soc_used;                       /* 0643: the last ladder update used the SoC reading */
++	int soc_cc;                          /* 0643: last SoC reading (centi-C), -99999 = none */
+ };
+ 
+ static bool n2s_prime_floors = true;     /* 0642: false = the 0460 floors (set before n2s_init) */
+@@ -78,13 +82,21 @@
+ 	g->last_ms = now ? now : 1;
+ 	bool slow = g->last_slow_ms == 0 || now - g->last_slow_ms >= N2D_GOV_SLOW_TICK_MS, first = g->last_slow_ms == 0;
+ 	if (slow) {
+-		int cC = 0;
++		int cC = 0, sc = 0, eff = 0;
++		bool approx = false;
+ 		unsigned was = g->th.level;
+ 		bool ok = o->gauge(ctx, &cC);
+-		unsigned lv = n2g_therm_update(&g->th, ok, cC);
++		bool sok = so->soc != NULL && so->soc(ctx, &sc, &approx);                     /* 0643 */
++		unsigned lv = n2g_therm_update2(&g->th, ok, cC, sok, sc, approx);
++		bool used = n2g_therm_soc_usable(sok, sc, approx, ok, cC, &eff);
+ 		if (lv != was || first) {
+ 			o->log(ctx, N2S_L_LADDER, lv, ok ? (unsigned)cC : 0u, ok, n2g_cl_limit(&g->cl[0], lv) | n2g_cl_limit(&g->cl[1], lv) << 8);
+ 		}
++		if (lv != was || first || used != g->soc_used) {
++			o->log(ctx, N2S_L_SOC, lv, sok ? (unsigned)(sc + 100000) : 0u, approx, used);
++		}
++		g->soc_used = used;
++		g->soc_cc = sok ? sc : -99999;
+ 		g->last_slow_ms = now ? now : 1;
+ 	}
+ 	struct n2g_hints h = { 0, 0, 0, 0, 0 };
+--- a/bsd/dev/nord2_cpufreq.c
++++ b/bsd/dev/nord2_cpufreq.c
+@@ -54,6 +54,7 @@
+ extern int nord2_sched_mode;                                                            /* nord2_sched.c (0099): placement mode bits */
+ extern int nord2_sched_prime;                                                           /* nord2_sched.c (0642): eligible threads take the prime core first */
+ extern bool nord2_battery_temperature_cC(int *centi);                                  /* Nord2GPU.cpp */
++extern bool nord2_soc_temperature_cC(int *centi, bool *approx);                        /* Nord2GPU.cpp (0643): hottest LVTS sensor of the last 5 s */
+ extern int nord2_cpu_util_permille(int cpu);                                            /* Nord2GPU.cpp (0172): busy permille over the last ~100 ms */
+ extern int nord2_gpu_pmic_ready(void);  /* Nord2GPU.cpp (0142): the GPU driver is ready and its PMIC owner thread answers */
+ extern int nord2_pmic_read(unsigned bus, unsigned sid, unsigned reg, unsigned *val);  /* Nord2GPU.cpp (0116): read-only PMIC access on the owner thread */
+@@ -677,6 +678,15 @@
+ 	case N2D_L_GOVCLK:
+ 		printf("NORD2 DVFS gov clock: cluster %s asked %u MHz, measures %u MHz\n", cl[a & 3], b, c);
+ 		break;
++	case N2S_L_SOC:                                                                 /* 0643 */
++		if (b == 0) {
++			printf("NORD2 DVFS thermal ladder: level %u, SoC temperature not readable: battery steps 41/43/45/46 C\n", a);
++		} else {
++			int sc = (int)b - 100000;
++			printf("NORD2 DVFS thermal ladder: level %u, SoC %d.%02d C%s %s\n", a, sc / 100, (sc < 0 ? -sc : sc) % 100, c ? " (default calibration: +10 C margin)" : "",
++			    d ? "used: battery steps 43/44.5/45.5/46 C, SoC steps 85/90/95/100 C" : "NOT used (implausible next to the battery, or off): battery steps 41/43/45/46 C");
++		}
++		break;
+ 	case N2S_L_LADDER:
+ 		printf("NORD2 DVFS thermal ladder: level %u (battery %d.%02d C%s), fastest row L %u (%u MHz) B %u (%u MHz)\n", a, (int)b / 100, (int)b % 100, c ? "" : ", gauge unreadable",
+ 		    d & 0xff, n2d_row_mhz(N2DV_L, d & 0xff), d >> 8, n2d_row_mhz(N2DV_B, d >> 8));
+@@ -756,7 +766,13 @@
+ 	*total = *busy + t[CPU_STATE_IDLE];
+ }
+ 
+-static const struct n2s_ops n2s_kops = { n2s_ticks, n2s_hints };
++static bool
++n2s_soc(__unused void *ctx, int *cC, bool *approx)
++{
++	return nord2_soc_temperature_cC(cC, approx);
++}
++
++static const struct n2s_ops n2s_kops = { n2s_ticks, n2s_hints, n2s_soc };       /* 0643: + SoC temperature */
+ 
+ static void
+ n2s_print(const struct n2d_state *st, const struct n2s_gov *g, int mode)
+@@ -1014,13 +1030,16 @@
+ 	}
+ }
+ 
++static int n2p_soc_cc = -99999;         /* 0643: copied from the policy state for the CPUPLAT line */
++static unsigned n2p_soc_used;
++
+ static void
+ n2p_print(const struct n2d_state *st)
+ {
+ 	int row = n2p_cci_last;
+-	printf("NORD2 CPUPLAT: mode=%u ll=%uMHz cci=%dMHz(row %d) perf=%s | 2s: perf_ms=%u ll_fast_ms=%u cci_writes=%u ll_moves=%u | ll_bad=%u\n", n2p_mode,
++	printf("NORD2 CPUPLAT: mode=%u ll=%uMHz cci=%dMHz(row %d) perf=%s | 2s: perf_ms=%u ll_fast_ms=%u cci_writes=%u ll_moves=%u | ll_bad=%u | soc_cC=%d soc_used=%u\n", n2p_mode,
+ 	    n2d_row_mhz(N2DV_LL, st->cur[N2DV_LL]), row >= 0 && row < 16 ? (int)n2d_row_mhz(N2DV_CCI, (unsigned)row) : -1, row, n2p_perf_now ? "on" : "off",
+-	    n2p_st.perf_ms, n2p_st.ll_fast_ms, n2p_st.cci_writes, n2p_st.ll_moves, n2p_st.ll_bad);
++	    n2p_st.perf_ms, n2p_st.ll_fast_ms, n2p_st.cci_writes, n2p_st.ll_moves, n2p_st.ll_bad, n2p_soc_cc, n2p_soc_used);
+ 	n2p_st.perf_ms = n2p_st.ll_fast_ms = n2p_st.cci_writes = n2p_st.ll_moves = 0;
+ }
+ 
+@@ -1070,6 +1089,9 @@
+ 				nord2_sched_prime = 0;
+ 				n2s_prime_floors = false;
+ 			}
++			if (gm & 16) {
++				n2g_therm_soc_off = true;                  /* 0643 kill: the battery-only ladder (steps 41/43/45/46 C) */
++			}
+ 			printf("NORD2 CPUPLAT: prime-first placement %s (kern n2prime=%d), B floors ui/anim/touch %s MHz\n", nord2_sched_prime ? "on" : "off",
+ 			    nord2_sched_prime, n2s_prime_floors ? "2463/2713/2713" : "1998/2463/2463 (0460)");
+ 		}
+@@ -1102,6 +1124,8 @@
+ 			if (slow_tick) {
+ 				struct n2g_hints h;
+ 				n2s_print(&st, &sg, mode);
++				n2p_soc_cc = sg.soc_cc;
++				n2p_soc_used = sg.soc_used;
+ 				n2p_print(&st);
+ 				nord2_dvfs_hints(&h);
+ 				n2s_report_done(&sg, &h);
