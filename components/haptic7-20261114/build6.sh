@@ -1,0 +1,3 @@
+#!/bin/bash
+cd $NORD2_WORK/gpu/build/haptic7-20261114/integ
+for v in a b c; do bash build_all.sh q10hapd6$v '"0611 $NORD2_WORK/gpu/build/haptic2-20261114" "0613 $NORD2_WORK/gpu/build/haptic3-20261114" "0614 $NORD2_WORK/gpu/build/haptic4-20261114" "0616 $NORD2_WORK/gpu/build/haptic5-20261114" "0618 $NORD2_WORK/gpu/build/haptic7-20261114/v6'$v'"' > $NORD2_WORK/gpu/build/haptic7-20261114/build_q10hapd6$v.log 2>&1; echo "== q10hapd6$v"; grep -E 'error:|FAILURES|SCANPATH_OK|outside the allowed|WIFI_MEMBERS_OK|KERNEL OK' $NORD2_WORK/gpu/build/haptic7-20261114/build_q10hapd6$v.log | cut -c1-120; sha256sum $NORD2_WORK/gpu/build/device-mmu-q10hapd6$v-candidate/ui-sched/*.img 2>&1 | sed 's#$NORD2_WORK/gpu/build/##'; done

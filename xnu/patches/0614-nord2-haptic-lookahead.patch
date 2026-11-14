@@ -1,0 +1,101 @@
+--- a/bsd/dev/nord2_haptic.h
++++ b/bsd/dev/nord2_haptic.h
+@@ -640,7 +640,7 @@
+ 	bool ram_ok;
+ 	uint64_t click_onset, clicks, stale, wave_n[N2H_W_COUNT + 1];
+ 	/* 0613: tick train + per-onset path record (n2h_click_take / the owner's per-waveform log) */
+-	uint64_t train_last_us, trains, onset_peak;
++	uint64_t train_last_us, trains, onset_peak, lookahead;
+ 	uint64_t ons_onset, ons_clicks, ons_cont, ons_skip, ons_peak_first;
+ 	uint64_t path_ram, path_train, path_cont, path_skip, path_none, dur_hist[5];
+ };
+--- a/bsd/dev/nord2_haptic.inc
++++ b/bsd/dev/nord2_haptic.inc
+@@ -15,6 +15,9 @@
+  * waveform still loud after a click gets more clicks every 70 ms (tick train) instead; a RAM play still busy at its end is stopped
+  * at once (GLB_STATE stayed 7 after the boot click: 87 ms of motor phase, onsets dropped); stale window 80 ms; one log line per iOS
+  * waveform with its length, peak and the path taken (RAM / RAM train / CONT / skip + why), and per-path sums.
++ * 0614 (haptic4-20261114): the waveform is chosen on the peak after a 9 ms lookahead (the first write often held only the attack:
++ * the same 10347-peak iOS waveform played a weak tick or a click at random), gain floor 0.85, tick 1.5 cycles + brake, and a RAM
++ * play gets 15 ms past its end to reach idle by itself before GO 0.
+  */
+ #include "nord2_haptic.h"
+ 
+@@ -392,6 +395,9 @@
+ 		return;
+ 	}
+ 	if (!ok) { return; }
++	/* 0614: GLB_STATE 7 / 0xa right after a click's end are the chip's own end-of-play states (ticks reached idle by ~30 ms by
++	 * themselves): give it N2H_RAM_SETTLE_MS before GO 0, so no play is cut */
++	if (now < n2h_ram.play_end_us + (uint64_t)N2H_RAM_SETTLE_MS * 1000u) { return; }
+ 	/* 0613: the waveform is over by time; the chip stays in GLB_STATE 7 (seen after the boot click) until GO 0: stop it now */
+ 	n2h_ram.overruns++;
+ 	if (n2h_ram.ovsaid < 8) { n2h_ram.ovsaid++; printf("NORD2 HAPTIC: RAM play end: GLB_STATE %#x %llu ms after the start: GO 0\n", glb, (now - n2h_hw.on_us) / 1000); }
+@@ -522,6 +528,7 @@
+ 			    "verify_bad %llu uploads %llu last gain %#x vbat %u mV\n", n2h_ram.state, n2h_strm.clicks, n2h_strm.wave_n[1],
+ 			    n2h_strm.wave_n[2], n2h_strm.wave_n[3], n2h_ram.plays, n2h_strm.stale, n2h_ram.overruns, n2h_ram.verify_bad,
+ 			    n2h_ram.uploads, n2h_ram.gain, n2h_hw.vbat_mv);
++			printf("NORD2 HAPTIC LOOKAHEAD: %llu ticks waited for a waveform's peak\n", n2h_strm.lookahead);
+ 			printf("NORD2 HAPTIC PATHS: RAM %llu train %llu (extra clicks %llu) CONT %llu skip %llu none %llu | iOS waveform ms <30 %llu "
+ 			    "<60 %llu <120 %llu <300 %llu >=300 %llu\n", n2h_strm.path_ram, n2h_strm.path_train, n2h_strm.trains, n2h_strm.path_cont,
+ 			    n2h_strm.path_skip, n2h_strm.path_none, n2h_strm.dur_hist[0], n2h_strm.dur_hist[1], n2h_strm.dur_hist[2],
+--- a/bsd/dev/nord2_haptic_ram.h
++++ b/bsd/dev/nord2_haptic_ram.h
+@@ -60,6 +60,7 @@
+ #define N2H_VBAT_MIN            3000u
+ #define N2H_VBAT_MAX            4500u
+ #define N2H_CLICK_STALE_US      80000ull  /* an onset not played within 80 ms (motor busy) is dropped (0613: was 40) */
++#define N2H_RAM_SETTLE_MS       15u       /* 0614: end-of-play states before GO 0 */
+ #define N2H_RAM_OVERRUN_MS      30u       /* RAM play still busy this long past the waveform: GO 0 */
+ #define N2H_TICK_BELOW          350u      /* level (0..1000 of N2H_PEAK_FULL) below this: tick */
+ #define N2H_HEAVY_PEAK          16384u    /* |sample| from half full scale: heavy */
+@@ -77,7 +78,7 @@
+ };
+ static const struct n2h_profile n2h_profiles[3] = {
+ 	{ "default", 358, N2H_GAIN_UNITY, { { 0, 0, { 0 } },
+-		{ 2, 2, { 100, 40 } },
++		{ 3, 3, { 100, 100, 40 } },        /* 0614: tick 1.5 cycles + brake (was 1 + 0.7: too weak) */
+ 		{ 4, 4, { 100, 100, 100, 40 } },
+ 		{ 6, 6, { 100, 100, 100, 100, 100, 40 } } } },
+ 	{ "strong", 512, N2H_GAIN_UNITY, { { 0, 0, { 0 } },
+@@ -85,7 +86,7 @@
+ 		{ 5, 5, { 100, 100, 100, 100, 40 } },
+ 		{ 7, 7, { 100, 100, 100, 100, 100, 100, 40 } } } },
+ 	{ "soft", 256, 0x60, { { 0, 0, { 0 } },
+-		{ 2, 2, { 100, 40 } },
++		{ 3, 3, { 100, 100, 40 } },
+ 		{ 4, 4, { 100, 100, 100, 40 } },
+ 		{ 6, 6, { 100, 100, 100, 100, 100, 40 } } } },
+ };
+@@ -256,7 +257,7 @@
+ 	if (level > 1000) { level = 1000; }
+ 	if (vbat_mv < N2H_VBAT_MIN) { vbat_mv = N2H_VBAT_MIN; }
+ 	if (vbat_mv > N2H_VBAT_MAX) { vbat_mv = N2H_VBAT_MAX; }
+-	uint32_t g = (uint32_t)p->gain_max * (550u + 450u * level / 1000u) / 1000u;
++	uint32_t g = (uint32_t)p->gain_max * (850u + 150u * level / 1000u) / 1000u;   /* 0614: floor 0.85 (was 0.55) */
+ 	g = g * N2H_VBAT_REFER / vbat_mv;
+ 	if (therm == 1) { g /= 2u; }
+ 	if (g > N2H_GAIN_HW_MAX) { g = N2H_GAIN_HW_MAX; }
+@@ -283,6 +284,7 @@
+  *  - the same limits as the CONT path (switch, latch, thermal, budget).
+  */
+ #define N2H_TRAIN_GAP_MS        70u
++#define N2H_LOOKAHEAD_US        9000ull   /* 0614 */
+ #define N2H_TRAIN_REL           50u
+ #define N2H_TRAIN_MIN_PEAK      2048u
+ static inline bool
+@@ -302,6 +304,14 @@
+ 		if (s->budget_us <= 0) { s->throttled++; t->ons_skip = N2H_SKIP_BUDGET; return false; }
+ 		peak = (uint32_t)e->peak;
+ 		t->onset_peak = peak;
++		/* 0614: the first write of a waveform often holds only its attack (log: "first 1040" of a 10347 waveform -> weak tick);
++		 * a soft-looking onset waits until N2H_LOOKAHEAD_US of it were written (one more 5.3 ms write), then decides on the peak */
++		if (n2h_wave_for(peak, &level) != N2H_W_CLICK && n2h_wave_for(peak, &level) != N2H_W_HEAVY &&
++		    now - onset < N2H_LOOKAHEAD_US && !(quiet > heard)) {
++			t->click_onset = 0;            /* not taken yet: the next tick looks again */
++			t->lookahead++;
++			return false;
++		}
+ 	} else {
+ 		/* tick train: same waveform, still sounding, still loud, not yet a CONT-length event */
+ 		if (t->ons_clicks == 0 || t->ons_onset != onset) { return false; }

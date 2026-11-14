@@ -1,0 +1,225 @@
+--- a/bsd/dev/nord2_haptic.h
++++ b/bsd/dev/nord2_haptic.h
+@@ -585,6 +585,7 @@
+ 	volatile uint64_t peak;       /* largest |sample| since the onset or since the owner last took it */
+ 	volatile uint64_t onsets, frames, writes;
+ 	volatile uint64_t zc, act_frames;    /* 0611: zero crossings / non-silent frames since the onset (iOS waveform frequency) */
++	volatile uint64_t peak_recent;       /* 0613: largest |sample| since the owner last cleared it (train / CONT decisions) */
+ 	volatile int64_t last_sign;
+ };
+ 
+@@ -611,11 +612,13 @@
+ 		e->onsets++;
+ 		e->zc = 0;
+ 		e->last_sign = 0;
++		e->peak_recent = 0;
+ 		e->act_frames = 0;
+ 	}
+ 	e->act_frames += frames;
+ 	e->heard_us = now;
+ 	if (peak > e->peak) { e->peak = peak; }
++	if (peak > e->peak_recent) { e->peak_recent = peak; }
+ }
+ 
+ /* the drive for a stream peak (HackiOS gain_for, in DRV_LVL terms; thermal halving on top) */
+@@ -636,8 +639,13 @@
+ 	 * still sounding N2H_SUSTAIN_MS after its onset (iOS continuous events, the ringer's vibration) */
+ 	bool ram_ok;
+ 	uint64_t click_onset, clicks, stale, wave_n[N2H_W_COUNT + 1];
++	/* 0613: tick train + per-onset path record (n2h_click_take / the owner's per-waveform log) */
++	uint64_t train_last_us, trains, onset_peak;
++	uint64_t ons_onset, ons_clicks, ons_cont, ons_skip, ons_peak_first;
++	uint64_t path_ram, path_train, path_cont, path_skip, path_none, dur_hist[5];
+ };
+-#define N2H_SUSTAIN_MS          50u
++#define N2H_SUSTAIN_MS          300u      /* 0613: CONT only for a waveform still sounding 300 ms after its onset (was 50) */
++enum { N2H_SKIP_NONE = 0, N2H_SKIP_STALE, N2H_SKIP_BUDGET, N2H_SKIP_OFF, N2H_SKIP_TAIL };
+ 
+ /*
+  * The whole decision for a tick: an internal pattern (boot pulse, test) first, else the stream.
+--- a/bsd/dev/nord2_haptic.inc
++++ b/bsd/dev/nord2_haptic.inc
+@@ -11,6 +11,10 @@
+  * to the chip's SRAM in 128-byte steps (one per tick, then read back and compared) and from then on plays each iOS onset as one
+  * RAM click (tick / click / heavy by the onset's peak, gain by level and VBAT); CONT drive is kept only for waveforms still
+  * sounding 50 ms after their onset.  A failed upload or verify keeps the 0610 CONT behaviour.  nord2_haptic_ram.h.
++ * 0613 (haptic3-20261114): CONT only after 300 ms of loud sound (was 50 ms: UIKit waveforms of 50..120 ms got click + buzz); a
++ * waveform still loud after a click gets more clicks every 70 ms (tick train) instead; a RAM play still busy at its end is stopped
++ * at once (GLB_STATE stayed 7 after the boot click: 87 ms of motor phase, onsets dropped); stale window 80 ms; one log line per iOS
++ * waveform with its length, peak and the path taken (RAM / RAM train / CONT / skip + why), and per-path sums.
+  */
+ #include "nord2_haptic.h"
+ 
+@@ -387,11 +391,11 @@
+ 		if (n2h_ram.wsaid < 6) { n2h_ram.wsaid++; printf("NORD2 HAPTIC: click done, idle %llu ms after the start\n", (now - n2h_hw.on_us) / 1000); }
+ 		return;
+ 	}
+-	if (now >= n2h_ram.play_end_us + (uint64_t)N2H_RAM_OVERRUN_MS * 1000u) {
+-		n2h_ram.overruns++;
+-		if (n2h_ram.ovsaid < 8) { n2h_ram.ovsaid++; printf("NORD2 HAPTIC: RAM play still busy (GLB_STATE %#x) %llu ms after the start: GO 0\n", glb, (now - n2h_hw.on_us) / 1000); }
+-		n2h_hw_stop(now, NULL);
+-	}
++	if (!ok) { return; }
++	/* 0613: the waveform is over by time; the chip stays in GLB_STATE 7 (seen after the boot click) until GO 0: stop it now */
++	n2h_ram.overruns++;
++	if (n2h_ram.ovsaid < 8) { n2h_ram.ovsaid++; printf("NORD2 HAPTIC: RAM play end: GLB_STATE %#x %llu ms after the start: GO 0\n", glb, (now - n2h_hw.on_us) / 1000); }
++	n2h_hw_stop(now, NULL);
+ }
+ 
+ /* 0611: one line per iOS waveform once it ended (first 40): its length, peak and frequency, for the tuning */
+@@ -402,12 +406,14 @@
+ 	if (onset == 0 || onset == n2h_ram.logged_onset || heard < onset) { return; }
+ 	if (!(quiet > heard || now - heard >= N2H_ACTIVE_US)) { return; }
+ 	n2h_ram.logged_onset = onset;
++	uint64_t fr = n2h_env_g.act_frames, zc = n2h_env_g.zc, dur = (heard - onset) / 1000 + 5;   /* + the last 256-frame write */
++	const char *path = n2h_path_account(&n2h_strm, onset, dur);
+ 	static unsigned said;
+-	if (said >= 40) { return; }
++	if (said >= 200) { return; }
+ 	said++;
+-	uint64_t fr = n2h_env_g.act_frames, zc = n2h_env_g.zc;
+-	printf("NORD2 HAPTIC: iOS waveform: onset to last sound %llu ms, %llu non-silent frames (%llu ms), peak %llu, ~%llu Hz\n",
+-	    (heard - onset) / 1000, fr, fr / 48u, n2h_env_g.peak, fr ? zc * 48000u / (2u * fr) : 0);
++	printf("NORD2 HAPTIC: iOS waveform %llu ms (%llu loud frames), peak %llu (first %llu), ~%llu Hz -> %s, clicks %llu%s\n", dur, fr,
++	    n2h_env_g.peak, n2h_strm.ons_onset == onset ? n2h_strm.ons_peak_first : 0, fr ? zc * 48000u / (2u * fr) : 0, path,
++	    n2h_strm.ons_onset == onset ? n2h_strm.ons_clicks : 0, n2h_strm.ons_onset == onset && n2h_strm.ons_cont ? ", CONT" : "");
+ }
+ 
+ /* input owner thread, every loop (10 ms) */
+@@ -450,8 +456,9 @@
+ 			if (n2h_measure_vbat(&n2h_bus_g, &mv) && mv >= 2500 && mv <= 4700) { n2h_hw.vbat_mv = mv; }
+ 		}
+ 		n2h_budget(&n2h_st, now, false);
++		uint64_t tr0 = n2h_strm.trains;
+ 		if (n2h_click_take(&n2h_st, &n2h_strm, &n2h_env_g, &c, now, n2h_hw.vbat_mv, N2H_PROFILE, &wave, &gain, &peak)) {
+-			n2h_ram_start(wave, gain, now, "iOS", peak, now - n2h_env_g.onset_us);
++			n2h_ram_start(wave, gain, now, n2h_strm.trains != tr0 ? "iOS train" : "iOS", peak, now - n2h_env_g.onset_us);
+ 		}
+ 	}
+ 	hw_on = n2h_hw.phase == N2H_HW_ON || n2h_hw.phase == N2H_HW_RAM;
+@@ -462,6 +469,15 @@
+ 	if (n2h_st.latched) { return; }
+ 	switch (n2h_hw.phase) {
+ 	case N2H_HW_OFF:
++		if (want && !pattern && n2h_strm.ram_ok) {
++			/* 0613: CONT for a long iOS waveform only while it is still loud (not a quiet tail) */
++			if (n2h_env_g.peak_recent < N2H_TRAIN_MIN_PEAK) {
++				if (n2h_strm.ons_onset == n2h_env_g.onset_us && !n2h_strm.ons_clicks) { n2h_strm.ons_skip = N2H_SKIP_TAIL; }
++				break;
++			}
++			n2h_env_g.peak_recent = 0;
++			if (n2h_strm.ons_onset == n2h_env_g.onset_us) { n2h_strm.ons_cont = 1; }
++		}
+ 		if (want) { n2h_hw_start(drv, now, until, pattern ? n2h_fx_table[n2h_st.effect].name : "iOS"); }
+ 		break;
+ 	case N2H_HW_ON:
+@@ -506,6 +522,10 @@
+ 			    "verify_bad %llu uploads %llu last gain %#x vbat %u mV\n", n2h_ram.state, n2h_strm.clicks, n2h_strm.wave_n[1],
+ 			    n2h_strm.wave_n[2], n2h_strm.wave_n[3], n2h_ram.plays, n2h_strm.stale, n2h_ram.overruns, n2h_ram.verify_bad,
+ 			    n2h_ram.uploads, n2h_ram.gain, n2h_hw.vbat_mv);
++			printf("NORD2 HAPTIC PATHS: RAM %llu train %llu (extra clicks %llu) CONT %llu skip %llu none %llu | iOS waveform ms <30 %llu "
++			    "<60 %llu <120 %llu <300 %llu >=300 %llu\n", n2h_strm.path_ram, n2h_strm.path_train, n2h_strm.trains, n2h_strm.path_cont,
++			    n2h_strm.path_skip, n2h_strm.path_none, n2h_strm.dur_hist[0], n2h_strm.dur_hist[1], n2h_strm.dur_hist[2],
++			    n2h_strm.dur_hist[3], n2h_strm.dur_hist[4]);
+ 		}
+ 	}
+ }
+--- a/bsd/dev/nord2_haptic_ram.h
++++ b/bsd/dev/nord2_haptic_ram.h
+@@ -59,7 +59,7 @@
+ #define N2H_VBAT_REFER          4400u     /* Android AW8697_VBAT_REFER / MIN / MAX */
+ #define N2H_VBAT_MIN            3000u
+ #define N2H_VBAT_MAX            4500u
+-#define N2H_CLICK_STALE_US      40000ull  /* an onset not played within 40 ms (motor busy) is dropped */
++#define N2H_CLICK_STALE_US      80000ull  /* an onset not played within 80 ms (motor busy) is dropped (0613: was 40) */
+ #define N2H_RAM_OVERRUN_MS      30u       /* RAM play still busy this long past the waveform: GO 0 */
+ #define N2H_TICK_BELOW          350u      /* level (0..1000 of N2H_PEAK_FULL) below this: tick */
+ #define N2H_HEAVY_PEAK          16384u    /* |sample| from half full scale: heavy */
+@@ -275,30 +275,77 @@
+ }
+ 
+ /*
+- * A new iOS onset -> one RAM click (call only when the motor is idle).  true = play *wave at *gain.  An onset older than
+- * N2H_CLICK_STALE_US (the motor was busy) is dropped; the same limits as the CONT path apply (switch, latch, thermal, budget).
++ * 0613: the RAM click decision for this tick (call only when the motor is idle).  true = play *wave at *gain.
++ *  - a new onset: one click (waveform by its peak); an onset older than N2H_CLICK_STALE_US (motor busy) is dropped (skip "stale");
++ *  - the same waveform still sounding (iOS continuous event / pattern) and still loud (recent peak >= N2H_TRAIN_REL % of the onset's
++ *    peak and >= N2H_TRAIN_MIN_PEAK): one more click every N2H_TRAIN_GAP_MS until N2H_SUSTAIN_MS (Android-style tick train;
++ *    CONT drive is left for waveforms longer than that, i.e. the ringer's vibration);
++ *  - the same limits as the CONT path (switch, latch, thermal, budget).
+  */
++#define N2H_TRAIN_GAP_MS        70u
++#define N2H_TRAIN_REL           50u
++#define N2H_TRAIN_MIN_PEAK      2048u
+ static inline bool
+-n2h_click_take(struct n2h_state *s, struct n2h_stream *t, const struct n2h_env *e, const struct n2h_cfg *c, uint64_t now,
++n2h_click_take(struct n2h_state *s, struct n2h_stream *t, struct n2h_env *e, const struct n2h_cfg *c, uint64_t now,
+     uint32_t vbat_mv, const struct n2h_profile *p, uint8_t *wave, uint8_t *gain, uint32_t *peak_out)
+ {
+-	uint64_t onset = e->onset_us, heard = e->heard_us;
++	uint64_t onset = e->onset_us, heard = e->heard_us, quiet = e->quiet_us;
++	uint32_t peak, level = 0;
+ 	if (!t->ram_ok || s->nseg) { return false; }
+-	if (onset == 0 || onset == t->click_onset || heard < onset) { return false; }
+-	t->click_onset = onset;
+-	if (!c->mode || s->latched || s->therm >= 2) { return false; }
+-	if (now < onset || now - onset > N2H_CLICK_STALE_US) { t->stale++; return false; }
+-	if (s->budget_us <= 0) { s->throttled++; return false; }
+-	uint32_t peak = (uint32_t)e->peak, level = 0;
++	if (onset == 0 || heard < onset) { return false; }
++	if (onset != t->click_onset) {
++		t->click_onset = onset;
++		t->ons_onset = onset; t->ons_clicks = 0; t->ons_cont = 0; t->ons_skip = N2H_SKIP_NONE;
++		t->ons_peak_first = e->peak;
++		if (!c->mode || s->latched || s->therm >= 2) { t->ons_skip = N2H_SKIP_OFF; return false; }
++		if (now < onset || now - onset > N2H_CLICK_STALE_US) { t->stale++; t->ons_skip = N2H_SKIP_STALE; return false; }
++		if (s->budget_us <= 0) { s->throttled++; t->ons_skip = N2H_SKIP_BUDGET; return false; }
++		peak = (uint32_t)e->peak;
++		t->onset_peak = peak;
++	} else {
++		/* tick train: same waveform, still sounding, still loud, not yet a CONT-length event */
++		if (t->ons_clicks == 0 || t->ons_onset != onset) { return false; }
++		if (!(quiet <= heard && now >= heard && now - heard < N2H_ACTIVE_US)) { return false; }
++		if (now - onset >= (uint64_t)N2H_SUSTAIN_MS * 1000u || now - t->train_last_us < (uint64_t)N2H_TRAIN_GAP_MS * 1000u) { return false; }
++		peak = (uint32_t)e->peak_recent;
++		uint64_t need = t->onset_peak * N2H_TRAIN_REL / 100u;
++		if (need < N2H_TRAIN_MIN_PEAK) { need = N2H_TRAIN_MIN_PEAK; }
++		if (peak < need) { return false; }
++		if (!c->mode || s->latched || s->therm >= 2) { return false; }
++		if (s->budget_us <= 0) { s->throttled++; return false; }
++		t->trains++;
++	}
+ 	if (peak <= N2H_SILENT_BELOW) { peak = N2H_SILENT_BELOW + 1; }
+ 	*wave = n2h_wave_for(peak, &level);
+ 	*gain = n2h_gain_for(level, vbat_mv, s->therm, p);
+ 	*peak_out = peak;
++	e->peak_recent = 0;
++	t->train_last_us = now;
+ 	t->clicks++;
++	t->ons_clicks++;
+ 	t->wave_n[*wave]++;
+ 	return true;
+ }
+ 
++/* 0613: the path an ended iOS waveform took (counted once, by the owner's per-waveform log); returns a name for the log */
++static inline const char *
++n2h_path_account(struct n2h_stream *t, uint64_t onset, uint64_t dur_ms)
++{
++	unsigned b = dur_ms < 30 ? 0 : dur_ms < 60 ? 1 : dur_ms < 120 ? 2 : dur_ms < 300 ? 3 : 4;
++	t->dur_hist[b]++;
++	bool mine = t->ons_onset == onset;
++	if (mine && t->ons_cont) { t->path_cont++; return t->ons_clicks ? "RAM+CONT" : "CONT"; }
++	if (mine && t->ons_clicks > 1) { t->path_train++; return "RAM train"; }
++	if (mine && t->ons_clicks == 1) { t->path_ram++; return "RAM"; }
++	if (mine && t->ons_skip) {
++		t->path_skip++;
++		return t->ons_skip == N2H_SKIP_STALE ? "skip (motor busy > 80 ms)" : t->ons_skip == N2H_SKIP_BUDGET ? "skip (budget)" :
++		    t->ons_skip == N2H_SKIP_TAIL ? "skip (quiet tail)" : "skip (off/thermal/latched)";
++	}
++	t->path_none++;
++	return "none (not seen while idle)";
++}
++
+ /* zero crossings of a write's samples with a +-N2H_SILENT_BELOW hysteresis (the iOS waveform's frequency, for the log) */
+ static inline unsigned
+ n2h_zc_count(const int16_t *s, unsigned n, volatile int64_t *last_sign)

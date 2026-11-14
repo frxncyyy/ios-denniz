@@ -1,0 +1,1214 @@
+--- /dev/null
++++ b/bsd/dev/nord2_haptic.h
+@@ -0,0 +1,635 @@
++/*
++ * nord2_haptic.h -- 0610 (haptic-20261114): the Awinic AW8697 LRA haptic driver (pure C: register sequences, effect table,
++ * limits and watchdog policy; host-tested by test/haptic_test.c against a simulated AW8697).  The XNU side is nord2_haptic.inc.
++ *
++ * Hardware [V = verified from the sources / Android logs named]:
++ *  - [V ios-sweet/dtb/nord2/live.dts, the live Nord 2 DT] i2c9@11CB1000 (SCL GPIO120, SDA GPIO121, 400 kHz) node aw8697_haptic@5A:
++ *    compatible "awinic,aw8697_haptic", reg 0x5a, reset-gpio GPIO110 (0x6e), irq-gpio GPIO135 (0x87, input pull-up),
++ *    qcom,device_id 815.  The same bus carries the alert-slider halls (nord2_slider.inc already bit-bangs it on the input thread).
++ *  - [V Android dmesg baseband-recon-20261104/dmesg_vendor_debug.log, wifi/rescue-dmesg.txt] "aw8697_haptic 9-005a: ...
++ *    device_id=815", "aw8697_read_chipid aw8697 detected", "aw8697_haptic_init get f0_pre=1700"; the RAM waveform file
++ *    aw8697_haptic_170.bin is NOT on the phone ("failed to read aw8697_haptic_170.bin"), and no awinic firmware exists in the vendor
++ *    dump (cam-vendor-20261109/vfs) either.  So this driver uses CONT mode only (the chip drives the LRA at its own resonance,
++ *    closed loop on the back-EMF), which needs no waveform file.  RAM and RTP modes are not used (RTP would need ~24 kB/s, far
++ *    beyond the ~8 kB/s of the software I2C anyway).
++ *  - [V nord2-current-kernel drivers/misc/aw8697_haptic/aw8697.c v1.3.6, aw8697.h, aw8697_reg.h] chip id reg 0x00 = 0x97, soft reset
++ *    = write 0xAA to reg 0x00; reset pin low 1-2 ms then high, 3.5-4 ms before I2C; init = aw8697_haptic_init (standby, PWM 24K,
++ *    BSTDBG1..3 = 30/eb/d4, TSET 0x12, R_SPARE 0x68, IOC 4.65 A, peak current 3.5 A, motor protect "no action", manual boost,
++ *    triggers off, offset calibration, CONT vbat HW compensation); CONT play = aw8697_haptic_cont with the 0815 constants
++ *    F0_PRE 1700 (170 Hz), DRV_LVL 60, DRV_LVL_OV 125, TD 0x009a, ZC_THR 0x0ff1, NUM_BRK 3 (aw8697.h AW8697_0815_*);
++ *    stop = GO 0, wait GLB_STATE[3:0] == 0 (Android: 200 x 2 ms, else soft reset + re-init), then standby.
++ *  - CONT mode sets BST_MODE = BYPASS (aw8697_haptic_play_mode case CONT): the boost converter is never enabled by this driver,
++ *    and BSTDBG4 (boost voltage) is never written.  No boost over-voltage is possible from here.
++ *
++ * Limits (all enforced here, host-tested): drive level <= N2H_DRV_HW_MAX (= the Android 0815 value, sysctl can only lower it);
++ * one segment <= kern.n2hap_max_ms (default 1000, hard 3000); on-time budget (token bucket, N2H_BUDGET_MS full, refills at half the
++ * elapsed time = 50 % long-run duty); battery >= 43 C half drive, >= 46 C off until < 44 C; a motor still on 50 ms past its segment
++ * end is stopped (watchdog); a stop not confirmed within N2H_STOP_TIMEOUT_US -> soft reset + re-init; 3 I2C failures in a row ->
++ * reset pin held low (the chip, and so the motor, is off without I2C) and the driver latched off for the boot.
++ *
++ * Userland ABI of /dev/redwood-haptic (0666, write only) [V haptic-20261114/re: RedwoodAudio.driver strings; its source
++ * scratchpad-backup-20261106/halplug/d/audio_plugin.c actuator_write]: the HAL plug-in's 1-channel "Actuator" output device (where
++ * iOS 16 plays every haptic as a waveform once MobileGestalt says DeviceSupportsClosedLoopHaptics: UIKit feedbacks, keyboard,
++ * CoreHaptics, system haptics, the ringer's vibration) opens the node once O_WRONLY|O_NONBLOCK and writes each I/O cycle's
++ * int16 mono samples (48 kHz).  Same contract as HackiOS redwood_haptic.c (haptic=5).  The write never waits: it only records the
++ * envelope (n2h_env_feed); the input owner thread turns it into CONT drive: the motor runs while iOS's waveform is not silent
++ * (|sample| > N2H_SILENT_BELOW), at least N2H_TAP_MIN_MS from an onset, at a drive that follows the waveform's peak (full drive
++ * from a third of full scale up, five eighths of it for the softest: HackiOS gain_for), never longer than kern.n2hap_max_ms in one
++ * go (then it rests as long).  The last close (mediaserverd gone) stops the motor; so does silence or no write for N2H_ACTIVE_US.
++ */
++#ifndef NORD2_HAPTIC_H
++#define NORD2_HAPTIC_H
++#include <stdint.h>
++#include <stdbool.h>
++
++/* ---- chip ---- */
++#define N2H_ADDR                0x5Au
++#define N2H_CHIPID              0x97u
++#define N2H_GPIO_RESET          110u
++#define N2H_GPIO_IRQ            135u
++
++#define N2H_REG_ID              0x00u
++#define N2H_REG_SYSST           0x01u
++#define N2H_REG_SYSINT          0x02u
++#define N2H_REG_SYSINTM         0x03u
++#define N2H_REG_SYSCTRL         0x04u
++#define N2H_REG_GO              0x05u
++#define N2H_REG_TRG_CFG2        0x1Cu
++#define N2H_REG_DATCTRL         0x2Bu
++#define N2H_REG_PWMPRC          0x2Du
++#define N2H_REG_PWMDBG          0x2Eu
++#define N2H_REG_BSTDBG1         0x31u
++#define N2H_REG_BSTDBG2         0x32u
++#define N2H_REG_BSTDBG3         0x33u
++#define N2H_REG_BSTCFG          0x34u
++#define N2H_REG_ANADBG          0x35u
++#define N2H_REG_ANACTRL         0x36u
++#define N2H_REG_DATDBG          0x39u
++#define N2H_REG_BSTDBG4         0x3Au
++#define N2H_REG_PRLVL           0x3Eu
++#define N2H_REG_GLB_STATE       0x46u
++#define N2H_REG_BST_AUTO        0x47u
++#define N2H_REG_CONT_CTRL       0x48u
++#define N2H_REG_F_PRE_H         0x49u
++#define N2H_REG_F_PRE_L         0x4Au
++#define N2H_REG_TD_H            0x4Bu
++#define N2H_REG_TD_L            0x4Cu
++#define N2H_REG_TSET            0x4Du
++#define N2H_REG_TRIM_LRA        0x5Bu
++#define N2H_REG_R_SPARE         0x5Du
++#define N2H_REG_D2SCFG          0x5Eu
++#define N2H_REG_DETCTRL         0x5Fu
++#define N2H_REG_RLDET           0x60u
++#define N2H_REG_VBATDET         0x62u
++#define N2H_REG_ADCTEST         0x66u
++#define N2H_REG_F_LRA_CONT_H    0x6Au
++#define N2H_REG_F_LRA_CONT_L    0x6Bu
++#define N2H_REG_ZC_THRSH_H      0x72u
++#define N2H_REG_ZC_THRSH_L      0x73u
++#define N2H_REG_BEMF_VTHH_H     0x74u
++#define N2H_REG_BEMF_VTHH_L     0x75u
++#define N2H_REG_BEMF_VTHL_H     0x76u
++#define N2H_REG_BEMF_VTHL_L     0x77u
++#define N2H_REG_BEMF_NUM        0x78u
++#define N2H_REG_TIME_NZC        0x7Au
++#define N2H_REG_DRV_LVL         0x7Bu
++#define N2H_REG_DRV_LVL_OV      0x7Cu
++
++#define N2H_SYSCTRL_RAMINIT     0x20u
++#define N2H_SYSCTRL_PLAY_MASK   0x0Cu
++#define N2H_SYSCTRL_PLAY_CONT   0x08u
++#define N2H_SYSCTRL_BOOST       0x02u     /* never set by this driver */
++#define N2H_SYSCTRL_STANDBY     0x01u
++#define N2H_SYSINTM_UVLO        0x20u     /* 1 = UVLO interrupt masked (standby), 0 = enabled (active) */
++#define N2H_GO                  0x01u
++#define N2H_SOFTRESET           0xAAu
++#define N2H_GLB_BUSY_MASK       0x0Fu
++#define N2H_DETCTRL_RL          0x40u
++#define N2H_DETCTRL_NOPROTECT   0x20u
++#define N2H_DETCTRL_VBAT_GO     0x02u
++#define N2H_DETCTRL_DIAG_GO     0x01u
++#define N2H_ANACTRL_HD_PD       0x08u
++#define N2H_D2SCFG_CLK_MASK     0xE0u
++#define N2H_D2SCFG_CLK_1P5M     0x60u
++#define N2H_D2SCFG_CLK_6M       0x20u
++#define N2H_CONT_CTRL_VALUE     0x89u     /* ZC detect | wait 1 period | by GO | close loop | f0 detect off | O2C off | auto brake */
++
++/* 0815 motor (Android aw8697.h AW8697_0815_*) */
++#define N2H_F0_PRE              1700u     /* 0.1 Hz */
++#define N2H_F0_COEFF            260u
++#define N2H_TD                  0x009Au
++#define N2H_ZC_THR              0x0FF1u
++#define N2H_NUM_BRK             3u
++#define N2H_DRV_HW_MAX          60u       /* DRV_LVL ceiling = the Android value */
++#define N2H_DRV_OV_HW_MAX       125u      /* DRV_LVL_OV ceiling = the Android value */
++#define N2H_DRV_MIN             18u       /* level 1/1000 maps here */
++
++/* ---- register sequences (interpreted by n2h_run; mask = the bits changed) ---- */
++enum { N2H_OP_W = 1, N2H_OP_RMW, N2H_OP_DLY_MS, N2H_OP_DRV, N2H_OP_DRV_OV, N2H_OP_WAIT_CLR };
++struct n2h_op { uint8_t op, reg, mask, val; };
++
++/* after the chip id check (aw8697_haptic_init order; the RAM / trigger / proc parts of Android are not used) */
++static const struct n2h_op n2h_seq_init[] = {
++	{ N2H_OP_RMW, N2H_REG_SYSINTM, N2H_SYSINTM_UVLO, N2H_SYSINTM_UVLO },       /* standby mode */
++	{ N2H_OP_RMW, N2H_REG_SYSCTRL, N2H_SYSCTRL_STANDBY | N2H_SYSCTRL_BOOST, N2H_SYSCTRL_STANDBY },
++	{ N2H_OP_RMW, N2H_REG_PWMDBG, 0x60, 0x40 },                                /* PWM 24K */
++	{ N2H_OP_W, N2H_REG_BSTDBG1, 0xFF, 0x30 },
++	{ N2H_OP_W, N2H_REG_BSTDBG2, 0xFF, 0xEB },
++	{ N2H_OP_W, N2H_REG_BSTDBG3, 0xFF, 0xD4 },
++	{ N2H_OP_W, N2H_REG_TSET, 0xFF, 0x12 },
++	{ N2H_OP_W, N2H_REG_R_SPARE, 0xFF, 0x68 },
++	{ N2H_OP_RMW, N2H_REG_ANADBG, 0x0C, 0x0C },                                /* IOC 4.65 A */
++	{ N2H_OP_RMW, N2H_REG_BSTCFG, 0x07, 0x05 },                                /* boost peak current 3.5 A (boost unused) */
++	{ N2H_OP_RMW, N2H_REG_DETCTRL, N2H_DETCTRL_NOPROTECT, N2H_DETCTRL_NOPROTECT },/* motor protect config 0 (Android) */
++	{ N2H_OP_RMW, N2H_REG_PWMPRC, 0x80, 0x00 },
++	{ N2H_OP_RMW, N2H_REG_PRLVL, 0x80, 0x00 },
++	{ N2H_OP_RMW, N2H_REG_BST_AUTO, 0x07, 0x00 },                              /* manual boost, auto boost off for RAM/RTP */
++	{ N2H_OP_RMW, N2H_REG_TRG_CFG2, 0x07, 0x00 },                              /* TRIG1..3 off (OPLUS "disable trig") */
++	{ N2H_OP_RMW, N2H_REG_SYSCTRL, N2H_SYSCTRL_RAMINIT, N2H_SYSCTRL_RAMINIT },  /* offset calibration */
++	{ N2H_OP_RMW, N2H_REG_DETCTRL, N2H_DETCTRL_DIAG_GO, N2H_DETCTRL_DIAG_GO },
++	{ N2H_OP_WAIT_CLR, N2H_REG_DETCTRL, N2H_DETCTRL_DIAG_GO, 20 },              /* <= 20 reads */
++	{ N2H_OP_RMW, N2H_REG_SYSCTRL, N2H_SYSCTRL_RAMINIT, 0 },
++	{ N2H_OP_RMW, N2H_REG_ADCTEST, 0x40, 0x40 },                               /* CONT vbat HW compensation */
++};
++
++/* the CONT block (aw8697_haptic_cont minus play_mode / GO); written before every start */
++static const struct n2h_op n2h_seq_cont[] = {
++	{ N2H_OP_W, N2H_REG_F_PRE_H, 0xFF, (uint8_t)((1000000000u / (N2H_F0_PRE * N2H_F0_COEFF)) >> 8) },
++	{ N2H_OP_W, N2H_REG_F_PRE_L, 0xFF, (uint8_t)(1000000000u / (N2H_F0_PRE * N2H_F0_COEFF)) },
++	{ N2H_OP_RMW, N2H_REG_DATCTRL, 0xE0, 0xE0 },                               /* FC bits as Android leaves them | LPF on */
++	{ N2H_OP_W, N2H_REG_CONT_CTRL, 0xFF, N2H_CONT_CTRL_VALUE },
++	{ N2H_OP_W, N2H_REG_TD_H, 0xFF, (uint8_t)(N2H_TD >> 8) },
++	{ N2H_OP_W, N2H_REG_TD_L, 0xFF, (uint8_t)N2H_TD },
++	{ N2H_OP_W, N2H_REG_TSET, 0xFF, 0x12 },
++	{ N2H_OP_W, N2H_REG_ZC_THRSH_H, 0xFF, (uint8_t)(N2H_ZC_THR >> 8) },
++	{ N2H_OP_W, N2H_REG_ZC_THRSH_L, 0xFF, (uint8_t)N2H_ZC_THR },
++	{ N2H_OP_W, N2H_REG_BEMF_VTHH_H, 0xFF, 0x10 },
++	{ N2H_OP_W, N2H_REG_BEMF_VTHH_L, 0xFF, 0x08 },
++	{ N2H_OP_W, N2H_REG_BEMF_VTHL_H, 0xFF, 0x03 },
++	{ N2H_OP_W, N2H_REG_BEMF_VTHL_L, 0xFF, 0xF8 },
++	{ N2H_OP_RMW, N2H_REG_BEMF_NUM, 0x0F, N2H_NUM_BRK },
++	{ N2H_OP_W, N2H_REG_TIME_NZC, 0xFF, 0x23 },
++};
++
++/* start: drive levels, CONT play mode with the boost bypassed, active, UVLO irq on, GO */
++static const struct n2h_op n2h_seq_start[] = {
++	{ N2H_OP_DRV, N2H_REG_DRV_LVL, 0xFF, 0 },
++	{ N2H_OP_DRV_OV, N2H_REG_DRV_LVL_OV, 0xFF, 0 },
++	{ N2H_OP_RMW, N2H_REG_SYSCTRL, N2H_SYSCTRL_PLAY_MASK | N2H_SYSCTRL_BOOST | N2H_SYSCTRL_STANDBY | N2H_SYSCTRL_RAMINIT,
++	  N2H_SYSCTRL_PLAY_CONT },
++	{ N2H_OP_RMW, N2H_REG_SYSINTM, N2H_SYSINTM_UVLO, 0 },
++	{ N2H_OP_RMW, N2H_REG_GO, N2H_GO, N2H_GO },
++};
++
++/* stop request (the brake runs in the chip; standby follows once GLB_STATE[3:0] == 0) */
++static const struct n2h_op n2h_seq_stop[] = {
++	{ N2H_OP_RMW, N2H_REG_GO, N2H_GO, 0 },
++};
++
++static const struct n2h_op n2h_seq_standby[] = {
++	{ N2H_OP_RMW, N2H_REG_SYSINTM, N2H_SYSINTM_UVLO, N2H_SYSINTM_UVLO },
++	{ N2H_OP_RMW, N2H_REG_SYSCTRL, N2H_SYSCTRL_STANDBY | N2H_SYSCTRL_BOOST, N2H_SYSCTRL_STANDBY },
++};
++
++/* registers this driver may write (everything else, e.g. BSTDBG4 boost voltage, RAM, RTP FIFO, TRIM_LRA, is refused) */
++static inline bool
++n2h_reg_writable(uint8_t reg)
++{
++	switch (reg) {
++	case N2H_REG_ID:          /* soft reset 0xAA only (checked by the caller) */
++	case N2H_REG_SYSINTM: case N2H_REG_SYSCTRL: case N2H_REG_GO: case N2H_REG_TRG_CFG2: case N2H_REG_DATCTRL:
++	case N2H_REG_PWMPRC: case N2H_REG_PWMDBG: case N2H_REG_BSTDBG1: case N2H_REG_BSTDBG2: case N2H_REG_BSTDBG3:
++	case N2H_REG_BSTCFG: case N2H_REG_ANADBG: case N2H_REG_ANACTRL: case N2H_REG_PRLVL: case N2H_REG_BST_AUTO:
++	case N2H_REG_CONT_CTRL: case N2H_REG_F_PRE_H: case N2H_REG_F_PRE_L: case N2H_REG_TD_H: case N2H_REG_TD_L:
++	case N2H_REG_TSET: case N2H_REG_R_SPARE: case N2H_REG_D2SCFG: case N2H_REG_DETCTRL: case N2H_REG_ADCTEST:
++	case N2H_REG_ZC_THRSH_H: case N2H_REG_ZC_THRSH_L: case N2H_REG_BEMF_VTHH_H: case N2H_REG_BEMF_VTHH_L:
++	case N2H_REG_BEMF_VTHL_H: case N2H_REG_BEMF_VTHL_L: case N2H_REG_BEMF_NUM: case N2H_REG_TIME_NZC:
++	case N2H_REG_DRV_LVL: case N2H_REG_DRV_LVL_OV:
++		return true;
++	default:
++		return false;
++	}
++}
++
++/* bus callbacks (the XNU side: the I2C9 software bus on the input thread; the host test: the simulated chip) */
++struct n2h_bus {
++	void *ctx;
++	bool (*rd)(void *ctx, uint8_t reg, uint8_t *v);
++	bool (*wr)(void *ctx, uint8_t reg, uint8_t v);
++	void (*sleep_ms)(void *ctx, unsigned ms);
++};
++
++static inline bool
++n2h_write(const struct n2h_bus *b, uint8_t reg, uint8_t v)
++{
++	if (!n2h_reg_writable(reg)) { return false; }
++	if (reg == N2H_REG_ID && v != N2H_SOFTRESET) { return false; }
++	if (reg == N2H_REG_SYSCTRL && (v & N2H_SYSCTRL_BOOST)) { return false; }     /* the boost is never enabled */
++	if (reg == N2H_REG_DRV_LVL && v > N2H_DRV_HW_MAX) { return false; }
++	if (reg == N2H_REG_DRV_LVL_OV && v > N2H_DRV_OV_HW_MAX) { return false; }
++	return b->wr(b->ctx, reg, v);
++}
++
++/* runs a sequence; drv / drv_ov feed the N2H_OP_DRV* entries. Returns the index of the failing op + 1, 0 on success. */
++static inline unsigned
++n2h_run(const struct n2h_bus *b, const struct n2h_op *ops, unsigned n, uint8_t drv, uint8_t drv_ov)
++{
++	for (unsigned i = 0; i < n; i++) {
++		const struct n2h_op *o = &ops[i];
++		uint8_t v = 0;
++		bool ok = true;
++		switch (o->op) {
++		case N2H_OP_W:      ok = n2h_write(b, o->reg, o->val); break;
++		case N2H_OP_DRV:    ok = n2h_write(b, o->reg, drv); break;
++		case N2H_OP_DRV_OV: ok = n2h_write(b, o->reg, drv_ov); break;
++		case N2H_OP_RMW:
++			ok = b->rd(b->ctx, o->reg, &v) && n2h_write(b, o->reg, (uint8_t)((v & ~o->mask) | (o->val & o->mask)));
++			break;
++		case N2H_OP_DLY_MS: b->sleep_ms(b->ctx, o->val); break;
++		case N2H_OP_WAIT_CLR:
++			ok = false;
++			for (unsigned k = 0; k < o->val; k++) {
++				if (!b->rd(b->ctx, o->reg, &v)) { break; }
++				if (!(v & o->mask)) { ok = true; break; }
++				b->sleep_ms(b->ctx, 1);
++			}
++			break;
++		default: ok = false; break;
++		}
++		if (!ok) { return i + 1; }
++	}
++	return 0;
++}
++#define N2H_RUN(b, seq, d, o) n2h_run((b), (seq), (unsigned)(sizeof(seq) / sizeof((seq)[0])), (d), (o))
++
++/* LRA DC resistance in milliohm (Android aw8697_lra_resistance_show: RLDET x 298), motor test without moving it.
++ * Leaves the chip in standby with the boost bypassed. */
++static inline bool
++n2h_measure_lra(const struct n2h_bus *b, uint32_t *mohm)
++{
++	uint8_t v = 0;
++	bool ok = N2H_RUN(b, n2h_seq_stop, 0, 0) == 0;
++	static const struct n2h_op pre[] = {
++		{ N2H_OP_RMW, N2H_REG_SYSCTRL, N2H_SYSCTRL_RAMINIT | N2H_SYSCTRL_BOOST, N2H_SYSCTRL_RAMINIT },
++		{ N2H_OP_RMW, N2H_REG_ANACTRL, N2H_ANACTRL_HD_PD, 0 },
++		{ N2H_OP_RMW, N2H_REG_D2SCFG, N2H_D2SCFG_CLK_MASK, N2H_D2SCFG_CLK_1P5M },
++		{ N2H_OP_RMW, N2H_REG_DETCTRL, N2H_DETCTRL_RL, N2H_DETCTRL_RL },
++		{ N2H_OP_RMW, N2H_REG_DETCTRL, N2H_DETCTRL_DIAG_GO, N2H_DETCTRL_DIAG_GO },
++		{ N2H_OP_DLY_MS, 0, 0, 3 },
++	};
++	static const struct n2h_op post[] = {
++		{ N2H_OP_RMW, N2H_REG_ANACTRL, N2H_ANACTRL_HD_PD, N2H_ANACTRL_HD_PD },
++		{ N2H_OP_RMW, N2H_REG_D2SCFG, N2H_D2SCFG_CLK_MASK, N2H_D2SCFG_CLK_6M },
++		{ N2H_OP_RMW, N2H_REG_SYSCTRL, N2H_SYSCTRL_RAMINIT | N2H_SYSCTRL_BOOST, 0 },
++	};
++	ok = ok && N2H_RUN(b, pre, 0, 0) == 0 && b->rd(b->ctx, N2H_REG_RLDET, &v);
++	bool ok2 = N2H_RUN(b, post, 0, 0) == 0;
++	*mohm = 298u * v;
++	return ok && ok2;
++}
++
++/* battery voltage seen by the chip, mV (Android aw8697_haptic_get_vbat: VBATDET x 6100 / 256) */
++static inline bool
++n2h_measure_vbat(const struct n2h_bus *b, uint32_t *mv)
++{
++	uint8_t v = 0;
++	static const struct n2h_op pre[] = {
++		{ N2H_OP_RMW, N2H_REG_SYSCTRL, N2H_SYSCTRL_RAMINIT | N2H_SYSCTRL_BOOST, N2H_SYSCTRL_RAMINIT },
++		{ N2H_OP_RMW, N2H_REG_DETCTRL, N2H_DETCTRL_VBAT_GO, N2H_DETCTRL_VBAT_GO },
++		{ N2H_OP_WAIT_CLR, N2H_REG_DETCTRL, N2H_DETCTRL_VBAT_GO, 20 },
++	};
++	static const struct n2h_op post[] = {
++		{ N2H_OP_RMW, N2H_REG_SYSCTRL, N2H_SYSCTRL_RAMINIT | N2H_SYSCTRL_BOOST, 0 },
++	};
++	bool ok = N2H_RUN(b, pre, 0, 0) == 0 && b->rd(b->ctx, N2H_REG_VBATDET, &v);
++	bool ok2 = N2H_RUN(b, post, 0, 0) == 0;
++	*mv = 6100u * v / 256u;
++	return ok && ok2;
++}
++
++/* CONT drive frequency the chip tracked during the last play, 0.1 Hz (Android aw8697_haptic_read_cont_f0); 0 = none */
++static inline uint32_t
++n2h_cont_f0(uint8_t h, uint8_t l)
++{
++	uint32_t r = (uint32_t)h << 8 | l;
++	return r ? 1000000000u / (r * N2H_F0_COEFF) : 0u;
++}
++
++/* ---- effects: the iOS feedback kinds (UIFeedbackGenerator / AudioServices / system haptics) as CONT segments ---- */
++enum {
++	N2H_FX_STOP = 0,
++	N2H_FX_IMPACT_LIGHT = 1, N2H_FX_IMPACT_MEDIUM = 2, N2H_FX_IMPACT_HEAVY = 3, N2H_FX_IMPACT_SOFT = 4, N2H_FX_IMPACT_RIGID = 5,
++	N2H_FX_SELECTION = 6,
++	N2H_FX_NOTIFY_SUCCESS = 7, N2H_FX_NOTIFY_WARNING = 8, N2H_FX_NOTIFY_ERROR = 9,
++	N2H_FX_KEYBOARD = 10, N2H_FX_RINGER_SWITCH = 11, N2H_FX_PEEK = 12, N2H_FX_POP = 13,
++	N2H_FX_VIBRATE = 14,           /* kSystemSoundID_Vibrate 4095 */
++	N2H_FX_RING = 15,              /* one ringtone vibration cycle */
++	N2H_FX_RAW = 16,               /* ms + level from the request */
++	N2H_FX_COUNT
++};
++#define N2H_SEG_MAX 4
++struct n2h_seg { uint16_t on_ms, level, off_ms; };
++struct n2h_fx { const char *name; uint8_t n; struct n2h_seg seg[N2H_SEG_MAX]; };
++static const struct n2h_fx n2h_fx_table[N2H_FX_COUNT] = {
++	[N2H_FX_STOP]           = { "stop", 0, {{0, 0, 0}} },
++	[N2H_FX_IMPACT_LIGHT]   = { "impact-light", 1, {{12, 450, 0}} },
++	[N2H_FX_IMPACT_MEDIUM]  = { "impact-medium", 1, {{16, 700, 0}} },
++	[N2H_FX_IMPACT_HEAVY]   = { "impact-heavy", 1, {{22, 1000, 0}} },
++	[N2H_FX_IMPACT_SOFT]    = { "impact-soft", 1, {{24, 500, 0}} },
++	[N2H_FX_IMPACT_RIGID]   = { "impact-rigid", 1, {{10, 1000, 0}} },
++	[N2H_FX_SELECTION]      = { "selection", 1, {{8, 500, 0}} },
++	[N2H_FX_NOTIFY_SUCCESS] = { "success", 2, {{14, 700, 90}, {16, 1000, 0}} },
++	[N2H_FX_NOTIFY_WARNING] = { "warning", 2, {{18, 1000, 140}, {14, 700, 0}} },
++	[N2H_FX_NOTIFY_ERROR]   = { "error", 3, {{14, 850, 70}, {14, 850, 70}, {20, 1000, 0}} },
++	[N2H_FX_KEYBOARD]       = { "keyboard", 1, {{8, 550, 0}} },
++	[N2H_FX_RINGER_SWITCH]  = { "ringer-switch", 1, {{30, 1000, 0}} },
++	[N2H_FX_PEEK]           = { "peek", 1, {{20, 800, 0}} },
++	[N2H_FX_POP]            = { "pop", 1, {{26, 1000, 0}} },
++	[N2H_FX_VIBRATE]        = { "vibrate", 1, {{400, 1000, 0}} },
++	[N2H_FX_RING]           = { "ring", 1, {{800, 1000, 0}} },
++	[N2H_FX_RAW]            = { "raw", 1, {{0, 0, 0}} },
++};
++
++/* ---- policy ---- */
++#define N2H_MAX_MS_DEFAULT      1000u     /* kern.n2hap_max_ms: one segment */
++#define N2H_MAX_MS_HW           3000u
++#define N2H_MIN_ON_MS           6u
++#define N2H_BUDGET_MS           8000u     /* on-time bucket */
++#define N2H_REFILL_DIV          2u        /* +1 us of budget per 2 us elapsed (50 % long-run duty) */
++#define N2H_WARM_CC             4300
++#define N2H_HOT_CC              4600
++#define N2H_HOT_CLEAR_CC        4400
++#define N2H_THERM_PERIOD_US     5000000ull
++#define N2H_OVERRUN_US          50000ull  /* motor on this long past its segment end: watchdog stop */
++#define N2H_STOP_TIMEOUT_US     100000ull /* GLB_STATE not idle this long after GO=0: soft reset + re-init */
++#define N2H_FAULT_LATCH         3u
++
++struct n2h_cfg {
++	uint32_t mode;        /* kern.n2hap: 1 allow, 0 off (and kept off) */
++	uint32_t drv_max;     /* kern.n2hap_drvmax: DRV_LVL at level 1000, N2H_DRV_MIN..N2H_DRV_HW_MAX */
++	uint32_t max_ms;      /* kern.n2hap_max_ms */
++};
++
++static inline void
++n2h_cfg_fix(struct n2h_cfg *c)
++{
++	if (c->mode > 1) { c->mode = 1; }
++	if (c->drv_max > N2H_DRV_HW_MAX) { c->drv_max = N2H_DRV_HW_MAX; }
++	if (c->drv_max < N2H_DRV_MIN) { c->drv_max = N2H_DRV_MIN; }
++	if (c->max_ms > N2H_MAX_MS_HW) { c->max_ms = N2H_MAX_MS_HW; }
++	if (c->max_ms < 50) { c->max_ms = 50; }
++}
++
++/* request word (userland -> owner thread): seq:32 | effect:8 | level:10 | ms:14 */
++struct n2h_req { uint32_t seq, effect, level, ms; };
++
++static inline uint64_t
++n2h_req_pack(uint32_t seq, uint32_t effect, uint32_t level, uint32_t ms)
++{
++	if (level > 1000) { level = 1000; }
++	if (ms > 0x3fff) { ms = 0x3fff; }
++	return (uint64_t)seq << 32 | (uint64_t)(effect & 0xffu) << 24 | (uint64_t)(level & 0x3ffu) << 14 | (ms & 0x3fffu);
++}
++
++static inline struct n2h_req
++n2h_req_unpack(uint64_t w)
++{
++	struct n2h_req r = { (uint32_t)(w >> 32), (uint32_t)(w >> 24) & 0xffu, (uint32_t)(w >> 14) & 0x3ffu, (uint32_t)w & 0x3fffu };
++	return r;
++}
++
++enum { N2H_PH_IDLE = 0, N2H_PH_ON, N2H_PH_GAP };
++
++struct n2h_state {
++	/* pattern being played */
++	uint32_t effect, level_req;
++	uint8_t nseg, seg, phase;
++	struct n2h_seg segs[N2H_SEG_MAX];
++	uint64_t phase_end_us;
++	/* limits */
++	int64_t budget_us;
++	uint64_t budget_t_us;
++	uint32_t therm;       /* 0 normal, 1 warm (half drive), 2 hot (off) */
++	int therm_cc;
++	bool latched;
++	uint32_t seen_seq;
++	/* counters */
++	uint64_t reqs, plays, segs_on, throttled, therm_refused, clamped, bad_effect;
++};
++
++static inline void
++n2h_init(struct n2h_state *s, uint64_t now)
++{
++	*s = (struct n2h_state){ 0 };
++	s->budget_us = (int64_t)N2H_BUDGET_MS * 1000;
++	s->budget_t_us = now;
++}
++
++/* keeps the bucket current; on = the motor was driven since the last call */
++static inline void
++n2h_budget(struct n2h_state *s, uint64_t now, bool on)
++{
++	if (now <= s->budget_t_us) { return; }
++	uint64_t dt = now - s->budget_t_us;
++	s->budget_t_us = now;
++	s->budget_us += (int64_t)(dt / N2H_REFILL_DIV);
++	if (on) { s->budget_us -= (int64_t)dt; }
++	if (s->budget_us > (int64_t)N2H_BUDGET_MS * 1000) { s->budget_us = (int64_t)N2H_BUDGET_MS * 1000; }
++	if (s->budget_us < -(int64_t)N2H_BUDGET_MS * 1000) { s->budget_us = -(int64_t)N2H_BUDGET_MS * 1000; }
++}
++
++/* a new request replaces the pattern (latest wins, as on iOS) */
++static inline void
++n2h_take(struct n2h_state *s, const struct n2h_req *r, const struct n2h_cfg *c, uint64_t now)
++{
++	if (r->seq == 0 || r->seq == s->seen_seq) { return; }
++	s->seen_seq = r->seq;
++	s->reqs++;
++	if (r->effect >= N2H_FX_COUNT) { s->bad_effect++; return; }
++	const struct n2h_fx *fx = &n2h_fx_table[r->effect];
++	s->effect = r->effect; s->level_req = r->level;
++	s->nseg = fx->n; s->seg = 0; s->phase = N2H_PH_IDLE;
++	for (unsigned i = 0; i < fx->n && i < N2H_SEG_MAX; i++) {
++		struct n2h_seg g = fx->seg[i];
++		if (r->effect == N2H_FX_RAW) { g.on_ms = (uint16_t)r->ms; g.level = (uint16_t)(r->level ? r->level : 1000); }
++		else if (r->level) { g.level = (uint16_t)((uint32_t)g.level * r->level / 1000u); }
++		if (g.on_ms > c->max_ms) { g.on_ms = (uint16_t)c->max_ms; s->clamped++; }
++		if (g.on_ms < N2H_MIN_ON_MS) { g.on_ms = N2H_MIN_ON_MS; }
++		if (g.level == 0) { g.level = 1; }
++		s->segs[i] = g;
++	}
++	if (s->nseg) { s->plays++; s->phase_end_us = now; }
++}
++
++/* the thermal level from a battery reading (centi-C), hysteresis on the hot side; returns true when it changed */
++static inline bool
++n2h_therm_update(struct n2h_state *s, bool ok, int cc)
++{
++	uint32_t t = s->therm;
++	if (!ok) { return false; }
++	s->therm_cc = cc;
++	if (cc >= N2H_HOT_CC) { t = 2; }
++	else if (t == 2 && cc >= N2H_HOT_CLEAR_CC) { t = 2; }
++	else if (cc >= N2H_WARM_CC) { t = 1; }
++	else { t = 0; }
++	bool changed = t != s->therm;
++	s->therm = t;
++	return changed;
++}
++
++static inline uint8_t
++n2h_drv_for(uint32_t level, const struct n2h_cfg *c, uint32_t therm)
++{
++	if (level > 1000) { level = 1000; }
++	uint32_t top = c->drv_max > N2H_DRV_HW_MAX ? N2H_DRV_HW_MAX : c->drv_max;
++	if (top < N2H_DRV_MIN) { top = N2H_DRV_MIN; }
++	uint32_t d = N2H_DRV_MIN + (top - N2H_DRV_MIN) * level / 1000u;
++	if (therm == 1) { d = d / 2u < N2H_DRV_MIN ? N2H_DRV_MIN : d / 2u; }
++	return (uint8_t)d;
++}
++
++static inline uint8_t
++n2h_drv_ov_for(uint8_t drv)
++{
++	uint32_t ov = (uint32_t)drv * N2H_DRV_OV_HW_MAX / N2H_DRV_HW_MAX;
++	return (uint8_t)(ov > N2H_DRV_OV_HW_MAX ? N2H_DRV_OV_HW_MAX : ov);
++}
++
++/* the decision for this tick: true = the motor should be driven at *drv until *until_us */
++static inline bool
++n2h_decide(struct n2h_state *s, const struct n2h_cfg *c, uint64_t now, bool hw_on, uint8_t *drv, uint64_t *until_us)
++{
++	n2h_budget(s, now, hw_on);
++	if (!c->mode || s->latched || s->therm >= 2) {
++		if (s->nseg && s->therm >= 2) { s->therm_refused++; }
++		s->nseg = 0; s->phase = N2H_PH_IDLE;
++		return false;
++	}
++	for (;;) {
++		if (s->nseg == 0 || s->seg >= s->nseg) { s->nseg = 0; s->phase = N2H_PH_IDLE; return false; }
++		struct n2h_seg *g = &s->segs[s->seg];
++		if (s->phase == N2H_PH_IDLE) {
++			if (s->budget_us < (int64_t)g->on_ms * 1000) { s->throttled++; s->nseg = 0; return false; }
++			s->phase = N2H_PH_ON;
++			s->phase_end_us = now + (uint64_t)g->on_ms * 1000u;
++			s->segs_on++;
++		}
++		if (s->phase == N2H_PH_ON) {
++			if (s->budget_us <= 0) { s->throttled++; s->nseg = 0; s->phase = N2H_PH_IDLE; return false; }
++			if (now < s->phase_end_us) {
++				*drv = n2h_drv_for(g->level, c, s->therm);
++				*until_us = s->phase_end_us;
++				return true;
++			}
++			s->phase = N2H_PH_GAP;
++			s->phase_end_us = now + (uint64_t)g->off_ms * 1000u;
++		}
++		if (s->phase == N2H_PH_GAP) {
++			if (now < s->phase_end_us) { return false; }
++			s->seg++; s->phase = N2H_PH_IDLE;
++		}
++	}
++}
++
++/* ---- the iOS stream (HAL "Actuator" samples) ---- */
++#define N2H_SILENT_BELOW        256u      /* of 32768: no larger = silence (HackiOS SILENT_BELOW) */
++#define N2H_ACTIVE_US           25000ull  /* no non-silent write for this long = silence (a lost close, a stalled HAL) */
++#define N2H_TAP_MIN_MS          12u       /* an onset drives the motor at least this long (a 1-buffer transient is felt) */
++#define N2H_PEAK_FULL           10922u    /* 32767 / 3: full drive from here up */
++
++/* written by the HAL's I/O thread (the write handler), read by the owner thread; each field is one aligned 64-bit word */
++struct n2h_env {
++	volatile uint64_t heard_us;   /* last non-silent write */
++	volatile uint64_t quiet_us;   /* last silent write */
++	volatile uint64_t onset_us;   /* first non-silent write after silence */
++	volatile uint64_t peak;       /* largest |sample| since the onset or since the owner last took it */
++	volatile uint64_t onsets, frames, writes;
++};
++
++static inline uint32_t
++n2h_peak_of(const int16_t *s, unsigned n)
++{
++	uint32_t p = 0;
++	for (unsigned i = 0; i < n; i++) {
++		uint32_t v = s[i] < 0 ? (uint32_t)(-(int32_t)s[i]) : (uint32_t)s[i];
++		p = v > p ? v : p;
++	}
++	return p;
++}
++
++static inline void
++n2h_env_feed(struct n2h_env *e, uint32_t peak, unsigned frames, uint64_t now)
++{
++	e->writes++;
++	e->frames += frames;
++	if (peak <= N2H_SILENT_BELOW) { e->quiet_us = now; return; }
++	if (e->heard_us == 0 || e->quiet_us > e->heard_us || now - e->heard_us >= N2H_ACTIVE_US) {
++		e->onset_us = now;
++		e->peak = 0;
++		e->onsets++;
++	}
++	e->heard_us = now;
++	if (peak > e->peak) { e->peak = peak; }
++}
++
++/* the drive for a stream peak (HackiOS gain_for, in DRV_LVL terms; thermal halving on top) */
++static inline uint8_t
++n2h_drv_for_peak(uint32_t peak, const struct n2h_cfg *c, uint32_t therm)
++{
++	uint32_t level = peak >= N2H_PEAK_FULL ? 1000u : 625u + 375u * peak / N2H_PEAK_FULL;
++	return n2h_drv_for(level, c, therm);
++}
++
++struct n2h_stream {
++	uint64_t onset_seen;          /* onset_us of the waveform being played */
++	uint64_t run_start_us;        /* the motor has run continuously since (stream) */
++	uint64_t rest_until_us;       /* after a capped run */
++	uint32_t peak_hold;           /* peak of the waveform being played */
++	uint64_t taps, runs, capped, idle_stops;
++};
++
++/*
++ * The whole decision for a tick: an internal pattern (boot pulse, test) first, else the stream.
++ * Returns true = drive at *drv; *until_us = the latest time the motor may still be on (the watchdog's limit).
++ */
++static inline bool
++n2h_decide_all(struct n2h_state *s, struct n2h_stream *t, const struct n2h_env *e, const struct n2h_cfg *c, uint64_t now,
++    bool hw_on, uint8_t *drv, uint64_t *until_us)
++{
++	if (s->nseg) { return n2h_decide(s, c, now, hw_on, drv, until_us); }
++	n2h_budget(s, now, hw_on);
++	uint64_t heard = e->heard_us, quiet = e->quiet_us, onset = e->onset_us;
++	uint32_t peak = (uint32_t)e->peak;
++	bool active = heard != 0 && now >= heard && now - heard < N2H_ACTIVE_US && quiet <= heard;
++	bool in_tap = onset != 0 && now >= onset && now - onset < (uint64_t)N2H_TAP_MIN_MS * 1000u && heard >= onset;
++	bool want = c->mode && !s->latched && s->therm < 2 && (active || in_tap);
++	if (want && onset != t->onset_seen) {
++		t->onset_seen = onset;
++		t->peak_hold = 0;
++		t->taps++;
++	}
++	if (want && now < t->rest_until_us) { want = false; }
++	if (want && s->budget_us <= 0) { s->throttled++; want = false; }
++	if (!want) {
++		if (hw_on && !active && !in_tap) { t->idle_stops++; }
++		if (!active && !in_tap) { t->run_start_us = 0; }
++		if (hw_on && s->therm >= 2) { s->therm_refused++; }
++		return false;
++	}
++	if (t->run_start_us == 0) { t->run_start_us = now; t->runs++; }
++	if (now - t->run_start_us >= (uint64_t)c->max_ms * 1000u) {
++		t->capped++;
++		t->rest_until_us = now + (uint64_t)c->max_ms * 1000u;
++		t->run_start_us = 0;
++		return false;
++	}
++	if (peak > t->peak_hold) { t->peak_hold = peak; }
++	*drv = n2h_drv_for_peak(t->peak_hold, c, s->therm);
++	uint64_t end_a = heard + N2H_ACTIVE_US, end_b = onset + (uint64_t)N2H_TAP_MIN_MS * 1000u;
++	uint64_t end_c = t->run_start_us + (uint64_t)c->max_ms * 1000u;
++	uint64_t end = end_a > end_b ? end_a : end_b;
++	*until_us = end < end_c ? end : end_c;
++	return true;
++}
++
++#endif /* NORD2_HAPTIC_H */
+--- /dev/null
++++ b/bsd/dev/nord2_haptic.inc
+@@ -0,0 +1,474 @@
++/*
++ * 0610 (haptic-20261114): the AW8697 haptic motor (included by sweet_touch.c after the torch, 0496).  Chip, sequences and
++ * policy: nord2_haptic.h.  The chip sits on I2C9 (GPIO120/121), the software bus the input owner thread already drives for the
++ * alert-slider halls (nord2_slider.inc): every chip access here runs on that thread (n2h_owner_start, n2h_service, called from
++ * ni_thread), so no other bus user can collide with it.  /dev/redwood-haptic (0666) only records iOS's waveform envelope.
++ * No ml_io_map: GPIO110 (reset) and GPIO135 (irq, read only) are in the 0x10005000 page already mapped as ni_gpio.
++ * Kill switches: boot-arg n2hap=0 or n2gdv +1024 (no device node, the chip and its pins untouched); sysctl kern.n2hap=0 at run
++ * time (motor stopped and kept off).  kern.n2hap_drvmax (drive at full scale, 18..60, default 60 = Android), kern.n2hap_max_ms
++ * (one continuous run, default 1000), kern.n2hap_test (play effect N once: diagnostics), kern.n2hapstat (read only).
++ */
++#include "nord2_haptic.h"
++
++static struct n2h_cfg n2h_cfg_g = { 1, N2H_DRV_HW_MAX, N2H_MAX_MS_DEFAULT };
++static struct n2h_state n2h_st;                 /* owner thread */
++static struct n2h_stream n2h_strm;              /* owner thread */
++static struct n2h_env n2h_env_g;                /* written by the HAL I/O thread (write handler), read by the owner thread */
++static volatile uint64_t n2h_req_word;          /* internal patterns (kern.n2hap_test), latest wins */
++static uint32_t n2h_seq, n2h_opens, n2h_test_last;
++static bool n2h_made, n2h_owner_ready, n2h_chip_ok, n2h_pins_saved, n2h_announced;
++static lck_grp_t *n2h_grp;
++static lck_mtx_t *n2h_lock;
++static struct { unsigned mux, dir, dout; } n2h_pin_rst, n2h_pin_irq;
++enum { N2H_HW_OFF = 0, N2H_HW_ON, N2H_HW_STOPPING };
++static struct {
++	unsigned phase, faults, said;
++	uint8_t drv, glb_max;
++	uint64_t on_us, until_us, stop_us, therm_next_us, sum_next_us, sum_sig;
++	uint64_t starts, stops, drv_changes, watchdog, stop_timeouts, resets, io_fails, chip_faults;
++	uint32_t f0_last, lra_mohm, vbat_mv;
++} n2h_hw;
++
++/* ---- the I2C9 transactions (owner thread only) ---- */
++static bool
++n2h_bus_rd(__unused void *ctx, uint8_t reg, uint8_t *v)
++{
++	ns_bus();
++	bool ok = ni_bus_read(N2H_ADDR, reg, v, 1);
++	ni_bus(false);
++	return ok;
++}
++
++static bool
++n2h_bus_wr(__unused void *ctx, uint8_t reg, uint8_t v)
++{
++	ns_bus();
++	bool ok = ni_start() && ni_send((uint8_t)(N2H_ADDR << 1)) && ni_send(reg) && ni_send(v);
++	bool stopped = ni_stop();
++	ni_bus(false);
++	return ok && stopped;
++}
++
++static void
++n2h_bus_sleep(__unused void *ctx, unsigned ms)
++{
++	ni_wait(ms);
++}
++
++static const struct n2h_bus n2h_bus_g = { NULL, n2h_bus_rd, n2h_bus_wr, n2h_bus_sleep };
++
++static void
++n2h_pin_save(unsigned pin, unsigned *mux, unsigned *dir, unsigned *dout)
++{
++	*mux = (ni_rd(ni_gpio, 0x300 + pin / 8 * 16) >> (pin % 8 * 4)) & 15;
++	*dir = (ni_rd(ni_gpio, pin / 32 * 16) >> (pin % 32)) & 1;
++	*dout = (ni_rd(ni_gpio, 0x100 + pin / 32 * 16) >> (pin % 32)) & 1;
++}
++
++static void
++n2h_pin_restore(unsigned pin, unsigned mux, unsigned dir, unsigned dout)
++{
++	ni_gpio_bit(pin, 0, false);
++	ni_gpio_bit(pin, 0x100, dout != 0);
++	ni_gpio_bit(pin, 0, dir != 0);
++	ni_mask(ni_gpio, 0x300 + pin / 8 * 16, 15u << (pin % 8 * 4), mux << (pin % 8 * 4));
++}
++
++/* the reset pin as a GPIO output at `high' (low = the chip in reset: the motor cannot be driven) */
++static void
++n2h_reset_pin(bool high)
++{
++	ni_gpio_bit(N2H_GPIO_RESET, 0x100, high);
++	ni_gpio_bit(N2H_GPIO_RESET, 0, true);
++	ni_mask(ni_gpio, 0x300 + N2H_GPIO_RESET / 8 * 16, 15u << (N2H_GPIO_RESET % 8 * 4), 0);
++}
++
++static void
++n2h_latch(const char *why)
++{
++	n2h_st.latched = true;
++	(void)n2h_bus_wr(NULL, N2H_REG_GO, 0);
++	n2h_reset_pin(false);
++	n2h_hw.phase = N2H_HW_OFF;
++	printf("NORD2 HAPTIC: %s: the chip is held in reset (GPIO110 low), haptics off for this boot\n", why);
++}
++
++static void
++n2h_io_result(bool ok, const char *what)
++{
++	if (ok) { n2h_hw.faults = 0; return; }
++	n2h_hw.io_fails++;
++	if (++n2h_hw.faults >= N2H_FAULT_LATCH && !n2h_st.latched) {
++		char b[96];
++		snprintf(b, sizeof(b), "%u I2C failures in a row (%s, stage %u)", n2h_hw.faults, what, ni_stage);
++		n2h_latch(b);
++	} else if (n2h_hw.io_fails <= 16) {
++		printf("NORD2 HAPTIC: %s FAILED (stage %u, fails %u)\n", what, ni_stage, n2h_hw.faults);
++	}
++}
++
++/* reset pulse + id + init; true when the chip is configured and in standby */
++static bool
++n2h_chip_init(const char *why)
++{
++	uint8_t id = 0;
++	bool idok = false;
++	n2h_reset_pin(false);
++	ni_wait(2);
++	n2h_reset_pin(true);
++	ni_wait(5);
++	for (unsigned i = 0; i < 5 && !idok; i++) {
++		idok = n2h_bus_rd(NULL, N2H_REG_ID, &id) && id == N2H_CHIPID;
++		if (!idok) { ni_wait(2); }
++	}
++	if (!idok) {
++		printf("NORD2 HAPTIC: %s: no AW8697 at I2C9 0x5a (id %#x, stage %u, scl=%d sda=%d)\n", why, id, ni_stage,
++		    ni_level(NS_SCL), ni_level(NS_SDA));
++		return false;
++	}
++	unsigned bad = N2H_RUN(&n2h_bus_g, n2h_seq_init, 0, 0);
++	if (bad) {
++		printf("NORD2 HAPTIC: %s: init step %u failed (reg %#x, stage %u)\n", why, bad, n2h_seq_init[bad - 1].reg, ni_stage);
++		return false;
++	}
++	return true;
++}
++
++static void
++n2h_owner_start(void)
++{
++	if (!__atomic_load_n(&n2h_made, __ATOMIC_ACQUIRE)) { return; }      /* n2hap=0: the chip and its pins are not touched */
++	n2h_pin_save(N2H_GPIO_RESET, &n2h_pin_rst.mux, &n2h_pin_rst.dir, &n2h_pin_rst.dout);
++	n2h_pin_save(N2H_GPIO_IRQ, &n2h_pin_irq.mux, &n2h_pin_irq.dir, &n2h_pin_irq.dout);
++	n2h_pins_saved = true;
++	printf("NORD2 HAPTIC: pins as found: reset GPIO110 mux=%u dir=%u out=%u level=%d, irq GPIO135 mux=%u dir=%u level=%d\n",
++	    n2h_pin_rst.mux, n2h_pin_rst.dir, n2h_pin_rst.dout, ni_level(N2H_GPIO_RESET), n2h_pin_irq.mux, n2h_pin_irq.dir,
++	    ni_level(N2H_GPIO_IRQ));
++	if (!ns_enabled || !ni_level(NS_SCL) || !ni_level(NS_SDA)) {
++		printf("NORD2 HAPTIC: I2C9 not usable (nord2slider=%d scl=%d sda=%d): haptics off, chip untouched\n", ns_enabled,
++		    ni_level(NS_SCL), ni_level(NS_SDA));
++		n2h_pins_saved = false;
++		return;
++	}
++	n2h_init(&n2h_st, ni_now_us());
++	if (!n2h_chip_init("start")) {
++		n2h_pin_restore(N2H_GPIO_RESET, n2h_pin_rst.mux, n2h_pin_rst.dir, n2h_pin_rst.dout);
++		printf("NORD2 HAPTIC: off for this boot (reset pin restored)\n");
++		return;
++	}
++	uint8_t trim = 0, sysst = 0, glb = 0;
++	(void)n2h_bus_rd(NULL, N2H_REG_TRIM_LRA, &trim);
++	(void)n2h_bus_rd(NULL, N2H_REG_SYSST, &sysst);
++	(void)n2h_bus_rd(NULL, N2H_REG_GLB_STATE, &glb);
++	bool lok = n2h_measure_lra(&n2h_bus_g, &n2h_hw.lra_mohm);
++	bool vok = n2h_measure_vbat(&n2h_bus_g, &n2h_hw.vbat_mv);
++	(void)N2H_RUN(&n2h_bus_g, n2h_seq_standby, 0, 0);
++	n2h_chip_ok = true;
++	n2h_hw.phase = N2H_HW_OFF;
++	printf("NORD2 HAPTIC: AW8697 id 0x97 configured (CONT mode, f0 preset %u.%u Hz, drive <= %u, boost never used): TRIM_LRA %#x "
++	    "SYSST %#x GLB %#x, LRA %u.%03u ohm%s, VBAT %u mV%s, irq level %d\n", N2H_F0_PRE / 10, N2H_F0_PRE % 10, n2h_cfg_g.drv_max,
++	    trim, sysst, glb, n2h_hw.lra_mohm / 1000, n2h_hw.lra_mohm % 1000, lok ? "" : " (read FAILED)", n2h_hw.vbat_mv,
++	    vok ? "" : " (read FAILED)", ni_level(N2H_GPIO_IRQ));
++	if (n2h_hw.lra_mohm < 4000 || n2h_hw.lra_mohm > 60000) {
++		printf("NORD2 HAPTIC: LRA resistance out of the 4..60 ohm range: the motor may be open or shorted (still allowed)\n");
++	}
++	/* one boot pulse: the user feels the motor once at boot; the log shows the chip's state machine and the tracked f0 */
++	struct n2h_req r = { 1, N2H_FX_RAW, 800, 60 };
++	n2h_take(&n2h_st, &r, &n2h_cfg_g, ni_now_us());
++	n2h_owner_ready = true;
++}
++
++static void
++n2h_hw_start(uint8_t drv, uint64_t now, uint64_t until, const char *src)
++{
++	unsigned bad = N2H_RUN(&n2h_bus_g, n2h_seq_cont, 0, 0);
++	if (!bad) { bad = N2H_RUN(&n2h_bus_g, n2h_seq_start, drv, n2h_drv_ov_for(drv)); }
++	n2h_io_result(bad == 0, "start");
++	if (bad) { return; }
++	n2h_hw.phase = N2H_HW_ON; n2h_hw.drv = drv; n2h_hw.on_us = now; n2h_hw.until_us = until; n2h_hw.glb_max = 0;
++	n2h_hw.starts++;
++	uint8_t glb = 0;
++	if (n2h_bus_rd(NULL, N2H_REG_GLB_STATE, &glb)) { n2h_hw.glb_max = glb & N2H_GLB_BUSY_MASK; }
++	if (n2h_hw.said < 24) {
++		printf("NORD2 HAPTIC: on (%s), drive %u ov %u, GLB_STATE %#x\n", src, drv, n2h_drv_ov_for(drv), glb);
++	}
++}
++
++static void
++n2h_hw_stop(uint64_t now, const char *why)
++{
++	unsigned bad = N2H_RUN(&n2h_bus_g, n2h_seq_stop, 0, 0);
++	n2h_io_result(bad == 0, "stop");
++	if (bad) { return; }
++	n2h_hw.phase = N2H_HW_STOPPING; n2h_hw.stop_us = now; n2h_hw.stops++;
++	if (n2h_hw.said < 24 && why != NULL) { printf("NORD2 HAPTIC: stop (%s) after %llu ms\n", why, (now - n2h_hw.on_us) / 1000); }
++}
++
++/* stopping: wait for GLB_STATE idle (the brake), then standby; a chip that does not stop is reset */
++static void
++n2h_hw_stopping(uint64_t now)
++{
++	uint8_t glb = 0xff, sysst = 0, fh = 0, fl = 0;
++	bool ok = n2h_bus_rd(NULL, N2H_REG_GLB_STATE, &glb);
++	n2h_io_result(ok, "state");
++	if (ok && (glb & N2H_GLB_BUSY_MASK) == 0) {
++		bool sok = N2H_RUN(&n2h_bus_g, n2h_seq_standby, 0, 0) == 0;
++		bool rok = n2h_bus_rd(NULL, N2H_REG_SYSST, &sysst) && n2h_bus_rd(NULL, N2H_REG_F_LRA_CONT_H, &fh) &&
++		    n2h_bus_rd(NULL, N2H_REG_F_LRA_CONT_L, &fl);
++		n2h_io_result(sok && rok, "standby");
++		if (!sok) { return; }
++		n2h_hw.phase = N2H_HW_OFF;
++		n2h_hw.f0_last = n2h_cont_f0(fh, fl);
++		if (n2h_hw.said < 24) {
++			n2h_hw.said++;
++			printf("NORD2 HAPTIC: standby %llu ms after the stop; tracked f0 %u.%u Hz; SYSST %#x\n", (now - n2h_hw.stop_us) / 1000,
++			    n2h_hw.f0_last / 10, n2h_hw.f0_last % 10, sysst);
++		}
++		if (sysst & 0xC6) {             /* boost error, over-voltage, over-current, over-temperature */
++			n2h_hw.chip_faults++;
++			char b[64];
++			snprintf(b, sizeof(b), "chip fault SYSST %#x", sysst);
++			n2h_latch(b);
++		}
++		return;
++	}
++	if (now - n2h_hw.stop_us >= N2H_STOP_TIMEOUT_US) {
++		n2h_hw.stop_timeouts++;
++		printf("NORD2 HAPTIC: still busy (GLB_STATE %#x) %llu ms after the stop: soft reset\n", glb, (now - n2h_hw.stop_us) / 1000);
++		(void)n2h_bus_wr(NULL, N2H_REG_ID, N2H_SOFTRESET);
++		ni_wait(4);
++		n2h_hw.resets++;
++		if (!n2h_chip_init("after a stop timeout")) { n2h_latch("re-init failed"); return; }
++		(void)N2H_RUN(&n2h_bus_g, n2h_seq_standby, 0, 0);
++		n2h_hw.phase = N2H_HW_OFF;
++	}
++}
++
++/* input owner thread, every loop (10 ms) */
++static void
++n2h_service(void)
++{
++	if (!n2h_owner_ready || !n2h_chip_ok) { return; }
++	uint64_t now = ni_now_us();
++	lck_mtx_lock(n2h_lock);
++	struct n2h_cfg c = n2h_cfg_g;
++	lck_mtx_unlock(n2h_lock);
++	uint64_t w = __atomic_load_n(&n2h_req_word, __ATOMIC_ACQUIRE);
++	if (w) {
++		struct n2h_req r = n2h_req_unpack(w);
++		n2h_take(&n2h_st, &r, &c, now);
++	}
++	bool hw_on = n2h_hw.phase == N2H_HW_ON;
++	if ((hw_on || n2h_env_g.heard_us + N2H_ACTIVE_US > now) && now >= n2h_hw.therm_next_us) {
++		int cc = 0;
++		bool ok = nord2_battery_temperature_cC(&cc);
++		n2h_hw.therm_next_us = now + N2H_THERM_PERIOD_US;
++		if (n2h_therm_update(&n2h_st, ok, cc)) {
++			printf("NORD2 HAPTIC: thermal level %u at battery %d.%02d C (%s)\n", n2h_st.therm, cc / 100, (cc < 0 ? -cc : cc) % 100,
++			    n2h_st.therm >= 2 ? "motor off" : n2h_st.therm == 1 ? "half drive" : "normal");
++		}
++	}
++	bool pattern = n2h_st.nseg != 0;
++	uint8_t drv = 0;
++	uint64_t until = 0;
++	bool want = n2h_decide_all(&n2h_st, &n2h_strm, &n2h_env_g, &c, now, hw_on, &drv, &until);
++	if (n2h_st.latched) { return; }
++	switch (n2h_hw.phase) {
++	case N2H_HW_OFF:
++		if (want) { n2h_hw_start(drv, now, until, pattern ? n2h_fx_table[n2h_st.effect].name : "iOS"); }
++		break;
++	case N2H_HW_ON:
++		if (now > n2h_hw.until_us + N2H_OVERRUN_US) {           /* this thread came back late: stop first, ask later */
++			n2h_hw.watchdog++;
++			printf("NORD2 HAPTIC: watchdog: on %llu ms past its limit\n", (now - n2h_hw.until_us) / 1000);
++			n2h_hw_stop(now, NULL);
++		} else if (!want) {
++			n2h_hw_stop(now, pattern ? "end of pattern" : !c.mode ? "kern.n2hap=0" : n2h_st.therm >= 2 ? "thermal" : "iOS silent");
++		} else {
++			n2h_hw.until_us = until;
++			if (drv + 4 < n2h_hw.drv || drv > n2h_hw.drv + 4) {
++				bool ok = n2h_write(&n2h_bus_g, N2H_REG_DRV_LVL, drv) && n2h_write(&n2h_bus_g, N2H_REG_DRV_LVL_OV, n2h_drv_ov_for(drv));
++				n2h_io_result(ok, "drive");
++				if (ok) { n2h_hw.drv = drv; n2h_hw.drv_changes++; }
++			}
++			uint8_t glb = 0;
++			if (n2h_hw.starts <= 4 && n2h_bus_rd(NULL, N2H_REG_GLB_STATE, &glb) && (glb & N2H_GLB_BUSY_MASK) > n2h_hw.glb_max) {
++				n2h_hw.glb_max = glb & N2H_GLB_BUSY_MASK;
++			}
++		}
++		break;
++	case N2H_HW_STOPPING:
++		n2h_hw_stopping(now);
++		break;
++	}
++	if (now >= n2h_hw.sum_next_us) {
++		n2h_hw.sum_next_us = now + 60000000ull;
++		uint64_t sig = n2h_env_g.writes + n2h_hw.starts * 3 + n2h_st.throttled * 5 + n2h_hw.io_fails * 7;
++		if (sig != n2h_hw.sum_sig) {
++			n2h_hw.sum_sig = sig;
++			printf("NORD2 HAPTIC SUM: opens %u writes %llu frames %llu onsets %llu taps %llu runs %llu capped %llu starts %llu stops %llu "
++			    "drvchg %llu throttled %llu therm %u refused %llu watchdog %llu stop_timeouts %llu resets %llu io_fails %llu faults %llu "
++			    "f0 %u.%u Hz budget %lld ms\n", n2h_opens, n2h_env_g.writes, n2h_env_g.frames, n2h_env_g.onsets, n2h_strm.taps,
++			    n2h_strm.runs, n2h_strm.capped, n2h_hw.starts, n2h_hw.stops, n2h_hw.drv_changes, n2h_st.throttled, n2h_st.therm,
++			    n2h_st.therm_refused, n2h_hw.watchdog, n2h_hw.stop_timeouts, n2h_hw.resets, n2h_hw.io_fails, n2h_hw.chip_faults,
++			    n2h_hw.f0_last / 10, n2h_hw.f0_last % 10, n2h_st.budget_us / 1000);
++		}
++	}
++}
++
++/* nord2_input_prepare_return: other cores are off, no locks */
++static void
++n2h_force_off(void)
++{
++	if (n2h_owner_ready && n2h_chip_ok && !n2h_st.latched) {
++		(void)n2h_bus_wr(NULL, N2H_REG_GO, 0);
++		delay(20000);
++		(void)N2H_RUN(&n2h_bus_g, n2h_seq_standby, 0, 0);
++	}
++	if (n2h_pins_saved) { n2h_pin_restore(N2H_GPIO_RESET, n2h_pin_rst.mux, n2h_pin_rst.dir, n2h_pin_rst.dout); }
++}
++
++static void
++n2h_post(uint32_t effect, uint32_t level, uint32_t ms)
++{
++	lck_mtx_lock(n2h_lock);
++	n2h_seq = n2h_seq + 1 == 0 ? 2 : n2h_seq + 1;
++	if (n2h_seq == 1) { n2h_seq = 2; }                       /* 1 is the boot pulse's */
++	__atomic_store_n(&n2h_req_word, n2h_req_pack(n2h_seq, effect, level, ms), __ATOMIC_RELEASE);
++	lck_mtx_unlock(n2h_lock);
++}
++
++static int
++n2hd_open(dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	if (!n2h_made || minor(dev) != 0) { return ENXIO; }
++	lck_mtx_lock(n2h_lock);
++	n2h_opens++;
++	lck_mtx_unlock(n2h_lock);
++	return 0;
++}
++
++static int
++n2hd_close(dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	if (!n2h_made || minor(dev) != 0) { return ENXIO; }
++	n2h_env_g.quiet_us = ni_now_us();      /* the writer is gone (mediaserverd exited): silence now, the motor stops */
++	n2h_post(N2H_FX_STOP, 0, 0);
++	printf("NORD2 HAPTIC: /dev/redwood-haptic closed (last close): motor stopped\n");
++	return 0;
++}
++
++/* the HAL's I/O thread: never waits, never fails a well-formed write */
++static int
++n2hd_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	int16_t samples[256];
++	int err = 0;
++	if (!n2h_made || minor(dev) != 0) { return ENXIO; }
++	uint64_t now = ni_now_us();
++	while (uio_resid(uio) >= 2) {
++		user_ssize_t n = uio_resid(uio);
++		if (n > (user_ssize_t)sizeof(samples)) { n = sizeof(samples); }
++		n &= ~(user_ssize_t)1;
++		if ((err = uiomove((char *)samples, (int)n, uio)) != 0) { break; }
++		n2h_env_feed(&n2h_env_g, n2h_peak_of(samples, (unsigned)(n / 2)), (unsigned)(n / 2), now);
++	}
++	if (uio_resid(uio) == 1) { (void)uiomove((char *)samples, 1, uio); }
++	if (!n2h_announced && n2h_env_g.onsets) {
++		n2h_announced = true;
++		printf("NORD2 HAPTIC: first waveform from iOS's Actuator (peak %llu of 32768)\n", n2h_env_g.peak);
++	}
++	return err;
++}
++
++static const struct cdevsw n2hd_cdevsw = {
++	.d_open = n2hd_open, .d_close = n2hd_close,
++	.d_read = eno_rdwrt, .d_write = n2hd_write, .d_ioctl = eno_ioctl,
++	.d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL,
++	.d_select = eno_select, .d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0,
++};
++
++static int
++n2h_sysctl_cfg SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1)
++	if (n2h_lock == NULL) { return ENODEV; }
++	lck_mtx_lock(n2h_lock);
++	struct n2h_cfg c = n2h_cfg_g;
++	lck_mtx_unlock(n2h_lock);
++	uint32_t *field = arg2 == 0 ? &c.mode : arg2 == 1 ? &c.drv_max : &c.max_ms;
++	int v = (int)*field, changed = 0;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (err != 0 || !changed) { return err; }
++	if (v < 0 || v > 100000) { return EINVAL; }
++	*field = (uint32_t)v;
++	n2h_cfg_fix(&c);
++	lck_mtx_lock(n2h_lock);
++	n2h_cfg_g = c;
++	lck_mtx_unlock(n2h_lock);
++	printf("NORD2 HAPTIC: sysctl %s: mode %u drvmax %u max_ms %u\n", oidp->oid_name, c.mode, c.drv_max, c.max_ms);
++	return 0;
++}
++
++static int
++n2h_sysctl_test SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	int v = (int)n2h_test_last, changed = 0;
++	int err = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (err != 0 || !changed) { return err; }
++	if (v < 0 || v >= N2H_FX_COUNT || v == N2H_FX_RAW || n2h_lock == NULL) { return EINVAL; }
++	n2h_test_last = (uint32_t)v;
++	n2h_post((uint32_t)v, 0, 0);
++	return 0;
++}
++
++static int
++n2h_sysctl_stat SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[512];
++	snprintf(buf, sizeof(buf), "made=%u owner=%u chip=%u latched=%u phase=%u drv=%u opens=%u writes=%llu frames=%llu onsets=%llu taps=%llu "
++	    "runs=%llu capped=%llu starts=%llu stops=%llu throttled=%llu therm=%u bat_cC=%d refused=%llu watchdog=%llu stop_timeouts=%llu "
++	    "resets=%llu io_fails=%llu faults=%llu f0_dHz=%u lra_mohm=%u vbat_mv=%u budget_ms=%lld", n2h_made, n2h_owner_ready, n2h_chip_ok,
++	    n2h_st.latched, n2h_hw.phase, n2h_hw.drv, n2h_opens, n2h_env_g.writes, n2h_env_g.frames, n2h_env_g.onsets, n2h_strm.taps,
++	    n2h_strm.runs, n2h_strm.capped, n2h_hw.starts, n2h_hw.stops, n2h_st.throttled, n2h_st.therm, n2h_st.therm_cc,
++	    n2h_st.therm_refused, n2h_hw.watchdog, n2h_hw.stop_timeouts, n2h_hw.resets, n2h_hw.io_fails, n2h_hw.chip_faults,
++	    n2h_hw.f0_last, n2h_hw.lra_mohm, n2h_hw.vbat_mv, n2h_st.budget_us / 1000);
++	return sysctl_io_string(req, buf, sizeof(buf), 0, NULL);
++}
++SYSCTL_PROC(_kern, OID_AUTO, n2hap, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, n2h_sysctl_cfg, "I",
++    "0610 haptics: 1 allow, 0 motor off and kept off");
++SYSCTL_PROC(_kern, OID_AUTO, n2hap_drvmax, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 1, n2h_sysctl_cfg, "I",
++    "0610 haptics: AW8697 DRV_LVL at full scale, 18..60 (60 = Android)");
++SYSCTL_PROC(_kern, OID_AUTO, n2hap_max_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 2, n2h_sysctl_cfg, "I",
++    "0610 haptics: longest continuous run, ms (50..3000, default 1000; then a rest as long)");
++SYSCTL_PROC(_kern, OID_AUTO, n2hap_test, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, n2h_sysctl_test, "I",
++    "0610 haptics: play effect N once (1..15, nord2_haptic.h N2H_FX_*)");
++SYSCTL_PROC(_kern, OID_AUTO, n2hapstat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, n2h_sysctl_stat, "A",
++    "0610 haptics state and counters");
++
++static void
++nord2_haptic_start(void)
++{
++	uint32_t on = 1;
++	int gdv = 0;
++	if (!PE_parse_boot_argn("n2hap", &on, sizeof(on)) && PE_parse_boot_argn("n2gdv", &gdv, sizeof(gdv)) && (gdv & 1024)) { on = 0; }
++	n2h_grp = lck_grp_alloc_init("nord2-haptic", LCK_GRP_ATTR_NULL);
++	n2h_lock = n2h_grp != NULL ? lck_mtx_alloc_init(n2h_grp, LCK_ATTR_NULL) : NULL;
++	if (on == 0 || n2h_lock == NULL) {
++		printf("NORD2 HAPTIC: /dev/redwood-haptic not made (boot-arg n2hap=%u / n2gdv +1024): chip untouched\n", on);
++		return;
++	}
++	int major = cdevsw_add(-1, &n2hd_cdevsw);
++	if (major < 0) { printf("NORD2 HAPTIC: cdevsw_add failed (%d)\n", major); return; }
++	if (devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-haptic") == NULL) {
++		printf("NORD2 HAPTIC: devfs_make_node failed\n");
++		(void)cdevsw_remove(major, &n2hd_cdevsw);
++		return;
++	}
++	__atomic_store_n(&n2h_made, true, __ATOMIC_RELEASE);
++	printf("NORD2 HAPTIC: /dev/redwood-haptic made (major %d, 0666): iOS Actuator samples -> AW8697 CONT drive <= %u, run <= %u ms, "
++	    "budget %u ms at 50 %% refill, thermal half %d C / off %d C\n", major, n2h_cfg_g.drv_max, n2h_cfg_g.max_ms, N2H_BUDGET_MS,
++	    N2H_WARM_CC / 100, N2H_HOT_CC / 100);
++}
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -792,6 +792,9 @@
+ 
+ static void n2t_service(void);      /* 0496, below */
+ static void n2t_force_off(void);
++static void n2h_force_off(void);  /* 0610, nord2_haptic.inc */
++static void n2h_owner_start(void);
++static void n2h_service(void);
+ 
+ int
+ nord2_input_prepare_return(void)
+@@ -814,6 +817,7 @@
+ 	bool power_ok = true;
+ 	if (ni_bus_owned) {
+ 		n2t_force_off();      /* 0496: the flash LED off before the return */
++		n2h_force_off();      /* 0610: the haptic motor stopped, its reset pin as found */
+ 		ni_bus(false); (void)ni_stop();
+ 		ni_bus(true); (void)ni_stop();
+ 		if (ns_enabled) { ns_bus(); (void)ni_stop(); }
+@@ -907,6 +911,7 @@
+ 	/* Publish retained maps only after this owner finishes initial GPIO writes. */
+ 	nah_native_publish_ready();
+ 	ns_probe(); /* alert slider: publishes the boot ring/silent state */
++	n2h_owner_start(); /* 0610: the AW8697 haptic chip on the same I2C9 bus (reset, id, init, one boot pulse) */
+ 	n2scp_pmic_snapshot(); /* 0284: VCORE/SSHUB state for the SCP thread, on the PMIF's owner thread */
+ 	ni_bus(false);
+ 	unsigned errors = 0, ticks = 0, key_errors = 0, slider_ticks = 0;
+@@ -959,6 +964,7 @@
+ 		if ((++slider_ticks % 10) == 0) { ns_poll(); }
+ 		n2scp_pmic_service(); n2c_pmic_service();   /* 0284: VIBR on/off requests from the SCP thread */
+ 		if (powered) { n2t_service(); }   /* 0496: torch requests from /dev/redwood-torch (MT6360 FLED, same I2C5 bus) */
++		n2h_service();     /* 0610: iOS Actuator envelope -> AW8697 CONT drive, limits, watchdog (I2C9) */
+ 		n2rtc_service();   /* 0540: calendar -> MT6359P RTC when the calendar moved (one deadline compare per tick) */
+ 		ni_wait(10);
+ 	}
+@@ -1331,6 +1337,8 @@
+ 	    n2t_cfg_g.strobe ? "on" : "off", n2t_cfg_g.strobesel, n2t_strobe_ma(n2t_cfg_g.strobesel), N2T_STROBE_MS_MAX, N2T_STRB_TO_MARGIN_MS);
+ }
+ 
++#include "nord2_haptic.inc"   /* 0610: /dev/redwood-haptic and the AW8697 on I2C9 */
++
+ void
+ nord2_input_init(void)
+ {
+@@ -1352,6 +1360,7 @@
+ 	nord2_vcodec_start();   /* 0310: /dev/redwood-vcodec + /dev/redwood-vcodec-client */
+ 	nord2_gpsdl_start();   /* 0580: /dev/gpsdl0,1 (no register access here; kill switch sysctl kern.n2gnss bit 0) */
+ 	nord2_torch_start();    /* 0496: /dev/redwood-torch */
++	nord2_haptic_start();   /* 0610: /dev/redwood-haptic */
+ }
+ #else /* original Sweet hardware */
+ /*
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1233,6 +1233,43 @@
+ 		OSSafeReleaseNULL(cam);
+ 		OSSafeReleaseNULL(product);
+ 	}
++	/*
++	 * 0610 (haptic-20261114): IODeviceTree:/product/haptics { closed-loop, supports-3rd-party-haptics }.  libMobileGestalt 20H392:
++	 * DeviceSupportsHaptics = the node exists (answer 0x19c576454), DeviceSupportsClosedLoopHaptics = its property "closed-loop"
++	 * (0x19c564a9c), "haptics" = "supports-3rd-party-haptics" (0x19c56ed8c).  Closed loop makes FigVibrator / CoreHaptics / UIKit
++	 * play every haptic as a waveform on the HAL plug-in's "Actuator" device, which RedwoodAudio.driver writes to /dev/redwood-haptic
++	 * (bsd/dev/nord2_haptic.inc).  Same layout as the D22AP /product/haptics and HackiOS mkidentity.py.  Not made with n2hap=0 or
++	 * n2gdv +1024.  The cached "no" answers are in MobileGestalt's cache file (guest haptic1).
++	 */
++	{
++		extern const IORegistryPlane *gIODTPlane;
++		uint32_t hap = 1;
++		int gdv = 0;
++		if (!PE_parse_boot_argn("n2hap", &hap, sizeof(hap)) && PE_parse_boot_argn("n2gdv", &gdv, sizeof(gdv)) && (gdv & 1024) != 0) { hap = 0; }
++		IORegistryEntry *product = IORegistryEntry::fromPath("/product", gIODTPlane);
++		IORegistryEntry *hn = product != NULL ? product->childFromPath("haptics", gIODTPlane) : NULL;
++		const char *what = hap == 0 ? "not made (n2hap=0 / n2gdv +1024)" : product == NULL ? "NOT made (no /product)" : hn != NULL ? "was there" : "NOT made";
++		if (hap != 0 && product != NULL) {
++			if (hn == NULL) {
++				hn = OSTypeAlloc(IORegistryEntry);
++				if (hn != NULL && !hn->init()) { OSSafeReleaseNULL(hn); }
++				if (hn != NULL) {
++					hn->setName("haptics");
++					(void)hn->setProperty("name", (void *)(uintptr_t)"haptics", (unsigned int)sizeof("haptics"));
++					if (hn->attachToParent(product, gIODTPlane)) { what = "made"; } else { OSSafeReleaseNULL(hn); }
++				}
++			}
++			if (hn != NULL) {
++				uint32_t one = 1;
++				(void)hn->setProperty("closed-loop", &one, (unsigned int)sizeof(one));
++				(void)hn->setProperty("supports-3rd-party-haptics", &one, (unsigned int)sizeof(one));
++			}
++		}
++		IOLog("NORD2 HAPTIC CAP: IODeviceTree:/product/haptics %s%s (0610: MobileGestalt DeviceSupportsHaptics / ClosedLoopHaptics)\n",
++		    what, hn != NULL && hap != 0 ? ", closed-loop = 1, supports-3rd-party-haptics = 1" : "");
++		OSSafeReleaseNULL(hn);
++		OSSafeReleaseNULL(product);
++	}
+ 	return true;
+ }
+ 

@@ -1,0 +1,73 @@
+# haptic1: MobileGestalt's cached haptics answers -> true (kernel 0610: /dev/redwood-haptic + IODeviceTree:/product/haptics).
+# libMobileGestalt 20H392 (verified with bltorch-20261114/tools/mgslots.py on the mirror's cache of 2026-11-14 00:31):
+#   DeviceSupportsHaptics            slot 0xbd  (answer 0x19c576454: /product/haptics exists)           UIKit feedback level 1
+#   DeviceSupportsClosedLoopHaptics  slot 0xa7  (0x19c564a9c: /product/haptics "closed-loop")           CoreHaptics, VibeSynth,
+#                                                                                                        Settings System Haptics,
+#                                                                                                        UIKit level 2, keyboard
+#   haptics                          slot 0x84  (0x19c56ed8c: "supports-3rd-party-haptics")
+#   VibratorCapability               slot 0x22e (0x19c575448: DeviceSupportsHaptics or a "vibrator")
+# MGCopyAnswer answers from CacheData first (594 slots x 8 bytes, a valid byte per slot at 0x1290); the phone's cache holds
+# valid=1 value=0 for all four, so the kernel's new node alone would change nothing.  This block sets those value bytes to 1
+# (file size, owner and mode kept, nothing else changes); slots already 1 or not valid are left alone.  It refuses a cache of
+# another build/layout.  Receipt /private/var/db/nord2-stock/haptic1.json (offsets, old bytes, sha before/after); the undo puts
+# the old bytes back.  Idempotent; HAPTIC1_REFUSED = no change.
+import os, json, hashlib, plistlib
+R='/work/root'
+MG='/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist'
+D='/private/var/db/nord2-stock'; REC=D+'/haptic1.json'
+SLOTS_WANTED=[0xa7,0xbd,0x84,0x22e]; SLOTS=594; VALID=0x1290; LEN=0x14e2; BUILD='20H392'; UUID='42F6FA57-C5A1-4134-9BF4-AB00F962EAE8'
+sha=lambda b: hashlib.sha256(b).hexdigest(); rd=lambda p: open(R+p,'rb').read()
+def put(path, data, mode, uid, gid):
+    tmp=R+path+'.nord2tmp'
+    if os.path.lexists(tmp): os.remove(tmp)
+    with open(tmp,'xb') as f: f.write(data); f.flush(); os.fsync(f.fileno())
+    os.chmod(tmp,mode); os.chown(tmp,uid,gid); os.replace(tmp,R+path)
+    assert rd(path)==data
+def locate(raw):
+    try: p=plistlib.loads(raw)
+    except Exception as e: return None,'not a property list (%s)'%type(e).__name__
+    if not isinstance(p,dict) or p.get('CacheVersion')!=BUILD or p.get('CacheUUID')!=UUID: return None,'cache of another build (%r %r)'%(p.get('CacheVersion') if isinstance(p,dict) else None, p.get('CacheUUID') if isinstance(p,dict) else None)
+    d=p.get('CacheData')
+    if not isinstance(d,bytes) or len(d)!=LEN or LEN!=VALID+SLOTS: return None,'CacheData is not the 20H392 layout'
+    if raw[:6]!=b'bplist' or raw.count(d)!=1: return None,'CacheData not found once as raw bytes'
+    return raw.find(d),None
+def rmrec():
+    os.remove(R+REC)
+    if os.path.isdir(R+D) and not os.listdir(R+D): os.rmdir(R+D)
+rec=json.load(open(R+REC)) if os.path.exists(R+REC) else None
+if not os.path.isfile(R+MG):
+    if UNDO and rec is not None: rmrec(); print('HAPTIC1_UNDO the cache file is gone (it will be made again from the device tree): receipt removed')
+    else: print('HAPTIC1_UNDO nothing to undo' if UNDO else 'HAPTIC1_INSTALL no cache file: MobileGestalt will ask the device tree (kernel 0610), nothing to change')
+else:
+    raw=rd(MG); off,why=locate(raw); st=os.stat(R+MG)
+    if off is None: print('HAPTIC1_REFUSED', why)
+    elif not UNDO:
+        state={s:(raw[off+VALID+s], raw[off+s*8:off+s*8+8]) for s in SLOTS_WANTED}
+        bad=[hex(s) for s,(v,cur) in state.items() if v and cur[0] not in (0,1)] + [hex(s) for s,(v,cur) in state.items() if v and cur[1:]!=bytes(7)]
+        todo=[s for s,(v,cur) in state.items() if v and cur==bytes(8)]
+        if rec is not None and not todo: print('HAPTIC1_INSTALL already (receipt present, slots', {hex(s):state[s][1][0] for s in SLOTS_WANTED}, ')')
+        elif rec is not None: print('HAPTIC1_REFUSED receipt present but slots', [hex(s) for s in todo], 'are 0 again: undo first')
+        elif bad: print('HAPTIC1_REFUSED unexpected cached values in slots', bad)
+        elif not todo: print('HAPTIC1_INSTALL nothing to change (slots already true or not cached):', {hex(s):list(state[s][:1])+[state[s][1][0]] for s in SLOTS_WANTED})
+        else:
+            new=bytearray(raw)
+            for s in todo: new[off+s*8]=1
+            new=bytes(new)
+            rec={'by':'haptic-20261114 haptic1','path':MG,'slots':[{'slot':s,'file_offset':off+s*8,'old_byte':0,'new_byte':1} for s in todo],'sha_before':sha(raw),'sha_after':sha(new)}
+            os.makedirs(R+D,exist_ok=True)
+            with open(R+REC,'w') as f: json.dump(rec,f,indent=1); f.flush(); os.fsync(f.fileno())
+            put(MG,new,st.st_mode&0o7777,st.st_uid,st.st_gid)
+            a=plistlib.loads(raw); b=plistlib.loads(new); da=a.pop('CacheData'); db=b.pop('CacheData')
+            assert a==b and len(da)==len(db) and [i for i in range(LEN) if da[i]!=db[i]]==sorted(s*8 for s in todo)
+            print('HAPTIC1_INSTALL cached answers 0 -> 1 for slots %s (%d bytes, sha %s -> %s)'%([hex(s) for s in todo],len(new),sha(raw)[:12],sha(new)[:12]))
+    else:
+        if rec is None: print('HAPTIC1_UNDO nothing to undo')
+        else:
+            mine=[e for e in rec['slots'] if raw[e['file_offset']]==e['new_byte']]
+            new=bytearray(raw)
+            for e in mine: new[e['file_offset']]=e['old_byte']
+            new=bytes(new)
+            if mine: put(MG,new,st.st_mode&0o7777,st.st_uid,st.st_gid)
+            rmrec()
+            print('HAPTIC1_UNDO %d of %d slots put back (others not ours any more) byte_identical_to_before=%s'%(len(mine),len(rec['slots']),sha(new)==rec['sha_before']))
+os.sync()

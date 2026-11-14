@@ -1,0 +1,789 @@
+--- a/bsd/dev/nord2_haptic.h
++++ b/bsd/dev/nord2_haptic.h
+@@ -54,6 +54,19 @@
+ #define N2H_REG_SYSINTM         0x03u
+ #define N2H_REG_SYSCTRL         0x04u
+ #define N2H_REG_GO              0x05u
++#define N2H_REG_WAVSEQ1         0x07u     /* 0611: RAM playback (nord2_haptic_ram.h) */
++#define N2H_REG_WAVSEQ2         0x08u
++#define N2H_REG_WAVLOOP1        0x0Fu
++#define N2H_REG_MAIN_LOOP       0x13u
++#define N2H_REG_BASE_ADDRH      0x21u
++#define N2H_REG_BASE_ADDRL      0x22u
++#define N2H_REG_FIFO_AEH        0x23u
++#define N2H_REG_FIFO_AEL        0x24u
++#define N2H_REG_FIFO_AFH        0x25u
++#define N2H_REG_FIFO_AFL        0x26u
++#define N2H_REG_RAMADDRH        0x40u
++#define N2H_REG_RAMADDRL        0x41u
++#define N2H_REG_RAMDATA         0x42u     /* burst port: only through n2h_ram_write (RAMINIT on), never n2h_write */
+ #define N2H_REG_TRG_CFG2        0x1Cu
+ #define N2H_REG_DATCTRL         0x2Bu
+ #define N2H_REG_PWMPRC          0x2Du
+@@ -98,6 +111,7 @@
+ #define N2H_SYSCTRL_RAMINIT     0x20u
+ #define N2H_SYSCTRL_PLAY_MASK   0x0Cu
+ #define N2H_SYSCTRL_PLAY_CONT   0x08u
++#define N2H_SYSCTRL_PLAY_RAM    0x00u     /* 0611 */
+ #define N2H_SYSCTRL_BOOST       0x02u     /* never set by this driver */
+ #define N2H_SYSCTRL_STANDBY     0x01u
+ #define N2H_SYSINTM_UVLO        0x20u     /* 1 = UVLO interrupt masked (standby), 0 = enabled (active) */
+@@ -125,7 +139,8 @@
+ #define N2H_DRV_MIN             18u       /* level 1/1000 maps here */
+ 
+ /* ---- register sequences (interpreted by n2h_run; mask = the bits changed) ---- */
+-enum { N2H_OP_W = 1, N2H_OP_RMW, N2H_OP_DLY_MS, N2H_OP_DRV, N2H_OP_DRV_OV, N2H_OP_WAIT_CLR };
++enum { N2H_OP_W = 1, N2H_OP_RMW, N2H_OP_DLY_MS, N2H_OP_DRV, N2H_OP_DRV_OV, N2H_OP_WAIT_CLR, N2H_OP_GAIN, N2H_OP_WAVE };
++/* 0611: N2H_OP_GAIN writes n2h_run's first argument (DATDBG gain), N2H_OP_WAVE its second (WAVSEQ1 waveform) */
+ struct n2h_op { uint8_t op, reg, mask, val; };
+ 
+ /* after the chip id check (aw8697_haptic_init order; the RAM / trigger / proc parts of Android are not used) */
+@@ -205,6 +220,10 @@
+ 	case N2H_REG_ZC_THRSH_H: case N2H_REG_ZC_THRSH_L: case N2H_REG_BEMF_VTHH_H: case N2H_REG_BEMF_VTHH_L:
+ 	case N2H_REG_BEMF_VTHL_H: case N2H_REG_BEMF_VTHL_L: case N2H_REG_BEMF_NUM: case N2H_REG_TIME_NZC:
+ 	case N2H_REG_DRV_LVL: case N2H_REG_DRV_LVL_OV:
++	/* 0611: RAM playback (waveform select, loops, gain, RAM layout); RAMDATA itself is not here (burst only) */
++	case N2H_REG_WAVSEQ1: case N2H_REG_WAVSEQ2: case N2H_REG_WAVLOOP1: case N2H_REG_MAIN_LOOP: case N2H_REG_DATDBG:
++	case N2H_REG_BASE_ADDRH: case N2H_REG_BASE_ADDRL: case N2H_REG_FIFO_AEH: case N2H_REG_FIFO_AEL: case N2H_REG_FIFO_AFH:
++	case N2H_REG_FIFO_AFL: case N2H_REG_RAMADDRH: case N2H_REG_RAMADDRL:
+ 		return true;
+ 	default:
+ 		return false;
+@@ -217,7 +236,23 @@
+ 	bool (*rd)(void *ctx, uint8_t reg, uint8_t *v);
+ 	bool (*wr)(void *ctx, uint8_t reg, uint8_t v);
+ 	void (*sleep_ms)(void *ctx, unsigned ms);
+-};
++	/* 0611: bursts on one register (the RAMDATA port; n <= N2H_BURST_MAX) */
++	bool (*wrn)(void *ctx, uint8_t reg, const uint8_t *v, unsigned n);
++	bool (*rdn)(void *ctx, uint8_t reg, uint8_t *v, unsigned n);
++};
++#define N2H_BURST_MAX           62u       /* ni_bus_read's limit; writes use the same size */
++
++/* 0611 limits checked in n2h_write */
++#define N2H_GAIN_HW_MAX         0xBBu     /* DATDBG ceiling = the Android limit 128 x 4400 / 3000 (its RAM vbat compensation) */
++#define N2H_W_COUNT             3u        /* waveform kinds: tick, click, heavy */
++#ifndef N2H_WSEQ_MAX
++#ifdef N2H_VENDOR_RAM
++#include "nord2_haptic_vendor.h"
++#define N2H_WSEQ_MAX            N2H_VENDOR_NWAVES
++#else
++#define N2H_WSEQ_MAX            N2H_W_COUNT
++#endif
++#endif
+ 
+ static inline bool
+ n2h_write(const struct n2h_bus *b, uint8_t reg, uint8_t v)
+@@ -227,6 +262,9 @@
+ 	if (reg == N2H_REG_SYSCTRL && (v & N2H_SYSCTRL_BOOST)) { return false; }     /* the boost is never enabled */
+ 	if (reg == N2H_REG_DRV_LVL && v > N2H_DRV_HW_MAX) { return false; }
+ 	if (reg == N2H_REG_DRV_LVL_OV && v > N2H_DRV_OV_HW_MAX) { return false; }
++	if (reg == N2H_REG_DATDBG && v > N2H_GAIN_HW_MAX) { return false; }                  /* 0611 */
++	if (reg == N2H_REG_WAVSEQ1 && v > N2H_WSEQ_MAX) { return false; }                    /* 0611: only loaded waveforms */
++	if ((reg == N2H_REG_WAVSEQ2 || reg == N2H_REG_MAIN_LOOP || reg == N2H_REG_WAVLOOP1) && v != 0) { return false; } /* 0611: play once */
+ 	return b->wr(b->ctx, reg, v);
+ }
+ 
+@@ -242,6 +280,8 @@
+ 		case N2H_OP_W:      ok = n2h_write(b, o->reg, o->val); break;
+ 		case N2H_OP_DRV:    ok = n2h_write(b, o->reg, drv); break;
+ 		case N2H_OP_DRV_OV: ok = n2h_write(b, o->reg, drv_ov); break;
++		case N2H_OP_GAIN:   ok = o->reg == N2H_REG_DATDBG && n2h_write(b, o->reg, drv); break;
++		case N2H_OP_WAVE:   ok = o->reg == N2H_REG_WAVSEQ1 && drv_ov >= 1 && n2h_write(b, o->reg, drv_ov); break;
+ 		case N2H_OP_RMW:
+ 			ok = b->rd(b->ctx, o->reg, &v) && n2h_write(b, o->reg, (uint8_t)((v & ~o->mask) | (o->val & o->mask)));
+ 			break;
+@@ -544,6 +584,8 @@
+ 	volatile uint64_t onset_us;   /* first non-silent write after silence */
+ 	volatile uint64_t peak;       /* largest |sample| since the onset or since the owner last took it */
+ 	volatile uint64_t onsets, frames, writes;
++	volatile uint64_t zc, act_frames;    /* 0611: zero crossings / non-silent frames since the onset (iOS waveform frequency) */
++	volatile int64_t last_sign;
+ };
+ 
+ static inline uint32_t
+@@ -567,7 +609,11 @@
+ 		e->onset_us = now;
+ 		e->peak = 0;
+ 		e->onsets++;
++		e->zc = 0;
++		e->last_sign = 0;
++		e->act_frames = 0;
+ 	}
++	e->act_frames += frames;
+ 	e->heard_us = now;
+ 	if (peak > e->peak) { e->peak = peak; }
+ }
+@@ -586,7 +632,12 @@
+ 	uint64_t rest_until_us;       /* after a capped run */
+ 	uint32_t peak_hold;           /* peak of the waveform being played */
+ 	uint64_t taps, runs, capped, idle_stops;
++	/* 0611: with the RAM clicks loaded (ram_ok) an onset is a RAM click (n2h_click_take) and CONT drive is only for a waveform
++	 * still sounding N2H_SUSTAIN_MS after its onset (iOS continuous events, the ringer's vibration) */
++	bool ram_ok;
++	uint64_t click_onset, clicks, stale, wave_n[N2H_W_COUNT + 1];
+ };
++#define N2H_SUSTAIN_MS          50u
+ 
+ /*
+  * The whole decision for a tick: an internal pattern (boot pulse, test) first, else the stream.
+@@ -601,7 +652,10 @@
+ 	uint64_t heard = e->heard_us, quiet = e->quiet_us, onset = e->onset_us;
+ 	uint32_t peak = (uint32_t)e->peak;
+ 	bool active = heard != 0 && now >= heard && now - heard < N2H_ACTIVE_US && quiet <= heard;
+-	bool in_tap = onset != 0 && now >= onset && now - onset < (uint64_t)N2H_TAP_MIN_MS * 1000u && heard >= onset;
++	bool in_tap = !t->ram_ok && onset != 0 && now >= onset && now - onset < (uint64_t)N2H_TAP_MIN_MS * 1000u && heard >= onset;
++	if (t->ram_ok && active && !(onset != 0 && now >= onset && now - onset >= (uint64_t)N2H_SUSTAIN_MS * 1000u)) {
++		active = false;              /* 0611: a short waveform is a RAM click, not CONT */
++	}
+ 	bool want = c->mode && !s->latched && s->therm < 2 && (active || in_tap);
+ 	if (want && onset != t->onset_seen) {
+ 		t->onset_seen = onset;
+@@ -627,9 +681,11 @@
+ 	*drv = n2h_drv_for_peak(t->peak_hold, c, s->therm);
+ 	uint64_t end_a = heard + N2H_ACTIVE_US, end_b = onset + (uint64_t)N2H_TAP_MIN_MS * 1000u;
+ 	uint64_t end_c = t->run_start_us + (uint64_t)c->max_ms * 1000u;
+-	uint64_t end = end_a > end_b ? end_a : end_b;
++	uint64_t end = t->ram_ok ? end_a : end_a > end_b ? end_a : end_b;
+ 	*until_us = end < end_c ? end : end_c;
+ 	return true;
+ }
+ 
++#include "nord2_haptic_ram.h"      /* 0611: RAM clicks (waveform synthesis, upload, play) */
++
+ #endif /* NORD2_HAPTIC_H */
+--- a/bsd/dev/nord2_haptic.inc
++++ b/bsd/dev/nord2_haptic.inc
+@@ -7,6 +7,10 @@
+  * Kill switches: boot-arg n2hap=0 or n2gdv +1024 (no device node, the chip and its pins untouched); sysctl kern.n2hap=0 at run
+  * time (motor stopped and kept off).  kern.n2hap_drvmax (drive at full scale, 18..60, default 60 = Android), kern.n2hap_max_ms
+  * (one continuous run, default 1000), kern.n2hap_test (play effect N once: diagnostics), kern.n2hapstat (read only).
++ * 0611 (haptic2-20261114): after the boot pulse the owner thread synthesises three click waveforms at the tracked f0, uploads them
++ * to the chip's SRAM in 128-byte steps (one per tick, then read back and compared) and from then on plays each iOS onset as one
++ * RAM click (tick / click / heavy by the onset's peak, gain by level and VBAT); CONT drive is kept only for waveforms still
++ * sounding 50 ms after their onset.  A failed upload or verify keeps the 0610 CONT behaviour.  nord2_haptic_ram.h.
+  */
+ #include "nord2_haptic.h"
+ 
+@@ -20,7 +24,7 @@
+ static lck_grp_t *n2h_grp;
+ static lck_mtx_t *n2h_lock;
+ static struct { unsigned mux, dir, dout; } n2h_pin_rst, n2h_pin_irq;
+-enum { N2H_HW_OFF = 0, N2H_HW_ON, N2H_HW_STOPPING };
++enum { N2H_HW_OFF = 0, N2H_HW_ON, N2H_HW_STOPPING, N2H_HW_RAM };
+ static struct {
+ 	unsigned phase, faults, said;
+ 	uint8_t drv, glb_max;
+@@ -29,6 +33,18 @@
+ 	uint32_t f0_last, lra_mohm, vbat_mv;
+ } n2h_hw;
+ 
++/* 0611: the RAM clicks (owner thread) */
++enum { N2H_RAM_NONE = 0, N2H_RAM_WRITING, N2H_RAM_VERIFYING, N2H_RAM_READY, N2H_RAM_FAILED };
++static uint8_t n2h_ram_img[N2H_RAM_IMG_MAX];
++static struct n2h_ram_layout n2h_lay;
++static struct {
++	unsigned state, off, said, ovsaid, wsaid;
++	uint8_t datdbg_boot, wave, gain;
++	bool datdbg_read;
++	uint64_t t0_us, play_end_us, vbat_next_us, logged_onset;
++	uint64_t uploads, plays, overruns, verify_bad;
++} n2h_ram;
++
+ /* ---- the I2C9 transactions (owner thread only) ---- */
+ static bool
+ n2h_bus_rd(__unused void *ctx, uint8_t reg, uint8_t *v)
+@@ -55,7 +71,28 @@
+ 	ni_wait(ms);
+ }
+ 
+-static const struct n2h_bus n2h_bus_g = { NULL, n2h_bus_rd, n2h_bus_wr, n2h_bus_sleep };
++/* 0611: one start, the register, n bytes, one stop (the RAMDATA port auto-increments the SRAM address) */
++static bool
++n2h_bus_wrn(__unused void *ctx, uint8_t reg, const uint8_t *v, unsigned n)
++{
++	ns_bus();
++	bool ok = n > 0 && n <= N2H_BURST_MAX && ni_start() && ni_send((uint8_t)(N2H_ADDR << 1)) && ni_send(reg);
++	for (unsigned i = 0; ok && i < n; i++) { ok = ni_send(v[i]); }
++	bool stopped = ni_stop();
++	ni_bus(false);
++	return ok && stopped;
++}
++
++static bool
++n2h_bus_rdn(__unused void *ctx, uint8_t reg, uint8_t *v, unsigned n)
++{
++	ns_bus();
++	bool ok = ni_bus_read(N2H_ADDR, reg, v, n);
++	ni_bus(false);
++	return ok;
++}
++
++static const struct n2h_bus n2h_bus_g = { NULL, n2h_bus_rd, n2h_bus_wr, n2h_bus_sleep, n2h_bus_wrn, n2h_bus_rdn };
+ 
+ static void
+ n2h_pin_save(unsigned pin, unsigned *mux, unsigned *dir, unsigned *dout)
+@@ -160,6 +197,7 @@
+ 	(void)n2h_bus_rd(NULL, N2H_REG_TRIM_LRA, &trim);
+ 	(void)n2h_bus_rd(NULL, N2H_REG_SYSST, &sysst);
+ 	(void)n2h_bus_rd(NULL, N2H_REG_GLB_STATE, &glb);
++	n2h_ram.datdbg_read = n2h_bus_rd(NULL, N2H_REG_DATDBG, &n2h_ram.datdbg_boot);     /* 0611: restored before CONT */
+ 	bool lok = n2h_measure_lra(&n2h_bus_g, &n2h_hw.lra_mohm);
+ 	bool vok = n2h_measure_vbat(&n2h_bus_g, &n2h_hw.vbat_mv);
+ 	(void)N2H_RUN(&n2h_bus_g, n2h_seq_standby, 0, 0);
+@@ -169,6 +207,8 @@
+ 	    "SYSST %#x GLB %#x, LRA %u.%03u ohm%s, VBAT %u mV%s, irq level %d\n", N2H_F0_PRE / 10, N2H_F0_PRE % 10, n2h_cfg_g.drv_max,
+ 	    trim, sysst, glb, n2h_hw.lra_mohm / 1000, n2h_hw.lra_mohm % 1000, lok ? "" : " (read FAILED)", n2h_hw.vbat_mv,
+ 	    vok ? "" : " (read FAILED)", ni_level(N2H_GPIO_IRQ));
++	printf("NORD2 HAPTIC RAM: 0611 RAM clicks, profile %s: DATDBG at boot %#x%s; upload after the boot pulse\n", N2H_PROFILE->name,
++	    n2h_ram.datdbg_boot, n2h_ram.datdbg_read ? "" : " (read FAILED)");
+ 	if (n2h_hw.lra_mohm < 4000 || n2h_hw.lra_mohm > 60000) {
+ 		printf("NORD2 HAPTIC: LRA resistance out of the 4..60 ohm range: the motor may be open or shorted (still allowed)\n");
+ 	}
+@@ -181,6 +221,9 @@
+ static void
+ n2h_hw_start(uint8_t drv, uint64_t now, uint64_t until, const char *src)
+ {
++	if (n2h_ram.plays && n2h_ram.datdbg_read && n2h_ram.datdbg_boot <= N2H_GAIN_HW_MAX) {
++		(void)n2h_write(&n2h_bus_g, N2H_REG_DATDBG, n2h_ram.datdbg_boot);     /* 0611: CONT as in 0610 after RAM clicks */
++	}
+ 	unsigned bad = N2H_RUN(&n2h_bus_g, n2h_seq_cont, 0, 0);
+ 	if (!bad) { bad = N2H_RUN(&n2h_bus_g, n2h_seq_start, drv, n2h_drv_ov_for(drv)); }
+ 	n2h_io_result(bad == 0, "start");
+@@ -239,11 +282,134 @@
+ 		ni_wait(4);
+ 		n2h_hw.resets++;
+ 		if (!n2h_chip_init("after a stop timeout")) { n2h_latch("re-init failed"); return; }
++		n2h_ram.state = N2H_RAM_NONE;        /* 0611: the SRAM is uploaded again */
++		n2h_strm.ram_ok = false;
+ 		(void)N2H_RUN(&n2h_bus_g, n2h_seq_standby, 0, 0);
+ 		n2h_hw.phase = N2H_HW_OFF;
+ 	}
+ }
+ 
++/* 0611: one RAM waveform (the motor is idle) */
++static void
++n2h_ram_start(uint8_t wave, uint8_t gain, uint64_t now, const char *src, uint32_t peak, uint64_t lat_us)
++{
++	unsigned bad = N2H_RUN(&n2h_bus_g, n2h_seq_ram_play, gain, n2h_lay.idx[wave]);
++	n2h_io_result(bad == 0, "RAM play");
++	if (bad) { return; }
++	n2h_hw.phase = N2H_HW_RAM; n2h_hw.on_us = now; n2h_hw.starts++;
++	n2h_ram.play_end_us = now + (uint64_t)n2h_lay.ms_x10[wave] * 100u + 2000u;
++	n2h_hw.until_us = n2h_ram.play_end_us + (uint64_t)N2H_RAM_OVERRUN_MS * 1000u;
++	n2h_ram.plays++; n2h_ram.wave = wave; n2h_ram.gain = gain;
++	if (n2h_ram.said < 40) {
++		n2h_ram.said++;
++		printf("NORD2 HAPTIC: click (%s) %s (RAM wave %u) gain %#x peak %u, %u.%u ms waveform, %llu ms after the onset\n", src,
++		    n2h_wave_name[wave], n2h_lay.idx[wave], gain, peak, n2h_lay.ms_x10[wave] / 10, n2h_lay.ms_x10[wave] % 10, lat_us / 1000);
++	}
++}
++
++/* 0611: the RAM upload, one step per tick while the motor is idle (WRITING -> VERIFYING -> READY or FAILED) */
++static void
++n2h_ram_fail(const char *what, unsigned at)
++{
++	(void)N2H_RUN(&n2h_bus_g, n2h_seq_ram_close, 0, 0);
++	(void)N2H_RUN(&n2h_bus_g, n2h_seq_standby, 0, 0);
++	n2h_ram.state = N2H_RAM_FAILED;
++	n2h_strm.ram_ok = false;
++	printf("NORD2 HAPTIC RAM: %s at byte %u (stage %u): RAM clicks off, CONT taps as in 0610\n", what, at, ni_stage);
++}
++
++static void
++n2h_ram_step(uint64_t now, const struct n2h_cfg *c)
++{
++	if (n2h_ram.state == N2H_RAM_NONE) {
++		uint32_t f0 = n2h_f0_for_ram(n2h_hw.f0_last);
++		if (n2h_ram_build(n2h_ram_img, sizeof(n2h_ram_img), f0, N2H_PROFILE, &n2h_lay) == 0) { n2h_ram_fail("image build failed", 0); return; }
++		unsigned bad = N2H_RUN(&n2h_bus_g, n2h_seq_ram_open, 0, 0);
++		n2h_io_result(bad == 0, "RAM open");
++		if (bad) { n2h_ram_fail("RAM open failed", 0); return; }
++		n2h_ram.state = N2H_RAM_WRITING; n2h_ram.off = 0; n2h_ram.t0_us = now; n2h_ram.uploads++;
++		return;
++	}
++	unsigned n = n2h_lay.len - n2h_ram.off < N2H_RAM_CHUNK ? n2h_lay.len - n2h_ram.off : N2H_RAM_CHUNK;
++	uint16_t addr = (uint16_t)(N2H_RAM_BASE + n2h_ram.off);
++	if (n2h_ram.state == N2H_RAM_WRITING) {
++		bool ok = n2h_ram_write(&n2h_bus_g, addr, n2h_ram_img + n2h_ram.off, n);
++		n2h_io_result(ok, "RAM write");
++		if (!ok) { n2h_ram_fail("RAM write failed", n2h_ram.off); return; }
++		n2h_ram.off += n;
++		if (n2h_ram.off >= n2h_lay.len) { n2h_ram.state = N2H_RAM_VERIFYING; n2h_ram.off = 0; }
++		return;
++	}
++	if (n2h_ram.state == N2H_RAM_VERIFYING) {
++		unsigned bad = n; uint8_t got = 0;
++		bool ok = n2h_ram_verify(&n2h_bus_g, addr, n2h_ram_img + n2h_ram.off, n, &bad, &got);
++		n2h_io_result(ok, "RAM read");
++		if (!ok) { n2h_ram_fail("RAM read-back failed", n2h_ram.off); return; }
++		if (bad < n) {
++			n2h_ram.verify_bad++;
++			printf("NORD2 HAPTIC RAM: read-back %#x != %#x at %#x\n", got, n2h_ram_img[n2h_ram.off + bad], N2H_RAM_BASE + n2h_ram.off + bad);
++			n2h_ram_fail("RAM verify mismatch", n2h_ram.off + bad);
++			return;
++		}
++		n2h_ram.off += n;
++		if (n2h_ram.off < n2h_lay.len) { return; }
++		bool cok = N2H_RUN(&n2h_bus_g, n2h_seq_ram_close, 0, 0) == 0 && N2H_RUN(&n2h_bus_g, n2h_seq_standby, 0, 0) == 0;
++		n2h_io_result(cok, "RAM close");
++		if (!cok) { n2h_ram_fail("RAM close failed", n2h_lay.len); return; }
++		n2h_ram.state = N2H_RAM_READY;
++		n2h_strm.ram_ok = true;
++		n2h_strm.click_onset = n2h_env_g.onset_us;          /* what iOS played before is not replayed */
++		n2h_ram.vbat_next_us = now + 60000000ull;
++		printf("NORD2 HAPTIC RAM: %u bytes at %#x written and read back OK in %llu ms: f0 %u.%u Hz (tracked %u.%u), profile %s, "
++		    "tick %u.%u ms, click %u.%u ms, heavy %u.%u ms; iOS onsets now play RAM clicks (boost bypassed, gain <= %#x)\n",
++		    n2h_lay.len, N2H_RAM_BASE, (now - n2h_ram.t0_us) / 1000, n2h_lay.f0_dhz / 10, n2h_lay.f0_dhz % 10, n2h_hw.f0_last / 10,
++		    n2h_hw.f0_last % 10, n2h_lay.vendor ? "vendor aw8697_haptic_170.bin" : N2H_PROFILE->name, n2h_lay.ms_x10[1] / 10, n2h_lay.ms_x10[1] % 10, n2h_lay.ms_x10[2] / 10,
++		    n2h_lay.ms_x10[2] % 10, n2h_lay.ms_x10[3] / 10, n2h_lay.ms_x10[3] % 10, N2H_GAIN_HW_MAX);
++		if (c->mode && n2h_st.therm < 2 && !n2h_st.latched) {   /* one boot click: the user feels the new waveform once */
++			n2h_ram_start(N2H_W_CLICK, n2h_gain_for(1000, n2h_hw.vbat_mv, n2h_st.therm, N2H_PROFILE), now, "boot", 0, 0);
++		}
++	}
++}
++
++/* 0611: RAM waveform playing: wait for GLB_STATE idle after its length, then standby; still busy N2H_RAM_OVERRUN_MS later: GO 0 */
++static void
++n2h_ram_playing(uint64_t now)
++{
++	if (now < n2h_ram.play_end_us) { return; }
++	uint8_t glb = 0xff;
++	bool ok = n2h_bus_rd(NULL, N2H_REG_GLB_STATE, &glb);
++	n2h_io_result(ok, "state");
++	if (ok && (glb & N2H_GLB_BUSY_MASK) == 0) {
++		bool sok = N2H_RUN(&n2h_bus_g, n2h_seq_standby, 0, 0) == 0;
++		n2h_io_result(sok, "standby");
++		if (!sok) { return; }
++		n2h_hw.phase = N2H_HW_OFF; n2h_hw.stops++;
++		if (n2h_ram.wsaid < 6) { n2h_ram.wsaid++; printf("NORD2 HAPTIC: click done, idle %llu ms after the start\n", (now - n2h_hw.on_us) / 1000); }
++		return;
++	}
++	if (now >= n2h_ram.play_end_us + (uint64_t)N2H_RAM_OVERRUN_MS * 1000u) {
++		n2h_ram.overruns++;
++		if (n2h_ram.ovsaid < 8) { n2h_ram.ovsaid++; printf("NORD2 HAPTIC: RAM play still busy (GLB_STATE %#x) %llu ms after the start: GO 0\n", glb, (now - n2h_hw.on_us) / 1000); }
++		n2h_hw_stop(now, NULL);
++	}
++}
++
++/* 0611: one line per iOS waveform once it ended (first 40): its length, peak and frequency, for the tuning */
++static void
++n2h_ios_wave_log(uint64_t now)
++{
++	uint64_t onset = n2h_env_g.onset_us, heard = n2h_env_g.heard_us, quiet = n2h_env_g.quiet_us;
++	if (onset == 0 || onset == n2h_ram.logged_onset || heard < onset) { return; }
++	if (!(quiet > heard || now - heard >= N2H_ACTIVE_US)) { return; }
++	n2h_ram.logged_onset = onset;
++	static unsigned said;
++	if (said >= 40) { return; }
++	said++;
++	uint64_t fr = n2h_env_g.act_frames, zc = n2h_env_g.zc;
++	printf("NORD2 HAPTIC: iOS waveform: onset to last sound %llu ms, %llu non-silent frames (%llu ms), peak %llu, ~%llu Hz\n",
++	    (heard - onset) / 1000, fr, fr / 48u, n2h_env_g.peak, fr ? zc * 48000u / (2u * fr) : 0);
++}
++
+ /* input owner thread, every loop (10 ms) */
+ static void
+ n2h_service(void)
+@@ -268,6 +434,27 @@
+ 			    n2h_st.therm >= 2 ? "motor off" : n2h_st.therm == 1 ? "half drive" : "normal");
+ 		}
+ 	}
++	/* 0611: the RAM upload runs right after the boot pulse, while the motor is idle; nothing else drives the chip meanwhile */
++	if ((n2h_ram.state == N2H_RAM_NONE || n2h_ram.state == N2H_RAM_WRITING || n2h_ram.state == N2H_RAM_VERIFYING) &&
++	    n2h_hw.phase == N2H_HW_OFF && n2h_st.nseg == 0 && !n2h_st.latched) {
++		n2h_ram_step(now, &c);
++		if (n2h_ram.state != N2H_RAM_READY && n2h_ram.state != N2H_RAM_FAILED) { return; }
++	}
++	n2h_ios_wave_log(now);
++	if (n2h_strm.ram_ok && n2h_hw.phase == N2H_HW_OFF && !n2h_st.latched) {
++		uint8_t wave = 0, gain = 0;
++		uint32_t peak = 0;
++		if (n2h_ram.vbat_next_us && now >= n2h_ram.vbat_next_us) {     /* VBAT for the gain compensation, once a minute */
++			n2h_ram.vbat_next_us = now + 60000000ull;
++			uint32_t mv = 0;
++			if (n2h_measure_vbat(&n2h_bus_g, &mv) && mv >= 2500 && mv <= 4700) { n2h_hw.vbat_mv = mv; }
++		}
++		n2h_budget(&n2h_st, now, false);
++		if (n2h_click_take(&n2h_st, &n2h_strm, &n2h_env_g, &c, now, n2h_hw.vbat_mv, N2H_PROFILE, &wave, &gain, &peak)) {
++			n2h_ram_start(wave, gain, now, "iOS", peak, now - n2h_env_g.onset_us);
++		}
++	}
++	hw_on = n2h_hw.phase == N2H_HW_ON || n2h_hw.phase == N2H_HW_RAM;
+ 	bool pattern = n2h_st.nseg != 0;
+ 	uint8_t drv = 0;
+ 	uint64_t until = 0;
+@@ -300,10 +487,13 @@
+ 	case N2H_HW_STOPPING:
+ 		n2h_hw_stopping(now);
+ 		break;
++	case N2H_HW_RAM:
++		n2h_ram_playing(now);
++		break;
+ 	}
+ 	if (now >= n2h_hw.sum_next_us) {
+ 		n2h_hw.sum_next_us = now + 60000000ull;
+-		uint64_t sig = n2h_env_g.writes + n2h_hw.starts * 3 + n2h_st.throttled * 5 + n2h_hw.io_fails * 7;
++		uint64_t sig = n2h_env_g.writes + n2h_hw.starts * 3 + n2h_st.throttled * 5 + n2h_hw.io_fails * 7 + n2h_ram.state * 11;
+ 		if (sig != n2h_hw.sum_sig) {
+ 			n2h_hw.sum_sig = sig;
+ 			printf("NORD2 HAPTIC SUM: opens %u writes %llu frames %llu onsets %llu taps %llu runs %llu capped %llu starts %llu stops %llu "
+@@ -312,6 +502,10 @@
+ 			    n2h_strm.runs, n2h_strm.capped, n2h_hw.starts, n2h_hw.stops, n2h_hw.drv_changes, n2h_st.throttled, n2h_st.therm,
+ 			    n2h_st.therm_refused, n2h_hw.watchdog, n2h_hw.stop_timeouts, n2h_hw.resets, n2h_hw.io_fails, n2h_hw.chip_faults,
+ 			    n2h_hw.f0_last / 10, n2h_hw.f0_last % 10, n2h_st.budget_us / 1000);
++			printf("NORD2 HAPTIC RAM SUM: state %u clicks %llu (tick %llu click %llu heavy %llu) plays %llu stale %llu overruns %llu "
++			    "verify_bad %llu uploads %llu last gain %#x vbat %u mV\n", n2h_ram.state, n2h_strm.clicks, n2h_strm.wave_n[1],
++			    n2h_strm.wave_n[2], n2h_strm.wave_n[3], n2h_ram.plays, n2h_strm.stale, n2h_ram.overruns, n2h_ram.verify_bad,
++			    n2h_ram.uploads, n2h_ram.gain, n2h_hw.vbat_mv);
+ 		}
+ 	}
+ }
+@@ -371,7 +565,9 @@
+ 		if (n > (user_ssize_t)sizeof(samples)) { n = sizeof(samples); }
+ 		n &= ~(user_ssize_t)1;
+ 		if ((err = uiomove((char *)samples, (int)n, uio)) != 0) { break; }
+-		n2h_env_feed(&n2h_env_g, n2h_peak_of(samples, (unsigned)(n / 2)), (unsigned)(n / 2), now);
++		uint32_t pk = n2h_peak_of(samples, (unsigned)(n / 2));
++		n2h_env_feed(&n2h_env_g, pk, (unsigned)(n / 2), now);
++		if (pk > N2H_SILENT_BELOW) { n2h_env_g.zc += n2h_zc_count(samples, (unsigned)(n / 2), &n2h_env_g.last_sign); }   /* 0611 */
+ 	}
+ 	if (uio_resid(uio) == 1) { (void)uiomove((char *)samples, 1, uio); }
+ 	if (!n2h_announced && n2h_env_g.onsets) {
+@@ -427,10 +623,11 @@
+ n2h_sysctl_stat SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(oidp, arg1, arg2)
+-	char buf[512];
+-	snprintf(buf, sizeof(buf), "made=%u owner=%u chip=%u latched=%u phase=%u drv=%u opens=%u writes=%llu frames=%llu onsets=%llu taps=%llu "
++	char buf[704];
++	snprintf(buf, sizeof(buf), "ram=%u clicks=%llu tick=%llu click=%llu heavy=%llu stale=%llu ram_overruns=%llu f0ram_dHz=%u made=%u owner=%u chip=%u latched=%u phase=%u drv=%u opens=%u writes=%llu frames=%llu onsets=%llu taps=%llu "
+ 	    "runs=%llu capped=%llu starts=%llu stops=%llu throttled=%llu therm=%u bat_cC=%d refused=%llu watchdog=%llu stop_timeouts=%llu "
+-	    "resets=%llu io_fails=%llu faults=%llu f0_dHz=%u lra_mohm=%u vbat_mv=%u budget_ms=%lld", n2h_made, n2h_owner_ready, n2h_chip_ok,
++	    "resets=%llu io_fails=%llu faults=%llu f0_dHz=%u lra_mohm=%u vbat_mv=%u budget_ms=%lld", n2h_ram.state, n2h_strm.clicks,
++	    n2h_strm.wave_n[1], n2h_strm.wave_n[2], n2h_strm.wave_n[3], n2h_strm.stale, n2h_ram.overruns, n2h_lay.f0_dhz, n2h_made, n2h_owner_ready, n2h_chip_ok,
+ 	    n2h_st.latched, n2h_hw.phase, n2h_hw.drv, n2h_opens, n2h_env_g.writes, n2h_env_g.frames, n2h_env_g.onsets, n2h_strm.taps,
+ 	    n2h_strm.runs, n2h_strm.capped, n2h_hw.starts, n2h_hw.stops, n2h_st.throttled, n2h_st.therm, n2h_st.therm_cc,
+ 	    n2h_st.therm_refused, n2h_hw.watchdog, n2h_hw.stop_timeouts, n2h_hw.resets, n2h_hw.io_fails, n2h_hw.chip_faults,
+--- /dev/null
++++ b/bsd/dev/nord2_haptic_ram.h
+@@ -0,0 +1,319 @@
++/*
++ * nord2_haptic_ram.h -- 0611 (haptic2-20261114): crisp RAM clicks for the AW8697 (included at the end of nord2_haptic.h; pure C,
++ * host-tested by test/haptic_test.c against the simulated chip).
++ *
++ * Why [V phone logs autocycle/runs/f3, vc9p, gr1 with q10jcz]: 0610 turned every iOS haptic into CONT drive: "on (iOS)" ...
++ * "stop (iOS silent) after 41..53 ms", then the chip's brake ran 13..31 ms more ("standby N ms after the stop").  CONT mode is
++ * a closed loop that ramps the LRA up over several periods and keeps it at resonance: ~8 cycles of 170 Hz = the "mosquito" buzz
++ * the user reported.  Android (the same kernel tree, aw8697.c "vibration run in ram mode") plays every effect from the chip's
++ * SRAM: short waveforms with the drive and an antiphase brake baked in.  The Android file aw8697_haptic_170.bin is not on the
++ * phone nor in the vendor dump, so this file SYNTHESISES the waveforms at boot, at the f0 the chip tracked during the boot pulse
++ * (170 Hz on this motor; 1700 dHz when the reading is missing or outside 160..180 Hz) and uploads them over I2C9.
++ *
++ * RAM format [V aw8697.c aw8697_container_update / aw8697_ram_loaded, haptic_hv.c get_ram_num]: the image is written from
++ * BASE_ADDR through the RAMDATA port (RAMINIT on, RAMADDR auto-increments, bursts); byte 0 at the base is a version byte, then
++ * one 4-byte entry per waveform {start H, start L, end H, end L} (absolute SRAM addresses; ram_num = (first start - base - 1) / 4),
++ * then the waveforms: signed 8-bit samples at 24 kHz with PWMDBG = 24K [V aw8697.c osc calibration: fre_val 2 -> len / 24000].
++ * FIFO_AE/AF = base/2 and base - base/4 (aw8697_container_update).  Playback [V aw8697_haptic_play_wav_seq / play_mode RAM]:
++ * WAVSEQ1 = waveform, WAVSEQ2 = 0, loops 0, SYSCTRL play mode RAM with the boost BYPASSED (as Android's RAM mode), active, GO;
++ * gain = DATDBG (0x80 = unity, Android's AW8697_HAPTIC_RAM_VBAT_COMP_GAIN, scaled by 4400 / VBAT, ceiling 128 x 4400 / 3000).
++ * In bypass the bridge output cannot exceed VBAT whatever the gain: the strongest click equals Android's.
++ *
++ * Waveforms (full scale = VBAT across the 8.3 ohm LRA, as Android): N drive half-cycles of a soft-clipped sine at f0, then M
++ * antiphase half-cycles (the brake: at resonance the LRA's velocity is in phase with the drive, so an antiphase drive takes out
++ * about the energy the same number of half-cycles put in; the last brake half-cycle is weaker so the motor is not driven back).
++ *   tick  (selection, keyboard, soft taps)  1 cycle drive + 0.7 cycle brake  ~11.8 ms
++ *   click (most UIKit impacts)              2 cycles      + 1.7               ~23.5 ms
++ *   heavy (very loud iOS transients)        3 cycles      + 2.7               ~35 ms
++ * Profiles (compile time, N2H_RAM_PROFILE): 0 default; 1 strong (squarer drive, one more drive half-cycle); 2 soft (pure sine,
++ * gain 3/4).
++ * Vendor waveforms (compile time, N2H_VENDOR_RAM): nord2_haptic_vendor.h, generated by haptic2-20261114/make_vendor_header.py from
++ * Android's own aw8697_haptic_170.bin (odm partition), replaces the synthesis: the file's image is uploaded as Android does
++ * (its base address, its table) and tick / click / heavy play the vendor waveform indices chosen by the script.
++ */
++#ifndef NORD2_HAPTIC_RAM_H
++#define NORD2_HAPTIC_RAM_H
++
++#ifndef N2H_RAM_PROFILE
++#define N2H_RAM_PROFILE         0
++#endif
++
++#ifdef N2H_VENDOR_RAM
++#include "nord2_haptic_vendor.h"          /* n2h_vendor_img[], N2H_VENDOR_BASE / _LEN / _NWAVES, n2h_vendor_idx[] */
++#define N2H_RAM_BASE            N2H_VENDOR_BASE
++#else
++#define N2H_RAM_BASE            0x0800u   /* waveform area 0x0800..0x1fff (the RTP FIFO below it is unused) */
++#endif
++#define N2H_RAM_END             0x2000u   /* 8 KiB SRAM */
++#define N2H_RAM_RATE            24000u
++#define N2H_RAM_VERSION         0x01u
++#if defined(N2H_VENDOR_RAM) && N2H_VENDOR_LEN > 3072u
++#define N2H_RAM_IMG_MAX         N2H_VENDOR_LEN
++#else
++#define N2H_RAM_IMG_MAX         3072u     /* our image (header + 3 waveforms, any profile, f0 >= 160 Hz) stays below this */
++#endif
++#define N2H_RAM_CHUNK           128u      /* bytes uploaded / verified per owner tick (~13 ms of bus time) */
++#define N2H_F0_MIN_OK           1600u
++#define N2H_F0_MAX_OK           1800u
++#define N2H_GAIN_UNITY          0x80u
++#define N2H_VBAT_REFER          4400u     /* Android AW8697_VBAT_REFER / MIN / MAX */
++#define N2H_VBAT_MIN            3000u
++#define N2H_VBAT_MAX            4500u
++#define N2H_CLICK_STALE_US      40000ull  /* an onset not played within 40 ms (motor busy) is dropped */
++#define N2H_RAM_OVERRUN_MS      30u       /* RAM play still busy this long past the waveform: GO 0 */
++#define N2H_TICK_BELOW          350u      /* level (0..1000 of N2H_PEAK_FULL) below this: tick */
++#define N2H_HEAVY_PEAK          16384u    /* |sample| from half full scale: heavy */
++
++enum { N2H_W_TICK = 1, N2H_W_CLICK = 2, N2H_W_HEAVY = 3 };
++static const char *const n2h_wave_name[N2H_W_COUNT + 1] = { "none", "tick", "click", "heavy" };
++
++#define N2H_BRK_MAX 10
++struct n2h_wdef { uint8_t drive_halves, nbrk; uint8_t brk_pct[N2H_BRK_MAX]; };
++struct n2h_profile {
++	const char *name;
++	uint16_t clip_q8;             /* sine x clip_q8 / 256, clipped at full scale (256 = pure sine, 512 = nearly square) */
++	uint8_t gain_max;             /* DATDBG at level 1000 before the VBAT compensation */
++	struct n2h_wdef w[N2H_W_COUNT + 1];
++};
++static const struct n2h_profile n2h_profiles[3] = {
++	{ "default", 358, N2H_GAIN_UNITY, { { 0, 0, { 0 } },
++		{ 2, 2, { 100, 40 } },
++		{ 4, 4, { 100, 100, 100, 40 } },
++		{ 6, 6, { 100, 100, 100, 100, 100, 40 } } } },
++	{ "strong", 512, N2H_GAIN_UNITY, { { 0, 0, { 0 } },
++		{ 3, 3, { 100, 100, 30 } },
++		{ 5, 5, { 100, 100, 100, 100, 40 } },
++		{ 7, 7, { 100, 100, 100, 100, 100, 100, 40 } } } },
++	{ "soft", 256, 0x60, { { 0, 0, { 0 } },
++		{ 2, 2, { 100, 40 } },
++		{ 4, 4, { 100, 100, 100, 40 } },
++		{ 6, 6, { 100, 100, 100, 100, 100, 40 } } } },
++};
++#if N2H_RAM_PROFILE < 0 || N2H_RAM_PROFILE > 2
++#error "N2H_RAM_PROFILE must be 0 (default), 1 (strong) or 2 (soft)"
++#endif
++#define N2H_PROFILE (&n2h_profiles[N2H_RAM_PROFILE])
++
++/* sin(i x 90 deg / 64), Q15 */
++static const uint16_t n2h_qsin[65] = {
++	0, 804, 1608, 2410, 3212, 4011, 4808, 5602, 6393, 7179, 7962, 8739, 9512, 10278, 11039, 11793, 12539, 13279, 14010, 14732,
++	15446, 16151, 16846, 17530, 18204, 18868, 19519, 20159, 20787, 21403, 22005, 22594, 23170, 23731, 24279, 24811, 25329, 25832,
++	26319, 26790, 27245, 27683, 28105, 28510, 28898, 29268, 29621, 29956, 30273, 30571, 30852, 31113, 31356, 31580, 31785, 31971,
++	32137, 32285, 32412, 32521, 32609, 32678, 32728, 32757, 32767 };
++
++struct n2h_ram_layout {
++	uint32_t f0_dhz, len;                     /* image bytes (from the base) */
++	uint16_t start[N2H_W_COUNT + 1], end[N2H_W_COUNT + 1];   /* absolute SRAM addresses, end inclusive */
++	uint32_t ms_x10[N2H_W_COUNT + 1];         /* waveform length, 0.1 ms */
++	uint8_t idx[N2H_W_COUNT + 1];             /* WAVSEQ1 value for tick / click / heavy */
++	bool vendor;
++};
++
++static inline uint32_t
++n2h_f0_for_ram(uint32_t tracked_dhz)
++{
++	return tracked_dhz >= N2H_F0_MIN_OK && tracked_dhz <= N2H_F0_MAX_OK ? tracked_dhz : N2H_F0_PRE;
++}
++
++/* one waveform at f0 into out (cap bytes); returns its length or 0 when it does not fit */
++static inline unsigned
++n2h_wave_synth(uint8_t *out, unsigned cap, uint32_t f0_dhz, const struct n2h_wdef *w, uint16_t clip_q8)
++{
++	unsigned halves = (unsigned)w->drive_halves + w->nbrk, n = 0;
++	/* phase in units of one half-cycle = 2^32; advance per 24 kHz sample = f0 x 2 / 24000 half-cycles */
++	uint64_t inc = ((uint64_t)f0_dhz << 32) / (5u * N2H_RAM_RATE), ph = 0;
++	for (;;) {
++		unsigned h = (unsigned)(ph >> 32);
++		if (h >= halves) { break; }
++		if (n >= cap) { return 0; }
++		unsigned idx = (unsigned)((ph >> 25) & 127u);           /* 0..127 across the half-cycle */
++		uint32_t s = n2h_qsin[idx <= 64 ? idx : 128 - idx];      /* |sin|, Q15 */
++		uint32_t v = s * clip_q8 / 256u;
++		if (v > 32767u) { v = 32767u; }
++		unsigned pct = h < w->drive_halves ? 100u : w->brk_pct[h - w->drive_halves];
++		int32_t mag = (int32_t)((v * 127u * pct + 50u * 32767u) / (100u * 32767u));
++		bool neg = (h & 1u) != 0;                                /* the sine's own sign in this half-cycle */
++		if (h >= w->drive_halves) { neg = !neg; }               /* brake: antiphase */
++		out[n++] = (uint8_t)(int8_t)(neg ? -mag : mag);
++		ph += inc;
++	}
++	for (unsigned z = 0; z < 2; z++) {                           /* end at rest */
++		if (n >= cap) { return 0; }
++		out[n++] = 0;
++	}
++	return n;
++}
++
++/* the whole image (version, table, waveforms); returns its length (0 = failure) */
++static inline unsigned
++n2h_ram_build(uint8_t *img, unsigned cap, uint32_t f0_dhz, const struct n2h_profile *p, struct n2h_ram_layout *lay)
++{
++	unsigned hdr = 1u + 4u * N2H_W_COUNT, pos = hdr;
++	if (cap < hdr || f0_dhz < N2H_F0_MIN_OK || f0_dhz > N2H_F0_MAX_OK) { return 0; }
++	*lay = (struct n2h_ram_layout){ 0 };
++	lay->f0_dhz = f0_dhz;
++#ifdef N2H_VENDOR_RAM
++	(void)p; (void)pos;
++	if (cap < N2H_VENDOR_LEN || N2H_VENDOR_BASE + N2H_VENDOR_LEN > N2H_RAM_END) { return 0; }
++	for (unsigned i = 0; i < N2H_VENDOR_LEN; i++) { img[i] = n2h_vendor_img[i]; }
++	lay->vendor = true;
++	for (unsigned k = 1; k <= N2H_W_COUNT; k++) {
++		unsigned v = n2h_vendor_idx[k];
++		if (v < 1 || v > N2H_VENDOR_NWAVES) { return 0; }
++		const uint8_t *e = img + 1 + 4 * (v - 1);
++		unsigned st = (unsigned)e[0] << 8 | e[1], en = (unsigned)e[2] << 8 | e[3];
++		if (st <= N2H_VENDOR_BASE || en < st || en >= N2H_VENDOR_BASE + N2H_VENDOR_LEN) { return 0; }
++		lay->start[k] = (uint16_t)st; lay->end[k] = (uint16_t)en; lay->idx[k] = (uint8_t)v;
++		lay->ms_x10[k] = (en - st + 1u) * 10000u / N2H_RAM_RATE;
++	}
++	lay->len = N2H_VENDOR_LEN;
++	return N2H_VENDOR_LEN;
++#else
++	img[0] = N2H_RAM_VERSION;
++	for (unsigned k = 1; k <= N2H_W_COUNT; k++) {
++		unsigned n = n2h_wave_synth(img + pos, cap - pos, f0_dhz, &p->w[k], p->clip_q8);
++		if (n == 0 || N2H_RAM_BASE + pos + n > N2H_RAM_END) { return 0; }
++		lay->start[k] = (uint16_t)(N2H_RAM_BASE + pos);
++		lay->end[k] = (uint16_t)(N2H_RAM_BASE + pos + n - 1);
++		lay->ms_x10[k] = n * 10000u / N2H_RAM_RATE;
++		lay->idx[k] = (uint8_t)k;
++		uint8_t *e = img + 1 + 4 * (k - 1);
++		e[0] = (uint8_t)(lay->start[k] >> 8); e[1] = (uint8_t)lay->start[k];
++		e[2] = (uint8_t)(lay->end[k] >> 8);   e[3] = (uint8_t)lay->end[k];
++		pos += n;
++	}
++	lay->len = pos;
++	return pos;
++#endif
++}
++
++/* RAM layout registers + RAMINIT on (aw8697_container_update order); the data follows with n2h_ram_write */
++static const struct n2h_op n2h_seq_ram_open[] = {
++	{ N2H_OP_RMW, N2H_REG_SYSCTRL, N2H_SYSCTRL_RAMINIT | N2H_SYSCTRL_BOOST, N2H_SYSCTRL_RAMINIT },
++	{ N2H_OP_W, N2H_REG_BASE_ADDRH, 0xFF, (uint8_t)(N2H_RAM_BASE >> 8) },
++	{ N2H_OP_W, N2H_REG_BASE_ADDRL, 0xFF, (uint8_t)N2H_RAM_BASE },
++	{ N2H_OP_W, N2H_REG_FIFO_AEH, 0xFF, (uint8_t)((N2H_RAM_BASE >> 1) >> 8) },
++	{ N2H_OP_W, N2H_REG_FIFO_AEL, 0xFF, (uint8_t)(N2H_RAM_BASE >> 1) },
++	{ N2H_OP_W, N2H_REG_FIFO_AFH, 0xFF, (uint8_t)((N2H_RAM_BASE - (N2H_RAM_BASE >> 2)) >> 8) },
++	{ N2H_OP_W, N2H_REG_FIFO_AFL, 0xFF, (uint8_t)(N2H_RAM_BASE - (N2H_RAM_BASE >> 2)) },
++};
++static const struct n2h_op n2h_seq_ram_close[] = {
++	{ N2H_OP_RMW, N2H_REG_SYSCTRL, N2H_SYSCTRL_RAMINIT | N2H_SYSCTRL_BOOST, 0 },
++};
++
++/* RAMADDR = addr then bursts of the RAMDATA port (RAMINIT must be on: the caller opened it) */
++static inline bool
++n2h_ram_addr(const struct n2h_bus *b, uint16_t addr)
++{
++	return addr < N2H_RAM_END && n2h_write(b, N2H_REG_RAMADDRH, (uint8_t)(addr >> 8)) && n2h_write(b, N2H_REG_RAMADDRL, (uint8_t)addr);
++}
++
++static inline bool
++n2h_ram_write(const struct n2h_bus *b, uint16_t addr, const uint8_t *v, unsigned n)
++{
++	if (b->wrn == NULL || addr < N2H_RAM_BASE || (uint32_t)addr + n > N2H_RAM_END || !n2h_ram_addr(b, addr)) { return false; }
++	for (unsigned i = 0; i < n; i += N2H_BURST_MAX) {
++		unsigned k = n - i < N2H_BURST_MAX ? n - i : N2H_BURST_MAX;
++		if (!b->wrn(b->ctx, N2H_REG_RAMDATA, v + i, k)) { return false; }
++	}
++	return true;
++}
++
++/* reads back and compares; *bad = first mismatching offset (n = none). false on a bus error. */
++static inline bool
++n2h_ram_verify(const struct n2h_bus *b, uint16_t addr, const uint8_t *v, unsigned n, unsigned *bad, uint8_t *got)
++{
++	uint8_t buf[N2H_BURST_MAX];
++	*bad = n;
++	if (b->rdn == NULL || !n2h_ram_addr(b, addr)) { return false; }
++	for (unsigned i = 0; i < n; i += N2H_BURST_MAX) {
++		unsigned k = n - i < N2H_BURST_MAX ? n - i : N2H_BURST_MAX;
++		if (!b->rdn(b->ctx, N2H_REG_RAMDATA, buf, k)) { return false; }
++		for (unsigned j = 0; j < k && *bad == n; j++) {
++			if (buf[j] != v[i + j]) { *bad = i + j; *got = buf[j]; }
++		}
++	}
++	return true;
++}
++
++/* play one RAM waveform: n2h_run(b, seq, gain, wave) (aw8697_haptic_set_wav_seq + play_wav_seq; boost bypassed) */
++static const struct n2h_op n2h_seq_ram_play[] = {
++	{ N2H_OP_GAIN, N2H_REG_DATDBG, 0xFF, 0 },
++	{ N2H_OP_WAVE, N2H_REG_WAVSEQ1, 0xFF, 0 },
++	{ N2H_OP_W, N2H_REG_WAVSEQ2, 0xFF, 0 },
++	{ N2H_OP_W, N2H_REG_WAVLOOP1, 0xFF, 0 },
++	{ N2H_OP_W, N2H_REG_MAIN_LOOP, 0xFF, 0 },
++	{ N2H_OP_RMW, N2H_REG_SYSCTRL, N2H_SYSCTRL_PLAY_MASK | N2H_SYSCTRL_BOOST | N2H_SYSCTRL_STANDBY | N2H_SYSCTRL_RAMINIT,
++	  N2H_SYSCTRL_PLAY_RAM },
++	{ N2H_OP_RMW, N2H_REG_SYSINTM, N2H_SYSINTM_UVLO, 0 },
++	{ N2H_OP_RMW, N2H_REG_GO, N2H_GO, N2H_GO },
++};
++
++/* DATDBG for a level (0..1000), with Android's RAM VBAT compensation and the thermal halving */
++static inline uint8_t
++n2h_gain_for(uint32_t level, uint32_t vbat_mv, uint32_t therm, const struct n2h_profile *p)
++{
++	if (level > 1000) { level = 1000; }
++	if (vbat_mv < N2H_VBAT_MIN) { vbat_mv = N2H_VBAT_MIN; }
++	if (vbat_mv > N2H_VBAT_MAX) { vbat_mv = N2H_VBAT_MAX; }
++	uint32_t g = (uint32_t)p->gain_max * (550u + 450u * level / 1000u) / 1000u;
++	g = g * N2H_VBAT_REFER / vbat_mv;
++	if (therm == 1) { g /= 2u; }
++	if (g > N2H_GAIN_HW_MAX) { g = N2H_GAIN_HW_MAX; }
++	if (g < 8u) { g = 8u; }
++	return (uint8_t)g;
++}
++
++/* the waveform for an iOS onset's peak */
++static inline uint8_t
++n2h_wave_for(uint32_t peak, uint32_t *level)
++{
++	uint32_t l = peak >= N2H_PEAK_FULL ? 1000u : peak * 1000u / N2H_PEAK_FULL;
++	*level = l;
++	if (peak >= N2H_HEAVY_PEAK) { return N2H_W_HEAVY; }
++	return l < N2H_TICK_BELOW ? N2H_W_TICK : N2H_W_CLICK;
++}
++
++/*
++ * A new iOS onset -> one RAM click (call only when the motor is idle).  true = play *wave at *gain.  An onset older than
++ * N2H_CLICK_STALE_US (the motor was busy) is dropped; the same limits as the CONT path apply (switch, latch, thermal, budget).
++ */
++static inline bool
++n2h_click_take(struct n2h_state *s, struct n2h_stream *t, const struct n2h_env *e, const struct n2h_cfg *c, uint64_t now,
++    uint32_t vbat_mv, const struct n2h_profile *p, uint8_t *wave, uint8_t *gain, uint32_t *peak_out)
++{
++	uint64_t onset = e->onset_us, heard = e->heard_us;
++	if (!t->ram_ok || s->nseg) { return false; }
++	if (onset == 0 || onset == t->click_onset || heard < onset) { return false; }
++	t->click_onset = onset;
++	if (!c->mode || s->latched || s->therm >= 2) { return false; }
++	if (now < onset || now - onset > N2H_CLICK_STALE_US) { t->stale++; return false; }
++	if (s->budget_us <= 0) { s->throttled++; return false; }
++	uint32_t peak = (uint32_t)e->peak, level = 0;
++	if (peak <= N2H_SILENT_BELOW) { peak = N2H_SILENT_BELOW + 1; }
++	*wave = n2h_wave_for(peak, &level);
++	*gain = n2h_gain_for(level, vbat_mv, s->therm, p);
++	*peak_out = peak;
++	t->clicks++;
++	t->wave_n[*wave]++;
++	return true;
++}
++
++/* zero crossings of a write's samples with a +-N2H_SILENT_BELOW hysteresis (the iOS waveform's frequency, for the log) */
++static inline unsigned
++n2h_zc_count(const int16_t *s, unsigned n, volatile int64_t *last_sign)
++{
++	unsigned zc = 0;
++	int64_t ls = *last_sign;
++	for (unsigned i = 0; i < n; i++) {
++		int64_t sg = s[i] > (int32_t)N2H_SILENT_BELOW ? 1 : s[i] < -(int32_t)N2H_SILENT_BELOW ? -1 : 0;
++		if (sg != 0) {
++			if (ls != 0 && sg != ls) { zc++; }
++			ls = sg;
++		}
++	}
++	*last_sign = ls;
++	return zc;
++}
++
++#endif /* NORD2_HAPTIC_RAM_H */
