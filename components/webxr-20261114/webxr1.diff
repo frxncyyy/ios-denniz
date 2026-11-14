@@ -1,0 +1,109 @@
+diff -u ./air_metal.c ../src/air_metal.c
+--- ./air_metal.c	2026-11-14 01:33:41.146096155 +0100
++++ ../src/air_metal.c	2026-11-14 19:28:17.265470556 +0100
+@@ -1548,6 +1548,24 @@
+     * its own business and not this table's.
+     */
+    { 540, "MTLPixelFormatRGB8_420_2P",     PIPE_FORMAT_R8_G8B8_420_UNORM },
++   /*
++    * webxr1 (14 November): THE EXTENDED-RANGE FORMATS AS EIGHT BITS A CHANNEL. A wide-colour
++    * device (this port is an iPhone X to iOS) makes WebKit's page tiles 'w30r' (opaque,
++    * Metal 554) and its transparent layers 'b3a8' (550), and the GPU process draws them with
++    * CoreAnimation's Metal renderer: refused, every page stayed black (run perf1a, "pixel
++    * format 554 ... refused"). The kernel allocates those FourCCs as plain 'BGRA' of the same
++    * geometry (MiniIOSurface.cpp) and reports 'BGRA' back, so the memory IS eight bits a
++    * channel: the formats are served as exactly that. Whoever writes and whoever reads goes
++    * through this table, so the two agree; what is lost is the range outside [0, 1] and the
++    * two extra bits, which this panel cannot show anyway. 554/555 have no alpha: BGRX, which
++    * samples alpha as 1 as Metal's BGR10_XR does.
++    */
++   { 550, "MTLPixelFormatBGRA10_XR (8-bit BGRA here)",      PIPE_FORMAT_B8G8R8A8_UNORM },
++   { 551, "MTLPixelFormatBGRA10_XR_sRGB (8-bit BGRA here)", PIPE_FORMAT_B8G8R8A8_SRGB },
++   { 552, "MTLPixelFormatBGRA10_XR (8-bit BGRA here)",      PIPE_FORMAT_B8G8R8A8_UNORM },
++   { 553, "MTLPixelFormatBGRA10_XR_sRGB (8-bit BGRA here)", PIPE_FORMAT_B8G8R8A8_SRGB },
++   { 554, "MTLPixelFormatBGR10_XR (8-bit BGRX here)",       PIPE_FORMAT_B8G8R8X8_UNORM },
++   { 555, "MTLPixelFormatBGR10_XR_sRGB (8-bit BGRX here)",  PIPE_FORMAT_B8G8R8X8_SRGB },
+ };
+ 
+ /*
+Common subdirectories: ./redwood-drm and ../src/redwood-drm
+diff -u ./redwooddrawable.m ../src/redwooddrawable.m
+--- ./redwooddrawable.m	2026-11-14 02:16:01.757535276 +0100
++++ ../src/redwooddrawable.m	2026-11-14 19:28:42.131122322 +0100
+@@ -70,6 +70,7 @@
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <string.h>
++#include <unistd.h>
+ 
+ #include "redwood_drawable.h"
+ #include "m2m.h"
+@@ -600,10 +601,38 @@
+ 	return texel % elem == 0 || elem % texel == 0;
+ }
+ 
++/*
++ * webxr1 (14 November): the extended-range formats 550-555 over the 'BGRA' surface the kernel makes of 'w30r' / 'b3a8' / 'w40a'.
++ * The compiler library serves them as eight bits a channel (BGRA8 for 550-553, BGRX8 for 554/555), which is what that memory is,
++ * so writer and reader agree. WebKit's page tiles are 'w30r' drawn as 554 in com.apple.WebKit.GPU: refused, Safari pages black.
++ * Not while /var/db/nord2-metal/no-webxr exists (read once per process): the old refusal.
++ */
++static int
++rwd_xr8_on(void)
++{
++	static int on = -1;
++
++	if (on < 0) {
++		on = access("/var/db/nord2-metal/no-webxr", F_OK) != 0;
++		m2m_log('I', "WEBXR", "webxr1 %s: Metal formats 550-555 %s over 'BGRA' surfaces (/var/db/nord2-metal/no-webxr %s)",
++		    on ? "on" : "off", on ? "served as 8-bit BGRA/BGRX" : "refused", on ? "absent" : "present");
++	}
++	return on;
++}
++
++static int
++rwd_is_xr(unsigned metal)
++{
++	return metal >= 550 && metal <= 555;
++}
++
+ /* Whether a surface of `fourcc` may stand under Metal format `metal` (a format may have several). */
+ static int
+ rwd_fourcc_serves(unsigned metal, uint32_t fourcc)
+ {
++	if (rwd_is_xr(metal) && fourcc == 'BGRA' && rwd_xr8_on()) {
++		return 1;        /* webxr1 */
++	}
+ 	for (size_t i = 0; i < sizeof(rwd_formats) / sizeof(rwd_formats[0]); i++) {
+ 		if (rwd_formats[i].metal == metal && rwd_formats[i].fourcc == fourcc && !rwd_formats[i].substituted) {
+ 			return 1;
+@@ -617,6 +646,16 @@
+ rwd_format_of_metal(unsigned metal_pixel_format, uint32_t *fourcc, unsigned *bytes_per_pixel,
+ 		    char *why, size_t why_size)
+ {
++	/* webxr1: an XR format is the kernel's 'BGRA' of the same geometry, four bytes a pixel, and is served as such */
++	if (rwd_is_xr(metal_pixel_format) && rwd_xr8_on()) {
++		if (fourcc != NULL) {
++			*fourcc = 'BGRA';
++		}
++		if (bytes_per_pixel != NULL) {
++			*bytes_per_pixel = 4;
++		}
++		return 0;
++	}
+ 	for (size_t i = 0; i < sizeof(rwd_formats) / sizeof(rwd_formats[0]); i++) {
+ 		const struct rwd_format *f = &rwd_formats[i];
+ 
+diff -u ./redwoodmetal.m ../src/redwoodmetal.m
+--- ./redwoodmetal.m	2026-11-14 02:16:01.759251982 +0100
++++ ../src/redwoodmetal.m	2026-11-14 19:28:42.132990189 +0100
+@@ -7840,7 +7840,7 @@
+ 	 * regardless. The compositor's own imports (YCbCr planes etc.) are left alone: only plain 8/10/16-bit colour formats. */
+ 	{
+ 		unsigned pf = shape.pixel_format;
+-		bool colour = pf == 70 || pf == 71 || pf == 80 || pf == 81 || pf == 90 || pf == 94 || pf == 115 || (pf >= 552 && pf <= 555);
++		bool colour = pf == 70 || pf == 71 || pf == 80 || pf == 81 || pf == 90 || pf == 94 || pf == 115 || (pf >= 550 && pf <= 555);   /* webxr1: 550/551 too */
+ 		unsigned before = shape.usage;
+ 		if (colour && shape.type == 2 && !(shape.usage & 4u)) {
+ 			shape.usage = shape.usage ? (shape.usage | 4u) : (1u | 4u);
+Only in ../src: webxr_host_test.c

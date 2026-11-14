@@ -1,0 +1,66 @@
+# dk1: stop the driverkitd crash loop (phone logs 2026-11-13, kernel q10jib, after cc-txn-wall4).
+# /usr/libexec/driverkitd has NEVER survived a launch on this port: every launch (also before the transaction: ia_boot.log,
+# ib_boot.log) is killed by jetsam (exit reason namespace 1 code 7 = per-process memory limit) while it is inside read() called
+# from -[NSData initWithContentsOfURL:options:error:] (driverkitd+0x9e6b4). Before the transaction it was launched once per boot
+# (RunAtLoad) and then left alone. Its job is also launched on demand: Mach services com.apple.DriverKitExtensionServer /
+# HostSpecialPort 15 and the launch events com.apple.LaunchServices.applicationRegistered / applicationUnregistered. Since the
+# transaction that demand exists and is never consumed (the daemon dies first), so launchd respawns it every 10 s for hours
+# (hot1.log 134 launches in 23 min, hot2.log still 6/min at 1 h uptime), each time with ReportCrash and, every ~70 s,
+# ReportMemoryException behind it.
+# This block removes the job /System/Library/LaunchDaemons/com.apple.driverkitd.plist from the launchd cache
+# /System/Library/xpc/launchd.plist (Metal receipt installed_launchd_sha256 checked before and updated after, as poster1).
+# The job, its position in the dictionary and the sha before are kept in /private/var/db/nord2-stock/dk1.json; the undo puts
+# the identical job back at the same position. Nothing else is touched. Idempotent; DK1_REFUSED = no change.
+import os, json, hashlib, plistlib, base64
+R='/work/root'; LP='/System/Library/xpc/launchd.plist'; MR='/private/var/db/nord2-metal/receipt.json'
+KEY='/System/Library/LaunchDaemons/com.apple.driverkitd.plist'; PROG=['/usr/libexec/driverkitd']
+D='/private/var/db/nord2-stock'; REC=D+'/dk1.json'
+sha=lambda b: hashlib.sha256(b).hexdigest(); rd=lambda p: open(R+p,'rb').read()
+def put(path, data, mode, uid, gid):
+    tmp=R+path+'.nord2tmp'
+    if os.path.lexists(tmp): os.remove(tmp)
+    with open(tmp,'xb') as f: f.write(data); f.flush(); os.fsync(f.fileno())
+    os.chmod(tmp,mode); os.chown(tmp,uid,gid); os.replace(tmp,R+path)
+    assert rd(path)==data
+raw=rd(LP); fmt=plistlib.FMT_BINARY if raw[:6]==b'bplist' else plistlib.FMT_XML; cfg=plistlib.loads(raw)
+rc=json.load(open(R+MR)); oldh=rc.get('installed_launchd_sha256')
+def save_launchd(tag):
+    out=plistlib.dumps(cfg,fmt=fmt,sort_keys=False); lst=os.stat(R+LP)
+    put(LP,out,lst.st_mode&0o7777,lst.st_uid,lst.st_gid); assert plistlib.loads(rd(LP))==cfg
+    rc['installed_launchd_sha256']=sha(out); mst=os.stat(R+MR)
+    put(MR,(json.dumps(rc,indent=2)+'\n').encode(),mst.st_mode&0o7777,mst.st_uid,mst.st_gid)
+    print('DK1_LAUNCHD', tag, oldh[:12], '->', rc['installed_launchd_sha256'][:12])
+    return sha(out)
+LD=cfg.get('LaunchDaemons'); rec=json.load(open(R+REC)) if os.path.exists(R+REC) else None
+if oldh!=sha(raw): print('DK1_REFUSED launchd.plist differs from the Metal receipt: not touching it')
+elif not isinstance(LD,dict): print('DK1_REFUSED no LaunchDaemons dictionary')
+elif not UNDO:
+    job=LD.get(KEY)
+    if rec is not None and job is None: print('DK1_INSTALL already (job absent, receipt present)')
+    elif rec is not None: print('DK1_REFUSED receipt present but the job is in the cache again: undo first')
+    elif not isinstance(job,dict) or job.get('ProgramArguments')!=PROG or job.get('Label')!='com.apple.driverkitd': print('DK1_REFUSED driverkitd job not found / unexpected')
+    else:
+        keys=list(LD); i=keys.index(KEY)
+        rec={'by':'payload-hotfix1 dk1','key':KEY,'index':i,'after_key':keys[i-1] if i else None,'launchd_sha_before':sha(raw),
+             'job_bplist_b64':base64.b64encode(plistlib.dumps(job,fmt=plistlib.FMT_BINARY,sort_keys=False)).decode()}
+        os.makedirs(R+D,exist_ok=True)
+        with open(R+REC,'w') as f: json.dump(rec,f,indent=1); f.flush(); os.fsync(f.fileno())
+        del LD[KEY]; h=save_launchd('driverkitd job removed'); rec['launchd_sha_after']=h
+        with open(R+REC,'w') as f: json.dump(rec,f,indent=1); f.flush(); os.fsync(f.fileno())
+        assert KEY not in plistlib.loads(rd(LP))['LaunchDaemons']
+        print('DK1_INSTALL removed', KEY, 'jobs', len(keys), '->', len(LD))
+else:
+    if rec is None: print('DK1_UNDO nothing to undo')
+    elif KEY in LD: print('DK1_REFUSED undo: the job is already in the cache, receipt left in place')
+    else:
+        job=plistlib.loads(base64.b64decode(rec['job_bplist_b64'])); new={}; done=False
+        if rec['after_key'] is None: new[KEY]=job; done=True
+        for k,v in LD.items():
+            new[k]=v
+            if not done and k==rec['after_key']: new[KEY]=job; done=True
+        if not done: new[KEY]=job
+        cfg['LaunchDaemons']=new; h=save_launchd('driverkitd job restored')
+        os.remove(R+REC)
+        if os.path.isdir(R+D) and not os.listdir(R+D): os.rmdir(R+D)
+        print('DK1_UNDO done byte_identical_to_before=%s'%(h==rec['launchd_sha_before']))
+os.sync()

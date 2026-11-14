@@ -1,0 +1,132 @@
+# sbshift1 (sbshift-20261114): move the iOS status bar items clear of the Nord 2 punch hole by a byte patch of UIKitCore in the
+# dyld shared cache (subcache dyld_shared_cache_arm64.03 of iOS 16.7 20H392), instead of the 0550 overlay band rotation.
+#
+# Why [V-disasm of this exact cache; the guest file is byte-identical to the host copy, sha 511377c04e30...]:
+#   iOS picks _UIStatusBarVisualProvider_Split1125 (iPhone X).  -[_UIStatusBarVisualProvider_FixedSplit leadingCenteringEdgeInset]
+#   = UIRoundToScale(notchRect.x/2 + 0.15*cornerRadius) + [class leadingCenteringOffset]; +[Split1125 leadingCenteringOffset] returns
+#   the literal -2/3 pt -> the clock is centred 46.67 pt (iOS x 140 = panel x 118) from the left edge: under the hole (panel centre
+#   ~(104,72), radius ~35, right edge ~139 +-5, measured on the user's photos IMG_20261114_003513/003547).
+#   -[FixedSplit trailingCenteringEdgeInset] = leadingCenteringEdgeInset + [class trailingCenteringOffset] (1.0): the trailing items
+#   are centred at the same distance from the right edge (+1 pt), so they follow the leading change unless compensated.
+#   Callers [V-xref UIKitCore]: leadingCenteringOffset only from leadingCenteringEdgeInset; leadingCenteringEdgeInset from
+#   leadingEdgeInsets, trailingCenteringEdgeInset, pillCenteringEdgeInset; trailingCenteringOffset also from expandedEdgeInsets
+#   (Control Center) -> that call is NOT patched (patching the selector's implementation would move the expanded bar off screen).
+# Patch (2 sites, 16 bytes, + the 2 page hashes of the ad-hoc code directory so the subcache signature stays self-consistent):
+#   A  +[_UIStatusBarVisualProvider_Split1125 leadingCenteringOffset] (vm 0x18922e754, file 0x24a2754):
+#        adrp x8,..; ldr d0,[x8,#0x1c8]; ret   ->   movz x8,#0x4042,lsl #48; fmov d0,x8; ret        (= +36.0 pt instead of -0.667)
+#   B  -[_UIStatusBarVisualProvider_FixedSplit trailingCenteringEdgeInset] (vm 0x189aba7b0, file 0x2d2e7b0):
+#        bl _objc_msgSend$trailingCenteringOffset   ->   fmov d0,#-25.0
+# Result (pt from the iOS edges; panel px = 3*pt - 22 on the left): leading centre 46.67 -> 83.33 pt (clock "00:35" panel x
+#   ~54..183 -> ~164..293, >= 20 px clear of the hole edge); trailing centre 47.67 -> 58.33 pt (battery 32 px further from the
+#   rounded corner); pill (call/recording) follows the clock.  Expanded (Control Center) bar unchanged.
+# Code signing: the subcache is ad-hoc signed (CodeDirectory flags 0x2, empty CMS); not in a trust cache on this port (warning only,
+#   every subcache).  The two changed 16 KiB page hashes are rewritten, so page validation (if active) still matches.
+# Receipt /private/var/db/nord2-stock/sbshift1.json (original bytes + hashes).  Idempotent; SBSHIFT1_REFUSED = no change.
+import os, json, hashlib, struct
+R = globals().get('R', '/work/root')
+P = '/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64.03'
+D = '/private/var/db/nord2-stock'; REC = D + '/sbshift1.json'
+SIZE = 115769344
+SHA_STOCK = '511377c04e3054b905fcfb83bb2d1e6ffdb3b838ae21969fd1962dbfcab9880b'
+SITES = [  # file offset, stock bytes, patched bytes, what
+    (0x24a2754, bytes.fromhex('086400b000e540fdc0035fd6'), bytes.fromhex('4808e8d20001679ec0035fd6'), '+[Split1125 leadingCenteringOffset] = 36.0'),
+    (0x2d2e7b0, bytes.fromhex('7c2e2794'), bytes.fromhex('0030771e'), '-[FixedSplit trailingCenteringEdgeInset]: offset -25.0'),
+]
+
+def cd_info(f):
+    f.seek(0); h = f.read(0x200)
+    if not h.startswith(b'dyld_v1   arm64\0'): raise ValueError('not an arm64 dyld cache')
+    cso, css = struct.unpack_from('<QQ', h, 0x28)
+    f.seek(cso); sb = f.read(css)
+    magic, length, count = struct.unpack_from('>III', sb, 0)
+    if magic != 0xfade0cc0: raise ValueError('superblob magic')
+    for i in range(count):
+        typ, off = struct.unpack_from('>II', sb, 12 + 8 * i)
+        if typ == 0:
+            m, l = struct.unpack_from('>II', sb, off)
+            if m != 0xfade0c02: raise ValueError('code directory magic')
+            flags, hoff = struct.unpack_from('>II', sb, off + 12)
+            ncode, climit = struct.unpack_from('>II', sb, off + 28)
+            hsize, htype, _, pshift = sb[off + 36], sb[off + 37], sb[off + 38], sb[off + 39]
+            if (hsize, htype, pshift) != (32, 2, 14) or climit != cso: raise ValueError('unexpected code directory geometry')
+            return {'base': cso + off + hoff, 'ncode': ncode, 'limit': climit, 'flags': flags}
+    raise ValueError('no code directory')
+
+def page_hash(f, cd, pg):
+    f.seek(pg << 14); return hashlib.sha256(f.read(min(1 << 14, cd['limit'] - (pg << 14)))).digest()
+
+def stored_hash(f, cd, pg):
+    f.seek(cd['base'] + 32 * pg); return f.read(32)
+
+def state(f, cd):
+    """'stock', 'patched' or a reason string; checks bytes and that every touched page hash matches the stored one"""
+    got = []
+    for off, old, new, _ in SITES:
+        f.seek(off); b = f.read(len(old)); got.append('stock' if b == old else 'patched' if b == new else 'other')
+    for pg in sorted({off >> 14 for off, _, _, _ in SITES}):
+        if page_hash(f, cd, pg) != stored_hash(f, cd, pg): return 'page %d hash mismatch' % pg
+    if all(g == 'stock' for g in got): return 'stock'
+    if all(g == 'patched' for g in got): return 'patched'
+    return 'mixed ' + ','.join(got)
+
+def write_sites(f, cd, which):
+    for off, old, new, _ in SITES:
+        f.seek(off); f.write(new if which == 'patched' else old)
+    f.flush()
+    for pg in sorted({off >> 14 for off, _, _, _ in SITES}):
+        h = page_hash(f, cd, pg); f.seek(cd['base'] + 32 * pg); f.write(h)
+    f.flush(); os.fsync(f.fileno())
+
+def full_sha(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as g:
+        while True:
+            b = g.read(1 << 22)
+            if not b: break
+            h.update(b)
+    return h.hexdigest()
+
+def run(undo):
+    path = R + P
+    if not os.path.isfile(path) or os.path.getsize(path) != SIZE: print('SBSHIFT1_REFUSED', P, 'missing or unexpected size'); return 'refused'
+    rec = json.load(open(R + REC)) if os.path.exists(R + REC) else None
+    with open(path, 'r+b') as f:
+        try: cd = cd_info(f)
+        except ValueError as e: print('SBSHIFT1_REFUSED code directory:', e); return 'refused'
+        st = state(f, cd)
+        if not undo:
+            if st == 'patched' and rec is not None: print('SBSHIFT1_INSTALL already (patched, receipt present)'); return 'noop'
+            if st != 'stock': print('SBSHIFT1_REFUSED state', st, 'receipt', rec is not None); return 'refused'
+            sha0 = full_sha(path)
+            if sha0 != SHA_STOCK: print('SBSHIFT1_REFUSED subcache sha', sha0[:12], '!= stock', SHA_STOCK[:12]); return 'refused'
+            pages = sorted({off >> 14 for off, _, _, _ in SITES})
+            r = {'by': 'sbshift-20261114 sbshift1', 'file': P, 'sha_before': sha0,
+                 'sites': [{'off': off, 'stock': old.hex(), 'patched': new.hex(), 'what': w} for off, old, new, w in SITES],
+                 'page_hash_before': {str(pg): stored_hash(f, cd, pg).hex() for pg in pages}}
+            os.makedirs(R + D, exist_ok=True)
+            with open(R + REC, 'w') as o: json.dump(r, o, indent=1); o.flush(); os.fsync(o.fileno())
+            write_sites(f, cd, 'patched')
+            st2 = state(f, cd)
+            if st2 != 'patched': print('SBSHIFT1_FAILED after write', st2); return 'failed'
+            r['page_hash_after'] = {str(pg): stored_hash(f, cd, pg).hex() for pg in pages}
+            with open(R + REC, 'w') as o: json.dump(r, o, indent=1); o.flush(); os.fsync(o.fileno())
+            print('SBSHIFT1_INSTALL patched', len(SITES), 'sites +', len(pages), 'page hashes in', P.split('/')[-1], 'sha', sha0[:12], '->', full_sha(path)[:12])
+            return 'install'
+        else:
+            if st == 'stock':
+                if rec is not None: os.remove(R + REC)
+                print('SBSHIFT1_UNDO nothing to undo (stock bytes)' + (', receipt removed' if rec is not None else '')); return 'noop'
+            if st != 'patched' or rec is None: print('SBSHIFT1_REFUSED undo: state', st, 'receipt', rec is not None); return 'refused'
+            if [(s['off'], s['stock'], s['patched']) for s in rec['sites']] != [(o, a.hex(), b.hex()) for o, a, b, _ in SITES]:
+                print('SBSHIFT1_REFUSED undo: receipt sites differ'); return 'refused'
+            write_sites(f, cd, 'stock')
+            if state(f, cd) != 'stock': print('SBSHIFT1_FAILED undo write'); return 'failed'
+            for pg, hx in rec['page_hash_before'].items():
+                if stored_hash(f, cd, int(pg)).hex() != hx: print('SBSHIFT1_FAILED undo page hash', pg); return 'failed'
+        sha1 = full_sha(path)
+        if sha1 != rec['sha_before']: print('SBSHIFT1_FAILED undo sha', sha1[:12]); return 'failed'
+        os.remove(R + REC)
+        print('SBSHIFT1_UNDO restored stock bytes and page hashes, sha', sha1[:12]); return 'undo'
+
+if 'UNDO' in globals() and not globals().get('NO_RUN'):
+    run(UNDO)
