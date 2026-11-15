@@ -1,0 +1,368 @@
+--- a/bsd/dev/nord2_gpu_core.c
++++ b/bsd/dev/nord2_gpu_core.c
+@@ -210,8 +210,11 @@
+         }
+         if (b->state == N2C_BO_QUARANTINED)
+                 c->stats.drained++;
+-        if (b->size)
++        if (b->size) {
+                 (void)n2va_free(x->va, b->va, b->size + BO_GUARD);
++                struct n2c_freed *fr = &c->freed[c->freed_next++ % N2C_FREED_RING];      /* 0750: for the fault report */
++                fr->va = b->va; fr->size = b->size; fr->t_ms = now(c); fr->handle = b->handle; fr->ctx = (uint8_t)(x - c->ctxs);
++        }
+         if (b->cookie && c->ops.free_owner)
+                 c->ops.free_owner(c->ctx, b->cookie);
+         x->wired = x->wired >= b->charged ? x->wired - b->charged : 0;
+@@ -1314,6 +1317,8 @@
+                 return N2C_E_NO_CTX;
+         if (c->state == N2C_CORE_BROKEN)
+                 return N2C_E_BROKEN;
++        if (x->state == N2C_CTX_FAULTED)
++                c->as_stats.faulted_refused++;  /* 0750 */
+         if (c->state != N2C_CORE_READY || x->state != N2C_CTX_OPEN ||
+             (!x->as_live && !as_dynamic_ctx(c, idx)) || c->reset_pending)
+                 return N2C_E_STATE;     /* 0500: a dynamic client gets its AS in try_start */
+@@ -2016,6 +2021,86 @@
+                 lat_busy(c, t);
+ }
+ 
++/* 0750: one record per MMU fault: the address against the context's live buffers (inside / in the guard page behind one) and the
++ * ranges unmapped lately, plus its job on the hardware.  Read by the IOKit layer (n2c_fault_get) for the 'NORD2 GPU FAULT:' line. */
++static void fault_record(struct n2c_core *c, const struct n2hw_mmu_fault *f, unsigned idx, unsigned cls)
++{
++        struct n2c_fault_rec *r = &c->fault_ring[c->fault_seq % N2C_FAULT_RING];
++        memset(r, 0, sizeof(*r));
++        r->seq = ++c->fault_seq;
++        r->t_ms = now(c);
++        r->address = f->address;
++        r->status = f->status;
++        r->bus = f->bus_error;
++        r->as = (uint8_t)f->as;
++        r->cls = (uint8_t)cls;
++        r->ctx = idx < N2C_MAX_CTX ? (uint8_t)idx : N2C_AS_NONE;
++        if (idx >= N2C_MAX_CTX)
++                return;
++        struct n2c_ctx *x = &c->ctxs[idx];
++        if (x->state == N2C_CTX_FREE || !x->bos)
++                return;
++        const struct n2c_bo *below = NULL;
++        for (unsigned i = 0; i < N2C_MAX_BOS; i++) {
++                const struct n2c_bo *b = x->bos[i];
++                if (!b || !b->size)
++                        continue;
++                r->ctx_bos++;
++                if (r->where == N2C_FW_INSIDE)
++                        continue;       /* found; the rest is only counted */
++                if (f->address >= b->va && f->address - b->va < b->size) {
++                        below = b;
++                        r->where = N2C_FW_INSIDE;
++                        continue;
++                }
++                if (b->va <= f->address && (!below || b->va > below->va))
++                        below = b;
++        }
++        if (below) {
++                r->bo_handle = below->handle;
++                r->bo_va = below->va;
++                r->bo_size = below->size;
++                if (r->where == N2C_FW_NONE && f->address - below->va < below->size + BO_GUARD)
++                        r->where = N2C_FW_GUARD;
++        }
++        if (r->where == N2C_FW_NONE) {
++                for (unsigned k = 0; k < N2C_FREED_RING; k++) {      /* newest first */
++                        const struct n2c_freed *fr = &c->freed[(c->freed_next + N2C_FREED_RING - 1u - k) % N2C_FREED_RING];
++                        if (fr->size && fr->ctx == idx && f->address >= fr->va && f->address - fr->va < fr->size + BO_GUARD) {
++                                r->where = N2C_FW_FREED;
++                                r->bo_handle = fr->handle;
++                                r->bo_va = fr->va;
++                                r->bo_size = fr->size;
++                                r->freed_ago_ms = r->t_ms >= fr->t_ms ? r->t_ms - fr->t_ms : 0;
++                                break;
++                        }
++                }
++        }
++        for (unsigned k = 0; k < N2C_MAX_JOBS; k++) {
++                const struct n2c_job *j = &c->jobs[k];
++                if (j->ctx != idx || j->state == N2C_JOB_FREE)
++                        continue;
++                if (!terminal(j->state))
++                        r->ctx_jobs++;
++                if ((j->state == N2C_JOB_RUNNING || j->state == N2C_JOB_STOPPING) && !r->kind) {
++                        r->kind = j->kind;
++                        r->phase = j->phase;
++                        r->slot = (uint8_t)j->slot;
++                        r->head = j->heads[j->phase & 1u];
++                }
++        }
++}
++
++bool n2c_fault_get(const struct n2c_core *c, uint64_t after, struct n2c_fault_rec *out)
++{
++        if (!c || !out || c->fault_seq <= after)
++                return false;
++        uint64_t first = c->fault_seq > N2C_FAULT_RING ? c->fault_seq - N2C_FAULT_RING + 1u : 1u;
++        uint64_t want = after + 1u > first ? after + 1u : first;
++        *out = c->fault_ring[(want - 1u) % N2C_FAULT_RING];
++        return out->seq == want;
++}
++
+ static void handle_mmu_irqs(struct n2c_core *c)
+ {
+         struct n2hw_mmu_fault f[16];
+@@ -2026,8 +2111,19 @@
+                 unsigned idx = f[i].as;
+                 if (c->as_dyn && f[i].as != 0) {
+                         idx = f[i].as < N2C_HW_AS ? c->as_owner[f[i].as] : N2C_AS_NONE;
++                        /* 0750: the AS was disabled for this context's fault and it still holds it: a further report of its own stalled
++                         * access (the other slot's chain, or the same access again), not an orphan.  Its work is already stopped. */
++                        if (idx < N2C_MAX_CTX && c->ctxs[idx].state == N2C_CTX_FAULTED && !c->ctxs[idx].as_live &&
++                            c->ctxs[idx].as == f[i].as) {
++                                c->as_stats.trail_faults++;
++                                fault_record(c, &f[i], idx, N2C_FC_TRAIL);
++                                c->ctxs[idx].fault_ms = now(c);
++                                c->ctxs[idx].fault_poll = c->poll_seq;
++                                continue;
++                        }
+                         if (idx >= N2C_MAX_CTX || !c->ctxs[idx].as_live || c->ctxs[idx].as != f[i].as) {
+                                 c->as_stats.orphan_faults++;
++                                fault_record(c, &f[i], N2C_AS_NONE, N2C_FC_ORPHAN);
+                                 note(c, "Nord2 GPU core: MMU fault on an AS no context holds");
+                                 continue;
+                         }
+@@ -2037,8 +2133,12 @@
+                 struct n2c_ctx *x = &c->ctxs[idx];
+                 if (x->state == N2C_CTX_FREE)
+                         continue;
++                fault_record(c, &f[i], idx, x->state == N2C_CTX_FAULTED ? N2C_FC_TRAIL : N2C_FC_CTX);      /* 0750 (static mode: same AS) */
+                 x->fault_status = f[i].status;
+                 x->fault_address = f[i].address;
++                x->fault_ms = now(c);   /* 0750 */
++                x->fault_poll = c->poll_seq;
++                x->faults++;
+                 if (x->state == N2C_CTX_OPEN)
+                         x->state = N2C_CTX_FAULTED;
+                 /* kbase_mmu_report_fault_and_kill(): stop the context's
+@@ -2080,10 +2180,49 @@
+         }
+ }
+ 
++/* 0750: a client killed by an MMU fault (kbase_mmu_report_fault_and_kill) used to stay FAULTED until it closed: every later submit EIO.
++ * For backboardd that is a dead compositor (frames presented from never-rendered buffers = the flashing display) until reboot.  Its
++ * faulting work is over once no job of it is queued (prep included) or on the hardware and one whole poll has drained the MMU interrupt
++ * without a further report on its AS (trailing reports refresh fault_poll): hand the disabled AS back (as_unbind; the next job rebinds one
++ * with UPDATE + FLUSH like any unbound client) and accept submits again.  Bounded: N2C_REVIVE_MAX per N2C_REVIVE_WINDOW_MS. */
++static void revive_faulted(struct n2c_core *c)
++{
++        if (!c->revive_on || !c->as_dyn || c->reset_pending || c->state != N2C_CORE_READY)
++                return;
++        uint64_t t = now(c);
++        for (unsigned i = 1; i < N2C_MAX_CTX; i++) {
++                struct n2c_ctx *x = &c->ctxs[i];
++                if (x->state != N2C_CTX_FAULTED || x->as_live)  /* as_live: the disable failed, the reset owns it */
++                        continue;
++                if (c->poll_seq - x->fault_poll < 2u || t - x->fault_ms < N2C_REVIVE_QUIET_MS ||
++                    ctx_has_active(c, i) || ctx_has_queued(c, i))
++                        continue;
++                if (!x->revive_win_ms || t - x->revive_win_ms >= N2C_REVIVE_WINDOW_MS) {
++                        x->revive_win_ms = t ? t : 1;
++                        x->revives = 0;
++                        x->revive_held = false;
++                }
++                if (x->revives >= N2C_REVIVE_MAX) {
++                        if (!x->revive_held) {
++                                x->revive_held = true;
++                                c->as_stats.revive_refused++;
++                                note(c, "Nord2 GPU core: faulted context not revived (budget of the 30 s window spent; waits for the window)");
++                        }
++                        continue;
++                }
++                as_unbind(c, x);
++                x->state = N2C_CTX_OPEN;
++                x->revives++;
++                c->as_stats.revives++;
++                note(c, "Nord2 GPU core: context revived after its MMU fault (0750)");
++        }
++}
++
+ void n2c_poll(struct n2c_core *c)
+ {
+         if (!c || c->state != N2C_CORE_READY)
+                 return;
++        c->poll_seq++;  /* 0750 */
+         c->lat_in_irq = true;
+         handle_job_irqs(c);
+         c->lat_in_irq = false;
+@@ -2091,6 +2230,7 @@
+         check_deadlines(c);
+         if (c->reset_pending)
+                 (void)n2c_reset(c);
++        revive_faulted(c);      /* 0750 */
+         try_start(c);
+         /* 0666: no job on the hardware or waiting -> after pg_idle_us power the shader cores down (L2 cleaned and kept on, kbase-like) */
+         if (c->pg_on && c->state == N2C_CORE_READY && c->gpu_powered && !c->reset_pending && !c->hold_start) {
+--- a/bsd/dev/nord2_gpu_core.h
++++ b/bsd/dev/nord2_gpu_core.h
+@@ -211,7 +211,38 @@
+         uint64_t prof_run_us, prof_q_us;
+         uint32_t prof_q_max_us, prof_jobs;
+         uint8_t prio;             /* 0662: N2C_PRIO_* (set at open by the IOKit layer from the process name) */
++        /* 0750: MMU-fault recovery.  A FAULTED dynamic client gets its submissions back (state OPEN, AS handed back, rebound at its next
++         * job) once nothing of it is queued or on the hardware, at least one whole poll has passed without a further report on its AS
++         * and N2C_REVIVE_QUIET_MS elapsed; at most N2C_REVIVE_MAX revivals per N2C_REVIVE_WINDOW_MS, after that it waits for the window. */
++        uint64_t fault_ms;        /* time of the last fault charged to (or trailing behind) this context */
++        uint32_t fault_poll;      /* c->poll_seq at that report */
++        uint32_t faults;          /* faults charged to this context */
++        uint8_t revives;          /* revivals in the current window */
++        bool revive_held;         /* the window's budget is spent (counted once in as_stats.revive_refused) */
++        uint64_t revive_win_ms;   /* start of the window (0 = none yet) */
++};
++#define N2C_REVIVE_QUIET_MS 20u
++#define N2C_REVIVE_MAX 3u
++#define N2C_REVIVE_WINDOW_MS 30000u
++/* 0750: what the core saw for each MMU fault (ring, read by the IOKit layer with n2c_fault_get) */
++enum { N2C_FC_CTX = 1, N2C_FC_TRAIL, N2C_FC_ORPHAN };
++enum { N2C_FW_NONE = 0, N2C_FW_INSIDE, N2C_FW_GUARD, N2C_FW_FREED };
++#define N2C_FAULT_RING 8u
++#define N2C_FREED_RING 64u
++struct n2c_fault_rec {
++        uint64_t seq;             /* 1, 2, ... (0 = empty) */
++        uint64_t t_ms, address, head;
++        uint32_t status;          /* AS_FAULTSTATUS */
++        uint8_t as, ctx, cls;     /* ctx: N2C_AS_NONE when nobody holds the AS */
++        uint8_t kind, phase, slot;        /* the context's job on the hardware (kind 0 = none) */
++        uint8_t where;            /* N2C_FW_*: the address against the context's buffers */
++        bool bus;                 /* bus fault bit */
++        uint32_t bo_handle;       /* buffer containing the address, or the nearest one below it (0 = none) */
++        uint64_t bo_va, bo_size;
++        uint64_t freed_ago_ms;    /* N2C_FW_FREED: how long ago that range was unmapped */
++        uint32_t ctx_bos, ctx_jobs;
+ };
++struct n2c_freed { uint64_t va, size, t_ms; uint32_t handle; uint8_t ctx; };
+ #define N2C_PRIO_LOW 0u
+ #define N2C_PRIO_NORMAL 1u
+ #define N2C_PRIO_HIGH 2u
+@@ -330,6 +361,10 @@
+         uint64_t bind_waits;      /* a job could not get an AS in this poll (every AS held by a context with work on the hardware) */
+         uint64_t bind_failures;   /* disable/configure/flush not acknowledged: reset requested */
+         uint64_t orphan_faults;   /* MMU fault on an AS no context holds */
++        uint64_t trail_faults;    /* 0750: further report on the AS a FAULTED context still holds (disabled): its own stalled access, not an orphan */
++        uint64_t revives;         /* 0750: FAULTED contexts given back their submissions */
++        uint64_t revive_refused;  /* 0750: revivals held back because the window's budget was spent */
++        uint64_t faulted_refused; /* 0750: submits refused because the context was FAULTED */
+         uint64_t ctx_refused;     /* n2c_ctx_open found no free context */
+         uint32_t ctx_open, ctx_peak, bound;
+ };
+@@ -426,7 +461,16 @@
+         uint8_t as_owner[N2C_HW_AS];      /* context holding each AS (dynamic mode), N2C_AS_NONE = free */
+         uint64_t as_clock;
+         struct n2c_as_stats as_stats;
++        /* 0750 */
++        bool revive_on;                   /* revive FAULTED dynamic clients (n2c_init: false; the IOKit layer sets kern.n2gfrev, default 1) */
++        uint32_t poll_seq;                /* n2c_poll rounds on a READY core */
++        uint64_t fault_seq;
++        struct n2c_fault_rec fault_ring[N2C_FAULT_RING];
++        struct n2c_freed freed[N2C_FREED_RING];
++        unsigned freed_next;
+ };
++/* 0750: the oldest fault record with seq > after (false: none).  Telemetry only, call under the core lock. */
++bool n2c_fault_get(const struct n2c_core *c, uint64_t after, struct n2c_fault_rec *out);
+ 
+ bool n2c_init(struct n2c_core *c, const struct n2c_ops *ops, void *ctx,
+               struct n2hw *hw);
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -236,6 +236,11 @@
+ SYSCTL_INT(_kern, OID_AUTO, n2guvm, CTLFLAG_RW | CTLFLAG_LOCKED, &gUvMargin, 0, "0665: margin above the vendor VGPU, uV (0..50000)");
+ SYSCTL_INT(_kern, OID_AUTO, n2gpg, CTLFLAG_RW | CTLFLAG_LOCKED, &gPg, 0, "0666: GPU shader-core power gating when idle");
+ SYSCTL_INT(_kern, OID_AUTO, n2gpgus, CTLFLAG_RW | CTLFLAG_LOCKED, &gPgIdleUs, 0, "0666: idle time before the shader cores are powered down, us");
++/* 0750: kern.n2gfrev / boot-arg n2gfrev=0 = a client killed by an MMU fault stays FAULTED until it closes (the old behaviour: backboardd's
++ * compositor dead until reboot, the flashing display); 1 (default) = revived once its faulting work is over (nord2_gpu_core.c revive_faulted).
++ * Every MMU fault prints 'NORD2 GPU FAULT:' (class, AS, owner process, decoded AS_FAULTSTATUS, address against the client's buffers). */
++static int gFaultRevive = 1;
++SYSCTL_INT(_kern, OID_AUTO, n2gfrev, CTLFLAG_RW | CTLFLAG_LOCKED, &gFaultRevive, 0, "0750: revive a GPU client after its MMU fault (0 = stays faulted until close)");
+ SYSCTL_INT(_kern, OID_AUTO, n2gpipe, CTLFLAG_RW | CTLFLAG_LOCKED, &gPipe, 0, "0632: precise GPU jobs may overlap older fragment jobs of their context (1 on, 0 off)");
+ SYSCTL_INT(_kern, OID_AUTO, n2gjsnext, CTLFLAG_RW | CTLFLAG_LOCKED, &gJsNext, 0, "0630: GPU JS NEXT pipelining (1 on, 0 no new NEXT writes)");
+ SYSCTL_INT(_kern, OID_AUTO, n2gpu_lat, CTLFLAG_RW | CTLFLAG_LOCKED, &gLatMode, 0, "0400: GPU latency changes off-mask: 1 BH thread, 2 late release, 4 zero skip, 8 deferred owner free");
+@@ -418,6 +423,7 @@
+           v = 1; if (PE_parse_boot_argn("n2gpr", &v, sizeof(v))) gPrio = v != 0; c->prio_on = gPrio != 0; gPrioApplied = gPrio;
+           v = 1; if (PE_parse_boot_argn("n2girq", &v, sizeof(v))) gIrqBig = v != 0;
+           v = 1; if (PE_parse_boot_argn("n2guv", &v, sizeof(v))) gUv = v != 0;
++          { int fr = 1; if (PE_parse_boot_argn("n2gfrev", &fr, sizeof(fr))) gFaultRevive = fr != 0; c->revive_on = gFaultRevive != 0; }      /* 0750 */
+           v = 1; if (PE_parse_boot_argn("n2gpg", &v, sizeof(v))) gPg = v != 0; c->pg_on = gPg != 0; c->pg_idle_us = (uint32_t)gPgIdleUs; gPgApplied = gPg;
+           IOLog("NORD2 GPU POWER: per-OPP voltage %s (margin %d uV), shader-core gating %s after %d us idle (n2guv=0 / n2gpg=0 off)\n", gUv ? "on" : "off", gUvMargin, gPg ? "on" : "off", gPgIdleUs);
+           IOLog("NORD2 GPUPROF: step A on: preclean=%d abi_v4=%d prio=%d irq_big=%d (boot-args n2gpc/n2gv4/n2gpr/n2girq =0 to switch off)\n", gPreclean, gV4, gPrio, gIrqBig); }
+@@ -747,14 +753,53 @@
+         static uint64_t last_us, last_sum;
+         if (!d->core) return;
+         const n2c_as_stats &a = d->core->as_stats; const n2c_stats &s = d->core->stats;
+-        uint64_t sum = a.binds + a.evictions + a.bind_waits + a.bind_failures + a.orphan_faults + a.ctx_refused + a.ctx_open + a.ctx_peak + s.mmu_faults + s.resets + s.flush_failures;
++        uint64_t sum = a.binds + a.evictions + a.bind_waits + a.bind_failures + a.orphan_faults + a.ctx_refused + a.ctx_open + a.ctx_peak + s.mmu_faults + s.resets + s.flush_failures +
++                       a.trail_faults + a.revives + a.revive_refused;      /* 0750 */
+         uint64_t t = now_us(NULL);
+         if (sum == last_sum || (last_us && t - last_us < 2000000ull)) return;
+         last_sum = sum; last_us = t;
+-        IOLog("NORD2 GPU AS: mode=%s open=%u peak=%u bound=%u binds=%llu evict=%llu waits=%llu bindfail=%llu refused=%llu mmu_faults=%llu orphan=%llu resets=%llu flushfail=%llu\n",
++        IOLog("NORD2 GPU AS: mode=%s open=%u peak=%u bound=%u binds=%llu evict=%llu waits=%llu bindfail=%llu refused=%llu mmu_faults=%llu orphan=%llu resets=%llu flushfail=%llu trail=%llu revived=%llu revive_held=%llu faulted_refused=%llu\n",
+               d->core->as_dyn ? "dynamic" : "static", a.ctx_open, a.ctx_peak, a.bound, (unsigned long long)a.binds, (unsigned long long)a.evictions,
+               (unsigned long long)a.bind_waits, (unsigned long long)a.bind_failures, (unsigned long long)a.ctx_refused, (unsigned long long)s.mmu_faults,
+-              (unsigned long long)a.orphan_faults, (unsigned long long)s.resets, (unsigned long long)s.flush_failures);
++              (unsigned long long)a.orphan_faults, (unsigned long long)s.resets, (unsigned long long)s.flush_failures,
++              (unsigned long long)a.trail_faults, (unsigned long long)a.revives, (unsigned long long)a.revive_refused, (unsigned long long)a.faulted_refused);
++}
++/* 0750: one line per MMU fault (the core keeps the last N2C_FAULT_RING; called under d->lock right after n2c_poll). */
++static const char *fault_exc_name(uint32_t st) {
++        unsigned e = st & 0xffu;
++        if (e >= 0xc0 && e <= 0xc7) return "TRANSLATION_FAULT";
++        if (e >= 0xc8 && e <= 0xcf) return "PERMISSION_FAULT";
++        if (e >= 0xd0 && e <= 0xd7) return "TRANSTAB_BUS_FAULT";
++        if (e >= 0xd8 && e <= 0xdf) return "ACCESS_FLAG_FAULT";
++        if (e >= 0xe0 && e <= 0xe7) return "ADDRESS_SIZE_FAULT_IN";
++        if (e >= 0xe8 && e <= 0xef) return "ADDRESS_SIZE_FAULT_OUT";
++        if (e >= 0xf0 && e <= 0xff) return "MEMORY_ATTRIBUTE_FAULT";
++        return "UNKNOWN";
++}
++static void fault_emit(Nord2GPU *d) {
++        static uint64_t last;
++        if (!d->core) return;
++        d->core->revive_on = gFaultRevive != 0;
++        static const char *const cls[4] = { "?", "context-killed", "trailing", "orphan" };
++        static const char *const wh[4] = { "in no buffer of the client", "INSIDE buffer", "in the guard page / past the end of buffer", "in a range UNMAPPED" };
++        static const char *const acc[4] = { "atomic", "execute", "read", "write" };
++        static const char *const kn[4] = { "none", "compute", "render", "fragment" };
++        n2c_fault_rec r;
++        unsigned n = 0;
++        while (d->core->fault_seq > last) {
++                if (!n2c_fault_get(d->core, last, &r)) { last = d->core->fault_seq; break; }
++                last = r.seq;
++                const char *nm = r.ctx < N2C_MAX_CTX && gCtxName[r.ctx][0] ? gCtxName[r.ctx] : "?";
++                int pid = r.ctx < N2C_MAX_CTX ? gCtxPid[r.ctx] : -1;
++                if (++n > 4) continue;  /* at most 4 lines per tick; the AS line keeps the counts */
++                IOLog("NORD2 GPU FAULT: #%llu %s AS%u ctx=%u %s[%d] status=0x%08x %s level %u %s%s src=0x%04x addr=0x%010llx %s handle=0x%x va=0x%010llx size=0x%llx (+0x%llx) freed_ago_ms=%llu"
++                      " | job %s phase %u slot %u head=0x%010llx | client bufs=%u jobs=%u | gdvfs %u kHz vgpu %u uV uv_failed=%u\n",
++                      (unsigned long long)r.seq, cls[r.cls & 3u], r.as, r.ctx, nm, pid, r.status, fault_exc_name(r.status), r.status & 7u,
++                      acc[(r.status >> 8) & 3u], r.bus ? " BUS" : "", r.status >> 16, (unsigned long long)r.address, wh[r.where & 3u], r.bo_handle,
++                      (unsigned long long)r.bo_va, (unsigned long long)r.bo_size, (unsigned long long)(r.address - r.bo_va),
++                      (unsigned long long)r.freed_ago_ms,
++                      kn[r.kind & 3u], r.phase, r.slot, (unsigned long long)r.head, r.ctx_bos, r.ctx_jobs, n2g_gpu_khz[gGdv.g.cur < N2G_GPU_NOPP ? gGdv.g.cur : 0], gGdv.curVg, (unsigned)gGdv.uvFailed);
++        }
+ }
+ static void lat_emit(Nord2GPU *d) {
+         n2c_lat l;
+@@ -845,6 +890,7 @@
+                 d->emitJobStats();
+                 lat_emit(d);
+                 as_emit(d);      /* 0500 */
++                fault_emit(d);   /* 0750 */
+                 d->gdvfsPoll(now_us(NULL));      /* 0461 */
+                 if (d->core->state == N2C_CORE_BROKEN) {
+                         d->ready = false; d->setProperty("Nord2GPUState", "fault-memory-pinned");
+@@ -1558,6 +1604,9 @@
+         if (v.uvWdUs && now < v.uvWdUs && !v.uvFailed && core->stats.faulted + core->stats.resets + core->stats.timeouts != v.uvWdCount) {
+                 v.uvFailed = true; v.uvWdUs = 0;
+                 IOLog("NORD2 GDVFS VOLT: a GPU fault / reset / timeout within 10 s of a voltage step at %u uV: back to the boot rails, per-OPP voltage off\n", v.curVg);
++                IOLog("NORD2 GDVFS VOLT: (0750) trigger: jobs faulted=%llu resets=%llu timeouts=%llu mmu_faults=%llu at %u kHz; a fault that recurs at the boot rails is not the voltage (see 'NORD2 GPU FAULT:')\n",
++                      (unsigned long long)core->stats.faulted, (unsigned long long)core->stats.resets, (unsigned long long)core->stats.timeouts,
++                      (unsigned long long)core->stats.mmu_faults, n2g_gpu_khz[v.g.cur < N2G_GPU_NOPP ? v.g.cur : 0]);
+                 if (v.curVg < v.bootVg && gdvfsVolt(v.bootVg, v.bootVs, "fault fallback")) { v.curVg = v.bootVg; v.curVs = v.bootVs; v.covered = n2g_gpu_max_idx(v.bootVg, v.bootVs); }
+         }
+         if (v.lastUs && now - v.lastUs < N2G_GPU_POLL_MS * 1000ull) return;
