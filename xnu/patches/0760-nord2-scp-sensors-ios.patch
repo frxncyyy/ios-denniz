@@ -1,0 +1,487 @@
+diff -ruN a/bsd/dev/nord2_scp.inc b/bsd/dev/nord2_scp.inc
+--- a/bsd/dev/nord2_scp.inc	2026-11-15 21:02:54.913939327 +0100
++++ b/bsd/dev/nord2_scp.inc	2026-11-15 21:04:29.126647712 +0100
+@@ -123,6 +123,43 @@
+ extern void sweet_hid_proximity(int near);
+ extern void sweet_hid_ambient(int lux);
+ extern void sweet_hid_motion(int kind, int x, int y, int z);
++/*
++ * 0760 (sensors-20261115): the motion sensors and the light sensor reach iOS.
++ *   - sweet_hid_motion() now takes iOS units as IOFixed (16.16), converted here from the hub's (Android sensor 2.0 gains of
++ *     mtk_nanohub.c: accelerometer 1000 = 1 m/s^2, gyroscope 1000000 = 1 rad/s, magnetometer 100 = 1 uT). iOS (CoreMotion /
++ *     locationd CLAccelerometer: kIOHIDEventTypeAccelerometer fields X/Y/Z read as floats) wants g with the opposite sign of
++ *     Android (lying face up: Android z = +9.81 m/s^2, iOS z = -1 g); gyroscope rad/s and magnetometer uT keep Android's signs.
++ *     kern.n2scp_axflip negates single axes on top of that (bits 0-2 accel x/y/z, 3-5 gyro, 6-8 compass), for the pose test.
++ *   - accelerometer / gyroscope / compass are enabled on demand: kern.n2scp_motion 2 (default) follows what iOS asks of each
++ *     HID service (its "ReportInterval" property; a service nobody has configured streams while it has a client), 1 = always
++ *     on at 50/50/25 Hz (0531's old mode), 0 = off.  The hub is re-told only when a rate changes.
++ *   - light: mtk_nanohub never marks light as on-change (only its rate field from the HAL's sampling period), and the
++ *     on-change enable of 0284 never produced a single light record; it is now enabled at kern.n2scp_lightrate (Hz * 1024,
++ *     default 5 Hz; 0 = 0284's on-change request).  Proximity is not touched (same calls, same order, same rate).
++ *   - kern.n2scp_alslcd = N sends OPLUS' "LCD info" request once (sensor 4, action 117, brightness N, dc mode 0), what Android's
++ *     sensor_devinfo does for its light algorithm; default never sent.
++ *   - kern.n2scp_raw: one line with the last raw and converted samples, rates, counters (the ssh diagnostic).
++ *   Logs "NORD2 SCP: ..." as before; no new MMIO mapping, no new register, no new PMIC write.
++ */
++extern int sweet_hid_motion_want(int kind);     /* SweetHID.cpp: Hz iOS wants from that service (0 = off) */
++extern void sweet_hid_sensor_status(char *buf, int len);
++static int n2scp_axflip;                        /* 0760: kern.n2scp_axflip */
++static volatile int32_t n2scp_ios[3][3];        /* 0760: last value handed to iOS per kind, IOFixed */
++static volatile uint32_t n2scp_out[3];          /* 0760: samples handed to iOS per kind */
++static void
++n2scp_motion_out(int kind, int32_t a, int32_t b, int32_t c)
++{
++	int64_t v[3] = { a, b, c };
++	for (int i = 0; i < 3; i++) {
++		if (kind == 0) { v[i] = -v[i] * 6553600 / 980665; }      /* 1/1000 m/s^2 -> g, iOS sign */
++		else if (kind == 1) { v[i] = v[i] * 65536 / 1000000; }  /* 1e-6 rad/s -> rad/s */
++		else { v[i] = v[i] * 65536 / 100; }                     /* 1/100 uT -> uT */
++		if (n2scp_axflip & (1 << (kind * 3 + i))) { v[i] = -v[i]; }
++		n2scp_ios[kind][i] = (int32_t)v[i];
++	}
++	n2scp_out[kind]++;
++	sweet_hid_motion(kind, (int)v[0], (int)v[1], (int)v[2]);
++}
+ 
+ static int n2scp_chan;
+ static void
+@@ -403,9 +440,9 @@
+ 		n2scp_lux = a;
+ 		sweet_hid_ambient(a);
+ 		break;
+-	case N2H_ACCEL: n2scp_acc[0] = a; n2scp_acc[1] = b; n2scp_acc[2] = c; sweet_hid_motion(0, a, b, c); break;
+-	case N2H_GYRO: n2scp_gyr[0] = a; n2scp_gyr[1] = b; n2scp_gyr[2] = c; sweet_hid_motion(1, a, b, c); break;
+-	case N2H_MAG: n2scp_magv[0] = a; n2scp_magv[1] = b; n2scp_magv[2] = c; sweet_hid_motion(2, a, b, c); break;
++	case N2H_ACCEL: n2scp_acc[0] = a; n2scp_acc[1] = b; n2scp_acc[2] = c; n2scp_motion_out(0, a, b, c); break;
++	case N2H_GYRO: n2scp_gyr[0] = a; n2scp_gyr[1] = b; n2scp_gyr[2] = c; n2scp_motion_out(1, a, b, c); break;
++	case N2H_MAG: n2scp_magv[0] = a; n2scp_magv[1] = b; n2scp_magv[2] = c; n2scp_motion_out(2, a, b, c); break;
+ 	default: break;
+ 	}
+ 	if (n2scp_records <= 16 || (n2scp_records % 2000) == 0) {
+@@ -446,9 +483,70 @@
+  */
+ #include <sys/sysctl.h>
+ #define N2SCP_IDLE_POLL_MS  100u
+-static int n2scp_motion;                        /* 0 (default): accelerometer, gyroscope, magnetometer off; 1: on */
++#ifndef N2SCP_MOTION_DEFAULT
++#define N2SCP_MOTION_DEFAULT 2                  /* 0760: on demand */
++#endif
++static int n2scp_motion = N2SCP_MOTION_DEFAULT; /* 0 off; 1 always on (0531's old mode); 2 (0760 default) what iOS asks for */
+ SYSCTL_INT(_kern, OID_AUTO, n2scp_motion, CTLFLAG_RW | CTLFLAG_LOCKED, &n2scp_motion, 0,
+-    "NORD2 SCP: 1 = accelerometer/gyroscope/magnetometer sampled (50/50/25 Hz, 20 ms polling); 0 = off, 100 ms polling");
++    "NORD2 SCP: accelerometer/gyroscope/magnetometer: 0 off, 1 always on (50/50/25 Hz), 2 on demand (iOS ReportInterval)");
++SYSCTL_INT(_kern, OID_AUTO, n2scp_axflip, CTLFLAG_RW | CTLFLAG_LOCKED, &n2scp_axflip, 0,
++    "NORD2 SCP 0760: negate axes handed to iOS: bits 0-2 accel x/y/z, 3-5 gyro, 6-8 compass");
++static int n2scp_lightrate = 5 * 1024;          /* 0760: Hz * 1024; 0 = 0284's on-change request */
++SYSCTL_INT(_kern, OID_AUTO, n2scp_lightrate, CTLFLAG_RW | CTLFLAG_LOCKED, &n2scp_lightrate, 0,
++    "NORD2 SCP 0760: light sensor rate (Hz*1024, 0 = on-change as 0284); re-sent to the hub on change");
++static int n2scp_alslcd;                        /* 0760: > 0 = send the OPLUS LCD info (brightness) once */
++SYSCTL_INT(_kern, OID_AUTO, n2scp_alslcd, CTLFLAG_RW | CTLFLAG_LOCKED, &n2scp_alslcd, 0,
++    "NORD2 SCP 0760: write a brightness (1..2047) to send OPLUS SET_LCD_INFO for the light sensor once");
++static int n2scp_rate_now[3];                   /* 0760: Hz the hub was last told per kind (acc, gyro, mag) */
++static int
++n2scp_sysctl_raw SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[640], hid[200];
++	hid[0] = 0;
++	sweet_hid_sensor_status(hid, (int)sizeof(hid));
++	/* integers only: g/rad/s/uT as value*1000 (milli units) */
++	int64_t m[3][3];
++	for (int k = 0; k < 3; k++) { for (int i = 0; i < 3; i++) { m[k][i] = (int64_t)n2scp_ios[k][i] * 1000 / 65536; } }
++	int n = snprintf(buf, sizeof(buf),
++	    "state %#x mode %d | acc raw %d %d %d (mm/s2) ios_mg %lld %lld %lld | gyr raw %d %d %d (urad/s) ios_mrad %lld %lld %lld | "
++	    "mag raw %d %d %d (10nT) ios_muT %lld %lld %lld | lux %d prox %d | hz acc %d gyr %d mag %d light %d | counts acc %u gyr %u mag %u "
++	    "light %u prox %u out %u %u %u | records %u msgs %u | axflip %#x | %s",
++	    n2scp_state, n2scp_motion, n2scp_acc[0], n2scp_acc[1], n2scp_acc[2], m[0][0], m[0][1], m[0][2],
++	    n2scp_gyr[0], n2scp_gyr[1], n2scp_gyr[2], m[1][0], m[1][1], m[1][2], n2scp_magv[0], n2scp_magv[1], n2scp_magv[2],
++	    m[2][0], m[2][1], m[2][2], n2scp_lux, n2scp_prox, n2scp_rate_now[0], n2scp_rate_now[1], n2scp_rate_now[2],
++	    n2scp_lightrate, n2scp_count[0], n2scp_count[3], n2scp_count[1], n2scp_count[4], n2scp_count[7], n2scp_out[0], n2scp_out[1],
++	    n2scp_out[2], n2scp_records, n2scp_msgs, n2scp_axflip, hid);
++	if (n < 0) { n = 0; }
++	if (n >= (int)sizeof(buf)) { n = (int)sizeof(buf) - 1; }
++	return SYSCTL_OUT(req, buf, (size_t)n + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, n2scp_raw, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, n2scp_sysctl_raw, "A",
++    "NORD2 SCP 0760: last raw and iOS-unit samples, rates, counters, HID service state");
++
++/* 0760: OPLUS SET_LCD_INFO {sensor 4 (light), action 117, data brightness << 16 | dc mode} on IPI_SENSOR, as sensor_devinfo does */
++static void
++n2scp_lcd_info(uint32_t brightness)
++{
++	uint32_t req[8] = { (117u << 8) | 4u, (brightness & 0xffffu) << 16, 0, 0, 0, 0, 0, 0 };
++	printf("NORD2 SCP: light LCD info brightness %u: %s\n", brightness, n2scp_send(N2SCP_IPI_SENSOR, req, sizeof(req)) ? "taken" : "NOT TAKEN");
++}
++
++/* 0760: the rate iOS wants per kind, clamped to what the 0531 mode did (acc/gyro 50, mag 25 when forced) */
++static int
++n2scp_motion_target(int kind)
++{
++	static const int forced[3] = { 50, 50, 25 };
++	int mode = n2scp_motion;
++	if (mode == 1) { return forced[kind]; }
++	if (mode != 2) { return 0; }
++	int hz = sweet_hid_motion_want(kind);
++	if (hz <= 0) { return 0; }
++	/* a few steps only, so small changes of the asked interval do not re-send the enable */
++	hz = hz <= 5 ? 5 : hz <= 10 ? 10 : hz <= 25 ? 25 : hz <= 50 ? 50 : 100;
++	if (kind == 2 && hz > 50) { hz = 50; }   /* MMC5603 */
++	return hz;
++}
+ 
+ static void
+ n2scp_thread(void *arg __unused, wait_result_t res __unused)
+@@ -543,26 +641,44 @@
+ 	n2scp_vibr_want = 1;
+ 	for (int i = 0; i < 100 && n2scp_vibr_done < 0; i++) { n2scp_sleep(10); }
+ 	(void)n2scp_config(N2S_PROX, 1, 0xFFFFFF01u);
+-	(void)n2scp_config(N2S_LIGHT, 1, 0xFFFFFF01u);
++	int light_rate = n2scp_lightrate;       /* 0760: what the hub was last told for light */
++	(void)n2scp_config(N2S_LIGHT, 1, light_rate > 0 ? (uint32_t)light_rate : 0xFFFFFF01u);
+ 	n2scp_state |= 4;
+-	printf("NORD2 SCP: step 5: proximity and light enabled; motion sensors %s (kern.n2scp_motion), polling every %u ms\n",
+-	    n2scp_motion ? "on" : "off", n2scp_motion ? 20u : N2SCP_IDLE_POLL_MS);
+-	int motion = 0;                         /* what the hub was last told */
++	printf("NORD2 SCP: step 5: proximity and light (rate %d) enabled; motion sensors mode %d (kern.n2scp_motion: 0 off, 1 on, 2 on demand)\n",
++	    light_rate, n2scp_motion);
++	static const uint8_t mtype[3] = { N2S_ACCEL, N2S_GYRO, N2S_MAG };
++	static const char *const mname[3] = { "accelerometer", "gyroscope", "magnetometer" };
+ 	for (uint32_t ms = 0, say = 0;;) {
+-		int want = n2scp_motion ? 1 : 0;
+-		if (want != motion) {           /* 0531: enable / disable only on a change (nothing is sent for the default) */
+-			(void)n2scp_config(N2S_ACCEL, want, 50u * 1024u);
+-			(void)n2scp_config(N2S_GYRO, want, 50u * 1024u);
+-			(void)n2scp_config(N2S_MAG, want, 25u * 1024u);
+-			motion = want;
+-			printf("NORD2 SCP: motion sensors %s, polling every %u ms\n", want ? "on" : "off", want ? 20u : N2SCP_IDLE_POLL_MS);
++		int motion = 0;
++		for (int k = 0; k < 3; k++) {   /* 0760: enable / disable / new rate only on a change (nothing is sent while nobody asks) */
++			int hz = n2scp_motion_target(k);
++			if (hz != n2scp_rate_now[k]) {
++				(void)n2scp_config(mtype[k], hz > 0, (uint32_t)(hz > 0 ? hz : n2scp_rate_now[k]) * 1024u);
++				static uint32_t said_rate;
++				if (said_rate++ < 200 || (said_rate % 100) == 0) {
++					printf("NORD2 SCP: %s %d Hz -> %d Hz (mode %d, change %u)\n", mname[k], n2scp_rate_now[k], hz, n2scp_motion, said_rate);
++				}
++				n2scp_rate_now[k] = hz;
++			}
++			motion |= hz > 0;
++		}
++		if (n2scp_lightrate != light_rate && n2scp_lightrate >= 0) {   /* 0760 */
++			light_rate = n2scp_lightrate;
++			(void)n2scp_config(N2S_LIGHT, 1, light_rate > 0 ? (uint32_t)light_rate : 0xFFFFFF01u);
++		}
++		if (n2scp_alslcd > 0) {         /* 0760: one request per write */
++			uint32_t v = (uint32_t)n2scp_alslcd;
++			n2scp_alslcd = 0;
++			n2scp_lcd_info(v);
+ 		}
+ 		while (n2scp_take(false)) { }
+ 		n2scp_drain();
+ 		if ((int32_t)(ms - say) >= 0) { /* the report keeps its 10 s period */
+ 			say = ms + 10000;
+ 			volatile uint32_t *h = (volatile uint32_t *)n2scp_dram + N2SCP_FIFO_OFF / 4;
+-			printf("NORD2 SCP: counts acc %u mag %u gyr %u light %u prox %u\n", n2scp_count[0], n2scp_count[1], n2scp_count[3], n2scp_count[4], n2scp_count[7]);
++			printf("NORD2 SCP: counts acc %u mag %u gyr %u light %u prox %u | to iOS %u %u %u | hz %d %d %d light %d\n", n2scp_count[0], n2scp_count[1],
++			    n2scp_count[3], n2scp_count[4], n2scp_count[7], n2scp_out[0], n2scp_out[1], n2scp_out[2], n2scp_rate_now[0], n2scp_rate_now[1],
++			    n2scp_rate_now[2], light_rate);
+ 			printf("NORD2 SCP: t=%us records %u msgs %u fifo rp %u wp %u | prox %d lux %d acc %d %d %d gyr %d %d %d mag %d %d %d | core0 %#x PC %#x\n",
+ 			    ms / 1000, n2scp_records, n2scp_msgs, h[0], h[1], n2scp_prox, n2scp_lux, n2scp_acc[0], n2scp_acc[1], n2scp_acc[2],
+ 			    n2scp_gyr[0], n2scp_gyr[1], n2scp_gyr[2], n2scp_magv[0], n2scp_magv[1], n2scp_magv[2],
+diff -ruN a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-15 21:02:54.915039959 +0100
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-15 21:08:37.745317679 +0100
+@@ -31,6 +31,8 @@
+ #include "IOHIDPrivateKeys.h"
+ #include "IOHIDUsageTables.h"
+ #include "../sweet_fb_cutout.h"     /* 0550: touch follows the punch-hole band rotation */
++#include <kern/thread_call.h>       /* 0760: sensor guard */
++#include <kern/clock.h>             /* 0760: absolutetime_to_nanoseconds */
+ 
+ extern "C" uint64_t mach_absolute_time(void);
+ 
+@@ -401,6 +403,28 @@
+ #ifndef N2_PROX_DISPATCH_ON_SET
+ #define N2_PROX_DISPATCH_ON_SET 0
+ #endif
++/*
++ * 0760 (sensors-20261115): light, accelerometer, gyroscope and compass services are published too (bits 1-4), the proximity
++ * service is left exactly as it was (bit 0 = N2_SENSOR_MASK).  The consumers [V-disasm locationd 20H392]: CLAccelerometer matches
++ * usage pair 0xFF00/0x03 + "Built-In", reads kIOHIDEventTypeAccelerometer X/Y/Z as floats (g) and drops type 1 (shake); CLGyro
++ * 0xFF00/0x09 kIOHIDEventTypeGyro; CLMagnetometer 0xFF00/0x0A kIOHIDEventTypeCompass; CLOrientationNotifier (behind backboardd's
++ * CMDeviceOrientationManager = the auto-rotation) needs both the accelerometer and the gyro; locationd sets "ReportInterval" (us)
++ * / "BatchInterval" / "MaxFIFOEvents" on the service through the event system.  CoreBrightness reads ALS events' level as a float.
++ * The SPU compass HID plugins match only services with "compass-acc-compensation" / "compass-disp-coex" (not published).
++ * Values arrive already in iOS units (nord2_scp.inc 0760: IOFixed g, rad/s, uT).
++ * Guard: q10ef showed that a sensor service backboardd cannot digest puts it in a crash loop.  Every start of backboardd opens
++ * each service once, so a new service opened N2_SENSOR_GUARD_OPENS times within N2_SENSOR_GUARD_WINDOW_S seconds removes all
++ * the 0760 services again (terminate, logged "SWEET HID: GUARD"); proximity stays.
++ * Switches: N2_SENSOR_MASK_NEW at build time, n2gdv bit 18 (262144) at boot = none of the new services, "nord2sensors=0" = none
++ * at all (0284), kern.n2scp_motion=0 = no motion sampling (the services stay, silent).
++ */
++#ifndef N2_SENSOR_MASK_NEW
++#define N2_SENSOR_MASK_NEW      0x1E
++#endif
++#ifndef N2_SENSOR_GUARD_OPENS
++#define N2_SENSOR_GUARD_OPENS   3
++#define N2_SENSOR_GUARD_WINDOW_S 300
++#endif
+ class SweetHIDSensor : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDSensor);
+ public:
+@@ -409,8 +433,13 @@
+ 	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching, IOOptionBits options) APPLE_KEXT_OVERRIDE;
+ 	void report(SInt32 value);
+-	void motion(SInt32 x, SInt32 y, SInt32 z);      /* accelerometer / gyro / compass, hub units */
++	void motion(SInt32 x, SInt32 y, SInt32 z);      /* accelerometer / gyro / compass, IOFixed iOS units (0760) */
+ 	IOHIDEvent *current(void);
++	int wantHz(int defaultHz);                      /* 0760 */
++	void status(char *buf, int len);                /* 0760 */
++	UInt32 usage(void) const { return fUsage; }
++protected:
++	virtual bool handleOpen(IOService *client, IOOptionBits options, void *argument) APPLE_KEXT_OVERRIDE;
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return 0xFF00; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return fUsage; }
+@@ -420,9 +449,14 @@
+ 	UInt32 fUsage;
+ 	const char *fName;
+ 	volatile SInt32 fValue;         /* proximity: 1 near, 0 far; light: lux */
+-	volatile SInt32 fXYZ[3];        /* motion: last sample in the hub's units (1/1000 m/s^2, mrad/s, 1/1000 uT) */
++	volatile SInt32 fXYZ[3];        /* motion: last sample, IOFixed g / rad/s / uT (0760) */
+ 	bool fHaveXYZ;
+ 	UInt32 fSaid;
++	volatile UInt32 fInterval;      /* 0760: last "ReportInterval" (us) set by iOS */
++	volatile bool fIntervalSet;
++	UInt32 fOpens, fSaidProps;
++	UInt64 fOpenT[N2_SENSOR_GUARD_OPENS];
++	volatile UInt32 fEvents;
+ };
+ OSDefineMetaClassAndStructors(SweetHIDSensor, IOHIDEventService);
+ 
+@@ -473,18 +507,15 @@
+ 		if (!fHaveXYZ) {
+ 			return NULL;
+ 		}
+-		/* IOFixed: g for the accelerometer (9806.65 hub units = 1 g), rad/s for the gyro, microtesla for the compass */
+-		SInt64 x = fXYZ[0], y = fXYZ[1], z = fXYZ[2];
++		/* 0760: already IOFixed in iOS units (g, rad/s, uT: nord2_scp.inc n2scp_motion_out) */
++		IOFixed x = fXYZ[0], y = fXYZ[1], z = fXYZ[2];
+ 		if (fUsage == 0x03) {
+-			return IOHIDEvent::accelerometerEvent(mach_absolute_time(), (IOFixed)(x * 65536 / 9807), (IOFixed)(y * 65536 / 9807),
+-			           (IOFixed)(z * 65536 / 9807));
++			return IOHIDEvent::accelerometerEvent(mach_absolute_time(), x, y, z);
+ 		}
+ 		if (fUsage == 0x09) {
+-			return IOHIDEvent::gyroEvent(mach_absolute_time(), (IOFixed)(x * 65536 / 1000), (IOFixed)(y * 65536 / 1000),
+-			           (IOFixed)(z * 65536 / 1000));
++			return IOHIDEvent::gyroEvent(mach_absolute_time(), x, y, z);
+ 		}
+-		return IOHIDEvent::compassEvent(mach_absolute_time(), (IOFixed)(x * 65536 / 1000), (IOFixed)(y * 65536 / 1000),
+-		           (IOFixed)(z * 65536 / 1000));
++		return IOHIDEvent::compassEvent(mach_absolute_time(), x, y, z);
+ 	}
+ 	if (v < 0) {
+ 		return NULL;
+@@ -504,10 +535,11 @@
+ 	if (event) {
+ 		if (fSaid < 3) {
+ 			fSaid++;
+-			IOLog("SWEET HID: %s %d %d %d (%u clients)\n", fName, (int)x, (int)y, (int)z, _clients->getCount());
++			IOLog("SWEET HID: %s %d %d %d (IOFixed, %u clients)\n", fName, (int)x, (int)y, (int)z, _clients->getCount());
+ 		}
+ 		dispatchEvent(event);
+ 		event->release();
++		fEvents++;
+ 	}
+ }
+ 
+@@ -533,6 +565,20 @@
+ 	if (!dict) {
+ 		return kIOReturnBadArgument;
+ 	}
++	if (fUsage != 0x08) {          /* 0760: what iOS asks of the light / motion services */
++		OSNumber *ri = OSDynamicCast(OSNumber, dict->getObject("ReportInterval"));
++		OSNumber *bi = OSDynamicCast(OSNumber, dict->getObject("BatchInterval"));
++		if (ri) {
++			fInterval = ri->unsigned32BitValue();
++			fIntervalSet = true;
++		}
++		if (fSaidProps < 40) {
++			fSaidProps++;
++			IOLog("SWEET HID: %s properties set (%u keys): ReportInterval %lld BatchInterval %lld\n", fName, dict->getCount(),
++			    ri ? (long long)ri->unsigned64BitValue() : -1LL, bi ? (long long)bi->unsigned64BitValue() : -1LL);
++		}
++		return kIOReturnSuccess;
++	}
+ 	if (fUsage == 0x08 && N2_PROX_DISPATCH_ON_SET) {
+ 		IOLog("SWEET HID: proximity properties set (%u keys): state %s again\n", dict->getCount(), fValue > 0 ? "near" : "far");
+ 		IOHIDEvent *event = current();
+@@ -555,6 +601,83 @@
+ 	return current();
+ }
+ 
++/* 0760: guard state, the thread call that removes the new services, the published mask */
++static volatile UInt32 gSweetSensorGuard;      /* 0 armed, 1 tripped (services being removed), 2 removed */
++static volatile UInt32 gSweetSensorMask;
++static thread_call_t gSweetGuardCall;
++
++static void
++sweet_hid_guard_fire(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
++{
++	SweetHIDSensor **list[4] = { &gSweetALS, &gSweetAccel, &gSweetGyro, &gSweetCompass };
++	for (int i = 0; i < 4; i++) {
++		SweetHIDSensor *s = *list[i];
++		if (!s) {
++			continue;
++		}
++		*list[i] = NULL;
++		IOLog("SWEET HID: GUARD: removing the %s service\n", s->getName());
++		s->terminate();
++	}
++	gSweetSensorGuard = 2;
++	IOLog("SWEET HID: GUARD: light/motion services removed (proximity kept); reboot to retry\n");
++}
++
++static bool
++sweet_hid_guard_trip(void)
++{
++	UInt32 expected = 0;
++	return __atomic_compare_exchange_n(&gSweetSensorGuard, &expected, 1u, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++}
++
++bool
++SweetHIDSensor::handleOpen(IOService *client, IOOptionBits options, void *argument)
++{
++	bool ok = IOHIDEventService::handleOpen(client, options, argument);
++	if (!ok || fUsage == 0x08) {
++		return ok;
++	}
++	uint64_t now, ns;
++	now = mach_absolute_time();
++	absolutetime_to_nanoseconds(now, &ns);
++	UInt64 t = ns / 1000000000ULL;
++	fOpenT[fOpens % N2_SENSOR_GUARD_OPENS] = t;
++	fOpens++;
++	IOLog("SWEET HID: %s opened (open #%u by %s)\n", fName, fOpens, client ? client->getName() : "?");
++	if (fOpens >= N2_SENSOR_GUARD_OPENS) {
++		UInt64 oldest = fOpenT[fOpens % N2_SENSOR_GUARD_OPENS];       /* the N-th last open */
++		if (t - oldest <= N2_SENSOR_GUARD_WINDOW_S && sweet_hid_guard_trip()) {
++			IOLog("SWEET HID: GUARD: %s opened %u times in %llu s (client restarting = backboardd crash loop?): removing the new services\n",
++			    fName, (unsigned)N2_SENSOR_GUARD_OPENS, (unsigned long long)(t - oldest));
++			if (gSweetGuardCall) {
++				thread_call_enter(gSweetGuardCall);
++			}
++		}
++	}
++	return ok;
++}
++
++int
++SweetHIDSensor::wantHz(int defaultHz)
++{
++	if (fIntervalSet) {
++		UInt32 us = fInterval;
++		if (us == 0) {
++			return 0;
++		}
++		return (int)(1000000u / us) > 0 ? (int)(1000000u / us) : 1;
++	}
++	/* nobody has configured the service: stream while it has a client (the event system's open) */
++	return (_clients && _clients->getCount() > 0) ? defaultHz : 0;
++}
++
++void
++SweetHIDSensor::status(char *buf, int len)
++{
++	snprintf(buf, (size_t)len, "%s c%u ri%s%u o%u e%u", fName, _clients ? _clients->getCount() : 0u, fIntervalSet ? "" : "?",
++	    (unsigned)fInterval, (unsigned)fOpens, (unsigned)fEvents);
++}
++
+ static SweetHIDSensor *
+ sweet_hid_new_sensor(IOService *provider, UInt32 usage, const char *name)
+ {
+@@ -601,11 +724,22 @@
+ 		int sensors = 1;
+ 		(void)PE_parse_boot_argn("nord2sensors", &sensors, sizeof(sensors));
+ 		if (sensors) {
++			/* 0760: the new services unless n2gdv bit 18 says no; the proximity line is 0284's */
++			int gdv = 0;
++			UInt32 mask = N2_SENSOR_MASK | N2_SENSOR_MASK_NEW;
++			if (PE_parse_boot_argn("n2gdv", &gdv, sizeof(gdv)) && (gdv & (1 << 18))) {
++				mask = N2_SENSOR_MASK;
++			}
++			gSweetGuardCall = thread_call_allocate(sweet_hid_guard_fire, NULL);
+ 			if (N2_SENSOR_MASK & 1) { gSweetProx = sweet_hid_new_sensor(provider, 0x08, "proximity"); }
+-			if (N2_SENSOR_MASK & 2) { gSweetALS = sweet_hid_new_sensor(provider, 0x04, "ambient-light"); }
+-			if (N2_SENSOR_MASK & 4) { gSweetAccel = sweet_hid_new_sensor(provider, 0x03, "accelerometer"); }
+-			if (N2_SENSOR_MASK & 8) { gSweetGyro = sweet_hid_new_sensor(provider, 0x09, "gyro"); }
+-			if (N2_SENSOR_MASK & 16) { gSweetCompass = sweet_hid_new_sensor(provider, 0x0A, "compass"); }
++			if (mask & 2) { gSweetALS = sweet_hid_new_sensor(provider, 0x04, "ambient-light"); }
++			if (mask & 4) { gSweetAccel = sweet_hid_new_sensor(provider, 0x03, "accelerometer"); }
++			if (mask & 8) { gSweetGyro = sweet_hid_new_sensor(provider, 0x09, "gyro"); }
++			if (mask & 16) { gSweetCompass = sweet_hid_new_sensor(provider, 0x0A, "compass"); }
++			gSweetSensorMask = (gSweetProx ? 1u : 0u) | (gSweetALS ? 2u : 0u) | (gSweetAccel ? 4u : 0u) | (gSweetGyro ? 8u : 0u) |
++			    (gSweetCompass ? 16u : 0u);
++			IOLog("SWEET HID: sensors published mask %#x (asked %#x, guard %u opens / %u s)\n", (unsigned)gSweetSensorMask, (unsigned)mask,
++			    (unsigned)N2_SENSOR_GUARD_OPENS, (unsigned)N2_SENSOR_GUARD_WINDOW_S);
+ 		}
+ 	}
+ #endif
+@@ -967,7 +1101,7 @@
+ extern "C" void
+ sweet_hid_ambient(int lux)
+ {
+-	if (gSweetALS && lux >= 0) {
++	if (gSweetALS && lux >= 0 && gSweetSensorGuard == 0) {
+ 		gSweetALS->report(lux);
+ 	}
+ }
+@@ -978,7 +1112,45 @@
+ sweet_hid_motion(int kind, int x, int y, int z)
+ {
+ 	SweetHIDSensor *s = kind == 0 ? gSweetAccel : kind == 1 ? gSweetGyro : gSweetCompass;
+-	if (s) {
++	if (s && gSweetSensorGuard == 0) {
+ 		s->motion(x, y, z);
+ 	}
+ }
++
++/* 0760: Hz iOS wants from a motion service (0 none / no service), for nord2_scp.inc's on-demand enable */
++extern "C" int sweet_hid_motion_want(int kind);
++extern "C" int
++sweet_hid_motion_want(int kind)
++{
++	static const int dflt[3] = { 50, 50, 25 };
++	SweetHIDSensor *s = kind == 0 ? gSweetAccel : kind == 1 ? gSweetGyro : kind == 2 ? gSweetCompass : NULL;
++	if (!s || gSweetSensorGuard != 0) {
++		return 0;
++	}
++	return s->wantHz(dflt[kind]);
++}
++
++/* 0760: one line for kern.n2scp_raw */
++extern "C" void sweet_hid_sensor_status(char *buf, int len);
++extern "C" void
++sweet_hid_sensor_status(char *buf, int len)
++{
++	SweetHIDSensor *list[4] = { gSweetAccel, gSweetGyro, gSweetCompass, gSweetALS };
++	int n = snprintf(buf, (size_t)len, "hid mask %#x guard %u", (unsigned)gSweetSensorMask, (unsigned)gSweetSensorGuard);
++	for (int i = 0; i < 4 && n > 0 && n < len - 2; i++) {
++		if (!list[i]) {
++			continue;
++		}
++		buf[n++] = ' ';
++		buf[n++] = '|';
++		buf[n++] = ' ';
++		if (n >= len) {
++			break;
++		}
++		list[i]->status(buf + n, len - n);
++		n += (int)strnlen(buf + n, (size_t)(len - n));
++	}
++	if (len > 0) {
++		buf[len - 1] = 0;
++	}
++}

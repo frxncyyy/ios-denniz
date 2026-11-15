@@ -1,0 +1,407 @@
+diff -ruN a/bsd/dev/nord2_scp.inc b/bsd/dev/nord2_scp.inc
+--- a/bsd/dev/nord2_scp.inc	2026-11-15 22:36:41.837465103 +0100
++++ b/bsd/dev/nord2_scp.inc	2026-11-15 22:39:01.163126796 +0100
+@@ -141,11 +141,63 @@
+  *   - kern.n2scp_raw: one line with the last raw and converted samples, rates, counters (the ssh diagnostic).
+  *   Logs "NORD2 SCP: ..." as before; no new MMIO mapping, no new register, no new PMIC write.
+  */
+-extern int sweet_hid_motion_want(int kind);     /* SweetHID.cpp: Hz iOS wants from that service (0 = off) */
++extern int sweet_hid_motion_want(int kind);     /* SweetHID.cpp: Hz iOS wants from that service (0 = off); 3 = orientation (0761) */
++extern void sweet_hid_orientation(int o);       /* 0761: UIDeviceOrientation 0..6 to the 0x20/0x8A service */
+ extern void sweet_hid_sensor_status(char *buf, int len);
+ static int n2scp_axflip;                        /* 0760: kern.n2scp_axflip */
+ static volatile int32_t n2scp_ios[3][3];        /* 0760: last value handed to iOS per kind, IOFixed */
+ static volatile uint32_t n2scp_out[3];          /* 0760: samples handed to iOS per kind */
++/*
++ * 0761: device orientation from the accelerometer, the job iPhone10,3's always-on processor does (SweetHID.cpp 0761 comment).
++ * Low-pass (1/4) of the iOS-unit gravity vector in milli-g; a candidate must hold for ~250 ms (n2scp_orient_hold samples) before it
++ * is sent; face up / down when |z| > 850 mg, landscape when |x| > 550 mg and |x| > |y| + 150, portrait likewise on y;
++ * UIDeviceOrientation numbering: 1 portrait (y -1 g), 2 upside down (y +1 g), 3 landscape left (x -1 g), 4 landscape right
++ * (x +1 g), 5 face up (z -1 g), 6 face down (z +1 g).  kern.n2scp_orient 0 = no orientation events; kern.n2scp_orient_force
++ * 0..6 = that orientation, held (test of the iOS side without moving the phone), -1 = the detector.
++ */
++static int n2scp_orient = 1, n2scp_orient_force = -1;
++static int n2scp_rate_now_acc;                  /* 0761: copy of n2scp_rate_now[0] for the hold time */
++static volatile int n2scp_orient_now = -1;
++static volatile uint32_t n2scp_orient_changes;
++static int32_t n2scp_lp[3];
++static int n2scp_lp_init, n2scp_orient_cand = -1, n2scp_orient_cnt, n2scp_orient_forced = -1;
++static int
++n2scp_orient_classify(const int32_t g[3], int cur)
++{
++	int32_t ax = g[0] < 0 ? -g[0] : g[0], ay = g[1] < 0 ? -g[1] : g[1], az = g[2] < 0 ? -g[2] : g[2];
++	if (az > 850) { return g[2] < 0 ? 5 : 6; }
++	if (ax > 550 && ax > ay + 150) { return g[0] < 0 ? 3 : 4; }
++	if (ay > 550 && ay > ax + 150) { return g[1] < 0 ? 1 : 2; }
++	return cur;                             /* ambiguous: keep */
++}
++static void
++n2scp_orient_set(int o, const char *why)
++{
++	static const char *const names[7] = { "unknown", "portrait", "upside-down", "landscape-left", "landscape-right", "face-up", "face-down" };
++	if (o == n2scp_orient_now || o < 0 || o > 6) { return; }
++	n2scp_orient_now = o;
++	n2scp_orient_changes++;
++	if (n2scp_orient_changes <= 300 || (n2scp_orient_changes % 100) == 0) {
++		printf("NORD2 SCP: device orientation %s (%s, lp %d %d %d mg, change %u)\n", names[o], why, n2scp_lp[0], n2scp_lp[1], n2scp_lp[2],
++		    n2scp_orient_changes);
++	}
++	sweet_hid_orientation(o);
++}
++static void
++n2scp_orient_feed(const int32_t ios_fixed[3], int hz)
++{
++	int32_t g[3];
++	for (int i = 0; i < 3; i++) { g[i] = (int32_t)((int64_t)ios_fixed[i] * 1000 / 65536); }
++	if (!n2scp_lp_init) { for (int i = 0; i < 3; i++) { n2scp_lp[i] = g[i]; } n2scp_lp_init = 1; }
++	for (int i = 0; i < 3; i++) { n2scp_lp[i] += (g[i] - n2scp_lp[i]) / 4; }
++	if (!n2scp_orient || n2scp_orient_force >= 0) { return; }
++	int c = n2scp_orient_classify(n2scp_lp, n2scp_orient_now);
++	if (c != n2scp_orient_cand) { n2scp_orient_cand = c; n2scp_orient_cnt = 0; }
++	int hold = hz > 0 ? hz / 4 : 3;
++	if (hold < 3) { hold = 3; }
++	if (++n2scp_orient_cnt >= hold && c >= 0) { n2scp_orient_set(c, "accelerometer"); }
++}
++
+ static void
+ n2scp_motion_out(int kind, int32_t a, int32_t b, int32_t c)
+ {
+@@ -159,6 +211,10 @@
+ 	}
+ 	n2scp_out[kind]++;
+ 	sweet_hid_motion(kind, (int)v[0], (int)v[1], (int)v[2]);
++	if (kind == 0) {                /* 0761 */
++		int32_t f[3] = { (int32_t)v[0], (int32_t)v[1], (int32_t)v[2] };
++		n2scp_orient_feed(f, n2scp_rate_now_acc);
++	}
+ }
+ 
+ static int n2scp_chan;
+@@ -379,7 +435,8 @@
+ 	if (p2 & (1u << 17)) {
+ 		uint32_t id = n2scp_rd(n2scp_mb[2], 34 * 4), len = n2scp_rd(n2scp_mb[2], 35 * 4), d0 = n2scp_rd(n2scp_mb[2], 36 * 4);
+ 		n2scp_msgs++;
+-		if (say || n2scp_msgs <= 40) {
++		static unsigned said_sensor_msg;     /* 0761: hub replies on IPI_SENSOR (e.g. to SET_LCD_INFO) after the first 40 */
++		if (say || n2scp_msgs <= 40 || (id == N2SCP_IPI_SENSOR && said_sensor_msg++ < 60)) {
+ 			printf("NORD2 SCP: msg %u id %u len %u: %08x %08x %08x %08x %08x %08x\n", n2scp_msgs, id, len, d0,
+ 			    n2scp_rd(n2scp_mb[2], 37 * 4), n2scp_rd(n2scp_mb[2], 38 * 4), n2scp_rd(n2scp_mb[2], 39 * 4),
+ 			    n2scp_rd(n2scp_mb[2], 40 * 4), n2scp_rd(n2scp_mb[2], 41 * 4));
+@@ -443,7 +500,13 @@
+ 	case N2H_ACCEL: n2scp_acc[0] = a; n2scp_acc[1] = b; n2scp_acc[2] = c; n2scp_motion_out(0, a, b, c); break;
+ 	case N2H_GYRO: n2scp_gyr[0] = a; n2scp_gyr[1] = b; n2scp_gyr[2] = c; n2scp_motion_out(1, a, b, c); break;
+ 	case N2H_MAG: n2scp_magv[0] = a; n2scp_magv[1] = b; n2scp_magv[2] = c; n2scp_motion_out(2, a, b, c); break;
+-	default: break;
++	default: {
++		static unsigned said_other;     /* 0761: records of types we do not route (e.g. an OPLUS light type) */
++		if (said_other++ < 40) {
++			printf("NORD2 SCP: record of type %u (not routed) #%u: %d %d %d\n", type, said_other, a, b, c);
++		}
++		break;
++	}
+ 	}
+ 	if (n2scp_records <= 16 || (n2scp_records % 2000) == 0) {
+ 		printf("NORD2 SCP: record %u type %u: %d %d %d\n", n2scp_records, type, a, b, c);
+@@ -498,11 +561,21 @@
+ SYSCTL_INT(_kern, OID_AUTO, n2scp_alslcd, CTLFLAG_RW | CTLFLAG_LOCKED, &n2scp_alslcd, 0,
+     "NORD2 SCP 0760: write a brightness (1..2047) to send OPLUS SET_LCD_INFO for the light sensor once");
+ static int n2scp_rate_now[3];                   /* 0760: Hz the hub was last told per kind (acc, gyro, mag) */
++SYSCTL_INT(_kern, OID_AUTO, n2scp_orient, CTLFLAG_RW | CTLFLAG_LOCKED, &n2scp_orient, 0,
++    "NORD2 SCP 0761: 1 = device orientation events from the accelerometer (0x20/0x8A service), 0 = none");
++SYSCTL_INT(_kern, OID_AUTO, n2scp_orient_force, CTLFLAG_RW | CTLFLAG_LOCKED, &n2scp_orient_force, 0,
++    "NORD2 SCP 0761: -1 = detector; 0..6 = send this UIDeviceOrientation (1 portrait 2 upside down 3 landscape left 4 right 5 up 6 down)");
++static int n2scp_lighttype = N2S_LIGHT;         /* 0761: ConfigCmd sensor type used for light */
++SYSCTL_INT(_kern, OID_AUTO, n2scp_lighttype, CTLFLAG_RW | CTLFLAG_LOCKED, &n2scp_lighttype, 0,
++    "NORD2 SCP 0761: sensor type of the light enable (5 Android light; re-sent on change, the old type is disabled)");
++static int n2scp_alslcd_auto = 1023;            /* 0761: brightness sent with SET_LCD_INFO while light is silent (0 = never) */
++SYSCTL_INT(_kern, OID_AUTO, n2scp_alslcd_auto, CTLFLAG_RW | CTLFLAG_LOCKED, &n2scp_alslcd_auto, 0,
++    "NORD2 SCP 0761: brightness for OPLUS SET_LCD_INFO sent after the light enable and every 20 s (6 times) while no light record came; 0 = never");
+ static int
+ n2scp_sysctl_raw SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(oidp, arg1, arg2)
+-	char buf[640], hid[200];
++	char buf[900], hid[300];
+ 	hid[0] = 0;
+ 	sweet_hid_sensor_status(hid, (int)sizeof(hid));
+ 	/* integers only: g/rad/s/uT as value*1000 (milli units) */
+@@ -511,12 +584,13 @@
+ 	int n = snprintf(buf, sizeof(buf),
+ 	    "state %#x mode %d | acc raw %d %d %d (mm/s2) ios_mg %lld %lld %lld | gyr raw %d %d %d (urad/s) ios_mrad %lld %lld %lld | "
+ 	    "mag raw %d %d %d (10nT) ios_muT %lld %lld %lld | lux %d prox %d | hz acc %d gyr %d mag %d light %d | counts acc %u gyr %u mag %u "
+-	    "light %u prox %u out %u %u %u | records %u msgs %u | axflip %#x | %s",
++	    "light %u prox %u out %u %u %u | records %u msgs %u | axflip %#x | orient %d (changes %u, mode %d force %d) lighttype %d | %s",
+ 	    n2scp_state, n2scp_motion, n2scp_acc[0], n2scp_acc[1], n2scp_acc[2], m[0][0], m[0][1], m[0][2],
+ 	    n2scp_gyr[0], n2scp_gyr[1], n2scp_gyr[2], m[1][0], m[1][1], m[1][2], n2scp_magv[0], n2scp_magv[1], n2scp_magv[2],
+ 	    m[2][0], m[2][1], m[2][2], n2scp_lux, n2scp_prox, n2scp_rate_now[0], n2scp_rate_now[1], n2scp_rate_now[2],
+ 	    n2scp_lightrate, n2scp_count[0], n2scp_count[3], n2scp_count[1], n2scp_count[4], n2scp_count[7], n2scp_out[0], n2scp_out[1],
+-	    n2scp_out[2], n2scp_records, n2scp_msgs, n2scp_axflip, hid);
++	    n2scp_out[2], n2scp_records, n2scp_msgs, n2scp_axflip, n2scp_orient_now, n2scp_orient_changes, n2scp_orient, n2scp_orient_force,
++	    n2scp_lighttype, hid);
+ 	if (n < 0) { n = 0; }
+ 	if (n >= (int)sizeof(buf)) { n = (int)sizeof(buf) - 1; }
+ 	return SYSCTL_OUT(req, buf, (size_t)n + 1);
+@@ -541,6 +615,10 @@
+ 	if (mode == 1) { return forced[kind]; }
+ 	if (mode != 2) { return 0; }
+ 	int hz = sweet_hid_motion_want(kind);
++	if (kind == 0 && n2scp_orient) {        /* 0761: the orientation detector needs the accelerometer while its service is wanted */
++		int ho = sweet_hid_motion_want(3);
++		if (ho > hz) { hz = ho; }
++	}
+ 	if (hz <= 0) { return 0; }
+ 	/* a few steps only, so small changes of the asked interval do not re-send the enable */
+ 	hz = hz <= 5 ? 5 : hz <= 10 ? 10 : hz <= 25 ? 25 : hz <= 50 ? 50 : 100;
+@@ -642,7 +720,9 @@
+ 	for (int i = 0; i < 100 && n2scp_vibr_done < 0; i++) { n2scp_sleep(10); }
+ 	(void)n2scp_config(N2S_PROX, 1, 0xFFFFFF01u);
+ 	int light_rate = n2scp_lightrate;       /* 0760: what the hub was last told for light */
+-	(void)n2scp_config(N2S_LIGHT, 1, light_rate > 0 ? (uint32_t)light_rate : 0xFFFFFF01u);
++	int light_type = n2scp_lighttype;       /* 0761 */
++	(void)n2scp_config((uint8_t)light_type, 1, light_rate > 0 ? (uint32_t)light_rate : 0xFFFFFF01u);
++	uint32_t lcd_tries = 0, lcd_next_ms = 1000;     /* 0761: SET_LCD_INFO 1 s after the enable, then every 20 s while light is silent */
+ 	n2scp_state |= 4;
+ 	printf("NORD2 SCP: step 5: proximity and light (rate %d) enabled; motion sensors mode %d (kern.n2scp_motion: 0 off, 1 on, 2 on demand)\n",
+ 	    light_rate, n2scp_motion);
+@@ -662,9 +742,35 @@
+ 			}
+ 			motion |= hz > 0;
+ 		}
+-		if (n2scp_lightrate != light_rate && n2scp_lightrate >= 0) {   /* 0760 */
+-			light_rate = n2scp_lightrate;
+-			(void)n2scp_config(N2S_LIGHT, 1, light_rate > 0 ? (uint32_t)light_rate : 0xFFFFFF01u);
++		if ((n2scp_lightrate != light_rate && n2scp_lightrate >= 0) || (n2scp_lighttype != light_type && n2scp_lighttype > 0 &&
++		    n2scp_lighttype < 128 && n2scp_lighttype != N2S_PROX)) {   /* 0760 rate, 0761 type */
++			if (n2scp_lighttype != light_type && n2scp_lighttype > 0 && n2scp_lighttype < 128 && n2scp_lighttype != N2S_PROX) {
++				(void)n2scp_config((uint8_t)light_type, 0, light_rate > 0 ? (uint32_t)light_rate : 0xFFFFFF01u);
++				light_type = n2scp_lighttype;
++			}
++			light_rate = n2scp_lightrate >= 0 ? n2scp_lightrate : light_rate;
++			(void)n2scp_config((uint8_t)light_type, 1, light_rate > 0 ? (uint32_t)light_rate : 0xFFFFFF01u);
++			lcd_tries = 0; lcd_next_ms = ms + 1000;
++		}
++		if (n2scp_count[4] == 0 && n2scp_alslcd_auto > 0 && lcd_tries < 6 && (int32_t)(ms - lcd_next_ms) >= 0) {   /* 0761 */
++			lcd_tries++;
++			lcd_next_ms = ms + 20000;
++			printf("NORD2 SCP: light still silent: OPLUS LCD info, try %u of 6\n", lcd_tries);
++			n2scp_lcd_info((uint32_t)n2scp_alslcd_auto);
++		}
++		if (n2scp_orient_force != n2scp_orient_forced) {        /* 0761: forced orientation for the iOS-side test */
++			n2scp_orient_forced = n2scp_orient_force;
++			if (n2scp_orient_force >= 0 && n2scp_orient_force <= 6) {
++				n2scp_orient_set(n2scp_orient_force, "kern.n2scp_orient_force");
++			}
++		}
++		n2scp_rate_now_acc = n2scp_rate_now[0];
++		{       /* 0761: the current orientation again every 10 s (fresh sensor time), for a locationd that started after the change */
++			static uint32_t orient_next;
++			if (n2scp_orient_now >= 0 && n2scp_orient && (int32_t)(ms - orient_next) >= 0) {
++				orient_next = ms + 10000;
++				sweet_hid_orientation(n2scp_orient_now);
++			}
+ 		}
+ 		if (n2scp_alslcd > 0) {         /* 0760: one request per write */
+ 			uint32_t v = (uint32_t)n2scp_alslcd;
+diff -ruN a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-15 22:36:41.837582746 +0100
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-15 22:39:01.162723469 +0100
+@@ -418,8 +418,19 @@
+  * Switches: N2_SENSOR_MASK_NEW at build time, n2gdv bit 18 (262144) at boot = none of the new services, "nord2sensors=0" = none
+  * at all (0284), kern.n2scp_motion=0 = no motion sampling (the services stay, silent).
+  */
++/*
++ * 0761 (sensors-20261115 r2, after the q10jfinal25 phone run: accelerometer streams but iOS does not rotate): locationd's
++ * CLOrientationNotifier [V-disasm locationd 20H392, numberOfSpectatorsChanged 0x100107540 / onIohidEvent 0x10010a12c] always
++ * opens a HID service with usage pair 0x20/0x8A (HID sensor page, "device orientation") + Built-In and, on devices where the
++ * orientation comes from the always-on processor, takes kIOHIDEventTypeOrientation (10) events from it: field 0xA0004
++ * (DeviceOrientationUsage) in 0x64..0x6A (unknown, portrait, upside down, landscape left, landscape right, face up, face down =
++ * UIDeviceOrientation + 0x64), orientation type CMUsage (1); the optional first child (vendor page 0xFF15 usage 2, 8 data bytes)
++ * is the AOP time stamp.  Our phone is an iPhone10,3 to iOS, so that service is published (bit 5, "device-orientation") and fed
++ * by nord2_scp.inc's detector on the accelerometer; the accelerometer / gyro services stay for the AP-side detector and CoreMotion.
++ * "ReportInterval" -1 (0xFFFFFFFF, seen on the phone) now means "not configured" instead of 1 us.
++ */
+ #ifndef N2_SENSOR_MASK_NEW
+-#define N2_SENSOR_MASK_NEW      0x1E
++#define N2_SENSOR_MASK_NEW      0x3E
+ #endif
+ #ifndef N2_SENSOR_GUARD_OPENS
+ #define N2_SENSOR_GUARD_OPENS   3
+@@ -428,7 +439,7 @@
+ class SweetHIDSensor : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDSensor);
+ public:
+-	bool initSensor(UInt32 usage, const char *name);
++	bool initSensor(UInt32 usage, const char *name, UInt32 page = 0xFF00);
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching, IOOptionBits options) APPLE_KEXT_OVERRIDE;
+@@ -441,12 +452,13 @@
+ protected:
+ 	virtual bool handleOpen(IOService *client, IOOptionBits options, void *argument) APPLE_KEXT_OVERRIDE;
+ protected:
+-	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return 0xFF00; }
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return fPage; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return fUsage; }
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 0x10 + fUsage; }
+ 	virtual OSString *getProduct() APPLE_KEXT_OVERRIDE { return OSString::withCString(fName); }
+ private:
+ 	UInt32 fUsage;
++	UInt32 fPage;                   /* 0761: 0xFF00, or 0x20 for the device orientation service */
+ 	const char *fName;
+ 	volatile SInt32 fValue;         /* proximity: 1 near, 0 far; light: lux */
+ 	volatile SInt32 fXYZ[3];        /* motion: last sample, IOFixed g / rad/s / uT (0760) */
+@@ -463,11 +475,14 @@
+ static SweetHIDButtons *gSweetButtons;
+ static SweetHIDTouch *gSweetTouch;
+ static SweetHIDSensor *gSweetProx, *gSweetALS, *gSweetAccel, *gSweetGyro, *gSweetCompass;
++static SweetHIDSensor *gSweetOrient;           /* 0761: 0x20/0x8A device orientation */
++#define N2_ORIENT_USAGE 0x8A                    /* 0761: fUsage of the orientation service (page 0x20) */
+ 
+ bool
+-SweetHIDSensor::initSensor(UInt32 usage, const char *name)
++SweetHIDSensor::initSensor(UInt32 usage, const char *name, UInt32 page)
+ {
+ 	fUsage = usage;
++	fPage = page;
+ 	fName = name;
+ 	fValue = usage == 0x08 ? 0 : -1;
+ 	return init(NULL);
+@@ -490,7 +505,7 @@
+ 		setProperty("Placement", 1ULL, 32);
+ 	}
+ 	registerService();
+-	IOLog("SWEET HID: %s sensor registered (0xFF00/0x%02x)\n", fName, (unsigned)fUsage);
++	IOLog("SWEET HID: %s sensor registered (0x%04x/0x%02x)\n", fName, (unsigned)fPage, (unsigned)fUsage);
+ 	return true;
+ }
+ 
+@@ -503,6 +518,24 @@
+ 		    v > 0 ? (IOHIDProximityDetectionMask)(kIOHIDProximityDetectionReceiver | kIOHIDProximityDetectionLargeBodyContact) :
+ 		    (IOHIDProximityDetectionMask)0, v > 0 ? 1000 : 0);
+ 	}
++	if (fPage == 0x20 && fUsage == N2_ORIENT_USAGE) {     /* 0761: UIDeviceOrientation 0..6 -> usage 0x64.. */
++		if (v < 0 || v > 6) {
++			return NULL;
++		}
++		/* locationd notifyAOO drops an update whose sensor time is not newer than the last one ("Skipping stale orientation"):
++		 * the time comes only from the first child, vendor page 0xFF15 usage 2 with 8 data bytes, so it is always attached */
++		uint64_t now = mach_absolute_time();
++		IOHIDEvent *e = IOHIDEvent::orientationEvent(now, kIOHIDOrientationTypeCMUsage);
++		if (e) {
++			e->setIntegerValue(kIOHIDEventFieldOrientationDeviceOrientationUsage, 0x64 + v);
++			IOHIDEvent *t = IOHIDEvent::vendorDefinedEvent(now, 0xFF15, 2, 0, (UInt8 *)&now, (UInt32)sizeof(now));
++			if (t) {
++				e->appendChild(t);
++				t->release();
++			}
++		}
++		return e;
++	}
+ 	if (fUsage == 0x03 || fUsage == 0x09 || fUsage == 0x0A) {
+ 		if (!fHaveXYZ) {
+ 			return NULL;
+@@ -569,8 +602,20 @@
+ 		OSNumber *ri = OSDynamicCast(OSNumber, dict->getObject("ReportInterval"));
+ 		OSNumber *bi = OSDynamicCast(OSNumber, dict->getObject("BatchInterval"));
+ 		if (ri) {
+-			fInterval = ri->unsigned32BitValue();
+-			fIntervalSet = true;
++			UInt64 v = ri->unsigned64BitValue();
++			if (v == 0xFFFFFFFFULL || v == ~0ULL || (SInt64)v < 0) {
++				fIntervalSet = false;           /* 0761: -1 = not configured (seen on the gyro) */
++			} else {
++				fInterval = v > 0xFFFFFFFEULL ? 0xFFFFFFFEu : (UInt32)v;
++				fIntervalSet = true;
++			}
++		}
++		if (fPage == 0x20 && fValue >= 0) {      /* 0761: a (re)configuring locationd gets the current orientation at once */
++			IOHIDEvent *e = current();
++			if (e) {
++				dispatchEvent(e);
++				e->release();
++			}
+ 		}
+ 		if (fSaidProps < 40) {
+ 			fSaidProps++;
+@@ -593,6 +638,9 @@
+ IOHIDEvent *
+ SweetHIDSensor::copyEvent(IOHIDEventType type, IOHIDEvent *matching __unused, IOOptionBits options __unused)
+ {
++	if (fPage == 0x20) {            /* 0761 */
++		return type == kIOHIDEventTypeOrientation ? current() : NULL;
++	}
+ 	if ((fUsage == 0x08 && type != kIOHIDEventTypeProximity) || (fUsage == 0x04 && type != kIOHIDEventTypeAmbientLightSensor) ||
+ 	    (fUsage == 0x03 && type != kIOHIDEventTypeAccelerometer) || (fUsage == 0x09 && type != kIOHIDEventTypeGyro) ||
+ 	    (fUsage == 0x0A && type != kIOHIDEventTypeCompass)) {
+@@ -609,8 +657,8 @@
+ static void
+ sweet_hid_guard_fire(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
+ {
+-	SweetHIDSensor **list[4] = { &gSweetALS, &gSweetAccel, &gSweetGyro, &gSweetCompass };
+-	for (int i = 0; i < 4; i++) {
++	SweetHIDSensor **list[5] = { &gSweetALS, &gSweetAccel, &gSweetGyro, &gSweetCompass, &gSweetOrient };
++	for (int i = 0; i < 5; i++) {
+ 		SweetHIDSensor *s = *list[i];
+ 		if (!s) {
+ 			continue;
+@@ -679,10 +727,10 @@
+ }
+ 
+ static SweetHIDSensor *
+-sweet_hid_new_sensor(IOService *provider, UInt32 usage, const char *name)
++sweet_hid_new_sensor(IOService *provider, UInt32 usage, const char *name, UInt32 page = 0xFF00)
+ {
+ 	SweetHIDSensor *s = OSTypeAlloc(SweetHIDSensor);
+-	if (!s || !s->initSensor(usage, name) || !s->attach(provider)) {
++	if (!s || !s->initSensor(usage, name, page) || !s->attach(provider)) {
+ 		OSSafeReleaseNULL(s);
+ 		return NULL;
+ 	}
+@@ -736,8 +784,9 @@
+ 			if (mask & 4) { gSweetAccel = sweet_hid_new_sensor(provider, 0x03, "accelerometer"); }
+ 			if (mask & 8) { gSweetGyro = sweet_hid_new_sensor(provider, 0x09, "gyro"); }
+ 			if (mask & 16) { gSweetCompass = sweet_hid_new_sensor(provider, 0x0A, "compass"); }
++			if (mask & 32) { gSweetOrient = sweet_hid_new_sensor(provider, N2_ORIENT_USAGE, "device-orientation", 0x20); }   /* 0761 */
+ 			gSweetSensorMask = (gSweetProx ? 1u : 0u) | (gSweetALS ? 2u : 0u) | (gSweetAccel ? 4u : 0u) | (gSweetGyro ? 8u : 0u) |
+-			    (gSweetCompass ? 16u : 0u);
++			    (gSweetCompass ? 16u : 0u) | (gSweetOrient ? 32u : 0u);
+ 			IOLog("SWEET HID: sensors published mask %#x (asked %#x, guard %u opens / %u s)\n", (unsigned)gSweetSensorMask, (unsigned)mask,
+ 			    (unsigned)N2_SENSOR_GUARD_OPENS, (unsigned)N2_SENSOR_GUARD_WINDOW_S);
+ 		}
+@@ -1122,22 +1171,32 @@
+ extern "C" int
+ sweet_hid_motion_want(int kind)
+ {
+-	static const int dflt[3] = { 50, 50, 25 };
+-	SweetHIDSensor *s = kind == 0 ? gSweetAccel : kind == 1 ? gSweetGyro : kind == 2 ? gSweetCompass : NULL;
++	static const int dflt[4] = { 50, 50, 25, 25 };
++	SweetHIDSensor *s = kind == 0 ? gSweetAccel : kind == 1 ? gSweetGyro : kind == 2 ? gSweetCompass : kind == 3 ? gSweetOrient : NULL;
+ 	if (!s || gSweetSensorGuard != 0) {
+ 		return 0;
+ 	}
+ 	return s->wantHz(dflt[kind]);
+ }
+ 
++/* 0761: device orientation (UIDeviceOrientation 0..6) for the 0x20/0x8A service; dispatched by report() (callers: on change) */
++extern "C" void sweet_hid_orientation(int o);
++extern "C" void
++sweet_hid_orientation(int o)
++{
++	if (gSweetOrient && gSweetSensorGuard == 0 && o >= 0 && o <= 6) {
++		gSweetOrient->report(o);
++	}
++}
++
+ /* 0760: one line for kern.n2scp_raw */
+ extern "C" void sweet_hid_sensor_status(char *buf, int len);
+ extern "C" void
+ sweet_hid_sensor_status(char *buf, int len)
+ {
+-	SweetHIDSensor *list[4] = { gSweetAccel, gSweetGyro, gSweetCompass, gSweetALS };
++	SweetHIDSensor *list[5] = { gSweetAccel, gSweetGyro, gSweetCompass, gSweetALS, gSweetOrient };
+ 	int n = snprintf(buf, (size_t)len, "hid mask %#x guard %u", (unsigned)gSweetSensorMask, (unsigned)gSweetSensorGuard);
+-	for (int i = 0; i < 4 && n > 0 && n < len - 2; i++) {
++	for (int i = 0; i < 5 && n > 0 && n < len - 2; i++) {
+ 		if (!list[i]) {
+ 			continue;
+ 		}

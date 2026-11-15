@@ -1,0 +1,191 @@
+diff -ruN a/bsd/dev/nord2_scp.inc b/bsd/dev/nord2_scp.inc
+--- a/bsd/dev/nord2_scp.inc	2026-11-15 23:47:42.929909280 +0100
++++ b/bsd/dev/nord2_scp.inc	2026-11-15 23:54:23.722304215 +0100
+@@ -63,6 +63,10 @@
+ /* FIFO records carry the MTK handle: the Android type - 1 (q10et: accelerometer 0, magnetometer 1, gyroscope 3, proximity 7) */
+ enum { N2H_ACCEL = 0, N2H_MAG = 1, N2H_GYRO = 3, N2H_LIGHT = 4, N2H_PROX = 7 };
+ static volatile uint32_t n2scp_count[16];
++static volatile uint32_t n2scp_rsp[12], n2scp_rsp_seq;     /* 0762: last IPI_SENSOR reply (action != notify) */
++static int n2scp_lightpoll = 1;                 /* 0762: 1 = poll the light raw value when the hub never pushes light */
++static volatile int32_t n2scp_lightpolled = -1;
++static volatile uint32_t n2scp_lightpolls;
+ 
+ static vm_offset_t n2scp_tcm, n2scp_cfg, n2scp_c0, n2scp_c1, n2scp_infra, n2scp_topck, n2scp_dram;
+ static vm_offset_t n2scp_mb[5];
+@@ -362,11 +366,12 @@
+ 	pkt[10] = 0x00; pkt[11] = 0x03;            /* EVT_NO_SENSOR_CONFIG_EVENT 0x300 */
+ 	memcpy(pkt + 10 + 12, &rate, 4);
+ 	pkt[10 + 16] = type;
+-	pkt[10 + 17] = enable ? 1 : 0;
++	pkt[10 + 17] = (uint8_t)(enable < 0 ? 0 : enable);    /* 0762: 0 disable, 1 enable, 2 flush (nanohub CONFIG_CMD_*) */
+ 	crc = n2scp_crc(pkt, 30);
+ 	memcpy(pkt + 30, &crc, 4);
+ 	bool ok = n2scp_send(N2SCP_IPI_CHRE, pkt, sizeof(pkt));
+-	printf("NORD2 SCP: config sensor %u %s rate %u: %s\n", type, enable ? "on" : "off", rate, ok ? "taken" : "NOT TAKEN");
++	printf("NORD2 SCP: config sensor %u %s rate %u: %s\n", type, enable == 0 ? "off" : enable == 1 ? "on" : "cmd 2 (flush)", rate,
++	    ok ? "taken" : "NOT TAKEN");
+ 	return ok;
+ }
+ 
+@@ -436,6 +441,19 @@
+ 		uint32_t id = n2scp_rd(n2scp_mb[2], 34 * 4), len = n2scp_rd(n2scp_mb[2], 35 * 4), d0 = n2scp_rd(n2scp_mb[2], 36 * 4);
+ 		n2scp_msgs++;
+ 		static unsigned said_sensor_msg;     /* 0761: hub replies on IPI_SENSOR (e.g. to SET_LCD_INFO) after the first 40 */
++		if (id == N2SCP_IPI_SENSOR && ((d0 >> 8) & 0xff) != 6) {   /* 0762: a reply to one of our requests: keep and log all 12 words */
++			for (int i = 0; i < 12; i++) { n2scp_rsp[i] = n2scp_rd(n2scp_mb[2], (36u + (uint32_t)i) * 4u); }
++			n2scp_rsp_seq++;
++			static unsigned said_rsp;
++			if (said_rsp++ < 300) {
++				printf("NORD2 SCP: reply sensor %u action %u err %u: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", d0 & 0xff,
++				    (d0 >> 8) & 0xff, (d0 >> 16) & 0xff, n2scp_rsp[1], n2scp_rsp[2], n2scp_rsp[3], n2scp_rsp[4], n2scp_rsp[5], n2scp_rsp[6],
++				    n2scp_rsp[7], n2scp_rsp[8], n2scp_rsp[9], n2scp_rsp[10], n2scp_rsp[11]);
++			}
++		} else if (id == N2SCP_IPI_SENSOR && (d0 & 0xff) != 0 && (d0 & 0xff) != 7) {   /* 0762: a push for another sensor (light = 4) */
++			static unsigned said_push;
++			if (said_push++ < 40) { printf("NORD2 SCP: push notify for sensor %u event %u wp %#x\n", d0 & 0xff, (d0 >> 16) & 0xff, n2scp_rd(n2scp_mb[2], 38 * 4)); }
++		}
+ 		if (say || n2scp_msgs <= 40 || (id == N2SCP_IPI_SENSOR && said_sensor_msg++ < 60)) {
+ 			printf("NORD2 SCP: msg %u id %u len %u: %08x %08x %08x %08x %08x %08x\n", n2scp_msgs, id, len, d0,
+ 			    n2scp_rd(n2scp_mb[2], 37 * 4), n2scp_rd(n2scp_mb[2], 38 * 4), n2scp_rd(n2scp_mb[2], 39 * 4),
+@@ -493,6 +511,7 @@
+ 		break;
+ 	}
+ 	case N2H_LIGHT:
++		if (n2scp_count[4] == 1) { printf("NORD2 SCP: light first sample lux %d (fifo record, fields %d %d)\n", a, b, c); }   /* 0762 */
+ 		if (n2scp_lux < 0 || a > n2scp_lux * 2 || a < n2scp_lux / 2) { printf("NORD2 SCP: light %d lux\n", a); }
+ 		n2scp_lux = a;
+ 		sweet_hid_ambient(a);
+@@ -575,7 +594,7 @@
+ n2scp_sysctl_raw SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(oidp, arg1, arg2)
+-	char buf[900], hid[300];
++	char buf[1100], hid[300];
+ 	hid[0] = 0;
+ 	sweet_hid_sensor_status(hid, (int)sizeof(hid));
+ 	/* integers only: g/rad/s/uT as value*1000 (milli units) */
+@@ -584,13 +603,13 @@
+ 	int n = snprintf(buf, sizeof(buf),
+ 	    "state %#x mode %d | acc raw %d %d %d (mm/s2) ios_mg %lld %lld %lld | gyr raw %d %d %d (urad/s) ios_mrad %lld %lld %lld | "
+ 	    "mag raw %d %d %d (10nT) ios_muT %lld %lld %lld | lux %d prox %d | hz acc %d gyr %d mag %d light %d | counts acc %u gyr %u mag %u "
+-	    "light %u prox %u out %u %u %u | records %u msgs %u | axflip %#x | orient %d (changes %u, mode %d force %d) lighttype %d | %s",
++	    "light %u prox %u out %u %u %u | records %u msgs %u | axflip %#x | orient %d (changes %u, mode %d force %d) lighttype %d | lightpoll %d polled %d (%u) rsp#%u %08x %08x %08x | %s",
+ 	    n2scp_state, n2scp_motion, n2scp_acc[0], n2scp_acc[1], n2scp_acc[2], m[0][0], m[0][1], m[0][2],
+ 	    n2scp_gyr[0], n2scp_gyr[1], n2scp_gyr[2], m[1][0], m[1][1], m[1][2], n2scp_magv[0], n2scp_magv[1], n2scp_magv[2],
+ 	    m[2][0], m[2][1], m[2][2], n2scp_lux, n2scp_prox, n2scp_rate_now[0], n2scp_rate_now[1], n2scp_rate_now[2],
+ 	    n2scp_lightrate, n2scp_count[0], n2scp_count[3], n2scp_count[1], n2scp_count[4], n2scp_count[7], n2scp_out[0], n2scp_out[1],
+ 	    n2scp_out[2], n2scp_records, n2scp_msgs, n2scp_axflip, n2scp_orient_now, n2scp_orient_changes, n2scp_orient, n2scp_orient_force,
+-	    n2scp_lighttype, hid);
++	    n2scp_lighttype, n2scp_lightpoll, n2scp_lightpolled, n2scp_lightpolls, n2scp_rsp_seq, n2scp_rsp[0], n2scp_rsp[1], n2scp_rsp[2], hid);
+ 	if (n < 0) { n = 0; }
+ 	if (n >= (int)sizeof(buf)) { n = (int)sizeof(buf) - 1; }
+ 	return SYSCTL_OUT(req, buf, (size_t)n + 1);
+@@ -606,6 +625,44 @@
+ 	printf("NORD2 SCP: light LCD info brightness %u: %s\n", brightness, n2scp_send(N2SCP_IPI_SENSOR, req, sizeof(req)) ? "taken" : "NOT TAKEN");
+ }
+ 
++/* 0762: SCP_SENSOR_HUB_SET_CUST (action 5) {sensor, 5, -, -, cust action} and wait <= 100 ms for its reply; true = a reply came */
++static bool
++n2scp_cust(uint32_t sensor, uint32_t cust)
++{
++	uint32_t req[8] = { (5u << 8) | (sensor & 0xff), cust, 0, 0, 0, 0, 0, 0 };
++	uint32_t seq0 = n2scp_rsp_seq;
++	if (!n2scp_send(N2SCP_IPI_SENSOR, req, sizeof(req))) { return false; }
++	for (int i = 0; i < 20 && n2scp_rsp_seq == seq0; i++) {
++		if (!n2scp_take(false)) { n2scp_sleep(5); }
++	}
++	return n2scp_rsp_seq != seq0 && (n2scp_rsp[0] & 0xff) == (sensor & 0xff) && ((n2scp_rsp[0] >> 8) & 0xff) == 5;
++}
++static void
++n2scp_cust_info(uint32_t sensor)
++{
++	if (!n2scp_cust(sensor, 12)) {          /* CUST_ACTION_GET_SENSOR_INFO */
++		printf("NORD2 SCP: sensor %u info: no reply\n", sensor);
++		return;
++	}
++	char name[17];
++	for (int i = 0; i < 16; i++) { name[i] = (char)((n2scp_rsp[2 + i / 4] >> (8 * (i % 4))) & 0xff); }
++	name[16] = 0;
++	for (int i = 0; i < 16; i++) { if (name[i] && (name[i] < 0x20 || name[i] > 0x7e)) { name[i] = '?'; } }
++	printf("NORD2 SCP: sensor %u info: err %u name \"%s\"\n", sensor, (n2scp_rsp[0] >> 16) & 0xff, name);
++}
++/* 0762: light raw data request (CUST_ACTION_GET_RAW_DATA 7); -1 = no / failed reply */
++static int64_t
++n2scp_light_raw(void)
++{
++	if (!n2scp_cust(4, 7) || ((n2scp_rsp[0] >> 16) & 0xff) != 0 || n2scp_rsp[1] != 7) { return -1; }
++	return (int64_t)n2scp_rsp[2];
++}
++SYSCTL_INT(_kern, OID_AUTO, n2scp_lightpoll, CTLFLAG_RW | CTLFLAG_LOCKED, &n2scp_lightpoll, 0,
++    "NORD2 SCP 0762: 1 = if no light record arrives, poll CUST GET_RAW_DATA for light once a second and hand the value to iOS as lux; 0 = never");
++static int n2scp_summary_s = 30;                /* 0762: one summary line every N s (0 = none) */
++SYSCTL_INT(_kern, OID_AUTO, n2scp_summary_s, CTLFLAG_RW | CTLFLAG_LOCKED, &n2scp_summary_s, 0,
++    "NORD2 SCP 0762: seconds between the 'sensors summary' log lines (0 = off)");
++
+ /* 0760: the rate iOS wants per kind, clamped to what the 0531 mode did (acc/gyro 50, mag 25 when forced) */
+ static int
+ n2scp_motion_target(int kind)
+@@ -765,6 +822,63 @@
+ 			}
+ 		}
+ 		n2scp_rate_now_acc = n2scp_rate_now[0];
++		{       /* 0762: what the hub says it has (Android's init_sensorlist_info) and one light raw read, 5 s after step 5 */
++			static int asked;
++			if (!asked && ms >= 5000) {
++				asked = 1;
++				static const uint32_t ids[6] = { 0, 1, 3, 4, 5, 7 };
++				for (int i = 0; i < 6; i++) { n2scp_cust_info(ids[i]); }
++				printf("NORD2 SCP: light raw read: %lld (-1 = no reply / error)\n", (long long)n2scp_light_raw());
++			}
++		}
++		{       /* 0762: light still silent after 30 s: re-enable ladder (once each, 20 s apart): disable+enable, rate 0, on-change, flush */
++			static uint32_t ladder_next = 30000;
++			static int ladder;
++			if (n2scp_count[4] == 0 && ladder < 4 && ms >= ladder_next) {
++				ladder_next = ms + 20000;
++				uint32_t rate = ladder == 1 ? 0u : ladder == 2 ? 0xFFFFFF01u : (light_rate > 0 ? (uint32_t)light_rate : 0xFFFFFF01u);
++				printf("NORD2 SCP: light silent: ladder step %d (%s)\n", ladder + 1, ladder == 0 ? "disable + enable" : ladder == 1 ? "rate 0" :
++				    ladder == 2 ? "on-change" : "flush");
++				if (ladder == 0) { (void)n2scp_config((uint8_t)light_type, 0, rate); }
++				(void)n2scp_config((uint8_t)light_type, ladder == 3 ? 2 : 1, rate);
++				ladder++;
++			}
++		}
++		if (n2scp_lightpoll && n2scp_count[4] == 0 && ms >= 25000) {     /* 0762: polled fallback, 1 Hz */
++			static uint32_t poll_next, poll_fail;
++			if (ms >= poll_next && poll_fail < 10) {
++				poll_next = ms + 1000;
++				int64_t raw = n2scp_light_raw();
++				if (raw < 0) {
++					poll_fail++;
++					if (poll_fail == 10) { printf("NORD2 SCP: light poll: 10 failed reads, stopped\n"); }
++				} else {
++					poll_fail = 0;
++					n2scp_lightpolls++;
++					if (n2scp_lightpolled < 0) { printf("NORD2 SCP: light first sample lux %lld (polled raw value)\n", (long long)raw); }
++					n2scp_lightpolled = (int32_t)raw;
++					n2scp_lux = (int32_t)raw;
++					sweet_hid_ambient((int)raw);
++				}
++			}
++		}
++		if (n2scp_summary_s > 0) {      /* 0762: everything in one line */
++			static uint32_t sum_next = 15000;
++			if (ms >= sum_next) {
++				static const char *const on[7] = { "unknown", "portrait", "upside-down", "landscape-left", "landscape-right", "face-up", "face-down" };
++				sum_next = ms + (uint32_t)n2scp_summary_s * 1000u;
++				int o = n2scp_orient_now;
++				printf("NORD2 SCP: sensors summary t=%us | acc %dHz %d %d %d mg (%u) | gyr %dHz %d %d %d mrad/s (%u) | mag %dHz %d %d %d uT (%u) | "
++				    "light %d lux (fifo %u polled %u) | prox %s (%u) | orient %s (%u changes)\n", ms / 1000,
++				    n2scp_rate_now[0], (int)((int64_t)n2scp_ios[0][0] * 1000 / 65536), (int)((int64_t)n2scp_ios[0][1] * 1000 / 65536),
++				    (int)((int64_t)n2scp_ios[0][2] * 1000 / 65536), n2scp_count[0],
++				    n2scp_rate_now[1], (int)((int64_t)n2scp_ios[1][0] * 1000 / 65536), (int)((int64_t)n2scp_ios[1][1] * 1000 / 65536),
++				    (int)((int64_t)n2scp_ios[1][2] * 1000 / 65536), n2scp_count[3],
++				    n2scp_rate_now[2], (int)(n2scp_ios[2][0] / 65536), (int)(n2scp_ios[2][1] / 65536), (int)(n2scp_ios[2][2] / 65536), n2scp_count[1],
++				    n2scp_lux, n2scp_count[4], n2scp_lightpolls, n2scp_prox < 0 ? "none" : n2scp_prox ? "far" : "NEAR", n2scp_count[7],
++				    (o >= 0 && o <= 6) ? on[o] : "none", n2scp_orient_changes);
++			}
++		}
+ 		{       /* 0761: the current orientation again every 10 s (fresh sensor time), for a locationd that started after the change */
+ 			static uint32_t orient_next;
+ 			if (n2scp_orient_now >= 0 && n2scp_orient && (int32_t)(ms - orient_next) >= 0) {

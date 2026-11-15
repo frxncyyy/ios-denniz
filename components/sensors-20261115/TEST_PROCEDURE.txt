@@ -1,0 +1,164 @@
+SCP sensors to iOS (sensors-20261115, piece 0760) -- phone test procedure. NOT run by the author (host-only agent).
+
+What it is
+  Kernel only (no userland payload needed): q10jfinal25 = q10jfinal24bt (bt6) + 0760
+  (device-mmu-q10jfinal25-candidate/ui-sched/nord2-ios-metal-q10jfinal25-ui654fb60dvfs-cap3500-ram5088-sched.img, 15304704 B,
+   sha256 66eb02b116ee59d2a50c9bf8c453c3c86ce2c80f31faeb505df578e40f06db56).
+  The SCP hub, its firmware start, IPI/mailbox, calibration and the PROXIMITY path are 0284/0531 and are unchanged
+  (same ConfigCmd calls in the same order; the proximity HID service and the touch-service proximity are untouched).
+  New: four more HID services under SweetHIDButtons' provider, each IOHIDEventService 0xFF00 usage pair:
+     ambient-light 0x04, accelerometer 0x03, gyro 0x09, compass 0x0A (transport SPU, Built-In).
+  Motion sampling on demand (kern.n2scp_motion=2): the hub samples acc/gyro/mag only while iOS asks (ReportInterval set by
+  locationd through the HID event system); a service nobody configured streams while it has a client.
+  Light: enabled at 5 Hz (kern.n2scp_lightrate=5120) instead of 0284's on-change request that never produced data.
+
+Flash: kernel q10jfinal25 (image + sha256 in the agent report), same procedure as any kernel-only change. The SCP thread maps at
+~90 s and starts the hub ~20 s later as before: sensors work from ~2 min after boot.
+
+1. Logs (USB live log), in order:
+     SWEET HID: sensors published mask 0x1f (asked 0x1f, guard 3 opens / 300 s)
+     SWEET HID: proximity / ambient-light / accelerometer / gyro / compass sensor registered (0xFF00/0x..)
+     SWEET HID: <name> opened (open #1 by IOHIDEventServiceUserClient)            one per service (backboardd)
+     NORD2 SCP: step 5: proximity and light (rate 5120) enabled; motion sensors mode 2 ...
+     SWEET HID: accelerometer properties set (.. keys): ReportInterval N BatchInterval M     (locationd asking)
+     NORD2 SCP: accelerometer 0 Hz -> 50 Hz (mode 2, change 1)  (and gyroscope / magnetometer)
+     SWEET HID: accelerometer <x> <y> <z> (IOFixed, 1 clients)
+     NORD2 SCP: counts acc .. | to iOS a g m | hz .. light 5120         every 10 s
+   BAD signs: "SWEET HID: GUARD: ..." (backboardd restarted 3 times within 300 s after the services appeared: the four new services
+   were removed by the kernel itself, proximity kept; send the backboardd crash log + the lines before), backboardd/SpringBoard
+   respawning, "light" count staying 0 after 2 min (the light fix did not help: try step 5b).
+
+2. ssh diagnostic (root shell):
+     sh n2sensors.sh 20 1        (copy sensors-20261115/phone/n2sensors.sh, or simply: sysctl kern.n2scp_raw)
+   Fields: acc raw (mm/s^2, Android convention) and ios_mg (milli-g as handed to iOS); gyr raw (urad/s) / ios_mrad (mrad/s);
+   mag raw (10 nT) / ios_muT; lux; prox (1 far, 0 near, -1 none); hz told to the hub; counts per sensor; "to iOS" counts;
+   HID part: per service c<clients> ri<ReportInterval us, '?' = never set> o<opens> e<events dispatched>.
+
+3. Orientation / pose test (the gravity vector must follow the pose). With `sysctl kern.n2scp_raw` (or n2sensors.sh) read
+   ios_mg for each pose, holding still 2 s:
+     a) flat, screen UP on the table           expect ios_mg ~ (0, 0, -1000)
+     b) upright portrait (top up)              expect ios_mg ~ (0, -1000, 0)
+     c) landscape, left edge down              expect ios_mg ~ (-1000, 0, 0)   (right edge down: +1000)
+     d) flat, screen DOWN                      expect ios_mg ~ (0, 0, +1000)
+   If an axis has the wrong sign: sysctl -w kern.n2scp_axflip=<bits> (bit0 acc x, bit1 acc y, bit2 acc z; 3-5 gyro; 6-8 compass),
+   repeat, and report the value that is right (it becomes the compiled default).
+   If magnitudes are ~9.8x off or axes swapped (x<->y), report the raw lines of a)-c).
+   Gyro: rotate the phone about its long axis: ios_mrad x/y/z changes sign with the direction, ~0 at rest (< 20 mrad/s).
+   Compass: |ios_muT| is uncalibrated (hard-iron of the phone; values ~150-190 uT seen in q10j logs), it must change when the phone
+   is turned flat on the table.
+
+4. iOS:
+   a) Control Center: Portrait Orientation Lock OFF. Open an app that rotates (Safari, Photos, Calculator for landscape): turn the
+      phone to landscape -> the UI rotates within ~1 s; back to portrait -> rotates back. Home screen of iPhone X stays portrait (normal).
+   b) Lock on -> no rotation. c) Terraria (landscape game): starts in the landscape side matching the pose, flips 180 deg when
+      the phone is turned over.
+   d) CoreMotion: Compass app (calibration dance may be asked), Measure > Level (bubble follows the tilt), a game using tilt.
+   e) Proximity unchanged: call, phone to the ear -> screen off, away -> on (regression check).
+   f) Light: lux in kern.n2scp_raw changes with a hand over the top of the screen / a lamp. Auto-Brightness itself needs MobileGestalt's
+      "ambient-light-sensor" answer (cached false on this rootfs): NOT expected to switch on with this kernel alone.
+
+5. Switches (run time, root shell; the boot line is full)
+     sysctl -w kern.n2scp_motion=0     motion sampling off (services stay, silent)        1 = always on (0531 old mode)
+     sysctl -w kern.n2scp_axflip=N     axis signs (see 3)
+     sysctl -w kern.n2scp_lightrate=0  light back to 0284's on-change request; any other value = Hz*1024 (re-sent at once)
+  5b sysctl -w kern.n2scp_alslcd=1023  sends OPLUS SET_LCD_INFO (brightness 1023) to the light algorithm once (log "light LCD info")
+   Boot time: n2gdv bit 18 (n2gdv=335882 instead of 73738: rebuild with EXTRA_ARGS_OVERRIDE) = none of the four new services.
+   Automatic: the kernel GUARD removes the four services after 3 opens within 300 s (backboardd crash loop); reboot re-arms it.
+   Fallback image: q10jfinal24bt (same kernel without 0760).
+
+Verified on the host: piece applies fuzz-0 on the chain, KERNEL OK, FAILURES none, SCANPATH_OK, WIFI_MEMBERS_OK, known 0399 IMAGECHECK stop, host test
+  sensors-20261115/test/run.sh -> SENSORS_HOST_TESTS_OK (unit conversion, sign, axflip, rate steps).
+NOT verified: anything on hardware (axis signs vs the hub's direction mapping, locationd actually setting ReportInterval on these
+  services, backboardd/CoreBrightness accepting the four services, the light sensor reporting at a fixed rate).
+
+==== r2: piece 0761, kernel q10jfinal27 (after the q10jfinal25 phone run) ====
+Image: device-mmu-q10jfinal27-candidate/ui-sched/nord2-ios-metal-q10jfinal27-ui654fb60dvfs-cap3500-ram5088-sched.img
+  15308800 B, sha256 28ed2227c983bea3a43feb935e1091169a37f7af66e65d91dfe8b6b5b5eabcd8 = q10jfinal26bt (bt7) + 0761. Fallback q10jfinal26bt.
+What the q10jfinal25 run showed and what 0761 does:
+ (1) no rotation: [V-disasm locationd] on iPhone10,3-class devices locationd's orientation comes from a HID service with usage pair
+     0x20/0x8A (HID sensor page "device orientation"), events kIOHIDEventTypeOrientation (10) with DeviceOrientationUsage 0x64..0x6A
+     (= UIDeviceOrientation + 0x64) and a first child vendor event (page 0xFF15 usage 2, 8-byte sensor time) - without a newer sensor
+     time every update is dropped ("Skipping stale orientation"). Nobody published that service. 0761 publishes it
+     ("device-orientation", mask bit 5) and feeds it from a kernel detector on the accelerometer (low-pass, ~250 ms hold, face up/down
+     |z| > 0.85 g, landscape/portrait > 0.55 g with 0.15 g margin); current state re-sent every 10 s and when locationd configures the
+     service. The accelerometer is kept on while that service is wanted. [I] whether this phone's locationd really takes the AOP path
+     (capability bit 6 of its model table) - if it takes the AP path instead, the accelerometer + gyro services (0760) are what it uses.
+ (2) gyro "stuck": [I] not a hub fault - the gyro was on only while iOS asked (ReportInterval 5000 / 1000000), then iOS set 0 = off and
+     the last sample stays in the diag. -1 now means "not configured" (was read as 1 us). Check with kern.n2scp_motion=1 (step 4).
+ (3) magnetometer 0 counts: [I] same: enabled only while iOS asks (Compass app / heading). Check with Compass or kern.n2scp_motion=1.
+ (4) light silent: 0761 sends OPLUS SET_LCD_INFO (brightness 1023) 1 s after the light enable and every 20 s up to 6 times while no
+     light record came (kern.n2scp_alslcd_auto, 0 = never); logs the hub's IPI_SENSOR replies and any record type it does not route;
+     kern.n2scp_lighttype lets you try another ConfigCmd type at run time.
+
+Phone steps (q10jfinal27):
+ 1. Flash, wait 2.5 min. Log: "SWEET HID: sensors published mask 0x3f", "device-orientation sensor registered (0x0020/0x8a)",
+    "device-orientation opened", "NORD2 SCP: device orientation <name> (accelerometer, lp x y z mg, change N)",
+    "NORD2 SCP: light still silent: OPLUS LCD info, try 1 of 6" + "light LCD info brightness 1023: taken" (+ maybe "msg .. id 3 .." reply).
+    No "SWEET HID: GUARD".
+ 2. ssh: sh n2orient.sh 40   (sensors-20261115/phone/n2orient.sh; kernel lines each second, plus locationd/backboardd log lines if a
+    log/oslog tool exists) while doing, 3 s each: portrait upright -> landscape (rotate left, i.e. top of the phone to the LEFT) ->
+    portrait -> landscape (top to the RIGHT) -> upside down -> flat face up -> flat face down.
+    Expected orient: 1 -> 3 -> 1 -> 4 -> 2 -> 5 -> 6. If landscape left/right come out swapped: sysctl -w kern.n2scp_axflip=1 and
+    repeat (bit 0 = accel x); if portrait/upside down swapped: axflip=2. Report the working value.
+    "device-orientation c1 ri.. o1 eN": e must grow with every change (events reach the event system).
+ 3. iOS test without moving (isolates the iOS side): Safari open, Portrait Orientation Lock OFF, phone flat on the table:
+      sysctl -w kern.n2scp_orient_force=3   -> Safari should turn to landscape;  =4 the other landscape;  =1 back to portrait;
+      sysctl -w kern.n2scp_orient_force=-1  -> detector again.
+    If forced values do NOT rotate Safari: the AOP path is not what locationd uses on this phone -> send the n2orient.sh userland lines
+    / "device-orientation ... ri" value; next step would be the AP path (accelerometer service ReportInterval).
+    Then Terraria: hold landscape, turn 180 deg -> the game flips (UIKit landscape left <-> right).
+ 4. Gyro / compass: sysctl -w kern.n2scp_motion=1 (all on at 50/50/25 Hz), sysctl kern.n2scp_raw twice 2 s apart while moving: gyr raw and
+    mag raw must change, counts gyr/mag grow; then sysctl -w kern.n2scp_motion=2 (on demand). Compass app with motion=2: "magnetometer
+    0 Hz -> N Hz" in the log and the needle moves (a figure-8 calibration may be asked).
+ 5. Light: after step 1 wait 2 min; sysctl kern.n2scp_raw: "light <count>" > 0 and lux changing with a hand over the top edge.
+    If still 0: send the "light LCD info" and "msg ... id 3" log lines and any "record of type N (not routed)" lines; then try
+    sysctl -w kern.n2scp_lighttype=<N> with that N.
+ 6. Regression: proximity in a call (screen off at the ear).
+Switches new in 0761: kern.n2scp_orient (1/0), kern.n2scp_orient_force (-1, 0..6), kern.n2scp_lighttype (5), kern.n2scp_alslcd_auto (1023/0).
+Host: test/run.sh -> SENSORS_HOST_TESTS_OK (adds: detector 6 poses, ambiguous 45 deg keeps state, 100 ms glitch ignored, force mode,
+  accelerometer kept on for the orientation service).
+
+==== r3: piece 0762, kernel q10jfinal30 + ssh tool n2sens (after the q10jfinal27 run) ====
+Image: device-mmu-q10jfinal30-candidate/ui-sched/nord2-ios-metal-q10jfinal30-ui654fb60dvfs-cap3500-ram5088-sched.img
+  15316992 B, sha256 3301f08828a5d268f0b548dd3f664df54f643762b3248f9fda747029c817819b = q10jfinal29bt (bt9) + 0762 (only nord2_scp.inc
+  differs from the 29bt stage; receipt identical). Fallback q10jfinal29bt.
+Decoded from the q10jfinal27 log [V source mtk_nanohub.h + log]: 'msg id 3 00040600 0 <wp> 0 <t lo> <t hi>' = SCP_SENSOR_HUB_NOTIFY
+  (action 6) event SCP_DIRECT_PUSH (4) for sensor byte0 (0 = accelerometer, 7 = proximity, msg 14 '00040607'), currWp = the FIFO write
+  pointer (+0x2c = one 44-byte record), then the SCP time stamp. NOT light: the hub never pushed anything for sensor 4. The light enable
+  was acknowledged (nanohub reply data byte 1 = success, msgs 3-9), SET_LCD_INFO got NO reply at all. The SCP firmware does contain the
+  OPLUS TCS3701 ALS driver ("[oplus_alsps] enable als succeed", LB/HB algorithms by brightness) [V strings scp1.img].
+0762: (a) 5 s after step 5 asks the hub CUST GET_SENSOR_INFO for sensors 0,1,3,4,5,7 ("NORD2 SCP: sensor N info: err E name "...""
+  = what Android's sensor_devinfo does) and one CUST GET_RAW_DATA for light; every IPI_SENSOR reply is logged in full ("reply sensor ..");
+  pushes for other sensors are logged ("push notify for sensor 4 ..."). (b) light silent after 30 s: ladder, 20 s apart: disable+enable,
+  rate 0, on-change, flush. (c) kern.n2scp_lightpoll=1 (default): from 25 s, if no light record ever came, GET_RAW_DATA for light once a
+  second; a good reply is handed to iOS as lux ("NORD2 SCP: light first sample lux N (polled raw value)"; 10 failures in a row stop it).
+  [I] the raw value's unit (lux or counts) is unknown until seen. (d) "NORD2 SCP: sensors summary ..." every 30 s (kern.n2scp_summary_s):
+  acc/gyr/mag rates + last iOS-unit values + counts, light lux (fifo/polled), prox, orientation.
+Magnetometer scale (question from the run) [V]: raw unit 10 nT (Android gain 100/uT); raw -5548 = -55.48 uT; kern.n2scp_raw prints
+  ios_muT = thousandths of uT (-55479 = -55.479 uT); iOS gets IOFixed -55.48 uT (SWEET HID: compass -3635937 = -55.48 * 65536). Correct.
+Compass app frozen - findings:
+  [V-disasm locationd] CLMagnetometer reads our compass events correctly (type 21, X/Y/Z floats) and iOS does request it (ReportInterval 25000).
+  [V-disasm locationd] device motion / heading on this model class comes from the always-on processor: the fusion service is chosen by the
+  model capability word (0x1003b5670 bit 4 -> CLSensorFusionService9AxisSPU, bit 3 -> 6AxisSPU, else AP fusion classes), the SPU one parses
+  VENDOR-DEFINED HID events with a binary payload (report types 2 = 9-axis with magnetic field/bias, 3 = 6-axis, 4, 0xFF; quaternion +
+  rotation rate + magnetic field floats; populateDeviceMotion 0x10017b384), and the compass heading report is part of it
+  (CLCompass7::populateMotionType(CMDeviceMotionReport::Compass)). [I, strong] this phone takes the SPU path (it also took the AOP
+  orientation path, bit 6, which works now). So: raw magnetometer reaches locationd, but no fused attitude/heading exists -> frozen dial.
+  Fix = next piece: a 0xFF00/0x10 "device motion" HID service fed by an in-kernel 9-axis fusion (fixed-point quaternion filter on
+  acc+gyro+mag) in Apple's report format (payload layout still to be decoded from 0x1002152fc). Not in 0762.
+  n2sens (below) settles it: "deviceMotion (nil)" with mag samples present = the SPU fusion gap; MG/CL lines show availability/authorization.
+n2sens (ssh tool, sensors-20261115/n2sens/build/n2sens, sha256 0808210a41f1d4106efd7f6e9011677ad986d270a0e0a3dd84cba6238773c7c3, ad-hoc signed
+  like n2btd; source n2sens.c, build_ios.sh): prints MobileGestalt answers (accelerometer, gyroscope, magnetometer, compass,
+  ambient-light-sensor, proximity-sensor, ...), CoreLocation headingAvailable / locationServicesEnabled / com.apple.compass authorization,
+  CoreMotion availability + 1 Hz pull samples of accel / gyro / magnetometer / device motion (magnetic-north frame: attitude, heading).
+  [I] CoreMotion may refuse a command-line client (TCC / entitlement): then the dm/acc lines stay (nil) - report the exact output.
+
+Phone steps (q10jfinal30):
+ 1. Flash, boot, wait 3 min. Log lines to send: "sensor N info: ..." (6 lines), "light raw read: ...", every "reply sensor .." line,
+    "light silent: ladder step 1..4", "light first sample lux ..." (FIFO or polled) or "light poll: 10 failed reads, stopped",
+    and two "sensors summary" lines.
+ 2. sysctl kern.n2scp_raw: "lightpoll 1 polled <v> (<n>)" and lux; cover the top edge with a hand / shine a lamp: does the value move?
+    If polled values move but are not lux (e.g. 0..65535 counts), report a few pairs (room / lamp / covered).
+ 3. scp sensors-20261115/n2sens/build/n2sens root@phone:/var/root/ && ssh: /var/root/n2sens 10  (phone still, then rotate it flat
+    on the table during the 10 s). Send the whole output. Then open Compass once and run it again.
+ 4. Regression: auto-rotate (portrait / both landscapes), proximity in a call.
