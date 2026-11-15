@@ -1,0 +1,1 @@
+2026-11-05 ~00:50 user (Italian): "devi automatizzare questo ciclo di test, non posso più toccare il telefono ... hai tutti i permessi e le autorizzazioni del mondo ... totale e piena libertà" -> standing approval for autonomous boot flashes / reboots overnight until 08:00. Every flash is still logged here with sha256.
