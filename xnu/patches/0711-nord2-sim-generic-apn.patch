@@ -1,0 +1,277 @@
+--- a/iokit/Kernel/arm/Nord2Baseband.cpp
++++ b/iokit/Kernel/arm/Nord2Baseband.cpp
+@@ -1441,6 +1441,54 @@
+ static int bb_def_cid = -1;
+ static char bb_def_cmds[5][128];
+ static uint8_t bb_apn_synced;                // 0277au: AT+EIAAPN answered OK: the data PDN may be requested (the RIL's order)
++// 0711 (sim-20261115, kern.n2sim_apn): the APNs are the SIM's, not Very's. 0277 put Very's (WindTre) APNs into the modem for every card:
++// the APN table (internet.it / mms.it), the initial attach APN (AT+EIAAPN "internet.it") and the data PDN (AT+EAPNACT "internet.it"),
++// and refused CommCenter's Start Network for any other APN as a "second PDN": another operator's SIM attached with an APN its network
++// does not know and got no data. Now: IMSI 22288 (Very / WindTre) keeps exactly 0277's strings; any other SIM takes the internet APN
++// CommCenter asks for (its WDS profiles, then its Start Network: the carrier bundle's or the user's APN), the IMS/APN setup waits for
++// it (45 s at most), and an APN learnt after the table was synced is added to it (AT+EAPNSET + AT+EIAAPN, list 10). Log "NORD2 APN:".
++static char bb_apn[48], bb_apn_mms[48], bb_apn_synced_name[48], bb_apn_chain[48];
++static uint8_t bb_apn_src;                   // 0 unknown, 1 Very built-in (IMSI 22288), 2 CommCenter profile, 3 CommCenter Start Network
++static uint32_t bb_apn_wait_ms, bb_apn_resyncs;
++static const char *bb_apn_cur(void) { return nord2_sim_apn ? bb_apn : "internet.it"; }
++static const char *bb_apn_mms_cur(void) { return nord2_sim_apn ? bb_apn_mms : "mms.it"; }
++static const char *bb_apn_src_name(void)
++{
++  return bb_apn_src == 1 ? "Very built-in, IMSI 22288" : bb_apn_src == 2 ? "CommCenter profile" : bb_apn_src == 3 ? "CommCenter Start Network" : "unknown";
++}
++static bool bb_apn_has(const uint8_t *a, uint32_t n, const char *w)
++{
++  const uint32_t l = (uint32_t)strlen(w);
++  for (uint32_t i = 0; i + l <= n; i++) {
++    uint32_t k = 0;
++    while (k < l && (a[i + k] | 32) == (uint8_t)w[k]) k++;
++    if (k == l) return true;
++  }
++  return false;
++}
++static void bb_apn_resync(void);
++// a CommCenter APN (profile or Start Network) for this SIM; src 2 profile, 3 Start Network (wins over a profile)
++static void bb_apn_learn(const uint8_t *a, uint32_t n, uint8_t src)
++{
++  if (!nord2_sim_apn || !a || !n || n > 30u || bb_apn_src == 1) return;     // <= 30: the AT+EAPNSET parameter line stays < 220
++  for (uint32_t i = 0; i < n; i++)                                    // an APN label (23.003): no quotes/commas for the AT lines
++    if (!((a[i] >= 'a' && a[i] <= 'z') || (a[i] >= 'A' && a[i] <= 'Z') || (a[i] >= '0' && a[i] <= '9') || a[i] == '.' || a[i] == '-' || a[i] == '_'))
++      return;
++  char v[48];
++  memcpy(v, a, n);
++  v[n] = 0;
++  if (bb_apn_has(a, n, "mms")) {
++    if (strcmp(bb_apn_mms, v)) { strlcpy(bb_apn_mms, v, sizeof bb_apn_mms); printf("NORD2 APN: MMS APN \"%s\" (from %s)\n", v, src == 3 ? "CommCenter Start Network" : "CommCenter profile"); }
++    return;
++  }
++  static const char *const aux[] = { "ims", "sos", "xcap", "ia", "emergency", "wap" };
++  for (const char *x : aux) if (strlen(x) == n && bb_apn_has(a, n, x)) return;
++  if (bb_apn[0] && (!strcmp(bb_apn, v) || src < bb_apn_src || (src == 2 && bb_apn_src == 2))) return;
++  strlcpy(bb_apn, v, sizeof bb_apn);
++  bb_apn_src = src;
++  printf("NORD2 APN: internet APN \"%s\" (from %s)%s\n", bb_apn, bb_apn_src_name(), bb_apn_synced ? ": adding it to the modem's APN table" : "");
++  if (bb_apn_synced && strcmp(bb_apn_synced_name, bb_apn)) bb_apn_resync();
++}
+ static void bb_def_done(void *ctx, int final, const char *text, unsigned len)
+ {
+   const uint32_t i = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ctx)) % 5u;
+@@ -1803,9 +1851,10 @@
+   bb_p2.act_cid = 0;
+   bb_p2.idle_ms = bb_now_ms();
+   if (BB_PDN2_EAPNACT) {                                               // 0277bc
+-    static const char *const table[] = { "mms.it", "internet.it", "ims", "sos", "xcap" };   // BB_IMS_APN_SYNC's APNs
+-    bool known = false;
++    const char *const table[] = { bb_apn_mms_cur(), bb_apn_synced_name[0] ? bb_apn_synced_name : bb_apn_cur(), "ims", "sos", "xcap" };
++    bool known = false;                                                // BB_IMS_APN_SYNC's APNs (0711: the SIM's)
+     for (const char *t : table) {
++      if (!t[0]) continue;
+       const unsigned tl = (unsigned)strlen(t);
+       bool eq = strlen(bb_p2.apn) == tl;
+       for (unsigned i = 0; eq && i < tl; i++) eq = (bb_p2.apn[i] | 32) == t[i];
+@@ -1914,7 +1963,7 @@
+   if (bb_profiles[1].used) return;
+   struct nord2_pdn_info p;
+   (void)nord2_pdn_get(&p);
+-  const char *a = p.apn ? p.apn : "internet.it";
++  const char *a = nord2_sim_apn ? bb_apn_cur() : p.apn ? p.apn : "internet.it";   // 0711: "" (network default) until known
+   bb_profile &f = bb_profiles[1];
+   f.used = 1; f.pdp = 0; f.persistent = 1;
+   uint32_t k = 0;
+@@ -1966,6 +2015,7 @@
+     f = bb_profiles[1];
+     bb_profile_store(f, tlvs, tl);
+     f.used = 1;
++    bb_apn_learn(reinterpret_cast<const uint8_t *>(f.apn), f.apn_len, 2);   // 0711
+     b[0] = 0; b[1] = (uint8_t)i;
+     t = nbm_tlv(bb_tlv, room, 0x01, b, 2);
+     if (++bb_profile_creates <= 12) printf("NORD2 BB: WDS create profile -> #%d, APN length %u, PDP type %u\n", i, f.apn_len, f.pdp);
+@@ -1975,10 +2025,12 @@
+     i = bb_profile_index(tlvs, tl);
+     if (i <= 0 || !bb_profiles[i].used) { *error = 0x0029; break; }   // QMI_ERR_INVALID_PROFILE
+     bb_profile_store(bb_profiles[i], tlvs, tl);
++    bb_apn_learn(reinterpret_cast<const uint8_t *>(bb_profiles[i].apn), bb_profiles[i].apn_len, 2);   // 0711
+     break;
+   case 0x00c7:                                                        // 0277q: profile id 0x01 + APN 0x14 + PDP type 0x11 (q10ce: 6867
+     i = bb_profile_index(tlvs, tl);                                   // INVALID_QMI_CMD answers in 88 s); stored, success
+-    if (i > 0) { bb_profiles[i].used = 1; bb_profile_store(bb_profiles[i], tlvs, tl); }
++    if (i > 0) { bb_profiles[i].used = 1; bb_profile_store(bb_profiles[i], tlvs, tl);
++                 bb_apn_learn(reinterpret_cast<const uint8_t *>(bb_profiles[i].apn), bb_profiles[i].apn_len, 2); }   // 0711
+     if (++bb_profile_c7 <= 6) printf("NORD2 BB: WDS 0x00c7 on profile #%d: APN length %u, PDP type %u\n", i, i > 0 ? (unsigned)bb_profiles[i].apn_len : 0u, i > 0 ? (unsigned)bb_profiles[i].pdp : 0u);
+     break;
+   case 0x0029:                                                        // Delete Profile
+@@ -2046,6 +2098,10 @@
+       apn_len = bb_profiles[prof].apn_len;
+     }
+     (void)nord2_pdn_get(&p);
++    if (nord2_sim_apn) {                                              // 0711: the SIM's internet APN, learnt from this call if new
++      if (apn_len) bb_apn_learn(apn, apn_len, 3);
++      p.apn = bb_apn_cur();
++    }
+     char shown[40];
+     uint32_t k = 0;
+     for (; k < apn_len && k + 1 < sizeof shown; k++) shown[k] = apn[k] >= 32 && apn[k] < 127 ? (char)apn[k] : '?';
+@@ -2591,8 +2647,47 @@
+ #define BB_IMS_EAPN_N (sizeof bb_ims_eapn / sizeof bb_ims_eapn[0])
+ #define BB_IMS_EAPN_OK_N (sizeof bb_ims_eapn_ok / sizeof bb_ims_eapn_ok[0])
+ // 0277ai: list 0 setup, 1 checks, 3 AP-side IMS PDN; 0277ak: 2 IMS restart
++// 0711: list 0's Very strings with the SIM's APNs ("AT" = no-op when this SIM has no such APN); list 10 adds a late APN
++static char bb_ims_sub[232];
++static const char *bb_apn_subst(const char *c)                   // nullptr: c unchanged
++{
++  if (!nord2_sim_apn) return nullptr;
++  const char *from = nullptr, *to = nullptr;
++  if (bb_has_substr(c, "\"internet.it\"")) { from = "internet.it"; to = bb_apn_chain; }
++  else if (bb_has_substr(c, "\"mms.it\"")) { from = "mms.it"; to = bb_apn_mms_cur(); }
++  if (!from || !strcmp(from, to)) return nullptr;
++  if (!to[0]) return "AT";
++  const size_t fl = strlen(from), tl = strlen(to);
++  size_t k = 0;
++  for (const char *q = c; *q;) {
++    if (!strncmp(q, from, fl) && q > c && q[-1] == '"' && q[fl] == '"') {
++      if (k + tl + 1 >= sizeof bb_ims_sub) return "AT";
++      memcpy(bb_ims_sub + k, to, tl); k += tl; q += fl;
++    } else {
++      if (k + 2 >= sizeof bb_ims_sub) return "AT";
++      bb_ims_sub[k++] = *q++;
++    }
++  }
++  bb_ims_sub[k] = 0;
++  return k <= 220 ? bb_ims_sub : "AT";
++}
++#define BB_APN_RESYNC_N 5u
++static const char *bb_apn_resync_cmd(uint32_t i)
++{
++  const char *a = bb_apn_chain;
++  switch (i) {
++  case 0: return "AT+EAPNLOCK=1";
++  case 1: snprintf(bb_ims_sub, sizeof bb_ims_sub, "AT+EAPNSET=\"%s\",1,\"\",\"\"", a); return bb_ims_sub;
++  case 2: snprintf(bb_ims_sub, sizeof bb_ims_sub, "AT+EAPNSET=\"%s\",2,\"type=default,supl,hipri,vsim;protocol=IPV4V6;roaming_protocol=IP;"
++                   "authtype=0;carrier_enabled=1;max_conns=0;max_conns_time=0;wait_time=0;bearer_bitmask=4294836223;inactive_timer=0\"", a);
++          return bb_ims_sub;
++  case 3: return "AT+EAPNLOCK=0";
++  default: snprintf(bb_ims_sub, sizeof bb_ims_sub, "AT+EIAAPN=\"%s\",0,\"IPV4V6\",\"IP\",0,\"\",\"\"", a); return bb_ims_sub;
++  }
++}
+ static const char *bb_ims_cmd(uint32_t list, uint32_t i)
+ {
++  if (list == 10) return bb_apn_resync_cmd(i);                            // 0711
+   if (list == 9) return bb_ims_reon[i < 2 ? i : 0];                       // 0277aq
+   if (list == 8) return bb_ims_dereg[i < 2 ? i : 0];                      // 0277aq
+   if (list == 7) return bb_ims_eapn_ok[i < BB_IMS_EAPN_OK_N ? i : 0];     // 0277aq
+@@ -2602,11 +2697,12 @@
+   if (list == 3) return bb_ims_pdn[i < BB_IMS_PDN_N ? i : 0];
+   if (list == 2) return bb_ims_restart[i < BB_IMS_RESTART_N ? i : 0];
+   if (list == 1) return bb_ims_checks[i < BB_IMS_CHK_N ? i : 0];
+-  return bb_ims_cmds[i < BB_IMS_N ? i : 0];
++  const char *c = bb_ims_cmds[i < BB_IMS_N ? i : 0], *sub = bb_apn_subst(c);   // 0711
++  return sub ? sub : c;
+ }
+ static uint32_t bb_ims_list_n(uint32_t list)
+ {
+-  return list == 9 || list == 8 ? 2u : list == 7 ? BB_IMS_EAPN_OK_N : list == 6 ? BB_IMS_EAPN_N : list == 5 ? BB_IMS_CID1_N : list == 4 ? BB_IMS_CYCLE_N : list == 3 ? BB_IMS_PDN_N : list == 2 ? BB_IMS_RESTART_N : list == 1 ? BB_IMS_CHK_N : BB_IMS_N;
++  return list == 10 ? BB_APN_RESYNC_N : list == 9 || list == 8 ? 2u : list == 7 ? BB_IMS_EAPN_OK_N : list == 6 ? BB_IMS_EAPN_N : list == 5 ? BB_IMS_CID1_N : list == 4 ? BB_IMS_CYCLE_N : list == 3 ? BB_IMS_PDN_N : list == 2 ? BB_IMS_RESTART_N : list == 1 ? BB_IMS_CHK_N : BB_IMS_N;
+ }
+ // 0277ab: one command at a time (the AT queue holds 32: the list does not fit at once); ctx = list << 8 | index
+ static void bb_ims_done(void *ctx, int final, const char *text, unsigned len);
+@@ -2615,6 +2711,17 @@
+   const char *c = bb_ims_cmd(list, i);
+   return nord2_at_query(c, bb_ims_done, reinterpret_cast<void *>(static_cast<uintptr_t>(list << 8 | i)));
+ }
++// 0711: a late internet APN into the synced table (bb_lock held)
++static void bb_apn_resync(void)
++{
++  if (!bb_apn[0] || !bb_apn_synced) return;
++  bb_apn_synced = 0;
++  strlcpy(bb_apn_chain, bb_apn, sizeof bb_apn_chain);
++  bb_apn_resyncs++;
++  const int e = bb_ims_send(10, 0);
++  printf("NORD2 APN: APN table update for \"%s\" (#%u) %s\n", bb_apn_chain, bb_apn_resyncs, e ? "NOT queued" : "queued");
++  if (e) bb_apn_synced = 1;
++}
+ static bool bb_has_substr(const char *h, const char *n)
+ {
+   const size_t ln = strlen(n);
+@@ -2656,13 +2763,16 @@
+   if (list == 2 && idx + 1 >= BB_IMS_RESTART_N && BB_IMS_AP_PDN && !bb_ims_registered && bb_ims_send(3, 0))
+     printf("NORD2 BB: IMS: the AP-side IMS PDN could not be queued\n");
+   // 0277au: AT+EIAAPN answered: the APN table is in place; the data PDN now, the RIL's way (AT+EDRETRY + AT+EAPNACT default)
+-  if (list == 0 && idx + 1 >= BB_IMS_N) {                           // 0277aw: after the whole setup (2nd table sync, EDALLOW)
+-    bb_apn_synced = 1;
++  if ((list == 0 && idx + 1 >= BB_IMS_N) || (list == 10 && idx + 1 >= BB_APN_RESYNC_N)) {   // 0277aw: after the whole setup (2nd
++    bb_apn_synced = 1;                                                                     // table sync, EDALLOW); 0711: or list 10
++    strlcpy(bb_apn_synced_name, bb_apn_chain, sizeof bb_apn_synced_name);
+     printf("NORD2 BB: IMS setup done (APN table twice, AT+EIAAPN, data allowed): data PDN request allowed now\n");
++    if (nord2_sim_apn) printf("NORD2 APN: modem APN table synced with internet APN \"%s\" (%s)\n", bb_apn_synced_name, list == 10 ? "late APN" : "setup");
+     if (BB_DATA_EAPNACT && bb_lock) {
+       IOLockLock(bb_lock);
+       bb_pdn_up_ms = 0;
+-      bb_pdn_bring_up("internet.it");
++      if (nord2_sim_apn && strcmp(bb_apn_synced_name, bb_apn_cur())) bb_apn_resync();      // 0711: the APN changed meanwhile
++      else bb_pdn_bring_up(bb_apn_cur());
+       IOLockUnlock(bb_lock);
+     }
+   }
+@@ -2683,7 +2793,13 @@
+   if ((bb_flags & (NBB_NO_IMS | NBB_NO_AT | NBB_NO_VOICE)) || bb_st.sim != NBM_SIM_READY || (nord2_modem_state() & NORD2_MODEM_DEAD))
+     return;
+   const uint32_t now = bb_now_ms();
++  if (!bb_ims_state && nord2_sim_apn) {                               // 0711: the APN table needs the SIM's APN
++    if (!bb_st.imsi[0] && bb_identity_tries < 6) return;              // the IMSI first (Very or not)
++    if (!bb_apn_src && !(bb_apn_wait_ms && now - bb_apn_wait_ms >= 45000u)) return;
++    if (!bb_apn_src) printf("NORD2 APN: no APN from CommCenter 45 s after the SIM was ready: IMS/APN setup without an internet APN\n");
++  }
+   if (!bb_ims_state) {
++    strlcpy(bb_apn_chain, bb_apn_cur(), sizeof bb_apn_chain);         // 0711: the APN this table sync carries
+     if (bb_ims_send(0, 0)) return;                                    // queue full: again at the next snapshot
+     bb_ims_state = 1;
+     bb_ims_t0 = now ? now : 1u;
+@@ -2850,7 +2966,7 @@
+       }
+       if (BB_DATA_EAPNACT && !strncmp(line, "+EIWLPL:", 8) && bb_strstr(line, "\"setup\",\"default\",1") && bb_lock) {
+         IOLockLock(bb_lock);                                                               // 0277at: the modem asks for it
+-        bb_pdn_bring_up("internet.it");
++        bb_pdn_bring_up(bb_apn_cur());                                                     // 0711
+         IOLockUnlock(bb_lock);
+       }
+       return !strncmp(line, "+CIREGU", 7) || !strncmp(line, "+CIREP", 6) || !strncmp(line, "+EIMS", 5) || !strncmp(line, "+EIMC", 5) ||
+@@ -3977,12 +4093,18 @@
+ // ICCID and GIDs for the whole boot (they are read once), so a second card was announced with the first one's identity in the
+ // activation indication, and its SIM-bound setup (IMS, APN table, SMS/call settings) was never redone. Forget all of it; the next
+ // ready card is read again (bb_identity_tries reset).
+-static void bb_sim_forget_more(void)                             // 0711 fills it in
+-{
+-}
+-static const char *bb_report_more(void)                          // 0711/0712 fill it in
++static void bb_sim_forget_more(void)                             // 0711: the old card's APNs
+ {
+-  return "";
++  bb_apn[0] = bb_apn_mms[0] = bb_apn_synced_name[0] = bb_apn_chain[0] = 0;
++  bb_apn_src = 0;
++  bb_apn_wait_ms = 0;
++}
++static char bb_report_buf[200];
++static const char *bb_report_more(void)                          // 0711 (0712 adds NR)
++{
++  snprintf(bb_report_buf, sizeof bb_report_buf, "; APN \"%s\" (%s), MMS \"%s\", synced \"%s\", updates %u (n2sim_apn %u)", bb_apn_cur(),
++           nord2_sim_apn ? bb_apn_src_name() : "0277 fixed", bb_apn_mms_cur(), bb_apn_synced_name, bb_apn_resyncs, nord2_sim_apn);
++  return bb_report_buf;
+ }
+ static void bb_sim_forget(const char *why)
+ {
+@@ -4120,6 +4242,16 @@
+     bb_refresh_again = 1;
+   bb_hold_check();                                                // 0277m: the virtual boot waits for a settled SIM
+   bb_cs_setup();                                                  // 0277r: SMS and call AT settings once the SIM is ready
++  if (nord2_sim_apn && !bb_apn_src && bb_st.sim == NBM_SIM_READY && bb_st.imsi[0]) {   // 0711: whose SIM is it
++    if (!memcmp(bb_st.imsi, "22288", 5)) {
++      strlcpy(bb_apn, "internet.it", sizeof bb_apn); strlcpy(bb_apn_mms, "mms.it", sizeof bb_apn_mms);
++      bb_apn_src = 1;
++      printf("NORD2 APN: SIM of PLMN 22288 (Very/WindTre): internet.it / mms.it as before\n");
++    } else if (!bb_apn_wait_ms) {
++      bb_apn_wait_ms = bb_now_ms() ? bb_now_ms() : 1u;
++      printf("NORD2 APN: SIM of PLMN %.5s: waiting for CommCenter's APN (IMS/APN setup deferred, 45 s at most)\n", bb_st.imsi);
++    }
++  }
+   bb_ims_setup();                                                 // 0277aa: VoLTE step 1
+   if (bb_refresh_again) bb_refresh_locked();
+ }

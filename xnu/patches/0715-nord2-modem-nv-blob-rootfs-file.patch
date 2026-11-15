@@ -1,0 +1,127 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -1935,6 +1935,20 @@
+ #define SWEET_FS_DISK_DEV "/dev/rufsroot0"
+ #define SWEET_FS_DISK_OFF (64ULL << 30)
+ static vnode_t sweet_fs_dvp = NULLVP;              /* 0270: opened lazily on the first disk-blob need, kept (usecount only) */
++/*
++ * 0715 (sim-20261115): the raw copy at userdata+64 GiB is no longer safe: since the iOS root volume was grown to 107 GiB (storage-20261114,
++ * 2026-11-14) that region is FREE SPACE of the HFS volume, and iOS reused it (q10jfinal18bt3 boot bt18c: "fs disk blob: no valid
++ * header (377f0682)", the modem never reached READY, no AT, no +CGMR: Settings 'Modem Firmware' empty, no IMEI). The blob is now
++ * first looked for as a regular file of the root volume, SWEET_FS_FILE (HFS-owned, never overwritten by allocation; same N2NVDSK1
++ * format, offsets from 0); if it is absent or its header/table is invalid the raw copy is used exactly as before. kern.n2nv_src
++ * (ro): 0 none yet / unusable, 1 raw userdata+64 GiB, 2 rootfs file; +0x100 when the file was present but invalid.
++ */
++#define SWEET_FS_FILE "/private/var/db/nord2-modem/n2nvdisk.bin"
++static uint64_t sweet_fs_disk_off = SWEET_FS_DISK_OFF;
++static int sweet_fs_src;                           /* 0 none, 1 raw device, 2 rootfs file */
++static int sweet_fs_file_tried, sweet_fs_file_bad;
++unsigned nord2_nv_src;
++static void sweet_fs_dev_close(void);
+ static unsigned sweet_fs_dev_fails;
+ 
+ /*
+@@ -1957,6 +1971,23 @@
+ 	if (sweet_fs_dvp != NULLVP) {
+ 		return 0;
+ 	}
++	if (!sweet_fs_file_tried) {                        /* 0715: the root volume's file first */
++		vnode_t fvp = NULLVP;
++		err = vnode_open(SWEET_FS_FILE, FREAD, 0, 0, &fvp, ctx);
++		if (err == 0) {
++			vnode_put(fvp);
++			sweet_fs_dvp = fvp;
++			sweet_fs_disk_off = 0;
++			sweet_fs_src = 2;
++			sweet_fs_file_tried = 1;
++			printf("NORD2 MODEM: fs disk blob source: rootfs file %s\n", SWEET_FS_FILE);
++			return 0;
++		}
++		if (err != ENOENT) {                           /* ENOENT may be "root not mounted yet": decided below (0715) */
++			sweet_fs_file_tried = 1;
++			printf("NORD2 MODEM: fs disk blob: rootfs file %s not usable (%d), raw userdata+64GiB\n", SWEET_FS_FILE, err);
++		}
++	}
+ 	if (sweet_fs_dev_fails >= 3) {
+ 		return -1;
+ 	}
+@@ -1967,6 +1998,22 @@
+ 			vnode_put(vp);                      /* drop the iocount, keep the open usecount */
+ 			sweet_fs_dvp = vp;
+ 			sweet_fs_dev_fails = 0;
++			sweet_fs_disk_off = SWEET_FS_DISK_OFF;   /* 0715 */
++			sweet_fs_src = 1;
++			if (!sweet_fs_file_tried) {             /* /dev is there, so the root is mounted now: the file once more */
++				vnode_t fvp = NULLVP;
++				sweet_fs_file_tried = 1;
++				if (vnode_open(SWEET_FS_FILE, FREAD, 0, 0, &fvp, ctx) == 0) {
++					vnode_put(fvp);
++					sweet_fs_dev_close();
++					sweet_fs_dvp = fvp;
++					sweet_fs_disk_off = 0;
++					sweet_fs_src = 2;
++					printf("NORD2 MODEM: fs disk blob source: rootfs file %s\n", SWEET_FS_FILE);
++					return 0;
++				}
++				printf("NORD2 MODEM: fs disk blob: no rootfs file %s, raw userdata+64GiB\n", SWEET_FS_FILE);
++			}
+ 			return 0;
+ 		}
+ 		if (err != ENOENT && err != ENXIO) {
+@@ -1991,7 +2038,7 @@
+ 	if (vnode_getwithref(sweet_fs_dvp)) {
+ 		return -1;
+ 	}
+-	err = vn_rdwr(UIO_READ, sweet_fs_dvp, (caddr_t)buf, (int)len, (off_t)(SWEET_FS_DISK_OFF + off), UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
++	err = vn_rdwr(UIO_READ, sweet_fs_dvp, (caddr_t)buf, (int)len, (off_t)(sweet_fs_disk_off + off), UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
+ 	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+ 	vnode_put(sweet_fs_dvp);
+ 	return (err || resid) ? -1 : 0;
+@@ -2362,9 +2409,30 @@
+ 	return ~c;
+ }
+ 
++static int sweet_fs_disk_init_once(void);
++/* 0715: the rootfs file first; an invalid file falls back to the raw copy once */
+ static int
+ sweet_fs_disk_init(void)
+ {
++	int rc = sweet_fs_disk_init_once();
++
++	if (rc && sweet_fs_dstate < 0 && sweet_fs_src == 2 && !sweet_fs_file_bad) {
++		sweet_fs_file_bad = 1;
++		printf("NORD2 MODEM: fs disk blob: rootfs file unusable, falling back to raw userdata+64GiB\n");
++		sweet_fs_dev_close();
++		sweet_fs_src = 0;
++		sweet_fs_dstate = 0;
++		if (sweet_fs_dev_open() == 0) {
++			rc = sweet_fs_disk_init_once();
++		}
++	}
++	nord2_nv_src = (rc == 0 ? (unsigned)sweet_fs_src : 0U) | (sweet_fs_file_bad ? 0x100U : 0U);
++	return rc;
++}
++
++static int
++sweet_fs_disk_init_once(void)
++{
+ 	uint8_t *h;
+ 	uint32_t count, tbytes, hcrc;
+ 
+@@ -2405,7 +2473,7 @@
+ 	}
+ 	sweet_fs_dcount = count;
+ 	sweet_fs_dstate = 1;
+-	printf("NORD2 MODEM: fs disk blob: %u files\n", count);
++	printf("NORD2 MODEM: fs disk blob: %u files (source %s)\n", count, sweet_fs_src == 2 ? "rootfs file" : "raw userdata+64GiB");
+ out:
+ 	sweet_fs_free(h, 4096);
+ 	return sweet_fs_dstate > 0 ? 0 : -1;
+@@ -5975,6 +6043,7 @@
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, n2sim_helper, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_n2sim_helper, "IU",
+     "0713: userland helper step codes, printed");
++SYSCTL_UINT(_kern, OID_AUTO, n2nv_src, CTLFLAG_RD | CTLFLAG_LOCKED, &nord2_nv_src, 0, "0715: modem NVRAM blob source: 1 raw userdata+64GiB, 2 rootfs file, +0x100 file invalid");
+ SYSCTL_UINT(_kern, OID_AUTO, n2nr_ui, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_nr_ui, 0, "0714: 1 = NR5G next to LTE in the NAS serving system while the NR leg is up (experiment)");
+ SYSCTL_STRING(_net_nord2, OID_AUTO, pdp, CTLFLAG_RD | CTLFLAG_LOCKED, n2net_sysctl_pdp, sizeof(n2net_sysctl_pdp), "PDN of cid 1");
+ 

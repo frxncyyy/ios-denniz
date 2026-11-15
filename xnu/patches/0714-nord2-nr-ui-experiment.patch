@@ -1,0 +1,73 @@
+--- a/iokit/Kernel/arm/Nord2Baseband.cpp
++++ b/iokit/Kernel/arm/Nord2Baseband.cpp
+@@ -4219,12 +4219,18 @@
+   char iccid[24];
+   bb_snapshots++;
+   bb_sim_track();                                                 // 0710
++  {                                                               // 0714 (experiment, kern.n2nr_ui, default 0)
++    const uint8_t nr = nord2_nr_ui && nord2_nr && (nord2_nr_state & 0x800000ffu) > 0x80000000u ? 1u : 0u;
++    if (nr != bb_st.nr_ui) printf("NORD2 NR: serving system %s NR5G (kern.n2nr_ui %u, NR state 0x%08x)\n", nr ? "now lists" : "no longer lists", nord2_nr_ui, nord2_nr_state);
++    bb_st.nr_ui = nr;
++  }
+   reg = nbm_reg(&bb_st, &radio, &roaming);
+   uint32_t nas = 2166136261u, uim = 2166136261u;
+   nas = bb_hash(nas, &reg, 1); nas = bb_hash(nas, &radio, 1); nas = bb_hash(nas, &roaming, sizeof roaming);
+   nas = bb_hash(nas, &bb_st.cs_stat, sizeof bb_st.cs_stat); nas = bb_hash(nas, &bb_st.eps_stat, sizeof bb_st.eps_stat);
+   nas = bb_hash(nas, bb_st.plmn, sizeof bb_st.plmn); nas = bb_hash(nas, bb_st.oper, sizeof bb_st.oper);
+   nas = bb_hash(nas, &bb_st.tac, 4); nas = bb_hash(nas, &bb_st.eci, 4);
++  if (bb_st.nr_ui) nas = bb_hash(nas, &bb_st.nr_ui, 1);          // 0714: a change re-sends the serving system indication
+   uim = bb_hash(uim, &bb_st.sim, sizeof bb_st.sim); uim = bb_hash(uim, &bb_st.pin_lock, sizeof bb_st.pin_lock);
+   if (bb_st.fix) {                                                // 0710: what CommCenter is shown (debounced lock, retries)
+     const int shown = nbm_sim_shown(&bb_st);
+--- a/iokit/Kernel/arm/nord2_bb_qmi.h
++++ b/iokit/Kernel/arm/nord2_bb_qmi.h
+@@ -121,6 +121,7 @@
+     uint8_t pin_seen;            /* snapshots in a row whose +CPIN said SIM PIN / SIM PUK */
+     uint8_t pin1_left, puk1_left;   /* AT+EPINC? retries + 1 (0 unknown) */
+     char cpin_tok[16];           /* the last +CPIN token / +CME ERROR text, for the log (never an identity) */
++    uint8_t nr_ui;               /* 0714 (experiment): NR5G listed next to LTE in the serving system; 0 = off */
+ };
+ 
+ static inline void nbm_init(struct nbm_state *s)
+@@ -502,6 +503,10 @@
+     b[3] = reg == 1 ? 2 : 0;                                                    /* selected network: 3GPP */
+     b[4] = radio ? 1 : 0;
+     b[5] = radio;
++    if (s->nr_ui && radio == 8) {                                               /* 0714: EN-DC with the NR leg up: LTE + NR5G (0x0C) */
++        b[4] = 2; b[6] = 12;
++        w += nbm_tlv(t + w, room - w, 0x01, b, 7u);
++    } else
+     w += nbm_tlv(t + w, room - w, 0x01, b, radio ? 6u : 5u);
+     if (reg != 1) return w;
+     w += nbm_tlv_u8(t + w, room - w, 0x10, roaming ? 0 : 1);                  /* QmiNasRoamingIndicatorStatus: 0 on, 1 off */
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -3388,6 +3388,7 @@
+ /* 0710/0711/0712 (sim-20261115): see nord2_bb_kpi.h; the SYSCTL lines are next to the net.nord2 node below */
+ unsigned nord2_sim_fix = 15, nord2_sim_state, nord2_sim_apn = 1, nord2_nr = 1, nord2_nr_state;
+ unsigned nord2_bb_link, nord2_sim_helper;           /* 0713 */
++unsigned nord2_nr_ui;                               /* 0714, default 0 (experiment) */
+ #define NORD2_ATQ_N    32
+ #define NORD2_ATQ_CMD  224                       /* 0277aa: was 64 (AT+EAPNSET="ims",2,"type=ims;..." is ~190) */
+ #define NORD2_ATQ_RESP 1024
+@@ -5974,6 +5975,7 @@
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, n2sim_helper, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_n2sim_helper, "IU",
+     "0713: userland helper step codes, printed");
++SYSCTL_UINT(_kern, OID_AUTO, n2nr_ui, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_nr_ui, 0, "0714: 1 = NR5G next to LTE in the NAS serving system while the NR leg is up (experiment)");
+ SYSCTL_STRING(_net_nord2, OID_AUTO, pdp, CTLFLAG_RD | CTLFLAG_LOCKED, n2net_sysctl_pdp, sizeof(n2net_sysctl_pdp), "PDN of cid 1");
+ 
+ /* one DL packet from the DPMAIF (called by n2d_rx_poll in the modem thread) */
+--- a/bsd/kern/nord2_bb_kpi.h
++++ b/bsd/kern/nord2_bb_kpi.h
+@@ -91,6 +91,10 @@
+  *                   AppleBaseband power-ons (bits 24-31): the helper checks the baseband link came back after a CommCenter restart
+  *  kern.n2sim_helper (rw) the helper writes its step codes here; the kernel prints "NORD2 SIM: helper step 0x..." (USB log) */
+ extern unsigned nord2_bb_link, nord2_sim_helper;
++/* 0714 (sim-20261115) EXPERIMENT, default OFF: kern.n2nr_ui = 1 lists NR5G (QMI radio interface 0x0C) next to LTE in the NAS serving
++ * system while the modem reports its NR leg up (+ENRCABAND state 1, 0712), to see whether CommCenter shows 5G at all under the Mav17
++ * identity (expected: no -- its radio personality has no NR capability). 0 = 0712 behaviour. */
++extern unsigned nord2_nr_ui;
+ 
+ /*
+  * 0277l: cellular data owned by CommCenter. sweet_amfi.c brings up the PDN of cid 1 itself (AT+CGDCONT/CGACT on its APN, +EIF,

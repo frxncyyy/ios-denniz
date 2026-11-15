@@ -1,0 +1,429 @@
+--- a/iokit/Kernel/arm/Nord2Baseband.cpp
++++ b/iokit/Kernel/arm/Nord2Baseband.cpp
+@@ -399,6 +399,18 @@
+ static uint32_t bb_q_inflight, bb_q_epoch, bb_q_errors, bb_snapshots, bb_refresh_again, bb_identity_tries;
+ static uint32_t bb_nas_sig, bb_uim_sig, bb_log_sig, bb_sig_valid;
+ static uint8_t bb_had_iccid, bb_had_imsi;
++// 0710 (sim-20261115): SIM state / PIN fixes, switched by kern.n2sim_fix (nord2_bb_kpi.h); log lines "NORD2 SIM: ..."
++static int bb_sim_prev_raw = NBM_SIM_UNKNOWN, bb_sim_prev_shown = -1;
++static volatile uint8_t bb_sim_removed_urc;      // +ESIMS: 0 (MediaTek: card removed) seen by bb_urc, handled at the next snapshot
++static uint32_t bb_sim_swaps, bb_epinc_ms;
++#define BB_CTX_PIN 0x40000000u                   // bb_at_done: a UIM PIN operation (phase 1 the command, 2 AT+EPINC?), 0xff a lone AT+EPINC?
++struct bb_pin_op { uint8_t used, channel, cid, phase, pin_id; uint16_t txn, message; uint32_t gen, error; };
++static bb_pin_op bb_pinq;                        // one PIN operation at a time
++static uint32_t bb_pin_gen, bb_pin_ops, bb_pin_fail;
++#define BB_QMI_ERR_INCORRECT_PIN 0x000cu
++#define BB_QMI_ERR_PIN_BLOCKED 0x0023u
++#define BB_QMI_ERR_PIN_PERM_BLOCKED 0x0024u
++#define BB_QMI_ERR_DEVICE_IN_USE 0x0017u
+ static bb_uim_read bb_uimq[BB_UIM_PENDING];
+ static uint32_t bb_uim_gen, bb_uim_reads, bb_uim_fail;
+ // activation (BSP 0xb00c)
+@@ -1065,6 +1077,145 @@
+   }
+ }
+ 
++// 0710: UIM PIN operations (libqmi qmi-service-uim.json: 0x0025 Set PIN Protection {pin id, enabled, pin}, 0x0026 Verify PIN {pin id,
++// pin}, 0x0027 Unblock PIN {pin id, puk, new pin}, 0x0028 Change PIN {pin id, old, new}, all in TLV 0x02 with u8-length strings;
++// answer TLV 0x10 retries left {verify, unblock}). 0277 answered none of them (INVALID_QMI_CMD): a card that really has its PIN on
++// could never be unlocked from iOS. PIN1 through AT+CPIN / AT+CPWD="SC" / AT+CLCK="SC"; PIN2 is not offered (NOT_SUPPORTED). The
++// digits live only in this function's stack and the AT queue entry; the AT log shows these commands up to their '=' (sweet_amfi.c).
++static bool bb_has_substr(const char *h, const char *n);         // (IMS section below)
++static bool bb_pin_take(const uint8_t *v, uint32_t len, uint32_t *at, char *out)    // out: 9 bytes
++{
++  if (*at >= len) return false;
++  const uint32_t n = v[*at];
++  if (n < 4u || n > 8u || *at + 1u + n > len) return false;
++  for (uint32_t i = 0; i < n; i++) {
++    if (v[*at + 1u + i] < '0' || v[*at + 1u + i] > '9') return false;
++    out[i] = (char)v[*at + 1u + i];
++  }
++  out[n] = 0;
++  *at += 1u + n;
++  return true;
++}
++static void bb_wipe(void *p, uint32_t n)
++{
++  volatile uint8_t *b = static_cast<volatile uint8_t *>(p);
++  while (n--) *b++ = 0;
++}
++static const char *bb_pin_op_name(uint32_t message)
++{
++  return message == 0x0025u ? "Set PIN Protection" : message == 0x0026u ? "Verify PIN" : message == 0x0027u ? "Unblock PIN" : "Change PIN";
++}
++static int bb_uim_pin_start(uint32_t qmux, uint32_t cid, const uint8_t *sdu, uint32_t n, uint32_t *error)
++{
++  const uint32_t message = nbq_rd16(sdu + 3), tl = n >= 7u ? nbq_rd16(sdu + 5) : 0u;
++  uint32_t len = 0, at = 1;
++  char a[9], b[9], cmd[64];
++  uint8_t id = 0, en = 0;
++  const uint8_t *v = nullptr;
++  *error = 0;
++  a[0] = b[0] = 0;
++  if (n < 7u || 7u + tl > n) *error = NBQ_ERR_MALFORMED_MESSAGE;
++  else if (!(v = nbq_tlv(sdu + 7, tl, 0x02, &len)) || len < 2u) *error = NBQ_ERR_MISSING_ARGUMENT;
++  if (!*error) {
++    id = v[0];
++    if (message == 0x0025u) { en = v[1]; at = 2; }
++    if (!bb_pin_take(v, len, &at, a) || ((message == 0x0027u || message == 0x0028u) && !bb_pin_take(v, len, &at, b)))
++      *error = NBQ_ERR_INVALID_ARG;
++  }
++  if (!*error && id != 1u) *error = NBQ_ERR_NOT_SUPPORTED;       // PIN2 / UPIN: not offered through this modem's AT
++  if (!*error && bb_pinq.used) *error = BB_QMI_ERR_DEVICE_IN_USE;
++  if (!*error) {
++    if (message == 0x0026u) snprintf(cmd, sizeof cmd, "AT+CPIN=\"%s\"", a);
++    else if (message == 0x0027u) snprintf(cmd, sizeof cmd, "AT+CPIN=\"%s\",\"%s\"", a, b);
++    else if (message == 0x0028u) snprintf(cmd, sizeof cmd, "AT+CPWD=\"SC\",\"%s\",\"%s\"", a, b);
++    else snprintf(cmd, sizeof cmd, "AT+CLCK=\"SC\",%u,\"%s\"", en ? 1u : 0u, a);
++    bb_pin_gen = (bb_pin_gen + 1u) & 0xffffu;
++    bb_pinq = { 1, (uint8_t)qmux, (uint8_t)cid, 1, id, nbq_rd16(sdu + 1), (uint16_t)message, bb_pin_gen, 0 };
++    const int e = nord2_at_query(cmd, bb_at_done, reinterpret_cast<void *>(static_cast<uintptr_t>(BB_CTX_PIN | bb_pin_gen << 8 | 1u)));
++    bb_wipe(cmd, sizeof cmd);
++    if (e) { bb_pinq.used = 0; *error = NBQ_ERR_DEVICE_NOT_READY; }
++  }
++  bb_wipe(a, sizeof a); bb_wipe(b, sizeof b);
++  if (*error) {
++    bb_reply(qmux, NBQ_SVC_UIM, cid, sdu, *error, nullptr, 0);
++    bb_pin_fail++;
++    printf("NORD2 SIM: UIM %s (PIN%u) refused, err 0x%x\n", bb_pin_op_name(message), id, *error);
++    return BB_ANSWERED;
++  }
++  bb_pin_ops++;
++  printf("NORD2 SIM: UIM %s (PIN%u%s) -> AT (digits not logged)\n", bb_pin_op_name(message), id,
++         message == 0x0025u ? (en ? ", on" : ", off") : "");
++  return BB_DEFERRED;
++}
++// "+EPINC: <pin1>, <pin2>, <puk1>, <puk2>" (MediaTek): retries, kept + 1 in bb_st (0 unknown)
++static void bb_epinc_parse(const char *text, unsigned len)
++{
++  for (unsigned i = 0; i + 7u <= len; i++) {
++    if (memcmp(text + i, "+EPINC:", 7)) continue;
++    long f[4] = { -1, -1, -1, -1 };
++    unsigned k = 0, j = i + 7u;
++    while (j < len && k < 4u && text[j] != '\n') {
++      while (j < len && (text[j] == ' ' || text[j] == ',')) j++;
++      if (j >= len || text[j] < '0' || text[j] > '9') break;
++      long x = 0;
++      while (j < len && text[j] >= '0' && text[j] <= '9') x = x * 10 + (text[j++] - '0');
++      f[k++] = x;
++    }
++    if (k >= 3u && f[0] >= 0 && f[0] < 255 && f[2] >= 0 && f[2] < 255) {
++      bb_st.pin1_left = (uint8_t)(f[0] + 1); bb_st.puk1_left = (uint8_t)(f[2] + 1);
++    }
++    return;
++  }
++}
++static void bb_pin_done(uint32_t ctx, int final, const char *text, unsigned len)
++{
++  const uint32_t phase = ctx & 0xffu, gen = ctx >> 8 & 0xffffu;
++  if (phase == 0xffu) { if (final == NORD2_AT_FINAL_OK) bb_epinc_parse(text, len); return; }
++  if (!bb_pinq.used || bb_pinq.gen != gen) return;
++  bb_pin_op &o = bb_pinq;
++  if (phase == 1u) {
++    uint32_t err = 0;
++    if (final == NORD2_AT_FINAL_TIMEOUT) err = NBQ_ERR_INTERNAL;
++    else if (final != NORD2_AT_FINAL_OK) {
++      unsigned e = len;
++      while (e && (text[e - 1] == '\n' || text[e - 1] == '\r')) e--;
++      unsigned s0 = e;
++      while (s0 && text[s0 - 1] != '\n') s0--;
++      char last[64];
++      unsigned m = e - s0 < sizeof last - 1 ? e - s0 : (unsigned)sizeof last - 1;
++      for (unsigned i = 0; i < m; i++) last[i] = text[s0 + i];
++      last[m] = 0;
++      err = bb_has_substr(last, "PUK required") || bb_has_substr(last, ": 12") ? BB_QMI_ERR_PIN_BLOCKED :
++            bb_has_substr(last, "blocked") ? BB_QMI_ERR_PIN_PERM_BLOCKED :
++            bb_has_substr(last, "incorrect") || bb_has_substr(last, ": 16") ? BB_QMI_ERR_INCORRECT_PIN : NBQ_ERR_INTERNAL;
++    }
++    o.error = err;
++    o.phase = 2;
++    if (!nord2_at_query("AT+EPINC?", bb_at_done, reinterpret_cast<void *>(static_cast<uintptr_t>(BB_CTX_PIN | o.gen << 8 | 2u)))) return;
++  } else if (final == NORD2_AT_FINAL_OK) {
++    bb_epinc_parse(text, len);
++  }
++  o.used = 0;
++  bb_epinc_ms = bb_now_ms();
++  if (nbq_client_find(&bb_qmux, o.channel, NBQ_SVC_UIM, o.cid) >= 0) {
++    uint8_t sdu[7], r[2];
++    uint32_t t = 0;
++    sdu[0] = 0; nbq_wr16(sdu + 1, o.txn); nbq_wr16(sdu + 3, o.message); nbq_wr16(sdu + 5, 0);
++    if (bb_st.pin1_left) {
++      const bool unblock = o.message == 0x0027u;
++      r[0] = (uint8_t)(bb_st.pin1_left - 1u);
++      r[1] = bb_st.puk1_left ? (uint8_t)(bb_st.puk1_left - 1u) : 10u;
++      if (unblock && !o.error && !r[0]) r[0] = 3;
++      t = nbm_tlv(bb_tlv, sizeof bb_tlv, 0x10, r, 2);
++    }
++    bb_reply(o.channel, NBQ_SVC_UIM, o.cid, sdu, o.error, bb_tlv, t);
++  }
++  printf("NORD2 SIM: UIM %s (PIN%u) -> %s (err 0x%x), retries PIN1 %d PUK1 %d\n", bb_pin_op_name(o.message), o.pin_id,
++         o.error ? "failed" : "OK", o.error, bb_st.pin1_left ? (int)bb_st.pin1_left - 1 : -1, bb_st.puk1_left ? (int)bb_st.puk1_left - 1 : -1);
++  if (o.error) bb_pin_fail++;
++  bb_refresh_soon(300);                                           // the card status indication with the new state
++}
++
+ static int bb_uim(uint32_t qmux, uint32_t cid, const uint8_t *sdu, uint32_t n, uint32_t *error)
+ {
+   const uint32_t message = nbq_rd16(sdu + 3), room = sizeof bb_tlv;
+@@ -1085,6 +1236,9 @@
+   case NBM_UIM_READ_RECORD:
+   case NBM_UIM_GET_FILE_ATTRIBUTES:    // 0277f: AT+CRSM GET RESPONSE
+     return bb_uim_read_start(qmux, cid, sdu, n, error);
++  case 0x0025u: case 0x0026u: case 0x0027u: case 0x0028u:   // 0710: Set PIN Protection, Verify, Unblock, Change PIN
++    if (nord2_sim_fix & 4u) return bb_uim_pin_start(qmux, cid, sdu, n, error);
++    return BB_UNHANDLED;
+   default:
+     return BB_UNHANDLED;
+   }
+@@ -3819,12 +3973,71 @@
+   }
+ }
+ 
++// 0710: the card went away (hot swap; +CPIN "SIM not inserted" after a card, or MediaTek's +ESIMS: 0): 0277 kept the old card's IMSI,
++// ICCID and GIDs for the whole boot (they are read once), so a second card was announced with the first one's identity in the
++// activation indication, and its SIM-bound setup (IMS, APN table, SMS/call settings) was never redone. Forget all of it; the next
++// ready card is read again (bb_identity_tries reset).
++static void bb_sim_forget_more(void)                             // 0711 fills it in
++{
++}
++static const char *bb_report_more(void)                          // 0711/0712 fill it in
++{
++  return "";
++}
++static void bb_sim_forget(const char *why)
++{
++  const bool had = bb_st.imsi[0] || bb_st.have_iccid;
++  bb_wipe(bb_st.imsi, sizeof bb_st.imsi);
++  bb_wipe(bb_st.iccid_ef, sizeof bb_st.iccid_ef);
++  bb_st.have_iccid = 0;
++  bb_wipe(bb_st.gid, sizeof bb_st.gid);
++  bb_st.gid_len[0] = bb_st.gid_len[1] = 0; bb_st.gid_known[0] = bb_st.gid_known[1] = 0; bb_st.gid_size[0] = bb_st.gid_size[1] = 0;
++  bb_st.pin_lock = -1; bb_st.pin_seen = 0; bb_st.pin1_left = bb_st.puk1_left = 0;
++  bb_had_iccid = bb_had_imsi = 0;
++  bb_identity_tries = 0;
++  bb_ims_state = 0; bb_ims_checks_done = 0; bb_ims_registered = 0; bb_ims_cycled = 0;
++  bb_apn_synced = 0; bb_def_pending = 0;
++  bb_cs_setup_state = 0;
++  bb_profiles[1].used = 0;
++  bb_sim_forget_more();                                           // 0711: the SIM's APN
++  bb_sim_swaps++;
++  printf("NORD2 SIM: card gone (%s): %s; SIM-bound setup will run again for the next card (#%u)\n", why,
++         had ? "its IMSI/ICCID/GIDs forgotten" : "no identity was cached", bb_sim_swaps);
++}
++static void bb_sim_track(void)
++{
++  bb_st.fix = (uint8_t)(nord2_sim_fix & 0xffu);
++  const int raw = bb_st.sim;
++  const uint32_t now = bb_now_ms();
++  if (raw == NBM_SIM_PIN || raw == NBM_SIM_PUK) { if (bb_st.pin_seen < 255u) bb_st.pin_seen++; } else bb_st.pin_seen = 0;
++  if (bb_st.fix & 2u) {
++    const bool cached = bb_st.imsi[0] || bb_st.have_iccid || bb_st.gid_known[0] || bb_st.gid_known[1];
++    if (bb_sim_removed_urc && cached) bb_sim_forget("+ESIMS: 0");
++    else if (raw == NBM_SIM_ABSENT && bb_sim_prev_raw != NBM_SIM_ABSENT && (cached || bb_ims_state)) bb_sim_forget("+CPIN: SIM not inserted");
++  }
++  bb_sim_removed_urc = 0;
++  if ((bb_st.fix & 8u) && (raw == NBM_SIM_PIN || raw == NBM_SIM_PUK) && !bb_pinq.used && (!bb_epinc_ms || now - bb_epinc_ms > 5000u)) {
++    bb_epinc_ms = now ? now : 1u;
++    (void)nord2_at_query("AT+EPINC?", bb_at_done, reinterpret_cast<void *>(static_cast<uintptr_t>(BB_CTX_PIN | 0xffu)));
++  }
++  if ((bb_st.fix & 1u) && bb_st.pin_seen == 1u) bb_refresh_soon(1500);   // confirm (or not) a PIN lock soon
++  const int shown = nbm_sim_shown(&bb_st);
++  if (raw != bb_sim_prev_raw || shown != bb_sim_prev_shown)
++    printf("NORD2 SIM: +CPIN \"%s\" -> state %d, shown to CommCenter %d (CFUN %d, PIN-lock %d, seen %u, retries PIN1 %d PUK1 %d, fix 0x%x)\n",
++           bb_st.cpin_tok, raw, shown, bb_st.cfun, bb_st.pin_lock, bb_st.pin_seen, bb_st.pin1_left ? (int)bb_st.pin1_left - 1 : -1,
++           bb_st.puk1_left ? (int)bb_st.puk1_left - 1 : -1, bb_st.fix);
++  bb_sim_prev_raw = raw; bb_sim_prev_shown = shown;
++  const uint32_t ident = bb_st.imsi[0] && bb_st.have_iccid ? 1u : 0u;
++  nord2_sim_state = (uint32_t)(raw & 0xff) | (uint32_t)nbm_sim_settled(&bb_st) << 8 | (uint32_t)(shown & 0xff) << 16 | ident << 24;
++}
++
+ static void bb_snapshot_done(void)
+ {
+   uint8_t radio = 0, reg;
+   int roaming = 0;
+   char iccid[24];
+   bb_snapshots++;
++  bb_sim_track();                                                 // 0710
+   reg = nbm_reg(&bb_st, &radio, &roaming);
+   uint32_t nas = 2166136261u, uim = 2166136261u;
+   nas = bb_hash(nas, &reg, 1); nas = bb_hash(nas, &radio, 1); nas = bb_hash(nas, &roaming, sizeof roaming);
+@@ -3832,6 +4045,10 @@
+   nas = bb_hash(nas, bb_st.plmn, sizeof bb_st.plmn); nas = bb_hash(nas, bb_st.oper, sizeof bb_st.oper);
+   nas = bb_hash(nas, &bb_st.tac, 4); nas = bb_hash(nas, &bb_st.eci, 4);
+   uim = bb_hash(uim, &bb_st.sim, sizeof bb_st.sim); uim = bb_hash(uim, &bb_st.pin_lock, sizeof bb_st.pin_lock);
++  if (bb_st.fix) {                                                // 0710: what CommCenter is shown (debounced lock, retries)
++    const int shown = nbm_sim_shown(&bb_st);
++    uim = bb_hash(uim, &shown, sizeof shown); uim = bb_hash(uim, &bb_st.pin1_left, 2);
++  }
+   const uint32_t logsig = bb_hash(bb_hash(nas, &uim, 4), &bb_st.cfun, sizeof bb_st.cfun);
+   const bool have_iccid = nbm_iccid_digits(&bb_st, iccid, sizeof iccid) != 0;
+   const bool identity_new = (have_iccid && !bb_had_iccid) || (bb_st.imsi[0] && !bb_had_imsi);
+@@ -3915,6 +4132,8 @@
+   IOLockLock(bb_lock);
+   if (c & BB_CTX_UIM) {
+     bb_uim_read_done(c & ~BB_CTX_UIM, final, text, len);
++  } else if (c & BB_CTX_PIN) {                                    // 0710
++    bb_pin_done(c & ~BB_CTX_PIN, final, text, len);
+   } else {
+     const uint32_t q = c & 0xffu;
+     if (q < NBM_Q_COUNT && (bb_q_inflight & 1u << q)) {
+@@ -4905,6 +5124,8 @@
+   if (BB_IMS_SETUP && !(bb_flags & NBB_NO_IMS))                        // 0277aa
+     printf("NORD2 BB: report t=%u s (7): IMS step 1 %s, AT ok %u / failed %u, IMS URCs %u, checks %u, last registration \"%s\"\n", secs,
+            bb_ims_state ? "sent" : "not yet", bb_ims_ok, bb_ims_err, bb_ims_urcs, bb_ims_checks_done, bb_ims_last);
++  printf("NORD2 SIM: report t=%u s: state 0x%08x (fix 0x%x), card swaps %u, PIN operations %u (failed %u)%s\n", secs, nord2_sim_state,
++         nord2_sim_fix, bb_sim_swaps, bb_pin_ops, bb_pin_fail, bb_report_more());       // 0710 (0711/0712 add to the tail)
+   // every unhandled kind with its count: what the next phase has to implement
+   char line[160];
+   unsigned k = 0, n = 0;
+@@ -5089,6 +5310,11 @@
+   if (bb_ims_urc(line)) return;                                    // 0277aa: IMS URCs (logged; +CGEV/+EPDN go on below)
+   if (bb_cs_urc(line)) return;                                     // 0277r: SMS and call URCs
+   if (line[0] != '+') return;
++  if (nbm_prefix(line, "+ESIMS:")) {                               // 0710: "+ESIMS: 0,<cause>" = the card was removed
++    const char *v = line + 7;
++    while (*v == ' ') v++;
++    if (*v == '0' && (nord2_sim_fix & 2u)) bb_sim_removed_urc = 1;
++  }
+   if (nbm_prefix(line, "+CEREG:") || nbm_prefix(line, "+CREG:") || nbm_prefix(line, "+CGREG:") || nbm_prefix(line, "+CPIN:") ||
+       nbm_prefix(line, "+ESIMS:") || nbm_prefix(line, "+EUSIM:") || nbm_prefix(line, "+CGEV:"))
+     bb_refresh_soon(300);
+--- a/iokit/Kernel/arm/nord2_bb_qmi.h
++++ b/iokit/Kernel/arm/nord2_bb_qmi.h
+@@ -114,6 +114,13 @@
+     uint8_t gid_known[2];        /* 0 not read yet, 1 read, 2 the card has no such file */
+     uint16_t gid_size[2];        /* the size the GET RESPONSE gave, 0 unknown */
+     uint32_t answered;           /* NBM_Q_* bits answered at least once */
++    /* 0710 (sim-20261115): SIM state / PIN fixes, all off when fix == 0 (the bridge copies kern.n2sim_fix here every snapshot):
++     * bit 0 exact +CPIN tokens ("SIM PIN2"/"SIM PUK2" are not a PIN1 lock) + a PIN/PUK lock shown to CommCenter only when two
++     * snapshots in a row say so and +CLCK does not contradict it; bit 3 PIN1/PUK1 retries from MediaTek's AT+EPINC? */
++    uint8_t fix;
++    uint8_t pin_seen;            /* snapshots in a row whose +CPIN said SIM PIN / SIM PUK */
++    uint8_t pin1_left, puk1_left;   /* AT+EPINC? retries + 1 (0 unknown) */
++    char cpin_tok[16];           /* the last +CPIN token / +CME ERROR text, for the log (never an identity) */
+ };
+ 
+ static inline void nbm_init(struct nbm_state *s)
+@@ -278,11 +285,17 @@
+         if (nbm_prefix(l, "+CPIN:")) {
+             const char *p = l + 6;
+             while (*p == ' ') p++;
++            nbm_copy(s->cpin_tok, sizeof s->cpin_tok, p, 15);
++            /* 0710: "SIM PIN2" / "SIM PUK2" (27.007: the MT waits for PIN2/PUK2, used for FDN only) began with "SIM PIN" / "SIM PUK"
++             * and so were taken for a PIN1/PUK1 lock: iOS asked for a SIM PIN the card does not need */
++            if ((s->fix & 1u) && (nbm_prefix(p, "SIM PIN2") || nbm_prefix(p, "SIM PUK2"))) s->sim = NBM_SIM_READY;
++            else
+             s->sim = nbm_prefix(p, "READY") ? NBM_SIM_READY : nbm_prefix(p, "SIM PIN") ? NBM_SIM_PIN :
+                      nbm_prefix(p, "SIM PUK") ? NBM_SIM_PUK : NBM_SIM_ERROR;
+         } else if (nbm_prefix(l, "+CME ERROR:")) {
+             const char *p = l + 11;
+             while (*p == ' ') p++;
++            nbm_copy(s->cpin_tok, sizeof s->cpin_tok, p, 15);
+             s->sim = (nbm_prefix(p, "10") && (p[2] == 0 || p[2] == ' ')) || nbm_prefix(p, "SIM not inserted") ? NBM_SIM_ABSENT :
+                      (nbm_prefix(p, "14") && (p[2] == 0 || p[2] == ' ')) || nbm_prefix(p, "SIM busy") ? NBM_SIM_BUSY : NBM_SIM_ERROR;
+         }
+@@ -379,6 +392,7 @@
+         }
+     } else {
+         if (q == NBM_Q_CPIN && final == 1) s->sim = NBM_SIM_ERROR;   /* refined by the +CME ERROR line below */
++        if (q == NBM_Q_CLCK && final != 0 && (s->fix & 1u)) s->pin_lock = -1;   /* 0710: a failed +CLCK says nothing (was: stale) */
+         if (q == NBM_Q_CEREG) { s->have_tac = s->have_eci = 0; }
+         for (unsigned i = 0; i < len;) {
+             unsigned k = 0;
+@@ -691,7 +705,11 @@
+  * (a Qualcomm baseband reads it in low power mode too). Shown as BUSY: present, USIM application "detected". */
+ static inline int nbm_sim_shown(const struct nbm_state *s)
+ {
+-    return s->sim == NBM_SIM_ERROR && s->cfun != 1 ? NBM_SIM_BUSY : s->sim;
++    const int sim = s->sim == NBM_SIM_ERROR && s->cfun != 1 ? NBM_SIM_BUSY : s->sim;
++    /* 0710: a PIN/PUK lock reaches CommCenter (its "SIM PIN" sheet) only once two snapshots in a row said so and +CLCK "SC" does
++     * not say the PIN is off; until then the card is present and its USIM application "detected" (busy) */
++    if ((s->fix & 1u) && (sim == NBM_SIM_PIN || sim == NBM_SIM_PUK) && (s->pin_seen < 2 || s->pin_lock == 0)) return NBM_SIM_BUSY;
++    return sim;
+ }
+ /* 0277m: 1 when the modem's SIM state is final (radio function on and the card ready, locked or absent), 2 when the radio is on and
+  * +CPIN? still fails (final only if it stays so: the caller times it), 0 while it can still change on its own (CFUN not yet 1,
+@@ -743,7 +761,9 @@
+         b[k++] = 0; b[k++] = 0; b[k++] = 0;              /* feature, retries, unblock retries */
+         b[k++] = 0;                                      /* AID length (unknown: AT gives none) */
+         b[k++] = 0;                                      /* UPIN replaces PIN1 */
+-        b[k++] = pin1; b[k++] = 3; b[k++] = 10;          /* PIN1 state (1 enabled not verified, 2 verified, 3 disabled, 4 blocked), retries */
++        b[k++] = pin1;                                   /* PIN1 state (1 enabled not verified, 2 verified, 3 disabled, 4 blocked) */
++        b[k++] = (s->fix & 8u) && s->pin1_left ? (uint8_t)(s->pin1_left - 1u) : 3;   /* 0710: PIN1 / PUK1 retries from AT+EPINC? */
++        b[k++] = (s->fix & 8u) && s->puk1_left ? (uint8_t)(s->puk1_left - 1u) : 10;  /* when known (stored + 1, 0 unknown) */
+         b[k++] = 2; b[k++] = 3; b[k++] = 10;             /* PIN2 enabled not verified... reported as verified, 3/10 retries */
+     }
+     w += nbm_tlv(t + w, room - w, 0x10, b, k);
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -3385,6 +3385,8 @@
+  */
+ #include "nord2_bb_kpi.h"
+ const struct nord2_bb_hooks *nord2_bb_hooks;
++/* 0710/0711/0712 (sim-20261115): see nord2_bb_kpi.h; the SYSCTL lines are next to the net.nord2 node below */
++unsigned nord2_sim_fix = 15, nord2_sim_state, nord2_sim_apn = 1, nord2_nr = 1, nord2_nr_state;
+ #define NORD2_ATQ_N    32
+ #define NORD2_ATQ_CMD  224                       /* 0277aa: was 64 (AT+EAPNSET="ims",2,"type=ims;..." is ~190) */
+ #define NORD2_ATQ_RESP 1024
+@@ -3800,7 +3802,7 @@
+ {
+ 	uint8_t pkt[16 + 256];                          /* 0277aa: bridge queries up to NORD2_ATQ_CMD */
+ 	char shown[64];
+-	uint32_t n, k = 0;
++	uint32_t n, k = 0, quotes;                      /* 0710: quotes */
+ 	int rc;
+ 
+ 	for (n = 0; cmd[n] && n < 256; n++) {
+@@ -3824,6 +3826,18 @@
+ 		}
+ 		snprintf(shown, sizeof(shown), "%.3s<%u digits ..%c%c>", cmd, d, t1, t2);
+ 	}
++	/* 0710: commands that carry a PIN / PUK / password are logged up to their '=' (UIM Verify/Unblock/Change PIN, Set PIN Protection) */
++	for (k = 0, quotes = 0; cmd[k]; k++) {
++		quotes += cmd[k] == '"';
++	}
++	if (!strncmp(cmd, "AT+CPIN=", 8) || !strncmp(cmd, "AT+CPWD=", 8) || !strncmp(cmd, "AT+EPIN2=", 9) ||
++	    (!strncmp(cmd, "AT+CLCK=", 8) && quotes > 2)) {
++		unsigned eq = 0;
++		while (cmd[eq] && cmd[eq] != '=' && eq < 12) {
++			eq++;
++		}
++		snprintf(shown, sizeof(shown), "%.*s=<not logged>", (int)eq, cmd);
++	}
+ 	sweet_wr32(pkt, 0);
+ 	sweet_wr32(pkt + 4, 16 + n);
+ 	sweet_wr32(pkt + 8, 12);                            /* CCCI_UART2_TX */
+@@ -5938,6 +5952,11 @@
+ 
+ /* sysctl net.nord2.pdp: "pdp_ip0 ip a.b.c.d dns a.b.c.d a.b.c.d mtu N ch N" for a userspace helper (configd owns the resolver) */
+ SYSCTL_NODE(_net, OID_AUTO, nord2, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "Nord2 cellular data");
++SYSCTL_UINT(_kern, OID_AUTO, n2sim_fix, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_sim_fix, 0, "0710: SIM/PIN fixes bit mask, 0 = 0277");
++SYSCTL_UINT(_kern, OID_AUTO, n2sim_state, CTLFLAG_RD | CTLFLAG_LOCKED, &nord2_sim_state, 0, "0710: raw | settled<<8 | shown<<16 | identity<<24");
++SYSCTL_UINT(_kern, OID_AUTO, n2sim_apn, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_sim_apn, 0, "0711: 1 = the SIM's APN, 0 = internet.it for every SIM");
++SYSCTL_UINT(_kern, OID_AUTO, n2nr, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_nr, 0, "0712: 1 = NR (5G NSA) reporting from the modem");
++SYSCTL_UINT(_kern, OID_AUTO, n2nr_state, CTLFLAG_RD | CTLFLAG_LOCKED, &nord2_nr_state, 0, "0712: ENRCABAND state | band<<8 | ECAPABILITY<<24");
+ SYSCTL_STRING(_net_nord2, OID_AUTO, pdp, CTLFLAG_RD | CTLFLAG_LOCKED, n2net_sysctl_pdp, sizeof(n2net_sysctl_pdp), "PDN of cid 1");
+ 
+ /* one DL packet from the DPMAIF (called by n2d_rx_poll in the modem thread) */
+--- a/bsd/kern/nord2_bb_kpi.h
++++ b/bsd/kern/nord2_bb_kpi.h
+@@ -74,6 +74,19 @@
+ #define NORD2_MODEM_DEAD   4u       /* exception signalled */
+ unsigned nord2_modem_state(void);
+ 
++/* 0710/0711/0712 (sim-20261115): switches and state of the SIM/APN/NR fixes, defined in sweet_amfi.c as sysctls (the bridge only reads
++ * the switches and writes the state words):
++ *  kern.n2sim_fix   (rw, default 15) 0710: bit 0 exact +CPIN tokens + PIN/PUK lock debounce, bit 1 the SIM's identity (IMSI, ICCID,
++ *                   GIDs) and the SIM-bound setup are forgotten when the card goes away (hot swap), bit 2 UIM Verify/Unblock/Change PIN
++ *                   and Set PIN Protection answered through AT+CPIN/AT+CPWD/AT+CLCK, bit 3 PIN1/PUK1 retries from AT+EPINC?; 0 = 0277
++ *  kern.n2sim_state (ro) raw +CPIN state | settled << 8 | state shown to CommCenter << 16 | identity complete << 24
++ *  kern.n2sim_apn   (rw, default 1) 0711: 1 = the data/IMS APN table is the SIM's (Very's internet.it/mms.it only for IMSI 22288,
++ *                   otherwise CommCenter's APN), 0 = internet.it/mms.it for every SIM (0277 behaviour)
++ *  kern.n2nr        (rw, default 1) 0712: 1 = NR (5G NSA) reporting from the modem: AT+ECAPABILITY=1, AT+ENRCABAND=1, AT+E5GOPT? and
++ *                   the +ENRCABAND/+ECAPABILITY URCs logged ("NORD2 NR:"), 0 = off
++ *  kern.n2nr_state  (ro) last +ENRCABAND state (0 none, 1 NR leg) | NR band << 8 | +ECAPABILITY << 24 | 0x80000000 once known */
++extern unsigned nord2_sim_fix, nord2_sim_state, nord2_sim_apn, nord2_nr, nord2_nr_state;
++
+ /*
+  * 0277l: cellular data owned by CommCenter. sweet_amfi.c brings up the PDN of cid 1 itself (AT+CGDCONT/CGACT on its APN, +EIF,
+  * DPMAIF); with nord2_pdn_owner set (by the bridge, at NORD2_BB_EV_EARLY) it no longer configures an address or routes: it creates the

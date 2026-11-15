@@ -1,0 +1,99 @@
+--- a/iokit/Kernel/arm/Nord2Baseband.cpp
++++ b/iokit/Kernel/arm/Nord2Baseband.cpp
+@@ -4093,6 +4093,60 @@
+ // ICCID and GIDs for the whole boot (they are read once), so a second card was announced with the first one's identity in the
+ // activation indication, and its SIM-bound setup (IMS, APN table, SMS/call settings) was never redone. Forget all of it; the next
+ // ready card is read again (bb_identity_tries reset).
++// 0712 (sim-20261115, kern.n2nr): NR (5G) visibility. The modem already runs with the stock RIL's RAT mode (AT+EGRAT=22 / AT+ERAT=22,128 in
++// sweet_amfi.c's boot script: 2G/3G/4G/5G, NR preferred) and +CEREG reports AcT 13 (E-UTRA-NR dual connectivity) on Very's cells, so
++// NR NSA is the modem's business; iOS cannot show it: this identity is an iPhone X (Mav17 baseband, LTE only; CommCenter keeps
++// activation_5g_support kFalse), and nbm_radio maps AcT 10/13 to LTE on purpose. What was missing is any way to see whether the NR leg
++// is up: the stock RIL's reports are enabled here (AT+ECAPABILITY=1, AT+ENRCABAND=1, as mtkfusionrild after the radio is on; on
++// Android "+ENRCABAND: 1,78" = NR leg on band n78) and AT+E5GOPT? is read once (stock ROM: 5). Log "NORD2 NR:", kern.n2nr_state.
++static uint8_t bb_nr_setup;
++static uint32_t bb_nr_urcs;
++static void bb_nr_done(void *ctx, int final, const char *text, unsigned len)
++{
++  static const char *const cmds[] = { "AT+ECAPABILITY=1", "AT+ENRCABAND=1", "AT+E5GOPT?", "AT+ECAPABILITY?", "AT+ENRCABAND?" };
++  const uint32_t i = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ctx)) % 5u;
++  char shown[96];
++  unsigned k = 0;
++  for (unsigned j = 0; j < len && k + 2 < sizeof shown; j++) shown[k++] = text[j] == '\n' ? '|' : text[j] >= 32 && text[j] < 127 ? text[j] : '?';
++  while (k && shown[k - 1] == '|') k--;
++  shown[k] = 0;
++  printf("NORD2 NR: %s -> %s [%s]\n", cmds[i], final == NORD2_AT_FINAL_OK ? "OK" : final == NORD2_AT_FINAL_TIMEOUT ? "timeout" : "ERROR", shown);
++}
++static void bb_nr_check(void)                                     // bb_lock held, snapshot
++{
++  if (!nord2_nr || bb_nr_setup || bb_st.cfun != 1 || (bb_flags & NBB_NO_AT) || (nord2_modem_state() & NORD2_MODEM_DEAD)) return;
++  static const char *const cmds[] = { "AT+ECAPABILITY=1", "AT+ENRCABAND=1", "AT+E5GOPT?", "AT+ECAPABILITY?", "AT+ENRCABAND?" };
++  int e = 0;
++  for (uintptr_t i = 0; i < 5u && !e; i++) e = nord2_at_query(cmds[i], bb_nr_done, reinterpret_cast<void *>(i));
++  bb_nr_setup = 1;
++  printf("NORD2 NR: reporting enabled (AT+ECAPABILITY=1, AT+ENRCABAND=1, AT+E5GOPT?)%s; EPS AcT %d now (13 = NR dual connectivity cell)\n",
++         e ? " - queue full, partly" : "", bb_st.eps_act);
++}
++static long bb_nr_num(const char **p)
++{
++  while (**p == ' ' || **p == ',') (*p)++;
++  long v = -1;
++  if (**p == '-') { (*p)++; while (**p >= '0' && **p <= '9') (*p)++; return -1; }
++  if (**p >= '0' && **p <= '9') { v = 0; while (**p >= '0' && **p <= '9') v = v * 10 + (*(*p)++ - '0'); }
++  return v;
++}
++static bool bb_nr_urc(const char *line)                           // modem service thread; never an identity in these lines
++{
++  const bool band = nbm_prefix(line, "+ENRCABAND:"), cap = nbm_prefix(line, "+ECAPABILITY:");
++  if (!band && !cap && !nbm_prefix(line, "+E5GOPT:")) return false;
++  const char *p = line + (band ? 11 : cap ? 13 : 8);
++  uint32_t st = nord2_nr_state & 0x7fffffffu;
++  if (band) {
++    const long a = bb_nr_num(&p), b = bb_nr_num(&p);
++    if (a >= 0) st = (st & ~0x00ffffffu) | (uint32_t)(a & 0xff) | (b > 0 ? (uint32_t)(b & 0xffff) << 8 : 0u);
++  } else if (cap) {
++    const long a = bb_nr_num(&p);
++    if (a >= 0) st = (st & 0x00ffffffu) | (uint32_t)(a & 0x7f) << 24;
++  }
++  nord2_nr_state = st | 0x80000000u;
++  if (bb_nr_urcs++ < 200) printf("NORD2 NR: URC %.80s -> NR leg %s, band n%u\n", line, (st & 0xffu) ? "UP" : "down", (st >> 8) & 0xffffu);
++  return true;
++}
+ static void bb_sim_forget_more(void)                             // 0711: the old card's APNs
+ {
+   bb_apn[0] = bb_apn_mms[0] = bb_apn_synced_name[0] = bb_apn_chain[0] = 0;
+@@ -4102,8 +4156,9 @@
+ static char bb_report_buf[200];
+ static const char *bb_report_more(void)                          // 0711 (0712 adds NR)
+ {
+-  snprintf(bb_report_buf, sizeof bb_report_buf, "; APN \"%s\" (%s), MMS \"%s\", synced \"%s\", updates %u (n2sim_apn %u)", bb_apn_cur(),
+-           nord2_sim_apn ? bb_apn_src_name() : "0277 fixed", bb_apn_mms_cur(), bb_apn_synced_name, bb_apn_resyncs, nord2_sim_apn);
++  snprintf(bb_report_buf, sizeof bb_report_buf, "; APN \"%s\" (%s), MMS \"%s\", synced \"%s\", updates %u (n2sim_apn %u); NR state 0x%08x (%u URCs)",
++           bb_apn_cur(), nord2_sim_apn ? bb_apn_src_name() : "0277 fixed", bb_apn_mms_cur(), bb_apn_synced_name, bb_apn_resyncs, nord2_sim_apn,
++           nord2_nr_state, bb_nr_urcs);
+   return bb_report_buf;
+ }
+ static void bb_sim_forget(const char *why)
+@@ -4253,6 +4308,7 @@
+     }
+   }
+   bb_ims_setup();                                                 // 0277aa: VoLTE step 1
++  bb_nr_check();                                                  // 0712
+   if (bb_refresh_again) bb_refresh_locked();
+ }
+ 
+@@ -5411,6 +5467,7 @@
+         bb_ims_cycled = 0;
+         bb_apn_synced = 0;                                         // 0277au
+         bb_def_pending = 0;
++        bb_nr_setup = 0;                                           // 0712: the reports again after a modem (re)start
+       }
+       IOLockUnlock(bb_lock);
+     }
+@@ -5439,6 +5496,7 @@
+     if ((n & 1u) && bb_lock) { IOLockLock(bb_lock); bb_sms_ready_setup(); IOLockUnlock(bb_lock); }
+     return;
+   }
++  if (nord2_nr && bb_nr_urc(line)) return;                          // 0712: NR reports (logged)
+   if (bb_ims_urc(line)) return;                                    // 0277aa: IMS URCs (logged; +CGEV/+EPDN go on below)
+   if (bb_cs_urc(line)) return;                                     // 0277r: SMS and call URCs
+   if (line[0] != '+') return;
