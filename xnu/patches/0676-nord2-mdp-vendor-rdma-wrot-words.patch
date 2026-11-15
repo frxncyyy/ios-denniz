@@ -1,0 +1,152 @@
+--- a/bsd/dev/nord2_mdp.inc
++++ b/bsd/dev/nord2_mdp.inc
+@@ -5,7 +5,8 @@
+  * 0673 adds the bring-up stage P (owned-protection model + vendor-order release of exclusive MDP bits + MDP gates, see the
+  * 0673 blocks) and lets the probe read mdpsys once P verified that no MDP-owned protection bit is set;
+  * 0674 adds the larb2 SMI bring-up before S1, mutex end-of-frame as a second done indicator and full pipe dumps;
+- * 0675: larb2 setup optional (OSTDL never lowered, byte-mirrored read-back, S1 refused only for a real blocker), short log lines.
++ * 0675: larb2 setup optional (OSTDL never lowered, byte-mirrored read-back, S1 refused only for a real blocker), short log lines;
++ * 0676: vendor RDMA buffer words / RDMA_CON / WROT FIFO_TEST, ROT_EN frame bits, INT clear, main-buffer lines (job.h) + retry ladder.
+  * (gpu/build/mdp-20261114/MDP_OFFLOAD.md).  Answers "is the MDP powered, clocked and reachable on this phone, and in what
+  * state did the bootloader leave it" before any functional stage (DMA, scaling, rotation) is attempted.
+  *
+@@ -460,6 +461,7 @@
+ 	uint32_t caps;             /* N2MDP_CAP_* */
+ 	uint32_t s1, s2_pass, s2_fail, s3;   /* s1/s3: 0 not run, 1 pass, >1 failure code; s2: test bitmasks */
+ 	uint32_t rgb_swap;
++	uint32_t wrot_lines;       /* 0676: WROT main-buffer lines that worked (0 = n2mdp_wrot_lines default) */
+ 	uint32_t jobs, job_fail, last_us, max_us, timeouts;
+ 	uint32_t cg0_found, cg1_found, opened0, opened1;
+ 	bool gates_open, gce_opened, pool_ok, killed;
+@@ -997,7 +999,7 @@
+ 	struct n2mdp_job j = { 0 };
+ 	n2mdp_img_setup(&j.src, t->sfmt, t->sw, t->sh, src_pa, t->full);
+ 	n2mdp_img_setup(&j.dst, t->dfmt, t->dw, t->dh, dst_pa, 0);
+-	j.rot = t->rot; j.flip = t->flip; j.tile_w = t->tile16; j.rgb_swap = (uint8_t)n2mx.rgb_swap;
++	j.rot = t->rot; j.flip = t->flip; j.tile_w = t->tile16; j.rgb_swap = (uint8_t)n2mx.rgb_swap; j.wrot_lines = (uint8_t)n2mx.wrot_lines;
+ 	uint8_t *s0 = (uint8_t *)src_va, *s1 = n2mf_is_yuv(j.src.fmt) ? (uint8_t *)src_va + (j.src.addr[1] - j.src.addr[0]) : NULL;
+ 	uint32_t sbytes = n2mdp_img_bytes(&j.src), dbytes = n2mdp_img_bytes(&j.dst);
+ 	n2mdp_pattern(&j.src, s0, s1, (uint32_t)(t - n2mdp_tests));
+@@ -1054,6 +1056,18 @@
+ 		uint32_t crc = 0;
+ 		int r = n2mdp_test_run(t, n2mx.pool_pa + N2MDP_BUF_SRC, n2mx.pool_va + N2MDP_BUF_SRC, n2mx.pool_pa + N2MDP_BUF_DST,
+ 		    n2mx.pool_va + N2MDP_BUF_DST, &crc);
++		/* 0676: the very first job of the boot did not finish -> retry it with other WROT main-buffer line counts (each try
++		 * ended with the abort's engine resets; at most 3 more tries of <= ~190 ms); the count that works is kept */
++		static const uint8_t alt_lines[3] = { 16, 8, 4 };
++		for (unsigned a = 0; r == 3 && stage == 1 && i == 0 && n2mx.jobs == n2mx.job_fail && a < 3; a++) {
++			N2MDP_LOG("NORD2 MDP: %s retry %u with WROT main-buffer lines %u (previous %u timed out)\n", t->name, a + 1, alt_lines[a],
++			    n2mx.wrot_lines ? n2mx.wrot_lines : 32u);
++			n2mx.wrot_lines = alt_lines[a];
++			r = n2mdp_test_run(t, n2mx.pool_pa + N2MDP_BUF_SRC, n2mx.pool_va + N2MDP_BUF_SRC, n2mx.pool_pa + N2MDP_BUF_DST,
++			    n2mx.pool_va + N2MDP_BUF_DST, &crc);
++			if (r != 3) { N2MDP_LOG("NORD2 MDP: WROT main-buffer lines %u: %s\n", alt_lines[a], r == 0 ? "PASS, kept" : "finished but failed"); }
++		}
++		if (r == 3 && stage == 1 && i == 0) { n2mx.wrot_lines = 0; }
+ 		if (r == 0) { pass |= 1u << i; n2mx.caps |= t->cap; }
+ 		else {
+ 			fail |= 1u << i; if (code == 1) { code = (uint32_t)r + 1u; }
+--- a/bsd/dev/nord2_mdp_job.h
++++ b/bsd/dev/nord2_mdp_job.h
+@@ -47,6 +47,7 @@
+ 	uint8_t  flip;            /* bit0 = mirror horizontally (applied before the rotation, iOS convention) */
+ 	uint8_t  rgb_swap;        /* self-calibration: XOR applied to the RGB swap bits (stage 2 finds the right value) */
+ 	uint8_t  tile_w;          /* tile width in units of 16 output pixels (0 = default 32 = 512 px) */
++	uint8_t  wrot_lines;      /* 0676: WROT main-buffer line count (VIDO_MAIN_BUF_SIZE 14:8); 0 = n2mdp_wrot_lines() */
+ };
+ 
+ /* error codes of n2mdp_check() */
+@@ -187,7 +188,7 @@
+ 
+ struct n2mdp_tile { uint32_t ox0, ox1; uint32_t ix0, ix1; uint32_t lh_int, lh_sub; };
+ struct n2mdp_prog {
+-	struct n2mdp_op ops[1600];
++	struct n2mdp_op ops[2400];   /* 0676: + vendor per-tile RDMA buffer words, WROT INT clear */
+ 	uint32_t n, tiles, pipe, mutex;
+ 	int err;
+ };
+@@ -253,6 +254,37 @@
+ }
+ 
+ /* Compile the job.  pipe chosen here: direct when not scaled, scale pipe otherwise. */
++/* ======================================================================================================================
++ * 0676: values the vendor userland (libdpframework.so lib64/mt6893, phone copy) programs and 0671 did not [V-dis]:
++ *  RDMA (DpEngine_RDMA::onConfigTile 0xc1bd4 + calRDMASetting 0x215d34, 32 bpp = its default branch 0x21644c, executed under
++ *  an emulator on the host for 64/256/512/1024 px to check this port): per tile 0x0c0 = a, 0x088 = (W*4)<<12 | 4a (mask 0x1ffff3ff),
++ *  0x0d0 = (a*n)<<16 | n (mask 0x3fff1fff), 0x0d8 = b, 0x0b8 = 0 (mask 0x1ffff3ff), 0x0e8 = (b*m)<<16 | m (mask 0x3fff1fff) with
++ *  W = tile width, a = W < 569 ? 8 : 5120/W, b = 2W < 569 ? 8 : 5120/(2W), n = roundup4(ceil(W/a)), m = roundup4(ceil(W/b)),
++ *  a -= 1 if a*a*n > 5120, b -= 1 if 2*b*b*m > 5120.  Frame: RDMA_CON 0x020 = 0x20 (mask 0x1130), 0x2a8 = 0 (mask 7, 8-bit).
++ *  WROT (DpEngine_WROT::onConfigFrame 0xbdc88 / onConfigTile 0xbf30c): frame VIDO_FIFO_TEST 0x080 = getWROTFIFOSetting() = 0x100,
++ *  VIDO_ROT_EN 0x07c |= 0x900000; per tile VIDO_INT 0x01c = 1 before ROT_EN (the phone showed INT 0x7 left over before GO),
++ *  VIDO_MAIN_BUF_SIZE = W<<16 | L<<8 with L from calWROTSetting (multiple of 4, ceil(W/L)*L*L <= 0x4000); 0671 wrote L = 1.
++ * YUV sources keep the 0671 RDMA programming (their calRDMASetting branch is not ported yet). */
++static inline uint32_t
++n2mdp_wrot_lines(uint32_t tw)
++{
++	uint32_t L = 32u;
++	while (L > 4u && ((tw + L - 1u) / L) * L * L > 0x4000u) { L -= 4u; }
++	return L;
++}
++static inline void
++n2mdp_rdma_buf32(uint32_t W, uint32_t o[10])
++{
++	uint32_t a = W < 0x239u ? 8u : 5120u / W, b = 2u * W < 0x239u ? 8u : 5120u / (2u * W);
++	if (a == 0u) { a = 1u; }                            /* W > 5120 / 2560: never for our <= 520 px tiles */
++	if (b == 0u) { b = 1u; }
++	uint32_t n = (a + W - 1u) / a, m = (W - 1u + b) / b;
++	n = (n + 3u) & ~3u; m = (m + 3u) & ~3u;
++	o[0] = a; o[1] = W * 4u; o[2] = a * 4u; o[3] = a * n; o[4] = n; o[5] = b; o[6] = 0; o[7] = 0; o[8] = b * m; o[9] = m;
++	if (o[3] * a >= 0x1401u) { o[0] = a - 1u; }
++	if (0x1401u <= 2u * (b * o[8])) { o[5] = b - 1u; }
++}
++
+ static inline int
+ n2mdp_compile(const struct n2mdp_job *j, struct n2mdp_prog *p)
+ {
+@@ -297,7 +329,8 @@
+ 	if (!syuv) { s_swap ^= (j->rgb_swap & 1u); }
+ 	N2WM(p, R + R_GMCIF, 0x00010371u, 0x00030071u);
+ 	N2WM(p, R + R_SRC_CON, s_id | (s_swap << 14) | 0x20000u | 0x600u, 0x038cfe0fu);
+-	N2WM(p, R + R_CON, 0, 0x1110u);
++	N2WM(p, R + R_CON, 0x20u, 0x1130u);                 /* 0676: vendor sets bit 5 */
++	N2WM(p, R + 0x2a8u, 0u, 7u);                        /* 0676: 8-bit source (vendor 0x2a8 = 0 / 7 for 10-bit block) */
+ 	N2W(p, R + R_BASE0, j->src.addr[0]);
+ 	N2W(p, R + R_SRC_END0, (uint32_t)(j->src.addr[0] + n2mdp_plane_bytes(&j->src, 0) - 1u));
+ 	N2W(p, R + R_BKGD_B, j->src.pitch[0]);
+@@ -352,6 +385,8 @@
+ 	N2WM(p, W + W_MAT_CTRL, w_mat, 0xf3u);
+ 	N2WM(p, W + W_DITHER, 0xff000000u, 0xff000000u);
+ 	N2WM(p, W + W_RSV1, 1u << 31, 1u << 31);
++	N2W(p, W + 0x080u, 0x100u);                         /* 0676: VIDO_FIFO_TEST = getWROTFIFOSetting() */
++	N2WM(p, W + W_ROT_EN, 0x900000u, 0x900000u);        /* 0676: vendor frame bits 20 / 23 */
+ 
+ 	/* tiles */
+ 	struct n2mdp_tile t[N2MDP_MAX_TILES];
+@@ -367,6 +402,16 @@
+ 		N2W(p, R + R_SRC_SIZE, (ch << 16) | iw);
+ 		N2W(p, R + R_CLIP_SIZE, (ch << 16) | iw);
+ 		N2WM(p, R + R_OFFSET_1, 0, 0x003f001fu);
++		if (!syuv && sbpp == 4u) {                      /* 0676: vendor RDMA buffer words (calRDMASetting 32 bpp) */
++			uint32_t o[10];
++			n2mdp_rdma_buf32(iw, o);
++			N2W(p, R + 0x0c0u, o[0]);
++			N2WM(p, R + 0x088u, (o[1] << 12) + o[2], 0x1ffff3ffu);
++			N2WM(p, R + 0x0d0u, (o[3] << 16) + o[4], 0x3fff1fffu);
++			N2W(p, R + 0x0d8u, o[5]);
++			N2WM(p, R + 0x0b8u, (o[6] << 12) + o[7], 0x1ffff3ffu);
++			N2WM(p, R + 0x0e8u, (o[8] << 16) + o[9], 0x3fff1fffu);
++		}
+ 		if (pipe == N2MDP_PIPE_SCALE) {
+ 			N2W(p, Z + Z_IN, (ch << 16) | iw);
+ 			N2W(p, Z + Z_OUT, (oh << 16) | tw);
+@@ -385,7 +430,9 @@
+ 		N2W(p, W + W_IN_SIZE, (oh << 16) | tw);
+ 		N2W(p, W + W_TAR_SIZE, (oh << 16) | tw);
+ 		N2W(p, W + W_CROP_OFST, 0);
+-		N2WM(p, W + W_MAIN_BUF, (tw << 16) | (1u << 8), 0x1fff7f00u);
++		uint32_t wl = j->wrot_lines ? j->wrot_lines : n2mdp_wrot_lines(tw);
++		N2WM(p, W + W_MAIN_BUF, (tw << 16) | ((wl & 0x7fu) << 8), 0x1fff7f00u);
++		N2W(p, W + 0x01cu, 1u);                         /* 0676: VIDO_INT = 1 before the enable, as the vendor does */
+ 		N2WM(p, W + W_ROT_EN, 1u, 1u);
+ 		/* go + wait: GO clears the WROT frame-done GCE event and sets the mutex EN; WAIT polls that event through the GCE-M
+ 		 * token registers (CPU-readable; live.dts mdp_wrot0_write_frame_done = 0x123, wrot2 = 0x121) and logs the other

@@ -1,0 +1,191 @@
+--- a/bsd/dev/nord2_mdp.inc
++++ b/bsd/dev/nord2_mdp.inc
+@@ -3,7 +3,8 @@
+  * nord2_mdp.inc -- 0670: MT6893 MDP (Media Data Path, mdpsys 0x1f000000) probe = stage 0 of the MDP offload plan;
+  * 0671 adds the functional stages 1-3 (DMA self-test, function matrix, M4U1) and /dev/redwood-mdp (see the 0671 block below);
+  * 0673 adds the bring-up stage P (owned-protection model + vendor-order release of exclusive MDP bits + MDP gates, see the
+- * 0673 blocks) and lets the probe read mdpsys once P verified that no MDP-owned protection bit is set.
++ * 0673 blocks) and lets the probe read mdpsys once P verified that no MDP-owned protection bit is set;
++ * 0674 adds the larb2 SMI bring-up before S1, mutex end-of-frame as a second done indicator and full pipe dumps.
+  * (gpu/build/mdp-20261114/MDP_OFFLOAD.md).  Answers "is the MDP powered, clocked and reachable on this phone, and in what
+  * state did the bootloader leave it" before any functional stage (DMA, scaling, rotation) is attempted.
+  *
+@@ -690,24 +691,118 @@
+ 	return c;
+ }
+ 
+-/* larb2 ports p0..p3 (RDMA0, RDMA2, WROT0, WROT2): bit0 MMU_EN = translate through M4U1, 0 = physical */
++/* larb2 ports p0..p3 (RDMA0, RDMA2, WROT0, WROT2): bit0 MMU_EN = translate through M4U1, 0 = physical.
++ * 0674: physical mode also clears the address-bits-32+ field 15:8 (0xff01, as the codec's larb bring-up, pseudo_m4u_v2.c:563-575) */
++#define N2MDP_LARB_NS_PHYS 0x0000ff01u
+ static void
+ n2mdp_larb_mode(bool iova)
+ {
+ 	for (unsigned p = 0; p < 4; p++) {
+ 		uint32_t v = n2mdp_rd(N2MDP_W_LARB2 + 0x380u + 4u * p);
+-		uint32_t w = iova ? (v | 1u) : (v & ~1u);
++		uint32_t w = iova ? (v | 1u) : (v & ~N2MDP_LARB_NS_PHYS);
+ 		if (w != v) { n2mdp_wr(N2MDP_W_LARB2 + 0x380u + 4u * p, w); }
+ 	}
+ }
+ 
++/* ======================================================================================================================
++ * 0674: larb2 bring-up = what the vendor SMI driver does for larb2 when SYS_MDP powers on (smi_drv.c smi_subsys_after_on:
++ * mtk_smi_conf_set + smi_larb_port_set; mt6885/smi_conf.h smi_larb2_conf_pair :80-84, smi_larb2_init_pair :202-209):
++ *   SMI_LARB_CMD_THRT_CON 0x024 = 0x370256, SMI_LARB_SW_FLAG 0x040 = 1, INT_SMI_LARB_CMD_THRT_CON 0x524 = 0x370256,
++ *   SMI_LARB_OSTDL_PORT(p) 0x200+4p = { 5, 5, 5, 5, 1, 0x3f } (outstanding-request limits: 0 = the port can never issue),
++ *   NON_SEC_CON(p) |= 0x8 (bw throttle, smi_larb_bw_thrt_en_port).  The q10jmdp3 boot left this larb unconfigured (no SMI
++ *   driver on iOS; its MMU_EN bits were set by the boot chain with M4U1 PT_BASE 0) and S1 stalled with RDMA0 in "data running".
++ *   SMI_LARB_SLP_CON 0x00c bit 0 (sleep protect) set -> cleared, bit 16 polled clear <= 1 ms; still set -> S1 not started.
++ * Only larb2 (MDP-only ports) is written; the MDP SMI common (shared with VDEC larb4) is read for the log, never written.
++ * ==================================================================================================================== */
++static const uint8_t n2mdp_larb2_ostdl[6] = { 5, 5, 5, 5, 1, 0x3f };
++static void
++n2mdp_larb_dump(const char *when)
++{
++	uint32_t L = N2MDP_W_LARB2, C = 0x2000u;
++	N2MDP_LOG("NORD2 MDP LARB2 %s: STAT %#x IRQ %#x SLP_CON %#x CON %#x THRT %#x SW_FLAG %#x OSTDL_EN %#x INT_THRT %#x | OSTDL %#x %#x %#x %#x %#x %#x"
++	    " | NON_SEC %#x %#x %#x %#x %#x %#x | OSTD_MON %#x %#x %#x %#x | FIFO %#x BUS %#x EXT_ONGOING %#x INT_ONGOING %#x\n", when,
++	    n2mdp_rd(L + 0x0u), n2mdp_rd(L + 0x8u), n2mdp_rd(L + 0xcu), n2mdp_rd(L + 0x10u), n2mdp_rd(L + 0x24u), n2mdp_rd(L + 0x40u),
++	    n2mdp_rd(L + 0x60u), n2mdp_rd(L + 0x524u),
++	    n2mdp_rd(L + 0x200u), n2mdp_rd(L + 0x204u), n2mdp_rd(L + 0x208u), n2mdp_rd(L + 0x20cu), n2mdp_rd(L + 0x210u), n2mdp_rd(L + 0x214u),
++	    n2mdp_rd(L + 0x380u), n2mdp_rd(L + 0x384u), n2mdp_rd(L + 0x388u), n2mdp_rd(L + 0x38cu), n2mdp_rd(L + 0x390u), n2mdp_rd(L + 0x394u),
++	    n2mdp_rd(L + 0x280u), n2mdp_rd(L + 0x284u), n2mdp_rd(L + 0x288u), n2mdp_rd(L + 0x28cu),
++	    n2mdp_rd(L + 0xb0u), n2mdp_rd(L + 0xb4u), n2mdp_rd(L + 0xc8u), n2mdp_rd(L + 0xccu));
++	N2MDP_LOG("NORD2 MDP SMI-COMMON %s: L1LEN %#x L1ARB0-3 %#x %#x %#x %#x BUS_SEL %#x M4U_TH %#x FIFO_TH1 %#x FIFO_TH2 %#x DCM %#x CLAMP %#x"
++	    " DEBUG_S0-3 %#x %#x %#x %#x M0 %#x M1 %#x MISC %#x DUMMY %#x\n", when, n2mdp_rd(C + 0x100u), n2mdp_rd(C + 0x104u), n2mdp_rd(C + 0x108u),
++	    n2mdp_rd(C + 0x10cu), n2mdp_rd(C + 0x110u), n2mdp_rd(C + 0x220u), n2mdp_rd(C + 0x234u), n2mdp_rd(C + 0x238u), n2mdp_rd(C + 0x23cu),
++	    n2mdp_rd(C + 0x300u), n2mdp_rd(C + 0x3c0u), n2mdp_rd(C + 0x400u), n2mdp_rd(C + 0x404u), n2mdp_rd(C + 0x408u), n2mdp_rd(C + 0x40cu),
++	    n2mdp_rd(C + 0x430u), n2mdp_rd(C + 0x434u), n2mdp_rd(C + 0x440u), n2mdp_rd(C + 0x444u));
++}
++static bool
++n2mdp_larb2_init(void)
++{
++	uint32_t L = N2MDP_W_LARB2;
++	n2mdp_larb_dump("as found");
++	if (n2mdp_rd(L + 0xcu) & 1u) {
++		n2mdp_wr(L + 0xcu, n2mdp_rd(L + 0xcu) & ~1u);
++		unsigned k = 0;
++		while ((n2mdp_rd(L + 0xcu) & (1u << 16)) && k < 200u) { n2mdp_delay(5); k++; }
++		if (n2mdp_rd(L + 0xcu) & ((1u << 16) | 1u)) {
++			N2MDP_LOG("NORD2 MDP LARB2: sleep protect did not release (SLP_CON %#x after %u us)\n", n2mdp_rd(L + 0xcu), k * 5u);
++			return false;
++		}
++	}
++	if (n2mdp_rd(L + 0x24u) != 0x370256u) { n2mdp_wr(L + 0x24u, 0x370256u); }
++	if (n2mdp_rd(L + 0x40u) != 1u) { n2mdp_wr(L + 0x40u, 1u); }
++	if (n2mdp_rd(L + 0x524u) != 0x370256u) { n2mdp_wr(L + 0x524u, 0x370256u); }
++	for (unsigned p = 0; p < 6; p++) {
++		if (n2mdp_rd(L + 0x200u + 4u * p) != n2mdp_larb2_ostdl[p]) { n2mdp_wr(L + 0x200u + 4u * p, n2mdp_larb2_ostdl[p]); }
++	}
++	for (unsigned p = 0; p < 4; p++) {
++		uint32_t v = n2mdp_rd(L + 0x380u + 4u * p);
++		if (!(v & 0x8u)) { n2mdp_wr(L + 0x380u + 4u * p, v | 0x8u); }
++	}
++	n2mdp_larb_mode(false);
++	n2mdp_larb_dump("configured");
++	bool ok = n2mdp_rd(L + 0x24u) == 0x370256u && n2mdp_rd(L + 0x200u) == 5u && n2mdp_rd(L + 0x208u) == 5u &&
++	    !(n2mdp_rd(L + 0x380u) & N2MDP_LARB_NS_PHYS) && !(n2mdp_rd(L + 0x388u) & N2MDP_LARB_NS_PHYS);
++	if (!ok) { N2MDP_LOG("NORD2 MDP LARB2: configuration did not stick\n"); }
++	return ok;
++}
++
+ static uint32_t n2mdp_diag_logged;
+ 
++/* 0674: full pipe dump (RDMA / WROT / mutex / topology / direct-link valid-ready / larb2), read-only except the WROT debug
++ * selector 0x018 (vendor cmdq_mdp_dump_rot does the same).  Used before GO, shortly after GO and on every timeout. */
++static void
++n2mdp_diag(const struct n2mdp_prog *p, const char *when)
++{
++	uint32_t R = N2MDP_W_RDMA(p->pipe), W = N2MDP_W_WROT(p->pipe), X = N2MDP_W_MUTEX, mid = p->mutex;
++	uint32_t m0 = n2mdp_rd(R + 0x400u), m1 = n2mdp_rd(R + 0x408u), hv = n2mdp_rd(R + 0x4d0u);
++	N2MDP_LOG("NORD2 MDP DIAG %s: RDMA EN %#x INT_EN %#x INT_ST %#x CON %#x GMCIF %#x SRC_CON %#x BASE %#x END %#x PITCH %#x SIZE %#x CLIP %#x"
++	    " OFS %#x | MON0 %#x (ack %u req %u) MON1 %#x (state %#x grep %u) h/v %u/%u\n", when, n2mdp_rd(R + 0x0u), n2mdp_rd(R + 0x10u),
++	    n2mdp_rd(R + 0x18u), n2mdp_rd(R + 0x20u), n2mdp_rd(R + 0x28u), n2mdp_rd(R + 0x30u), n2mdp_rd(R + 0xf00u), n2mdp_rd(R + 0x100u),
++	    n2mdp_rd(R + 0x60u), n2mdp_rd(R + 0x70u), n2mdp_rd(R + 0x78u), n2mdp_rd(R + 0x118u), m0, (m0 >> 11) & 1u, (m0 >> 10) & 1u, m1,
++	    (m1 >> 8) & 0x7ffu, (m1 >> 20) & 1u, hv & 0xfffu, (hv >> 16) & 0xfffu);
++	uint32_t dbg[8];
++	for (unsigned k = 0; k < 8; k++) { n2mdp_wr(W + 0x018u, (k + 1u) << 8); dbg[k] = n2mdp_rd(W + 0x0d0u); }
++	N2MDP_LOG("NORD2 MDP DIAG %s: WROT CTRL %#x MAIN_BUF %#x SUB_BUF %#x INT %#x TAR %#x IN %#x STRIDE %#x BASE %#x OFST %#x ROT_EN %#x"
++	    " RST %#x/%#x EOL %#x PENDING0 %#x FRAME %#x | dbg1-8 %#x %#x %#x %#x %#x %#x %#x %#x\n", when, n2mdp_rd(W + 0x0u), n2mdp_rd(W + 0x8u),
++	    n2mdp_rd(W + 0xcu), n2mdp_rd(W + 0x1cu), n2mdp_rd(W + 0x24u), n2mdp_rd(W + 0x78u), n2mdp_rd(W + 0x30u), n2mdp_rd(W + 0xf00u),
++	    n2mdp_rd(W + 0x2cu), n2mdp_rd(W + 0x7cu), n2mdp_rd(W + 0x10u), n2mdp_rd(W + 0x14u), n2mdp_rd(W + 0x70u), n2mdp_rd(W + 0xe0u),
++	    n2mdp_rd(W + 0x28u), dbg[0], dbg[1], dbg[2], dbg[3], dbg[4], dbg[5], dbg[6], dbg[7]);
++	N2MDP_LOG("NORD2 MDP DIAG %s: MUTEX INTEN %#x INTSTA %#x (sof %u eof %u) EN %#x SOF %#x MOD0 %#x MOD1 %#x | TOPO RDMA0 MOUT %#x RDMA2 MOUT %#x"
++	    " WROT0 SEL %#x WROT2 SEL %#x MASK %#x %#x %#x | DL_VALID %#x %#x %#x DL_READY %#x %#x %#x | UNDERRUN %#x id %#x | CG %#x %#x %#x"
++	    " | ev wrot %u rdma %u | M4U1 FAULT %#x\n", when, n2mdp_rd(X + 0x0u), n2mdp_rd(X + 0x4u), (n2mdp_rd(X + 0x4u) >> mid) & 1u,
++	    (n2mdp_rd(X + 0x4u) >> (mid + 16u)) & 1u, n2mdp_rd(N2MDP_MUTEX_EN(mid)), n2mdp_rd(N2MDP_MUTEX_SOF(mid)), n2mdp_rd(N2MDP_MUTEX_MOD0(mid)),
++	    n2mdp_rd(N2MDP_MUTEX_MOD1(mid)), n2mdp_rd(0xf20u), n2mdp_rd(0xf28u), n2mdp_rd(0xf70u), n2mdp_rd(0xf78u), n2mdp_rd(0xfd0u),
++	    n2mdp_rd(0xfd4u), n2mdp_rd(0xfd8u), n2mdp_rd(0xfe0u), n2mdp_rd(0xfe4u), n2mdp_rd(0xfe8u), n2mdp_rd(0xff0u), n2mdp_rd(0xff4u),
++	    n2mdp_rd(0xff8u), n2mdp_rd(0xe00u), n2mdp_rd(0xe04u), n2mdp_rd(0x100u), n2mdp_rd(0x110u), n2mdp_rd(0x120u),
++	    n2mdp_gce_event(N2MDP_EV_WROT_DONE(p->pipe)), n2mdp_gce_event(N2MDP_EV_RDMA_DONE(p->pipe)), n2mdp_rd(0x27000u + 0x134u));
++	n2mdp_larb_dump(when);
++}
++
+ /* abort: stop the mutex, reset the engines of the pipe; never leaves a DMA running */
+ static void
+ n2mdp_abort(const struct n2mdp_prog *p, const char *why)
+ {
+ 	uint32_t R = N2MDP_W_RDMA(p->pipe), W = N2MDP_W_WROT(p->pipe);
++	n2mdp_diag(p, "timeout");
+ 	N2MDP_LOG("NORD2 MDP ABORT (%s): mutex EN %#x INTSTA %#x MOD0 %#x | RDMA EN %#x MON0 %#x MON1 %#x | WROT CTRL %#x ROT_EN %#x "
+ 	    "RST_STAT %#x | ev wrot %u rdma %u\n", why, n2mdp_rd(N2MDP_MUTEX_EN(p->mutex)), n2mdp_rd(N2MDP_W_MUTEX + 4u),
+ 	    n2mdp_rd(N2MDP_MUTEX_MOD0(p->mutex)), n2mdp_rd(R + R_EN), n2mdp_rd(R + 0x400u), n2mdp_rd(R + R_MON1), n2mdp_rd(W + W_CTRL),
+@@ -750,12 +845,17 @@
+ 		case N2MDP_OP_GO:
+ 			n2mdp_gce_clear(o->val);
+ 			n2mdp_gce_clear(N2MDP_EV_RDMA_DONE(p->pipe));
++			n2mdp_wr(N2MDP_W_MUTEX + 4u, ~((1u << p->mutex) | (1u << (p->mutex + 16u))));   /* INTSTA: 0 clears (sof, eof) */
++			if (n2mdp_diag_logged < 2) { n2mdp_diag(p, "before GO"); }
+ 			t0 = n2mdp_now_us();
+ 			n2mdp_wr(o->off, (n2mdp_rd(o->off) & ~1u) | 1u);
++			if (n2mdp_diag_logged < 2) { n2mdp_delay(50); n2mdp_diag(p, "GO+50us"); }
+ 			break;
+ 		case N2MDP_OP_WAIT: {
+ 			unsigned k = 0;
+-			while (!(n2mdp_gce_event(o->val) & 1u)) {
++			/* 0674: done = WROT frame-done GCE event OR the mutex end-of-frame status bit (INTSTA bit id+16 = eof, bit id = sof;
++			 * mtk_drm_ddp.c mtk_disp_mutex_irq_handler); the q10jmdp3 log had sof set and eof clear at the timeout */
++			while (!(n2mdp_gce_event(o->val) & 1u) && !((n2mdp_rd(N2MDP_W_MUTEX + 4u) >> (p->mutex + 16u)) & 1u)) {
+ 				if (k < 50) { n2mdp_delay(20); } else { n2mdp_delay(200); }
+ 				if (++k > 1000) {   /* ~190 ms */
+ 					n2mx.timeouts++;
+@@ -766,9 +866,10 @@
+ 			busy += n2mdp_now_us() - t0;
+ 			if (n2mdp_diag_logged < 3) {
+ 				n2mdp_diag_logged++;
+-				N2MDP_LOG("NORD2 MDP: tile done after %llu us: mutex EN %#x INTSTA %#x RDMA MON1 %#x ev rdma %u\n",
++				N2MDP_LOG("NORD2 MDP: tile done after %llu us: mutex EN %#x INTSTA %#x RDMA MON1 %#x ev wrot %u rdma %u\n",
+ 				    (unsigned long long)(n2mdp_now_us() - t0), n2mdp_rd(o->off), n2mdp_rd(N2MDP_W_MUTEX + 4u),
+-				    n2mdp_rd(N2MDP_W_RDMA(p->pipe) + R_MON1), n2mdp_gce_event(N2MDP_EV_RDMA_DONE(p->pipe)));
++				    n2mdp_rd(N2MDP_W_RDMA(p->pipe) + R_MON1), n2mdp_gce_event(o->val), n2mdp_gce_event(N2MDP_EV_RDMA_DONE(p->pipe)));
++				n2mdp_diag(p, "done");
+ 			}
+ 			break;
+ 		}
+@@ -870,7 +971,16 @@
+ 	int e = n2mdp_run(p, &us);
+ 	n2mdp_flush(dst_va, N2MDP_BUF_SPAN);
+ 	n2mx.jobs++;
+-	if (e) { n2mx.job_fail++; return 3; }
++	if (e) {
++		n2mx.job_fail++;
++		const uint8_t *dd = (const uint8_t *)dst_va;
++		uint32_t changed = 0, first = 0xffffffffu, last = 0;
++		for (uint32_t k = 0; k < N2MDP_BUF_SPAN; k++) { if (dd[k] != N2MDP_GUARD_BYTE) { changed++; if (first == 0xffffffffu) { first = k; } last = k; } }
++		const uint8_t *ss = (const uint8_t *)src_va;
++		N2MDP_LOG("NORD2 MDP: %s failed (%s): destination bytes written %u of %u (first %#x last %#x), first src bytes %02x%02x%02x%02x dst %02x%02x%02x%02x\n",
++		    t->name, e == ETIMEDOUT ? "timeout" : "poll", changed, dbytes, first, last, ss[0], ss[1], ss[2], ss[3], dd[0], dd[1], dd[2], dd[3]);
++		return 3;
++	}
+ 	n2mx.last_us = us; if (us > n2mx.max_us) { n2mx.max_us = us; }
+ 	const uint8_t *d = (const uint8_t *)dst_va;
+ 	uint32_t bad_guard = 0;
+@@ -1097,6 +1207,7 @@
+ 	if (why) { N2MDP_LOG("NORD2 MDP STAGES: not run (%s)\n", why); n2mdp_unlock(); return; }
+ 	if (!n2mdp_gates_on() || !n2mdp_pool_get()) { n2mx.s1 = 9; n2mdp_gates_restore(); N2MDP_LOG("NORD2 MDP STAGES: S1 cannot start (gates/pool)\n"); n2mdp_unlock(); return; }
+ 	for (unsigned p = 0; p < 4; p++) { n2mx.larb_found[p] = n2mdp_rd(N2MDP_W_LARB2 + 0x380u + 4u * p); }
++	if (!n2mdp_larb2_init()) { n2mx.s1 = 9; n2mdp_gates_restore(); N2MDP_LOG("NORD2 MDP STAGES: S1 cannot start (larb2)\n"); n2mdp_unlock(); return; }
+ 	N2MDP_LOG("NORD2 MDP S1: larb2 ports as found %#x %#x %#x %#x (bit0 = MMU_EN; forced 0 for physical jobs)\n", n2mx.larb_found[0],
+ 	    n2mx.larb_found[1], n2mx.larb_found[2], n2mx.larb_found[3]);
+ 	uint32_t pm = 0, fm = 0;

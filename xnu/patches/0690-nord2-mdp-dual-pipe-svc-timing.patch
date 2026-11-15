@@ -1,0 +1,1352 @@
+--- a/bsd/dev/nord2_mdp.inc
++++ b/bsd/dev/nord2_mdp.inc
+@@ -21,7 +21,13 @@
+  * 0687: service speed: IOVA mapping cache (8 entries, page-list hash), page-table flush of the touched range only, 5 us WAIT poll
+  * for the first 3 ms, map / run timing for the service log;
+  * 0688: MDP clock (mdp_sel parent, TVDPLL rate) in the probe log, compile timing;
+- * 0689: per-tile hw times, MDP lock wait, S2 TIMING jobs (rot 0 vs rot 90, tile widths 512..64 px).
++ * 0689: per-tile hw times, MDP lock wait, S2 TIMING jobs (rot 0 vs rot 90, tile widths 512..64 px);
++ * 0690: two pipes at once: unscaled jobs also run on RDMA2 -> WROT2 (direct lane, job.h), one lock per pipe + a map lock + a GCE
++ * token spin lock (the global MDP lock became a rw lock: stages / probe exclusive, service blits shared), resumable executor with
++ * per-run statistics (the 0689 globals mixed the two request streams), S2 pipe-2 capability jobs + a dual-pipe job (both pipes at
++ * once, exact) -> N2MDP_CAP_DUAL; S3 TIMING jobs (same frame physical vs IOVA, IOVA tile widths) with the vendor M4U1 write
++ * ordering / throttle setup measured before / after (kept only if not slower) and the best IOVA rotation tile width for the
++ * service; IOVA cache entries pinned while a job uses them (eviction / fault drop never unmaps a range in use).
+  * (gpu/build/mdp-20261114/MDP_OFFLOAD.md).  Answers "is the MDP powered, clocked and reachable on this phone, and in what
+  * state did the bootloader leave it" before any functional stage (DMA, scaling, rotation) is attempted.
+  *
+@@ -440,6 +446,7 @@
+ #define N2MDP_CAP_SCALE_ROT (1u << 10)
+ #define N2MDP_CAP_IOVA      (1u << 11)
+ #define N2MDP_CAP_RGB_SCALE (1u << 12)
++#define N2MDP_CAP_DUAL      (1u << 14)   /* 0690: pipe-2 direct lane + both pipes at once verified in this boot (service runs 2 jobs) */
+ #define N2MDP_CAP_NV12_DST  (1u << 13)   /* 0686: NV12 destinations (NV12 -> NV12 rotation / copy jobs passed in this boot) */   /* 0683: RGB-source scaling (smooth-pattern jobs passed in this boot) */
+ 
+ /* gates the functional stages keep open (CG_CON0): RDMA0 0, RSZ2 10? no: RSZ0 4 .. see clk-mt6885-mdp.c */
+@@ -457,6 +464,16 @@
+ #define N2MDP_BUF_PT       0x800000u     /* 1 MiB: 64 KiB-aligned M4U1 table block (580 KiB used) */
+ #define N2MDP_GUARD_BYTE   0xa5u
+ #define N2MDP_PREGUARD     0x100000u     /* 0677: pool 0x200000-0x2fffff (unused) = guard below the destination */
++#define N2MDP_BUF_SRC2     0x120000u     /* 0690: dual job, second source (1024x768 NV12 = 0x120000 bytes; ends in the pre-guard) */
++#define N2MDP_BUF_DST2     0x600000u     /* 0690: dual job, second destination + guard up to 0x7fffff (table block starts at 0x800000) */
++/* 0690: kern.n2mdp_tune bits (default all): 1 = vendor M4U1 write setup at S3 (kept only if the S3 TIMING rerun is not slower),
++ * 2 = second pipe for unscaled service requests (needs N2MDP_CAP_DUAL), 4 = S3-measured rotation tile width for the service */
++#define N2MDP_TUNE_M4U     1
++#define N2MDP_TUNE_DUAL    2
++#define N2MDP_TUNE_TILE    4
++static int n2mdp_tune = N2MDP_TUNE_M4U | N2MDP_TUNE_DUAL | N2MDP_TUNE_TILE;
++static int n2mdp_svc_tile_px;            /* kern.n2mdp_svc_tile: 0 = S3 choice (or 512), else 64..512 px for rotated unscaled requests */
++static uint32_t n2mdp_auto_tile16;       /* S3 choice in 16-px units (0 = default 512 px) */
+ 
+ #ifdef N2MDP_HOST
+ extern bool n2mdp_host_pool(uint32_t bytes, uint32_t *pa, vm_offset_t *va);
+@@ -469,6 +486,17 @@
+ #define n2mdp_flush(va, len) ((void)(va), (void)(len))
+ #define n2mdp_lock() ((void)0)
+ #define n2mdp_unlock() ((void)0)
++/* 0690: host model of the per-pipe locks (single-threaded tests mark a pipe busy to see the other one taken) */
++static bool n2mdp_host_pipe_busy[2];
++static bool n2mdp_pipe_trylock(unsigned i) { if (n2mdp_host_pipe_busy[i]) { return false; } n2mdp_host_pipe_busy[i] = true; return true; }
++static void n2mdp_pipe_lock(unsigned i) { n2mdp_host_pipe_busy[i] = true; }
++static void n2mdp_pipe_unlock(unsigned i) { n2mdp_host_pipe_busy[i] = false; }
++#define n2mdp_svc_enter() ((void)0)
++#define n2mdp_svc_exit() ((void)0)
++#define n2mdp_map_lock() ((void)0)
++#define n2mdp_map_unlock() ((void)0)
++#define n2mdp_gce_lock() ((void)0)
++#define n2mdp_gce_unlock() ((void)0)
+ #else
+ #include <sys/vnode.h>
+ #include <kern/locks.h>
+@@ -481,9 +509,25 @@
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ static LCK_GRP_DECLARE(n2mdp_grp, "nord2-mdp");
+-static LCK_MTX_DECLARE(n2mdp_mtx, &n2mdp_grp);
+-#define n2mdp_lock() lck_mtx_lock(&n2mdp_mtx)
+-#define n2mdp_unlock() lck_mtx_unlock(&n2mdp_mtx)
++/* 0690: the MDP lock is a rw lock: exclusive = stages, probe, bring-up (everything that was under the old mutex); shared = service
++ * blits, which then take ONE pipe lock (pipe 0 or pipe 2) for their run, the map lock for the IOVA cache / page tables / fault
++ * state, and the GCE spin lock for the two-register token read.  Order: rw -> pipe -> map; the spin lock is innermost. */
++static LCK_RW_DECLARE(n2mdp_rw, &n2mdp_grp);
++static LCK_MTX_DECLARE(n2mdp_pmtx0, &n2mdp_grp);
++static LCK_MTX_DECLARE(n2mdp_pmtx2, &n2mdp_grp);
++static LCK_MTX_DECLARE(n2mdp_map_mtx, &n2mdp_grp);
++static LCK_SPIN_DECLARE(n2mdp_gce_spin, &n2mdp_grp);
++#define n2mdp_lock() lck_rw_lock_exclusive(&n2mdp_rw)
++#define n2mdp_unlock() lck_rw_unlock_exclusive(&n2mdp_rw)
++#define n2mdp_svc_enter() lck_rw_lock_shared(&n2mdp_rw)
++#define n2mdp_svc_exit() lck_rw_unlock_shared(&n2mdp_rw)
++#define n2mdp_map_lock() lck_mtx_lock(&n2mdp_map_mtx)
++#define n2mdp_map_unlock() lck_mtx_unlock(&n2mdp_map_mtx)
++#define n2mdp_gce_lock() lck_spin_lock(&n2mdp_gce_spin)
++#define n2mdp_gce_unlock() lck_spin_unlock(&n2mdp_gce_spin)
++static bool n2mdp_pipe_trylock(unsigned i) { return lck_mtx_try_lock(i ? &n2mdp_pmtx2 : &n2mdp_pmtx0) != 0; }
++static void n2mdp_pipe_lock(unsigned i) { lck_mtx_lock(i ? &n2mdp_pmtx2 : &n2mdp_pmtx0); }
++static void n2mdp_pipe_unlock(unsigned i) { lck_mtx_unlock(i ? &n2mdp_pmtx2 : &n2mdp_pmtx0); }
+ #endif
+ 
+ static struct {
+@@ -511,8 +555,11 @@
+ static uint32_t
+ n2mdp_gce_event(uint32_t ev)
+ {
++	n2mdp_gce_lock();        /* 0690: ID write + VAL read must not interleave with the other pipe's poll */
+ 	ni_wr(n2mdp.gcem, N2MDP_GCE_TOKEN_ID, ev & 0x3ffu);
+-	return ni_rd(n2mdp.gcem, N2MDP_GCE_TOKEN_VAL);
++	uint32_t v = ni_rd(n2mdp.gcem, N2MDP_GCE_TOKEN_VAL);
++	n2mdp_gce_unlock();
++	return v;
+ }
+ static void n2mdp_gce_clear(uint32_t ev) { ni_wr(n2mdp.gcem, N2MDP_GCE_TOKEN_UPD, ev & 0x3ffu); }
+ 
+@@ -737,6 +784,19 @@
+ 		if (w != v) { n2mdp_wr(N2MDP_W_LARB2 + 0x380u + 4u * p, w); }
+ 	}
+ }
++/* 0690: only the two ports of one pipe (pipe 0: p0 RDMA0 + p2 WROT0; pipe 2: p1 RDMA2 + p3 WROT2), so a job ending on one pipe
++ * never switches the ports of a job still running on the other pipe */
++static void
++n2mdp_larb_mode_pipe(uint32_t pipe, bool iova)
++{
++	unsigned pr = pipe ? 1u : 0u, pw = pipe ? 3u : 2u;
++	for (unsigned q = 0; q < 2; q++) {
++		unsigned p = q ? pw : pr;
++		uint32_t v = n2mdp_rd(N2MDP_W_LARB2 + 0x380u + 4u * p);
++		uint32_t w = iova ? (v | 1u) : (v & ~N2MDP_LARB_NS_PHYS);
++		if (w != v) { n2mdp_wr(N2MDP_W_LARB2 + 0x380u + 4u * p, w); }
++	}
++}
+ 
+ /* ======================================================================================================================
+  * 0674: larb2 bring-up = what the vendor SMI driver does for larb2 when SYS_MDP powers on (smi_drv.c smi_subsys_after_on:
+@@ -910,26 +970,54 @@
+ 	n2mdp_wr(N2MDP_MUTEX_MOD0(p->mutex), 0);
+ }
+ 
+-/* run a compiled program; returns 0, ETIMEDOUT (wait), EIO (poll) */
++/* 0690: resumable executor.  n2mdp_x_step() runs the ops of one program until a WAIT whose tile is not finished (returns 0 =
++ * pending) or until the end / an error (returns 1).  One exec per pipe in flight: a single thread can drive both pipes
++ * (n2mdp_run2, the S2 dual job) and each service thread drives its own pipe (n2mdp_run_x).  Per-run statistics live in the exec,
++ * not in globals (the 0689 globals were read after the lock was released: "tiles 0" lines for the 2048x1536 stream).
++ * Timeout per tile: 200 ms of wall time (was ~9800 polls). */
++struct n2mdp_xstat { uint32_t hw_us, run_us, tiles, polls, tile_us[4], tile_max_us; };
++struct n2mdp_exec {
++	const struct n2mdp_prog *p;
++	uint32_t pc, k;               /* next op; polls of the current WAIT */
++	uint64_t t_start, t0, busy;
++	int err;
++	bool done;
++	struct n2mdp_xstat st;
++};
++#define N2MDP_TILE_TIMEOUT_US 200000u
++static void
++n2mdp_x_init(struct n2mdp_exec *x, const struct n2mdp_prog *p)
++{
++	memset(x, 0, sizeof(*x));
++	x->p = p;
++	x->t_start = n2mdp_now_us();
++}
+ static int
+-n2mdp_run(const struct n2mdp_prog *p, uint32_t *hw_us)
++n2mdp_x_step(struct n2mdp_exec *x)
+ {
+-	uint64_t t0 = 0, busy = 0;
+-	n2mdp_last_tiles = 0;
+-	for (uint32_t i = 0; i < p->n; i++) {
+-		const struct n2mdp_op *o = &p->ops[i];
++	const struct n2mdp_prog *p = x->p;
++	while (!x->done) {
++		if (x->pc >= p->n) { x->done = true; break; }
++		const struct n2mdp_op *o = &p->ops[x->pc];
+ 		switch (o->op) {
+ 		case N2MDP_OP_WRITE: {
+ 			uint32_t v = o->mask == 0xffffffffu ? o->val : ((n2mdp_rd(o->off) & ~o->mask) | (o->val & o->mask));
+ 			n2mdp_wr(o->off, v);
++			x->pc++;
+ 			break;
+ 		}
+ 		case N2MDP_OP_POLL: {
+ 			unsigned k = 0;
+ 			while ((n2mdp_rd(o->off) & o->mask) != o->val) {
+-				if (++k > 500) { n2mdp_abort(p, "poll"); N2MDP_LOG("NORD2 MDP: poll timeout at op %u off %#x want %#x/%#x\n", i, o->off, o->val, o->mask); return EIO; }
++				if (++k > 500) {
++					n2mdp_abort(p, "poll");
++					N2MDP_LOG("NORD2 MDP: poll timeout at op %u off %#x want %#x/%#x\n", x->pc, o->off, o->val, o->mask);
++					x->err = EIO; x->done = true;
++					return 1;
++				}
+ 				n2mdp_delay(10);
+ 			}
++			x->pc++;
+ 			break;
+ 		}
+ 		case N2MDP_OP_GO:
+@@ -937,42 +1025,94 @@
+ 			n2mdp_gce_clear(N2MDP_EV_RDMA_DONE(p->pipe));
+ 			n2mdp_wr(N2MDP_W_MUTEX + 4u, ~((1u << p->mutex) | (1u << (p->mutex + 16u))));   /* INTSTA: 0 clears (sof, eof) */
+ 			if (n2mdp_diag_logged < 2) { n2mdp_diag(p, "before GO"); }
+-			t0 = n2mdp_now_us();
++			x->t0 = n2mdp_now_us();
++			x->k = 0;
+ 			n2mdp_wr(o->off, (n2mdp_rd(o->off) & ~1u) | 1u);
+ 			if (n2mdp_diag_logged < 2) { n2mdp_delay(50); n2mdp_diag(p, "GO+50us"); }
++			x->pc++;
+ 			break;
+ 		case N2MDP_OP_WAIT: {
+-			unsigned k = 0;
+ 			/* 0674: done = WROT frame-done GCE event OR the mutex end-of-frame status bit (INTSTA bit id+16 = eof, bit id = sof;
+ 			 * mtk_drm_ddp.c mtk_disp_mutex_irq_handler); the q10jmdp3 log had sof set and eof clear at the timeout */
+-			while (!(n2mdp_gce_event(o->val) & 1u) && !((n2mdp_rd(N2MDP_W_MUTEX + 4u) >> (p->mutex + 16u)) & 1u)) {
+-				n2mdp_delay(k < 600u ? 5u : 20u);  /* 0687: 5 us for the first ~3 ms (a 1.7 Mpx rotation is ~3 ms), then 20 us */
+-				if (++k > 9800) {   /* ~200 ms */
++			if (!(n2mdp_gce_event(o->val) & 1u) && !((n2mdp_rd(N2MDP_W_MUTEX + 4u) >> (p->mutex + 16u)) & 1u)) {
++				if (n2mdp_now_us() - x->t0 > N2MDP_TILE_TIMEOUT_US) {
+ 					n2mx.timeouts++;
+ 					n2mdp_abort(p, "frame-done event never came");
+-					return ETIMEDOUT;
++					x->err = ETIMEDOUT; x->done = true;
++					return 1;
+ 				}
++				x->k++; x->st.polls++;
++				return 0;
+ 			}
+-			busy += n2mdp_now_us() - t0;
+-			if (n2mdp_last_tiles < 16u) { n2mdp_tile_us[n2mdp_last_tiles] = (uint32_t)(n2mdp_now_us() - t0); }   /* 0689: per-tile hw time */
+-			n2mdp_last_tiles++;
++			uint32_t dt = (uint32_t)(n2mdp_now_us() - x->t0);
++			x->busy += dt;
++			if (x->st.tiles < 4u) { x->st.tile_us[x->st.tiles] = dt; }
++			if (dt > x->st.tile_max_us) { x->st.tile_max_us = dt; }
++			x->st.tiles++;
+ 			if (n2mdp_diag_logged < 3) {
+ 				n2mdp_diag_logged++;
+-				N2MDP_LOG("NORD2 MDP: tile done after %llu us: mutex EN %#x INTSTA %#x RDMA MON1 %#x ev wrot %u rdma %u\n",
+-				    (unsigned long long)(n2mdp_now_us() - t0), n2mdp_rd(o->off), n2mdp_rd(N2MDP_W_MUTEX + 4u),
+-				    n2mdp_rd(N2MDP_W_RDMA(p->pipe) + R_MON1), n2mdp_gce_event(o->val), n2mdp_gce_event(N2MDP_EV_RDMA_DONE(p->pipe)));
++				N2MDP_LOG("NORD2 MDP: tile done after %u us: mutex EN %#x INTSTA %#x RDMA MON1 %#x ev wrot %u rdma %u\n", dt,
++				    n2mdp_rd(o->off), n2mdp_rd(N2MDP_W_MUTEX + 4u), n2mdp_rd(N2MDP_W_RDMA(p->pipe) + R_MON1), n2mdp_gce_event(o->val),
++				    n2mdp_gce_event(N2MDP_EV_RDMA_DONE(p->pipe)));
+ 				n2mdp_diag(p, "done");
+ 			}
++			x->pc++;
+ 			break;
+ 		}
+ 		case N2MDP_OP_END:
+ 		default:
+-			i = p->n;
++			x->done = true;
+ 			break;
+ 		}
+ 	}
+-	if (hw_us) { *hw_us = (uint32_t)busy; }
+-	return 0;
++	x->st.hw_us = (uint32_t)x->busy;
++	x->st.run_us = (uint32_t)(n2mdp_now_us() - x->t_start);
++	return 1;
++}
++/* poll period: 5 us for the first ~600 polls of a tile, then 20 us (0687 values) */
++static inline uint32_t n2mdp_poll_us(uint32_t k) { return k < 600u ? 5u : 20u; }
++
++/* run a compiled program; returns 0, ETIMEDOUT (wait), EIO (poll) */
++static int
++n2mdp_run_x(const struct n2mdp_prog *p, struct n2mdp_xstat *st)
++{
++	struct n2mdp_exec x;
++	n2mdp_x_init(&x, p);
++	while (!n2mdp_x_step(&x)) { n2mdp_delay(n2mdp_poll_us(x.k)); }
++	if (st) { *st = x.st; }
++	return x.err;
++}
++/* 0690: two programs on different pipes at once, driven by this thread (S2 dual job) */
++static void
++n2mdp_run2(const struct n2mdp_prog *a, const struct n2mdp_prog *b, struct n2mdp_xstat *sa, struct n2mdp_xstat *sb, int *ea, int *eb,
++    uint32_t *wall_us)
++{
++	struct n2mdp_exec xa, xb;
++	uint64_t t0 = n2mdp_now_us();
++	n2mdp_x_init(&xa, a);
++	n2mdp_x_init(&xb, b);
++	bool da = false, db = false;
++	for (;;) {
++		if (!da) { da = n2mdp_x_step(&xa) != 0; }
++		if (!db) { db = n2mdp_x_step(&xb) != 0; }
++		if (da && db) { break; }
++		n2mdp_delay(n2mdp_poll_us(xa.k < xb.k ? xa.k : xb.k));
++	}
++	*sa = xa.st; *sb = xb.st; *ea = xa.err; *eb = xb.err;
++	*wall_us = (uint32_t)(n2mdp_now_us() - t0);
++}
++/* legacy entry (stage tests, S3): also fills the 0689 globals read by the S2 TIMING log (exclusive lock held there) */
++static struct n2mdp_xstat n2mdp_tr_st;      /* 0690: statistics of the last n2mdp_run (S3 TIMING log) */
++static int
++n2mdp_run(const struct n2mdp_prog *p, uint32_t *hw_us)
++{
++	struct n2mdp_xstat st;
++	int e = n2mdp_run_x(p, &st);
++	n2mdp_tr_st = st;
++	if (hw_us) { *hw_us = st.hw_us; }
++	n2mdp_last_tiles = st.tiles;
++	for (unsigned i = 0; i < 4u; i++) { n2mdp_tile_us[i] = st.tile_us[i]; }
++	return e;
+ }
+ 
+ /* ---- self-tests ----------------------------------------------------------------------------------------------------- */
+@@ -982,59 +1122,88 @@
+ 	uint16_t sw, sh, dw, dh;
+ 	uint32_t cap;
+ 	uint8_t diag;           /* 0682: S2 diagnostic job: logged as S2 DIAG, never fails / stops S2, no capability */
++	uint8_t pipe2;          /* 0690: run the (unscaled) job on RDMA2 -> WROT2 */
++	uint8_t iova;           /* 0690: S3 TIMING rows: addresses are IOVAs (larb ports translate through M4U1) */
+ };
+ static const struct n2mdp_test n2mdp_tests[] = {
+-	{ "copy256",     N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 0,  1, 1, 256, 256, 256, 256, N2MDP_CAP_COPY, 0 },
+-	{ "rot90",       N2MF_BGRA, N2MF_BGRA, 1, 0, 0, 0,  1, 1, 256, 256, 256, 256, N2MDP_CAP_ROT90, 0 },
++	{ "copy256",     N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 0,  1, 1, 256, 256, 256, 256, N2MDP_CAP_COPY, 0, 0, 0 },
++	{ "rot90",       N2MF_BGRA, N2MF_BGRA, 1, 0, 0, 0,  1, 1, 256, 256, 256, 256, N2MDP_CAP_ROT90, 0, 0, 0 },
+ 	/* 0678: S2 starts with the jobs the camera / VideoToolbox path needs: NV12 -> BGRA (video / full range, WROT matrix 6 / 4),
+ 	 * NV12 -> BGRA rotated 90, NV12 -> BGRA 1/2 and 2x (RSZ alg 2 / alg 0); it stops at the first job that fails */
+-	{ "nv12v",       N2MF_NV12, N2MF_BGRA, 0, 0, 0, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12V, 0 },
+-	{ "nv12f",       N2MF_NV12, N2MF_BGRA, 0, 0, 1, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12F, 0 },
+-	{ "nv12rot90",   N2MF_NV12, N2MF_BGRA, 1, 0, 1, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12F, 0 },
+-	{ "scaledown",   N2MF_NV12, N2MF_BGRA, 0, 0, 1, 0,  0, 2, 512, 512, 256, 256, N2MDP_CAP_SCALE_DN, 0 },
+-	{ "scaleup",     N2MF_NV12, N2MF_BGRA, 0, 0, 1, 0,  0, 2, 128, 128, 256, 256, N2MDP_CAP_SCALE_UP, 0 },
+-	{ "rot180",      N2MF_BGRA, N2MF_BGRA, 2, 0, 0, 0,  1, 2, 256, 128, 256, 128, N2MDP_CAP_ROT180, 0 },
+-	{ "rot270",      N2MF_BGRA, N2MF_BGRA, 3, 0, 0, 0,  1, 2, 256, 128, 128, 256, N2MDP_CAP_ROT270, 0 },
+-	{ "flip",        N2MF_BGRA, N2MF_BGRA, 0, 1, 0, 0,  1, 2, 256, 128, 256, 128, N2MDP_CAP_FLIP, 0 },
+-	{ "tilecopy",    N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 16, 1, 2, 1024, 64, 1024, 64, N2MDP_CAP_TILE, 0 },
+-	{ "tilerot90",   N2MF_BGRA, N2MF_BGRA, 1, 0, 0, 16, 1, 2, 1024, 64, 64, 1024, N2MDP_CAP_TILE, 0 },
+-	{ "scalerot",    N2MF_NV12, N2MF_BGRA, 1, 0, 1, 0,  0, 2, 512, 256, 128, 256, N2MDP_CAP_SCALE_ROT, 0 },
++	{ "nv12v",       N2MF_NV12, N2MF_BGRA, 0, 0, 0, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12V, 0, 0, 0 },
++	{ "nv12f",       N2MF_NV12, N2MF_BGRA, 0, 0, 1, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12F, 0, 0, 0 },
++	{ "nv12rot90",   N2MF_NV12, N2MF_BGRA, 1, 0, 1, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12F, 0, 0, 0 },
++	{ "scaledown",   N2MF_NV12, N2MF_BGRA, 0, 0, 1, 0,  0, 2, 512, 512, 256, 256, N2MDP_CAP_SCALE_DN, 0, 0, 0 },
++	{ "scaleup",     N2MF_NV12, N2MF_BGRA, 0, 0, 1, 0,  0, 2, 128, 128, 256, 256, N2MDP_CAP_SCALE_UP, 0, 0, 0 },
++	{ "rot180",      N2MF_BGRA, N2MF_BGRA, 2, 0, 0, 0,  1, 2, 256, 128, 256, 128, N2MDP_CAP_ROT180, 0, 0, 0 },
++	{ "rot270",      N2MF_BGRA, N2MF_BGRA, 3, 0, 0, 0,  1, 2, 256, 128, 128, 256, N2MDP_CAP_ROT270, 0, 0, 0 },
++	{ "flip",        N2MF_BGRA, N2MF_BGRA, 0, 1, 0, 0,  1, 2, 256, 128, 256, 128, N2MDP_CAP_FLIP, 0, 0, 0 },
++	{ "tilecopy",    N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 16, 1, 2, 1024, 64, 1024, 64, N2MDP_CAP_TILE, 0, 0, 0 },
++	{ "tilerot90",   N2MF_BGRA, N2MF_BGRA, 1, 0, 0, 16, 1, 2, 1024, 64, 64, 1024, N2MDP_CAP_TILE, 0, 0, 0 },
++	{ "scalerot",    N2MF_NV12, N2MF_BGRA, 1, 0, 1, 0,  0, 2, 512, 256, 128, 256, N2MDP_CAP_SCALE_ROT, 0, 0, 0 },
+ 	/* 0682 S2 DIAG jobs (run after the 13 S2 jobs, never stop S2):
+ 	 *   rgbscale1    BGRA 512x256 -> 256x128, 1 tile: RGB source path (RDMA RGB->YUV matrix 0 [V-dis: JPEG profile -> RDMA mtx 0,
+ 	 *                WROT mtx 4]) without tiling
+ 	 *   nv12scale3t  NV12 1024x64 -> 768x48, 3 tiles of 256: tiling without the RGB path
+ 	 *   nv12scale3o  NV12 768x64 -> 1024x48 (horizontal 6-tap upscale, alg 0), 4 tiles: tiling with the 6-tap filter
+ 	 *   rgbscale3t   BGRA 1024x64 -> 768x48, 3 tiles = the q10jmdp10 scaletile job */
+-	{ "rgbscale1",   N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 0,  0, 2, 512, 256, 256, 128, 0, 1 },
+-	{ "nv12scale3t", N2MF_NV12, N2MF_BGRA, 0, 0, 1, 16, 0, 2, 1024, 64, 768, 48, 0, 1 },
+-	{ "nv12scale3o", N2MF_NV12, N2MF_BGRA, 0, 0, 1, 16, 0, 2, 768, 64, 1024, 48, 0, 1 },
+-	{ "rgbscale3t",  N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 16, 0, 2, 1024, 64, 768, 48, 0, 1 },
++	{ "rgbscale1",   N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 0,  0, 2, 512, 256, 256, 128, 0, 1, 0, 0 },
++	{ "nv12scale3t", N2MF_NV12, N2MF_BGRA, 0, 0, 1, 16, 0, 2, 1024, 64, 768, 48, 0, 1, 0, 0 },
++	{ "nv12scale3o", N2MF_NV12, N2MF_BGRA, 0, 0, 1, 16, 0, 2, 768, 64, 1024, 48, 0, 1, 0, 0 },
++	{ "rgbscale3t",  N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 16, 0, 2, 1024, 64, 768, 48, 0, 1, 0, 0 },
+ 	/* 0683: RGB-source scaling on a SMOOTH pattern (no 8-px blue checkerboard, no marker).  The vendor scale pipe carries RGB sources
+ 	 * as YUV (RDMA RGB->YUV, WROT YUV->RGB [V-dis]) and the PQ/RSZ chain resamples chroma, so sharp chroma edges cannot survive
+ 	 * exactly (q10jmdp12s3 rgbscale1: errors only at the checkerboard edges, interior pixels right).  These capability jobs
+ 	 * (diag 2) never stop S2; when both pass, N2MDP_CAP_RGB_SCALE allows RGB-source scaling in the service/blit path.  Accepted
+ 	 * tolerance = the S2 non-exact rule (mean <= 6, <= 1 % of samples over 32) on smooth content. */
+-	{ "rgbscale1s",  N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 0,  0, 2, 512, 256, 256, 128, N2MDP_CAP_RGB_SCALE, 2 },
+-	{ "rgbscale3s",  N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 16, 0, 2, 1024, 64, 768, 48, N2MDP_CAP_RGB_SCALE, 2 },
++	{ "rgbscale1s",  N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 0,  0, 2, 512, 256, 256, 128, N2MDP_CAP_RGB_SCALE, 2, 0, 0 },
++	{ "rgbscale3s",  N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 16, 0, 2, 1024, 64, 768, 48, N2MDP_CAP_RGB_SCALE, 2, 0, 0 },
+ 	/* 0686: NV12 -> NV12 (the camera's real request is 420f 1504x1128 -> 420f 1128x1504 rotated 90; 752x564 here = same aspect, fits
+ 	 * the test buffers).  Capability jobs (diag 3): all must pass for N2MDP_CAP_NV12_DST; they never stop S2. */
+-	{ "nv2nv",       N2MF_NV12, N2MF_NV12, 0, 0, 1, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12_DST, 3 },
+-	{ "nv2nvrot90",  N2MF_NV12, N2MF_NV12, 1, 0, 1, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12_DST, 3 },
+-	{ "nv2nvrot180", N2MF_NV12, N2MF_NV12, 2, 0, 1, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12_DST, 3 },
+-	{ "nv2nvrot270", N2MF_NV12, N2MF_NV12, 3, 0, 1, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12_DST, 3 },
+-	{ "nv2nvcam90",  N2MF_NV12, N2MF_NV12, 1, 0, 1, 0,  0, 2, 752, 564, 564, 752, N2MDP_CAP_NV12_DST, 3 },
++	{ "nv2nv",       N2MF_NV12, N2MF_NV12, 0, 0, 1, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12_DST, 3, 0, 0 },
++	{ "nv2nvrot90",  N2MF_NV12, N2MF_NV12, 1, 0, 1, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12_DST, 3, 0, 0 },
++	{ "nv2nvrot180", N2MF_NV12, N2MF_NV12, 2, 0, 1, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12_DST, 3, 0, 0 },
++	{ "nv2nvrot270", N2MF_NV12, N2MF_NV12, 3, 0, 1, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12_DST, 3, 0, 0 },
++	{ "nv2nvcam90",  N2MF_NV12, N2MF_NV12, 1, 0, 1, 0,  0, 2, 752, 564, 564, 752, N2MDP_CAP_NV12_DST, 3, 0, 0 },
+ 	/* 0689: timing jobs (diag 5, logged as S2 TIMING, no capability): 1024x768 NV12 -> NV12 rot 0 vs rot 90 and rot 90 with tile widths
+ 	 * 512 / 256 / 128 / 64 px -> rotation penalty and whether narrow rotation tiles write DRAM faster (the 1504x1128 camera rotation
+ 	 * runs at ~0.45 px/clk at 594 MHz) */
+-	{ "tim0_512",    N2MF_NV12, N2MF_NV12, 0, 0, 1, 32, 0, 2, 1024, 768, 1024, 768, 0, 5 },
+-	{ "tim90_512",   N2MF_NV12, N2MF_NV12, 1, 0, 1, 32, 0, 2, 1024, 768, 768, 1024, 0, 5 },
+-	{ "tim90_256",   N2MF_NV12, N2MF_NV12, 1, 0, 1, 16, 0, 2, 1024, 768, 768, 1024, 0, 5 },
+-	{ "tim90_128",   N2MF_NV12, N2MF_NV12, 1, 0, 1, 8,  0, 2, 1024, 768, 768, 1024, 0, 5 },
+-	{ "tim90_64",    N2MF_NV12, N2MF_NV12, 1, 0, 1, 4,  0, 2, 1024, 768, 768, 1024, 0, 5 },
++	{ "tim0_512",    N2MF_NV12, N2MF_NV12, 0, 0, 1, 32, 0, 2, 1024, 768, 1024, 768, 0, 5, 0, 0 },
++	{ "tim90_512",   N2MF_NV12, N2MF_NV12, 1, 0, 1, 32, 0, 2, 1024, 768, 768, 1024, 0, 5, 0, 0 },
++	{ "tim90_256",   N2MF_NV12, N2MF_NV12, 1, 0, 1, 16, 0, 2, 1024, 768, 768, 1024, 0, 5, 0, 0 },
++	{ "tim90_128",   N2MF_NV12, N2MF_NV12, 1, 0, 1, 8,  0, 2, 1024, 768, 768, 1024, 0, 5, 0, 0 },
++	{ "tim90_64",    N2MF_NV12, N2MF_NV12, 1, 0, 1, 4,  0, 2, 1024, 768, 768, 1024, 0, 5, 0, 0 },
++	/* 0690: pipe-2 direct lane (RDMA2 -> WROT2) capability jobs (diag 6): the pipe-0 unscaled S1/S2 set again on pipe 2; all must pass
++	 * (+ the dual job, both pipes at once) for N2MDP_CAP_DUAL, which lets the service run two unscaled requests at the same time */
++	{ "p2copy256",   N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 0,  1, 2, 256, 256, 256, 256, 0, 6, 1, 0 },
++	{ "p2rot90",     N2MF_BGRA, N2MF_BGRA, 1, 0, 0, 0,  1, 2, 256, 256, 256, 256, 0, 6, 1, 0 },
++	{ "p2nv12v",     N2MF_NV12, N2MF_BGRA, 0, 0, 0, 0,  0, 2, 256, 256, 256, 256, 0, 6, 1, 0 },
++	{ "p2nv12f",     N2MF_NV12, N2MF_BGRA, 0, 0, 1, 0,  0, 2, 256, 256, 256, 256, 0, 6, 1, 0 },
++	{ "p2nv12rot90", N2MF_NV12, N2MF_BGRA, 1, 0, 1, 0,  0, 2, 256, 256, 256, 256, 0, 6, 1, 0 },
++	{ "p2rot180",    N2MF_BGRA, N2MF_BGRA, 2, 0, 0, 0,  1, 2, 256, 128, 256, 128, 0, 6, 1, 0 },
++	{ "p2rot270",    N2MF_BGRA, N2MF_BGRA, 3, 0, 0, 0,  1, 2, 256, 128, 128, 256, 0, 6, 1, 0 },
++	{ "p2flip",      N2MF_BGRA, N2MF_BGRA, 0, 1, 0, 0,  1, 2, 256, 128, 256, 128, 0, 6, 1, 0 },
++	{ "p2tilecopy",  N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 16, 1, 2, 1024, 64, 1024, 64, 0, 6, 1, 0 },
++	{ "p2tilerot90", N2MF_BGRA, N2MF_BGRA, 1, 0, 0, 16, 1, 2, 1024, 64, 64, 1024, 0, 6, 1, 0 },
++	{ "p2nv2nv",     N2MF_NV12, N2MF_NV12, 0, 0, 1, 0,  0, 2, 256, 256, 256, 256, 0, 6, 1, 0 },
++	{ "p2nv2nvr90",  N2MF_NV12, N2MF_NV12, 1, 0, 1, 0,  0, 2, 256, 256, 256, 256, 0, 6, 1, 0 },
++	{ "p2nv2nvr180", N2MF_NV12, N2MF_NV12, 2, 0, 1, 0,  0, 2, 256, 256, 256, 256, 0, 6, 1, 0 },
++	{ "p2nv2nvr270", N2MF_NV12, N2MF_NV12, 3, 0, 1, 0,  0, 2, 256, 256, 256, 256, 0, 6, 1, 0 },
++	{ "p2nv2nvcam",  N2MF_NV12, N2MF_NV12, 1, 0, 1, 0,  0, 2, 752, 564, 564, 752, 0, 6, 1, 0 },
++	{ "p2tim90_512", N2MF_NV12, N2MF_NV12, 1, 0, 1, 32, 0, 2, 1024, 768, 768, 1024, 0, 5, 1, 0 },
++	/* 0690: S3 TIMING rows (stage 4 = run by n2mdp_s3_timing after S3 passed, never by the stage loop): the S2 timing frame again,
++	 * physical vs through M4U1 (pool pages mapped linearly, so only the translation differs), and the IOVA tile widths */
++	{ "phys90_512",  N2MF_NV12, N2MF_NV12, 1, 0, 1, 32, 0, 4, 1024, 768, 768, 1024, 0, 7, 0, 0 },
++	{ "iova90_512",  N2MF_NV12, N2MF_NV12, 1, 0, 1, 32, 0, 4, 1024, 768, 768, 1024, 0, 7, 0, 1 },
++	{ "iova90_256",  N2MF_NV12, N2MF_NV12, 1, 0, 1, 16, 0, 4, 1024, 768, 768, 1024, 0, 7, 0, 1 },
++	{ "iova90_128",  N2MF_NV12, N2MF_NV12, 1, 0, 1, 8,  0, 4, 1024, 768, 768, 1024, 0, 7, 0, 1 },
++	{ "iova90_64",   N2MF_NV12, N2MF_NV12, 1, 0, 1, 4,  0, 4, 1024, 768, 768, 1024, 0, 7, 0, 1 },
++	{ "iova0_512",   N2MF_NV12, N2MF_NV12, 0, 0, 1, 32, 0, 4, 1024, 768, 1024, 768, 0, 7, 0, 1 },
+ };
+ #define N2MDP_NTESTS (sizeof(n2mdp_tests) / sizeof(n2mdp_tests[0]))
+ 
+ static struct n2mdp_prog n2mdp_prog_buf;     /* one program at a time (under n2mdp_lock) */
++static struct n2mdp_prog n2mdp_pprog[2];     /* 0690: per-pipe programs of the service (under that pipe's lock) and of the dual job */
+ 
+ static bool
+ n2mdp_pool_get(void)
+@@ -1084,6 +1253,7 @@
+ 	n2mdp_img_setup(&j.dst, t->dfmt, t->dw, t->dh, dst_pa, 0);
+ 	j.rot = t->rot; j.flip = t->flip; j.tile_w = t->tile16; j.rgb_swap = (uint8_t)n2mx.rgb_swap; j.wrot_lines = (uint8_t)n2mx.wrot_lines;
+ 	j.allow_unverified = t->diag;
++	j.pipe2 = t->pipe2;     /* 0690 */
+ 	uint8_t *s0 = (uint8_t *)src_va, *s1 = n2mf_is_yuv(j.src.fmt) ? (uint8_t *)src_va + (j.src.addr[1] - j.src.addr[0]) : NULL;
+ 	uint32_t sbytes = n2mdp_img_bytes(&j.src), dbytes = n2mdp_img_bytes(&j.dst);
+ 	n2mdp_pattern(&j.src, s0, s1, (uint32_t)(t - n2mdp_tests) | (t->diag == 2 ? 0x100u : 0u));
+@@ -1097,8 +1267,9 @@
+ again:
+ 	if (n2mdp_compile(&j, p) != 0) { N2MDP_LOG("NORD2 MDP: %s: compile error %d\n", t->name, p->err); return 2; }
+ 	uint32_t us = 0;
+-	n2mdp_larb_mode(false);
++	n2mdp_larb_mode(t->iova != 0);            /* 0690: S3 TIMING rows translate through M4U1 */
+ 	int e = n2mdp_run(p, &us);
++	if (t->iova) { n2mdp_larb_mode(false); }
+ 	n2mdp_flush(dst_va, N2MDP_BUF_SPAN);
+ 	n2mx.jobs++;
+ 	if (e) {
+@@ -1150,10 +1321,78 @@
+ 	return m ? 5 : 0;
+ }
+ 
++/* 0690: dual-pipe job: pipe 0 (RDMA0 -> WROT0) and pipe 2 (RDMA2 -> WROT2) started together by this thread, each on its own
++ * buffers (A: SRC -> DST, B: SRC2 -> DST2), both outputs must be exact and stay inside their buffers.  Pass 0 runs A alone then B
++ * alone (serial), pass 1 both at once: "wall" vs "serial" is what two concurrent service requests gain, and the per-pipe hw times
++ * show how much each pipe slows down when both use DRAM.  1024x768 NV12 -> NV12, A rot 90, B rot 270. */
++static bool
++n2mdp_dual_guard_ok(vm_offset_t dva, uint32_t dbytes, uint32_t span)
++{
++	const uint8_t *d = (const uint8_t *)dva;
++	for (uint32_t k = dbytes; k < span; k += 61u) { if (d[k] != N2MDP_GUARD_BYTE) { return false; } }
++	return true;
++}
++static bool
++n2mdp_dual_test(void)
++{
++	struct n2mdp_job ja, jb;
++	const uint32_t W = 1024, H = 768;
++	memset(&ja, 0, sizeof(ja)); memset(&jb, 0, sizeof(jb));
++	n2mdp_img_setup(&ja.src, N2MF_NV12, W, H, n2mx.pool_pa + N2MDP_BUF_SRC, 1);
++	n2mdp_img_setup(&ja.dst, N2MF_NV12, H, W, n2mx.pool_pa + N2MDP_BUF_DST, 0);
++	n2mdp_img_setup(&jb.src, N2MF_NV12, W, H, n2mx.pool_pa + N2MDP_BUF_SRC2, 1);
++	n2mdp_img_setup(&jb.dst, N2MF_NV12, H, W, n2mx.pool_pa + N2MDP_BUF_DST2, 0);
++	ja.rot = 1; jb.rot = 3; jb.pipe2 = 1; ja.wrot_lines = jb.wrot_lines = (uint8_t)n2mx.wrot_lines;
++	vm_offset_t sav = n2mx.pool_va + N2MDP_BUF_SRC, sbv = n2mx.pool_va + N2MDP_BUF_SRC2;
++	vm_offset_t dav = n2mx.pool_va + N2MDP_BUF_DST, dbv = n2mx.pool_va + N2MDP_BUF_DST2;
++	uint32_t s1off = ja.src.addr[1] - ja.src.addr[0], d1off = ja.dst.addr[1] - ja.dst.addr[0];
++	uint32_t sbytes = n2mdp_img_bytes(&ja.src), dbytes = n2mdp_img_bytes(&ja.dst);
++	if (N2MDP_BUF_SRC2 + sbytes > N2MDP_BUF_DST || dbytes > N2MDP_BUF_SPAN) { return false; }
++	n2mdp_pattern(&ja.src, (uint8_t *)sav, (uint8_t *)sav + s1off, 61);
++	n2mdp_pattern(&jb.src, (uint8_t *)sbv, (uint8_t *)sbv + s1off, 62);
++	n2mdp_flush(sav, sbytes); n2mdp_flush(sbv, sbytes);
++	struct n2mdp_xstat a1, b1, a2, b2;
++	memset(&a1, 0, sizeof(a1)); memset(&b1, 0, sizeof(b1)); memset(&a2, 0, sizeof(a2)); memset(&b2, 0, sizeof(b2));
++	uint32_t wall = 0, serial = 0;
++	const char *why = NULL;
++	for (int pass = 0; pass < 2 && !why; pass++) {
++		memset((void *)dav, N2MDP_GUARD_BYTE, N2MDP_BUF_SPAN); n2mdp_flush(dav, N2MDP_BUF_SPAN);
++		memset((void *)dbv, N2MDP_GUARD_BYTE, N2MDP_BUF_SPAN); n2mdp_flush(dbv, N2MDP_BUF_SPAN);
++		if (n2mdp_compile(&ja, &n2mdp_pprog[0]) || n2mdp_compile(&jb, &n2mdp_pprog[1])) { why = "compile"; break; }
++		if (n2mdp_pprog[0].pipe != N2MDP_PIPE_DIRECT || n2mdp_pprog[1].pipe != N2MDP_PIPE_SCALE || n2mdp_pprog[1].scaled) { why = "pipe choice"; break; }
++		n2mdp_larb_mode(false);
++		int ea = 0, eb = 0;
++		if (pass == 0) {
++			uint64_t t0 = n2mdp_now_us();
++			ea = n2mdp_run_x(&n2mdp_pprog[0], &a1);
++			if (!ea) { eb = n2mdp_run_x(&n2mdp_pprog[1], &b1); }
++			serial = (uint32_t)(n2mdp_now_us() - t0);
++		} else {
++			n2mdp_run2(&n2mdp_pprog[0], &n2mdp_pprog[1], &a2, &b2, &ea, &eb, &wall);
++		}
++		n2mx.jobs += 2;
++		n2mdp_flush(dav, N2MDP_BUF_SPAN); n2mdp_flush(dbv, N2MDP_BUF_SPAN);
++		if (ea || eb) { n2mx.job_fail++; why = ea ? "pipe 0 did not finish" : "pipe 2 did not finish"; break; }
++		if (!n2mdp_dual_guard_ok(dav, dbytes, N2MDP_BUF_SPAN) || !n2mdp_dual_guard_ok(dbv, dbytes, N2MDP_BUF_SPAN)) { why = "write outside a destination"; break; }
++		struct n2mdp_cmp ca, cb;
++		int ma = n2mdp_compare_nv12(&ja, (uint8_t *)sav, (uint8_t *)sav + s1off, (uint8_t *)dav, (uint8_t *)dav + d1off, &ca);
++		int mb = n2mdp_compare_nv12(&jb, (uint8_t *)sbv, (uint8_t *)sbv + s1off, (uint8_t *)dbv, (uint8_t *)dbv + d1off, &cb);
++		if (ma || mb || ca.max_err || cb.max_err) {
++			N2MDP_LOG("NORD2 MDP S2 DUAL: pass %d mismatch: pipe 0 max err %u over %u, pipe 2 max err %u over %u\n", pass, ca.max_err, ca.over, cb.max_err, cb.over);
++			why = "output mismatch";
++		}
++	}
++	if (why) { N2MDP_LOG("NORD2 MDP S2 DUAL: FAILED (%s): dual-pipe service off\n", why); return false; }
++	N2MDP_LOG("NORD2 MDP S2 DUAL: ok | alone p0 hw %u run %u, p2 hw %u run %u (serial %u us) | together p0 hw %u p2 hw %u wall %u us (%u%% of serial)\n",
++	    a1.hw_us, a1.run_us, b1.hw_us, b1.run_us, serial, a2.hw_us, b2.hw_us, wall, serial ? wall * 100u / serial : 0u);
++	return true;
++}
++
++static inline uint32_t n2mdp_bit(unsigned i) { return i < 32u ? 1u << i : 0u; }   /* 0690: the test table has more than 32 rows */
+ static uint32_t
+ n2mdp_stage_tests(unsigned stage, uint32_t *pass_mask, uint32_t *fail_mask)
+ {
+-	uint32_t pass = 0, fail = 0, code = 1, rgb_pass = 0, rgb_fail = 0, nvd_pass = 0, nvd_fail = 0;
++	uint32_t pass = 0, fail = 0, code = 1, rgb_pass = 0, rgb_fail = 0, nvd_pass = 0, nvd_fail = 0, p2_n = 0, p2_pass = 0, p2_fail = 0;
+ 	for (unsigned i = 0; i < N2MDP_NTESTS; i++) {
+ 		const struct n2mdp_test *t = &n2mdp_tests[i];
+ 		if (t->stage != stage) { continue; }
+@@ -1174,9 +1413,10 @@
+ 		if (r == 3 && stage == 1 && i == 0) { n2mx.wrot_lines = 0; }
+ 		if (t->diag) {   /* 0682: separates the multi-tile / RGB-source scale questions; never affects S2 */
+ 			N2MDP_LOG("NORD2 MDP S2 DIAG %s: %s (code %d)\n", t->name, r == 0 ? "PASS" : "FAIL", r ? r + 1 : 1);
+-			if (r == 0) { n2mx.s2_diag |= 1u << i; }
++			if (r == 0) { n2mx.s2_diag |= n2mdp_bit(i); }
+ 			if (t->diag == 2) { if (r == 0 && !(rgb_fail)) { rgb_pass++; } else { rgb_fail = 1; } }
+ 			if (t->diag == 3) { if (r == 0 && !nvd_fail) { nvd_pass++; } else { nvd_fail = 1; } }
++			if (t->diag == 6) { p2_n++; if (r == 0 && !p2_fail) { p2_pass++; } else { p2_fail = 1; } }   /* 0690: pipe-2 direct lane */
+ 			if (t->diag == 5) {   /* 0689: timing job: hw time per tile width / rotation (rotation penalty, tile-width effect) */
+ 				N2MDP_LOG("NORD2 MDP S2 TIMING %s: %ux%u NV12 -> NV12 rot %u tile %u px: %s hw %u us over %u tiles (%u %u %u %u ...)\n", t->name, t->sw,
+ 				    t->sh, t->rot, (t->tile16 ? t->tile16 : 32u) * 16u, r == 0 ? "ok" : "FAILED", n2mx.last_us, n2mdp_last_tiles,
+@@ -1184,9 +1424,9 @@
+ 			}
+ 			continue;
+ 		}
+-		if (r == 0) { pass |= 1u << i; n2mx.caps |= t->cap; }
++		if (r == 0) { pass |= n2mdp_bit(i); n2mx.caps |= t->cap; }
+ 		else {
+-			fail |= 1u << i; if (code == 1) { code = (uint32_t)r + 1u; }
++			fail |= n2mdp_bit(i); if (code == 1) { code = (uint32_t)r + 1u; }
+ 			if (r == 3 || r == 4) { break; }     /* the hardware did not finish or wrote outside: stop this stage at once */
+ 			if (stage == 2) {                    /* 0678: S2 stops at its first failing job */
+ 				N2MDP_LOG("NORD2 MDP S2: stopped at the first failing job (%s, code %d); remaining S2 jobs skipped\n", t->name, r + 1);
+@@ -1195,9 +1435,17 @@
+ 		}
+ 	}
+ 	/* a capability shared by several tests (TILE) counts only if all of them passed */
+-	for (unsigned i = 0; i < N2MDP_NTESTS; i++) { if (fail & (1u << i)) { n2mx.caps &= ~n2mdp_tests[i].cap; } }
++	for (unsigned i = 0; i < N2MDP_NTESTS; i++) { if (fail & n2mdp_bit(i)) { n2mx.caps &= ~n2mdp_tests[i].cap; } }
+ 	if (stage == 2 && nvd_pass == 5u && !nvd_fail) { n2mx.caps |= N2MDP_CAP_NV12_DST; N2MDP_LOG("NORD2 MDP S2: NV12 destinations enabled (NV12 -> NV12 jobs passed)\n"); }
+ 	if (stage == 2 && rgb_pass == 2u && !rgb_fail) { n2mx.caps |= N2MDP_CAP_RGB_SCALE; N2MDP_LOG("NORD2 MDP S2: RGB-source scaling enabled (smooth jobs passed)\n"); }
++	if (stage == 2 && p2_n) {   /* 0690: second pipe for unscaled service requests: every pipe-2 job + the dual job (both pipes at once) */
++		if (p2_pass == p2_n && !p2_fail && n2mdp_dual_test()) {
++			n2mx.caps |= N2MDP_CAP_DUAL;
++			N2MDP_LOG("NORD2 MDP S2: dual pipe enabled (%u pipe-2 jobs + dual job passed)\n", p2_n);
++		} else if (p2_pass != p2_n || p2_fail) {
++			N2MDP_LOG("NORD2 MDP S2: dual pipe off (pipe-2 jobs passed %u of %u)\n", p2_pass, p2_n);
++		}
++	}
+ 	*pass_mask = pass; *fail_mask = fail;
+ 	return fail ? code : 1u;
+ }
+@@ -1292,10 +1540,14 @@
+ /* 0687: IOVA mapping cache for the service path.  Key = FNV-1a over the page list + page count; a hit re-uses the IOVA range
+  * (no table writes, no TLB work).  The MDP only reaches a cached range when a request's page list hashes to the same key, i.e. the
+  * same physical pages, so a stale entry (surface freed) is never used for other memory; entries are evicted LRU (unmapped), and the
+- * whole cache is dropped on an IOVA fault.  8 entries ~ the camera's buffer rotation. */
++ * whole cache is dropped on an IOVA fault.  8 entries ~ the camera's buffer rotation.
++ * 0690: two jobs can run at once, so an entry in use is pinned (busy count): eviction only takes idle entries, a fault drop marks
++ * busy entries dead (unmapped when their last user releases them), and with every entry busy the job gets a temporary mapping
++ * that is unmapped at its end.  Everything here runs under the map lock (or the exclusive MDP lock at boot). */
+ #define N2MDP_MC_N 8u
+-static struct { uint64_t key; uint32_t n, iova, lru; } n2mdp_mc[N2MDP_MC_N];
+-static uint32_t n2mdp_mc_tick, n2mdp_mc_hits, n2mdp_mc_miss;
++static struct { uint64_t key; uint32_t n, iova, lru, busy; bool dead; } n2mdp_mc[N2MDP_MC_N];
++static uint32_t n2mdp_mc_tick, n2mdp_mc_hits, n2mdp_mc_miss, n2mdp_mc_temp;
++static uint32_t n2mdp_fault_gen;                                           /* 0690: incremented at every IOVA fault seen */
+ uint32_t n2mdp_last_map_us, n2mdp_last_run_us, n2mdp_last_compile_us;     /* 0687/0688: read by the service log (C linkage) */
+ uint32_t n2mdp_last_lockwait_us, n2mdp_last_tiles, n2mdp_tile_us[16];    /* 0689: wait for the MDP lock (another request running), tiles */
+ static uint64_t
+@@ -1309,39 +1561,58 @@
+ n2mdp_mc_drop(void)
+ {
+ 	for (unsigned i = 0; i < N2MDP_MC_N; i++) {
+-		if (n2mdp_mc[i].key) { n2mdp_iova_unmap(n2mdp_mc[i].iova, n2mdp_mc[i].n); n2mdp_mc[i].key = 0; }
++		if (!n2mdp_mc[i].key) { continue; }
++		if (n2mdp_mc[i].busy) { n2mdp_mc[i].dead = true; continue; }   /* 0690: unmapped by the last n2mdp_mc_put */
++		n2mdp_iova_unmap(n2mdp_mc[i].iova, n2mdp_mc[i].n); n2mdp_mc[i].key = 0;
+ 	}
+ }
++/* IOVA of the page list (0 = none) pinned for one job; *slot = cache entry, or N2MDP_MC_N for a temporary mapping */
+ static uint32_t
+-n2mdp_mc_get(const uint64_t *pages, uint32_t n, uint32_t pin)
++n2mdp_mc_get(const uint64_t *pages, uint32_t n, unsigned *slot)
+ {
+ 	uint64_t key = n2mdp_mc_key(pages, n);
+-	unsigned victim = 0;
++	*slot = N2MDP_MC_N;
+ 	for (unsigned i = 0; i < N2MDP_MC_N; i++) {
+-		if (n2mdp_mc[i].key == key && n2mdp_mc[i].n == n) { n2mdp_mc[i].lru = ++n2mdp_mc_tick; n2mdp_mc_hits++; return n2mdp_mc[i].iova; }
+-		if (n2mdp_mc[i].key == 0) { victim = i; }
+-	}
+-	if (n2mdp_mc[victim].key) {          /* full: evict the least recently used entry that is not the one pinned for this job */
+-		uint32_t best = 0xffffffffu;
+-		for (unsigned i = 0; i < N2MDP_MC_N; i++) {
+-			if (n2mdp_mc[i].iova != pin && n2mdp_mc[i].lru < best) { best = n2mdp_mc[i].lru; victim = i; }
++		if (n2mdp_mc[i].key == key && n2mdp_mc[i].n == n && !n2mdp_mc[i].dead) {
++			n2mdp_mc[i].lru = ++n2mdp_mc_tick; n2mdp_mc[i].busy++; n2mdp_mc_hits++; *slot = i;
++			return n2mdp_mc[i].iova;
+ 		}
+ 	}
+ 	for (int tries = 0; tries < 2; tries++) {
+-		if (n2mdp_mc[victim].key) { n2mdp_iova_unmap(n2mdp_mc[victim].iova, n2mdp_mc[victim].n); n2mdp_mc[victim].key = 0; }
++		unsigned victim = N2MDP_MC_N;
++		uint32_t best = 0xffffffffu;
++		for (unsigned i = 0; i < N2MDP_MC_N; i++) {      /* a free entry, else the least recently used idle one */
++			if (!n2mdp_mc[i].key) { victim = i; break; }
++			if (!n2mdp_mc[i].busy && n2mdp_mc[i].lru < best) { best = n2mdp_mc[i].lru; victim = i; }
++		}
++		if (victim < N2MDP_MC_N && n2mdp_mc[victim].key) { n2mdp_iova_unmap(n2mdp_mc[victim].iova, n2mdp_mc[victim].n); n2mdp_mc[victim].key = 0; }
+ 		uint32_t iova = n2mdp_iova_map(pages, n);
+ 		if (iova) {
+-			n2mdp_mc[victim].key = key; n2mdp_mc[victim].n = n; n2mdp_mc[victim].iova = iova; n2mdp_mc[victim].lru = ++n2mdp_mc_tick;
+ 			n2mdp_mc_miss++;
++			if (victim == N2MDP_MC_N) { n2mdp_mc_temp++; return iova; }   /* every entry busy: temporary mapping */
++			n2mdp_mc[victim].key = key; n2mdp_mc[victim].n = n; n2mdp_mc[victim].iova = iova; n2mdp_mc[victim].lru = ++n2mdp_mc_tick;
++			n2mdp_mc[victim].busy = 1; n2mdp_mc[victim].dead = false; *slot = victim;
+ 			return iova;
+ 		}
+-		/* IOVA window fragmented: drop every entry except the pinned one and retry once */
++		/* IOVA window fragmented: drop every idle entry and retry once */
+ 		for (unsigned i = 0; i < N2MDP_MC_N; i++) {
+-			if (n2mdp_mc[i].key && n2mdp_mc[i].iova != pin) { n2mdp_iova_unmap(n2mdp_mc[i].iova, n2mdp_mc[i].n); n2mdp_mc[i].key = 0; }
++			if (n2mdp_mc[i].key && !n2mdp_mc[i].busy) { n2mdp_iova_unmap(n2mdp_mc[i].iova, n2mdp_mc[i].n); n2mdp_mc[i].key = 0; }
+ 		}
+ 	}
+ 	return 0;
+ }
++/* end of a job's use of a range from n2mdp_mc_get */
++static void
++n2mdp_mc_put(unsigned slot, uint32_t iova, uint32_t n)
++{
++	if (!iova) { return; }
++	if (slot >= N2MDP_MC_N) { n2mdp_iova_unmap(iova, n); return; }
++	if (n2mdp_mc[slot].busy) { n2mdp_mc[slot].busy--; }
++	if (!n2mdp_mc[slot].busy && n2mdp_mc[slot].dead) {
++		n2mdp_iova_unmap(n2mdp_mc[slot].iova, n2mdp_mc[slot].n);
++		n2mdp_mc[slot].key = 0; n2mdp_mc[slot].dead = false;
++	}
++}
+ 
+ #ifndef N2MDP_HOST
+ extern addr64_t kvtophys(vm_offset_t va);
+@@ -1404,6 +1675,114 @@
+ 	return res;
+ }
+ 
++/* ---- 0690: S3 TIMING, vendor M4U1 write setup, service rotation tile width ---------------------------------------------
++ * Runs once after S3 passed (exclusive MDP lock).  The S2 TIMING frame (1024x768 NV12 rot 90, ~1.4 ms physical = ~1 px/clk) is run
++ * physical and through M4U1 with the SAME pool pages mapped linearly, so the difference is the translation alone; then IOVA tile
++ * widths 256 / 128 / 64.  The camera requests ran at ~0.45 px/clk through IOVA (q10jmdp19: 2190 us per 512x1128 tile) while the
++ * physical S2 jobs ran at ~1 px/clk: this tells translation cost from DRAM contention.
++ * M4U1 is left by the boot chain as reset (PT_BASE 0); Android's mtk_iommu_hw_init (nord2-current-kernel drivers/iommu/
++ * mtk_iommu_v2.c:4080, mt6885 mt_iommu_plat.h) clears MISC_CTRL IN_ORDER_WR_EN (bits 1/17, CONFIG_MTK_SMI_EXT, MM IOMMUs) and
++ * WR_LEN_CTRL THROT_DIS (bits 5/21).  Applied here only when no other M4U1 master domain (VDEC/VENC/CAM larbs) is powered,
++ * measured before / after, and put back if a job fails, faults or is >10 % slower.  COHERENCE_EN / DCM are not touched. */
++#define N2MDP_M4U1_MISC   0x048u
++#define N2MDP_M4U1_PRIO   0x04cu
++#define N2MDP_M4U1_DCM    0x050u
++#define N2MDP_M4U1_WRLEN  0x054u
++#define N2MDP_M4U1_CTRL   0x110u
++#define N2MDP_M4U1_MISC_INORDER  ((1u << 1) | (1u << 17))
++#define N2MDP_M4U1_WRLEN_THRDIS  ((1u << 5) | (1u << 21))
++static uint32_t n2mdp_m4u_state;     /* 0 not tried, 1 applied, 2 already set, 3 deferred (other masters powered), 4 reverted, 5 off */
++static uint32_t
++n2mdp_m4u1_others_powered(void)
++{
++#ifdef N2MDP_HOST
++	return 0;
++#else
++	uint32_t s = ni_rd(n2mdp.spm, N2MDP_PWR_STA) & ni_rd(n2mdp.spm, N2MDP_PWR_STA2);
++	return s & ((1u << 16) | (1u << 18) | (1u << 12) | (1u << 23) | (1u << 24) | (1u << 26));
++#endif
++}
++static const struct n2mdp_test *
++n2mdp_test_named(const char *name)
++{
++	for (unsigned i = 0; i < N2MDP_NTESTS; i++) { if (!strcmp(n2mdp_tests[i].name, name)) { return &n2mdp_tests[i]; } }
++	return NULL;
++}
++/* one S3 TIMING row; returns run time in us (0 = failed / faulted) */
++static uint32_t
++n2mdp_s3_row(const char *name, uint32_t si, uint32_t di, const char *when)
++{
++	const struct n2mdp_test *t = n2mdp_test_named(name);
++	if (!t) { return 0; }
++	uint32_t crc = 0;
++	memset(&n2mdp_tr_st, 0, sizeof(n2mdp_tr_st));
++	int r = n2mdp_test_run(t, t->iova ? si : n2mx.pool_pa + N2MDP_BUF_SRC, n2mx.pool_va + N2MDP_BUF_SRC,
++	    t->iova ? di : n2mx.pool_pa + N2MDP_BUF_DST, n2mx.pool_va + N2MDP_BUF_DST, &crc);
++	uint32_t fault = n2mdp_rd(N2MDP_M4U1 + 0x134u);
++	if (fault) {
++		N2MDP_LOG("NORD2 MDP S3 TIMING %s: IOVA fault %#x va %#x\n", name, fault, n2mdp_rd(N2MDP_M4U1 + 0x13cu));
++		n2mdp_wr(N2MDP_M4U1 + 0x120u, n2mdp_rd(N2MDP_M4U1 + 0x120u) | (1u << 12));
++		r = 9;
++	}
++	struct n2mdp_xstat *x = &n2mdp_tr_st;
++	N2MDP_LOG("NORD2 MDP S3 TIMING %s%s: %s rot %u tile %u px: %s hw %u run %u us polls %u tiles %u (%u %u %u %u)\n", name, when,
++	    t->iova ? "iova" : "phys", t->rot, (t->tile16 ? t->tile16 : 32u) * 16u, r == 0 ? "ok" : "FAILED", x->hw_us, x->run_us, x->polls,
++	    x->tiles, x->tile_us[0], x->tile_us[1], x->tile_us[2], x->tile_us[3]);
++	return r == 0 ? (x->run_us ? x->run_us : 1u) : 0u;
++}
++static void
++n2mdp_s3_timing(void)
++{
++	static uint64_t pg[N2MDP_BUF_SPAN / 4096u];
++	const uint32_t n = N2MDP_BUF_SPAN / 4096u;
++	for (uint32_t k = 0; k < n; k++) { pg[k] = (uint64_t)n2mx.pool_pa + N2MDP_BUF_SRC + k * 4096u; }
++	uint32_t si = n2mdp_iova_map(pg, n);
++	for (uint32_t k = 0; k < n; k++) { pg[k] = (uint64_t)n2mx.pool_pa + N2MDP_BUF_DST + k * 4096u; }
++	uint32_t di = si ? n2mdp_iova_map(pg, n) : 0;
++	if (!si || !di) { N2MDP_LOG("NORD2 MDP S3 TIMING: no IOVA range\n"); if (si) { n2mdp_iova_unmap(si, n); } return; }
++	static const char *const wnames[4] = { "iova90_512", "iova90_256", "iova90_128", "iova90_64" };
++	static const uint8_t w16[4] = { 32, 16, 8, 4 };
++	uint32_t phys = n2mdp_s3_row("phys90_512", si, di, ""), run[4], best = 0;
++	for (unsigned w = 0; w < 4; w++) {
++		run[w] = n2mdp_s3_row(wnames[w], si, di, "");
++		if (run[w] && (!run[best] || run[w] < run[best])) { best = w; }
++	}
++	(void)n2mdp_s3_row("iova0_512", si, di, "");
++	/* service tile width: the fastest IOVA width, only if >= 3 % faster than 512 (each width was verified exact in S2 and here) */
++	n2mdp_auto_tile16 = (run[0] && run[best] && best != 0 && run[best] * 100u < run[0] * 97u) ? w16[best] : 0u;
++	N2MDP_LOG("NORD2 MDP S3 TIMING: 512-px rotation run phys %u us iova %u us (%u%%); best iova width %u px (%u us) -> service rotation tile %u px\n",
++	    phys, run[0], phys ? run[0] * 100u / phys : 0u, w16[best] * 16u, run[best], n2mdp_auto_tile16 ? n2mdp_auto_tile16 * 16u : 512u);
++	/* vendor M4U1 write setup */
++	uint32_t misc = n2mdp_rd(N2MDP_M4U1 + N2MDP_M4U1_MISC), wl = n2mdp_rd(N2MDP_M4U1 + N2MDP_M4U1_WRLEN);
++	N2MDP_LOG("NORD2 MDP S3 M4U1: as found MISC_CTRL %#x PRIORITY %#x DCM_DIS %#x WR_LEN %#x CTRL %#x\n", misc,
++	    n2mdp_rd(N2MDP_M4U1 + N2MDP_M4U1_PRIO), n2mdp_rd(N2MDP_M4U1 + N2MDP_M4U1_DCM), wl, n2mdp_rd(N2MDP_M4U1 + N2MDP_M4U1_CTRL));
++	uint32_t nmisc = misc & ~N2MDP_M4U1_MISC_INORDER, nwl = wl & ~N2MDP_M4U1_WRLEN_THRDIS, pw = n2mdp_m4u1_others_powered();
++	if (!(n2mdp_tune & N2MDP_TUNE_M4U)) { n2mdp_m4u_state = 5; N2MDP_LOG("NORD2 MDP S3 M4U1: vendor write setup off (kern.n2mdp_tune)\n"); }
++	else if (nmisc == misc && nwl == wl) { n2mdp_m4u_state = 2; N2MDP_LOG("NORD2 MDP S3 M4U1: already as the vendor sets it (in-order write off, throttle on)\n"); }
++	else if (pw) { n2mdp_m4u_state = 3; N2MDP_LOG("NORD2 MDP S3 M4U1: vendor write setup NOT applied: other M4U1 master domains powered (%#x)\n", pw); }
++	else {
++		n2mdp_wr(N2MDP_M4U1 + N2MDP_M4U1_MISC, nmisc);
++		n2mdp_wr(N2MDP_M4U1 + N2MDP_M4U1_WRLEN, nwl);
++		uint32_t a0 = n2mdp_s3_row("iova90_512", si, di, " (vendor M4U1)");
++		uint32_t ab = best ? n2mdp_s3_row(wnames[best], si, di, " (vendor M4U1)") : a0;
++		bool worse = !a0 || !ab || (run[0] && a0 * 100u > run[0] * 110u) || (run[best] && ab * 100u > run[best] * 110u);
++		if (worse) {
++			n2mdp_wr(N2MDP_M4U1 + N2MDP_M4U1_MISC, misc);
++			n2mdp_wr(N2MDP_M4U1 + N2MDP_M4U1_WRLEN, wl);
++			n2mdp_m4u_state = 4;
++		} else {
++			n2mdp_m4u_state = 1;
++			if (a0 && ab && best && ab * 100u < a0 * 97u) { n2mdp_auto_tile16 = w16[best]; }
++			else if (a0 && ab && best && ab * 100u >= a0 * 97u) { n2mdp_auto_tile16 = 0; }
++		}
++		N2MDP_LOG("NORD2 MDP S3 M4U1: vendor write setup MISC_CTRL %#x -> %#x WR_LEN %#x -> %#x: 512 px %u -> %u us, %u px %u -> %u us: %s; service tile %u px\n",
++		    misc, nmisc, wl, nwl, run[0], a0, w16[best] * 16u, run[best], ab, worse ? "REVERTED" : "kept",
++		    n2mdp_auto_tile16 ? n2mdp_auto_tile16 * 16u : 512u);
++	}
++	n2mdp_iova_unmap(di, n);
++	n2mdp_iova_unmap(si, n);
++}
++
+ /* ---- the stage machine ------------------------------------------------------------------------------------------------ */
+ static bool
+ n2mdp_killfile(void)
+@@ -1458,7 +1837,7 @@
+ 	if (n2mx.stage >= 2 && lvl >= 3) {
+ 		n2mx.s3 = n2mdp_stage3();
+ 		N2MDP_LOG("NORD2 MDP S3: %s (code %u)\n", n2mx.s3 == 1 ? "PASS" : "FAIL", n2mx.s3);
+-		if (n2mx.s3 == 1) { n2mx.stage = 3; n2mx.caps |= N2MDP_CAP_IOVA; }
++		if (n2mx.s3 == 1) { n2mx.stage = 3; n2mx.caps |= N2MDP_CAP_IOVA; n2mdp_s3_timing(); }   /* 0690 */
+ 	}
+ done:
+ 	N2MDP_LOG("NORD2 MDP STAGES: stage %u caps %#x s1 %u s2 pass %#x fail %#x s3 %u jobs %u fail %u timeouts %u max %u us\n", n2mx.stage,
+@@ -1475,10 +1854,19 @@
+ 	return (n2mx.stage >= 3 && !n2mx.killed) ? n2mx.caps : 0;
+ }
+ 
+-/* one blit between two page-listed images (IOVA path).  Returns 0 or an errno; never leaves anything mapped. */
++/* one blit between two page-listed images (IOVA path).  Returns 0 or an errno; never leaves anything mapped.
++ * 0690: two requests can run at once: scaled requests use pipe 2 (scale lane), unscaled ones pipe 0, or pipe 2's direct lane when
++ * pipe 0 is busy and N2MDP_CAP_DUAL passed (kern.n2mdp_tune bit 2).  Locks: MDP rw lock shared (stages / probe exclusive) -> the
++ * pipe lock for the whole job -> map lock around the IOVA cache / fault state only.  Statistics go to *st (per request). */
++static uint32_t n2mdp_pwait[2];      /* requests waiting for each pipe */
++static uint32_t n2mdp_busy_mask;     /* bit 0 = pipe 0 running a service job, bit 1 = pipe 2 */
++static uint32_t n2mdp_pjobs[2], n2mdp_overlap;
+ int
+-nord2_mdp_blit_pages(const struct n2mdp_pimg *src, const struct n2mdp_pimg *dst, uint32_t rot, uint32_t flip, uint32_t *hw_us)
++nord2_mdp_blit_pages_st(const struct n2mdp_pimg *src, const struct n2mdp_pimg *dst, uint32_t rot, uint32_t flip, struct n2mdp_bstat *st)
+ {
++	struct n2mdp_bstat lst;
++	if (!st) { st = &lst; }
++	memset(st, 0, sizeof(*st));
+ 	uint32_t caps = nord2_mdp_caps();
+ 	if (!(caps & N2MDP_CAP_IOVA)) { return ENODEV; }
+ 	if (rot > 3 || src->npages == 0 || dst->npages == 0 || src->npages > N2MDP_MAX_PAGES || dst->npages > N2MDP_MAX_PAGES) { return EINVAL; }
+@@ -1487,23 +1875,45 @@
+ 	if (flip & 1u) { need |= N2MDP_CAP_FLIP; }
+ 	if (n2mf_is_yuv(src->fmt)) { need |= src->full_range ? N2MDP_CAP_NV12F : N2MDP_CAP_NV12V; }
+ 	uint32_t ow = (rot & 1u) ? dst->h : dst->w, oh = (rot & 1u) ? dst->w : dst->h;
+-	if (ow != src->w || oh != src->h) {
++	bool scaled = ow != src->w || oh != src->h;
++	if (scaled) {
+ 		need |= (ow < src->w || oh < src->h) ? N2MDP_CAP_SCALE_DN : N2MDP_CAP_SCALE_UP;
+ 		if (rot) { need |= N2MDP_CAP_SCALE_ROT; }
+ 	}
+ 	if (ow > 512u) { need |= N2MDP_CAP_TILE; }
+-	if (!n2mf_is_yuv(src->fmt) && (ow != src->w || oh != src->h)) { need |= N2MDP_CAP_RGB_SCALE; }   /* 0683 */
++	if (!n2mf_is_yuv(src->fmt) && scaled) { need |= N2MDP_CAP_RGB_SCALE; }   /* 0683 */
+ 	if (n2mf_is_yuv(dst->fmt)) { need |= N2MDP_CAP_NV12_DST; }   /* 0686 */
+ 	if ((caps & need) != need) { return ENOTSUP; }
+ 	uint64_t tl0 = n2mdp_now_us();
+-	n2mdp_lock();
+-	n2mdp_last_lockwait_us = (uint32_t)(n2mdp_now_us() - tl0);   /* 0689: requests from several client threads are serialised here */
++	n2mdp_svc_enter();
++	unsigned pi;                         /* 0 = pipe 0, 1 = pipe 2 */
++	if (scaled) { pi = 1; }
++	else if ((caps & N2MDP_CAP_DUAL) && (n2mdp_tune & N2MDP_TUNE_DUAL)) {
++		if (n2mdp_pipe_trylock(0)) { pi = 0; goto locked; }
++		if (n2mdp_pipe_trylock(1)) { pi = 1; goto locked; }
++		pi = __atomic_load_n(&n2mdp_pwait[1], __ATOMIC_RELAXED) < __atomic_load_n(&n2mdp_pwait[0], __ATOMIC_RELAXED) ? 1u : 0u;
++	} else { pi = 0; }
++	__atomic_fetch_add(&n2mdp_pwait[pi], 1u, __ATOMIC_RELAXED);
++	n2mdp_pipe_lock(pi);
++	__atomic_fetch_sub(&n2mdp_pwait[pi], 1u, __ATOMIC_RELAXED);
++locked:
++	st->lockwait_us = (uint32_t)(n2mdp_now_us() - tl0);
++	st->pipe = pi ? 2u : 0u;
++	st->overlap = (__atomic_fetch_or(&n2mdp_busy_mask, 1u << pi, __ATOMIC_ACQ_REL) & (1u << (pi ^ 1u))) ? 1u : 0u;
+ 	int err = 0;
++	uint32_t tpx = 512u;
++	unsigned ss = N2MDP_MC_N, ds = N2MDP_MC_N;
+ 	uint64_t tm0 = n2mdp_now_us();
+-	uint32_t si = n2mdp_mc_get(src->pages, src->npages, 0);           /* 0687: cached IOVA ranges */
+-	uint32_t di = si ? n2mdp_mc_get(dst->pages, dst->npages, si) : 0;
+-	n2mdp_last_map_us = (uint32_t)(n2mdp_now_us() - tm0);
+-	if (!si || !di) { err = ENOMEM; si = di = 0; goto out; }
++	n2mdp_map_lock();
++	uint32_t gen0 = n2mdp_fault_gen;
++	uint32_t si = n2mdp_mc_get(src->pages, src->npages, &ss);           /* 0687: cached IOVA ranges (0690: pinned) */
++	uint32_t di = si ? n2mdp_mc_get(dst->pages, dst->npages, &ds) : 0;
++	n2mdp_map_unlock();
++	st->map_us = (uint32_t)(n2mdp_now_us() - tm0);
++	struct n2mdp_prog *pg = &n2mdp_pprog[pi];
++	struct n2mdp_xstat xs;
++	memset(&xs, 0, sizeof(xs));
++	if (!si || !di) { err = ENOMEM; goto out; }
+ 	struct n2mdp_job j;
+ 	memset(&j, 0, sizeof(j));
+ 	j.src.fmt = src->fmt; j.src.w = src->w; j.src.h = src->h; j.src.full_range = src->full_range; j.src.bt709 = src->bt709;
+@@ -1512,27 +1922,56 @@
+ 	j.dst.pitch[0] = dst->pitch[0]; j.dst.pitch[1] = dst->pitch[1]; j.dst.addr[0] = di + dst->off[0]; j.dst.addr[1] = dst->pitch[1] ? di + dst->off[1] : 0;
+ 	j.rot = (uint8_t)rot; j.flip = (uint8_t)(flip & 1u); j.rgb_swap = (uint8_t)n2mx.rgb_swap;
+ 	j.allow_unverified = (caps & N2MDP_CAP_RGB_SCALE) ? 1u : 0u;   /* 0683: RGB scaling only when this boot verified it */
++	j.pipe2 = (pi == 1u && !scaled) ? 1u : 0u;                        /* 0690: direct lane of pipe 2 */
++	if (!scaled && (rot & 1u)) {                                       /* 0690: rotation tile width (S3 TIMING choice / sysctl) */
++		uint32_t t16 = n2mdp_svc_tile_px > 0 ? (uint32_t)n2mdp_svc_tile_px / 16u : ((n2mdp_tune & N2MDP_TUNE_TILE) ? n2mdp_auto_tile16 : 0u);
++		if (t16 >= 4u && t16 <= 32u) { j.tile_w = (uint8_t)t16; tpx = t16 * 16u; }
++	}
+ 	uint64_t tc0 = n2mdp_now_us();
+-	if (n2mdp_compile(&j, &n2mdp_prog_buf)) { err = EINVAL; goto out; }
+-	n2mdp_last_compile_us = (uint32_t)(n2mdp_now_us() - tc0);   /* 0688 */
+-	n2mdp_larb_mode(true);
+-	err = n2mdp_run(&n2mdp_prog_buf, hw_us);
+-	n2mdp_larb_mode(false);
++	if (n2mdp_compile(&j, pg)) { err = EINVAL; goto out; }
++	st->compile_us = (uint32_t)(n2mdp_now_us() - tc0);   /* 0688 */
++	n2mdp_larb_mode_pipe(pg->pipe, true);                 /* 0690: only this pipe's two ports */
++	err = n2mdp_run_x(pg, &xs);
++	n2mdp_larb_mode_pipe(pg->pipe, false);
++	n2mdp_map_lock();
+ 	n2mx.jobs++;
+ 	if (err) { n2mx.job_fail++; }
+-	if (n2mdp_rd(N2MDP_M4U1 + 0x134u)) {     /* translation fault: the result is not trustworthy */
+-		N2MDP_LOG("NORD2 MDP: IOVA fault %#x va %#x in a service blit\n", n2mdp_rd(N2MDP_M4U1 + 0x134u), n2mdp_rd(N2MDP_M4U1 + 0x13cu));
+-		n2mdp_wr(N2MDP_M4U1 + 0x120u, n2mdp_rd(N2MDP_M4U1 + 0x120u) | (1u << 12));
+-		err = EFAULT;
+-		n2mdp_mc_drop();                        /* 0687: never re-use mappings after a fault */
+-		si = di = 0;
++	{
++		uint32_t fault = n2mdp_rd(N2MDP_M4U1 + 0x134u);
++		if (fault) {     /* translation fault: no result of a job that overlapped it is trustworthy */
++			N2MDP_LOG("NORD2 MDP: IOVA fault %#x va %#x in a service blit (pipe %u)\n", fault, n2mdp_rd(N2MDP_M4U1 + 0x13cu), pi ? 2u : 0u);
++			n2mdp_wr(N2MDP_M4U1 + 0x120u, n2mdp_rd(N2MDP_M4U1 + 0x120u) | (1u << 12));
++			n2mdp_fault_gen++;
++			n2mdp_mc_drop();                    /* 0687: never re-use mappings after a fault (0690: busy ones when released) */
++		}
++		if (n2mdp_fault_gen != gen0 && !err) { err = EFAULT; }
+ 	}
++	n2mdp_map_unlock();
+ out:
+-	(void)si; (void)di;                         /* 0687: the ranges stay cached */
+-	n2mdp_last_run_us = hw_us ? *hw_us : 0;
+-	n2mdp_unlock();
++	n2mdp_map_lock();
++	n2mdp_mc_put(ss, si, src->npages);
++	n2mdp_mc_put(ds, di, dst->npages);
++	n2mdp_pjobs[pi]++;
++	if (st->overlap) { n2mdp_overlap++; }
++	n2mdp_map_unlock();
++	__atomic_fetch_and(&n2mdp_busy_mask, ~(1u << pi), __ATOMIC_ACQ_REL);
++	st->hw_us = xs.hw_us; st->run_us = xs.run_us; st->tiles = xs.tiles; st->polls = xs.polls; st->tile_max_us = xs.tile_max_us;
++	for (unsigned i = 0; i < 4u; i++) { st->tile_us[i] = xs.tile_us[i]; }
++	st->tile_px = tpx;
++	/* legacy globals (0687-0689 readers; racy by nature, kept for /dev/redwood-mdp users) */
++	n2mdp_last_map_us = st->map_us; n2mdp_last_run_us = st->hw_us; n2mdp_last_compile_us = st->compile_us; n2mdp_last_lockwait_us = st->lockwait_us;
++	n2mdp_pipe_unlock(pi);
++	n2mdp_svc_exit();
+ 	return err;
+ }
++int
++nord2_mdp_blit_pages(const struct n2mdp_pimg *src, const struct n2mdp_pimg *dst, uint32_t rot, uint32_t flip, uint32_t *hw_us)
++{
++	struct n2mdp_bstat st;
++	int e = nord2_mdp_blit_pages_st(src, dst, rot, flip, &st);
++	if (hw_us) { *hw_us = st.hw_us; }
++	return e;
++}
+ 
+ #ifndef N2MDP_HOST
+ SYSCTL_INT(_kern, OID_AUTO, n2mdp_probe, CTLFLAG_RW | CTLFLAG_LOCKED, &n2mdp_req, 0,
+@@ -1548,6 +1987,14 @@
+ SYSCTL_UINT(_kern, OID_AUTO, n2mdp_s1, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mx.s1, 0, "0671: stage 1 result (1 pass, >1 failure code)");
+ SYSCTL_UINT(_kern, OID_AUTO, n2mdp_s2, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mx.s2_pass, 0, "0671: stage 2 tests passed (bitmask)");
+ SYSCTL_UINT(_kern, OID_AUTO, n2mdp_s3, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mx.s3, 0, "0671: stage 3 result (1 pass)");
++SYSCTL_INT(_kern, OID_AUTO, n2mdp_tune, CTLFLAG_RW | CTLFLAG_LOCKED, &n2mdp_tune, 0,
++    "0690: 1 vendor M4U1 write setup at S3 (boot only), 2 second pipe for unscaled service requests, 4 S3 rotation tile width (default 7)");
++SYSCTL_INT(_kern, OID_AUTO, n2mdp_svc_tile, CTLFLAG_RW | CTLFLAG_LOCKED, &n2mdp_svc_tile_px, 0,
++    "0690: rotation tile width in px for unscaled service requests (64..512, multiple of 16); 0 = S3 TIMING choice");
++SYSCTL_UINT(_kern, OID_AUTO, n2mdp_auto_tile, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mdp_auto_tile16, 0, "0690: S3 TIMING tile choice (16-px units, 0 = 512 px)");
++SYSCTL_UINT(_kern, OID_AUTO, n2mdp_m4u, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mdp_m4u_state, 0,
++    "0690: M4U1 vendor write setup: 0 not tried, 1 applied, 2 already set, 3 deferred (other masters powered), 4 reverted, 5 off");
++SYSCTL_UINT(_kern, OID_AUTO, n2mdp_overlap, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mdp_overlap, 0, "0690: service jobs that ran while the other pipe was busy");
+ 
+ static nord2_mdp_surface_blit_fn n2mdp_surface_hook;
+ void nord2_mdp_set_surface_hook(nord2_mdp_surface_blit_fn fn) { n2mdp_surface_hook = fn; }
+--- a/bsd/dev/nord2_mdp_job.h
++++ b/bsd/dev/nord2_mdp_job.h
+@@ -49,6 +49,7 @@
+ 	uint8_t  tile_w;          /* tile width in units of 16 output pixels (0 = default 32 = 512 px) */
+ 	uint8_t  wrot_lines;      /* 0676: WROT main-buffer line count (VIDO_MAIN_BUF_SIZE 14:8); 0 = n2mdp_wrot_lines() */
+ 	uint8_t  allow_unverified; /* 0682: S2 diagnostic jobs only: compile multi-tile / RGB-source scaling despite the 0681 limit */
++	uint8_t  pipe2;           /* 0690: unscaled job on the second pipe RDMA2 -> WROT2 (direct, no PQ/RSZ), so two jobs can run at once */
+ };
+ 
+ /* error codes of n2mdp_check() */
+@@ -194,6 +195,7 @@
+ struct n2mdp_prog {
+ 	struct n2mdp_op ops[2400];   /* 0676: + vendor per-tile RDMA buffer words, WROT INT clear */
+ 	uint32_t n, tiles, pipe, mutex;
++	uint32_t scaled;             /* 0690: 1 = scale lane (RDMA2 -> AAL2 -> RSZ2 -> TDSHP2 -> TCC2 -> WROT2); pipe 2 can also run direct */
+ 	int err;
+ };
+ 
+@@ -364,9 +366,10 @@
+ 	int e = n2mdp_check(j);
+ 	if (e) { p->err = e; return e; }
+ 	bool scaled = n2mdp_scaled(j);
+-	uint32_t pipe = scaled ? N2MDP_PIPE_SCALE : N2MDP_PIPE_DIRECT;
++	/* 0690: unscaled jobs may run on pipe 2 without its PQ / RSZ engines (RDMA2 -> WROT2), so pipe 0 and pipe 2 can work at once */
++	uint32_t pipe = (scaled || j->pipe2) ? N2MDP_PIPE_SCALE : N2MDP_PIPE_DIRECT;
+ 	uint32_t mid = N2MDP_MUTEX_ID(pipe);
+-	p->pipe = pipe; p->mutex = mid;
++	p->pipe = pipe; p->mutex = mid; p->scaled = scaled ? 1u : 0u;
+ 	uint32_t R = N2MDP_W_RDMA(pipe), W = N2MDP_W_WROT(pipe), Z = N2MDP_W_RSZ(pipe);
+ 	bool syuv = n2mf_is_yuv(j->src.fmt), dyuv = n2mf_is_yuv(j->dst.fmt);
+ 	uint32_t cw = n2mdp_crop_w(j), ch = n2mdp_crop_h(j), ow = n2mdp_out_w(j), oh = n2mdp_out_h(j);
+@@ -376,6 +379,13 @@
+ 		N2W(p, N2MDP_T_RDMA0_MOUT, 1u << 1);          /* RDMA0 out slot 1 = WROT0 */
+ 		N2W(p, N2MDP_T_WROT0_SEL, 2u);                /* WROT0 in slot 2 = RDMA0 */
+ 		N2W(p, N2MDP_MUTEX_MOD0(mid), (1u << 0) | (1u << 16));
++	} else if (!scaled) {
++		/* 0690 [V-dis libdpframework.so mt6893 tables, read from the binary]: DpPathConnection::s_moutMap RDMA2 (engine 14, reg 0xf28)
++		 * outputs { 26 AAL2, 42 WROT2, 28, 20 } -> slot 1 = WROT2; s_selInMap WROT2 (engine 42, reg 0xf78) inputs { 38 TCC2, 14 RDMA2 }
++		 * -> slot 1 = RDMA2 (same tables give 0671's RDMA0 MOUT bit 1 / WROT0 SEL 2 and the scale-lane values used below) */
++		N2W(p, N2MDP_T_RDMA2_MOUT, 1u << 1);          /* RDMA2 out slot 1 = WROT2 */
++		N2W(p, N2MDP_T_WROT2_SEL, 1u);                /* WROT2 in slot 1 = RDMA2 */
++		N2W(p, N2MDP_MUTEX_MOD0(mid), (1u << 2) | (1u << 18));   /* RDMA2 | WROT2 */
+ 	} else {
+ 		N2W(p, N2MDP_T_RDMA2_MOUT, 1u << 0);          /* RDMA2 out slot 0 = AAL2 */
+ 		N2W(p, N2MDP_T_AAL2_SEL, 0u);                 /* AAL2 in slot 0 = RDMA2 */
+@@ -414,10 +424,10 @@
+ 	/* colour: the scale pipe works in YUV, so RGB sources are converted at the RDMA (RGB -> BT601 full) and back at the WROT;
+ 	 * the direct pipe converts only YUV -> RGB at the WROT */
+ 	uint32_t r_mtx = 0, r_en = 0;
+-	if (pipe == N2MDP_PIPE_SCALE && !syuv) { r_en = 1; r_mtx = 0; /* RGB_TO_JPEG */ }
++	if (scaled && !syuv) { r_en = 1; r_mtx = 0; /* RGB_TO_JPEG */ }
+ 	N2WM(p, R + R_TRANSFORM, (r_en << 16) | (r_mtx << 23), 0x0f810000u);
+ 
+-	if (pipe == N2MDP_PIPE_SCALE) {
++	if (scaled) {
+ 		/* PQ engines of the scale pipe.  AAL2 / TDSHP2: [I] relay (their vendor programming goes through PQEngineInterface
+ 		 * DpEngineAAL / DpEngineTDSHP algorithms that were not decoded); vendor-seen writes kept: AAL EN 0x000 = 1 (onInitEngine),
+ 		 * AAL 0x200 bit 7, TDSHP 0x100 bit 2.  TCC2: [V-dis DpEngine_TCC] 0x000 = enable | width<<1 | height<<15 | 1<<29 (per tile). */
+@@ -449,7 +459,7 @@
+ 	uint32_t d_swap = (j->dst.fmt == N2MF_RGBA || j->dst.fmt == N2MF_NV21) ? 1u : 0u;
+ 	if (!dyuv) { d_swap ^= (j->rgb_swap & 1u); }
+ 	uint32_t w_mat = 0;
+-	bool yuv_in_pipe = syuv || pipe == N2MDP_PIPE_SCALE;
++	bool yuv_in_pipe = syuv || scaled;
+ 	if (yuv_in_pipe && !dyuv) {
+ 		uint32_t m = 4u;                                         /* JPEG (full 601) -> RGB */
+ 		if (syuv) { m = j->src.bt709 ? 7u : (j->src.full_range ? 4u : 6u); }
+@@ -479,7 +489,7 @@
+ 	 * mismatched (RSZ tile offsets / filter overlap beyond the first tile and the RDMA RGB->YUV matrix are not decoded). */
+ 	/* 0683: multi-tile NV12 scaling verified on hardware (q10jmdp12s3 nv12scale3t / nv12scale3o PASS): only RGB-source scaling
+ 	 * stays behind a flag (set when the boot's smooth-pattern RGB scale jobs passed, N2MDP_CAP_RGB_SCALE) */
+-	if (pipe == N2MDP_PIPE_SCALE && !syuv && !j->allow_unverified) { p->err = N2MDP_E_SCALE; return p->err; }
++	if (scaled && !syuv && !j->allow_unverified) { p->err = N2MDP_E_SCALE; return p->err; }
+ 	for (uint32_t k = 0; k < nt; k++) {
+ 		uint32_t iw = t[k].ix1 - t[k].ix0, tw = t[k].ox1 - t[k].ox0;
+ 		uint32_t sx = j->cx + t[k].ix0;
+@@ -500,7 +510,7 @@
+ 			N2WM(p, R + 0x0b8u, (o[6] << 12) + o[7], 0x1ffff3ffu);
+ 			N2WM(p, R + 0x0e8u, (o[8] << 16) + o[9], 0x3fff1fffu);
+ 		}
+-		if (pipe == N2MDP_PIPE_SCALE) {
++		if (scaled) {
+ 			/* 0678 [V-dis DpEngine_SCL::onConfigTile]: CONTROL_2 tile bits (mask 0x3800: bit 13 = not the last tile; bits 11/12 [I]
+ 			 * left 0), INPUT/OUTPUT_IMAGE, luma/chroma offsets.  Offset units follow rsz_config: alg 0 = input pixels + 15-bit fraction,
+ 			 * alg 1/2 = output domain, 20-bit fraction (offset * step).  Chroma = luma (the pipe is 4:4:4 after the RDMA). */
+@@ -561,7 +571,7 @@
+ 		N2WM(p, W + W_ROT_EN, 0u, 1u);
+ 		N2WM(p, R + R_EN, 0u, 1u);
+ 	}
+-	if (pipe == N2MDP_PIPE_SCALE) { N2WM(p, Z + Z_ENABLE, 0u, 1u); }
++	if (scaled) { N2WM(p, Z + Z_ENABLE, 0u, 1u); }
+ 	n2mdp_emit(p, N2MDP_OP_END, 0, 0, 0);
+ 	p->tiles = nt;
+ 	return p->err;
+--- a/bsd/dev/nord2_mdp_api.h
++++ b/bsd/dev/nord2_mdp_api.h
+@@ -23,6 +23,13 @@
+ 	const uint64_t *pages;          /* physical address of each 4 KiB page, in order */
+ };
+ 
++/* 0690: per-request statistics of nord2_mdp_blit_pages_st (all us): lock wait (pipe lock incl. the shared MDP lock), IOVA map,
++ * compile, MDP busy (sum of tile GO -> done), whole run, tiles, first 4 tile times, slowest tile, WAIT polls, pipe (0 / 2),
++ * overlap = the other pipe was running a job when this one started, rotation tile width used */
++struct n2mdp_bstat {
++	uint32_t lockwait_us, map_us, compile_us, hw_us, run_us, tiles, tile_us[4], tile_max_us, polls, pipe, overlap, tile_px;
++};
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -31,6 +38,8 @@
+ /* rot: clockwise quarter turns, flip bit0 = horizontal mirror (before rotation).  0 or errno (ENODEV, ENOTSUP, EINVAL, ENOMEM,
+  * ETIMEDOUT, EFAULT); the caller falls back to its own path on any error. */
+ int nord2_mdp_blit_pages(const struct n2mdp_pimg *src, const struct n2mdp_pimg *dst, uint32_t rot, uint32_t flip, uint32_t *hw_us);
++/* 0690: the same with per-request statistics (st may be NULL); two calls can run at once (pipe 0 / pipe 2) */
++int nord2_mdp_blit_pages_st(const struct n2mdp_pimg *src, const struct n2mdp_pimg *dst, uint32_t rot, uint32_t flip, struct n2mdp_bstat *st);
+ /* /dev/redwood-mdp RWMDP_BLIT_SURF goes through this hook, installed by the IOSurface side (0672) */
+ typedef int (*nord2_mdp_surface_blit_fn)(uint32_t src_id, uint32_t dst_id, uint32_t rot, uint32_t flip, uint32_t *hw_us);
+ void nord2_mdp_set_surface_hook(nord2_mdp_surface_blit_fn fn);
+--- a/iokit/Kernel/arm/sweet_m2scaler.inc
++++ b/iokit/Kernel/arm/sweet_m2scaler.inc
+@@ -19,6 +19,11 @@
+  * with transform 0 and [I] transform bit 0x1 = horizontal flip, 0x4 = rotate 90, 0x8 = rotate 180, 0x10 = rotate 270.
+  * Log lines: "NORD2 M2: ...".  Counters kern.n2m2_ok / n2m2_refused / n2m2_failed.  Kill: kern.n2mdp_svc=0 before registration,
+  * or /private/var/db/nord2-mdp-off (no MDP stage runs at all).
++ * 0690: requests from several client threads really run at once now (pipe 0 / pipe 2 in nord2_mdp.inc), so the surface cache and
++ * the counters are under sweet_m2_lock and a cached surface in use is pinned (busy count; the 0688 cache could evict an entry - and
++ * drop its wire hold - while another thread's job still used its pages); per-request timing is local (the 0687-0689 globals mixed
++ * the two streams).  Log: timing lines now in pairs (both streams), + pipe / tile width / polls / overlap; every 10 s one line per
++ * pipe and one per request class (size) with average lock wait, MDP time and total.
+  */
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Weverything"     /* the IOKit/sysctl macros below warn like everywhere else; keep the warning budget */
+@@ -28,11 +33,17 @@
+ #include <mach/clock_types.h>    /* NSEC_PER_SEC */
+ #include <string.h>
+ #include "sweet_m2_req.h"
+-extern "C" uint32_t n2mdp_last_map_us, n2mdp_last_run_us, n2mdp_last_compile_us;   /* 0687/0688: nord2_mdp.inc timing */
+-extern "C" uint32_t n2mdp_last_lockwait_us, n2mdp_last_tiles, n2mdp_tile_us[16];   /* 0689 */
+ static uint64_t sweet_m2_sum_wait;
+-static uint32_t sweet_m2_pages_us, sweet_m2_sc_hits, sweet_m2_sc_miss;      /* 0688 */
+-static uint32_t sweet_m2_cache_us;                          /* 0687: CPU cache maintenance of the current request */   /* 0685: request decoder (host-tested with the q10jmdp14 mediaserverd requests) */
++static uint32_t sweet_m2_sc_hits, sweet_m2_sc_miss, sweet_m2_sc_full;      /* 0688 (0690: full = every entry busy, not cached) */
++/* 0690: per-request timing (pages = page-list build, cache = CPU cache maintenance; b = nord2_mdp_blit_pages_st statistics) */
++struct sweet_m2_tm { uint32_t pages_us, cache_us; struct n2mdp_bstat b; };
++static IOLock *sweet_m2_lock;                               /* 0690: surface cache + counters (allocated in sweet_m2_install) */
++static inline void sweet_m2_lk(void) { if (sweet_m2_lock) { IOLockLock(sweet_m2_lock); } }
++static inline void sweet_m2_ulk(void) { if (sweet_m2_lock) { IOLockUnlock(sweet_m2_lock); } }
++static struct { uint32_t n; uint64_t wait, hw, run; } sweet_m2_pipe[2];      /* 0690: per pipe (0 / 2) */
++#define SWEET_M2_NCLS 4u
++static struct { uint32_t sw, sh, dw, dh, n, p2; uint64_t wait, hw, tot; } sweet_m2_cls[SWEET_M2_NCLS];   /* 0690: per request size */
++static uint32_t sweet_m2_ovl;
+ 
+ static int      sweet_m2_svc = 1;     /* 0684: ON for the controlled run image (q10jmdp14); registered only after S3 passed in this boot */
+ /* 0684 safety: after SWEET_M2_MAX_FAILED failed/faulted MDP transforms, or SWEET_M2_MAX_REFUSED refusals with no success, the service
+@@ -54,19 +65,19 @@
+ #define SWEET_M2_FMT_420F 0x34323066u   /* '420f' */
+ 
+ /* Resolve a surface into an MDP page-listed image.  Holds a reference (and a wire-on-demand hold) until sweet_m2_put. */
+-struct sweet_m2_ref { SweetSurface *s; bool held; bool cached; uint64_t *pages; uint32_t npages; struct n2mdp_pimg img; };
++struct sweet_m2_ref { SweetSurface *s; bool held; bool cached; int sc; uint64_t *pages; uint32_t npages; struct n2mdp_pimg img; };
+ 
+ /* 0688: surface cache.  Building the page list (getPhysicalSegment per 4 KiB page, ~3000 pages per camera request pair) every call
+  * is replaced by a cache of 8 resolved surfaces.  An entry keeps its own retain AND wire-on-demand hold, so the physical pages cannot
+  * move or be freed while it is cached; it is re-used only for the same id, the same SweetSurface object, the same memory object and
+  * length, and not purged.  LRU eviction unholds / releases. */
+ #define SWEET_M2_SC_N 8u
+-static struct { uint32_t id, lru, n; SweetSurface *s; IOMemoryDescriptor *mem; uint64_t len; uint64_t *pages; } sweet_m2_sc[SWEET_M2_SC_N];
++static struct { uint32_t id, lru, n, busy; SweetSurface *s; IOMemoryDescriptor *mem; uint64_t len; uint64_t *pages; } sweet_m2_sc[SWEET_M2_SC_N];
+ static uint32_t sweet_m2_sc_tick;
+ static void
+-sweet_m2_sc_evict(unsigned i)
++sweet_m2_sc_evict(unsigned i)       /* under sweet_m2_lock; never for a busy entry */
+ {
+-	if (!sweet_m2_sc[i].s) { return; }
++	if (!sweet_m2_sc[i].s || sweet_m2_sc[i].busy) { return; }
+ 	sweet_surface_wod_unhold(sweet_m2_sc[i].s);
+ 	sweet_m2_sc[i].s->release();
+ 	if (sweet_m2_sc[i].pages) { IOFree(sweet_m2_sc[i].pages, sweet_m2_sc[i].n * sizeof(uint64_t)); }
+@@ -74,9 +85,10 @@
+ }
+ 
+ static int
+-sweet_m2_get(uint32_t id, struct sweet_m2_ref *r)
++sweet_m2_get(uint32_t id, struct sweet_m2_ref *r, struct sweet_m2_tm *tm)
+ {
+ 	bzero(r, sizeof(*r));
++	r->sc = -1;
+ 	SweetSurface *s = sweet_surface_copy(id);
+ 	if (s == NULL) { return 1; }
+ 	r->s = s;
+@@ -92,19 +104,24 @@
+ 		im->pitch[1] = s->planes[1].bytesPerRow; im->off[1] = s->planes[1].offset;
+ 	} else { return 2; }
+ 	if (s->memory == NULL || s->purged) {
++		sweet_m2_lk();
+ 		for (unsigned i = 0; i < SWEET_M2_SC_N; i++) { if (sweet_m2_sc[i].s == s) { sweet_m2_sc_evict(i); } }
++		sweet_m2_ulk();
+ 		return 3;
+ 	}
+ 	uint64_t len = s->memory->getLength();
+ 	uint64_t p0 = mach_absolute_time();
++	sweet_m2_lk();
+ 	for (unsigned i = 0; i < SWEET_M2_SC_N; i++) {   /* 0688: cache hit = the same surface object, memory and size */
+ 		if (sweet_m2_sc[i].s == s && sweet_m2_sc[i].id == id && sweet_m2_sc[i].mem == s->memory && sweet_m2_sc[i].len == len) {
+-			sweet_m2_sc[i].lru = ++sweet_m2_sc_tick; sweet_m2_sc_hits++;
+-			r->cached = true; r->pages = sweet_m2_sc[i].pages; r->npages = sweet_m2_sc[i].n;
++			sweet_m2_sc[i].lru = ++sweet_m2_sc_tick; sweet_m2_sc_hits++; sweet_m2_sc[i].busy++;   /* 0690: pinned until sweet_m2_put */
++			r->cached = true; r->sc = (int)i; r->pages = sweet_m2_sc[i].pages; r->npages = sweet_m2_sc[i].n;
+ 			im->npages = r->npages; im->pages = r->pages;
++			sweet_m2_ulk();
+ 			goto flush;
+ 		}
+ 	}
++	sweet_m2_ulk();
+ 	if (!sweet_surface_wod_hold(s)) { return 4; }
+ 	r->held = true;
+ 	{
+@@ -120,34 +137,43 @@
+ 		for (IOByteCount o = 0; o < seg && k < n; o += 4096u) { r->pages[k++] = pa + o; }
+ 	}
+ 	im->npages = n; im->pages = r->pages;
+-	{	/* 0688: hand the resolved surface to the cache (it takes the extra retain, the hold and the page array) */
+-		unsigned v = 0; uint32_t best = 0xffffffffu;
+-		for (unsigned i = 0; i < SWEET_M2_SC_N; i++) { if (!sweet_m2_sc[i].s) { v = i; best = 0; break; } if (sweet_m2_sc[i].lru < best) { best = sweet_m2_sc[i].lru; v = i; } }
+-		sweet_m2_sc_evict(v);
+-		s->retain();
+-		sweet_m2_sc[v].id = id; sweet_m2_sc[v].s = s; sweet_m2_sc[v].mem = s->memory; sweet_m2_sc[v].len = len; sweet_m2_sc[v].n = n;
+-		sweet_m2_sc[v].pages = r->pages; sweet_m2_sc[v].lru = ++sweet_m2_sc_tick;
+-		r->held = false; r->cached = true; sweet_m2_sc_miss++;
++	{	/* 0688: hand the resolved surface to the cache (it takes the extra retain, the hold and the page array).
++		 * 0690: only a free or idle entry is replaced; with every entry busy the request keeps its own hold / pages (not cached) */
++		sweet_m2_lk();
++		unsigned v = SWEET_M2_SC_N; uint32_t best = 0xffffffffu;
++		for (unsigned i = 0; i < SWEET_M2_SC_N; i++) {
++			if (!sweet_m2_sc[i].s) { v = i; break; }
++			if (!sweet_m2_sc[i].busy && sweet_m2_sc[i].lru < best) { best = sweet_m2_sc[i].lru; v = i; }
++		}
++		if (v < SWEET_M2_SC_N) {
++			sweet_m2_sc_evict(v);
++			s->retain();
++			sweet_m2_sc[v].id = id; sweet_m2_sc[v].s = s; sweet_m2_sc[v].mem = s->memory; sweet_m2_sc[v].len = len; sweet_m2_sc[v].n = n;
++			sweet_m2_sc[v].pages = r->pages; sweet_m2_sc[v].lru = ++sweet_m2_sc_tick; sweet_m2_sc[v].busy = 1;
++			r->held = false; r->cached = true; r->sc = (int)v; sweet_m2_sc_miss++;
++		} else { sweet_m2_sc_full++; }
++		sweet_m2_ulk();
+ 	}
+ 	}
+ flush:
+-	{ uint64_t pns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - p0, &pns); sweet_m2_pages_us += (uint32_t)(pns / 1000u); }
++	{ uint64_t pns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - p0, &pns); tm->pages_us += (uint32_t)(pns / 1000u); }
+ 	/* the MDP is not cache coherent: clean + invalidate the pixels through the kernel mapping (PIPT: covers every alias) */
+ 	uintptr_t va = s->kernelAddress();
+ 	uint64_t c0 = mach_absolute_time();
+ 	if (va) { FlushPoC_DcacheRegion((vm_offset_t)va, (unsigned)len); }
+-	uint64_t cns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - c0, &cns); sweet_m2_cache_us += (uint32_t)(cns / 1000u);
++	uint64_t cns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - c0, &cns); tm->cache_us += (uint32_t)(cns / 1000u);
+ 	return 0;
+ }
+ static void
+-sweet_m2_put(struct sweet_m2_ref *r, bool written)
++sweet_m2_put(struct sweet_m2_ref *r, bool written, struct sweet_m2_tm *tm)
+ {
+ 	if (r->s && written) {
+ 		uintptr_t va = r->s->kernelAddress();
+ 		uint64_t c0 = mach_absolute_time();
+ 		if (va) { FlushPoC_DcacheRegion((vm_offset_t)va, (unsigned)r->s->memory->getLength()); }
+-		uint64_t cns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - c0, &cns); sweet_m2_cache_us += (uint32_t)(cns / 1000u);
++		uint64_t cns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - c0, &cns); tm->cache_us += (uint32_t)(cns / 1000u);
+ 	}
++	if (r->sc >= 0) { sweet_m2_lk(); if (sweet_m2_sc[r->sc].busy) { sweet_m2_sc[r->sc].busy--; } sweet_m2_ulk(); }   /* 0690: unpin */
+ 	if (r->pages && !r->cached) { IOFree(r->pages, r->npages * sizeof(uint64_t)); }   /* 0688: cached arrays belong to the cache */
+ 	if (r->held) { sweet_surface_wod_unhold(r->s); }
+ 	if (r->s) { r->s->release(); }
+@@ -171,30 +197,33 @@
+ }
+ static uint32_t sweet_m2_last_sfmt, sweet_m2_last_dfmt;   /* 0685: fourcc of the last surfaces seen (refusal log) */
+ static int
+-sweet_m2_blit_rect(const struct sweet_m2_req *q, uint32_t *hw_us)
++sweet_m2_blit_rect(const struct sweet_m2_req *q, struct sweet_m2_tm *tm)
+ {
+ 	struct sweet_m2_ref a, b;
+-	int e = sweet_m2_get(q->src, &a);
++	int e = sweet_m2_get(q->src, &a, tm);
+ 	if (a.s) { sweet_m2_last_sfmt = a.s->pixelFormat; }
+-	int f = e ? 0 : sweet_m2_get(q->dst, &b);
++	int f = e ? 0 : sweet_m2_get(q->dst, &b, tm);
+ 	if (!e && b.s) { sweet_m2_last_dfmt = b.s->pixelFormat; }
+ 	int err;
+ 	if (e || f) { err = 1000 + (e ? e : 100 + f); }
+ 	else if (b.img.fmt != 1u && b.img.fmt != 2u && !(b.img.fmt == 3u && (nord2_mdp_caps() & (1u << 13)))) { err = 1200; }   /* 0686: NV12 dst when verified */
+ 	else if ((err = sweet_m2_crop(&a.img, q->sx, q->sy, q->sw, q->sh)) != 0) { }
+ 	else if ((err = sweet_m2_crop(&b.img, q->dx, q->dy, q->dw, q->dh)) != 0) { err += 10; }
+-	else { err = nord2_mdp_blit_pages(&a.img, &b.img, q->rot, q->flip, hw_us); }
+-	if (!e) { sweet_m2_put(&a, false); }
+-	if (!e && !f) { sweet_m2_put(&b, err == 0); }
++	else { err = nord2_mdp_blit_pages_st(&a.img, &b.img, q->rot, q->flip, &tm->b); }   /* 0690: per-request statistics */
++	if (!e) { sweet_m2_put(&a, false, tm); }
++	if (!e && !f) { sweet_m2_put(&b, err == 0, tm); }
+ 	return err;
+ }
+ static int
+ sweet_m2_blit_ids(uint32_t src_id, uint32_t dst_id, uint32_t rot, uint32_t flip, uint32_t *hw_us)
+ {
+ 	struct sweet_m2_req q;
+-	bzero(&q, sizeof(q));
++	struct sweet_m2_tm tm;
++	bzero(&q, sizeof(q)); bzero(&tm, sizeof(tm));
+ 	q.src = src_id; q.dst = dst_id; q.rot = rot; q.flip = flip;
+-	return sweet_m2_blit_rect(&q, hw_us);
++	int e = sweet_m2_blit_rect(&q, &tm);
++	if (hw_us) { *hw_us = tm.b.hw_us; }
++	return e;
+ }
+ /* 0685: refusal / acceptance histogram for the stats line */
+ enum { SWEET_M2_H_SURF = SWEET_M2_R_N, SWEET_M2_H_SFMT, SWEET_M2_H_DFMT, SWEET_M2_H_CROP, SWEET_M2_H_MDPNO, SWEET_M2_H_FAIL, SWEET_M2_H_N };
+@@ -290,6 +319,22 @@
+ 			    sweet_m2_hist[SWEET_M2_H_SFMT], sweet_m2_hist[SWEET_M2_H_DFMT], sweet_m2_hist[SWEET_M2_H_CROP], sweet_m2_hist[SWEET_M2_H_MDPNO],
+ 			    sweet_m2_hist[SWEET_M2_H_FAIL], sweet_m2_cls_rot[0], sweet_m2_cls_rot[1], sweet_m2_cls_rot[2], sweet_m2_cls_rot[3],
+ 			    sweet_m2_cls_scaled, sweet_m2_cls_yuv, sweet_m2_last_sfmt, sweet_m2_last_dfmt);
++			sweet_m2_lk();   /* 0690: per pipe and per request class (averages in us) */
++			if (sweet_m2_pipe[0].n || sweet_m2_pipe[1].n) {
++				IOLog("NORD2 M2: pipes p0 n %u wait %u hw %u run %u | p2 n %u wait %u hw %u run %u | overlap %u | surface cache full %u\n",
++				    sweet_m2_pipe[0].n, sweet_m2_pipe[0].n ? (uint32_t)(sweet_m2_pipe[0].wait / sweet_m2_pipe[0].n) : 0u,
++				    sweet_m2_pipe[0].n ? (uint32_t)(sweet_m2_pipe[0].hw / sweet_m2_pipe[0].n) : 0u, sweet_m2_pipe[0].n ? (uint32_t)(sweet_m2_pipe[0].run / sweet_m2_pipe[0].n) : 0u,
++				    sweet_m2_pipe[1].n, sweet_m2_pipe[1].n ? (uint32_t)(sweet_m2_pipe[1].wait / sweet_m2_pipe[1].n) : 0u,
++				    sweet_m2_pipe[1].n ? (uint32_t)(sweet_m2_pipe[1].hw / sweet_m2_pipe[1].n) : 0u, sweet_m2_pipe[1].n ? (uint32_t)(sweet_m2_pipe[1].run / sweet_m2_pipe[1].n) : 0u,
++				    sweet_m2_ovl, sweet_m2_sc_full);
++			}
++			for (unsigned c = 0; c < SWEET_M2_NCLS; c++) {
++				if (!sweet_m2_cls[c].n) { continue; }
++				IOLog("NORD2 M2: class %ux%u -> %ux%u n %u (pipe 2: %u) avg wait %u hw %u total %u us\n", sweet_m2_cls[c].sw, sweet_m2_cls[c].sh,
++				    sweet_m2_cls[c].dw, sweet_m2_cls[c].dh, sweet_m2_cls[c].n, sweet_m2_cls[c].p2, (uint32_t)(sweet_m2_cls[c].wait / sweet_m2_cls[c].n),
++				    (uint32_t)(sweet_m2_cls[c].hw / sweet_m2_cls[c].n), (uint32_t)(sweet_m2_cls[c].tot / sweet_m2_cls[c].n));
++			}
++			sweet_m2_ulk();
+ 		}
+ 	}
+ 	if (!sweet_m2_off && (sweet_m2_failed >= SWEET_M2_MAX_FAILED || (sweet_m2_ok == 0 && sweet_m2_refused >= SWEET_M2_MAX_REFUSED))) {
+@@ -307,17 +352,20 @@
+ 	bzero(&q, sizeof(q));
+ 	int why = sweet_m2_decode(p, n, &q);                 /* 0685: rectangles / hint flags decoded (sweet_m2_req.h) */
+ 	if (why != SWEET_M2_OK) { sweet_m2_refused++; sweet_m2_hist[why]++; sweet_m2_dump(p, n, sweet_m2_reason[why]); return kIOReturnUnsupported; }
+-	uint32_t us = 0;
+-	sweet_m2_cache_us = 0; n2mdp_last_map_us = 0; n2mdp_last_run_us = 0; n2mdp_last_compile_us = 0; sweet_m2_pages_us = 0;
++	struct sweet_m2_tm tm;
++	bzero(&tm, sizeof(tm));
+ 	uint64_t t_beg = mach_absolute_time();
+-	int e = sweet_m2_blit_rect(&q, &us);
++	int e = sweet_m2_blit_rect(&q, &tm);
++	uint32_t us = tm.b.hw_us;
+ 	uint64_t t_ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - t_beg, &t_ns);
+ 	uint32_t tot_us = (uint32_t)(t_ns / 1000u);
+ 	if (e) {
+ 		int h = e >= 1300 ? SWEET_M2_H_CROP : e == 1200 ? SWEET_M2_H_DFMT : (e == 1002 || e == 1102) ? SWEET_M2_H_SFMT + (e == 1102 ? 1 : 0) :
+ 		    e >= 1000 ? SWEET_M2_H_SURF : (e == ENOTSUP || e == EINVAL || e == ENODEV) ? SWEET_M2_H_MDPNO : SWEET_M2_H_FAIL;
++		sweet_m2_lk();
+ 		sweet_m2_hist[h]++;
+ 		if (h == SWEET_M2_H_FAIL) { sweet_m2_failed++; } else { sweet_m2_refused++; }
++		sweet_m2_ulk();
+ 		if (sweet_m2_dumps < 16) {
+ 			IOLog("NORD2 M2: transform %u -> %u (%08x -> %08x) rot %u flip %u src %ux%u+%u+%u dst %ux%u+%u+%u not done (%d %s)\n", q.src, q.dst,
+ 			    sweet_m2_last_sfmt, sweet_m2_last_dfmt, q.rot, q.flip, q.sw, q.sh, q.sx, q.sy, q.dw, q.dh, q.dx, q.dy, e, sweet_m2_hname[h]);
+@@ -325,22 +373,37 @@
+ 		}
+ 		return kIOReturnUnsupported;
+ 	}
++	uint32_t src = q.src, dst = q.dst, rot = q.rot, flip = q.flip;
++	const struct n2mdp_bstat *b = &tm.b;
++	sweet_m2_lk();   /* 0690: counters / sums are shared by the client threads */
+ 	sweet_m2_hist[0]++; sweet_m2_cls_rot[q.rot & 3u]++;
+ 	if (q.sw && q.dw && ((q.rot & 1u) ? (q.sw != q.dh || q.sh != q.dw) : (q.sw != q.dw || q.sh != q.dh))) { sweet_m2_cls_scaled++; }
+ 	if (sweet_m2_last_sfmt == SWEET_M2_FMT_420V || sweet_m2_last_sfmt == SWEET_M2_FMT_420F) { sweet_m2_cls_yuv++; }
+-	if (sweet_m2_dumps < 16) { sweet_m2_dump(p, n, "accepted"); }
+-	uint32_t src = q.src, dst = q.dst, rot = q.rot, flip = q.flip;
+-	sweet_m2_sum_wait += n2mdp_last_lockwait_us;
+-	sweet_m2_sum_tot += tot_us; sweet_m2_sum_hw += us; sweet_m2_sum_map += n2mdp_last_map_us; sweet_m2_sum_cache += sweet_m2_cache_us;   /* 0686: timing (hw = MDP busy, total = whole request incl. page lists, IOVA map, cache maintenance) */
+-	sweet_m2_ok++;
+-	if (sweet_m2_ok <= 4 || (sweet_m2_ok & 255u) == 0) {
+-		IOLog("NORD2 M2: timing pages %u compile %u lockwait %u (avg %u) | %ux%u -> %ux%u tiles %u: %u %u %u %u us (surface cache hit %u miss %u)\n",
+-		    sweet_m2_pages_us, n2mdp_last_compile_us, n2mdp_last_lockwait_us, (uint32_t)(sweet_m2_sum_wait / sweet_m2_ok), q.sw ? q.sw : 0u, q.sh,
+-		    q.dw, q.dh, n2mdp_last_tiles, n2mdp_tile_us[0], n2mdp_tile_us[1], n2mdp_tile_us[2], n2mdp_tile_us[3], sweet_m2_sc_hits, sweet_m2_sc_miss);
++	bool dump = sweet_m2_dumps < 16;
++	sweet_m2_sum_wait += b->lockwait_us;
++	sweet_m2_sum_tot += tot_us; sweet_m2_sum_hw += us; sweet_m2_sum_map += b->map_us; sweet_m2_sum_cache += tm.cache_us;   /* 0686: timing (hw = MDP busy, total = whole request incl. page lists, IOVA map, cache maintenance) */
++	uint32_t ok = ++sweet_m2_ok;
++	unsigned pq = b->pipe ? 1u : 0u;
++	sweet_m2_pipe[pq].n++; sweet_m2_pipe[pq].wait += b->lockwait_us; sweet_m2_pipe[pq].hw += us; sweet_m2_pipe[pq].run += b->run_us;
++	if (b->overlap) { sweet_m2_ovl++; }
++	for (unsigned c = 0; c < SWEET_M2_NCLS; c++) {
++		if (sweet_m2_cls[c].n && (sweet_m2_cls[c].sw != q.sw || sweet_m2_cls[c].sh != q.sh || sweet_m2_cls[c].dw != q.dw || sweet_m2_cls[c].dh != q.dh)) { continue; }
++		sweet_m2_cls[c].sw = q.sw; sweet_m2_cls[c].sh = q.sh; sweet_m2_cls[c].dw = q.dw; sweet_m2_cls[c].dh = q.dh;
++		sweet_m2_cls[c].n++; sweet_m2_cls[c].p2 += pq; sweet_m2_cls[c].wait += b->lockwait_us; sweet_m2_cls[c].hw += us; sweet_m2_cls[c].tot += tot_us;
++		break;
++	}
++	uint32_t a_wait = (uint32_t)(sweet_m2_sum_wait / ok), a_hw = (uint32_t)(sweet_m2_sum_hw / ok), a_map = (uint32_t)(sweet_m2_sum_map / ok);
++	uint32_t a_cache = (uint32_t)(sweet_m2_sum_cache / ok), a_tot = (uint32_t)(sweet_m2_sum_tot / ok), sch = sweet_m2_sc_hits, scm = sweet_m2_sc_miss;
++	sweet_m2_ulk();
++	if (dump) { sweet_m2_dump(p, n, "accepted"); }
++	/* 0690: the first 4, then pairs (ok % 128 == 0 and 1: the two request streams alternate) */
++	if (ok <= 4 || (ok & 127u) <= 1u) {
++		IOLog("NORD2 M2: timing pages %u compile %u lockwait %u (avg %u) | %ux%u -> %ux%u tiles %u: %u %u %u %u us | pipe %u tile %u px polls %u ovl %u "
++		    "(surface cache hit %u miss %u)\n", tm.pages_us, b->compile_us, b->lockwait_us, a_wait, q.sw, q.sh, q.dw, q.dh, b->tiles,
++		    b->tile_us[0], b->tile_us[1], b->tile_us[2], b->tile_us[3], b->pipe, b->tile_px, b->polls, b->overlap, sch, scm);
+ 		IOLog("NORD2 M2: transform %u -> %u (%08x -> %08x) rot %u flip %u done: hw %u map %u cache %u total %u us (ok %u, avg hw %u map %u "
+-		    "cache %u total %u)\n", src, dst, sweet_m2_last_sfmt, sweet_m2_last_dfmt, rot, flip, us, n2mdp_last_map_us, sweet_m2_cache_us, tot_us,
+-		    sweet_m2_ok, (uint32_t)(sweet_m2_sum_hw / sweet_m2_ok), (uint32_t)(sweet_m2_sum_map / sweet_m2_ok), (uint32_t)(sweet_m2_sum_cache / sweet_m2_ok),
+-		    (uint32_t)(sweet_m2_sum_tot / sweet_m2_ok));
++		    "cache %u total %u)\n", src, dst, sweet_m2_last_sfmt, sweet_m2_last_dfmt, rot, flip, us, b->map_us, tm.cache_us, tot_us,
++		    ok, a_hw, a_map, a_cache, a_tot);
+ 	}
+ 	return kIOReturnSuccess;
+ }
+@@ -366,6 +429,7 @@
+ static void
+ sweet_m2_install(void)
+ {
++	if (!sweet_m2_lock) { sweet_m2_lock = IOLockAlloc(); }   /* 0690 */
+ 	nord2_mdp_set_surface_hook(sweet_m2_blit_ids);
+ 	nord2_mdp_set_publish_hook(sweet_m2_publish);
+ }

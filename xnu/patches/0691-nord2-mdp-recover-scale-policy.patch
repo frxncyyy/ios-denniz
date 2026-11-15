@@ -1,0 +1,231 @@
+--- a/bsd/dev/nord2_mdp.inc
++++ b/bsd/dev/nord2_mdp.inc
+@@ -27,7 +27,14 @@
+  * per-run statistics (the 0689 globals mixed the two request streams), S2 pipe-2 capability jobs + a dual-pipe job (both pipes at
+  * once, exact) -> N2MDP_CAP_DUAL; S3 TIMING jobs (same frame physical vs IOVA, IOVA tile widths) with the vendor M4U1 write
+  * ordering / throttle setup measured before / after (kept only if not slower) and the best IOVA rotation tile width for the
+- * service; IOVA cache entries pinned while a job uses them (eviction / fault drop never unmaps a range in use).
++ * service; IOVA cache entries pinned while a job uses them (eviction / fault drop never unmaps a range in use);
++ * 0691: q10jfinal19 phone: a mediaanalysisd 3088x2320 420f -> 2016x1514 420f downscale (scale lane, 788-px input tiles, NV12
++ * destination: a combination no boot job ever ran) stalled; the abort left WROT2 stuck in soft reset (next jobs: poll timeout at
++ * op 13 = WROT2 RST_STAT), 3 failures -> the whole service (camera too) shut down.  Now: abort recovery as the vendor does it
++ * (cmdqMdpResetEng: WROT release polled; engines that do not come back -> MDPSYS SW0_RST_B pulse for the lane + MOUT reset),
++ * a lane that stays dead is never used again; scaling only inside what S2 verified (input tile <= 512 px, RGB destinations;
++ * frames above 1024x512 need the new S2 scbig job = N2MDP_CAP_SCALE_BIG), any scaled failure switches scaling off for the boot
++ * (camera rotations untouched); the service no longer counts scaled failures toward its automatic shutdown.
+  * (gpu/build/mdp-20261114/MDP_OFFLOAD.md).  Answers "is the MDP powered, clocked and reachable on this phone, and in what
+  * state did the bootloader leave it" before any functional stage (DMA, scaling, rotation) is attempted.
+  *
+@@ -447,6 +454,18 @@
+ #define N2MDP_CAP_IOVA      (1u << 11)
+ #define N2MDP_CAP_RGB_SCALE (1u << 12)
+ #define N2MDP_CAP_DUAL      (1u << 14)   /* 0690: pipe-2 direct lane + both pipes at once verified in this boot (service runs 2 jobs) */
++#define N2MDP_CAP_SCALE_BIG (1u << 15)   /* 0691: S2 scbig (1024x1024 NV12 -> 640x640, 512-px input tiles) passed: scaled frames > 1024x512 */
++/* 0691: largest scaling input tile S2 ever ran (scaledown 512x512 -> 256x256); the service splits scaled jobs so no tile exceeds it */
++#define N2MDP_SCALE_MAX_IN 512u
++/* output tile width (16-px units) whose input span (with the 4-px filter margins) stays <= N2MDP_SCALE_MAX_IN */
++static inline uint32_t
++n2mdp_scale_tile16(uint32_t cw, uint32_t ow)
++{
++	if (!cw || !ow) { return 32u; }
++	uint64_t t = ((uint64_t)(N2MDP_SCALE_MAX_IN - 16u) * ow / cw) / 16u;
++	return t < 2u ? 2u : t > 32u ? 32u : (uint32_t)t;
++}
++static uint32_t n2mdp_scale_off;           /* 0691: a scaled job failed in this boot: scaling refused from then on */
+ #define N2MDP_CAP_NV12_DST  (1u << 13)   /* 0686: NV12 destinations (NV12 -> NV12 rotation / copy jobs passed in this boot) */   /* 0683: RGB-source scaling (smooth-pattern jobs passed in this boot) */
+ 
+ /* gates the functional stages keep open (CG_CON0): RDMA0 0, RSZ2 10? no: RSZ0 4 .. see clk-mt6885-mdp.c */
+@@ -946,6 +965,61 @@
+ 	n2mdp_larb_dump(when);
+ }
+ 
++/* 0691: engine reset of one pipe as the vendor does it (mt6893/mdp.c cmdqMdpResetEng + mdp_common.c cmdq_mdp_loop_reset): RDMA
++ * reset 1 -> MON_STA_1 bit 8 -> 0; WROT SOFT_RST 1 -> RST_STAT 1 -> 0 -> RST_STAT 0 (the 0671 abort never polled the release; on
++ * q10jfinal19 WROT2 stayed at RST_STAT 1 and every later job timed out at op 13); TDSHP CTRL 0 / 2 / 0 for the scale lane.  Engines
++ * that do not come back: MDPSYS SW0_RST_B (mdpsys 0x700, 0 = reset; pipe 0 RDMA0 0 / WROT0 7, pipe 2 RDMA2 8 AAL2 9 RSZ2 10 TDSHP2 12
++ * TCC2 13 WROT2 14 = cmdq_mdp_reset_with_mmsys) pulse + MOUT reset (0xf00 bit 6 RDMA0 / 8 RDMA2, old & ~b, old | b, old & ~b), then
++ * checked again.  Returns true when both engines are idle; a pipe that stays stuck is marked dead (never used again this boot). */
++#define N2MDP_SW0_RST_B   0x700u
++#define N2MDP_MOUT_RST    0xf00u
++static uint32_t n2mdp_lane_dead;          /* bit 0 = pipe 0, bit 1 = pipe 2 */
++static uint32_t n2mdp_recoveries, n2mdp_mmsys_resets;
++static bool
++n2mdp_poll_bits(uint32_t off, uint32_t mask, uint32_t want, unsigned tries)
++{
++	for (unsigned i = 0; i < tries; i++) { if ((n2mdp_rd(off) & mask) == want) { return true; } n2mdp_delay(10); }
++	return (n2mdp_rd(off) & mask) == want;
++}
++static bool
++n2mdp_engine_reset(uint32_t pipe)
++{
++	uint32_t R = N2MDP_W_RDMA(pipe), W = N2MDP_W_WROT(pipe);
++	n2mdp_wr(R + R_RESET, 1u);
++	bool r_ok = n2mdp_poll_bits(R + R_MON1, 1u << 8, 1u << 8, 100);
++	n2mdp_wr(R + R_RESET, 0);
++	n2mdp_wr(W + W_ROT_EN, 0);
++	n2mdp_wr(W + W_SOFT_RST, 1u);
++	bool w_ok = n2mdp_poll_bits(W + W_SOFT_RST_STAT, 1u, 1u, 100);
++	n2mdp_wr(W + W_SOFT_RST, 0);
++	w_ok = n2mdp_poll_bits(W + W_SOFT_RST_STAT, 1u, 0u, 100) && w_ok;
++	if (pipe == N2MDP_PIPE_SCALE) {
++		uint32_t T = N2MDP_W_TDSHP(2) + 0x100u;
++		n2mdp_wr(T, 0); n2mdp_wr(T, 2u); n2mdp_wr(T, 0);
++	}
++	return r_ok && w_ok;
++}
++static bool
++n2mdp_recover(uint32_t pipe, const char *why)
++{
++	n2mdp_recoveries++;
++	if (n2mdp_engine_reset(pipe)) { N2MDP_LOG("NORD2 MDP RECOVER pipe %u (%s): engine reset ok\n", pipe, why); return true; }
++	uint32_t bits = pipe ? ((1u << 8) | (1u << 9) | (1u << 10) | (1u << 12) | (1u << 13) | (1u << 14)) : ((1u << 0) | (1u << 7));
++	uint32_t mb = pipe ? (1u << 8) : (1u << 6);
++	n2mdp_gce_lock();            /* shared mdpsys registers (the other pipe may be running: its bits stay 1 = not reset) */
++	n2mdp_wr(N2MDP_SW0_RST_B, ~bits);
++	n2mdp_wr(N2MDP_SW0_RST_B, ~0u);
++	uint32_t mo = n2mdp_rd(N2MDP_MOUT_RST);
++	n2mdp_wr(N2MDP_MOUT_RST, mo & ~mb); n2mdp_wr(N2MDP_MOUT_RST, mo | mb); n2mdp_wr(N2MDP_MOUT_RST, mo & ~mb);
++	n2mdp_gce_unlock();
++	n2mdp_mmsys_resets++;
++	bool ok = n2mdp_engine_reset(pipe);
++	if (!ok) { n2mdp_lane_dead |= pipe ? 2u : 1u; }
++	N2MDP_LOG("NORD2 MDP RECOVER pipe %u (%s): engine reset failed -> SW0_RST_B pulse %#x: %s (RDMA MON1 %#x WROT RST_STAT %#x)\n", pipe, why,
++	    bits, ok ? "recovered" : "STILL STUCK, pipe off for this boot", n2mdp_rd(N2MDP_W_RDMA(pipe) + R_MON1), n2mdp_rd(N2MDP_W_WROT(pipe) + W_SOFT_RST_STAT));
++	return ok;
++}
++
+ /* abort: stop the mutex, reset the engines of the pipe; never leaves a DMA running */
+ static void
+ n2mdp_abort(const struct n2mdp_prog *p, const char *why)
+@@ -959,15 +1033,9 @@
+ 	    n2mdp_gce_event(N2MDP_EV_RDMA_DONE(p->pipe)));
+ 	n2mdp_wr(N2MDP_MUTEX_EN(p->mutex), 0);
+ 	n2mdp_wr(R + R_EN, 0);
+-	n2mdp_wr(R + R_RESET, 1u);
+-	for (unsigned i = 0; i < 100 && !(n2mdp_rd(R + R_MON1) & (1u << 8)); i++) { n2mdp_delay(10); }
+-	n2mdp_wr(R + R_RESET, 0);
+-	n2mdp_wr(W + W_ROT_EN, 0);
+-	n2mdp_wr(W + W_SOFT_RST, 1u);
+-	for (unsigned i = 0; i < 100 && !(n2mdp_rd(W + W_SOFT_RST_STAT) & 1u); i++) { n2mdp_delay(10); }
+-	n2mdp_wr(W + W_SOFT_RST, 0);
+ 	if (p->pipe == N2MDP_PIPE_SCALE) { n2mdp_wr(N2MDP_W_RSZ(2) + Z_ENABLE, 0); }
+ 	n2mdp_wr(N2MDP_MUTEX_MOD0(p->mutex), 0);
++	(void)n2mdp_recover(p->pipe, why);
+ }
+ 
+ /* 0690: resumable executor.  n2mdp_x_step() runs the ops of one program until a WAIT whose tile is not finished (returns 0 =
+@@ -1191,6 +1259,9 @@
+ 	{ "p2nv2nvr270", N2MF_NV12, N2MF_NV12, 3, 0, 1, 0,  0, 2, 256, 256, 256, 256, 0, 6, 1, 0 },
+ 	{ "p2nv2nvcam",  N2MF_NV12, N2MF_NV12, 1, 0, 1, 0,  0, 2, 752, 564, 564, 752, 0, 6, 1, 0 },
+ 	{ "p2tim90_512", N2MF_NV12, N2MF_NV12, 1, 0, 1, 32, 0, 2, 1024, 768, 768, 1024, 0, 5, 1, 0 },
++	/* 0691: large-frame downscale the way the service now tiles it (ratio ~0.63 like the mediaanalysisd 3088x2320 -> 2016x1514 request,
++	 * 1024 rows, input tiles <= 512 px: tile16 = n2mdp_scale_tile16(1024, 640) = 19 -> 304 px, 3 tiles) -> N2MDP_CAP_SCALE_BIG */
++	{ "scbig",       N2MF_NV12, N2MF_BGRA, 0, 0, 1, 19, 0, 2, 1024, 1024, 640, 640, N2MDP_CAP_SCALE_BIG, 8, 0, 0 },
+ 	/* 0690: S3 TIMING rows (stage 4 = run by n2mdp_s3_timing after S3 passed, never by the stage loop): the S2 timing frame again,
+ 	 * physical vs through M4U1 (pool pages mapped linearly, so only the translation differs), and the IOVA tile widths */
+ 	{ "phys90_512",  N2MF_NV12, N2MF_NV12, 1, 0, 1, 32, 0, 4, 1024, 768, 768, 1024, 0, 7, 0, 0 },
+@@ -1417,6 +1488,7 @@
+ 			if (t->diag == 2) { if (r == 0 && !(rgb_fail)) { rgb_pass++; } else { rgb_fail = 1; } }
+ 			if (t->diag == 3) { if (r == 0 && !nvd_fail) { nvd_pass++; } else { nvd_fail = 1; } }
+ 			if (t->diag == 6) { p2_n++; if (r == 0 && !p2_fail) { p2_pass++; } else { p2_fail = 1; } }   /* 0690: pipe-2 direct lane */
++			if (t->diag == 8 && r == 0) { n2mx.caps |= t->cap; N2MDP_LOG("NORD2 MDP S2: large-frame scaling enabled (%s passed)\n", t->name); }   /* 0691 */
+ 			if (t->diag == 5) {   /* 0689: timing job: hw time per tile width / rotation (rotation penalty, tile-width effect) */
+ 				N2MDP_LOG("NORD2 MDP S2 TIMING %s: %ux%u NV12 -> NV12 rot %u tile %u px: %s hw %u us over %u tiles (%u %u %u %u ...)\n", t->name, t->sw,
+ 				    t->sh, t->rot, (t->tile16 ? t->tile16 : 32u) * 16u, r == 0 ? "ok" : "FAILED", n2mx.last_us, n2mdp_last_tiles,
+@@ -1883,12 +1955,20 @@
+ 	if (ow > 512u) { need |= N2MDP_CAP_TILE; }
+ 	if (!n2mf_is_yuv(src->fmt) && scaled) { need |= N2MDP_CAP_RGB_SCALE; }   /* 0683 */
+ 	if (n2mf_is_yuv(dst->fmt)) { need |= N2MDP_CAP_NV12_DST; }   /* 0686 */
++	st->scaled = scaled ? 1u : 0u;
++	if (scaled) {   /* 0691: scaling only inside what this boot verified */
++		if (n2mdp_scale_off || (n2mdp_lane_dead & 2u)) { return ENOTSUP; }
++		if (n2mf_is_yuv(dst->fmt)) { return ENOTSUP; }            /* scaled NV12 destinations: never run by a boot job */
++		if (src->w > 1024u || src->h > 512u || ow > 1024u || oh > 1024u) { need |= N2MDP_CAP_SCALE_BIG; }
++		if (src->w > 4096u || src->h > 4096u) { return ENOTSUP; }
++	}
+ 	if ((caps & need) != need) { return ENOTSUP; }
++	if (n2mdp_lane_dead & 1u) { return ENODEV; }                     /* 0691: pipe 0 stuck after a failed recovery */
+ 	uint64_t tl0 = n2mdp_now_us();
+ 	n2mdp_svc_enter();
+ 	unsigned pi;                         /* 0 = pipe 0, 1 = pipe 2 */
+ 	if (scaled) { pi = 1; }
+-	else if ((caps & N2MDP_CAP_DUAL) && (n2mdp_tune & N2MDP_TUNE_DUAL)) {
++	else if ((caps & N2MDP_CAP_DUAL) && (n2mdp_tune & N2MDP_TUNE_DUAL) && !(n2mdp_lane_dead & 2u)) {
+ 		if (n2mdp_pipe_trylock(0)) { pi = 0; goto locked; }
+ 		if (n2mdp_pipe_trylock(1)) { pi = 1; goto locked; }
+ 		pi = __atomic_load_n(&n2mdp_pwait[1], __ATOMIC_RELAXED) < __atomic_load_n(&n2mdp_pwait[0], __ATOMIC_RELAXED) ? 1u : 0u;
+@@ -1927,12 +2007,24 @@
+ 		uint32_t t16 = n2mdp_svc_tile_px > 0 ? (uint32_t)n2mdp_svc_tile_px / 16u : ((n2mdp_tune & N2MDP_TUNE_TILE) ? n2mdp_auto_tile16 : 0u);
+ 		if (t16 >= 4u && t16 <= 32u) { j.tile_w = (uint8_t)t16; tpx = t16 * 16u; }
+ 	}
++	if (scaled) {                                                      /* 0691: input tiles <= 512 px */
++		uint32_t t16 = n2mdp_scale_tile16(src->w, ow);
++		if (t16 < 32u) { j.tile_w = (uint8_t)t16; tpx = t16 * 16u; }
++	}
+ 	uint64_t tc0 = n2mdp_now_us();
+ 	if (n2mdp_compile(&j, pg)) { err = EINVAL; goto out; }
+ 	st->compile_us = (uint32_t)(n2mdp_now_us() - tc0);   /* 0688 */
+ 	n2mdp_larb_mode_pipe(pg->pipe, true);                 /* 0690: only this pipe's two ports */
+ 	err = n2mdp_run_x(pg, &xs);
++	if (err == EIO && !(n2mdp_lane_dead & (pi ? 2u : 1u))) {   /* 0691: an engine reset poll failed; the abort recovered the pipe: once more */
++		N2MDP_LOG("NORD2 MDP: pipe %u job retried after recovery\n", pi ? 2u : 0u);
++		err = n2mdp_run_x(pg, &xs);
++	}
+ 	n2mdp_larb_mode_pipe(pg->pipe, false);
++	if (err && scaled && !n2mdp_scale_off) {
++		n2mdp_scale_off = 1;
++		N2MDP_LOG("NORD2 MDP: scaled job %ux%u -> %ux%u failed (%d): scaling off for this boot (unscaled jobs continue)\n", src->w, src->h, ow, oh, err);
++	}
+ 	n2mdp_map_lock();
+ 	n2mx.jobs++;
+ 	if (err) { n2mx.job_fail++; }
+@@ -1995,6 +2087,10 @@
+ SYSCTL_UINT(_kern, OID_AUTO, n2mdp_m4u, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mdp_m4u_state, 0,
+     "0690: M4U1 vendor write setup: 0 not tried, 1 applied, 2 already set, 3 deferred (other masters powered), 4 reverted, 5 off");
+ SYSCTL_UINT(_kern, OID_AUTO, n2mdp_overlap, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mdp_overlap, 0, "0690: service jobs that ran while the other pipe was busy");
++SYSCTL_UINT(_kern, OID_AUTO, n2mdp_scale_off, CTLFLAG_RW | CTLFLAG_LOCKED, &n2mdp_scale_off, 0, "0691: 1 = scaled requests refused (set by a scaled failure; write 0 to retry)");
++SYSCTL_UINT(_kern, OID_AUTO, n2mdp_lane_dead, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mdp_lane_dead, 0, "0691: pipes stuck after recovery (bit 0 pipe 0, bit 1 pipe 2)");
++SYSCTL_UINT(_kern, OID_AUTO, n2mdp_recoveries, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mdp_recoveries, 0, "0691: engine recoveries (aborts)");
++SYSCTL_UINT(_kern, OID_AUTO, n2mdp_mmsys_resets, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mdp_mmsys_resets, 0, "0691: MDPSYS SW0_RST_B lane resets");
+ 
+ static nord2_mdp_surface_blit_fn n2mdp_surface_hook;
+ void nord2_mdp_set_surface_hook(nord2_mdp_surface_blit_fn fn) { n2mdp_surface_hook = fn; }
+--- a/bsd/dev/nord2_mdp_api.h
++++ b/bsd/dev/nord2_mdp_api.h
+@@ -28,6 +28,7 @@
+  * overlap = the other pipe was running a job when this one started, rotation tile width used */
+ struct n2mdp_bstat {
+ 	uint32_t lockwait_us, map_us, compile_us, hw_us, run_us, tiles, tile_us[4], tile_max_us, polls, pipe, overlap, tile_px;
++	uint32_t scaled;                /* 0691: the request needed the scale lane (its failures do not stop the service) */
+ };
+ 
+ #ifdef __cplusplus
+--- a/iokit/Kernel/arm/sweet_m2scaler.inc
++++ b/iokit/Kernel/arm/sweet_m2scaler.inc
+@@ -44,6 +44,7 @@
+ #define SWEET_M2_NCLS 4u
+ static struct { uint32_t sw, sh, dw, dh, n, p2; uint64_t wait, hw, tot; } sweet_m2_cls[SWEET_M2_NCLS];   /* 0690: per request size */
+ static uint32_t sweet_m2_ovl;
++static uint32_t sweet_m2_failed_scaled;     /* 0691: failed scaled requests (the MDP turns scaling off; not counted for the shutdown) */
+ 
+ static int      sweet_m2_svc = 1;     /* 0684: ON for the controlled run image (q10jmdp14); registered only after S3 passed in this boot */
+ /* 0684 safety: after SWEET_M2_MAX_FAILED failed/faulted MDP transforms, or SWEET_M2_MAX_REFUSED refusals with no success, the service
+@@ -310,7 +311,7 @@
+ 		absolutetime_to_nanoseconds(dt, &ns);
+ 		if (sweet_m2_last_stats == 0 || ns >= 10ull * NSEC_PER_SEC) {
+ 			sweet_m2_last_stats = now;
+-			IOLog("NORD2 M2: stats calls %u ok %u refused %u failed %u%s\n", sweet_m2_calls, sweet_m2_ok, sweet_m2_refused, sweet_m2_failed,
++			IOLog("NORD2 M2: stats calls %u ok %u refused %u failed %u (scaled failed %u)%s\n", sweet_m2_calls, sweet_m2_ok, sweet_m2_refused, sweet_m2_failed, sweet_m2_failed_scaled,
+ 			    sweet_m2_off ? " (service OFF: automatic shutdown)" : "");
+ 			IOLog("NORD2 M2: hist ok %u async %u flags %u transform %u fract %u options %u rect %u surface %u srcfmt %u dstfmt %u crop %u "
+ 			    "mdp-unsupported %u mdp-failed %u | ok rot0/90/180/270 %u/%u/%u/%u scaled %u yuv-src %u | last fmt %08x -> %08x\n",
+@@ -364,7 +365,8 @@
+ 		    e >= 1000 ? SWEET_M2_H_SURF : (e == ENOTSUP || e == EINVAL || e == ENODEV) ? SWEET_M2_H_MDPNO : SWEET_M2_H_FAIL;
+ 		sweet_m2_lk();
+ 		sweet_m2_hist[h]++;
+-		if (h == SWEET_M2_H_FAIL) { sweet_m2_failed++; } else { sweet_m2_refused++; }
++		if (h == SWEET_M2_H_FAIL && tm.b.scaled) { sweet_m2_failed_scaled++; sweet_m2_refused++; }   /* 0691: caller falls back; camera path unaffected */
++		else if (h == SWEET_M2_H_FAIL) { sweet_m2_failed++; } else { sweet_m2_refused++; }
+ 		sweet_m2_ulk();
+ 		if (sweet_m2_dumps < 16) {
+ 			IOLog("NORD2 M2: transform %u -> %u (%08x -> %08x) rot %u flip %u src %ux%u+%u+%u dst %ux%u+%u+%u not done (%d %s)\n", q.src, q.dst,

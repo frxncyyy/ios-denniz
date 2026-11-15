@@ -1,0 +1,270 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1001,6 +1001,8 @@
+ 
+ OSDefineMetaClassAndStructors(IOCoreSurfaceRoot, IOService);
+ 
++static void sweet_m2_install(void);     /* 0672: sweet_m2scaler.inc (AppleM2ScalerCSCDriver over the MDP) */
++
+ bool
+ IOCoreSurfaceRoot::start(IOService *provider)
+ {
+@@ -1022,6 +1024,7 @@
+ 	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
+ 	registerService();
+ 	IOLog("SWEET SURF: IOCoreSurfaceRoot registered\n");
++	sweet_m2_install();     /* 0672: MDP hooks; the service itself is registered after the MDP self-tests pass */
+ 	return true;
+ }
+ 
+@@ -3051,4 +3054,5 @@
+ 	sweet_surface_wod_unhold(s);
+ 	return r;
+ }
++#include "sweet_m2scaler.inc"   /* 0672 */
+ #endif /* SWEET */
+--- /dev/null
++++ b/iokit/Kernel/arm/sweet_m2scaler.inc
+@@ -0,0 +1,242 @@
++/*
++ * sweet_m2scaler.inc -- 0672: "AppleM2ScalerCSCDriver" for the iOS frameworks, backed by the MT6893 MDP (bsd/dev/nord2_mdp.inc).
++ * Included once at the end of SweetSurface.cpp (it needs SweetSurface internals: sweet_surface_copy, wire-on-demand holds).
++ *
++ * Why this name [V-dsc 20H392]: IOSurfaceAcceleratorCreate() does IOServiceMatching("AppleM2ScalerCSCDriver") + IOServiceOpen(type 0);
++ * IOSurfaceAcceleratorTransformSurface() = IOConnectCallStructMethod(selector 1, 0x170-byte struct, no output); VideoToolbox's
++ * scalerCapabilities() reads the service property "IOSurfaceAcceleratorCapabilitiesDict".  VideoToolbox (VTPixelTransferNodeScaler),
++ * CMCapture, CMPhoto, ImageIO, AppleJPEG, QuartzCore look the same name up; without it they use Metal (GPU) or vImage (CPU).
++ * Selectors seen in IOSurfaceAccelerator.framework: 0 capture (0x40), 1 transform (0x170), 2 abort transfers, 3 abort captures,
++ * 4 custom filter (0x20), 5 get id (scalar out), 7 performance stats, 8 kernel tests, 9 histogram.
++ * Struct (prepareTransformBuffersAndOptions 0x1d3c21d14): +0 source IOSurfaceID, +4 destination IOSurfaceID, +8..+0x1f completion
++ * (callback, refcon, ...: 0 = synchronous), +0x20 flags (low bits "Transform" flip/rotate: at most one bit above bit 1), +0x28..
++ * rectangles (16.16 fixed point, layout not decoded), then options (alpha, border fill, histogram, dither ...).
++ *
++ * Policy (safe by default): registered only when nord2_mdp_caps() has N2MDP_CAP_IOVA (stage 3 passed in this boot) and
++ * kern.n2mdp_svc != 0; every request we do not fully understand is refused with kIOReturnUnsupported and logged (first 16 raw
++ * structs are hex-dumped): asynchronous completions, non-zero rectangles, options, unknown transform bits, formats other than
++ * BGRA/RGBA/420v/420f, surfaces we cannot resolve.  Supported: whole-surface to whole-surface copy / scale / colour conversion
++ * with transform 0 and [I] transform bit 0x1 = horizontal flip, 0x4 = rotate 90, 0x8 = rotate 180, 0x10 = rotate 270.
++ * Log lines: "NORD2 M2: ...".  Counters kern.n2m2_ok / n2m2_refused / n2m2_failed.  Kill: kern.n2mdp_svc=0 before registration,
++ * or /private/var/db/nord2-mdp-off (no MDP stage runs at all).
++ */
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Weverything"     /* the IOKit/sysctl macros below warn like everywhere else; keep the warning budget */
++#include "../../../bsd/dev/nord2_mdp_api.h"
++#include <sys/sysctl.h>
++
++static int      sweet_m2_svc = 1;
++static uint32_t sweet_m2_ok, sweet_m2_refused, sweet_m2_failed, sweet_m2_dumps;
++SYSCTL_INT(_kern, OID_AUTO, n2mdp_svc, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_m2_svc, 0, "0672: register AppleM2ScalerCSCDriver when the MDP stages pass (0 = never)");
++SYSCTL_UINT(_kern, OID_AUTO, n2m2_ok, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_m2_ok, 0, "0672: transforms done by the MDP");
++SYSCTL_UINT(_kern, OID_AUTO, n2m2_refused, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_m2_refused, 0, "0672: transforms refused (caller falls back)");
++SYSCTL_UINT(_kern, OID_AUTO, n2m2_failed, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_m2_failed, 0, "0672: transforms that failed in the MDP");
++
++#define SWEET_M2_FMT_BGRA 0x42475241u   /* 'BGRA' */
++#define SWEET_M2_FMT_RGBA 0x52474241u   /* 'RGBA' */
++#define SWEET_M2_FMT_420V 0x34323076u   /* '420v' */
++#define SWEET_M2_FMT_420F 0x34323066u   /* '420f' */
++
++/* Resolve a surface into an MDP page-listed image.  Holds a reference (and a wire-on-demand hold) until sweet_m2_put. */
++struct sweet_m2_ref { SweetSurface *s; bool held; uint64_t *pages; uint32_t npages; struct n2mdp_pimg img; };
++
++static int
++sweet_m2_get(uint32_t id, struct sweet_m2_ref *r)
++{
++	bzero(r, sizeof(*r));
++	SweetSurface *s = sweet_surface_copy(id);
++	if (s == NULL) { return 1; }
++	r->s = s;
++	uint32_t f = s->pixelFormat;
++	struct n2mdp_pimg *im = &r->img;
++	im->w = s->width; im->h = s->height;
++	if (f == SWEET_M2_FMT_BGRA || f == SWEET_M2_FMT_RGBA) {
++		im->fmt = f == SWEET_M2_FMT_BGRA ? 1u : 2u;
++		im->pitch[0] = s->bytesPerRow; im->off[0] = s->offset;
++	} else if ((f == SWEET_M2_FMT_420V || f == SWEET_M2_FMT_420F) && s->planeCount >= 2) {
++		im->fmt = 3u; im->full_range = f == SWEET_M2_FMT_420F;
++		im->pitch[0] = s->planes[0].bytesPerRow; im->off[0] = s->planes[0].offset;
++		im->pitch[1] = s->planes[1].bytesPerRow; im->off[1] = s->planes[1].offset;
++	} else { return 2; }
++	if (s->memory == NULL || s->purged) { return 3; }
++	if (!sweet_surface_wod_hold(s)) { return 4; }
++	r->held = true;
++	uint64_t len = s->memory->getLength();
++	uint32_t n = (uint32_t)((len + 4095u) / 4096u);
++	if (n == 0 || n > N2MDP_MAX_PAGES) { return 5; }
++	r->pages = (uint64_t *)IOMalloc(n * sizeof(uint64_t));
++	if (r->pages == NULL) { return 6; }
++	r->npages = n;
++	for (uint32_t k = 0; k < n; ) {
++		IOByteCount seg = 0;
++		uint64_t pa = s->memory->getPhysicalSegment((IOByteCount)k * 4096u, &seg, kIOMemoryMapperNone);
++		if (pa == 0 || seg == 0) { return 7; }
++		for (IOByteCount o = 0; o < seg && k < n; o += 4096u) { r->pages[k++] = pa + o; }
++	}
++	im->npages = n; im->pages = r->pages;
++	/* the MDP is not cache coherent: clean + invalidate the pixels through the kernel mapping (PIPT: covers every alias) */
++	uintptr_t va = s->kernelAddress();
++	if (va) { FlushPoC_DcacheRegion((vm_offset_t)va, (unsigned)len); }
++	return 0;
++}
++static void
++sweet_m2_put(struct sweet_m2_ref *r, bool written)
++{
++	if (r->s && written) {
++		uintptr_t va = r->s->kernelAddress();
++		if (va) { FlushPoC_DcacheRegion((vm_offset_t)va, (unsigned)r->s->memory->getLength()); }
++	}
++	if (r->pages) { IOFree(r->pages, r->npages * sizeof(uint64_t)); }
++	if (r->held) { sweet_surface_wod_unhold(r->s); }
++	if (r->s) { r->s->release(); }
++	bzero(r, sizeof(*r));
++}
++
++static int
++sweet_m2_blit_ids(uint32_t src_id, uint32_t dst_id, uint32_t rot, uint32_t flip, uint32_t *hw_us)
++{
++	struct sweet_m2_ref a, b;
++	int e = sweet_m2_get(src_id, &a);
++	int f = e ? 0 : sweet_m2_get(dst_id, &b);
++	int err;
++	if (e || f) { err = 1000 + (e ? e : 100 + f); }
++	else if (b.img.fmt != 1u && b.img.fmt != 2u) { err = 1200; }     /* RGB destinations only */
++	else { err = nord2_mdp_blit_pages(&a.img, &b.img, rot, flip, hw_us); }
++	if (!e) { sweet_m2_put(&a, false); }
++	if (!e && !f) { sweet_m2_put(&b, err == 0); }
++	return err;
++}
++
++class AppleM2ScalerCSCDriver : public IOService {
++	OSDeclareDefaultStructors(AppleM2ScalerCSCDriver);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(AppleM2ScalerCSCDriver, IOService);
++
++static void
++sweet_m2_set_num(OSDictionary *d, const char *k, uint32_t v)
++{
++	OSNumber *n = OSNumber::withNumber(v, 32);
++	if (n) { d->setObject(k, n); n->release(); }
++}
++
++bool
++AppleM2ScalerCSCDriver::start(IOService *provider)
++{
++	if (!IOService::start(provider)) { return false; }
++	setProperty(kIOUserClientClassKey, "AppleM2ScalerCSCDriverUserClient");
++	OSDictionary *caps = OSDictionary::withCapacity(16);
++	if (caps) {
++		sweet_m2_set_num(caps, "IOSurfaceAcceleratorCapabilitiesMaxSourceWidth", 4096);
++		sweet_m2_set_num(caps, "IOSurfaceAcceleratorCapabilitiesMaxSourceHeight", 4096);
++		sweet_m2_set_num(caps, "IOSurfaceAcceleratorCapabilitiesMaxDestWidth", 4096);
++		sweet_m2_set_num(caps, "IOSurfaceAcceleratorCapabilitiesMaxDestHeight", 4096);
++		sweet_m2_set_num(caps, "IOSurfaceAcceleratorScalerVersion", 1);
++		caps->setObject("IOSurfaceAcceleratorFormatInRGBA8888", kOSBooleanTrue);
++		setProperty("IOSurfaceAcceleratorCapabilitiesDict", caps);
++		caps->release();
++	}
++	setProperty("Nord2MDPCaps", (unsigned long long)nord2_mdp_caps(), 32);
++	registerService();
++	IOLog("NORD2 M2: AppleM2ScalerCSCDriver registered (MDP caps %#x; whole-surface transforms only, everything else refused)\n",
++	    nord2_mdp_caps());
++	return true;
++}
++
++class AppleM2ScalerCSCDriverUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleM2ScalerCSCDriverUserClient);
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE { terminate(); return kIOReturnSuccess; }
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(AppleM2ScalerCSCDriverUserClient, IOUserClient);
++
++static void
++sweet_m2_dump(const uint8_t *p, uint32_t n, const char *why)
++{
++	if (sweet_m2_dumps >= 16) { return; }
++	sweet_m2_dumps++;
++	char name[24]; proc_selfname(name, sizeof(name));
++	IOLog("NORD2 M2: %s refused (%s), struct %u bytes:\n", name, why, n);
++	for (uint32_t o = 0; o < n; o += 32) {
++		const uint32_t *w = (const uint32_t *)(const void *)(p + o);
++		IOLog("NORD2 M2:  +%03x %08x %08x %08x %08x %08x %08x %08x %08x\n", o, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++	}
++}
++
++IOReturn
++AppleM2ScalerCSCDriverUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args, __unused IOExternalMethodDispatch *dispatch,
++    __unused OSObject *target, __unused void *reference)
++{
++	if (selector == 5) {                          /* GetID */
++		if (args->scalarOutputCount >= 1) { args->scalarOutput[0] = 1; }
++		return kIOReturnSuccess;
++	}
++	if (selector == 2 || selector == 3) { return kIOReturnSuccess; }   /* abort transfers / captures: nothing is ever queued */
++	if (selector != 1) { sweet_m2_refused++; return kIOReturnUnsupported; }
++	if (args->structureInput == NULL || args->structureInputSize < 0x58) { sweet_m2_refused++; return kIOReturnBadArgument; }
++	const uint8_t *p = (const uint8_t *)args->structureInput;
++	uint32_t n = args->structureInputSize;
++	uint32_t src = *(const uint32_t *)(const void *)p, dst = *(const uint32_t *)(const void *)(p + 4);
++	uint64_t cb = *(const uint64_t *)(const void *)(p + 8);
++	uint64_t flags = *(const uint64_t *)(const void *)(p + 0x20);
++	const char *why = NULL;
++	bool rects_zero = true;
++	for (uint32_t o = 0x28; o < 0x58 && o + 4 <= n; o += 4) { if (*(const uint32_t *)(const void *)(p + o)) { rects_zero = false; } }
++	bool opts_zero = true;
++	for (uint32_t o = 0x58; o + 4 <= n; o += 4) { if (*(const uint32_t *)(const void *)(p + o)) { opts_zero = false; } }
++	uint32_t t = (uint32_t)(flags & 0x1fu), rot = 0, flip = 0;
++	if (cb != 0) { why = "asynchronous completion"; }
++	else if (!rects_zero) { why = "rectangles"; }
++	else if (!opts_zero) { why = "options"; }
++	else if (flags & ~0x2000ull & ~0x1full) { why = "flags"; }
++	else {
++		flip = t & 1u;
++		switch (t & ~1u) {
++		case 0: rot = 0; break;
++		case 0x4: rot = 1; break;
++		case 0x8: rot = 2; break;
++		case 0x10: rot = 3; break;
++		default: why = "transform"; break;
++		}
++	}
++	if (why) { sweet_m2_refused++; sweet_m2_dump(p, n, why); return kIOReturnUnsupported; }
++	uint32_t us = 0;
++	int e = sweet_m2_blit_ids(src, dst, rot, flip, &us);
++	if (e) {
++		if (e >= 1000 || e == ENOTSUP) { sweet_m2_refused++; } else { sweet_m2_failed++; }
++		if (sweet_m2_dumps < 16) { IOLog("NORD2 M2: transform %u -> %u rot %u flip %u not done (%d)\n", src, dst, rot, flip, e); sweet_m2_dumps++; }
++		return kIOReturnUnsupported;
++	}
++	sweet_m2_ok++;
++	if (sweet_m2_ok <= 4 || (sweet_m2_ok & 1023u) == 0) { IOLog("NORD2 M2: transform %u -> %u rot %u flip %u done in %u us (ok %u)\n", src, dst, rot, flip, us, sweet_m2_ok); }
++	return kIOReturnSuccess;
++}
++
++/* called by nord2_mdp.inc (C) after the stages, from its thread */
++static void
++sweet_m2_publish(uint32_t caps)
++{
++	static bool done;
++	if (done || !(caps & (1u << 11)) || !sweet_m2_svc) {
++		IOLog("NORD2 M2: not registered (caps %#x, kern.n2mdp_svc %d)\n", caps, sweet_m2_svc);
++		return;
++	}
++	done = true;
++	AppleM2ScalerCSCDriver *d = OSTypeAlloc(AppleM2ScalerCSCDriver);
++	IOService *res = IOService::getResourceService();
++	if (d == NULL || res == NULL || !d->init() || !d->attach(res)) { IOLog("NORD2 M2: cannot create the service\n"); if (d) { d->release(); } return; }
++	if (!d->start(res)) { d->detach(res); IOLog("NORD2 M2: start failed\n"); }
++	d->release();
++}
++
++/* hooks into nord2_mdp.inc; installed from IOCoreSurfaceRoot::start */
++static void
++sweet_m2_install(void)
++{
++	nord2_mdp_set_surface_hook(sweet_m2_blit_ids);
++	nord2_mdp_set_publish_hook(sweet_m2_publish);
++}
++#pragma clang diagnostic pop

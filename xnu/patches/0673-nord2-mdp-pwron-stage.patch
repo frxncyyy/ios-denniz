@@ -1,0 +1,394 @@
+--- a/bsd/dev/nord2_mdp.inc
++++ b/bsd/dev/nord2_mdp.inc
+@@ -1,7 +1,9 @@
+ /* SPDX-License-Identifier: MIT */
+ /*
+  * nord2_mdp.inc -- 0670: MT6893 MDP (Media Data Path, mdpsys 0x1f000000) probe = stage 0 of the MDP offload plan;
+- * 0671 adds the functional stages 1-3 (DMA self-test, function matrix, M4U1) and /dev/redwood-mdp (see the 0671 block below).
++ * 0671 adds the functional stages 1-3 (DMA self-test, function matrix, M4U1) and /dev/redwood-mdp (see the 0671 block below);
++ * 0673 adds the bring-up stage P (owned-protection model + vendor-order release of exclusive MDP bits + MDP gates, see the
++ * 0673 blocks) and lets the probe read mdpsys once P verified that no MDP-owned protection bit is set.
+  * (gpu/build/mdp-20261114/MDP_OFFLOAD.md).  Answers "is the MDP powered, clocked and reachable on this phone, and in what
+  * state did the bootloader leave it" before any functional stage (DMA, scaling, rotation) is attempted.
+  *
+@@ -112,7 +114,90 @@
+ 	vm_offset_t spm, top, infra, sys, gced, gcem;
+ 	uint32_t state;              /* kern.n2mdp_state: verdict bits (see n2mdp_probe) */
+ 	uint32_t runs;
++	bool prot_owned_rule;        /* 0673: set by the bring-up stage after it verified the MDP-owned protection bits clear */
+ } n2mdp;
++
++/* ======================================================================================================================
++ * 0673: MDP bus-protection model (clk-mt6885-pg.c:200-262 registers, 300-540 masks, 2921-3110 spm_mtcmos_ctrl_mdp).
++ * The infracfg protection registers are SHARED by every MM domain.  MDP's own power-on masks include the bits of the domains
++ * that sit behind the MDP SMI common (CAM, CAM_RAWA/C, VEN_CORE1, ...), and the vendor kernel leaves those bits SET whenever
++ * such a child domain is off (Android's normal state with the camera / encoder idle).  A set bit of a powered-off child
++ * domain therefore does NOT block MDP traffic.  Phone log 2026-11-15 (q10jmdp0/1/2a): STA1 0xe70c508e (MDP bits 10/23
++ * clear), MM 0x55554815 -> MDP-mask bits set = 0x50440014 = CAM 2,4 + CAM_RAWA 18 + CAM_RAWC 22 + VEN_CORE1 28,30, MM_2 0x141
++ * -> 0x141 = VEN 0 + VDE2 6 + ISP 8; all those domains are off in PWR_STATUS 0x10580fff.  The 0670 probe counted them as
++ * "MDP protection SET" (any bit of the MDP masks) and never read mdpsys.
++ * Rule used after the bring-up stage verified it: an MDP-mask bit must be clear unless a powered-off other domain owns it.
++ * The bring-up stage WRITES only the bits that no other domain shares (exclusive MDP bits) and never a display-domain bit. */
++struct n2mdp_preg { const char *name; uint16_t en, set, clr, sta1; };
++static const struct n2mdp_preg n2mdp_pregs[4] = {
++	{ "PROTECTEN",                0x220u, 0x2a0u, 0x2a4u, 0x228u },
++	{ "PROTECTEN_MM",             0x2d0u, 0x2d4u, 0x2d8u, 0x2ecu },
++	{ "PROTECTEN_MM_2",           0xdc8u, 0xdccu, 0xdd0u, 0xdd8u },
++	{ "PROTECTEN_SUB_INFRA_VDNR", 0xbb4u, 0xbb8u, 0xbbcu, 0xbc4u },
++};
++/* MDP steps in the vendor power-ON release order (pg.c:3071-3107: step2:0..3 then step1:0..2) */
++struct n2mdp_pstep { const char *name; uint8_t reg; uint32_t mask; };
++#define N2MDP_NPSTEPS 7u
++static const struct n2mdp_pstep n2mdp_psteps[N2MDP_NPSTEPS] = {
++	{ "step2:0", 0, 0x00800000u }, { "step2:1", 1, 0xa08802a8u }, { "step2:2", 2, 0x00000a82u }, { "step2:3", 3, 0x00100000u },
++	{ "step1:0", 0, 0x00000400u }, { "step1:1", 1, 0x50440154u }, { "step1:2", 2, 0x00000155u },
++};
++/* vendor power-DOWN order (pg.c:2933-3006: step1:0..2 then step2:0..3) = order used to put released bits back */
++static const uint8_t n2mdp_pdown_order[N2MDP_NPSTEPS] = { 4, 5, 6, 0, 1, 2, 3 };
++/* other domains' protection bits (step1 | step2) in the registers MDP uses, with their PWR_STATUS bit (pg.c:542-570) */
++struct n2mdp_pother { const char *name; uint8_t reg, sta_bit; uint32_t mask; };
++static const struct n2mdp_pother n2mdp_pothers[] = {
++	{ "ISP", 2, 12, 0x00000300u }, { "VDE2", 2, 16, 0x000000c0u }, { "VEN", 2, 17, 0x00000003u },
++	{ "ISP2", 1, 13, 0x0000c000u }, { "IPE", 1, 14, 0x00030000u }, { "VDE", 1, 15, 0x03000000u }, { "VEN", 1, 17, 0x0c000000u },
++	{ "VEN_CORE1", 1, 18, 0xf0000000u }, { "CAM", 1, 23, 0x0000003fu }, { "CAM_RAWA", 1, 24, 0x000c0000u },
++	{ "CAM_RAWB", 1, 25, 0x00300000u }, { "CAM_RAWC", 1, 26, 0x00c00000u },
++};
++#define N2MDP_NPOTHERS (sizeof(n2mdp_pothers) / sizeof(n2mdp_pothers[0]))
++/* display (DIS, bit 20) domain bits (DIS_PROT_STEP*): never written by this file; set while DIS is on = not usable */
++static const uint32_t n2mdp_dis_bits[4] = { 0x00000040u, 0x05115541u | 0x0a228282u, 0u, 0x00200000u };
++
++static uint32_t
++n2mdp_prot_mdp(unsigned r)
++{
++	uint32_t m = 0;
++	for (unsigned k = 0; k < N2MDP_NPSTEPS; k++) { if (n2mdp_psteps[k].reg == r) { m |= n2mdp_psteps[k].mask; } }
++	return m;
++}
++/* bits of register r owned by another domain that is powered off (pwr = PWR_STATUS & PWR_STATUS_2ND) */
++static uint32_t
++n2mdp_prot_child_off(unsigned r, uint32_t pwr)
++{
++	uint32_t m = 0;
++	for (unsigned k = 0; k < N2MDP_NPOTHERS; k++) {
++		if (n2mdp_pothers[k].reg == r && !(pwr & (1u << n2mdp_pothers[k].sta_bit))) { m |= n2mdp_pothers[k].mask; }
++	}
++	return m;
++}
++/* MDP-mask bits no other domain shares (the only bits the bring-up stage may write) */
++static uint32_t
++n2mdp_prot_exclusive(unsigned r)
++{
++	uint32_t m = n2mdp_prot_mdp(r) & ~n2mdp_dis_bits[r];
++	for (unsigned k = 0; k < N2MDP_NPOTHERS; k++) { if (n2mdp_pothers[k].reg == r) { m &= ~n2mdp_pothers[k].mask; } }
++	return m;
++}
++/* MDP-mask bits set in v that are not explained by a powered-off child domain: must be 0 before any mdpsys access */
++static uint32_t
++n2mdp_prot_owned(unsigned r, uint32_t v, uint32_t pwr)
++{
++	return v & n2mdp_prot_mdp(r) & ~n2mdp_prot_child_off(r, pwr);
++}
++/* name of the first other domain owning bit b of register r (log only) */
++static const char *
++n2mdp_prot_owner(unsigned r, unsigned b)
++{
++	if (n2mdp_dis_bits[r] & (1u << b)) { return "DIS"; }
++	for (unsigned k = 0; k < N2MDP_NPOTHERS; k++) {
++		if (n2mdp_pothers[k].reg == r && (n2mdp_pothers[k].mask & (1u << b))) { return n2mdp_pothers[k].name; }
++	}
++	return "MDP only";
++}
++static unsigned n2mdp_lowbit(uint32_t v) { unsigned b = 0; while (b < 31 && !(v & (1u << b))) { b++; } return b; }
+ static int n2mdp_req;            /* kern.n2mdp_probe: 1 / 2 = run that level once; -1 = never (kill); cleared after a run */
+ static int n2mdp_boot_level = N2MDP_BOOT_LEVEL;
+ 
+@@ -205,6 +290,19 @@
+ 	bool power = (s0 & s1 & N2MDP_MDP_BIT) != 0;
+ 	bool prot = (p1 & N2MDP_P_STA1) || (pm & N2MDP_P_MM) || (pm2 & N2MDP_P_MM2);
+ 	bool mux = (cfg1 & N2MDP_MDPSEL_GATE) != 0;
++	{	/* 0673: owned / child-explained breakdown (read-only, infracfg_ao is always on) */
++		uint32_t psub = ni_rd(n2mdp.infra, n2mdp_pregs[3].sta1), pwr = s0 & s1, sv[4] = { p1, pm, pm2, psub }, own[4];
++		for (unsigned r = 0; r < 4; r++) { own[r] = n2mdp_prot_owned(r, sv[r], pwr); }
++		N2MDP_LOG("NORD2 MDP: prot breakdown (MDP-mask bits set / owned by a powered-off child / MDP-owned): sta1 %#x/%#x/%#x"
++		    " mm %#x/%#x/%#x mm2 %#x/%#x/%#x sub_vdnr %#x (raw %#x)/%#x/%#x | rule %s\n",
++		    p1 & n2mdp_prot_mdp(0), p1 & n2mdp_prot_mdp(0) & n2mdp_prot_child_off(0, pwr), own[0],
++		    pm & n2mdp_prot_mdp(1), pm & n2mdp_prot_mdp(1) & n2mdp_prot_child_off(1, pwr), own[1],
++		    pm2 & n2mdp_prot_mdp(2), pm2 & n2mdp_prot_mdp(2) & n2mdp_prot_child_off(2, pwr), own[2],
++		    psub & n2mdp_prot_mdp(3), psub, psub & n2mdp_prot_mdp(3) & n2mdp_prot_child_off(3, pwr), own[3],
++		    n2mdp.prot_owned_rule ? "owned (0673 bring-up verified)" : "any MDP-mask bit (0670)");
++		if (n2mdp.prot_owned_rule) { prot = (own[0] | own[1] | own[2] | own[3]) != 0; }
++		else if (psub & n2mdp_prot_mdp(3)) { prot = true; }      /* 0670 rule + MDP step2:3 (SUB_INFRA_VDNR bit 20), was not read */
++	}
+ 	N2MDP_LOG("NORD2 MDP: level %d run %u | spm status %#x/%#x MDP_PWR_CON %#x DIS_PWR_CON %#x (MDP %s, DIS %s) | prot sta1 %#x mm %#x"
+ 	    " mm2 %#x (MDP bits %s) | CLK_CFG_1 %#x (mdp_sel parent %u, %s) | IFRAO0 %#x (GCE %s, GCE2 %s)\n", level, n2mdp.runs, s0, s1,
+ 	    ni_rd(n2mdp.spm, N2MDP_MDP_CON), ni_rd(n2mdp.spm, N2MDP_DIS_CON), power ? "on" : "OFF", (s0 & s1 & N2MDP_DIS_BIT) ? "on" : "OFF",
+@@ -289,13 +387,14 @@
+  *   service  (0672, SweetSurface.cpp) registers AppleM2ScalerCSCDriver only if stage 3 passed in this boot and no kill file
+  * Each stage runs only if the previous one passed in this boot.  Results: kern.n2mdp_stage, kern.n2mdp_caps, kern.n2mdp_s1,
+  * kern.n2mdp_s2, kern.n2mdp_s3, log lines "NORD2 MDP S1/S2/S3 ..." and "NORD2 MDP STAGES: ...".
+- * Kill switches: file /private/var/db/nord2-mdp-off (probe only), sysctl kern.n2mdp_stages (max stage, default N2MDP_STAGES),
++ * Kill switches: file /private/var/db/nord2-mdp-off (probe only), sysctl kern.n2mdp_stages (bits 7:0 max stage, bit 8 = 0673
++ * bring-up stage P; default N2MDP_STAGES),
+  * kern.n2mdp_probe = -1 before +45 s.
+  * ==================================================================================================================== */
+ #include "nord2_mdp_job.h"
+ 
+ #ifndef N2MDP_STAGES
+-#define N2MDP_STAGES 1   /* q10jmdp2a: probe + DMA self-test only */
++#define N2MDP_STAGES 0x101   /* q10jmdp3: 0673 bring-up (bit 8) + probe + DMA self-test (stage 1); q10jmdp2a was 1 */
+ #endif
+ 
+ #define N2MDP_CAP_COPY      (1u << 0)
+@@ -410,6 +509,187 @@
+ 	N2MDP_LOG("NORD2 MDP: gates restored: CG0 %#x CG1 %#x\n", n2mdp_rd(N2MDP_CG0), n2mdp_rd(N2MDP_CG1));
+ }
+ 
++/* ======================================================================================================================
++ * 0673: bring-up stage "P" (kern.n2mdp_stages bit 0x100): the MDP part of the vendor power-on (spm_mtcmos_ctrl_mdp
++ * STA_POWER_ON after the SPM steps, then enable_subsys_hwcg(SYS_MDP)) on a domain that is already powered:
++ *   1. checks: PWR_STATUS and _2ND bit 19 on, MDP_PWR_CON = on state (RST_B ON ON_2ND set; ISO CLK_DIS SRAM_PDN SRAM_ACK
++ *      clear), mdp_sel ungated.  The SPM power-on itself is NOT done here (domain shared with the codec code).
++ *   2. protection: for each step in the vendor release order step2:0 2:1 2:2 2:3 1:0 1:1 1:2, clear (write 1 to the _CLR
++ *      register) only the EXCLUSIVE MDP bits that are set in EN or STA1, then poll STA1 and EN until those bits read 0
++ *      (<= N2MDP_PROT_POLLS x N2MDP_PROT_POLL_US).  Bits shared with another domain are never written: if one is set while that
++ *      domain is on (or it is a display bit) the stage stops before writing anything.  A step that does not clear ->
++ *      every bit released so far is set again in the vendor power-down order (step1 then step2) with its ack polled, and
++ *      the register/bit is logged.
++ *   3. verification: all four STA1 registers re-read, MDP-owned bits (owned rule above) must be 0.
++ *   4. gates: mdpsys CG_CON1 CLR (0x118) <- 0x1112 (SMI0/1/2 + APMCU_GALS, as enable_subsys_hwcg), then CG_CON0 CLR (0x108)
++ *      <- APB 31 | MUTEX0 15 | RDMA0 0 | RSZ0 4 | WROT0 7 (only the gated ones), infracfg IFRAO0 CLR (0x84) <- GCE2 bit 9
++ *      if gated (GCE bit 8 = display GCE: not touched); read back; any gate still closed -> gates and protection restored.
++ *   5. the caller re-runs the read-only probe with the owned rule.
++ * Result kern.n2mdp_pwron: 0 not run, 1 OK, 2 domain off, 3 PWR_CON not on, 4 mdp_sel gated, 5 shared/display bit set,
++ * 6 release ack timeout (restored), 7 restore failed, 8 gates did not open (restored), 9 maps, 10 owned bit set after release.
++ * ==================================================================================================================== */
++#define N2MDP_PWRON_BIT       0x100
++#define N2MDP_PROT_POLLS      200u
++#define N2MDP_PROT_POLL_US    5u
++#define N2MDP_CON_ON_MASK     0x111fu    /* SRAM_ACK 12 | SRAM_PDN 8 | CLK_DIS 4 | ON_2ND 3 | ON 2 | ISO 1 | RST_B 0 */
++#define N2MDP_CON_ON_VAL      0x000du    /* ON_2ND | ON | RST_B */
++#define N2MDP_CG0_PWRON       (N2MDP_CG0_APB | N2MDP_CG0_MUTEX0 | (1u << 0) | (1u << 4) | (1u << 7))
++
++static struct {
++	uint32_t code;
++	uint32_t released[N2MDP_NPSTEPS];     /* bits this stage cleared per step that were set in EN (put back on failure) */
++	uint32_t opened0, opened1;
++	bool gce_opened;
++} n2pw;
++
++static const char *const n2mdp_pwron_why[11] = { "not run", "OK", "domain off (SPM power-on not attempted)",
++	"MDP_PWR_CON not in the on state", "mdp_sel gated (topckgen mux not touched)", "shared or display protection bit set",
++	"release ack timeout (protection restored)", "RESTORE FAILED", "gates did not open (restored)", "mapping failed",
++	"MDP-owned protection bit set after release (restored)" };
++
++/* poll register `off` of infracfg until (v & bits) == want; returns microseconds spent or -1 on timeout */
++static int
++n2mdp_prot_poll(uint16_t off, uint32_t bits, uint32_t want)
++{
++	for (unsigned k = 0; k <= N2MDP_PROT_POLLS; k++) {
++		if ((ni_rd(n2mdp.infra, off) & bits) == want) { return (int)(k * N2MDP_PROT_POLL_US); }
++		if (k < N2MDP_PROT_POLLS) { n2mdp_delay(N2MDP_PROT_POLL_US); }
++	}
++	return -1;
++}
++
++/* put back every bit released so far, vendor power-down order; returns false if an ack did not come */
++static bool
++n2mdp_prot_restore(void)
++{
++	bool ok = true;
++	for (unsigned i = 0; i < N2MDP_NPSTEPS; i++) {
++		unsigned k = n2mdp_pdown_order[i];
++		uint32_t b = n2pw.released[k];
++		if (!b) { continue; }
++		const struct n2mdp_preg *R = &n2mdp_pregs[n2mdp_psteps[k].reg];
++		ni_wr(n2mdp.infra, R->set, b);
++		int us = n2mdp_prot_poll(R->sta1, b, b);
++		if (us < 0) {
++			ok = false;
++			N2MDP_LOG("NORD2 MDP PWRON: RESTORE STUCK %s %s_SET <- %#x: STA1 (%#x) %#x after %u us, bit %u not acked\n",
++			    n2mdp_psteps[k].name, R->name, b, R->sta1, ni_rd(n2mdp.infra, R->sta1), N2MDP_PROT_POLLS * N2MDP_PROT_POLL_US,
++			    n2mdp_lowbit(b & ~ni_rd(n2mdp.infra, R->sta1)));
++		} else {
++			N2MDP_LOG("NORD2 MDP PWRON: restored %s %s_SET <- %#x (acked after %d us)\n", n2mdp_psteps[k].name, R->name, b, us);
++			n2pw.released[k] = 0;
++		}
++	}
++	return ok;
++}
++
++static void
++n2mdp_pwron_gates_restore(void)
++{
++	if (n2pw.opened0) { n2mdp_wr(N2MDP_CG0 + 4u, n2pw.opened0); }
++	if (n2pw.opened1) { n2mdp_wr(N2MDP_CG1 + 4u, n2pw.opened1); }
++	if (n2pw.gce_opened) { ni_wr(n2mdp.infra, N2MDP_IFRAO0_CLR - 4u, N2MDP_IFR_GCE2); }
++	n2pw.opened0 = n2pw.opened1 = 0; n2pw.gce_opened = false;
++}
++
++static uint32_t
++n2mdp_pwron_inner(void)
++{
++	if (!n2mdp_maps()) { return 9; }
++	uint32_t s0 = ni_rd(n2mdp.spm, N2MDP_PWR_STA), s1 = ni_rd(n2mdp.spm, N2MDP_PWR_STA2), pwr = s0 & s1;
++	uint32_t con = ni_rd(n2mdp.spm, N2MDP_MDP_CON), cfg1 = ni_rd(n2mdp.top, N2MDP_CFG1);
++	N2MDP_LOG("NORD2 MDP PWRON: start | spm %#x/%#x MDP_PWR_CON %#x CLK_CFG_1 %#x\n", s0, s1, con, cfg1);
++	if (!(pwr & N2MDP_MDP_BIT)) { return 2; }
++	if ((con & N2MDP_CON_ON_MASK) != N2MDP_CON_ON_VAL) { return 3; }
++	if (cfg1 & N2MDP_MDPSEL_GATE) { return 4; }
++
++	/* 2a. plan: nothing is written before every step is known to be safe */
++	uint32_t en[4], sta[4], rel[N2MDP_NPSTEPS];
++	for (unsigned r = 0; r < 4; r++) {
++		en[r] = ni_rd(n2mdp.infra, n2mdp_pregs[r].en); sta[r] = ni_rd(n2mdp.infra, n2mdp_pregs[r].sta1);
++		uint32_t v = en[r] | sta[r], own = n2mdp_prot_owned(r, v, pwr), ex = n2mdp_prot_exclusive(r);
++		N2MDP_LOG("NORD2 MDP PWRON: %s EN %#x STA1 %#x | MDP mask %#x set %#x, child-off %#x, MDP-owned set %#x (exclusive %#x)\n",
++		    n2mdp_pregs[r].name, en[r], sta[r], n2mdp_prot_mdp(r), v & n2mdp_prot_mdp(r), v & n2mdp_prot_mdp(r) &
++		    n2mdp_prot_child_off(r, pwr), own, own & ex);
++		if (own & ~ex) {
++			unsigned b = n2mdp_lowbit(own & ~ex);
++			N2MDP_LOG("NORD2 MDP PWRON: %s bit %u is set and shared with %s (domain on or display): not written, stage stops\n",
++			    n2mdp_pregs[r].name, b, n2mdp_prot_owner(r, b));
++			return 5;
++		}
++	}
++	for (unsigned k = 0; k < N2MDP_NPSTEPS; k++) {
++		unsigned r = n2mdp_psteps[k].reg;
++		rel[k] = (en[r] | sta[r]) & n2mdp_psteps[k].mask & n2mdp_prot_exclusive(r);
++	}
++	/* 2b. release, vendor order (a bit may sit in two steps of one register: cleared by the first) */
++	unsigned nrel = 0;
++	for (unsigned k = 0; k < N2MDP_NPSTEPS; k++) {
++		const struct n2mdp_preg *R = &n2mdp_pregs[n2mdp_psteps[k].reg];
++		for (unsigned j = 0; j < k; j++) { if (n2mdp_psteps[j].reg == n2mdp_psteps[k].reg) { rel[k] &= ~rel[j]; } }
++		uint32_t b = rel[k];
++		if (!b) { continue; }
++		ni_wr(n2mdp.infra, R->clr, b);
++		n2pw.released[k] = b & en[n2mdp_psteps[k].reg];   /* put back only what EN really had (a bit may be set in STA1 only) */
++		nrel++;
++		int us = n2mdp_prot_poll(R->sta1, b, 0), us2 = us < 0 ? -1 : n2mdp_prot_poll(R->en, b, 0);
++		if (us < 0 || us2 < 0) {
++			uint32_t st = ni_rd(n2mdp.infra, R->sta1), e = ni_rd(n2mdp.infra, R->en);
++			N2MDP_LOG("NORD2 MDP PWRON: STUCK %s %s_CLR <- %#x: %s %#x still has %#x after %u us (bit %u)\n", n2mdp_psteps[k].name, R->name,
++			    b, us < 0 ? "STA1" : "EN", us < 0 ? st : e, (us < 0 ? st : e) & b, N2MDP_PROT_POLLS * N2MDP_PROT_POLL_US,
++			    n2mdp_lowbit((us < 0 ? st : e) & b));
++			return n2mdp_prot_restore() ? 6 : 7;
++		}
++		N2MDP_LOG("NORD2 MDP PWRON: released %s %s_CLR <- %#x (STA1 clear after %d us, EN after %d us)\n", n2mdp_psteps[k].name, R->name,
++		    b, us, us2);
++	}
++	if (!nrel) { N2MDP_LOG("NORD2 MDP PWRON: no exclusive MDP protection bit set: nothing to release\n"); }
++	/* 3. verify with fresh reads */
++	pwr = ni_rd(n2mdp.spm, N2MDP_PWR_STA) & ni_rd(n2mdp.spm, N2MDP_PWR_STA2);
++	for (unsigned r = 0; r < 4; r++) {
++		uint32_t v = ni_rd(n2mdp.infra, n2mdp_pregs[r].sta1), own = n2mdp_prot_owned(r, v, pwr);
++		if (own || !(pwr & N2MDP_MDP_BIT)) {
++			N2MDP_LOG("NORD2 MDP PWRON: after release %s STA1 %#x MDP-owned %#x (bit %u, %s), MDP power %s\n", n2mdp_pregs[r].name, v, own,
++			    n2mdp_lowbit(own), n2mdp_prot_owner(r, n2mdp_lowbit(own)), (pwr & N2MDP_MDP_BIT) ? "on" : "OFF");
++			return n2mdp_prot_restore() ? 10 : 7;
++		}
++	}
++	/* 4. gates (mdpsys config reads are allowed now: domain on, protection verified, mdp_sel running) */
++	uint32_t c0 = n2mdp_rd(N2MDP_CG0), c1 = n2mdp_rd(N2MDP_CG1), ifr = ni_rd(n2mdp.infra, N2MDP_IFRAO0_STA);
++	n2pw.opened1 = c1 & N2MDP_CG1_SMI;
++	n2pw.opened0 = c0 & N2MDP_CG0_PWRON;
++	if (n2pw.opened1) { n2mdp_wr(N2MDP_CG1 + 8u, N2MDP_CG1_SMI); }   /* exactly enable_subsys_hwcg(SYS_MDP) */
++	if (n2pw.opened0) { n2mdp_wr(N2MDP_CG0 + 8u, n2pw.opened0); }
++	if (ifr & N2MDP_IFR_GCE2) { ni_wr(n2mdp.infra, N2MDP_IFRAO0_CLR, N2MDP_IFR_GCE2); n2pw.gce_opened = true; }
++	uint32_t a0 = n2mdp_rd(N2MDP_CG0), a1 = n2mdp_rd(N2MDP_CG1), a2 = ni_rd(n2mdp.infra, N2MDP_IFRAO0_STA);
++	bool ok = !(a0 & N2MDP_CG0_PWRON) && !(a1 & N2MDP_CG1_SMI) && !(a2 & N2MDP_IFR_GCE2);
++	N2MDP_LOG("NORD2 MDP PWRON: gates %s: CG_CON0 %#x -> %#x (opened %#x) CG_CON1 %#x -> %#x (CLR1 <- %#x) IFRAO0 %#x -> %#x\n",
++	    ok ? "open" : "DID NOT OPEN", c0, a0, n2pw.opened0, c1, a1, n2pw.opened1 ? N2MDP_CG1_SMI : 0u, ifr, a2);
++	if (!ok) {
++		n2mdp_pwron_gates_restore();
++		return n2mdp_prot_restore() ? 8 : 7;
++	}
++	return 1;
++}
++
++/* runs under n2mdp_lock; serialised against the codec power code (it moves the shared protection registers) */
++static uint32_t
++n2mdp_pwron(void)
++{
++	memset(&n2pw, 0, sizeof(n2pw));
++#ifndef N2MDP_HOST
++	n2vc_lock();
++#endif
++	uint32_t c = n2mdp_pwron_inner();
++#ifndef N2MDP_HOST
++	n2vc_unlock();
++#endif
++	n2pw.code = c;
++	if (c == 1) { n2mdp.prot_owned_rule = true; }
++	N2MDP_LOG("NORD2 MDP PWRON: result %u (%s)\n", c, c <= 10 ? n2mdp_pwron_why[c] : "?");
++	return c;
++}
++
+ /* larb2 ports p0..p3 (RDMA0, RDMA2, WROT0, WROT2): bit0 MMU_EN = translate through M4U1, 0 = physical */
+ static void
+ n2mdp_larb_mode(bool iova)
+@@ -797,11 +1077,23 @@
+ n2mdp_stages(uint32_t probe_state)
+ {
+ 	n2mdp_lock();
+-	if (n2mx.stage >= 1 || n2mx.s1 > 1) { n2mdp_unlock(); return; }         /* once per boot */
++	if (n2mx.stage >= 1 || n2mx.s1 > 1 || n2pw.code > 1) { n2mdp_unlock(); return; }         /* once per boot */
+ 	const char *why = NULL;
+-	if (n2mdp_max_stage < 1) { why = "kern.n2mdp_stages = 0"; }
++	int lvl = n2mdp_max_stage & 0xff;
++	bool pwron = (n2mdp_max_stage & N2MDP_PWRON_BIT) != 0;
++	if (n2mdp_max_stage < 0 || (lvl < 1 && !pwron)) { why = "kern.n2mdp_stages = 0"; }
+ 	else if (n2mdp_killfile()) { why = "/private/var/db/nord2-mdp-off present"; n2mx.killed = true; }
+-	else if (!(probe_state & N2MDP_S_POWER) || (probe_state & (N2MDP_S_PROT | N2MDP_S_MUXGATE | N2MDP_S_NOMAP))) { why = "probe not OK"; }
++	if (!why && pwron && n2pw.code == 0) {
++		/* 0673 stage P: bring-up, then the read-only probe again with the owned-protection rule */
++		if (n2mdp_pwron() == 1) {
++			n2mdp.runs++;
++			probe_state = n2mdp.state = n2mdp_probe(1);
++			N2MDP_LOG("NORD2 MDP PWRON: re-probe state %#x (%s)\n", probe_state, (probe_state & N2MDP_S_APB) ? "mdpsys reachable, APB open" :
++			    "mdpsys NOT reachable");
++		}
++	}
++	if (!why && lvl < 1) { why = "kern.n2mdp_stages: functional stages off"; }
++	else if (!why && (!(probe_state & N2MDP_S_POWER) || (probe_state & (N2MDP_S_PROT | N2MDP_S_MUXGATE | N2MDP_S_NOMAP)))) { why = "probe not OK"; }
+ 	if (why) { N2MDP_LOG("NORD2 MDP STAGES: not run (%s)\n", why); n2mdp_unlock(); return; }
+ 	if (!n2mdp_gates_on() || !n2mdp_pool_get()) { n2mx.s1 = 9; n2mdp_gates_restore(); N2MDP_LOG("NORD2 MDP STAGES: S1 cannot start (gates/pool)\n"); n2mdp_unlock(); return; }
+ 	for (unsigned p = 0; p < 4; p++) { n2mx.larb_found[p] = n2mdp_rd(N2MDP_W_LARB2 + 0x380u + 4u * p); }
+@@ -812,13 +1104,13 @@
+ 	N2MDP_LOG("NORD2 MDP S1: %s (pass %#x fail %#x)\n", n2mx.s1 == 1 ? "PASS" : "FAIL", pm, fm);
+ 	if (n2mx.s1 != 1) { n2mx.caps = 0; n2mdp_gates_restore(); goto done; }
+ 	n2mx.stage = 1;
+-	if (n2mdp_max_stage >= 2) {
++	if (lvl >= 2) {
+ 		uint32_t r = n2mdp_stage_tests(2, &n2mx.s2_pass, &n2mx.s2_fail);
+ 		N2MDP_LOG("NORD2 MDP S2: %s (pass %#x fail %#x, caps %#x, rgb_swap %u)\n", r == 1 ? "PASS" : "PARTIAL", n2mx.s2_pass, n2mx.s2_fail,
+ 		    n2mx.caps, n2mx.rgb_swap);
+ 		if (r != 4 && r != 5) { n2mx.stage = 2; }      /* timeouts / guard hits end the stage machine */
+ 	}
+-	if (n2mx.stage >= 2 && n2mdp_max_stage >= 3) {
++	if (n2mx.stage >= 2 && lvl >= 3) {
+ 		n2mx.s3 = n2mdp_stage3();
+ 		N2MDP_LOG("NORD2 MDP S3: %s (code %u)\n", n2mx.s3 == 1 ? "PASS" : "FAIL", n2mx.s3);
+ 		if (n2mx.s3 == 1) { n2mx.stage = 3; n2mx.caps |= N2MDP_CAP_IOVA; }
+@@ -892,7 +1184,9 @@
+ SYSCTL_INT(_kern, OID_AUTO, n2mdp_boot, CTLFLAG_RW | CTLFLAG_LOCKED, &n2mdp_boot_level, 0,
+     "0670: level of the automatic probe at +45 s (0 = none)");
+ SYSCTL_UINT(_kern, OID_AUTO, n2mdp_state, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mdp.state, 0, "0670: verdict bits of the last probe");
+-SYSCTL_INT(_kern, OID_AUTO, n2mdp_stages, CTLFLAG_RW | CTLFLAG_LOCKED, &n2mdp_max_stage, 0, "0671: highest functional stage to run (0..3)");
++SYSCTL_INT(_kern, OID_AUTO, n2mdp_stages, CTLFLAG_RW | CTLFLAG_LOCKED, &n2mdp_max_stage, 0, "0671/0673: bits 7:0 highest functional stage to run (0..3), bit 8 (0x100) = 0673 MDP bring-up (bus protection + gates)");
++SYSCTL_UINT(_kern, OID_AUTO, n2mdp_pwron, CTLFLAG_RD | CTLFLAG_LOCKED, &n2pw.code, 0,
++    "0673: bring-up result (0 not run, 1 OK, 2 domain off, 3 PWR_CON, 4 mdp_sel gated, 5 shared bit set, 6 ack timeout restored, 7 restore failed, 8 gates, 9 maps, 10 owned bit after release)");
+ SYSCTL_UINT(_kern, OID_AUTO, n2mdp_stage, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mx.stage, 0, "0671: highest stage passed in this boot");
+ SYSCTL_UINT(_kern, OID_AUTO, n2mdp_caps, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mx.caps, 0, "0671: capability bits that passed");
+ SYSCTL_UINT(_kern, OID_AUTO, n2mdp_s1, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mx.s1, 0, "0671: stage 1 result (1 pass, >1 failure code)");
+@@ -980,8 +1274,8 @@
+ 	bool dev = major >= 0 && devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-mdp") != NULL;
+ 	if (kernel_thread_start(n2mdp_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+-		printf("NORD2 MDP: probe thread on (boot probe level %d at +45 s then stages up to %d; read-only again at +180 s; "
+-		    "/dev/redwood-mdp %s)\n", n2mdp_boot_level, n2mdp_max_stage, dev ? "made" : "NOT made");
++		printf("NORD2 MDP: probe thread on (boot probe level %d at +45 s then stages %#x (bit 8 = 0673 bring-up); read-only again at +180 s; "
++		    "/dev/redwood-mdp %s)\n", n2mdp_boot_level, (unsigned)n2mdp_max_stage, dev ? "made" : "NOT made");
+ 	}
+ }
+ #endif /* !N2MDP_HOST */

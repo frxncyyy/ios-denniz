@@ -1,0 +1,90 @@
+--- a/iokit/Kernel/arm/sweet_m2scaler.inc
++++ b/iokit/Kernel/arm/sweet_m2scaler.inc
+@@ -24,8 +24,18 @@
+ #pragma clang diagnostic ignored "-Weverything"     /* the IOKit/sysctl macros below warn like everywhere else; keep the warning budget */
+ #include "../../../bsd/dev/nord2_mdp_api.h"
+ #include <sys/sysctl.h>
+-
+-static int      sweet_m2_svc = 0;     /* 0683: off by default; controlled run: kern.n2mdp_svc=1 then kern.n2mdp_publish=1 */
++#include <kern/clock.h>          /* 0684: absolutetime_to_nanoseconds */
++#include <mach/clock_types.h>    /* NSEC_PER_SEC */
++#include <string.h>
++
++static int      sweet_m2_svc = 1;     /* 0684: ON for the controlled run image (q10jmdp14); registered only after S3 passed in this boot */
++/* 0684 safety: after SWEET_M2_MAX_FAILED failed/faulted MDP transforms, or SWEET_M2_MAX_REFUSED refusals with no success, the service
++ * terminates itself (new IOSurfaceAccelerator clients then get no service = the Metal/vImage path) and refuses everything still open. */
++#define SWEET_M2_MAX_FAILED  3u
++#define SWEET_M2_MAX_REFUSED 64u
++static bool     sweet_m2_off;
++static uint64_t sweet_m2_last_stats;
++static uint32_t sweet_m2_calls;
+ static uint32_t sweet_m2_ok, sweet_m2_refused, sweet_m2_failed, sweet_m2_dumps;
+ SYSCTL_INT(_kern, OID_AUTO, n2mdp_svc, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_m2_svc, 0, "0672: register AppleM2ScalerCSCDriver when the MDP stages pass (0 = never)");
+ SYSCTL_UINT(_kern, OID_AUTO, n2m2_ok, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_m2_ok, 0, "0672: transforms done by the MDP");
+@@ -112,6 +122,7 @@
+ public:
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ };
++static AppleM2ScalerCSCDriver *sweet_m2_drv;   /* 0684: for the automatic shutdown */
+ OSDefineMetaClassAndStructors(AppleM2ScalerCSCDriver, IOService);
+ 
+ static void
+@@ -125,6 +136,7 @@
+ AppleM2ScalerCSCDriver::start(IOService *provider)
+ {
+ 	if (!IOService::start(provider)) { return false; }
++	sweet_m2_drv = this;
+ 	setProperty(kIOUserClientClassKey, "AppleM2ScalerCSCDriverUserClient");
+ 	OSDictionary *caps = OSDictionary::withCapacity(16);
+ 	if (caps) {
+@@ -159,7 +171,7 @@
+ 	if (sweet_m2_dumps >= 16) { return; }
+ 	sweet_m2_dumps++;
+ 	char name[24]; proc_selfname(name, sizeof(name));
+-	IOLog("NORD2 M2: %s refused (%s), struct %u bytes:\n", name, why, n);
++	IOLog("NORD2 M2: request #%u from %s %s (%s), struct %u bytes:\n", sweet_m2_dumps, name, strcmp(why, "accepted") ? "refused" : "accepted", why, n);
+ 	for (uint32_t o = 0; o < n; o += 32) {
+ 		const uint32_t *w = (const uint32_t *)(const void *)(p + o);
+ 		IOLog("NORD2 M2:  +%03x %08x %08x %08x %08x %08x %08x %08x %08x\n", o, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+@@ -175,6 +187,24 @@
+ 		return kIOReturnSuccess;
+ 	}
+ 	if (selector == 2 || selector == 3) { return kIOReturnSuccess; }   /* abort transfers / captures: nothing is ever queued */
++	/* 0684: periodic counters (every >= 10 s while there is traffic) and the automatic shutdown */
++	sweet_m2_calls++;
++	{
++		uint64_t now = mach_absolute_time(), ns = 0, dt = now - sweet_m2_last_stats;
++		absolutetime_to_nanoseconds(dt, &ns);
++		if (sweet_m2_last_stats == 0 || ns >= 10ull * NSEC_PER_SEC) {
++			sweet_m2_last_stats = now;
++			IOLog("NORD2 M2: stats calls %u ok %u refused %u failed %u%s\n", sweet_m2_calls, sweet_m2_ok, sweet_m2_refused, sweet_m2_failed,
++			    sweet_m2_off ? " (service OFF: automatic shutdown)" : "");
++		}
++	}
++	if (!sweet_m2_off && (sweet_m2_failed >= SWEET_M2_MAX_FAILED || (sweet_m2_ok == 0 && sweet_m2_refused >= SWEET_M2_MAX_REFUSED))) {
++		sweet_m2_off = true;
++		IOLog("NORD2 M2: automatic shutdown (ok %u refused %u failed %u): service terminated, clients fall back to Metal/vImage\n",
++		    sweet_m2_ok, sweet_m2_refused, sweet_m2_failed);
++		if (sweet_m2_drv) { sweet_m2_drv->terminate(kIOServiceAsynchronous); }
++	}
++	if (sweet_m2_off || !sweet_m2_svc) { sweet_m2_refused++; return kIOReturnUnsupported; }
+ 	if (selector != 1) { sweet_m2_refused++; return kIOReturnUnsupported; }
+ 	if (args->structureInput == NULL || args->structureInputSize < 0x58) { sweet_m2_refused++; return kIOReturnBadArgument; }
+ 	const uint8_t *p = (const uint8_t *)args->structureInput;
+@@ -203,6 +233,7 @@
+ 		}
+ 	}
+ 	if (why) { sweet_m2_refused++; sweet_m2_dump(p, n, why); return kIOReturnUnsupported; }
++	if (sweet_m2_dumps < 16) { sweet_m2_dump(p, n, "accepted"); }   /* 0684: the first 16 requests are dumped, accepted ones too */
+ 	uint32_t us = 0;
+ 	int e = sweet_m2_blit_ids(src, dst, rot, flip, &us);
+ 	if (e) {
+@@ -220,7 +251,7 @@
+ sweet_m2_publish(uint32_t caps)
+ {
+ 	static bool done;
+-	if (done || !(caps & (1u << 11)) || !sweet_m2_svc) {   /* 0683: may be called again via kern.n2mdp_publish */
++	if (done || !(caps & (1u << 11)) || !sweet_m2_svc || sweet_m2_off) {   /* 0683: may be called again via kern.n2mdp_publish */
+ 		IOLog("NORD2 M2: not registered (caps %#x, kern.n2mdp_svc %d)\n", caps, sweet_m2_svc);
+ 		return;
+ 	}

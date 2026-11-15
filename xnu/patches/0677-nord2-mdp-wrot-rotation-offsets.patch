@@ -1,0 +1,112 @@
+--- a/bsd/dev/nord2_mdp.inc
++++ b/bsd/dev/nord2_mdp.inc
+@@ -6,7 +6,8 @@
+  * 0673 blocks) and lets the probe read mdpsys once P verified that no MDP-owned protection bit is set;
+  * 0674 adds the larb2 SMI bring-up before S1, mutex end-of-frame as a second done indicator and full pipe dumps;
+  * 0675: larb2 setup optional (OSTDL never lowered, byte-mirrored read-back, S1 refused only for a real blocker), short log lines;
+- * 0676: vendor RDMA buffer words / RDMA_CON / WROT FIFO_TEST, ROT_EN frame bits, INT clear, main-buffer lines (job.h) + retry ladder.
++ * 0676: vendor RDMA buffer words / RDMA_CON / WROT FIFO_TEST, ROT_EN frame bits, INT clear, main-buffer lines (job.h) + retry ladder;
++ * 0677: vendor WROT start offsets for rotation / mirror (job.h), guard below the destination, mismatch write map.
+  * (gpu/build/mdp-20261114/MDP_OFFLOAD.md).  Answers "is the MDP powered, clocked and reachable on this phone, and in what
+  * state did the bootloader leave it" before any functional stage (DMA, scaling, rotation) is attempted.
+  *
+@@ -427,6 +428,7 @@
+ #define N2MDP_BUF_SPAN     0x200000u     /* largest test buffer is 1 MiB; 1 MiB guard band after each */
+ #define N2MDP_BUF_PT       0x800000u     /* 1 MiB: 64 KiB-aligned M4U1 table block (580 KiB used) */
+ #define N2MDP_GUARD_BYTE   0xa5u
++#define N2MDP_PREGUARD     0x100000u     /* 0677: pool 0x200000-0x2fffff (unused) = guard below the destination */
+ 
+ #ifdef N2MDP_HOST
+ extern bool n2mdp_host_pool(uint32_t bytes, uint32_t *pa, vm_offset_t *va);
+@@ -1004,8 +1006,10 @@
+ 	uint32_t sbytes = n2mdp_img_bytes(&j.src), dbytes = n2mdp_img_bytes(&j.dst);
+ 	n2mdp_pattern(&j.src, s0, s1, (uint32_t)(t - n2mdp_tests));
+ 	memset((void *)dst_va, N2MDP_GUARD_BYTE, N2MDP_BUF_SPAN);
++	memset((void *)(dst_va - N2MDP_PREGUARD), N2MDP_GUARD_BYTE, N2MDP_PREGUARD);   /* 0677: guard BELOW the destination too */
+ 	n2mdp_flush(src_va, sbytes);
+ 	n2mdp_flush(dst_va, N2MDP_BUF_SPAN);
++	n2mdp_flush(dst_va - N2MDP_PREGUARD, N2MDP_PREGUARD);
+ 	struct n2mdp_prog *p = &n2mdp_prog_buf;
+ 	int retry_swap = 0;
+ again:
+@@ -1028,8 +1032,18 @@
+ 	n2mx.last_us = us; if (us > n2mx.max_us) { n2mx.max_us = us; }
+ 	const uint8_t *d = (const uint8_t *)dst_va;
+ 	uint32_t bad_guard = 0;
++	n2mdp_flush(dst_va - N2MDP_PREGUARD, N2MDP_PREGUARD);
+ 	for (uint32_t k = dbytes; k < N2MDP_BUF_SPAN; k += 61u) { if (d[k] != N2MDP_GUARD_BYTE) { bad_guard++; } }
+ 	if (bad_guard) { N2MDP_LOG("NORD2 MDP: %s: %u guard bytes overwritten after %u bytes of output\n", t->name, bad_guard, dbytes); return 4; }
++	{	/* 0677: the 1 MiB below the destination (rot90 with the 0671 offset walked backwards from the buffer start) */
++		const uint8_t *g = (const uint8_t *)(dst_va - N2MDP_PREGUARD);
++		uint32_t nb = 0, lo = 0xffffffffu;
++		for (uint32_t k = 0; k < N2MDP_PREGUARD; k++) { if (g[k] != N2MDP_GUARD_BYTE) { nb++; if (lo == 0xffffffffu) { lo = k; } } }
++		if (nb) {
++			N2MDP_LOG("NORD2 MDP: %s: %u bytes written BELOW the destination (lowest at dst-%#x)\n", t->name, nb, N2MDP_PREGUARD - lo);
++			return 4;
++		}
++	}
+ 	struct n2mdp_cmp c;
+ 	int m = n2mdp_compare(&j, s0, s1, d, t->exact, &c);
+ 	*out_crc = n2mdp_crc32(d, dbytes, 0);
+@@ -1037,6 +1051,13 @@
+ 	    "swapped-better %u) hw %u us crc %08x\n", t->name, t->sw, t->sh, n2mf_is_yuv(t->sfmt) ? (t->full ? "420f" : "420v") : "BGRA",
+ 	    t->dw, t->dh, t->rot, t->flip, p->tiles, p->pipe, m ? "MISMATCH" : "ok", c.max_err, c.samples ? c.sum_err / c.samples : 0,
+ 	    c.samples ? (c.sum_err * 100u / c.samples) % 100u : 0, c.over, c.samples, c.first_x, c.first_y, c.swapped_better, us, *out_crc);
++	if (m) {	/* 0677: where did the hardware write?  count + first/last non-guard byte + the first 4 output pixels */
++		uint32_t nw = 0, fi = 0xffffffffu, la = 0;
++		for (uint32_t k = 0; k < N2MDP_BUF_SPAN; k++) { if (d[k] != N2MDP_GUARD_BYTE) { nw++; if (fi == 0xffffffffu) { fi = k; } la = k; } }
++		N2MDP_LOG("NORD2 MDP: %s mismatch detail: %u of %u destination bytes written (first %#x last %#x) px0 %02x%02x%02x%02x px1 %02x%02x%02x%02x"
++		    " px(w-1) %02x%02x%02x%02x\n", t->name, nw, dbytes, fi, la, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
++		    d[(t->dw - 1u) * 4u], d[(t->dw - 1u) * 4u + 1u], d[(t->dw - 1u) * 4u + 2u], d[(t->dw - 1u) * 4u + 3u]);
++	}
+ 	if (m && c.swapped_better && !retry_swap) {
+ 		retry_swap = 1; j.rgb_swap ^= 1u;
+ 		memset((void *)dst_va, N2MDP_GUARD_BYTE, N2MDP_BUF_SPAN); n2mdp_flush(dst_va, N2MDP_BUF_SPAN);
+--- a/bsd/dev/nord2_mdp_job.h
++++ b/bsd/dev/nord2_mdp_job.h
+@@ -90,6 +90,9 @@
+ 	uint32_t ow = n2mdp_out_w(j), oh = n2mdp_out_h(j);
+ 	if (ow * N2MDP_MAX_SCALE < cw || cw * N2MDP_MAX_SCALE < ow || oh * N2MDP_MAX_SCALE < ch || ch * N2MDP_MAX_SCALE < oh) { return N2MDP_E_SCALE; }
+ 	if (j->rot > 3) { return N2MDP_E_SIZE; }
++	/* 0677: the vendor's WROT mirror is a horizontal mirror of the DESTINATION after the rotation, our reference mirrors the
++	 * source first; they agree only for rot 0 / 180-free cases, so mirror + rotation is refused until a phone run settles it */
++	if ((j->flip & 1u) && (j->rot & 3u)) { return N2MDP_E_DST; }
+ 	return N2MDP_OK;
+ }
+ 
+@@ -239,18 +242,25 @@
+ static inline void
+ n2mdp_dst_offset(const struct n2mdp_job *j, const struct n2mdp_tile *t, uint32_t *o0, uint32_t *o1)
+ {
+-	uint32_t ow = n2mdp_out_w(j);
+-	uint32_t a = t->ox0, b = t->ox1;                 /* tile columns in the scaled, unrotated picture */
+-	if (j->flip & 1u) { uint32_t na = ow - b, nb = ow - a; a = na; b = nb; }
+-	uint32_t bpp = n2mf_bpp(j->dst.fmt), dx = 0, dy = 0;
++	/* 0677: the vendor's WROT start address (DpEngine_WROT::onConfigTile 0xbf30c, linear formats) [V-dis]: VIDO_OFST_ADDR points to
++	 * the FIRST pixel the WROT writes, which for the mirrored / rotated walks is the LAST byte of that pixel (hence the "- 1").
++	 * (x0, y0) = tile start in the unrotated output, W x H = unrotated output size, P = pitch, B = bytes per pixel, F = flip:
++	 *   rot 0:   F0 y0*P + x0*B                     F1 y0*P + (W - x0)*B - 1
++	 *   rot 90:  F0 x0*P + (H - y0)*B - 1           F1 x0*P + y0*B
++	 *   rot 180: F0 (H-1-y0)*P + (W - x0)*B - 1     F1 (H-1-y0)*P + x0*B
++	 *   rot 270: F0 (W-1-x0)*P + y0*B               F1 (W-1-x0)*P + (H - y0)*B - 1
++	 * 0671 used the tile's top-left corner in the destination: right for rot 0 (copy256 passed on the phone) but for rot 90 the
++	 * WROT walked backwards from offset 0, i.e. BELOW the destination buffer (q10jmdp6 rot90: every pixel wrong).  Our tiles span
++	 * the whole height (y0 = 0).  YUV destinations keep the 0671 rot-0 formula (only RGB destinations are produced today). */
++	uint32_t W = n2mdp_out_w(j), H = n2mdp_out_h(j), x0 = t->ox0, y0 = 0, P = j->dst.pitch[0], B = n2mf_bpp(j->dst.fmt);
++	uint32_t F = j->flip & 1u;
+ 	switch (j->rot & 3u) {
+-	case 0: dx = a; dy = 0; break;
+-	case 1: dx = 0; dy = a; break;                   /* column a of the source becomes row a (90 cw) */
+-	case 2: dx = ow - b; dy = 0; break;
+-	default: dx = 0; dy = ow - b; break;             /* 270 */
++	case 0:  *o0 = F ? y0 * P + (W - x0) * B - 1u : y0 * P + x0 * B; break;
++	case 1:  *o0 = F ? x0 * P + y0 * B : x0 * P + (H - y0) * B - 1u; break;
++	case 2:  *o0 = F ? (H - 1u - y0) * P + x0 * B : (H - 1u - y0) * P + (W - x0) * B - 1u; break;
++	default: *o0 = F ? (W - 1u - x0) * P + (H - y0) * B - 1u : (W - 1u - x0) * P + y0 * B; break;
+ 	}
+-	*o0 = dy * j->dst.pitch[0] + dx * bpp;
+-	*o1 = n2mf_is_yuv(j->dst.fmt) ? (dy / 2u) * j->dst.pitch[1] + dx : 0;
++	*o1 = n2mf_is_yuv(j->dst.fmt) ? (y0 / 2u) * j->dst.pitch[1] + x0 : 0;
+ }
+ 
+ /* Compile the job.  pipe chosen here: direct when not scaled, scale pipe otherwise. */

@@ -1,0 +1,1303 @@
+--- a/bsd/dev/nord2_mdp.inc
++++ b/bsd/dev/nord2_mdp.inc
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: MIT */
+ /*
+- * nord2_mdp.inc -- 0670: MT6893 MDP (Media Data Path, mdpsys 0x1f000000) probe = stage 0 of the MDP offload plan
++ * nord2_mdp.inc -- 0670: MT6893 MDP (Media Data Path, mdpsys 0x1f000000) probe = stage 0 of the MDP offload plan;
++ * 0671 adds the functional stages 1-3 (DMA self-test, function matrix, M4U1) and /dev/redwood-mdp (see the 0671 block below).
+  * (gpu/build/mdp-20261114/MDP_OFFLOAD.md).  Answers "is the MDP powered, clocked and reachable on this phone, and in what
+  * state did the bootloader leave it" before any functional stage (DMA, scaling, rotation) is attempted.
+  *
+@@ -274,12 +275,671 @@
+ 	return st;
+ }
+ 
++
++/* ======================================================================================================================
++ * 0671: functional stages (gpu/build/mdp-20261114/MDP_OFFLOAD.md section 7).  State machine, one boot:
++ *   stage 0  probe (above)                          -> must find: domain on, protection clear, mdp_sel running
++ *   stage 1  DMA self-test: BGRA 256x256 copy + 90-degree rotation, RDMA0 -> WROT0 direct, buffers in the vcodec DMA pool
++ *            (known PA < 4 GiB), larb2 ports in bypass (MMU_EN 0), CPU-programmed, completion = WROT frame-done GCE-M event
++ *            read through the GCE token registers, exact CPU-reference compare + guard bands; timeout -> abort (mutex off,
++ *            engine resets), gates back as found
++ *   stage 2  function matrix: 180/270/flip, tiled copy/rotation, NV12 (420v/420f) -> BGRA, scaling down/up, scale + rotate;
++ *            each test sets one capability bit; R/B order self-calibrated
++ *   stage 3  M4U1 page tables (0401's sweet_fb_iommu.h): copy from the pool to scattered kernel pages above 4 GiB through IOVAs
++ *   service  (0672, SweetSurface.cpp) registers AppleM2ScalerCSCDriver only if stage 3 passed in this boot and no kill file
++ * Each stage runs only if the previous one passed in this boot.  Results: kern.n2mdp_stage, kern.n2mdp_caps, kern.n2mdp_s1,
++ * kern.n2mdp_s2, kern.n2mdp_s3, log lines "NORD2 MDP S1/S2/S3 ..." and "NORD2 MDP STAGES: ...".
++ * Kill switches: file /private/var/db/nord2-mdp-off (probe only), sysctl kern.n2mdp_stages (max stage, default N2MDP_STAGES),
++ * kern.n2mdp_probe = -1 before +45 s.
++ * ==================================================================================================================== */
++#include "nord2_mdp_job.h"
++
++#ifndef N2MDP_STAGES
++#define N2MDP_STAGES 1   /* q10jmdp2a: probe + DMA self-test only */
++#endif
++
++#define N2MDP_CAP_COPY      (1u << 0)
++#define N2MDP_CAP_ROT90     (1u << 1)
++#define N2MDP_CAP_ROT180    (1u << 2)
++#define N2MDP_CAP_ROT270    (1u << 3)
++#define N2MDP_CAP_FLIP      (1u << 4)
++#define N2MDP_CAP_TILE      (1u << 5)
++#define N2MDP_CAP_NV12V     (1u << 6)
++#define N2MDP_CAP_NV12F     (1u << 7)
++#define N2MDP_CAP_SCALE_DN  (1u << 8)
++#define N2MDP_CAP_SCALE_UP  (1u << 9)
++#define N2MDP_CAP_SCALE_ROT (1u << 10)
++#define N2MDP_CAP_IOVA      (1u << 11)
++
++/* gates the functional stages keep open (CG_CON0): RDMA0 0, RSZ2 10? no: RSZ0 4 .. see clk-mt6885-mdp.c */
++#define N2MDP_CG0_FUNC  ((1u << 0) | (1u << 7) | (1u << 8) | (1u << 9) | (1u << 10) | (1u << 12) | (1u << 13) | (1u << 14) | \
++                         (1u << 15) | (1u << 31))   /* RDMA0 WROT0 RDMA2 AAL2 RSZ2 TDSHP2 TCC2 WROT2 MUTEX0 APB */
++#define N2MDP_IFRAO0_CLR 0x084u
++#define N2MDP_GCE_TOKEN_ID  0x60u
++#define N2MDP_GCE_TOKEN_VAL 0x64u
++#define N2MDP_GCE_TOKEN_UPD 0x68u
++
++#define N2MDP_POOL_BYTES   0x900000u     /* 9 MiB of the vcodec pool: test buffers (8 MiB) + page-table block (1 MiB) */
++#define N2MDP_BUF_SRC      0x000000u
++#define N2MDP_BUF_DST      0x300000u
++#define N2MDP_BUF_SPAN     0x200000u     /* largest test buffer is 1 MiB; 1 MiB guard band after each */
++#define N2MDP_BUF_PT       0x800000u     /* 1 MiB: 64 KiB-aligned M4U1 table block (580 KiB used) */
++#define N2MDP_GUARD_BYTE   0xa5u
++
++#ifdef N2MDP_HOST
++extern bool n2mdp_host_pool(uint32_t bytes, uint32_t *pa, vm_offset_t *va);
++extern void n2mdp_host_delay(uint32_t us);
++extern uint64_t n2mdp_host_now(void);
++extern bool n2mdp_host_killfile(void);
++extern bool n2mdp_host_alloc_hi(uint32_t bytes, vm_offset_t *va, uint64_t *pa_of_page /* bytes/4096 entries */);
++#define n2mdp_delay(us) n2mdp_host_delay(us)
++#define n2mdp_now_us() n2mdp_host_now()
++#define n2mdp_flush(va, len) ((void)(va), (void)(len))
++#define n2mdp_lock() ((void)0)
++#define n2mdp_unlock() ((void)0)
++#else
++#include <sys/vnode.h>
++#include <kern/locks.h>
++#define n2mdp_delay(us) delay((int)(us))
++static uint64_t n2mdp_now_us(void) { uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns / 1000u; }
++static void
++n2mdp_flush(vm_offset_t va, uint32_t len)
++{
++	for (vm_offset_t a = va & ~63ul; a < va + len; a += 64) { __asm__ volatile("dc civac, %0" :: "r"(a) : "memory"); }
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++static LCK_GRP_DECLARE(n2mdp_grp, "nord2-mdp");
++static LCK_MTX_DECLARE(n2mdp_mtx, &n2mdp_grp);
++#define n2mdp_lock() lck_mtx_lock(&n2mdp_mtx)
++#define n2mdp_unlock() lck_mtx_unlock(&n2mdp_mtx)
++#endif
++
++static struct {
++	uint32_t stage;            /* highest stage passed in this boot (0 = none) */
++	uint32_t caps;             /* N2MDP_CAP_* */
++	uint32_t s1, s2_pass, s2_fail, s3;   /* s1/s3: 0 not run, 1 pass, >1 failure code; s2: test bitmasks */
++	uint32_t rgb_swap;
++	uint32_t jobs, job_fail, last_us, max_us, timeouts;
++	uint32_t cg0_found, cg1_found, opened0, opened1;
++	bool gates_open, gce_opened, pool_ok, killed;
++	uint32_t pool_pa;
++	vm_offset_t pool_va;
++	uint32_t larb_found[4];
++	/* stage 3 */
++	bool iommu_on;
++	uint32_t ptbase, l1_pa;
++} n2mx;
++static int n2mdp_max_stage = N2MDP_STAGES;
++
++static inline uint32_t n2mdp_rd(uint32_t off) { return ni_rd(n2mdp.sys, off); }
++static inline void n2mdp_wr(uint32_t off, uint32_t v) { ni_wr(n2mdp.sys, off, v); }
++
++static uint32_t
++n2mdp_gce_event(uint32_t ev)
++{
++	ni_wr(n2mdp.gcem, N2MDP_GCE_TOKEN_ID, ev & 0x3ffu);
++	return ni_rd(n2mdp.gcem, N2MDP_GCE_TOKEN_VAL);
++}
++static void n2mdp_gce_clear(uint32_t ev) { ni_wr(n2mdp.gcem, N2MDP_GCE_TOKEN_UPD, ev & 0x3ffu); }
++
++/* open the clocks the functional stages need (records what it changed so a failure can restore them) */
++static bool
++n2mdp_gates_on(void)
++{
++	if (n2mx.gates_open) { return true; }
++	uint32_t c0 = n2mdp_rd(N2MDP_CG0), c1 = n2mdp_rd(N2MDP_CG1);
++	n2mx.cg0_found = c0; n2mx.cg1_found = c1;
++	n2mx.opened0 = c0 & N2MDP_CG0_FUNC; n2mx.opened1 = c1 & N2MDP_CG1_SMI;
++	if (n2mx.opened1) { n2mdp_wr(N2MDP_CG1 + 8u, n2mx.opened1); }
++	if (n2mx.opened0) { n2mdp_wr(N2MDP_CG0 + 8u, n2mx.opened0); }
++	uint32_t ifr = ni_rd(n2mdp.infra, N2MDP_IFRAO0_STA);
++	if (ifr & N2MDP_IFR_GCE2) { ni_wr(n2mdp.infra, N2MDP_IFRAO0_CLR, N2MDP_IFR_GCE2); n2mx.gce_opened = true; }
++	uint32_t a0 = n2mdp_rd(N2MDP_CG0), a1 = n2mdp_rd(N2MDP_CG1), a2 = ni_rd(n2mdp.infra, N2MDP_IFRAO0_STA);
++	bool ok = !(a0 & N2MDP_CG0_FUNC) && !(a1 & N2MDP_CG1_SMI) && !(a2 & N2MDP_IFR_GCE2);
++	N2MDP_LOG("NORD2 MDP: gates %s: CG0 %#x -> %#x CG1 %#x -> %#x IFRAO0 %#x -> %#x\n", ok ? "open" : "DID NOT OPEN", c0, a0, c1, a1, ifr, a2);
++	n2mx.gates_open = ok;
++	return ok;
++}
++static void
++n2mdp_gates_restore(void)
++{
++	if (n2mx.opened0) { n2mdp_wr(N2MDP_CG0 + 4u, n2mx.opened0); }
++	if (n2mx.opened1) { n2mdp_wr(N2MDP_CG1 + 4u, n2mx.opened1); }
++	if (n2mx.gce_opened) { ni_wr(n2mdp.infra, N2MDP_IFRAO0_CLR - 4u, N2MDP_IFR_GCE2); n2mx.gce_opened = false; }   /* 0x80 = SET */
++	n2mx.opened0 = n2mx.opened1 = 0; n2mx.gates_open = false;
++	N2MDP_LOG("NORD2 MDP: gates restored: CG0 %#x CG1 %#x\n", n2mdp_rd(N2MDP_CG0), n2mdp_rd(N2MDP_CG1));
++}
++
++/* larb2 ports p0..p3 (RDMA0, RDMA2, WROT0, WROT2): bit0 MMU_EN = translate through M4U1, 0 = physical */
++static void
++n2mdp_larb_mode(bool iova)
++{
++	for (unsigned p = 0; p < 4; p++) {
++		uint32_t v = n2mdp_rd(N2MDP_W_LARB2 + 0x380u + 4u * p);
++		uint32_t w = iova ? (v | 1u) : (v & ~1u);
++		if (w != v) { n2mdp_wr(N2MDP_W_LARB2 + 0x380u + 4u * p, w); }
++	}
++}
++
++static uint32_t n2mdp_diag_logged;
++
++/* abort: stop the mutex, reset the engines of the pipe; never leaves a DMA running */
++static void
++n2mdp_abort(const struct n2mdp_prog *p, const char *why)
++{
++	uint32_t R = N2MDP_W_RDMA(p->pipe), W = N2MDP_W_WROT(p->pipe);
++	N2MDP_LOG("NORD2 MDP ABORT (%s): mutex EN %#x INTSTA %#x MOD0 %#x | RDMA EN %#x MON0 %#x MON1 %#x | WROT CTRL %#x ROT_EN %#x "
++	    "RST_STAT %#x | ev wrot %u rdma %u\n", why, n2mdp_rd(N2MDP_MUTEX_EN(p->mutex)), n2mdp_rd(N2MDP_W_MUTEX + 4u),
++	    n2mdp_rd(N2MDP_MUTEX_MOD0(p->mutex)), n2mdp_rd(R + R_EN), n2mdp_rd(R + 0x400u), n2mdp_rd(R + R_MON1), n2mdp_rd(W + W_CTRL),
++	    n2mdp_rd(W + W_ROT_EN), n2mdp_rd(W + W_SOFT_RST_STAT), n2mdp_gce_event(N2MDP_EV_WROT_DONE(p->pipe)),
++	    n2mdp_gce_event(N2MDP_EV_RDMA_DONE(p->pipe)));
++	n2mdp_wr(N2MDP_MUTEX_EN(p->mutex), 0);
++	n2mdp_wr(R + R_EN, 0);
++	n2mdp_wr(R + R_RESET, 1u);
++	for (unsigned i = 0; i < 100 && !(n2mdp_rd(R + R_MON1) & (1u << 8)); i++) { n2mdp_delay(10); }
++	n2mdp_wr(R + R_RESET, 0);
++	n2mdp_wr(W + W_ROT_EN, 0);
++	n2mdp_wr(W + W_SOFT_RST, 1u);
++	for (unsigned i = 0; i < 100 && !(n2mdp_rd(W + W_SOFT_RST_STAT) & 1u); i++) { n2mdp_delay(10); }
++	n2mdp_wr(W + W_SOFT_RST, 0);
++	if (p->pipe == N2MDP_PIPE_SCALE) { n2mdp_wr(N2MDP_W_RSZ(2) + Z_ENABLE, 0); }
++	n2mdp_wr(N2MDP_MUTEX_MOD0(p->mutex), 0);
++}
++
++/* run a compiled program; returns 0, ETIMEDOUT (wait), EIO (poll) */
++static int
++n2mdp_run(const struct n2mdp_prog *p, uint32_t *hw_us)
++{
++	uint64_t t0 = 0, busy = 0;
++	for (uint32_t i = 0; i < p->n; i++) {
++		const struct n2mdp_op *o = &p->ops[i];
++		switch (o->op) {
++		case N2MDP_OP_WRITE: {
++			uint32_t v = o->mask == 0xffffffffu ? o->val : ((n2mdp_rd(o->off) & ~o->mask) | (o->val & o->mask));
++			n2mdp_wr(o->off, v);
++			break;
++		}
++		case N2MDP_OP_POLL: {
++			unsigned k = 0;
++			while ((n2mdp_rd(o->off) & o->mask) != o->val) {
++				if (++k > 500) { n2mdp_abort(p, "poll"); N2MDP_LOG("NORD2 MDP: poll timeout at op %u off %#x want %#x/%#x\n", i, o->off, o->val, o->mask); return EIO; }
++				n2mdp_delay(10);
++			}
++			break;
++		}
++		case N2MDP_OP_GO:
++			n2mdp_gce_clear(o->val);
++			n2mdp_gce_clear(N2MDP_EV_RDMA_DONE(p->pipe));
++			t0 = n2mdp_now_us();
++			n2mdp_wr(o->off, (n2mdp_rd(o->off) & ~1u) | 1u);
++			break;
++		case N2MDP_OP_WAIT: {
++			unsigned k = 0;
++			while (!(n2mdp_gce_event(o->val) & 1u)) {
++				if (k < 50) { n2mdp_delay(20); } else { n2mdp_delay(200); }
++				if (++k > 1000) {   /* ~190 ms */
++					n2mx.timeouts++;
++					n2mdp_abort(p, "frame-done event never came");
++					return ETIMEDOUT;
++				}
++			}
++			busy += n2mdp_now_us() - t0;
++			if (n2mdp_diag_logged < 3) {
++				n2mdp_diag_logged++;
++				N2MDP_LOG("NORD2 MDP: tile done after %llu us: mutex EN %#x INTSTA %#x RDMA MON1 %#x ev rdma %u\n",
++				    (unsigned long long)(n2mdp_now_us() - t0), n2mdp_rd(o->off), n2mdp_rd(N2MDP_W_MUTEX + 4u),
++				    n2mdp_rd(N2MDP_W_RDMA(p->pipe) + R_MON1), n2mdp_gce_event(N2MDP_EV_RDMA_DONE(p->pipe)));
++			}
++			break;
++		}
++		case N2MDP_OP_END:
++		default:
++			i = p->n;
++			break;
++		}
++	}
++	if (hw_us) { *hw_us = (uint32_t)busy; }
++	return 0;
++}
++
++/* ---- self-tests ----------------------------------------------------------------------------------------------------- */
++struct n2mdp_test {
++	const char *name;
++	uint8_t sfmt, dfmt, rot, flip, full, tile16, exact, stage;
++	uint16_t sw, sh, dw, dh;
++	uint32_t cap;
++};
++static const struct n2mdp_test n2mdp_tests[] = {
++	{ "copy256",     N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 0,  1, 1, 256, 256, 256, 256, N2MDP_CAP_COPY },
++	{ "rot90",       N2MF_BGRA, N2MF_BGRA, 1, 0, 0, 0,  1, 1, 256, 256, 256, 256, N2MDP_CAP_ROT90 },
++	{ "rot180",      N2MF_BGRA, N2MF_BGRA, 2, 0, 0, 0,  1, 2, 256, 128, 256, 128, N2MDP_CAP_ROT180 },
++	{ "rot270",      N2MF_BGRA, N2MF_BGRA, 3, 0, 0, 0,  1, 2, 256, 128, 128, 256, N2MDP_CAP_ROT270 },
++	{ "flip",        N2MF_BGRA, N2MF_BGRA, 0, 1, 0, 0,  1, 2, 256, 128, 256, 128, N2MDP_CAP_FLIP },
++	{ "tilecopy",    N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 16, 1, 2, 1024, 64, 1024, 64, N2MDP_CAP_TILE },
++	{ "tilerot90",   N2MF_BGRA, N2MF_BGRA, 1, 0, 0, 16, 1, 2, 1024, 64, 64, 1024, N2MDP_CAP_TILE },
++	{ "nv12v",       N2MF_NV12, N2MF_BGRA, 0, 0, 0, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12V },
++	{ "nv12f",       N2MF_NV12, N2MF_BGRA, 0, 0, 1, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12F },
++	{ "scaledown",   N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 0,  0, 2, 512, 512, 256, 256, N2MDP_CAP_SCALE_DN },
++	{ "scaleup",     N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 0,  0, 2, 128, 128, 256, 256, N2MDP_CAP_SCALE_UP },
++	{ "scalerot",    N2MF_NV12, N2MF_BGRA, 1, 0, 1, 0,  0, 2, 512, 256, 128, 256, N2MDP_CAP_SCALE_ROT },
++	{ "scaletile",   N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 16, 0, 2, 1024, 64, 768, 48, N2MDP_CAP_TILE },
++};
++#define N2MDP_NTESTS (sizeof(n2mdp_tests) / sizeof(n2mdp_tests[0]))
++
++static struct n2mdp_prog n2mdp_prog_buf;     /* one program at a time (under n2mdp_lock) */
++
++static bool
++n2mdp_pool_get(void)
++{
++	if (n2mx.pool_ok) { return true; }
++#ifdef N2MDP_HOST
++	n2mx.pool_ok = n2mdp_host_pool(N2MDP_POOL_BYTES, &n2mx.pool_pa, &n2mx.pool_va);
++#else
++	n2vc_lock();
++	uint32_t pg = n2vc_pool_take(N2MDP_POOL_BYTES / 4096u);
++	n2vc_unlock();
++	if (pg == 0xffffffffu) { N2MDP_LOG("NORD2 MDP: no %u KiB in the vcodec pool\n", N2MDP_POOL_BYTES >> 10); return false; }
++	n2mx.pool_pa = RW_CLAIM_VCODEC_PA + pg * 4096u;
++	n2mx.pool_va = ml_io_map_unmappable(n2mx.pool_pa, N2MDP_POOL_BYTES, VM_WIMG_DEFAULT);
++	if (!n2mx.pool_va) {
++		n2vc_lock(); for (uint32_t k = 0; k < N2MDP_POOL_BYTES / 4096u; k++) { n2vc_pg_mark(pg + k, false); } n2vc_unlock();
++		return false;
++	}
++	n2mx.pool_ok = true;
++#endif
++	N2MDP_LOG("NORD2 MDP: test buffers pa %#x+%#x (vcodec pool)\n", n2mx.pool_pa, N2MDP_POOL_BYTES);
++	return n2mx.pool_ok;
++}
++
++static void
++n2mdp_img_setup(struct n2mdp_img *im, uint32_t fmt, uint32_t w, uint32_t h, uint32_t base_pa, uint8_t full)
++{
++	im->fmt = fmt; im->w = w; im->h = h; im->full_range = full; im->bt709 = 0;
++	im->pitch[0] = (w * n2mf_bpp(fmt) + 63u) & ~63u;
++	im->addr[0] = base_pa;
++	if (n2mf_is_yuv(fmt)) {
++		im->pitch[1] = (w + 63u) & ~63u;
++		im->addr[1] = base_pa + ((im->pitch[0] * h + 4095u) & ~4095u);
++	} else { im->pitch[1] = 0; im->addr[1] = 0; }
++}
++static uint32_t n2mdp_img_bytes(const struct n2mdp_img *im)
++{
++	return (uint32_t)(n2mf_is_yuv(im->fmt) ? (im->addr[1] - im->addr[0]) + n2mdp_plane_bytes(im, 1) : n2mdp_plane_bytes(im, 0));
++}
++
++/* returns 0 pass; 2 compile, 3 timeout/poll, 4 guard, 5 compare */
++static int
++n2mdp_test_run(const struct n2mdp_test *t, uint32_t src_pa, vm_offset_t src_va, uint32_t dst_pa, vm_offset_t dst_va, uint32_t *out_crc)
++{
++	struct n2mdp_job j = { 0 };
++	n2mdp_img_setup(&j.src, t->sfmt, t->sw, t->sh, src_pa, t->full);
++	n2mdp_img_setup(&j.dst, t->dfmt, t->dw, t->dh, dst_pa, 0);
++	j.rot = t->rot; j.flip = t->flip; j.tile_w = t->tile16; j.rgb_swap = (uint8_t)n2mx.rgb_swap;
++	uint8_t *s0 = (uint8_t *)src_va, *s1 = n2mf_is_yuv(j.src.fmt) ? (uint8_t *)src_va + (j.src.addr[1] - j.src.addr[0]) : NULL;
++	uint32_t sbytes = n2mdp_img_bytes(&j.src), dbytes = n2mdp_img_bytes(&j.dst);
++	n2mdp_pattern(&j.src, s0, s1, (uint32_t)(t - n2mdp_tests));
++	memset((void *)dst_va, N2MDP_GUARD_BYTE, N2MDP_BUF_SPAN);
++	n2mdp_flush(src_va, sbytes);
++	n2mdp_flush(dst_va, N2MDP_BUF_SPAN);
++	struct n2mdp_prog *p = &n2mdp_prog_buf;
++	int retry_swap = 0;
++again:
++	if (n2mdp_compile(&j, p) != 0) { N2MDP_LOG("NORD2 MDP: %s: compile error %d\n", t->name, p->err); return 2; }
++	uint32_t us = 0;
++	n2mdp_larb_mode(false);
++	int e = n2mdp_run(p, &us);
++	n2mdp_flush(dst_va, N2MDP_BUF_SPAN);
++	n2mx.jobs++;
++	if (e) { n2mx.job_fail++; return 3; }
++	n2mx.last_us = us; if (us > n2mx.max_us) { n2mx.max_us = us; }
++	const uint8_t *d = (const uint8_t *)dst_va;
++	uint32_t bad_guard = 0;
++	for (uint32_t k = dbytes; k < N2MDP_BUF_SPAN; k += 61u) { if (d[k] != N2MDP_GUARD_BYTE) { bad_guard++; } }
++	if (bad_guard) { N2MDP_LOG("NORD2 MDP: %s: %u guard bytes overwritten after %u bytes of output\n", t->name, bad_guard, dbytes); return 4; }
++	struct n2mdp_cmp c;
++	int m = n2mdp_compare(&j, s0, s1, d, t->exact, &c);
++	*out_crc = n2mdp_crc32(d, dbytes, 0);
++	N2MDP_LOG("NORD2 MDP: %s %ux%u %s -> %ux%u rot %u flip %u tiles %u pipe %u: %s (max err %u mean %u.%02u over %u/%u first %u,%u "
++	    "swapped-better %u) hw %u us crc %08x\n", t->name, t->sw, t->sh, n2mf_is_yuv(t->sfmt) ? (t->full ? "420f" : "420v") : "BGRA",
++	    t->dw, t->dh, t->rot, t->flip, p->tiles, p->pipe, m ? "MISMATCH" : "ok", c.max_err, c.samples ? c.sum_err / c.samples : 0,
++	    c.samples ? (c.sum_err * 100u / c.samples) % 100u : 0, c.over, c.samples, c.first_x, c.first_y, c.swapped_better, us, *out_crc);
++	if (m && c.swapped_better && !retry_swap) {
++		retry_swap = 1; j.rgb_swap ^= 1u;
++		memset((void *)dst_va, N2MDP_GUARD_BYTE, N2MDP_BUF_SPAN); n2mdp_flush(dst_va, N2MDP_BUF_SPAN);
++		goto again;
++	}
++	if (!m && retry_swap) { n2mx.rgb_swap = j.rgb_swap; N2MDP_LOG("NORD2 MDP: R/B order calibrated: rgb_swap %u\n", n2mx.rgb_swap); }
++	return m ? 5 : 0;
++}
++
++static uint32_t
++n2mdp_stage_tests(unsigned stage, uint32_t *pass_mask, uint32_t *fail_mask)
++{
++	uint32_t pass = 0, fail = 0, code = 1;
++	for (unsigned i = 0; i < N2MDP_NTESTS; i++) {
++		const struct n2mdp_test *t = &n2mdp_tests[i];
++		if (t->stage != stage) { continue; }
++		uint32_t crc = 0;
++		int r = n2mdp_test_run(t, n2mx.pool_pa + N2MDP_BUF_SRC, n2mx.pool_va + N2MDP_BUF_SRC, n2mx.pool_pa + N2MDP_BUF_DST,
++		    n2mx.pool_va + N2MDP_BUF_DST, &crc);
++		if (r == 0) { pass |= 1u << i; n2mx.caps |= t->cap; }
++		else {
++			fail |= 1u << i; if (code == 1) { code = (uint32_t)r + 1u; }
++			if (r == 3 || r == 4) { break; }     /* the hardware did not finish or wrote outside: stop this stage at once */
++		}
++	}
++	/* a capability shared by several tests (TILE) counts only if all of them passed */
++	for (unsigned i = 0; i < N2MDP_NTESTS; i++) { if (fail & (1u << i)) { n2mx.caps &= ~n2mdp_tests[i].cap; } }
++	*pass_mask = pass; *fail_mask = fail;
++	return fail ? code : 1u;
++}
++
++/* ---- stage 3: M4U1 ------------------------------------------------------------------------------------------------- */
++#include "../../iokit/Kernel/arm/sweet_fb_iommu.h"
++#define N2MDP_M4U1        0x27000u
++static struct sweet_fb_iommu_pt n2mdp_pt;
++static struct sweet_fb_iova n2mdp_iova;
++
++static void
++n2mdp_m4u_tlb_all(void)
++{
++	n2mdp_wr(N2MDP_M4U1 + 0x02cu, 3u);   /* INVLD_SEL */
++	n2mdp_wr(N2MDP_M4U1 + 0x020u, 2u);   /* INVLDT: all */
++	n2mdp_delay(5);
++}
++
++/* other masters on M4U1 (larb 4/8/9/13/16/18): refuse to arm while a powered one has an MMU_EN port (0410's rule) */
++static int
++n2mdp_m4u1_others_clear(void)
++{
++#ifdef N2MDP_HOST
++	return 0;
++#else
++	static const struct { uint32_t pa, sta; } l[6] = {
++		{ 0x1602e000u, 1u << 16 }, { 0x17810000u, 1u << 18 }, { 0x1502e000u, 1u << 12 },
++		{ 0x1a001000u, 1u << 23 }, { 0x1a00f000u, 1u << 24 }, { 0x1a011000u, 1u << 26 } };
++	static vm_offset_t va[6];
++	uint32_t s0 = ni_rd(n2mdp.spm, N2MDP_PWR_STA), s1 = ni_rd(n2mdp.spm, N2MDP_PWR_STA2);
++	for (unsigned k = 0; k < 6; k++) {
++		if (!(s0 & s1 & l[k].sta)) { continue; }
++		if (!va[k]) { va[k] = ml_io_map_unmappable(l[k].pa, 0x1000, VM_WIMG_IO); }
++		if (!va[k]) { return -1; }
++		for (unsigned p = 0; p < 32; p++) {
++			if (ni_rd(va[k], 0x380u + 4u * p) & 1u) { N2MDP_LOG("NORD2 MDP S3: larb at %#x port %u translates (MMU_EN): M4U1 not armed\n", l[k].pa, p); return 1; }
++		}
++	}
++	return 0;
++#endif
++}
++
++static int
++n2mdp_m4u1_arm(void)
++{
++	if (n2mx.iommu_on) { return 0; }
++	uint32_t blk_pa = (n2mx.pool_pa + N2MDP_BUF_PT + 0xffffu) & ~0xffffu;
++	vm_offset_t blk_va = n2mx.pool_va + (blk_pa - n2mx.pool_pa);
++	if (blk_pa + SWEET_FB_IOMMU_BLOCK_BYTES > n2mx.pool_pa + N2MDP_POOL_BYTES) { return 10; }
++	memset((void *)blk_va, 0, SWEET_FB_IOMMU_BLOCK_BYTES);
++	if (!sweet_fb_iommu_pt_init(&n2mdp_pt, (volatile void *)blk_va, blk_pa)) { return 11; }
++	n2mdp_flush(blk_va, SWEET_FB_IOMMU_BLOCK_BYTES);
++	sweet_fb_iova_init(&n2mdp_iova);
++	int o = n2mdp_m4u1_others_clear();
++	if (o != 0) { return o < 0 ? 12 : 13; }
++	uint32_t old = n2mdp_rd(N2MDP_M4U1 + 0x000u), ctrl = n2mdp_rd(N2MDP_M4U1 + 0x110u);
++	n2mx.ptbase = (uint32_t)(n2mdp_pt.l1_pa & 0xffffff80u) | (uint32_t)((n2mdp_pt.l1_pa >> 32) & 7u);
++	n2mdp_wr(N2MDP_M4U1 + 0x000u, n2mx.ptbase);
++	n2mdp_wr(N2MDP_M4U1 + 0x114u, (uint32_t)((blk_pa + SWEET_FB_IOMMU_OFF_SCRATCH) & 0xffffff80u));   /* TFRP */
++	n2mdp_m4u_tlb_all();
++	uint32_t rb = n2mdp_rd(N2MDP_M4U1 + 0x000u);
++	N2MDP_LOG("NORD2 MDP S3: M4U1 PT_BASE %#x -> %#x (read %#x), CTRL %#x, tables pa %#x\n", old, n2mx.ptbase, rb, ctrl, blk_pa);
++	if (rb != n2mx.ptbase) { return 14; }
++	n2mx.iommu_on = true;
++	return 0;
++}
++
++/* map n 4 KiB pages (PA list) at a fresh IOVA range; returns IOVA or 0 */
++static uint32_t
++n2mdp_iova_map(const uint64_t *pages, uint32_t n)
++{
++	uint32_t iova = sweet_fb_iova_alloc(&n2mdp_iova, (uint64_t)n * 4096u);
++	if (iova == SWEET_FB_IOVA_FAIL) { return 0; }
++	for (uint32_t k = 0; k < n; k++) {
++		if (!sweet_fb_iommu_map_page(&n2mdp_pt, iova + k * 4096u, pages[k])) { sweet_fb_iommu_unmap(&n2mdp_pt, iova, k); sweet_fb_iova_free(&n2mdp_iova, iova, (uint64_t)n * 4096u); return 0; }
++	}
++	n2mdp_flush((vm_offset_t)n2mdp_pt.l1, SWEET_FB_IOMMU_BLOCK_BYTES);
++	n2mdp_m4u_tlb_all();
++	return iova;
++}
++static void
++n2mdp_iova_unmap(uint32_t iova, uint32_t n)
++{
++	sweet_fb_iommu_unmap(&n2mdp_pt, iova, n);
++	sweet_fb_iova_free(&n2mdp_iova, iova, (uint64_t)n * 4096u);
++	n2mdp_flush((vm_offset_t)n2mdp_pt.l1, SWEET_FB_IOMMU_BLOCK_BYTES);
++	n2mdp_m4u_tlb_all();
++}
++
++#ifndef N2MDP_HOST
++extern addr64_t kvtophys(vm_offset_t va);
++#endif
++
++/* stage 3 test: BGRA 256x256 copy from the pool (IOVA) to scattered kernel pages above 4 GiB (IOVA), checked by the CPU */
++static uint32_t
++n2mdp_stage3(void)
++{
++	int a = n2mdp_m4u1_arm();
++	if (a) { N2MDP_LOG("NORD2 MDP S3: M4U1 not armed (code %d)\n", a); return (uint32_t)a; }
++	const uint32_t W = 256, H = 256, bytes = W * H * 4u, n = bytes / 4096u;
++	static uint64_t spages[64], dpages[64];
++	vm_offset_t dva = 0;
++#ifdef N2MDP_HOST
++	if (!n2mdp_host_alloc_hi(bytes, &dva, dpages)) { return 20; }
++#else
++	if (kmem_alloc(kernel_map, &dva, bytes, KMA_KOBJECT | KMA_ZERO, VM_KERN_MEMORY_DIAG) != KERN_SUCCESS) { return 20; }
++	for (uint32_t k = 0; k < n; k++) { dpages[k] = kvtophys(dva + k * 4096u); if (!dpages[k]) { return 21; } }
++#endif
++	/* destination pages are used in REVERSE order through the IOVA range: the translation must be page-exact */
++	uint64_t rev[64];
++	for (uint32_t k = 0; k < n; k++) { rev[k] = dpages[n - 1u - k]; }
++	for (uint32_t k = 0; k < n; k++) { spages[k] = (uint64_t)n2mx.pool_pa + N2MDP_BUF_SRC + k * 4096u; }
++	uint32_t si = n2mdp_iova_map(spages, n), di = si ? n2mdp_iova_map(rev, n) : 0;
++	if (!si || !di) { if (si) { n2mdp_iova_unmap(si, n); } return 22; }
++	struct n2mdp_job j = { 0 };
++	n2mdp_img_setup(&j.src, N2MF_BGRA, W, H, si, 0);
++	n2mdp_img_setup(&j.dst, N2MF_BGRA, W, H, di, 0);
++	j.rgb_swap = (uint8_t)n2mx.rgb_swap;
++	uint8_t *s0 = (uint8_t *)(n2mx.pool_va + N2MDP_BUF_SRC);
++	n2mdp_pattern(&j.src, s0, NULL, 99);
++	memset((void *)dva, N2MDP_GUARD_BYTE, bytes);
++	n2mdp_flush((vm_offset_t)s0, bytes); n2mdp_flush(dva, bytes);
++	uint32_t res = 0, us = 0;
++	if (n2mdp_compile(&j, &n2mdp_prog_buf)) { res = 23; goto out; }
++	n2mdp_larb_mode(true);
++	int e = n2mdp_run(&n2mdp_prog_buf, &us);
++	n2mdp_larb_mode(false);
++	uint32_t fault = n2mdp_rd(N2MDP_M4U1 + 0x134u), fva = n2mdp_rd(N2MDP_M4U1 + 0x13cu);
++	if (fault) { n2mdp_wr(N2MDP_M4U1 + 0x120u, n2mdp_rd(N2MDP_M4U1 + 0x120u) | (1u << 12)); }
++	if (e) { res = 24; goto out; }
++	/* reassemble: logical page k of the image lives in dpages[n-1-k] = the kernel VA page (n-1-k) */
++	{
++		static uint8_t img[256 * 256 * 4];
++		for (uint32_t k = 0; k < n; k++) { memcpy(img + k * 4096u, (const void *)(dva + (n - 1u - k) * 4096u), 4096u); }
++		n2mdp_flush(dva, bytes);
++		struct n2mdp_cmp c;
++		int m = n2mdp_compare(&j, s0, NULL, img, true, &c);
++		N2MDP_LOG("NORD2 MDP S3: IOVA copy %s (src iova %#x pool, dst iova %#x -> %u pages above 4 GiB, first pa %#llx), max err %u, "
++		    "fault %#x va %#x, hw %u us\n", m ? "MISMATCH" : "ok", si, di, n, (unsigned long long)dpages[0], c.max_err, fault, fva, us);
++		res = (m || fault) ? 25u : 1u;
++	}
++out:
++	n2mdp_iova_unmap(di, n);
++	n2mdp_iova_unmap(si, n);
++#ifndef N2MDP_HOST
++	kmem_free(kernel_map, dva, bytes);
++#endif
++	return res;
++}
++
++/* ---- the stage machine ------------------------------------------------------------------------------------------------ */
++static bool
++n2mdp_killfile(void)
++{
++#ifdef N2MDP_HOST
++	return n2mdp_host_killfile();
++#else
++	vnode_t vp = NULLVP;
++	if (vnode_lookup("/private/var/db/nord2-mdp-off", 0, &vp, vfs_context_kernel()) == 0) { vnode_put(vp); return true; }
++	return false;
++#endif
++}
++
++static void
++n2mdp_stages(uint32_t probe_state)
++{
++	n2mdp_lock();
++	if (n2mx.stage >= 1 || n2mx.s1 > 1) { n2mdp_unlock(); return; }         /* once per boot */
++	const char *why = NULL;
++	if (n2mdp_max_stage < 1) { why = "kern.n2mdp_stages = 0"; }
++	else if (n2mdp_killfile()) { why = "/private/var/db/nord2-mdp-off present"; n2mx.killed = true; }
++	else if (!(probe_state & N2MDP_S_POWER) || (probe_state & (N2MDP_S_PROT | N2MDP_S_MUXGATE | N2MDP_S_NOMAP))) { why = "probe not OK"; }
++	if (why) { N2MDP_LOG("NORD2 MDP STAGES: not run (%s)\n", why); n2mdp_unlock(); return; }
++	if (!n2mdp_gates_on() || !n2mdp_pool_get()) { n2mx.s1 = 9; n2mdp_gates_restore(); N2MDP_LOG("NORD2 MDP STAGES: S1 cannot start (gates/pool)\n"); n2mdp_unlock(); return; }
++	for (unsigned p = 0; p < 4; p++) { n2mx.larb_found[p] = n2mdp_rd(N2MDP_W_LARB2 + 0x380u + 4u * p); }
++	N2MDP_LOG("NORD2 MDP S1: larb2 ports as found %#x %#x %#x %#x (bit0 = MMU_EN; forced 0 for physical jobs)\n", n2mx.larb_found[0],
++	    n2mx.larb_found[1], n2mx.larb_found[2], n2mx.larb_found[3]);
++	uint32_t pm = 0, fm = 0;
++	n2mx.s1 = n2mdp_stage_tests(1, &pm, &fm);
++	N2MDP_LOG("NORD2 MDP S1: %s (pass %#x fail %#x)\n", n2mx.s1 == 1 ? "PASS" : "FAIL", pm, fm);
++	if (n2mx.s1 != 1) { n2mx.caps = 0; n2mdp_gates_restore(); goto done; }
++	n2mx.stage = 1;
++	if (n2mdp_max_stage >= 2) {
++		uint32_t r = n2mdp_stage_tests(2, &n2mx.s2_pass, &n2mx.s2_fail);
++		N2MDP_LOG("NORD2 MDP S2: %s (pass %#x fail %#x, caps %#x, rgb_swap %u)\n", r == 1 ? "PASS" : "PARTIAL", n2mx.s2_pass, n2mx.s2_fail,
++		    n2mx.caps, n2mx.rgb_swap);
++		if (r != 4 && r != 5) { n2mx.stage = 2; }      /* timeouts / guard hits end the stage machine */
++	}
++	if (n2mx.stage >= 2 && n2mdp_max_stage >= 3) {
++		n2mx.s3 = n2mdp_stage3();
++		N2MDP_LOG("NORD2 MDP S3: %s (code %u)\n", n2mx.s3 == 1 ? "PASS" : "FAIL", n2mx.s3);
++		if (n2mx.s3 == 1) { n2mx.stage = 3; n2mx.caps |= N2MDP_CAP_IOVA; }
++	}
++done:
++	N2MDP_LOG("NORD2 MDP STAGES: stage %u caps %#x s1 %u s2 pass %#x fail %#x s3 %u jobs %u fail %u timeouts %u max %u us\n", n2mx.stage,
++	    n2mx.caps, n2mx.s1, n2mx.s2_pass, n2mx.s2_fail, n2mx.s3, n2mx.jobs, n2mx.job_fail, n2mx.timeouts, n2mx.max_us);
++	n2mdp_unlock();
++}
++
++/* ---- service API (C linkage; used by 0672 AppleM2ScalerCSCDriver and /dev/redwood-mdp) -------------------------------- */
++#include "nord2_mdp_api.h"
++
++uint32_t
++nord2_mdp_caps(void)
++{
++	return (n2mx.stage >= 3 && !n2mx.killed) ? n2mx.caps : 0;
++}
++
++/* one blit between two page-listed images (IOVA path).  Returns 0 or an errno; never leaves anything mapped. */
++int
++nord2_mdp_blit_pages(const struct n2mdp_pimg *src, const struct n2mdp_pimg *dst, uint32_t rot, uint32_t flip, uint32_t *hw_us)
++{
++	uint32_t caps = nord2_mdp_caps();
++	if (!(caps & N2MDP_CAP_IOVA)) { return ENODEV; }
++	if (rot > 3 || src->npages == 0 || dst->npages == 0 || src->npages > N2MDP_MAX_PAGES || dst->npages > N2MDP_MAX_PAGES) { return EINVAL; }
++	uint32_t need = N2MDP_CAP_COPY;
++	if (rot == 1) { need |= N2MDP_CAP_ROT90; } else if (rot == 2) { need |= N2MDP_CAP_ROT180; } else if (rot == 3) { need |= N2MDP_CAP_ROT270; }
++	if (flip & 1u) { need |= N2MDP_CAP_FLIP; }
++	if (n2mf_is_yuv(src->fmt)) { need |= src->full_range ? N2MDP_CAP_NV12F : N2MDP_CAP_NV12V; }
++	uint32_t ow = (rot & 1u) ? dst->h : dst->w, oh = (rot & 1u) ? dst->w : dst->h;
++	if (ow != src->w || oh != src->h) {
++		need |= (ow < src->w || oh < src->h) ? N2MDP_CAP_SCALE_DN : N2MDP_CAP_SCALE_UP;
++		if (rot) { need |= N2MDP_CAP_SCALE_ROT; }
++	}
++	if (ow > 512u) { need |= N2MDP_CAP_TILE; }
++	if ((caps & need) != need) { return ENOTSUP; }
++	n2mdp_lock();
++	int err = 0;
++	uint32_t si = n2mdp_iova_map(src->pages, src->npages);
++	uint32_t di = si ? n2mdp_iova_map(dst->pages, dst->npages) : 0;
++	if (!si || !di) { err = ENOMEM; goto out; }
++	struct n2mdp_job j;
++	memset(&j, 0, sizeof(j));
++	j.src.fmt = src->fmt; j.src.w = src->w; j.src.h = src->h; j.src.full_range = src->full_range; j.src.bt709 = src->bt709;
++	j.src.pitch[0] = src->pitch[0]; j.src.pitch[1] = src->pitch[1]; j.src.addr[0] = si + src->off[0]; j.src.addr[1] = src->pitch[1] ? si + src->off[1] : 0;
++	j.dst.fmt = dst->fmt; j.dst.w = dst->w; j.dst.h = dst->h;
++	j.dst.pitch[0] = dst->pitch[0]; j.dst.pitch[1] = dst->pitch[1]; j.dst.addr[0] = di + dst->off[0]; j.dst.addr[1] = dst->pitch[1] ? di + dst->off[1] : 0;
++	j.rot = (uint8_t)rot; j.flip = (uint8_t)(flip & 1u); j.rgb_swap = (uint8_t)n2mx.rgb_swap;
++	if (n2mdp_compile(&j, &n2mdp_prog_buf)) { err = EINVAL; goto out; }
++	n2mdp_larb_mode(true);
++	err = n2mdp_run(&n2mdp_prog_buf, hw_us);
++	n2mdp_larb_mode(false);
++	n2mx.jobs++;
++	if (err) { n2mx.job_fail++; }
++	if (n2mdp_rd(N2MDP_M4U1 + 0x134u)) {     /* translation fault: the result is not trustworthy */
++		N2MDP_LOG("NORD2 MDP: IOVA fault %#x va %#x in a service blit\n", n2mdp_rd(N2MDP_M4U1 + 0x134u), n2mdp_rd(N2MDP_M4U1 + 0x13cu));
++		n2mdp_wr(N2MDP_M4U1 + 0x120u, n2mdp_rd(N2MDP_M4U1 + 0x120u) | (1u << 12));
++		err = EFAULT;
++	}
++out:
++	if (di) { n2mdp_iova_unmap(di, dst->npages); }
++	if (si) { n2mdp_iova_unmap(si, src->npages); }
++	n2mdp_unlock();
++	return err;
++}
++
+ #ifndef N2MDP_HOST
+ SYSCTL_INT(_kern, OID_AUTO, n2mdp_probe, CTLFLAG_RW | CTLFLAG_LOCKED, &n2mdp_req, 0,
+     "0670: run the MDP probe once (1 read-only, 2 + open/close engine clock gates); -1 = never (also cancels the boot probe)");
+ SYSCTL_INT(_kern, OID_AUTO, n2mdp_boot, CTLFLAG_RW | CTLFLAG_LOCKED, &n2mdp_boot_level, 0,
+     "0670: level of the automatic probe at +45 s (0 = none)");
+ SYSCTL_UINT(_kern, OID_AUTO, n2mdp_state, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mdp.state, 0, "0670: verdict bits of the last probe");
++SYSCTL_INT(_kern, OID_AUTO, n2mdp_stages, CTLFLAG_RW | CTLFLAG_LOCKED, &n2mdp_max_stage, 0, "0671: highest functional stage to run (0..3)");
++SYSCTL_UINT(_kern, OID_AUTO, n2mdp_stage, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mx.stage, 0, "0671: highest stage passed in this boot");
++SYSCTL_UINT(_kern, OID_AUTO, n2mdp_caps, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mx.caps, 0, "0671: capability bits that passed");
++SYSCTL_UINT(_kern, OID_AUTO, n2mdp_s1, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mx.s1, 0, "0671: stage 1 result (1 pass, >1 failure code)");
++SYSCTL_UINT(_kern, OID_AUTO, n2mdp_s2, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mx.s2_pass, 0, "0671: stage 2 tests passed (bitmask)");
++SYSCTL_UINT(_kern, OID_AUTO, n2mdp_s3, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mx.s3, 0, "0671: stage 3 result (1 pass)");
++
++static nord2_mdp_surface_blit_fn n2mdp_surface_hook;
++void nord2_mdp_set_surface_hook(nord2_mdp_surface_blit_fn fn) { n2mdp_surface_hook = fn; }
++static nord2_mdp_publish_fn n2mdp_publish_hook;
++static bool n2mdp_stages_done;
++void
++nord2_mdp_set_publish_hook(nord2_mdp_publish_fn fn)
++{
++	n2mdp_publish_hook = fn;
++	if (n2mdp_stages_done && fn) { fn(nord2_mdp_caps()); }   /* stages already ran (late install) */
++}
++
++static int
++n2mdp_dev_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p) { return 0; }
++static int
++n2mdp_dev_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p) { return 0; }
++static int
++n2mdp_dev_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
++{
++	if (cmd == RWMDP_INFO) {
++		struct rwmdp_info *i = (struct rwmdp_info *)data;
++		memset(i, 0, sizeof(*i));
++		i->version = 1; i->stage = n2mx.stage; i->caps = n2mx.caps; i->s1 = n2mx.s1; i->s2_pass = n2mx.s2_pass; i->s2_fail = n2mx.s2_fail;
++		i->s3 = n2mx.s3; i->jobs = n2mx.jobs; i->job_fail = n2mx.job_fail; i->timeouts = n2mx.timeouts; i->last_us = n2mx.last_us;
++		i->max_us = n2mx.max_us; i->rgb_swap = n2mx.rgb_swap; i->killed = n2mx.killed; i->probe_state = n2mdp.state;
++		return 0;
++	}
++	if (cmd == RWMDP_BLIT_SURF) {
++		struct rwmdp_blit_surf *b = (struct rwmdp_blit_surf *)data;
++		nord2_mdp_surface_blit_fn fn = n2mdp_surface_hook;
++		if (!fn) { return ENODEV; }
++		b->hw_us = 0;
++		b->result = (uint32_t)fn(b->src_id, b->dst_id, b->rot, b->flip, &b->hw_us);
++		return 0;
++	}
++	return ENOTTY;
++}
++static const struct cdevsw n2mdp_cdevsw = {
++	.d_open = n2mdp_dev_open, .d_close = n2mdp_dev_close, .d_read = eno_rdwrt, .d_write = eno_rdwrt,
++	.d_ioctl = n2mdp_dev_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
+ 
+ static int n2mdp_chan;
+ 
+@@ -293,10 +953,22 @@
+ 		thread_block(THREAD_CONTINUE_NULL);
+ 		if (n2mdp_req < 0) { continue; }
+ 		int level = 0;
++		bool boot = false;
+ 		if (n2mdp_req == 1 || n2mdp_req == 2) { level = n2mdp_req; n2mdp_req = 0; }
+-		else if (t == 45 && n2mdp_boot_level > 0) { level = n2mdp_boot_level > 2 ? 2 : n2mdp_boot_level; }
++		else if (t == 45 && n2mdp_boot_level > 0) { level = n2mdp_boot_level > 2 ? 2 : n2mdp_boot_level; boot = true; }
+ 		else if (t == 180 && n2mdp_boot_level > 0) { level = 1; }   /* second read-only look after the UI / camera / codecs ran */
+-		if (level) { n2mdp.runs++; n2mdp.state = n2mdp_probe(level); }
++		if (level) {
++			n2mdp.runs++;
++			n2mdp_lock();
++			n2mdp.state = n2mdp_probe(level);
++			n2mdp_unlock();
++			if (boot) {
++				n2mdp_stages(n2mdp.state);
++				n2mdp_stages_done = true;
++				nord2_mdp_publish_fn fn = n2mdp_publish_hook;
++				if (fn) { fn(nord2_mdp_caps()); } else { printf("NORD2 MDP: no service hook (image without 0672)\n"); }
++			}
++		}
+ 	}
+ }
+ 
+@@ -304,10 +976,12 @@
+ nord2_mdp_start(void)
+ {
+ 	thread_t thread;
++	int major = cdevsw_add(-1, &n2mdp_cdevsw);
++	bool dev = major >= 0 && devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-mdp") != NULL;
+ 	if (kernel_thread_start(n2mdp_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+-		printf("NORD2 MDP: probe thread on (boot probe level %d at +45 s, read-only again at +180 s; kern.n2mdp_probe)\n",
+-		    n2mdp_boot_level);
++		printf("NORD2 MDP: probe thread on (boot probe level %d at +45 s then stages up to %d; read-only again at +180 s; "
++		    "/dev/redwood-mdp %s)\n", n2mdp_boot_level, n2mdp_max_stage, dev ? "made" : "NOT made");
+ 	}
+ }
+ #endif /* !N2MDP_HOST */
+--- /dev/null
++++ b/bsd/dev/nord2_mdp_job.h
+@@ -0,0 +1,523 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * nord2_mdp_job.h -- 0671: MT6893 MDP job compiler, PURE part (stdint/stdbool only; host-tested by
++ * gpu/build/mdp-20261114/test/t_mdp_job.c).  Turns a blit request (source/destination image, crop, rotation, flip, colour
++ * conversion, scaling) into a list of register writes on the MDP window (mdpsys 0x1f000000 + offset) split in tiles, plus a
++ * CPU reference model used by the kernel self-tests to check what the hardware wrote.
++ *
++ * Evidence (gpu/build/mdp-20261114/MDP_OFFLOAD.md section 7):
++ *  [V-src]  register offsets: nord2-current-kernel mdp/mt6893 (bases, MOUT/SEL names, RDMA reset 0x008 + MON_STA_1 0x408 bit 8),
++ *           upstream Linux mtk-mdp3 mdp_reg_rdma.h / mdp_reg_wrot.h / mdp_reg_rsz.h (offsets match this chip's dumps: 0xf00 bases).
++ *  [V-dis]  libdpframework.so (mt6893, the phone's vendor file) disassembly: mutex id 4+n for RDMAn, MOD0 bits (RDMA0-3 0-3, FG 4-5,
++ *           AAL0-3 6-9, HDR 10-11, RSZ0-3 12-15, WROT0-3 16-19, TDSHP0-3 20-23, TCC0-3 24-27), MOD1 bits COLOR0/1 0-1; mutex
++ *           registers EN 0x20+0x20*id, SOF 0x2c+0x20*id (0 = single), MOD0 0x30+0x20*id, MOD1 0x34+0x20*id; topology tables
++ *           s_moutMap / s_selInMap / s_selOutMap (MOUT = bitmask of outputs, SEL = index); RDMA GMCIF 0x10371 mask 0x30071;
++ *           RDMA SRC_CON = id | swap<<14 | 0x20000 | 0x600; TRANSFORM_0 = en<<16 | mtx<<23 (mask 0x0f810000);
++ *           WROT VIDO_CTRL = id | swap<<8 | 0x5000 | rot<<20 | flip<<24 (mask 0xf131510f).
++ *  [I]      everything else (RSZ control/step encoding, WROT MAT_CTRL/MAIN_BUF fields, rotated-tile offsets, matrix ids
++ *           4 = JPEG(full 601)->RGB, 6 = BT601->RGB, 7 = BT709->RGB, 1 = RGB->BT601 taken from the display IP's shared CSC enum).
++ *           Every [I] field is exercised by a stage-2 self-test with a CPU reference; a capability is offered only when its test
++ *           passed on this boot (nord2_mdp.inc).
++ */
++#ifndef NORD2_MDP_JOB_H
++#define NORD2_MDP_JOB_H
++
++/* ---- formats (named by memory byte order, iOS style) ----------------------------------------------------------------- */
++enum { N2MF_NONE = 0, N2MF_BGRA = 1, N2MF_RGBA = 2, N2MF_NV12 = 3, N2MF_NV21 = 4 };
++/* MTK hardware format ids (upstream mtk-mdp3-regs.h MDP_COLOR unique id / swap) */
++#define N2MDP_HW_RGBA8888_ID  2u
++#define N2MDP_HW_NV12_ID      12u
++
++static inline bool n2mf_is_yuv(uint32_t f) { return f == N2MF_NV12 || f == N2MF_NV21; }
++static inline bool n2mf_valid(uint32_t f) { return f >= N2MF_BGRA && f <= N2MF_NV21; }
++static inline uint32_t n2mf_bpp(uint32_t f) { return n2mf_is_yuv(f) ? 1u : 4u; }   /* bytes per pixel of plane 0 */
++
++/* ---- request ---------------------------------------------------------------------------------------------------------- */
++struct n2mdp_img {
++	uint32_t fmt, w, h;
++	uint32_t addr[2];        /* device address of plane 0 / 1 (PA with the larb port in bypass, or IOVA when M4U1 translates) */
++	uint32_t pitch[2];       /* bytes per row of plane 0 / 1 */
++	uint8_t  full_range;     /* YUV only: 1 = 420f, 0 = 420v */
++	uint8_t  bt709;          /* YUV only: matrix */
++};
++struct n2mdp_job {
++	struct n2mdp_img src, dst;
++	uint32_t cx, cy, cw, ch;  /* source crop (cw = 0: whole source) */
++	uint8_t  rot;             /* clockwise quarter turns 0..3 */
++	uint8_t  flip;            /* bit0 = mirror horizontally (applied before the rotation, iOS convention) */
++	uint8_t  rgb_swap;        /* self-calibration: XOR applied to the RGB swap bits (stage 2 finds the right value) */
++	uint8_t  tile_w;          /* tile width in units of 16 output pixels (0 = default 32 = 512 px) */
++};
++
++/* error codes of n2mdp_check() */
++enum { N2MDP_OK = 0, N2MDP_E_FMT = 1, N2MDP_E_SIZE = 2, N2MDP_E_ALIGN = 3, N2MDP_E_CROP = 4, N2MDP_E_SCALE = 5, N2MDP_E_DST = 6,
++	N2MDP_E_ADDR = 7, N2MDP_E_TILES = 8 };
++#define N2MDP_MAX_DIM     8191u    /* 13-bit size fields */
++#define N2MDP_MAX_SCALE   8u       /* we offer 1/8 .. 8x only */
++#define N2MDP_MAX_TILES   64u
++
++static inline uint32_t n2mdp_out_w(const struct n2mdp_job *j) { return (j->rot & 1u) ? j->dst.h : j->dst.w; }   /* pre-rotation */
++static inline uint32_t n2mdp_out_h(const struct n2mdp_job *j) { return (j->rot & 1u) ? j->dst.w : j->dst.h; }
++static inline uint32_t n2mdp_crop_w(const struct n2mdp_job *j) { return j->cw ? j->cw : j->src.w; }
++static inline uint32_t n2mdp_crop_h(const struct n2mdp_job *j) { return j->ch ? j->ch : j->src.h; }
++static inline bool n2mdp_scaled(const struct n2mdp_job *j) { return n2mdp_crop_w(j) != n2mdp_out_w(j) || n2mdp_crop_h(j) != n2mdp_out_h(j); }
++/* plane bytes needed by an image (for range checks of the caller's buffers) */
++static inline uint64_t n2mdp_plane_bytes(const struct n2mdp_img *im, unsigned p)
++{
++	if (p == 0) { return (uint64_t)im->pitch[0] * im->h; }
++	return n2mf_is_yuv(im->fmt) ? (uint64_t)im->pitch[1] * ((im->h + 1u) / 2u) : 0;
++}
++
++static inline int
++n2mdp_check(const struct n2mdp_job *j)
++{
++	if (!n2mf_valid(j->src.fmt) || !n2mf_valid(j->dst.fmt)) { return N2MDP_E_FMT; }
++	const struct n2mdp_img *im[2] = { &j->src, &j->dst };
++	for (unsigned i = 0; i < 2; i++) {
++		if (im[i]->w < 2 || im[i]->h < 2 || im[i]->w > N2MDP_MAX_DIM || im[i]->h > N2MDP_MAX_DIM) { return N2MDP_E_SIZE; }
++		if (im[i]->pitch[0] < im[i]->w * n2mf_bpp(im[i]->fmt) || (im[i]->pitch[0] & 15u)) { return N2MDP_E_ALIGN; }
++		if (im[i]->addr[0] == 0 || (im[i]->addr[0] & 15u)) { return N2MDP_E_ADDR; }
++		if (n2mf_is_yuv(im[i]->fmt)) {
++			if ((im[i]->w | im[i]->h) & 1u) { return N2MDP_E_ALIGN; }
++			if (im[i]->pitch[1] < im[i]->w || (im[i]->pitch[1] & 15u) || im[i]->addr[1] == 0 || (im[i]->addr[1] & 15u)) { return N2MDP_E_ALIGN; }
++		}
++	}
++	if (n2mf_is_yuv(j->dst.fmt) && !n2mf_is_yuv(j->src.fmt)) { return N2MDP_E_DST; }        /* RGB -> YUV not offered */
++	uint32_t cw = n2mdp_crop_w(j), ch = n2mdp_crop_h(j);
++	if ((uint64_t)j->cx + cw > j->src.w || (uint64_t)j->cy + ch > j->src.h || cw < 2 || ch < 2) { return N2MDP_E_CROP; }
++	if (n2mf_is_yuv(j->src.fmt) && ((j->cx | j->cy | cw | ch) & 1u)) { return N2MDP_E_CROP; }
++	uint32_t ow = n2mdp_out_w(j), oh = n2mdp_out_h(j);
++	if (ow * N2MDP_MAX_SCALE < cw || cw * N2MDP_MAX_SCALE < ow || oh * N2MDP_MAX_SCALE < ch || ch * N2MDP_MAX_SCALE < oh) { return N2MDP_E_SCALE; }
++	if (j->rot > 3) { return N2MDP_E_SIZE; }
++	return N2MDP_OK;
++}
++
++/* ---- the register program ---------------------------------------------------------------------------------------------- */
++/* MDP window offsets (mdpsys 0x1f000000 + ...) [V-src mdp_base.h] */
++#define N2MDP_W_SYS     0x00000u
++#define N2MDP_W_MUTEX   0x01000u
++#define N2MDP_W_RDMA(n) (0x06000u + 0x1000u * (n))
++#define N2MDP_W_AAL(n)  (0x0c000u + 0x1000u * (n))
++#define N2MDP_W_RSZ(n)  (0x12000u + 0x1000u * (n))
++#define N2MDP_W_WROT(n) (0x16000u + 0x1000u * (n))
++#define N2MDP_W_TDSHP(n) (0x1a000u + 0x1000u * (n))
++#define N2MDP_W_TCC(n)  (0x1e000u + 0x1000u * (n))
++#define N2MDP_W_LARB2   0x03000u
++
++/* pipes: 0 = RDMA0 -> WROT0 direct (no scaler; copy, rotate, flip, WROT colour matrix);
++ *        2 = RDMA2 -> AAL2 -> RSZ2 -> TDSHP2 -> TCC2 -> WROT2 (scaling) [V-dis adjacency table] */
++#define N2MDP_PIPE_DIRECT 0u
++#define N2MDP_PIPE_SCALE  2u
++
++/* op kinds of the program */
++enum { N2MDP_OP_WRITE = 0, N2MDP_OP_POLL = 1, N2MDP_OP_GO = 2, N2MDP_OP_WAIT = 3, N2MDP_OP_END = 4 };
++struct n2mdp_op { uint8_t op; uint32_t off, val, mask; };
++/* WRITE: *(win+off) = (*(win+off) & ~mask) | (val & mask)    (mask 0xffffffff = plain write)
++ * POLL : wait until (*(win+off) & mask) == val (timeout -> abort)
++ * GO   : mutex EN for the tile (val = mutex id): the frame starts
++ * WAIT : wait until the tile is done: (*(win+off) & mask) == val, the WROT's done condition */
++
++#define N2MDP_MUTEX_ID(pipe)       (4u + (pipe))                    /* RDMA0 -> mutex 4, RDMA2 -> mutex 6 [V-dis] */
++#define N2MDP_MUTEX_EN(id)         (N2MDP_W_MUTEX + 0x20u + 0x20u * (id))
++#define N2MDP_MUTEX_SOF(id)        (N2MDP_W_MUTEX + 0x2cu + 0x20u * (id))
++#define N2MDP_MUTEX_MOD0(id)       (N2MDP_W_MUTEX + 0x30u + 0x20u * (id))
++#define N2MDP_MUTEX_MOD1(id)       (N2MDP_W_MUTEX + 0x34u + 0x20u * (id))
++#define N2MDP_EV_WROT_DONE(pipe)   (0x123u - (pipe))                /* GCE-M events: wrot3 0x120 .. wrot0 0x123 [V-dt] */
++#define N2MDP_EV_RDMA_DONE(pipe)   (0x133u - (pipe))                /* rdma3 0x130 .. rdma0 0x133 [V-dt] */
++
++/* RDMA [V-src upstream] */
++#define R_EN 0x000u
++#define R_RESET 0x008u
++#define R_CON 0x020u
++#define R_GMCIF 0x028u
++#define R_SRC_CON 0x030u
++#define R_BKGD_B 0x060u
++#define R_SRC_SIZE 0x070u
++#define R_CLIP_SIZE 0x078u
++#define R_OFFSET_1 0x080u
++#define R_SF_BKGD_B 0x090u
++#define R_SRC_END0 0x100u
++#define R_SRC_END1 0x108u
++#define R_OFFSET0 0x118u
++#define R_OFFSET1 0x120u
++#define R_TRANSFORM 0x200u
++#define R_MON1 0x408u
++#define R_BASE0 0xf00u
++#define R_BASE1 0xf08u
++/* RSZ */
++#define Z_ENABLE 0x000u
++#define Z_CTRL1 0x004u
++#define Z_CTRL2 0x008u
++#define Z_IN 0x010u
++#define Z_OUT 0x014u
++#define Z_HSTEP 0x018u
++#define Z_VSTEP 0x01cu
++#define Z_LH_INT 0x020u
++#define Z_LH_SUB 0x024u
++#define Z_LV_INT 0x028u
++#define Z_LV_SUB 0x02cu
++#define Z_CH_INT 0x030u
++#define Z_CH_SUB 0x034u
++/* WROT */
++#define W_CTRL 0x000u
++#define W_MAIN_BUF 0x008u
++#define W_SOFT_RST 0x010u
++#define W_SOFT_RST_STAT 0x014u
++#define W_CROP_OFST 0x020u
++#define W_TAR_SIZE 0x024u
++#define W_OFST 0x02cu
++#define W_STRIDE 0x030u
++#define W_OFST_C 0x038u
++#define W_STRIDE_C 0x03cu
++#define W_DITHER 0x054u
++#define W_RSV1 0x070u
++#define W_IN_SIZE 0x078u
++#define W_ROT_EN 0x07cu
++#define W_MAT_CTRL 0x084u
++#define W_BASE 0xf00u
++#define W_BASE_C 0xf04u
++
++/* topology registers (mdpsys) [V-dis tables] */
++#define N2MDP_T_RDMA0_MOUT 0xf20u
++#define N2MDP_T_RDMA2_MOUT 0xf28u
++#define N2MDP_T_AAL2_SEL   0xf38u
++#define N2MDP_T_RSZ2_SEL   0xf68u
++#define N2MDP_T_WROT0_SEL  0xf70u
++#define N2MDP_T_WROT2_SEL  0xf78u
++
++struct n2mdp_tile { uint32_t ox0, ox1; uint32_t ix0, ix1; uint32_t lh_int, lh_sub; };
++struct n2mdp_prog {
++	struct n2mdp_op ops[1600];
++	uint32_t n, tiles, pipe, mutex;
++	int err;
++};
++
++static inline void
++n2mdp_emit(struct n2mdp_prog *p, uint8_t op, uint32_t off, uint32_t val, uint32_t mask)
++{
++	if (p->err) { return; }
++	if (p->n >= sizeof(p->ops) / sizeof(p->ops[0]) - 1u) { p->err = N2MDP_E_TILES; return; }
++	p->ops[p->n].op = op; p->ops[p->n].off = off; p->ops[p->n].val = val; p->ops[p->n].mask = mask; p->n++;
++}
++#define N2W(p, off, val) n2mdp_emit((p), N2MDP_OP_WRITE, (off), (val), 0xffffffffu)
++#define N2WM(p, off, val, m) n2mdp_emit((p), N2MDP_OP_WRITE, (off), (val), (m))
++
++/* scaler step, 1.15 fixed point of input pixels per output pixel (in-1)/(out-1) [I] */
++static inline uint32_t n2mdp_step(uint32_t in, uint32_t out)
++{
++	if (out <= 1u || in <= 1u) { return 1u << 15; }
++	return (uint32_t)((((uint64_t)(in - 1u)) << 15) / (out - 1u));
++}
++
++/* Split the pre-rotation output width into tiles and compute each tile's input span. */
++static inline uint32_t
++n2mdp_tiles(const struct n2mdp_job *j, struct n2mdp_tile *t, uint32_t max)
++{
++	uint32_t ow = n2mdp_out_w(j), cw = n2mdp_crop_w(j), tw = (j->tile_w ? j->tile_w : 32u) * 16u, n = 0;
++	uint32_t step = n2mdp_step(cw, ow);
++	bool scaled = n2mdp_scaled(j);
++	for (uint32_t x = 0; x < ow && n < max; x += tw, n++) {
++		uint32_t x1 = x + tw < ow ? x + tw : ow;
++		t[n].ox0 = x; t[n].ox1 = x1;
++		if (!scaled) {
++			t[n].ix0 = x; t[n].ix1 = x1; t[n].lh_int = 0; t[n].lh_sub = 0;
++		} else {
++			uint64_t s0 = (uint64_t)x * step, s1 = (uint64_t)(x1 - 1u) * step;   /* first/last source position, 1.15 */
++			uint32_t i0 = (uint32_t)(s0 >> 15), i1 = (uint32_t)(s1 >> 15) + 2u;   /* +1 right neighbour, +1 exclusive */
++			uint32_t lo = i0 >= 4u ? i0 - 4u : 0u;                                   /* 4 px filter margin each side */
++			uint32_t hi = i1 + 3u < cw ? i1 + 3u : cw;
++			if (n2mf_is_yuv(j->src.fmt)) { lo &= ~1u; hi = (hi + 1u) & ~1u; if (hi > cw) { hi = cw; } }
++			t[n].ix0 = lo; t[n].ix1 = hi;
++			t[n].lh_int = i0 - lo; t[n].lh_sub = (uint32_t)(s0 & 0x7fffu) << 5;   /* subpixel field is 20 bit [I] */
++		}
++	}
++	return n;
++}
++
++/* Destination byte offset of the top-left of a tile's footprint after flip + rotation (plane 0 / plane 1). */
++static inline void
++n2mdp_dst_offset(const struct n2mdp_job *j, const struct n2mdp_tile *t, uint32_t *o0, uint32_t *o1)
++{
++	uint32_t ow = n2mdp_out_w(j);
++	uint32_t a = t->ox0, b = t->ox1;                 /* tile columns in the scaled, unrotated picture */
++	if (j->flip & 1u) { uint32_t na = ow - b, nb = ow - a; a = na; b = nb; }
++	uint32_t bpp = n2mf_bpp(j->dst.fmt), dx = 0, dy = 0;
++	switch (j->rot & 3u) {
++	case 0: dx = a; dy = 0; break;
++	case 1: dx = 0; dy = a; break;                   /* column a of the source becomes row a (90 cw) */
++	case 2: dx = ow - b; dy = 0; break;
++	default: dx = 0; dy = ow - b; break;             /* 270 */
++	}
++	*o0 = dy * j->dst.pitch[0] + dx * bpp;
++	*o1 = n2mf_is_yuv(j->dst.fmt) ? (dy / 2u) * j->dst.pitch[1] + dx : 0;
++}
++
++/* Compile the job.  pipe chosen here: direct when not scaled, scale pipe otherwise. */
++static inline int
++n2mdp_compile(const struct n2mdp_job *j, struct n2mdp_prog *p)
++{
++	p->n = 0; p->err = 0; p->tiles = 0;
++	int e = n2mdp_check(j);
++	if (e) { p->err = e; return e; }
++	bool scaled = n2mdp_scaled(j);
++	uint32_t pipe = scaled ? N2MDP_PIPE_SCALE : N2MDP_PIPE_DIRECT;
++	uint32_t mid = N2MDP_MUTEX_ID(pipe);
++	p->pipe = pipe; p->mutex = mid;
++	uint32_t R = N2MDP_W_RDMA(pipe), W = N2MDP_W_WROT(pipe), Z = N2MDP_W_RSZ(pipe);
++	bool syuv = n2mf_is_yuv(j->src.fmt), dyuv = n2mf_is_yuv(j->dst.fmt);
++	uint32_t cw = n2mdp_crop_w(j), ch = n2mdp_crop_h(j), ow = n2mdp_out_w(j), oh = n2mdp_out_h(j);
++
++	/* topology + mutex modules */
++	if (pipe == N2MDP_PIPE_DIRECT) {
++		N2W(p, N2MDP_T_RDMA0_MOUT, 1u << 1);          /* RDMA0 out slot 1 = WROT0 */
++		N2W(p, N2MDP_T_WROT0_SEL, 2u);                /* WROT0 in slot 2 = RDMA0 */
++		N2W(p, N2MDP_MUTEX_MOD0(mid), (1u << 0) | (1u << 16));
++	} else {
++		N2W(p, N2MDP_T_RDMA2_MOUT, 1u << 0);          /* RDMA2 out slot 0 = AAL2 */
++		N2W(p, N2MDP_T_AAL2_SEL, 0u);                 /* AAL2 in slot 0 = RDMA2 */
++		N2W(p, N2MDP_T_RSZ2_SEL, 0u);                 /* RSZ2 in slot 0 = AAL2 */
++		N2W(p, N2MDP_T_WROT2_SEL, 0u);                /* WROT2 in slot 0 = TCC2 */
++		N2W(p, N2MDP_MUTEX_MOD0(mid), (1u << 2) | (1u << 8) | (1u << 14) | (1u << 22) | (1u << 26) | (1u << 18));
++	}
++	N2W(p, N2MDP_MUTEX_MOD1(mid), 0);
++	N2WM(p, N2MDP_MUTEX_SOF(mid), 0, 7u);               /* single (memory to memory) */
++
++	/* engine reset + frame config */
++	N2WM(p, R + R_RESET, 1u, 1u);
++	n2mdp_emit(p, N2MDP_OP_POLL, R + R_MON1, 1u << 8, 1u << 8);
++	N2WM(p, R + R_RESET, 0u, 1u);
++	N2WM(p, W + W_SOFT_RST, 1u, 1u);
++	n2mdp_emit(p, N2MDP_OP_POLL, W + W_SOFT_RST_STAT, 1u, 1u);
++	N2WM(p, W + W_SOFT_RST, 0u, 1u);
++	n2mdp_emit(p, N2MDP_OP_POLL, W + W_SOFT_RST_STAT, 0u, 1u);
++
++	uint32_t sbpp = n2mf_bpp(j->src.fmt);
++	uint32_t s_id = syuv ? N2MDP_HW_NV12_ID : N2MDP_HW_RGBA8888_ID;
++	uint32_t s_swap = (j->src.fmt == N2MF_RGBA || j->src.fmt == N2MF_NV21) ? 1u : 0u;
++	if (!syuv) { s_swap ^= (j->rgb_swap & 1u); }
++	N2WM(p, R + R_GMCIF, 0x00010371u, 0x00030071u);
++	N2WM(p, R + R_SRC_CON, s_id | (s_swap << 14) | 0x20000u | 0x600u, 0x038cfe0fu);
++	N2WM(p, R + R_CON, 0, 0x1110u);
++	N2W(p, R + R_BASE0, j->src.addr[0]);
++	N2W(p, R + R_SRC_END0, (uint32_t)(j->src.addr[0] + n2mdp_plane_bytes(&j->src, 0) - 1u));
++	N2W(p, R + R_BKGD_B, j->src.pitch[0]);
++	if (syuv) {
++		N2W(p, R + R_BASE1, j->src.addr[1]);
++		N2W(p, R + R_SRC_END1, (uint32_t)(j->src.addr[1] + n2mdp_plane_bytes(&j->src, 1) - 1u));
++		N2W(p, R + R_SF_BKGD_B, j->src.pitch[1]);
++	}
++	/* colour: the scale pipe works in YUV, so RGB sources are converted at the RDMA (RGB -> BT601 full) and back at the WROT;
++	 * the direct pipe converts only YUV -> RGB at the WROT */
++	uint32_t r_mtx = 0, r_en = 0;
++	if (pipe == N2MDP_PIPE_SCALE && !syuv) { r_en = 1; r_mtx = 0; /* RGB_TO_JPEG */ }
++	N2WM(p, R + R_TRANSFORM, (r_en << 16) | (r_mtx << 23), 0x0f810000u);
++
++	if (pipe == N2MDP_PIPE_SCALE) {
++		/* relay the PQ engines (AAL/TDSHP/TCC) [I: relay = bit0 of their CFG at 0x020 / TDSHP 0x100 bypass] */
++		N2WM(p, N2MDP_W_AAL(2) + 0x020u, 1u, 1u);
++		N2WM(p, N2MDP_W_AAL(2) + 0x000u, 1u, 1u);
++		N2WM(p, N2MDP_W_TDSHP(2) + 0x100u, 0u, 0xffffffffu);
++		N2WM(p, N2MDP_W_TDSHP(2) + 0x000u, 1u, 1u);
++		N2WM(p, N2MDP_W_TCC(2) + 0x020u, 1u, 1u);
++		N2WM(p, N2MDP_W_TCC(2) + 0x000u, 1u, 1u);
++		/* RSZ: reset, enable, steps */
++		N2WM(p, Z + Z_ENABLE, 0x10000u, 1u << 16);
++		N2WM(p, Z + Z_ENABLE, 0u, 1u << 16);
++		N2WM(p, Z + Z_ENABLE, 1u, 1u);
++		uint32_t hs = n2mdp_step(cw, ow), vs = n2mdp_step(ch, oh);
++		uint32_t hen = cw != ow, ven = ch != oh;
++		N2WM(p, Z + Z_CTRL1, hen | (ven << 1), 0x03fffdf3u);
++		N2WM(p, Z + Z_CTRL2, 0, 0x0fffc290u);
++		N2W(p, Z + Z_HSTEP, hs);
++		N2W(p, Z + Z_VSTEP, vs);
++	}
++
++	/* WROT frame */
++	uint32_t d_id = dyuv ? N2MDP_HW_NV12_ID : N2MDP_HW_RGBA8888_ID;
++	uint32_t d_swap = (j->dst.fmt == N2MF_RGBA || j->dst.fmt == N2MF_NV21) ? 1u : 0u;
++	if (!dyuv) { d_swap ^= (j->rgb_swap & 1u); }
++	uint32_t w_mat = 0;
++	bool yuv_in_pipe = syuv || pipe == N2MDP_PIPE_SCALE;
++	if (yuv_in_pipe && !dyuv) {
++		uint32_t m = 4u;                                         /* JPEG (full 601) -> RGB */
++		if (syuv) { m = j->src.bt709 ? 7u : (j->src.full_range ? 4u : 6u); }
++		w_mat = 1u | (m << 4);
++	}
++	uint32_t flip = j->flip & 1u;
++	N2W(p, W + W_BASE, j->dst.addr[0]);
++	if (dyuv) { N2W(p, W + W_BASE_C, j->dst.addr[1]); N2W(p, W + W_STRIDE_C, j->dst.pitch[1]); }
++	N2WM(p, W + W_CTRL, d_id | (d_swap << 8) | 0x5000u | ((uint32_t)(j->rot & 3u) << 20) | (flip << 24) |
++	    (dyuv ? (1u << 30) | (1u << 28) : 0), 0xf131510fu);
++	N2W(p, W + W_STRIDE, j->dst.pitch[0]);
++	N2WM(p, W + W_MAT_CTRL, w_mat, 0xf3u);
++	N2WM(p, W + W_DITHER, 0xff000000u, 0xff000000u);
++	N2WM(p, W + W_RSV1, 1u << 31, 1u << 31);
++
++	/* tiles */
++	struct n2mdp_tile t[N2MDP_MAX_TILES];
++	uint32_t nt = n2mdp_tiles(j, t, N2MDP_MAX_TILES);
++	if (nt == 0 || t[nt - 1].ox1 != ow) { p->err = N2MDP_E_TILES; return p->err; }
++	for (uint32_t k = 0; k < nt; k++) {
++		uint32_t iw = t[k].ix1 - t[k].ix0, tw = t[k].ox1 - t[k].ox0;
++		uint32_t sx = j->cx + t[k].ix0;
++		/* RDMA tile */
++		N2WM(p, R + R_EN, 1u, 1u);
++		N2W(p, R + R_OFFSET0, j->cy * j->src.pitch[0] + sx * sbpp);
++		if (syuv) { N2W(p, R + R_OFFSET1, (j->cy / 2u) * j->src.pitch[1] + sx); }
++		N2W(p, R + R_SRC_SIZE, (ch << 16) | iw);
++		N2W(p, R + R_CLIP_SIZE, (ch << 16) | iw);
++		N2WM(p, R + R_OFFSET_1, 0, 0x003f001fu);
++		if (pipe == N2MDP_PIPE_SCALE) {
++			N2W(p, Z + Z_IN, (ch << 16) | iw);
++			N2W(p, Z + Z_OUT, (oh << 16) | tw);
++			N2W(p, Z + Z_LH_INT, t[k].lh_int);
++			N2W(p, Z + Z_LH_SUB, t[k].lh_sub);
++			N2W(p, Z + Z_LV_INT, 0);
++			N2W(p, Z + Z_LV_SUB, 0);
++			N2W(p, Z + Z_CH_INT, t[k].lh_int / 2u);
++			N2W(p, Z + Z_CH_SUB, t[k].lh_sub);
++		}
++		/* WROT tile */
++		uint32_t o0, o1;
++		n2mdp_dst_offset(j, &t[k], &o0, &o1);
++		N2W(p, W + W_OFST, o0);
++		if (dyuv) { N2W(p, W + W_OFST_C, o1); }
++		N2W(p, W + W_IN_SIZE, (oh << 16) | tw);
++		N2W(p, W + W_TAR_SIZE, (oh << 16) | tw);
++		N2W(p, W + W_CROP_OFST, 0);
++		N2WM(p, W + W_MAIN_BUF, (tw << 16) | (1u << 8), 0x1fff7f00u);
++		N2WM(p, W + W_ROT_EN, 1u, 1u);
++		/* go + wait: GO clears the WROT frame-done GCE event and sets the mutex EN; WAIT polls that event through the GCE-M
++		 * token registers (CPU-readable; live.dts mdp_wrot0_write_frame_done = 0x123, wrot2 = 0x121) and logs the other
++		 * done indicators (mutex EN/INTSTA, RDMA MON_STA_1) the first time (nord2_mdp.inc n2mdp_run) */
++		n2mdp_emit(p, N2MDP_OP_GO, N2MDP_MUTEX_EN(mid), N2MDP_EV_WROT_DONE(pipe), 1u);
++		n2mdp_emit(p, N2MDP_OP_WAIT, N2MDP_MUTEX_EN(mid), N2MDP_EV_WROT_DONE(pipe), 1u);
++		N2WM(p, N2MDP_MUTEX_EN(mid), 0u, 1u);
++		N2WM(p, W + W_ROT_EN, 0u, 1u);
++		N2WM(p, R + R_EN, 0u, 1u);
++	}
++	if (pipe == N2MDP_PIPE_SCALE) { N2WM(p, Z + Z_ENABLE, 0u, 1u); }
++	n2mdp_emit(p, N2MDP_OP_END, 0, 0, 0);
++	p->tiles = nt;
++	return p->err;
++}
++
++/* ---- CPU reference --------------------------------------------------------------------------------------------------- */
++/* Reads one source pixel as R,G,B (0..255) */
++static inline void
++n2mdp_ref_px(const struct n2mdp_img *im, const uint8_t *p0, const uint8_t *p1, uint32_t x, uint32_t y, int *r, int *g, int *b)
++{
++	if (!n2mf_is_yuv(im->fmt)) {
++		const uint8_t *q = p0 + (uint64_t)y * im->pitch[0] + (uint64_t)x * 4u;
++		if (im->fmt == N2MF_BGRA) { *b = q[0]; *g = q[1]; *r = q[2]; } else { *r = q[0]; *g = q[1]; *b = q[2]; }
++		return;
++	}
++	int Y = p0[(uint64_t)y * im->pitch[0] + x];
++	const uint8_t *c = p1 + (uint64_t)(y / 2u) * im->pitch[1] + (x & ~1u);
++	int U = im->fmt == N2MF_NV12 ? c[0] : c[1], V = im->fmt == N2MF_NV12 ? c[1] : c[0];
++	int yy, cr, cg1, cg2, cb;     /* fixed point 1.10 BT.601 / 709, full or video range */
++	if (im->full_range) { yy = Y * 1024; } else { yy = (Y - 16) * 1192; }
++	int u = U - 128, v = V - 128;
++	if (im->bt709) { cr = im->full_range ? 1613 : 1836; cg1 = im->full_range ? 192 : 218; cg2 = im->full_range ? 479 : 546; cb = im->full_range ? 1900 : 2163; }
++	else { cr = im->full_range ? 1436 : 1634; cg1 = im->full_range ? 352 : 401; cg2 = im->full_range ? 731 : 832; cb = im->full_range ? 1815 : 2066; }
++	int R = (yy + cr * v + 512) >> 10, G = (yy - cg1 * u - cg2 * v + 512) >> 10, B = (yy + cb * u + 512) >> 10;
++	*r = R < 0 ? 0 : R > 255 ? 255 : R; *g = G < 0 ? 0 : G > 255 ? 255 : G; *b = B < 0 ? 0 : B > 255 ? 255 : B;
++}
++
++/* Expected output pixel (x,y) of the destination (RGB destinations only); bilinear for scaled jobs. */
++static inline void
++n2mdp_ref_out(const struct n2mdp_job *j, const uint8_t *s0, const uint8_t *s1, uint32_t x, uint32_t y, int *r, int *g, int *b)
++{
++	uint32_t ow = n2mdp_out_w(j), oh = n2mdp_out_h(j), u, v;   /* (u,v) position in the unrotated, scaled picture */
++	switch (j->rot & 3u) {
++	case 0: u = x; v = y; break;
++	case 1: u = y; v = oh - 1u - x; break;            /* 90 cw: dst(x,y) = src(y, H-1-x) */
++	case 2: u = ow - 1u - x; v = oh - 1u - y; break;
++	default: u = ow - 1u - y; v = x; break;           /* 270 */
++	}
++	if (j->flip & 1u) { u = ow - 1u - u; }
++	uint32_t cw = n2mdp_crop_w(j), ch = n2mdp_crop_h(j);
++	if (!n2mdp_scaled(j)) { n2mdp_ref_px(&j->src, s0, s1, j->cx + u, j->cy + v, r, g, b); return; }
++	uint64_t fx = (uint64_t)u * n2mdp_step(cw, ow), fy = (uint64_t)v * n2mdp_step(ch, oh);
++	uint32_t x0 = (uint32_t)(fx >> 15), y0 = (uint32_t)(fy >> 15);
++	uint32_t ax = (uint32_t)(fx & 0x7fff), ay = (uint32_t)(fy & 0x7fff);
++	uint32_t x1 = x0 + 1u < cw ? x0 + 1u : x0, y1 = y0 + 1u < ch ? y0 + 1u : y0;
++	int c[4][3];
++	n2mdp_ref_px(&j->src, s0, s1, j->cx + x0, j->cy + y0, &c[0][0], &c[0][1], &c[0][2]);
++	n2mdp_ref_px(&j->src, s0, s1, j->cx + x1, j->cy + y0, &c[1][0], &c[1][1], &c[1][2]);
++	n2mdp_ref_px(&j->src, s0, s1, j->cx + x0, j->cy + y1, &c[2][0], &c[2][1], &c[2][2]);
++	n2mdp_ref_px(&j->src, s0, s1, j->cx + x1, j->cy + y1, &c[3][0], &c[3][1], &c[3][2]);
++	int out[3];
++	for (int k = 0; k < 3; k++) {
++		int64_t top = (int64_t)c[0][k] * (32768 - ax) + (int64_t)c[1][k] * ax;
++		int64_t bot = (int64_t)c[2][k] * (32768 - ax) + (int64_t)c[3][k] * ax;
++		out[k] = (int)((top * (32768 - ay) + bot * ay + (1ll << 29)) >> 30);
++	}
++	*r = out[0]; *g = out[1]; *b = out[2];
++}
++
++/* Compare an RGB destination against the reference.  Returns 0 = match within tolerance; fills stats.
++ * exact: max error must be 0 (copy/rotate/flip of RGB); else mean <= 6 and 99.x % of samples within 32 (scaler/CSC). */
++struct n2mdp_cmp { uint32_t samples, max_err, sum_err, over, swapped_better; uint32_t first_x, first_y; };
++static inline int
++n2mdp_compare(const struct n2mdp_job *j, const uint8_t *s0, const uint8_t *s1, const uint8_t *d0, bool exact, struct n2mdp_cmp *c)
++{
++	c->samples = c->max_err = c->sum_err = c->over = c->swapped_better = 0; c->first_x = c->first_y = 0xffffffffu;
++	uint32_t W = j->dst.w, H = j->dst.h, sw = 0, sn = 0;
++	uint32_t stepx = W > 64 ? W / 64u : 1u, stepy = H > 64 ? H / 64u : 1u;
++	for (uint32_t y = 0; y < H; y += (exact ? 1u : stepy)) {
++		for (uint32_t x = 0; x < W; x += (exact ? 1u : stepx)) {
++			int r, g, b;
++			n2mdp_ref_out(j, s0, s1, x, y, &r, &g, &b);
++			const uint8_t *q = d0 + (uint64_t)y * j->dst.pitch[0] + (uint64_t)x * 4u;
++			int R, G, B;
++			if (j->dst.fmt == N2MF_BGRA) { B = q[0]; G = q[1]; R = q[2]; } else { R = q[0]; G = q[1]; B = q[2]; }
++			int e = (R > r ? R - r : r - R); int e2 = (G > g ? G - g : g - G); int e3 = (B > b ? B - b : b - B);
++			int m = e > e2 ? e : e2; m = m > e3 ? m : e3;
++			int es = (B > r ? B - r : r - B) + e2 + (R > b ? R - b : b - R);          /* the same pixel with R/B swapped */
++			sw += (uint32_t)es; sn += (uint32_t)(e + e2 + e3);
++			c->samples++; c->sum_err += (uint32_t)m;
++			if ((uint32_t)m > c->max_err) { c->max_err = (uint32_t)m; }
++			if (m > (exact ? 0 : 32)) { if (c->over == 0) { c->first_x = x; c->first_y = y; } c->over++; }
++		}
++	}
++	c->swapped_better = sw * 2u < sn;
++	if (exact) { return c->over ? 1 : 0; }
++	return (c->sum_err > 6u * c->samples || c->over * 100u > c->samples) ? 1 : 0;
++}
++
++/* CRC32 (for the log) */
++static inline uint32_t
++n2mdp_crc32(const uint8_t *p, uint64_t n, uint32_t crc)
++{
++	crc = ~crc;
++	for (uint64_t i = 0; i < n; i++) { crc ^= p[i]; for (int k = 0; k < 8; k++) { crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u))); } }
++	return ~crc;
++}
++
++/* deterministic test pattern: RGB gradients + 8x8 checker + a corner marker (orientation is visible in every rotation) */
++static inline void
++n2mdp_pattern(const struct n2mdp_img *im, uint8_t *p0, uint8_t *p1, uint32_t seed)
++{
++	for (uint32_t y = 0; y < im->h; y++) {
++		for (uint32_t x = 0; x < im->w; x++) {
++			uint32_t r = (x * 255u) / (im->w - 1u), g = (y * 255u) / (im->h - 1u);
++			uint32_t b = (((x >> 3) ^ (y >> 3)) & 1u) ? 200u : 40u;
++			if (x < 16 && y < 16) { r = 255; g = 255; b = 255; }                         /* top-left marker */
++			r ^= seed & 7u;
++			if (!n2mf_is_yuv(im->fmt)) {
++				uint8_t *q = p0 + (uint64_t)y * im->pitch[0] + (uint64_t)x * 4u;
++				if (im->fmt == N2MF_BGRA) { q[0] = (uint8_t)b; q[1] = (uint8_t)g; q[2] = (uint8_t)r; }
++				else { q[0] = (uint8_t)r; q[1] = (uint8_t)g; q[2] = (uint8_t)b; }
++				q[3] = 0xff;
++			} else {
++				p0[(uint64_t)y * im->pitch[0] + x] = (uint8_t)(16u + (r * 3u + g * 5u + b) * 219u / 2295u);
++				if (!(x & 1u) && !(y & 1u)) {
++					uint8_t *c = p1 + (uint64_t)(y / 2u) * im->pitch[1] + x;
++					c[0] = (uint8_t)(64u + (x * 128u) / im->w); c[1] = (uint8_t)(64u + (y * 128u) / im->h);
++				}
++			}
++		}
++	}
++}
++#endif /* NORD2_MDP_JOB_H */
+--- /dev/null
++++ b/bsd/dev/nord2_mdp_api.h
+@@ -0,0 +1,51 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * nord2_mdp_api.h -- 0671: the MDP blit service between bsd/dev/nord2_mdp.inc (C, owns the hardware) and
++ * iokit/Kernel/arm/sweet_m2scaler.inc (0672, C++, AppleM2ScalerCSCDriver + /dev/redwood-mdp surface blits).
++ * Formats are N2MF_* of nord2_mdp_job.h (1 BGRA, 2 RGBA, 3 NV12, 4 NV21).
++ */
++#ifndef NORD2_MDP_API_H
++#define NORD2_MDP_API_H
++#include <stdint.h>
++#ifdef N2MDP_HOST
++#include <sys/ioctl.h>
++#else
++#include <sys/ioccom.h>
++#endif
++
++#define N2MDP_MAX_PAGES 16384u     /* 64 MiB per image */
++
++struct n2mdp_pimg {
++	uint32_t fmt, w, h;
++	uint32_t pitch[2], off[2];      /* plane byte offsets from the first page */
++	uint8_t  full_range, bt709;
++	uint32_t npages;
++	const uint64_t *pages;          /* physical address of each 4 KiB page, in order */
++};
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++/* capability bits (N2MDP_CAP_*) valid for this boot; 0 = do not use the MDP (stages not passed, killed) */
++uint32_t nord2_mdp_caps(void);
++/* rot: clockwise quarter turns, flip bit0 = horizontal mirror (before rotation).  0 or errno (ENODEV, ENOTSUP, EINVAL, ENOMEM,
++ * ETIMEDOUT, EFAULT); the caller falls back to its own path on any error. */
++int nord2_mdp_blit_pages(const struct n2mdp_pimg *src, const struct n2mdp_pimg *dst, uint32_t rot, uint32_t flip, uint32_t *hw_us);
++/* /dev/redwood-mdp RWMDP_BLIT_SURF goes through this hook, installed by the IOSurface side (0672) */
++typedef int (*nord2_mdp_surface_blit_fn)(uint32_t src_id, uint32_t dst_id, uint32_t rot, uint32_t flip, uint32_t *hw_us);
++void nord2_mdp_set_surface_hook(nord2_mdp_surface_blit_fn fn);
++/* called once from the MDP thread after the stages (caps = nord2_mdp_caps()); installed by 0672 to register AppleM2ScalerCSCDriver */
++typedef void (*nord2_mdp_publish_fn)(uint32_t caps);
++void nord2_mdp_set_publish_hook(nord2_mdp_publish_fn fn);
++#ifdef __cplusplus
++}
++#endif
++
++/* /dev/redwood-mdp ioctls (group 'M') */
++struct rwmdp_info {
++	uint32_t version, stage, caps, s1, s2_pass, s2_fail, s3, jobs, job_fail, timeouts, last_us, max_us, rgb_swap, killed, probe_state, reserved;
++};
++struct rwmdp_blit_surf { uint32_t src_id, dst_id, rot, flip, hw_us, result; };
++#define RWMDP_INFO      _IOR('M', 1, struct rwmdp_info)
++#define RWMDP_BLIT_SURF _IOWR('M', 2, struct rwmdp_blit_surf)
++#endif

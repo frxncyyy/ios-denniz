@@ -1,0 +1,109 @@
+--- a/bsd/dev/nord2_mdp.inc
++++ b/bsd/dev/nord2_mdp.inc
+@@ -20,7 +20,8 @@
+  * 0686: NV12 destinations (WROT 2-plane, vendor chroma offsets / uv table) behind N2MDP_CAP_NV12_DST, 20 us WAIT polling;
+  * 0687: service speed: IOVA mapping cache (8 entries, page-list hash), page-table flush of the touched range only, 5 us WAIT poll
+  * for the first 3 ms, map / run timing for the service log;
+- * 0688: MDP clock (mdp_sel parent, TVDPLL rate) in the probe log, compile timing.
++ * 0688: MDP clock (mdp_sel parent, TVDPLL rate) in the probe log, compile timing;
++ * 0689: per-tile hw times, MDP lock wait, S2 TIMING jobs (rot 0 vs rot 90, tile widths 512..64 px).
+  * (gpu/build/mdp-20261114/MDP_OFFLOAD.md).  Answers "is the MDP powered, clocked and reachable on this phone, and in what
+  * state did the bootloader leave it" before any functional stage (DMA, scaling, rotation) is attempted.
+  *
+@@ -836,6 +837,7 @@
+ }
+ 
+ static uint32_t n2mdp_diag_logged;
++extern uint32_t n2mdp_last_tiles, n2mdp_tile_us[16];   /* 0689: defined with the service timing below */
+ 
+ /* 0674: full pipe dump (RDMA / WROT / mutex / topology / direct-link valid-ready / larb2), read-only except the WROT debug
+  * selector 0x018 (vendor cmdq_mdp_dump_rot does the same).  Used before GO, shortly after GO and on every timeout. */
+@@ -913,6 +915,7 @@
+ n2mdp_run(const struct n2mdp_prog *p, uint32_t *hw_us)
+ {
+ 	uint64_t t0 = 0, busy = 0;
++	n2mdp_last_tiles = 0;
+ 	for (uint32_t i = 0; i < p->n; i++) {
+ 		const struct n2mdp_op *o = &p->ops[i];
+ 		switch (o->op) {
+@@ -951,6 +954,8 @@
+ 				}
+ 			}
+ 			busy += n2mdp_now_us() - t0;
++			if (n2mdp_last_tiles < 16u) { n2mdp_tile_us[n2mdp_last_tiles] = (uint32_t)(n2mdp_now_us() - t0); }   /* 0689: per-tile hw time */
++			n2mdp_last_tiles++;
+ 			if (n2mdp_diag_logged < 3) {
+ 				n2mdp_diag_logged++;
+ 				N2MDP_LOG("NORD2 MDP: tile done after %llu us: mutex EN %#x INTSTA %#x RDMA MON1 %#x ev wrot %u rdma %u\n",
+@@ -1018,6 +1023,14 @@
+ 	{ "nv2nvrot180", N2MF_NV12, N2MF_NV12, 2, 0, 1, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12_DST, 3 },
+ 	{ "nv2nvrot270", N2MF_NV12, N2MF_NV12, 3, 0, 1, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12_DST, 3 },
+ 	{ "nv2nvcam90",  N2MF_NV12, N2MF_NV12, 1, 0, 1, 0,  0, 2, 752, 564, 564, 752, N2MDP_CAP_NV12_DST, 3 },
++	/* 0689: timing jobs (diag 5, logged as S2 TIMING, no capability): 1024x768 NV12 -> NV12 rot 0 vs rot 90 and rot 90 with tile widths
++	 * 512 / 256 / 128 / 64 px -> rotation penalty and whether narrow rotation tiles write DRAM faster (the 1504x1128 camera rotation
++	 * runs at ~0.45 px/clk at 594 MHz) */
++	{ "tim0_512",    N2MF_NV12, N2MF_NV12, 0, 0, 1, 32, 0, 2, 1024, 768, 1024, 768, 0, 5 },
++	{ "tim90_512",   N2MF_NV12, N2MF_NV12, 1, 0, 1, 32, 0, 2, 1024, 768, 768, 1024, 0, 5 },
++	{ "tim90_256",   N2MF_NV12, N2MF_NV12, 1, 0, 1, 16, 0, 2, 1024, 768, 768, 1024, 0, 5 },
++	{ "tim90_128",   N2MF_NV12, N2MF_NV12, 1, 0, 1, 8,  0, 2, 1024, 768, 768, 1024, 0, 5 },
++	{ "tim90_64",    N2MF_NV12, N2MF_NV12, 1, 0, 1, 4,  0, 2, 1024, 768, 768, 1024, 0, 5 },
+ };
+ #define N2MDP_NTESTS (sizeof(n2mdp_tests) / sizeof(n2mdp_tests[0]))
+ 
+@@ -1164,6 +1177,11 @@
+ 			if (r == 0) { n2mx.s2_diag |= 1u << i; }
+ 			if (t->diag == 2) { if (r == 0 && !(rgb_fail)) { rgb_pass++; } else { rgb_fail = 1; } }
+ 			if (t->diag == 3) { if (r == 0 && !nvd_fail) { nvd_pass++; } else { nvd_fail = 1; } }
++			if (t->diag == 5) {   /* 0689: timing job: hw time per tile width / rotation (rotation penalty, tile-width effect) */
++				N2MDP_LOG("NORD2 MDP S2 TIMING %s: %ux%u NV12 -> NV12 rot %u tile %u px: %s hw %u us over %u tiles (%u %u %u %u ...)\n", t->name, t->sw,
++				    t->sh, t->rot, (t->tile16 ? t->tile16 : 32u) * 16u, r == 0 ? "ok" : "FAILED", n2mx.last_us, n2mdp_last_tiles,
++				    n2mdp_tile_us[0], n2mdp_tile_us[1], n2mdp_tile_us[2], n2mdp_tile_us[3]);
++			}
+ 			continue;
+ 		}
+ 		if (r == 0) { pass |= 1u << i; n2mx.caps |= t->cap; }
+@@ -1279,6 +1297,7 @@
+ static struct { uint64_t key; uint32_t n, iova, lru; } n2mdp_mc[N2MDP_MC_N];
+ static uint32_t n2mdp_mc_tick, n2mdp_mc_hits, n2mdp_mc_miss;
+ uint32_t n2mdp_last_map_us, n2mdp_last_run_us, n2mdp_last_compile_us;     /* 0687/0688: read by the service log (C linkage) */
++uint32_t n2mdp_last_lockwait_us, n2mdp_last_tiles, n2mdp_tile_us[16];    /* 0689: wait for the MDP lock (another request running), tiles */
+ static uint64_t
+ n2mdp_mc_key(const uint64_t *pages, uint32_t n)
+ {
+@@ -1476,7 +1495,9 @@
+ 	if (!n2mf_is_yuv(src->fmt) && (ow != src->w || oh != src->h)) { need |= N2MDP_CAP_RGB_SCALE; }   /* 0683 */
+ 	if (n2mf_is_yuv(dst->fmt)) { need |= N2MDP_CAP_NV12_DST; }   /* 0686 */
+ 	if ((caps & need) != need) { return ENOTSUP; }
++	uint64_t tl0 = n2mdp_now_us();
+ 	n2mdp_lock();
++	n2mdp_last_lockwait_us = (uint32_t)(n2mdp_now_us() - tl0);   /* 0689: requests from several client threads are serialised here */
+ 	int err = 0;
+ 	uint64_t tm0 = n2mdp_now_us();
+ 	uint32_t si = n2mdp_mc_get(src->pages, src->npages, 0);           /* 0687: cached IOVA ranges */
+--- a/iokit/Kernel/arm/sweet_m2scaler.inc
++++ b/iokit/Kernel/arm/sweet_m2scaler.inc
+@@ -29,6 +29,8 @@
+ #include <string.h>
+ #include "sweet_m2_req.h"
+ extern "C" uint32_t n2mdp_last_map_us, n2mdp_last_run_us, n2mdp_last_compile_us;   /* 0687/0688: nord2_mdp.inc timing */
++extern "C" uint32_t n2mdp_last_lockwait_us, n2mdp_last_tiles, n2mdp_tile_us[16];   /* 0689 */
++static uint64_t sweet_m2_sum_wait;
+ static uint32_t sweet_m2_pages_us, sweet_m2_sc_hits, sweet_m2_sc_miss;      /* 0688 */
+ static uint32_t sweet_m2_cache_us;                          /* 0687: CPU cache maintenance of the current request */   /* 0685: request decoder (host-tested with the q10jmdp14 mediaserverd requests) */
+ 
+@@ -328,11 +330,13 @@
+ 	if (sweet_m2_last_sfmt == SWEET_M2_FMT_420V || sweet_m2_last_sfmt == SWEET_M2_FMT_420F) { sweet_m2_cls_yuv++; }
+ 	if (sweet_m2_dumps < 16) { sweet_m2_dump(p, n, "accepted"); }
+ 	uint32_t src = q.src, dst = q.dst, rot = q.rot, flip = q.flip;
++	sweet_m2_sum_wait += n2mdp_last_lockwait_us;
+ 	sweet_m2_sum_tot += tot_us; sweet_m2_sum_hw += us; sweet_m2_sum_map += n2mdp_last_map_us; sweet_m2_sum_cache += sweet_m2_cache_us;   /* 0686: timing (hw = MDP busy, total = whole request incl. page lists, IOVA map, cache maintenance) */
+ 	sweet_m2_ok++;
+ 	if (sweet_m2_ok <= 4 || (sweet_m2_ok & 255u) == 0) {
+-		IOLog("NORD2 M2: timing pages %u compile %u (surface cache hit %u miss %u, iova cache in map)\n", sweet_m2_pages_us, n2mdp_last_compile_us,
+-		    sweet_m2_sc_hits, sweet_m2_sc_miss);
++		IOLog("NORD2 M2: timing pages %u compile %u lockwait %u (avg %u) | %ux%u -> %ux%u tiles %u: %u %u %u %u us (surface cache hit %u miss %u)\n",
++		    sweet_m2_pages_us, n2mdp_last_compile_us, n2mdp_last_lockwait_us, (uint32_t)(sweet_m2_sum_wait / sweet_m2_ok), q.sw ? q.sw : 0u, q.sh,
++		    q.dw, q.dh, n2mdp_last_tiles, n2mdp_tile_us[0], n2mdp_tile_us[1], n2mdp_tile_us[2], n2mdp_tile_us[3], sweet_m2_sc_hits, sweet_m2_sc_miss);
+ 		IOLog("NORD2 M2: transform %u -> %u (%08x -> %08x) rot %u flip %u done: hw %u map %u cache %u total %u us (ok %u, avg hw %u map %u "
+ 		    "cache %u total %u)\n", src, dst, sweet_m2_last_sfmt, sweet_m2_last_dfmt, rot, flip, us, n2mdp_last_map_us, sweet_m2_cache_us, tot_us,
+ 		    sweet_m2_ok, (uint32_t)(sweet_m2_sum_hw / sweet_m2_ok), (uint32_t)(sweet_m2_sum_map / sweet_m2_ok), (uint32_t)(sweet_m2_sum_cache / sweet_m2_ok),

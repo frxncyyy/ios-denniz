@@ -1,0 +1,334 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1022,6 +1022,7 @@
+ #include "nord2_jpegdev.inc"   /* 0310: /dev/redwood-jpeg (K01) */
+ #include "nord2_gnss_bind.inc"   /* 0580: GNSS /dev/gpsdl0,1 (0350..0364 line) + its Wi-Fi/conninfra binding */
+ #include "nord2_vcodec_at.inc"   /* 0311: VENC bring-up steps, autotest command 8 */
++#include "nord2_mdp.inc"   /* 0670: MDP (mdpsys 0x1f000000) probe, stage 0 of the MDP offload plan */
+ #include "nord2_autotest.inc"   /* 0296: synthetic touches/keys and panel pictures over the USB console */
+ /*
+  * 0496 (bright-fix-20261114): the torch.  /dev/redwood-torch did not exist, so the camera's TorchLevel writes ("the flashlight at N
+@@ -1407,6 +1408,7 @@
+ 	nord2_gpsdl_start();   /* 0580: /dev/gpsdl0,1 (no register access here; kill switch sysctl kern.n2gnss bit 0) */
+ 	nord2_torch_start();    /* 0496: /dev/redwood-torch */
+ 	nord2_haptic_start();   /* 0610: /dev/redwood-haptic */
++	nord2_mdp_start();   /* 0670: MDP probe thread (read-only at +45 s by default; kern.n2mdp_probe) */
+ }
+ #else /* original Sweet hardware */
+ /*
+--- a/bsd/dev/nord2_mdp.inc
++++ b/bsd/dev/nord2_mdp.inc
+@@ -0,0 +1,313 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * nord2_mdp.inc -- 0670: MT6893 MDP (Media Data Path, mdpsys 0x1f000000) probe = stage 0 of the MDP offload plan
++ * (gpu/build/mdp-20261114/MDP_OFFLOAD.md).  Answers "is the MDP powered, clocked and reachable on this phone, and in what
++ * state did the bootloader leave it" before any functional stage (DMA, scaling, rotation) is attempted.
++ *
++ * Included once by bsd/dev/sweet_touch.c after nord2_vcodec_at.inc (uses ni_rd/ni_wr only).  Own thread, own mappings
++ * (ml_io_map_unmappable: no io_submap page), never touches the PMIC/pwrap bus, the display, the codec blocks or any power
++ * domain.  Sources of every number: nord2-current-kernel drivers/misc/mediatek/mdp/mt6893/{mdp_base.h,mdp.c},
++ * drivers/clk/mediatek/{clk-mt6885-mdp.c,clk-mt6885-pg.c,clk-mt6885.c}, drivers/mailbox/mtk-cmdq-mailbox.c,
++ * include/dt-bindings/memory/mt6885-larb-port.h, ios-sweet/dtb/nord2/live.dts (path:line in MDP_OFFLOAD.md section 2).
++ *
++ * Levels (kern.n2mdp_probe, written by a payload or 0 at boot; the boot probe runs at +45 s with N2MDP_BOOT_LEVEL):
++ *   1 = READ-ONLY.  SPM power status, infracfg bus protection, topckgen mdp_sel, infracfg GCE clock gates.  Only if the MDP
++ *       domain is on (PWR_STATUS and _2ND bit 19), its bus protection released and mdp_sel ungated: mdpsys CG_CON0..2 and the
++ *       topology (MOUT/SEL) registers; then the registers of every engine whose own clock gate is open (RDMA0-3, RSZ0-3,
++ *       WROT0-3, mutex), larb2/larb3 port MMU bits and M4U1 only if the MDP SMI clocks are open.  GCE-D/GCE-M thread
++ *       state only if their infracfg gate is open.  No register is written.
++ *   2 = level 1, then opens (CG_CLR) the clocks RDMA0, RSZ0, WROT0, MUTEX0, APB bus and the MDP SMI clocks (0x1112 =
++ *       exactly what Linux writes at MDP power-on, clk-mt6885-pg.c:1147-1149) that were closed, reads the same engine
++ *       registers again, and closes (CG_SET) exactly the gates it opened.  Writes only mdpsys CG_SET/CG_CLR registers.
++ *       Never enables an engine, never starts a DMA, never writes a larb / M4U / GCE / SPM / infracfg register.
++ * Log: "NORD2 MDP: ..." lines and a final "NORD2 MDP VERDICT: power=.. prot=.. mdp_sel=.. apb=.. smi=.. engines_open=..
++ *       rdma0_en=.. wrot0_en=.. larb2_mmu=.. m4u1_pt=.. gced_thr=.. gcem_thr=.. lvl=..".  kern.n2mdp_state = verdict bits.
++ * Kill switch: kern.n2mdp_probe = -1 before +45 s (payload) or build without 0670 (nothing else depends on it).
++ * Host test: gpu/build/mdp-20261114/test/t_mdp_probe.c (register model; fails on any MDP read while the domain is off,
++ * protected or its mux gated, on any engine read with its gate closed, on any write at level 1, and on a gate left open).
++ */
++#ifndef N2MDP_BOOT_LEVEL
++#define N2MDP_BOOT_LEVEL 2   /* q10jmdp1 variant: level 2 (open/close engine clock gates) at +45 s */
++#endif
++
++#define N2MDP_SPM_PA     0x10006000u
++#define N2MDP_TOP_PA     0x10000000u
++#define N2MDP_INFRA_PA   0x10001000u
++#define N2MDP_SYS_PA     0x1f000000u     /* mdpsys_config; the window covers mutex .. M4U1 .. COLOR1 (0x1f02d000) */
++#define N2MDP_SYS_BYTES  0x2e000u
++#define N2MDP_GCED_PA    0x10228000u     /* gce_mbox (display GCE), live.dts:4650 */
++#define N2MDP_GCEM_PA    0x10318000u     /* gce_mbox_m (MDP GCE), live.dts:5132 */
++
++/* SPM (clk-mt6885-pg.c:167-190) */
++#define N2MDP_PWR_STA    0x16cu
++#define N2MDP_PWR_STA2   0x170u
++#define N2MDP_MDP_CON    0x34cu
++#define N2MDP_DIS_CON    0x350u
++#define N2MDP_MDP_BIT    (1u << 19)
++#define N2MDP_DIS_BIT    (1u << 20)
++/* topckgen CLK_CFG_1: mdp_sel bits 11:8, gate bit 15 (clk-mt6885.c; same constant as nord2_vcodec.inc N2VC_MDP_GATE) */
++#define N2MDP_CFG1       0x020u
++#define N2MDP_MDPSEL_GATE (1u << 15)
++/* infracfg_ao bus protection status (clk-mt6885-pg.c:211,229,241) and the MDP masks (pg.c:411-460) */
++#define N2MDP_PROT_STA1  0x228u
++#define N2MDP_PROT_MM    0x2ecu
++#define N2MDP_PROT_MM2   0xdd8u
++#define N2MDP_P_STA1     ((1u << 10) | (1u << 23))
++#define N2MDP_P_MM       ((1u << 2) | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 6) | (1u << 7) | (1u << 8) | (1u << 9) | \
++                          (1u << 18) | (1u << 19) | (1u << 22) | (1u << 23) | (1u << 28) | (1u << 29) | (1u << 30) | (1u << 31))
++#define N2MDP_P_MM2      ((1u << 0) | (1u << 1) | (1u << 2) | (1u << 4) | (1u << 6) | (1u << 7) | (1u << 8) | (1u << 9) | (1u << 11))
++/* infracfg_ao IFRAO0 gates (clk-mt6885.c:2109-2113, 2245-2247, 2279): status 0x90, 1 = gated */
++#define N2MDP_IFRAO0_STA 0x090u
++#define N2MDP_IFR_GCE    (1u << 8)
++#define N2MDP_IFR_GCE2   (1u << 9)
++/* mdpsys (mdp.c:830-960, clk-mt6885-mdp.c:26-190): CG_CONn status (1 = gated), +4 SET (gate), +8 CLR (open) */
++#define N2MDP_CG0        0x100u
++#define N2MDP_CG1        0x110u
++#define N2MDP_CG2        0x120u
++#define N2MDP_CG0_APB    (1u << 31)
++#define N2MDP_CG0_MUTEX0 (1u << 15)
++#define N2MDP_CG1_SMI    0x1112u         /* APMCU_GALS bit 1, SMI0 4, SMI1 8, SMI2 12 (GATE_DUMMY in Linux) */
++#define N2MDP_OFF_MUTEX  0x1000u
++#define N2MDP_OFF_SMI    0x2000u
++#define N2MDP_OFF_LARB2  0x3000u
++#define N2MDP_OFF_LARB3  0x4000u
++#define N2MDP_OFF_M4U1   0x27000u
++#define N2MDP_LARB_PORTS 6u              /* mt6885-larb-port.h:54-67: L2 RDMA0,RDMA2,WROT0,WROT2,FG0,FAKE0; L3 RDMA1,3,WROT1,3,FG1,FAKE1 */
++
++struct n2mdp_eng { const char *name; uint32_t off; uint8_t cg; uint8_t kind; };
++enum { N2MDP_K_RDMA = 0, N2MDP_K_RSZ = 1, N2MDP_K_WROT = 2 };
++/* mdp_base.h (mt6893): bases; clk-mt6885-mdp.c: CG_CON0 bit of each engine */
++static const struct n2mdp_eng n2mdp_engs[12] = {
++	{ "RDMA0", 0x06000u, 0,  N2MDP_K_RDMA }, { "RDMA1", 0x07000u, 16, N2MDP_K_RDMA },
++	{ "RDMA2", 0x08000u, 8,  N2MDP_K_RDMA }, { "RDMA3", 0x09000u, 24, N2MDP_K_RDMA },
++	{ "RSZ0",  0x12000u, 4,  N2MDP_K_RSZ },  { "RSZ1",  0x13000u, 20, N2MDP_K_RSZ },
++	{ "RSZ2",  0x14000u, 10, N2MDP_K_RSZ },  { "RSZ3",  0x15000u, 26, N2MDP_K_RSZ },
++	{ "WROT0", 0x16000u, 7,  N2MDP_K_WROT }, { "WROT1", 0x17000u, 23, N2MDP_K_WROT },
++	{ "WROT2", 0x18000u, 14, N2MDP_K_WROT }, { "WROT3", 0x19000u, 30, N2MDP_K_WROT },
++};
++/* read-only registers per kind (mdp_common.c cmdq_mdp_dump_rdma/rot, mt6893/mdp.c cmdq_mdp_dump_rsz):
++ * RDMA 0x000 EN, 0x008 RESET, 0x030 SRC_CON, 0x060 MF_SRC_SIZE, 0x400 MON_STA_0, 0x408 MON_STA_1, 0xf00 SRC_BASE_0
++ * RSZ  0x000 ENABLE, 0x004 CONTROL_1, 0x008 CONTROL_2, 0x010 INPUT_IMAGE, 0x014 OUTPUT_IMAGE
++ * WROT 0x000 VIDO_CTRL, 0x004 MAIN_BUF_SIZE, 0x008 SOFT_RST, 0x00c SOFT_RST_STAT, 0x024 IN_SIZE, 0xf00 BASE_ADDR */
++static const uint16_t n2mdp_regs[3][7] = {
++	{ 0x000, 0x008, 0x030, 0x060, 0x400, 0x408, 0xf00 },
++	{ 0x000, 0x004, 0x008, 0x010, 0x014, 0xffff, 0xffff },
++	{ 0x000, 0x004, 0x008, 0x00c, 0x024, 0xf00, 0xffff },
++};
++/* topology (mdp.c:870-930): RDMA0..3 MOUT_EN, RSZ0..3 SEL_IN, WROT0..3 SEL_IN, MOUT masks */
++static const uint16_t n2mdp_topo[] = { 0xf20, 0xf24, 0xf28, 0xf2c, 0xf60, 0xf64, 0xf68, 0xf6c, 0xf70, 0xf74, 0xf78, 0xf7c,
++	0xfd0, 0xfd4, 0xfd8, 0x0f0 };
++
++#ifdef N2MDP_HOST
++extern vm_offset_t n2mdp_host_map(uint32_t pa, uint32_t bytes);
++#define n2mdp_map(pa, bytes) n2mdp_host_map((pa), (bytes))
++#define N2MDP_LOG printf
++#else
++#define n2mdp_map(pa, bytes) ml_io_map_unmappable((pa), (bytes), VM_WIMG_IO)
++#define N2MDP_LOG printf
++#endif
++
++static struct {
++	vm_offset_t spm, top, infra, sys, gced, gcem;
++	uint32_t state;              /* kern.n2mdp_state: verdict bits (see n2mdp_probe) */
++	uint32_t runs;
++} n2mdp;
++static int n2mdp_req;            /* kern.n2mdp_probe: 1 / 2 = run that level once; -1 = never (kill); cleared after a run */
++static int n2mdp_boot_level = N2MDP_BOOT_LEVEL;
++
++static bool
++n2mdp_maps(void)
++{
++	if (!n2mdp.spm) { n2mdp.spm = n2mdp_map(N2MDP_SPM_PA, 0x1000); }
++	if (!n2mdp.top) { n2mdp.top = n2mdp_map(N2MDP_TOP_PA, 0x1000); }
++	if (!n2mdp.infra) { n2mdp.infra = n2mdp_map(N2MDP_INFRA_PA, 0x1000); }
++	if (!n2mdp.sys) { n2mdp.sys = n2mdp_map(N2MDP_SYS_PA, N2MDP_SYS_BYTES); }
++	if (!n2mdp.gced) { n2mdp.gced = n2mdp_map(N2MDP_GCED_PA, 0x1000); }
++	if (!n2mdp.gcem) { n2mdp.gcem = n2mdp_map(N2MDP_GCEM_PA, 0x1000); }
++	return n2mdp.spm && n2mdp.top && n2mdp.infra && n2mdp.sys && n2mdp.gced && n2mdp.gcem;
++}
++
++/* engine registers, only for engines whose own gate (cg0 bit) is open; returns how many engines were read */
++static unsigned
++n2mdp_engines(uint32_t cg0, const char *when, uint32_t *rdma0_en, uint32_t *wrot0_en)
++{
++	unsigned n = 0;
++	for (unsigned i = 0; i < 12; i++) {
++		const struct n2mdp_eng *e = &n2mdp_engs[i];
++		if (cg0 & (1u << e->cg)) { continue; }
++		uint32_t v[7] = { 0 };
++		for (unsigned r = 0; r < 7; r++) {
++			if (n2mdp_regs[e->kind][r] != 0xffff) { v[r] = ni_rd(n2mdp.sys, e->off + n2mdp_regs[e->kind][r]); }
++		}
++		if (i == 0) { *rdma0_en = v[0]; }
++		if (i == 8) { *wrot0_en = v[0]; }
++		N2MDP_LOG("NORD2 MDP: %s %s regs %#x %#x %#x %#x %#x %#x %#x\n", when, e->name, v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
++		n++;
++	}
++	return n;
++}
++
++/* larb2/larb3 port MMU bits and M4U1 (only with the MDP SMI clocks open); returns larb2 port bit0 mask */
++static uint32_t
++n2mdp_smi(const char *when, uint32_t *m4u_pt)
++{
++	uint32_t l2 = 0, l3 = 0;
++	for (unsigned p = 0; p < N2MDP_LARB_PORTS; p++) {
++		uint32_t a = ni_rd(n2mdp.sys, N2MDP_OFF_LARB2 + 0x380u + 4u * p);
++		uint32_t b = ni_rd(n2mdp.sys, N2MDP_OFF_LARB3 + 0x380u + 4u * p);
++		if (a & 1u) { l2 |= 1u << p; }
++		if (b & 1u) { l3 |= 1u << p; }
++		if (p == 0) { N2MDP_LOG("NORD2 MDP: %s larb2 p0 %#x larb3 p0 %#x (NON_SEC_CON: bit0 MMU_EN, 15:8 address bits 32+)\n", when, a, b); }
++	}
++	*m4u_pt = ni_rd(n2mdp.sys, N2MDP_OFF_M4U1 + 0x000u);
++	N2MDP_LOG("NORD2 MDP: %s larb2 MMU_EN ports %#x larb3 %#x | M4U1 PT_BASE %#x CTRL %#x INT_CTRL0 %#x INT_MAIN %#x FAULT_ST1 %#x"
++	    " | smi_common 0x0 %#x larb2 STAT %#x\n", when, l2, l3, *m4u_pt, ni_rd(n2mdp.sys, N2MDP_OFF_M4U1 + 0x110u),
++	    ni_rd(n2mdp.sys, N2MDP_OFF_M4U1 + 0x120u), ni_rd(n2mdp.sys, N2MDP_OFF_M4U1 + 0x124u),
++	    ni_rd(n2mdp.sys, N2MDP_OFF_M4U1 + 0x134u), ni_rd(n2mdp.sys, N2MDP_OFF_SMI + 0x0u), ni_rd(n2mdp.sys, N2MDP_OFF_LARB2 + 0x0u));
++	return l2;
++}
++
++/* GCE thread table (mtk-cmdq-mailbox.c:32-61): which of the 24 threads are enabled (someone else's GCE use) */
++static uint32_t
++n2mdp_gce(vm_offset_t g, const char *name)
++{
++	uint32_t en = 0;
++	for (unsigned t = 0; t < 24; t++) {
++		if (ni_rd(g, 0x100u + 0x80u * t + 0x04u) & 1u) { en |= 1u << t; }
++	}
++	N2MDP_LOG("NORD2 MDP: %s IRQ_STATUS %#x LOADED_THR %#x enabled threads %#x\n", name, ni_rd(g, 0x10u), ni_rd(g, 0x18u), en);
++	return en;
++}
++
++/* state bits */
++#define N2MDP_S_RAN      (1u << 0)
++#define N2MDP_S_POWER    (1u << 1)
++#define N2MDP_S_PROT     (1u << 2)      /* bus protection still set (bad) */
++#define N2MDP_S_MUXGATE  (1u << 3)      /* mdp_sel gated (bad) */
++#define N2MDP_S_APB      (1u << 4)      /* APB bus clock open */
++#define N2MDP_S_SMI      (1u << 5)      /* MDP SMI clocks all open */
++#define N2MDP_S_ENGREAD  (1u << 6)      /* at least one engine read */
++#define N2MDP_S_LVL2     (1u << 7)      /* level 2 ran (gates opened and closed again) */
++#define N2MDP_S_RESTORED (1u << 8)      /* level 2: CG state after == before */
++#define N2MDP_S_GCEM_ON  (1u << 9)
++#define N2MDP_S_GCED_ON  (1u << 10)
++#define N2MDP_S_NOMAP    (1u << 15)
++
++static uint32_t
++n2mdp_probe(int level)
++{
++	uint32_t st = N2MDP_S_RAN;
++	if (!n2mdp_maps()) { N2MDP_LOG("NORD2 MDP: mapping failed\n"); return st | N2MDP_S_NOMAP; }
++	uint32_t s0 = ni_rd(n2mdp.spm, N2MDP_PWR_STA), s1 = ni_rd(n2mdp.spm, N2MDP_PWR_STA2);
++	uint32_t p1 = ni_rd(n2mdp.infra, N2MDP_PROT_STA1), pm = ni_rd(n2mdp.infra, N2MDP_PROT_MM), pm2 = ni_rd(n2mdp.infra, N2MDP_PROT_MM2);
++	uint32_t cfg1 = ni_rd(n2mdp.top, N2MDP_CFG1), ifr = ni_rd(n2mdp.infra, N2MDP_IFRAO0_STA);
++	bool power = (s0 & s1 & N2MDP_MDP_BIT) != 0;
++	bool prot = (p1 & N2MDP_P_STA1) || (pm & N2MDP_P_MM) || (pm2 & N2MDP_P_MM2);
++	bool mux = (cfg1 & N2MDP_MDPSEL_GATE) != 0;
++	N2MDP_LOG("NORD2 MDP: level %d run %u | spm status %#x/%#x MDP_PWR_CON %#x DIS_PWR_CON %#x (MDP %s, DIS %s) | prot sta1 %#x mm %#x"
++	    " mm2 %#x (MDP bits %s) | CLK_CFG_1 %#x (mdp_sel parent %u, %s) | IFRAO0 %#x (GCE %s, GCE2 %s)\n", level, n2mdp.runs, s0, s1,
++	    ni_rd(n2mdp.spm, N2MDP_MDP_CON), ni_rd(n2mdp.spm, N2MDP_DIS_CON), power ? "on" : "OFF", (s0 & s1 & N2MDP_DIS_BIT) ? "on" : "OFF",
++	    p1, pm, pm2, prot ? "SET" : "clear", cfg1, (cfg1 >> 8) & 0xfu, mux ? "GATED" : "running", ifr,
++	    (ifr & N2MDP_IFR_GCE) ? "gated" : "open", (ifr & N2MDP_IFR_GCE2) ? "gated" : "open");
++	if (power) { st |= N2MDP_S_POWER; }
++	if (prot) { st |= N2MDP_S_PROT; }
++	if (mux) { st |= N2MDP_S_MUXGATE; }
++	uint32_t gced = 0, gcem = 0;
++	if (!(ifr & N2MDP_IFR_GCE)) { gced = n2mdp_gce(n2mdp.gced, "GCE-D 0x10228000"); st |= N2MDP_S_GCED_ON; }
++	if (!(ifr & N2MDP_IFR_GCE2)) { gcem = n2mdp_gce(n2mdp.gcem, "GCE-M 0x10318000"); st |= N2MDP_S_GCEM_ON; }
++	uint32_t cg0 = 0xffffffffu, cg1 = 0xffffffffu, cg2 = 0xffffffffu, rdma0_en = 0, wrot0_en = 0, l2mmu = 0, m4u_pt = 0;
++	unsigned nread = 0;
++	if (power && !prot && !mux) {
++		cg0 = ni_rd(n2mdp.sys, N2MDP_CG0); cg1 = ni_rd(n2mdp.sys, N2MDP_CG1); cg2 = ni_rd(n2mdp.sys, N2MDP_CG2);
++		N2MDP_LOG("NORD2 MDP: mdpsys CG_CON0 %#x CG_CON1 %#x CG_CON2 %#x (1 = gated; APB %s, MUTEX0 %s, SMI clocks %s)\n", cg0, cg1, cg2,
++		    (cg0 & N2MDP_CG0_APB) ? "gated" : "open", (cg0 & N2MDP_CG0_MUTEX0) ? "gated" : "open",
++		    (cg1 & N2MDP_CG1_SMI) ? "some gated" : "open");
++		uint32_t t[sizeof(n2mdp_topo) / sizeof(n2mdp_topo[0])];
++		for (unsigned i = 0; i < sizeof(n2mdp_topo) / sizeof(n2mdp_topo[0]); i++) { t[i] = ni_rd(n2mdp.sys, n2mdp_topo[i]); }
++		N2MDP_LOG("NORD2 MDP: topology RDMA0-3 MOUT %#x %#x %#x %#x RSZ0-3 SEL %#x %#x %#x %#x WROT0-3 SEL %#x %#x %#x %#x"
++		    " MOUT_MASK %#x %#x %#x MISC %#x\n", t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11], t[12],
++		    t[13], t[14], t[15]);
++		if (!(cg0 & N2MDP_CG0_APB)) {
++			st |= N2MDP_S_APB;
++			if (!(cg0 & N2MDP_CG0_MUTEX0)) {
++				N2MDP_LOG("NORD2 MDP: mutex INTEN %#x INTSTA %#x MUTEX0 EN %#x MOD0 %#x MOD1 %#x\n", ni_rd(n2mdp.sys, N2MDP_OFF_MUTEX + 0x0u),
++				    ni_rd(n2mdp.sys, N2MDP_OFF_MUTEX + 0x4u), ni_rd(n2mdp.sys, N2MDP_OFF_MUTEX + 0x20u),
++				    ni_rd(n2mdp.sys, N2MDP_OFF_MUTEX + 0x30u), ni_rd(n2mdp.sys, N2MDP_OFF_MUTEX + 0x34u));
++			}
++			nread = n2mdp_engines(cg0, "as found", &rdma0_en, &wrot0_en);
++			if (!(cg1 & N2MDP_CG1_SMI)) { st |= N2MDP_S_SMI; l2mmu = n2mdp_smi("as found", &m4u_pt); }
++		}
++		if (nread) { st |= N2MDP_S_ENGREAD; }
++		if (level >= 2) {
++			uint32_t open0 = cg0 & (N2MDP_CG0_APB | N2MDP_CG0_MUTEX0 | (1u << 0) | (1u << 4) | (1u << 7));
++			uint32_t open1 = cg1 & N2MDP_CG1_SMI;
++			if (open1) { ni_wr(n2mdp.sys, N2MDP_CG1 + 8u, open1); }
++			if (open0) { ni_wr(n2mdp.sys, N2MDP_CG0 + 8u, open0); }
++			uint32_t c0 = ni_rd(n2mdp.sys, N2MDP_CG0), c1 = ni_rd(n2mdp.sys, N2MDP_CG1);
++			N2MDP_LOG("NORD2 MDP: level 2 opened CG0 %#x CG1 %#x -> CG_CON0 %#x CG_CON1 %#x\n", open0, open1, c0, c1);
++			if (!(c0 & N2MDP_CG0_APB)) {
++				if (!(c0 & N2MDP_CG0_MUTEX0)) {
++					N2MDP_LOG("NORD2 MDP: opened: mutex INTEN %#x INTSTA %#x MUTEX0 EN %#x MOD0 %#x\n", ni_rd(n2mdp.sys, N2MDP_OFF_MUTEX + 0x0u),
++					    ni_rd(n2mdp.sys, N2MDP_OFF_MUTEX + 0x4u), ni_rd(n2mdp.sys, N2MDP_OFF_MUTEX + 0x20u),
++					    ni_rd(n2mdp.sys, N2MDP_OFF_MUTEX + 0x30u));
++				}
++				nread += n2mdp_engines(c0, "opened", &rdma0_en, &wrot0_en);
++				if (!(c1 & N2MDP_CG1_SMI)) { l2mmu = n2mdp_smi("opened", &m4u_pt); }
++			}
++			if (open0) { ni_wr(n2mdp.sys, N2MDP_CG0 + 4u, open0); }
++			if (open1) { ni_wr(n2mdp.sys, N2MDP_CG1 + 4u, open1); }
++			uint32_t a0 = ni_rd(n2mdp.sys, N2MDP_CG0), a1 = ni_rd(n2mdp.sys, N2MDP_CG1);
++			st |= N2MDP_S_LVL2;
++			if (a0 == cg0 && a1 == cg1) { st |= N2MDP_S_RESTORED; }
++			if (nread) { st |= N2MDP_S_ENGREAD; }
++			N2MDP_LOG("NORD2 MDP: level 2 closed again: CG_CON0 %#x CG_CON1 %#x (%s)\n", a0, a1,
++			    (a0 == cg0 && a1 == cg1) ? "same as found" : "DIFFERENT from found");
++		}
++	} else {
++		N2MDP_LOG("NORD2 MDP: mdpsys not read (%s%s%s)\n", power ? "" : "domain off ", prot ? "bus protection set " : "",
++		    mux ? "mdp_sel gated" : "");
++	}
++	N2MDP_LOG("NORD2 MDP VERDICT: power=%d prot=%d mdp_sel=%s apb=%s smi=%s cg0=%#x cg1=%#x engines_read=%u rdma0_en=%#x wrot0_en=%#x"
++	    " larb2_mmu=%#x m4u1_pt=%#x gced_thr=%#x gcem_thr=%#x lvl=%d state=%#x\n", power, prot, mux ? "gated" : "on",
++	    (st & N2MDP_S_APB) ? "open" : "closed", (st & N2MDP_S_SMI) ? "open" : "closed", cg0, cg1, nread, rdma0_en, wrot0_en,
++	    l2mmu, m4u_pt, gced, gcem, level, st);
++	return st;
++}
++
++#ifndef N2MDP_HOST
++SYSCTL_INT(_kern, OID_AUTO, n2mdp_probe, CTLFLAG_RW | CTLFLAG_LOCKED, &n2mdp_req, 0,
++    "0670: run the MDP probe once (1 read-only, 2 + open/close engine clock gates); -1 = never (also cancels the boot probe)");
++SYSCTL_INT(_kern, OID_AUTO, n2mdp_boot, CTLFLAG_RW | CTLFLAG_LOCKED, &n2mdp_boot_level, 0,
++    "0670: level of the automatic probe at +45 s (0 = none)");
++SYSCTL_UINT(_kern, OID_AUTO, n2mdp_state, CTLFLAG_RD | CTLFLAG_LOCKED, &n2mdp.state, 0, "0670: verdict bits of the last probe");
++
++static int n2mdp_chan;
++
++static void
++n2mdp_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	for (unsigned t = 1;; t++) {
++		uint64_t deadline;
++		clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&n2mdp_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++		if (n2mdp_req < 0) { continue; }
++		int level = 0;
++		if (n2mdp_req == 1 || n2mdp_req == 2) { level = n2mdp_req; n2mdp_req = 0; }
++		else if (t == 45 && n2mdp_boot_level > 0) { level = n2mdp_boot_level > 2 ? 2 : n2mdp_boot_level; }
++		else if (t == 180 && n2mdp_boot_level > 0) { level = 1; }   /* second read-only look after the UI / camera / codecs ran */
++		if (level) { n2mdp.runs++; n2mdp.state = n2mdp_probe(level); }
++	}
++}
++
++static void
++nord2_mdp_start(void)
++{
++	thread_t thread;
++	if (kernel_thread_start(n2mdp_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("NORD2 MDP: probe thread on (boot probe level %d at +45 s, read-only again at +180 s; kern.n2mdp_probe)\n",
++		    n2mdp_boot_level);
++	}
++}
++#endif /* !N2MDP_HOST */

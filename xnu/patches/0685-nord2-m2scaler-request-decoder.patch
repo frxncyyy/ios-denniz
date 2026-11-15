@@ -1,0 +1,222 @@
+--- a/iokit/Kernel/arm/sweet_m2scaler.inc
++++ b/iokit/Kernel/arm/sweet_m2scaler.inc
+@@ -27,6 +27,7 @@
+ #include <kern/clock.h>          /* 0684: absolutetime_to_nanoseconds */
+ #include <mach/clock_types.h>    /* NSEC_PER_SEC */
+ #include <string.h>
++#include "sweet_m2_req.h"   /* 0685: request decoder (host-tested with the q10jmdp14 mediaserverd requests) */
+ 
+ static int      sweet_m2_svc = 1;     /* 0684: ON for the controlled run image (q10jmdp14); registered only after S3 passed in this boot */
+ /* 0684 safety: after SWEET_M2_MAX_FAILED failed/faulted MDP transforms, or SWEET_M2_MAX_REFUSED refusals with no success, the service
+@@ -102,20 +103,54 @@
+ 	bzero(r, sizeof(*r));
+ }
+ 
++/* 0685: apply a request rectangle to a resolved image (integer pixels; NV12 needs even values); 0 or 1300 */
+ static int
+-sweet_m2_blit_ids(uint32_t src_id, uint32_t dst_id, uint32_t rot, uint32_t flip, uint32_t *hw_us)
++sweet_m2_crop(struct n2mdp_pimg *im, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
++{
++	if (w == 0) { return 0; }                                            /* whole surface */
++	if ((uint64_t)x + w > im->w || (uint64_t)y + h > im->h || w < 2u || h < 2u) { return 1300; }
++	if (im->fmt == 3u) {
++		if ((x | y | w | h) & 1u) { return 1301; }
++		im->off[0] += y * im->pitch[0] + x; im->off[1] += (y / 2u) * im->pitch[1] + x;
++	} else {
++		im->off[0] += y * im->pitch[0] + x * 4u;
++	}
++	im->w = w; im->h = h;
++	return 0;
++}
++static uint32_t sweet_m2_last_sfmt, sweet_m2_last_dfmt;   /* 0685: fourcc of the last surfaces seen (refusal log) */
++static int
++sweet_m2_blit_rect(const struct sweet_m2_req *q, uint32_t *hw_us)
+ {
+ 	struct sweet_m2_ref a, b;
+-	int e = sweet_m2_get(src_id, &a);
+-	int f = e ? 0 : sweet_m2_get(dst_id, &b);
++	int e = sweet_m2_get(q->src, &a);
++	if (a.s) { sweet_m2_last_sfmt = a.s->pixelFormat; }
++	int f = e ? 0 : sweet_m2_get(q->dst, &b);
++	if (!e && b.s) { sweet_m2_last_dfmt = b.s->pixelFormat; }
+ 	int err;
+ 	if (e || f) { err = 1000 + (e ? e : 100 + f); }
+ 	else if (b.img.fmt != 1u && b.img.fmt != 2u) { err = 1200; }     /* RGB destinations only */
+-	else { err = nord2_mdp_blit_pages(&a.img, &b.img, rot, flip, hw_us); }
++	else if ((err = sweet_m2_crop(&a.img, q->sx, q->sy, q->sw, q->sh)) != 0) { }
++	else if ((err = sweet_m2_crop(&b.img, q->dx, q->dy, q->dw, q->dh)) != 0) { err += 10; }
++	else { err = nord2_mdp_blit_pages(&a.img, &b.img, q->rot, q->flip, hw_us); }
+ 	if (!e) { sweet_m2_put(&a, false); }
+ 	if (!e && !f) { sweet_m2_put(&b, err == 0); }
+ 	return err;
+ }
++static int
++sweet_m2_blit_ids(uint32_t src_id, uint32_t dst_id, uint32_t rot, uint32_t flip, uint32_t *hw_us)
++{
++	struct sweet_m2_req q;
++	bzero(&q, sizeof(q));
++	q.src = src_id; q.dst = dst_id; q.rot = rot; q.flip = flip;
++	return sweet_m2_blit_rect(&q, hw_us);
++}
++/* 0685: refusal / acceptance histogram for the stats line */
++enum { SWEET_M2_H_SURF = SWEET_M2_R_N, SWEET_M2_H_SFMT, SWEET_M2_H_DFMT, SWEET_M2_H_CROP, SWEET_M2_H_MDPNO, SWEET_M2_H_FAIL, SWEET_M2_H_N };
++static const char *const sweet_m2_hname[SWEET_M2_H_N] = { "ok", "short", "async", "flags", "transform", "fract", "options", "rect",
++	"surface", "srcfmt", "dstfmt", "crop", "mdp-unsupported", "mdp-failed" };
++static uint32_t sweet_m2_hist[SWEET_M2_H_N];
++static uint32_t sweet_m2_cls_rot[4], sweet_m2_cls_scaled, sweet_m2_cls_yuv;
+ 
+ class AppleM2ScalerCSCDriver : public IOService {
+ 	OSDeclareDefaultStructors(AppleM2ScalerCSCDriver);
+@@ -196,6 +231,13 @@
+ 			sweet_m2_last_stats = now;
+ 			IOLog("NORD2 M2: stats calls %u ok %u refused %u failed %u%s\n", sweet_m2_calls, sweet_m2_ok, sweet_m2_refused, sweet_m2_failed,
+ 			    sweet_m2_off ? " (service OFF: automatic shutdown)" : "");
++			IOLog("NORD2 M2: hist ok %u async %u flags %u transform %u fract %u options %u rect %u surface %u srcfmt %u dstfmt %u crop %u "
++			    "mdp-unsupported %u mdp-failed %u | ok rot0/90/180/270 %u/%u/%u/%u scaled %u yuv-src %u | last fmt %08x -> %08x\n",
++			    sweet_m2_hist[0], sweet_m2_hist[SWEET_M2_R_ASYNC], sweet_m2_hist[SWEET_M2_R_FLAGS], sweet_m2_hist[SWEET_M2_R_TRANSFORM],
++			    sweet_m2_hist[SWEET_M2_R_FRACT], sweet_m2_hist[SWEET_M2_R_OPTIONS], sweet_m2_hist[SWEET_M2_R_RECT], sweet_m2_hist[SWEET_M2_H_SURF],
++			    sweet_m2_hist[SWEET_M2_H_SFMT], sweet_m2_hist[SWEET_M2_H_DFMT], sweet_m2_hist[SWEET_M2_H_CROP], sweet_m2_hist[SWEET_M2_H_MDPNO],
++			    sweet_m2_hist[SWEET_M2_H_FAIL], sweet_m2_cls_rot[0], sweet_m2_cls_rot[1], sweet_m2_cls_rot[2], sweet_m2_cls_rot[3],
++			    sweet_m2_cls_scaled, sweet_m2_cls_yuv, sweet_m2_last_sfmt, sweet_m2_last_dfmt);
+ 		}
+ 	}
+ 	if (!sweet_m2_off && (sweet_m2_failed >= SWEET_M2_MAX_FAILED || (sweet_m2_ok == 0 && sweet_m2_refused >= SWEET_M2_MAX_REFUSED))) {
+@@ -206,41 +248,32 @@
+ 	}
+ 	if (sweet_m2_off || !sweet_m2_svc) { sweet_m2_refused++; return kIOReturnUnsupported; }
+ 	if (selector != 1) { sweet_m2_refused++; return kIOReturnUnsupported; }
+-	if (args->structureInput == NULL || args->structureInputSize < 0x58) { sweet_m2_refused++; return kIOReturnBadArgument; }
++	if (args->structureInput == NULL || args->structureInputSize < 0x68) { sweet_m2_refused++; sweet_m2_hist[SWEET_M2_R_SHORT]++; return kIOReturnBadArgument; }
+ 	const uint8_t *p = (const uint8_t *)args->structureInput;
+ 	uint32_t n = args->structureInputSize;
+-	uint32_t src = *(const uint32_t *)(const void *)p, dst = *(const uint32_t *)(const void *)(p + 4);
+-	uint64_t cb = *(const uint64_t *)(const void *)(p + 8);
+-	uint64_t flags = *(const uint64_t *)(const void *)(p + 0x20);
+-	const char *why = NULL;
+-	bool rects_zero = true;
+-	for (uint32_t o = 0x28; o < 0x58 && o + 4 <= n; o += 4) { if (*(const uint32_t *)(const void *)(p + o)) { rects_zero = false; } }
+-	bool opts_zero = true;
+-	for (uint32_t o = 0x58; o + 4 <= n; o += 4) { if (*(const uint32_t *)(const void *)(p + o)) { opts_zero = false; } }
+-	uint32_t t = (uint32_t)(flags & 0x1fu), rot = 0, flip = 0;
+-	if (cb != 0) { why = "asynchronous completion"; }
+-	else if (!rects_zero) { why = "rectangles"; }
+-	else if (!opts_zero) { why = "options"; }
+-	else if (flags & ~0x2000ull & ~0x1full) { why = "flags"; }
+-	else {
+-		flip = t & 1u;
+-		switch (t & ~1u) {
+-		case 0: rot = 0; break;
+-		case 0x4: rot = 1; break;
+-		case 0x8: rot = 2; break;
+-		case 0x10: rot = 3; break;
+-		default: why = "transform"; break;
+-		}
+-	}
+-	if (why) { sweet_m2_refused++; sweet_m2_dump(p, n, why); return kIOReturnUnsupported; }
+-	if (sweet_m2_dumps < 16) { sweet_m2_dump(p, n, "accepted"); }   /* 0684: the first 16 requests are dumped, accepted ones too */
++	struct sweet_m2_req q;
++	bzero(&q, sizeof(q));
++	int why = sweet_m2_decode(p, n, &q);                 /* 0685: rectangles / hint flags decoded (sweet_m2_req.h) */
++	if (why != SWEET_M2_OK) { sweet_m2_refused++; sweet_m2_hist[why]++; sweet_m2_dump(p, n, sweet_m2_reason[why]); return kIOReturnUnsupported; }
+ 	uint32_t us = 0;
+-	int e = sweet_m2_blit_ids(src, dst, rot, flip, &us);
++	int e = sweet_m2_blit_rect(&q, &us);
+ 	if (e) {
+-		if (e >= 1000 || e == ENOTSUP) { sweet_m2_refused++; } else { sweet_m2_failed++; }
+-		if (sweet_m2_dumps < 16) { IOLog("NORD2 M2: transform %u -> %u rot %u flip %u not done (%d)\n", src, dst, rot, flip, e); sweet_m2_dumps++; }
++		int h = e >= 1300 ? SWEET_M2_H_CROP : e == 1200 ? SWEET_M2_H_DFMT : (e == 1002 || e == 1102) ? SWEET_M2_H_SFMT + (e == 1102 ? 1 : 0) :
++		    e >= 1000 ? SWEET_M2_H_SURF : (e == ENOTSUP || e == EINVAL || e == ENODEV) ? SWEET_M2_H_MDPNO : SWEET_M2_H_FAIL;
++		sweet_m2_hist[h]++;
++		if (h == SWEET_M2_H_FAIL) { sweet_m2_failed++; } else { sweet_m2_refused++; }
++		if (sweet_m2_dumps < 16) {
++			IOLog("NORD2 M2: transform %u -> %u (%08x -> %08x) rot %u flip %u src %ux%u+%u+%u dst %ux%u+%u+%u not done (%d %s)\n", q.src, q.dst,
++			    sweet_m2_last_sfmt, sweet_m2_last_dfmt, q.rot, q.flip, q.sw, q.sh, q.sx, q.sy, q.dw, q.dh, q.dx, q.dy, e, sweet_m2_hname[h]);
++			sweet_m2_dump(p, n, sweet_m2_hname[h]);
++		}
+ 		return kIOReturnUnsupported;
+ 	}
++	sweet_m2_hist[0]++; sweet_m2_cls_rot[q.rot & 3u]++;
++	if (q.sw && q.dw && ((q.rot & 1u) ? (q.sw != q.dh || q.sh != q.dw) : (q.sw != q.dw || q.sh != q.dh))) { sweet_m2_cls_scaled++; }
++	if (sweet_m2_last_sfmt == SWEET_M2_FMT_420V || sweet_m2_last_sfmt == SWEET_M2_FMT_420F) { sweet_m2_cls_yuv++; }
++	if (sweet_m2_dumps < 16) { sweet_m2_dump(p, n, "accepted"); }
++	uint32_t src = q.src, dst = q.dst, rot = q.rot, flip = q.flip;
+ 	sweet_m2_ok++;
+ 	if (sweet_m2_ok <= 4 || (sweet_m2_ok & 1023u) == 0) { IOLog("NORD2 M2: transform %u -> %u rot %u flip %u done in %u us (ok %u)\n", src, dst, rot, flip, us, sweet_m2_ok); }
+ 	return kIOReturnSuccess;
+--- /dev/null
++++ b/iokit/Kernel/arm/sweet_m2_req.h
+@@ -0,0 +1,74 @@
++/*
++ * sweet_m2_req.h -- 0685: decoder of the IOSurfaceAccelerator transform request (selector 1, 0x170 bytes), pure C (host-tested with
++ * the 16 mediaserverd requests captured on q10jmdp14, gpu/build/mdp-20261114/test/t_m2_req.c).
++ *
++ * Layout [V-dsc 20H392 IOSurfaceAccelerator: convertToTransform 0x1d3c21a8c, prepareTransformRectangles 0x1d3c22be0,
++ * prepareTransformBuffersAndOptions 0x1d3c21d28; values seen in the phone's requests]:
++ *   +0x00 u32  source IOSurfaceID              +0x04 u32  destination IOSurfaceID
++ *   +0x08 u64  completion callback (0 = synchronous)   +0x10 u64 refcon   +0x18 u64 (third completion word)
++ *   +0x20 u64  flags: bits 0-4 "Transform" (0 none, bit 0 = horizontal flip [I], 0x4 rot 90, 0x8 rot 180, 0x10 rot 270),
++ *              0x40 CustomFilter, 0x80 NearestFilter, 0x100 OptOutBlitClip, 0x200 LockInScaler, 0x400 SkipAsyncCallback,
++ *              0x1000 FixUpscaling, 0x2000 set by prepareTransformBuffersAndOptions (DitherControl field, bits 13+),
++ *              UnwireSurface << 35; bit 30 seen set by mediaserverd [I: not decoded, treated as a hint]
++ *   +0x28 u64  source x (16.16)   +0x30 u64 source y (16.16)   +0x38 u64 source width (16.16)   +0x40 u64 source height (16.16)
++ *   +0x48..+0x57  zero in every request seen (option words)
++ *   +0x58 u32  destination x   +0x5c u32 destination y   +0x60 u32 destination width   +0x64 u32 destination height (pixels)
++ *   +0x68..+0x16f options (alpha / border fill / histogram / custom filter ...): must be zero for us
++ *   all-zero rectangles = whole surfaces (the old IOSurfaceAcceleratorTransferSurface path)
++ * mediaserverd (Magnifier preview, q10jmdp14): flags 0x40003004 = rot 90 + FixUpscaling + 0x2000 + bit 30, src rect 0,0 2048x1536
++ * (or 1504x1128), dst rect 0,0 1536x2048 (1128x1504) = whole-frame rotation.
++ */
++#ifndef SWEET_M2_REQ_H
++#define SWEET_M2_REQ_H
++#include <stdint.h>
++
++enum {
++	SWEET_M2_OK = 0, SWEET_M2_R_SHORT, SWEET_M2_R_ASYNC, SWEET_M2_R_FLAGS, SWEET_M2_R_TRANSFORM, SWEET_M2_R_FRACT, SWEET_M2_R_OPTIONS,
++	SWEET_M2_R_RECT, SWEET_M2_R_N
++};
++static const char *const sweet_m2_reason[SWEET_M2_R_N] = { "accepted", "short struct", "asynchronous completion", "flags",
++	"transform", "fractional source rectangle", "options", "rectangle sizes" };
++
++/* flag bits we accept as quality hints (they change nothing we can do): FixUpscaling, the 0x2000 word, SkipAsyncCallback,
++ * NearestFilter (we filter anyway), OptOutBlitClip, LockInScaler, bit 30 */
++#define SWEET_M2_FLAGS_OK (0x1full | 0x80ull | 0x100ull | 0x200ull | 0x400ull | 0x1000ull | 0x2000ull | 0x40000000ull)
++
++struct sweet_m2_req {
++	uint32_t src, dst, rot, flip;
++	uint64_t cb, flags;
++	uint32_t sx, sy, sw, sh;        /* integer pixels; sw == 0: whole source */
++	uint32_t dx, dy, dw, dh;        /* dw == 0: whole destination */
++};
++
++static inline uint64_t sweet_m2_u64(const uint8_t *p, uint32_t o) { uint64_t v = 0; for (int i = 7; i >= 0; i--) { v = (v << 8) | p[o + (uint32_t)i]; } return v; }
++static inline uint32_t sweet_m2_u32(const uint8_t *p, uint32_t o) { return (uint32_t)p[o] | ((uint32_t)p[o + 1] << 8) | ((uint32_t)p[o + 2] << 16) | ((uint32_t)p[o + 3] << 24); }
++
++static inline int
++sweet_m2_decode(const uint8_t *p, uint32_t n, struct sweet_m2_req *r)
++{
++	if (n < 0x68) { return SWEET_M2_R_SHORT; }
++	r->src = sweet_m2_u32(p, 0); r->dst = sweet_m2_u32(p, 4);
++	r->cb = sweet_m2_u64(p, 8); r->flags = sweet_m2_u64(p, 0x20);
++	if (r->cb != 0 && !(r->flags & 0x400ull)) { return SWEET_M2_R_ASYNC; }
++	if (r->flags & ~SWEET_M2_FLAGS_OK) { return SWEET_M2_R_FLAGS; }
++	uint32_t t = (uint32_t)(r->flags & 0x1fu);
++	r->flip = t & 1u;
++	switch (t & ~1u) {
++	case 0: r->rot = 0; break;
++	case 0x4: r->rot = 1; break;
++	case 0x8: r->rot = 2; break;
++	case 0x10: r->rot = 3; break;
++	default: return SWEET_M2_R_TRANSFORM;
++	}
++	uint64_t s[4] = { sweet_m2_u64(p, 0x28), sweet_m2_u64(p, 0x30), sweet_m2_u64(p, 0x38), sweet_m2_u64(p, 0x40) };
++	for (int i = 0; i < 4; i++) { if ((s[i] & 0xffffu) || (s[i] >> 32)) { return SWEET_M2_R_FRACT; } }
++	r->sx = (uint32_t)(s[0] >> 16); r->sy = (uint32_t)(s[1] >> 16); r->sw = (uint32_t)(s[2] >> 16); r->sh = (uint32_t)(s[3] >> 16);
++	for (uint32_t o = 0x48; o < 0x58; o += 4) { if (sweet_m2_u32(p, o)) { return SWEET_M2_R_OPTIONS; } }
++	for (uint32_t o = 0x68; o + 4 <= n; o += 4) { if (sweet_m2_u32(p, o)) { return SWEET_M2_R_OPTIONS; } }
++	r->dx = sweet_m2_u32(p, 0x58); r->dy = sweet_m2_u32(p, 0x5c); r->dw = sweet_m2_u32(p, 0x60); r->dh = sweet_m2_u32(p, 0x64);
++	if ((r->sw == 0) != (r->sh == 0) || (r->dw == 0) != (r->dh == 0)) { return SWEET_M2_R_RECT; }
++	if (r->sw == 0 && (r->sx | r->sy)) { return SWEET_M2_R_RECT; }
++	if (r->dw == 0 && (r->dx | r->dy)) { return SWEET_M2_R_RECT; }
++	return SWEET_M2_OK;
++}
++#endif

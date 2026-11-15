@@ -1,0 +1,205 @@
+--- a/bsd/dev/nord2_mdp.inc
++++ b/bsd/dev/nord2_mdp.inc
+@@ -16,7 +16,8 @@
+  * 0682: S2 DIAG jobs (rgbscale1, nv12scale3t, nv12scale3o, rgbscale3t) that tell RGB-source from multi-tile problems; vendor RSZ
+  * tile bits 11/12 for multi-tile jobs;
+  * 0683: NV12 multi-tile scaling allowed; RGB-source scaling behind N2MDP_CAP_RGB_SCALE (smooth-pattern jobs); default stages 0x103;
+- * kern.n2mdp_publish re-offers the 0672 service (registration still needs kern.n2mdp_svc = 1, default 0).
++ * kern.n2mdp_publish re-offers the 0672 service (registration still needs kern.n2mdp_svc = 1, default 0);
++ * 0686: NV12 destinations (WROT 2-plane, vendor chroma offsets / uv table) behind N2MDP_CAP_NV12_DST, 20 us WAIT polling.
+  * (gpu/build/mdp-20261114/MDP_OFFLOAD.md).  Answers "is the MDP powered, clocked and reachable on this phone, and in what
+  * state did the bootloader leave it" before any functional stage (DMA, scaling, rotation) is attempted.
+  *
+@@ -422,7 +423,8 @@
+ #define N2MDP_CAP_SCALE_UP  (1u << 9)
+ #define N2MDP_CAP_SCALE_ROT (1u << 10)
+ #define N2MDP_CAP_IOVA      (1u << 11)
+-#define N2MDP_CAP_RGB_SCALE (1u << 12)   /* 0683: RGB-source scaling (smooth-pattern jobs passed in this boot) */
++#define N2MDP_CAP_RGB_SCALE (1u << 12)
++#define N2MDP_CAP_NV12_DST  (1u << 13)   /* 0686: NV12 destinations (NV12 -> NV12 rotation / copy jobs passed in this boot) */   /* 0683: RGB-source scaling (smooth-pattern jobs passed in this boot) */
+ 
+ /* gates the functional stages keep open (CG_CON0): RDMA0 0, RSZ2 10? no: RSZ0 4 .. see clk-mt6885-mdp.c */
+ #define N2MDP_CG0_FUNC  ((1u << 0) | (1u << 7) | (1u << 8) | (1u << 9) | (1u << 10) | (1u << 12) | (1u << 13) | (1u << 14) | \
+@@ -926,8 +928,8 @@
+ 			/* 0674: done = WROT frame-done GCE event OR the mutex end-of-frame status bit (INTSTA bit id+16 = eof, bit id = sof;
+ 			 * mtk_drm_ddp.c mtk_disp_mutex_irq_handler); the q10jmdp3 log had sof set and eof clear at the timeout */
+ 			while (!(n2mdp_gce_event(o->val) & 1u) && !((n2mdp_rd(N2MDP_W_MUTEX + 4u) >> (p->mutex + 16u)) & 1u)) {
+-				if (k < 50) { n2mdp_delay(20); } else { n2mdp_delay(200); }
+-				if (++k > 1000) {   /* ~190 ms */
++				n2mdp_delay(20);                  /* 0686: 20 us granularity throughout (0671 slept 200 us after 1 ms) */
++				if (++k > 9500) {   /* ~190 ms */
+ 					n2mx.timeouts++;
+ 					n2mdp_abort(p, "frame-done event never came");
+ 					return ETIMEDOUT;
+@@ -994,6 +996,13 @@
+ 	 * tolerance = the S2 non-exact rule (mean <= 6, <= 1 % of samples over 32) on smooth content. */
+ 	{ "rgbscale1s",  N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 0,  0, 2, 512, 256, 256, 128, N2MDP_CAP_RGB_SCALE, 2 },
+ 	{ "rgbscale3s",  N2MF_BGRA, N2MF_BGRA, 0, 0, 0, 16, 0, 2, 1024, 64, 768, 48, N2MDP_CAP_RGB_SCALE, 2 },
++	/* 0686: NV12 -> NV12 (the camera's real request is 420f 1504x1128 -> 420f 1128x1504 rotated 90; 752x564 here = same aspect, fits
++	 * the test buffers).  Capability jobs (diag 3): all must pass for N2MDP_CAP_NV12_DST; they never stop S2. */
++	{ "nv2nv",       N2MF_NV12, N2MF_NV12, 0, 0, 1, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12_DST, 3 },
++	{ "nv2nvrot90",  N2MF_NV12, N2MF_NV12, 1, 0, 1, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12_DST, 3 },
++	{ "nv2nvrot180", N2MF_NV12, N2MF_NV12, 2, 0, 1, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12_DST, 3 },
++	{ "nv2nvrot270", N2MF_NV12, N2MF_NV12, 3, 0, 1, 0,  0, 2, 256, 256, 256, 256, N2MDP_CAP_NV12_DST, 3 },
++	{ "nv2nvcam90",  N2MF_NV12, N2MF_NV12, 1, 0, 1, 0,  0, 2, 752, 564, 564, 752, N2MDP_CAP_NV12_DST, 3 },
+ };
+ #define N2MDP_NTESTS (sizeof(n2mdp_tests) / sizeof(n2mdp_tests[0]))
+ 
+@@ -1090,7 +1099,8 @@
+ 		}
+ 	}
+ 	struct n2mdp_cmp c;
+-	int m = n2mdp_compare(&j, s0, s1, d, t->exact, &c);
++	int m = n2mf_is_yuv(j.dst.fmt) ? n2mdp_compare_nv12(&j, s0, s1, d, d + (j.dst.addr[1] - j.dst.addr[0]), &c)   /* 0686 */
++	    : n2mdp_compare(&j, s0, s1, d, t->exact, &c);
+ 	*out_crc = n2mdp_crc32(d, dbytes, 0);
+ 	N2MDP_LOG("NORD2 MDP: %s %ux%u %s -> %ux%u rot %u flip %u tiles %u pipe %u: %s (max err %u mean %u.%02u over %u/%u first %u,%u "
+ 	    "swapped-better %u) hw %u us crc %08x\n", t->name, t->sw, t->sh, n2mf_is_yuv(t->sfmt) ? (t->full ? "420f" : "420v") : "BGRA",
+@@ -1115,7 +1125,7 @@
+ static uint32_t
+ n2mdp_stage_tests(unsigned stage, uint32_t *pass_mask, uint32_t *fail_mask)
+ {
+-	uint32_t pass = 0, fail = 0, code = 1, rgb_pass = 0, rgb_fail = 0;
++	uint32_t pass = 0, fail = 0, code = 1, rgb_pass = 0, rgb_fail = 0, nvd_pass = 0, nvd_fail = 0;
+ 	for (unsigned i = 0; i < N2MDP_NTESTS; i++) {
+ 		const struct n2mdp_test *t = &n2mdp_tests[i];
+ 		if (t->stage != stage) { continue; }
+@@ -1138,6 +1148,7 @@
+ 			N2MDP_LOG("NORD2 MDP S2 DIAG %s: %s (code %d)\n", t->name, r == 0 ? "PASS" : "FAIL", r ? r + 1 : 1);
+ 			if (r == 0) { n2mx.s2_diag |= 1u << i; }
+ 			if (t->diag == 2) { if (r == 0 && !(rgb_fail)) { rgb_pass++; } else { rgb_fail = 1; } }
++			if (t->diag == 3) { if (r == 0 && !nvd_fail) { nvd_pass++; } else { nvd_fail = 1; } }
+ 			continue;
+ 		}
+ 		if (r == 0) { pass |= 1u << i; n2mx.caps |= t->cap; }
+@@ -1152,6 +1163,7 @@
+ 	}
+ 	/* a capability shared by several tests (TILE) counts only if all of them passed */
+ 	for (unsigned i = 0; i < N2MDP_NTESTS; i++) { if (fail & (1u << i)) { n2mx.caps &= ~n2mdp_tests[i].cap; } }
++	if (stage == 2 && nvd_pass == 5u && !nvd_fail) { n2mx.caps |= N2MDP_CAP_NV12_DST; N2MDP_LOG("NORD2 MDP S2: NV12 destinations enabled (NV12 -> NV12 jobs passed)\n"); }
+ 	if (stage == 2 && rgb_pass == 2u && !rgb_fail) { n2mx.caps |= N2MDP_CAP_RGB_SCALE; N2MDP_LOG("NORD2 MDP S2: RGB-source scaling enabled (smooth jobs passed)\n"); }
+ 	*pass_mask = pass; *fail_mask = fail;
+ 	return fail ? code : 1u;
+@@ -1392,6 +1404,7 @@
+ 	}
+ 	if (ow > 512u) { need |= N2MDP_CAP_TILE; }
+ 	if (!n2mf_is_yuv(src->fmt) && (ow != src->w || oh != src->h)) { need |= N2MDP_CAP_RGB_SCALE; }   /* 0683 */
++	if (n2mf_is_yuv(dst->fmt)) { need |= N2MDP_CAP_NV12_DST; }   /* 0686 */
+ 	if ((caps & need) != need) { return ENOTSUP; }
+ 	n2mdp_lock();
+ 	int err = 0;
+--- a/bsd/dev/nord2_mdp_job.h
++++ b/bsd/dev/nord2_mdp_job.h
+@@ -261,7 +261,16 @@
+ 	case 2:  *o0 = F ? (H - 1u - y0) * P + x0 * B : (H - 1u - y0) * P + (W - x0) * B - 1u; break;
+ 	default: *o0 = F ? (W - 1u - x0) * P + (H - y0) * B - 1u : (W - 1u - x0) * P + y0 * B; break;
+ 	}
+-	*o1 = n2mf_is_yuv(j->dst.fmt) ? (y0 / 2u) * j->dst.pitch[1] + x0 : 0;
++	*o1 = 0;
++	if (n2mf_is_yuv(j->dst.fmt)) {   /* 0686: chroma plane = the same walk on the half-size grid, 2 bytes per UV pair [V-dis onConfigTile] */
++		uint32_t cW = W / 2u, cH = H / 2u, cx = x0 / 2u, cy = y0 / 2u, cP = j->dst.pitch[1], cB = 2u;
++		switch (j->rot & 3u) {
++		case 0:  *o1 = F ? cy * cP + (cW - cx) * cB - 1u : cy * cP + cx * cB; break;
++		case 1:  *o1 = F ? cx * cP + cy * cB : cx * cP + (cH - cy) * cB - 1u; break;
++		case 2:  *o1 = F ? (cH - 1u - cy) * cP + cx * cB : (cH - 1u - cy) * cP + (cW - cx) * cB - 1u; break;
++		default: *o1 = F ? (cW - 1u - cx) * cP + (cH - cy) * cB - 1u : (cW - 1u - cx) * cP + cy * cB; break;
++		}
++	}
+ }
+ 
+ /* Compile the job.  pipe chosen here: direct when not scaled, scale pipe otherwise. */
+@@ -449,8 +458,11 @@
+ 	uint32_t flip = j->flip & 1u;
+ 	N2W(p, W + W_BASE, j->dst.addr[0]);
+ 	if (dyuv) { N2W(p, W + W_BASE_C, j->dst.addr[1]); N2W(p, W + W_STRIDE_C, j->dst.pitch[1]); }
+-	N2WM(p, W + W_CTRL, d_id | (d_swap << 8) | 0x5000u | ((uint32_t)(j->rot & 3u) << 20) | (flip << 24) |
+-	    (dyuv ? (1u << 30) | (1u << 28) : 0), 0xf131510fu);
++	/* 0686: YUV 4:2:0 destinations: CTRL bits 28 / 30 (chroma sample selection) from DpEngine_WROT::s_uvTable (libdpframework
++	 * 0x60cb8, indexed by vertical subsampling, rotation, flip) [V-dis]; 0671 set both bits for every rotation [I] */
++	static const uint8_t uvtab[4][2][2] = { { { 0, 0 }, { 1, 0 } }, { { 0, 1 }, { 0, 0 } }, { { 1, 1 }, { 0, 1 } }, { { 1, 0 }, { 1, 1 } } };
++	uint32_t uvb = dyuv ? (((uint32_t)uvtab[j->rot & 3u][flip][0] << 28) | ((uint32_t)uvtab[j->rot & 3u][flip][1] << 30)) : 0u;
++	N2WM(p, W + W_CTRL, d_id | (d_swap << 8) | 0x5000u | ((uint32_t)(j->rot & 3u) << 20) | (flip << 24) | uvb, 0xf131510fu);
+ 	N2W(p, W + W_STRIDE, j->dst.pitch[0]);
+ 	N2WM(p, W + W_MAT_CTRL, w_mat, 0xf3u);
+ 	N2WM(p, W + W_DITHER, 0xff000000u, 0xff000000u);
+@@ -639,6 +651,36 @@
+ 	return (c->sum_err > 6u * c->samples || c->over * 100u > c->samples) ? 1 : 0;
+ }
+ 
++/* 0686: NV12 destination check (unscaled jobs): Y per pixel, UV per 2x2 block, mapped through the rotation like n2mdp_ref_out */
++static inline int
++n2mdp_compare_nv12(const struct n2mdp_job *j, const uint8_t *s0, const uint8_t *s1, const uint8_t *d0, const uint8_t *d1, struct n2mdp_cmp *c)
++{
++	c->samples = c->max_err = c->sum_err = c->over = c->swapped_better = 0; c->first_x = c->first_y = 0xffffffffu;
++	uint32_t W = j->dst.w, H = j->dst.h, ow = n2mdp_out_w(j), oh = n2mdp_out_h(j);
++	for (uint32_t y = 0; y < H; y++) {
++		for (uint32_t x = 0; x < W; x++) {
++			uint32_t u, v;
++			switch (j->rot & 3u) {
++			case 0: u = x; v = y; break;
++			case 1: u = y; v = oh - 1u - x; break;
++			case 2: u = ow - 1u - x; v = oh - 1u - y; break;
++			default: u = ow - 1u - y; v = x; break;
++			}
++			if (j->flip & 1u) { u = ow - 1u - u; }
++			int e = (int)d0[(uint64_t)y * j->dst.pitch[0] + x] - (int)s0[(uint64_t)(j->cy + v) * j->src.pitch[0] + j->cx + u];
++			int m = e < 0 ? -e : e;
++			if (!(x & 1u) && !(y & 1u)) {
++				const uint8_t *dc = d1 + (uint64_t)(y / 2u) * j->dst.pitch[1] + x, *sc = s1 + (uint64_t)((j->cy + v) / 2u) * j->src.pitch[1] + ((j->cx + u) & ~1u);
++				for (int k = 0; k < 2; k++) { int ek = (int)dc[k] - (int)sc[k]; if (ek < 0) { ek = -ek; } if (ek > m) { m = ek; } }
++			}
++			c->samples++; c->sum_err += (uint32_t)m;
++			if ((uint32_t)m > c->max_err) { c->max_err = (uint32_t)m; }
++			if (m > 32) { if (c->over == 0) { c->first_x = x; c->first_y = y; } c->over++; }
++		}
++	}
++	return (c->sum_err > 6u * c->samples || c->over * 100u > c->samples) ? 1 : 0;
++}
++
+ /* CRC32 (for the log) */
+ static inline uint32_t
+ n2mdp_crc32(const uint8_t *p, uint64_t n, uint32_t crc)
+--- a/iokit/Kernel/arm/sweet_m2scaler.inc
++++ b/iokit/Kernel/arm/sweet_m2scaler.inc
+@@ -129,7 +129,7 @@
+ 	if (!e && b.s) { sweet_m2_last_dfmt = b.s->pixelFormat; }
+ 	int err;
+ 	if (e || f) { err = 1000 + (e ? e : 100 + f); }
+-	else if (b.img.fmt != 1u && b.img.fmt != 2u) { err = 1200; }     /* RGB destinations only */
++	else if (b.img.fmt != 1u && b.img.fmt != 2u && !(b.img.fmt == 3u && (nord2_mdp_caps() & (1u << 13)))) { err = 1200; }   /* 0686: NV12 dst when verified */
+ 	else if ((err = sweet_m2_crop(&a.img, q->sx, q->sy, q->sw, q->sh)) != 0) { }
+ 	else if ((err = sweet_m2_crop(&b.img, q->dx, q->dy, q->dw, q->dh)) != 0) { err += 10; }
+ 	else { err = nord2_mdp_blit_pages(&a.img, &b.img, q->rot, q->flip, hw_us); }
+@@ -151,6 +151,7 @@
+ 	"surface", "srcfmt", "dstfmt", "crop", "mdp-unsupported", "mdp-failed" };
+ static uint32_t sweet_m2_hist[SWEET_M2_H_N];
+ static uint32_t sweet_m2_cls_rot[4], sweet_m2_cls_scaled, sweet_m2_cls_yuv;
++static uint64_t sweet_m2_sum_tot, sweet_m2_sum_hw;   /* 0686 */
+ 
+ class AppleM2ScalerCSCDriver : public IOService {
+ 	OSDeclareDefaultStructors(AppleM2ScalerCSCDriver);
+@@ -256,7 +257,10 @@
+ 	int why = sweet_m2_decode(p, n, &q);                 /* 0685: rectangles / hint flags decoded (sweet_m2_req.h) */
+ 	if (why != SWEET_M2_OK) { sweet_m2_refused++; sweet_m2_hist[why]++; sweet_m2_dump(p, n, sweet_m2_reason[why]); return kIOReturnUnsupported; }
+ 	uint32_t us = 0;
++	uint64_t t_beg = mach_absolute_time();
+ 	int e = sweet_m2_blit_rect(&q, &us);
++	uint64_t t_ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - t_beg, &t_ns);
++	uint32_t tot_us = (uint32_t)(t_ns / 1000u);
+ 	if (e) {
+ 		int h = e >= 1300 ? SWEET_M2_H_CROP : e == 1200 ? SWEET_M2_H_DFMT : (e == 1002 || e == 1102) ? SWEET_M2_H_SFMT + (e == 1102 ? 1 : 0) :
+ 		    e >= 1000 ? SWEET_M2_H_SURF : (e == ENOTSUP || e == EINVAL || e == ENODEV) ? SWEET_M2_H_MDPNO : SWEET_M2_H_FAIL;
+@@ -274,8 +278,12 @@
+ 	if (sweet_m2_last_sfmt == SWEET_M2_FMT_420V || sweet_m2_last_sfmt == SWEET_M2_FMT_420F) { sweet_m2_cls_yuv++; }
+ 	if (sweet_m2_dumps < 16) { sweet_m2_dump(p, n, "accepted"); }
+ 	uint32_t src = q.src, dst = q.dst, rot = q.rot, flip = q.flip;
++	sweet_m2_sum_tot += tot_us; sweet_m2_sum_hw += us;   /* 0686: timing (hw = MDP busy, total = whole request incl. page lists, IOVA map, cache maintenance) */
+ 	sweet_m2_ok++;
+-	if (sweet_m2_ok <= 4 || (sweet_m2_ok & 1023u) == 0) { IOLog("NORD2 M2: transform %u -> %u rot %u flip %u done in %u us (ok %u)\n", src, dst, rot, flip, us, sweet_m2_ok); }
++	if (sweet_m2_ok <= 4 || (sweet_m2_ok & 255u) == 0) {
++		IOLog("NORD2 M2: transform %u -> %u (%08x -> %08x) rot %u flip %u done: hw %u us total %u us (ok %u, avg hw %u total %u)\n", src, dst,
++		    sweet_m2_last_sfmt, sweet_m2_last_dfmt, rot, flip, us, tot_us, sweet_m2_ok, (uint32_t)(sweet_m2_sum_hw / sweet_m2_ok), (uint32_t)(sweet_m2_sum_tot / sweet_m2_ok));
++	}
+ 	return kIOReturnSuccess;
+ }
+ 

@@ -1,0 +1,160 @@
+--- a/bsd/dev/nord2_mdp.inc
++++ b/bsd/dev/nord2_mdp.inc
+@@ -19,7 +19,8 @@
+  * kern.n2mdp_publish re-offers the 0672 service (registration still needs kern.n2mdp_svc = 1, default 0);
+  * 0686: NV12 destinations (WROT 2-plane, vendor chroma offsets / uv table) behind N2MDP_CAP_NV12_DST, 20 us WAIT polling;
+  * 0687: service speed: IOVA mapping cache (8 entries, page-list hash), page-table flush of the touched range only, 5 us WAIT poll
+- * for the first 3 ms, map / run timing for the service log.
++ * for the first 3 ms, map / run timing for the service log;
++ * 0688: MDP clock (mdp_sel parent, TVDPLL rate) in the probe log, compile timing.
+  * (gpu/build/mdp-20261114/MDP_OFFLOAD.md).  Answers "is the MDP powered, clocked and reachable on this phone, and in what
+  * state did the bootloader leave it" before any functional stage (DMA, scaling, rotation) is attempted.
+  *
+@@ -324,6 +325,18 @@
+ 	    ni_rd(n2mdp.spm, N2MDP_MDP_CON), ni_rd(n2mdp.spm, N2MDP_DIS_CON), power ? "on" : "OFF", (s0 & s1 & N2MDP_DIS_BIT) ? "on" : "OFF",
+ 	    p1, pm, pm2, prot ? "SET" : "clear", cfg1, (cfg1 >> 8) & 0xfu, mux ? "GATED" : "running", ifr,
+ 	    (ifr & N2MDP_IFR_GCE) ? "gated" : "open", (ifr & N2MDP_IFR_GCE2) ? "gated" : "open");
++	{	/* 0688: which MDP clock: mdp_sel parent (clk-mt6885.c mdp_parents) and, for parent 8, the TVDPLL rate (apmixedsys 0x1000c000:
++		 * TVDPLL_CON1 0x384 = pcw[21:0] (14 fractional bits) | posdiv[26:24]); live.dts mmdvfs mdp_step0 594 MHz = TOP_TVDPLL_CK,
++		 * step1 416 = UNIVPLL_D6, step2 312 = UNIVPLL_D4_D2, step3 273 = MAINPLL_D4_D2.  Read only. */
++		static const char *const mp[11] = { "26M", "mainpll_d5_d2", "mmpll_d6_d2", "mainpll_d4_d2 (273)", "univpll_d4_d2 (312)",
++			"mainpll_d6", "univpll_d6 (416)", "mainpll_d4", "tvdpll (mmdvfs step0)", "univpll_d4", "mmpll_d5_d2" };
++		static vm_offset_t apm;
++		if (!apm) { apm = n2mdp_map(0x1000c000u, 0x1000); }
++		uint32_t par = (cfg1 >> 8) & 0xfu, c0 = apm ? ni_rd(apm, 0x380u) : 0, c1 = apm ? ni_rd(apm, 0x384u) : 0;
++		uint64_t khz = ((uint64_t)(c1 & 0x3fffffu) * 26000u) >> (14u + ((c1 >> 24) & 7u));
++		N2MDP_LOG("NORD2 MDP: clock mdp_sel parent %u (%s) | TVDPLL CON0 %#x CON1 %#x = %u MHz (pll %s)\n", par, par < 11u ? mp[par] : "?",
++		    c0, c1, (uint32_t)(khz / 1000u), (c0 & 1u) ? "on" : "OFF");
++	}
+ 	if (power) { st |= N2MDP_S_POWER; }
+ 	if (prot) { st |= N2MDP_S_PROT; }
+ 	if (mux) { st |= N2MDP_S_MUXGATE; }
+@@ -1265,7 +1278,7 @@
+ #define N2MDP_MC_N 8u
+ static struct { uint64_t key; uint32_t n, iova, lru; } n2mdp_mc[N2MDP_MC_N];
+ static uint32_t n2mdp_mc_tick, n2mdp_mc_hits, n2mdp_mc_miss;
+-uint32_t n2mdp_last_map_us, n2mdp_last_run_us;     /* 0687: read by the service log (C linkage) */
++uint32_t n2mdp_last_map_us, n2mdp_last_run_us, n2mdp_last_compile_us;     /* 0687/0688: read by the service log (C linkage) */
+ static uint64_t
+ n2mdp_mc_key(const uint64_t *pages, uint32_t n)
+ {
+@@ -1478,7 +1491,9 @@
+ 	j.dst.pitch[0] = dst->pitch[0]; j.dst.pitch[1] = dst->pitch[1]; j.dst.addr[0] = di + dst->off[0]; j.dst.addr[1] = dst->pitch[1] ? di + dst->off[1] : 0;
+ 	j.rot = (uint8_t)rot; j.flip = (uint8_t)(flip & 1u); j.rgb_swap = (uint8_t)n2mx.rgb_swap;
+ 	j.allow_unverified = (caps & N2MDP_CAP_RGB_SCALE) ? 1u : 0u;   /* 0683: RGB scaling only when this boot verified it */
++	uint64_t tc0 = n2mdp_now_us();
+ 	if (n2mdp_compile(&j, &n2mdp_prog_buf)) { err = EINVAL; goto out; }
++	n2mdp_last_compile_us = (uint32_t)(n2mdp_now_us() - tc0);   /* 0688 */
+ 	n2mdp_larb_mode(true);
+ 	err = n2mdp_run(&n2mdp_prog_buf, hw_us);
+ 	n2mdp_larb_mode(false);
+--- a/iokit/Kernel/arm/sweet_m2scaler.inc
++++ b/iokit/Kernel/arm/sweet_m2scaler.inc
+@@ -28,7 +28,8 @@
+ #include <mach/clock_types.h>    /* NSEC_PER_SEC */
+ #include <string.h>
+ #include "sweet_m2_req.h"
+-extern "C" uint32_t n2mdp_last_map_us, n2mdp_last_run_us;   /* 0687: nord2_mdp.inc timing */
++extern "C" uint32_t n2mdp_last_map_us, n2mdp_last_run_us, n2mdp_last_compile_us;   /* 0687/0688: nord2_mdp.inc timing */
++static uint32_t sweet_m2_pages_us, sweet_m2_sc_hits, sweet_m2_sc_miss;      /* 0688 */
+ static uint32_t sweet_m2_cache_us;                          /* 0687: CPU cache maintenance of the current request */   /* 0685: request decoder (host-tested with the q10jmdp14 mediaserverd requests) */
+ 
+ static int      sweet_m2_svc = 1;     /* 0684: ON for the controlled run image (q10jmdp14); registered only after S3 passed in this boot */
+@@ -51,7 +52,24 @@
+ #define SWEET_M2_FMT_420F 0x34323066u   /* '420f' */
+ 
+ /* Resolve a surface into an MDP page-listed image.  Holds a reference (and a wire-on-demand hold) until sweet_m2_put. */
+-struct sweet_m2_ref { SweetSurface *s; bool held; uint64_t *pages; uint32_t npages; struct n2mdp_pimg img; };
++struct sweet_m2_ref { SweetSurface *s; bool held; bool cached; uint64_t *pages; uint32_t npages; struct n2mdp_pimg img; };
++
++/* 0688: surface cache.  Building the page list (getPhysicalSegment per 4 KiB page, ~3000 pages per camera request pair) every call
++ * is replaced by a cache of 8 resolved surfaces.  An entry keeps its own retain AND wire-on-demand hold, so the physical pages cannot
++ * move or be freed while it is cached; it is re-used only for the same id, the same SweetSurface object, the same memory object and
++ * length, and not purged.  LRU eviction unholds / releases. */
++#define SWEET_M2_SC_N 8u
++static struct { uint32_t id, lru, n; SweetSurface *s; IOMemoryDescriptor *mem; uint64_t len; uint64_t *pages; } sweet_m2_sc[SWEET_M2_SC_N];
++static uint32_t sweet_m2_sc_tick;
++static void
++sweet_m2_sc_evict(unsigned i)
++{
++	if (!sweet_m2_sc[i].s) { return; }
++	sweet_surface_wod_unhold(sweet_m2_sc[i].s);
++	sweet_m2_sc[i].s->release();
++	if (sweet_m2_sc[i].pages) { IOFree(sweet_m2_sc[i].pages, sweet_m2_sc[i].n * sizeof(uint64_t)); }
++	bzero(&sweet_m2_sc[i], sizeof(sweet_m2_sc[i]));
++}
+ 
+ static int
+ sweet_m2_get(uint32_t id, struct sweet_m2_ref *r)
+@@ -71,10 +89,23 @@
+ 		im->pitch[0] = s->planes[0].bytesPerRow; im->off[0] = s->planes[0].offset;
+ 		im->pitch[1] = s->planes[1].bytesPerRow; im->off[1] = s->planes[1].offset;
+ 	} else { return 2; }
+-	if (s->memory == NULL || s->purged) { return 3; }
++	if (s->memory == NULL || s->purged) {
++		for (unsigned i = 0; i < SWEET_M2_SC_N; i++) { if (sweet_m2_sc[i].s == s) { sweet_m2_sc_evict(i); } }
++		return 3;
++	}
++	uint64_t len = s->memory->getLength();
++	uint64_t p0 = mach_absolute_time();
++	for (unsigned i = 0; i < SWEET_M2_SC_N; i++) {   /* 0688: cache hit = the same surface object, memory and size */
++		if (sweet_m2_sc[i].s == s && sweet_m2_sc[i].id == id && sweet_m2_sc[i].mem == s->memory && sweet_m2_sc[i].len == len) {
++			sweet_m2_sc[i].lru = ++sweet_m2_sc_tick; sweet_m2_sc_hits++;
++			r->cached = true; r->pages = sweet_m2_sc[i].pages; r->npages = sweet_m2_sc[i].n;
++			im->npages = r->npages; im->pages = r->pages;
++			goto flush;
++		}
++	}
+ 	if (!sweet_surface_wod_hold(s)) { return 4; }
+ 	r->held = true;
+-	uint64_t len = s->memory->getLength();
++	{
+ 	uint32_t n = (uint32_t)((len + 4095u) / 4096u);
+ 	if (n == 0 || n > N2MDP_MAX_PAGES) { return 5; }
+ 	r->pages = (uint64_t *)IOMalloc(n * sizeof(uint64_t));
+@@ -87,6 +118,18 @@
+ 		for (IOByteCount o = 0; o < seg && k < n; o += 4096u) { r->pages[k++] = pa + o; }
+ 	}
+ 	im->npages = n; im->pages = r->pages;
++	{	/* 0688: hand the resolved surface to the cache (it takes the extra retain, the hold and the page array) */
++		unsigned v = 0; uint32_t best = 0xffffffffu;
++		for (unsigned i = 0; i < SWEET_M2_SC_N; i++) { if (!sweet_m2_sc[i].s) { v = i; best = 0; break; } if (sweet_m2_sc[i].lru < best) { best = sweet_m2_sc[i].lru; v = i; } }
++		sweet_m2_sc_evict(v);
++		s->retain();
++		sweet_m2_sc[v].id = id; sweet_m2_sc[v].s = s; sweet_m2_sc[v].mem = s->memory; sweet_m2_sc[v].len = len; sweet_m2_sc[v].n = n;
++		sweet_m2_sc[v].pages = r->pages; sweet_m2_sc[v].lru = ++sweet_m2_sc_tick;
++		r->held = false; r->cached = true; sweet_m2_sc_miss++;
++	}
++	}
++flush:
++	{ uint64_t pns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - p0, &pns); sweet_m2_pages_us += (uint32_t)(pns / 1000u); }
+ 	/* the MDP is not cache coherent: clean + invalidate the pixels through the kernel mapping (PIPT: covers every alias) */
+ 	uintptr_t va = s->kernelAddress();
+ 	uint64_t c0 = mach_absolute_time();
+@@ -103,7 +146,7 @@
+ 		if (va) { FlushPoC_DcacheRegion((vm_offset_t)va, (unsigned)r->s->memory->getLength()); }
+ 		uint64_t cns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - c0, &cns); sweet_m2_cache_us += (uint32_t)(cns / 1000u);
+ 	}
+-	if (r->pages) { IOFree(r->pages, r->npages * sizeof(uint64_t)); }
++	if (r->pages && !r->cached) { IOFree(r->pages, r->npages * sizeof(uint64_t)); }   /* 0688: cached arrays belong to the cache */
+ 	if (r->held) { sweet_surface_wod_unhold(r->s); }
+ 	if (r->s) { r->s->release(); }
+ 	bzero(r, sizeof(*r));
+@@ -263,7 +306,7 @@
+ 	int why = sweet_m2_decode(p, n, &q);                 /* 0685: rectangles / hint flags decoded (sweet_m2_req.h) */
+ 	if (why != SWEET_M2_OK) { sweet_m2_refused++; sweet_m2_hist[why]++; sweet_m2_dump(p, n, sweet_m2_reason[why]); return kIOReturnUnsupported; }
+ 	uint32_t us = 0;
+-	sweet_m2_cache_us = 0; n2mdp_last_map_us = 0; n2mdp_last_run_us = 0;
++	sweet_m2_cache_us = 0; n2mdp_last_map_us = 0; n2mdp_last_run_us = 0; n2mdp_last_compile_us = 0; sweet_m2_pages_us = 0;
+ 	uint64_t t_beg = mach_absolute_time();
+ 	int e = sweet_m2_blit_rect(&q, &us);
+ 	uint64_t t_ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - t_beg, &t_ns);
+@@ -288,6 +331,8 @@
+ 	sweet_m2_sum_tot += tot_us; sweet_m2_sum_hw += us; sweet_m2_sum_map += n2mdp_last_map_us; sweet_m2_sum_cache += sweet_m2_cache_us;   /* 0686: timing (hw = MDP busy, total = whole request incl. page lists, IOVA map, cache maintenance) */
+ 	sweet_m2_ok++;
+ 	if (sweet_m2_ok <= 4 || (sweet_m2_ok & 255u) == 0) {
++		IOLog("NORD2 M2: timing pages %u compile %u (surface cache hit %u miss %u, iova cache in map)\n", sweet_m2_pages_us, n2mdp_last_compile_us,
++		    sweet_m2_sc_hits, sweet_m2_sc_miss);
+ 		IOLog("NORD2 M2: transform %u -> %u (%08x -> %08x) rot %u flip %u done: hw %u map %u cache %u total %u us (ok %u, avg hw %u map %u "
+ 		    "cache %u total %u)\n", src, dst, sweet_m2_last_sfmt, sweet_m2_last_dfmt, rot, flip, us, n2mdp_last_map_us, sweet_m2_cache_us, tot_us,
+ 		    sweet_m2_ok, (uint32_t)(sweet_m2_sum_hw / sweet_m2_ok), (uint32_t)(sweet_m2_sum_map / sweet_m2_ok), (uint32_t)(sweet_m2_sum_cache / sweet_m2_ok),
