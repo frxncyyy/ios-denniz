@@ -1,0 +1,410 @@
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -16,6 +16,9 @@
+ #endif
+ #include <pexpert/pexpert.h>
+ #if defined(NORD2)
++#include <kern/clock.h>   /* 0701: mach_absolute_time */
++#endif
++#if defined(NORD2)
+ extern "C" {
+ #include "nord2_battery.h"
+ int nord2_battery_platform_sample(struct nbg_sample *);
+@@ -216,6 +219,31 @@
+ }
+ 
+ #if defined(NORD2)
++/*
++ * 0701 (usbchg-20261115): what iOS sees.
++ *  - external / charging follow the MP2650 status with the corrected VIN power-good polarity (nord2_battery.c);
++ *  - a failed sample no longer publishes 0 % / MaxCapacity 0: the last valid sample is held for kern.n2bat_hold_s (120 s), marked
++ *    Nord2BatterySOCStale, and only then the source is invalidated (that 0/0 blink was one cause of the "odd" percentage);
++ *  - displayed SOC: the gauge RSOC (0x2c), with a one-step direction filter (kern.n2bat_filter): a +-1 % flicker against the sign
++ *    of the measured current is not shown (raw SOC stays in Nord2BatteryRawSOC and the log);
++ *  - iPhone-style keys: CurrentCapacity/MaxCapacity in percent, AppleRawCurrentCapacity/AppleRawMaxCapacity/NominalChargeCapacity in
++ *    mAh from the gauge (RM/FCC), Amperage = AverageCurrent, InstantAmperage = Current, time to empty/full, AdapterDetails;
++ *  - poll every kern.n2bat_poll_ms (10 s, was 30 s); one NORD2 BAT14 line per change or every kern.n2bat_log_s.
++ *  kern.n2bat_legacy=1 = the pre-0701 publishing (kill switch; the polarity fix stays).
++ */
++extern "C" {
++extern unsigned nord2_bat_poll_ms, nord2_bat_hold_s, nord2_bat_filter, nord2_bat_log_s, nord2_bat_legacy;
++extern unsigned nord2_chg_policy_type(void);      /* 0702 (0 = no charger control in this kernel), nord2_battery.c */
++extern const char *nord2_chg_policy_name(void);
++}
++static struct nbg_sample n2b_last;
++static uint64_t n2b_last_ms, n2b_log_ms;
++static unsigned n2b_shown = 101, n2b_last_pg = 9, n2b_last_state = 9, n2b_last_logged = 101, n2b_fail;
++static uint64_t
++n2b_now_ms(void)
++{
++ uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns / 1000000ull;
++}
+ void
+ SweetBattery::pollNord2(void)
+ {
+@@ -223,36 +251,127 @@
+  int rc = fReal ? nord2_battery_platform_sample(&s) : -1;
+  if(rc != 0){s = (struct nbg_sample){};}
+  bool valid = rc == 0 && s.soc_valid && s.percent <= 100;
+- /* Percentage units on BOTH capacity keys; never claim5020mAh for Nord2.
+-  * No voltage-derived SOC or fabricated100% on disabled/transport failure.
+-  * MaxCapacity0 + ErrorCondition explicitly invalidates unavailable SOC. */
++ if(nord2_bat_legacy){
++  setBatteryInstalled(true);
++  setCurrentCapacity(valid ? s.percent : 0);
++  setMaxCapacity(valid ? 100 : 0);
++  setTimeRemaining(-1);
++  setExternalConnected(s.charger_valid && s.external);
++  setExternalChargeCapable(s.charger_valid && s.external);
++  setIsCharging(s.charger_valid && s.charging);
++  setVoltage(s.voltage_valid ? s.pack_mv : 0);
++  setAmperage(s.current_valid ? s.current_ma : 0);
++  setAtWarnLevel(false); setAtCriticalLevel(false);
++  putBool("FullyCharged", s.charger_valid && s.full);
++  putBool("Nord2BatterySOCValid", valid);
++  putBool("Nord2BatteryTemperatureValid", s.temperature_valid);
++  putNumber("Temperature", s.temperature_valid ? (UInt32)s.temperature_centi_c : 0);
++  const OSSymbol *e0 = OSSymbol::withCString(valid ? "" : "Battery sample unavailable");
++  if(e0){setErrorCondition((OSSymbol *)e0);e0->release();}
++  updateStatus();
++  return;
++ }
++ uint64_t now = n2b_now_ms();
++ bool stale = false;
++ if(valid){
++  /* ancillary fields missing in this sample: keep the previous ones (never fabricate on a first sample) */
++  if(!s.temperature_valid && n2b_last.temperature_valid){s.temperature_valid = 1; s.temperature_centi_c = n2b_last.temperature_centi_c;}
++  if(!s.voltage_valid && n2b_last.voltage_valid){s.voltage_valid = 1; s.pack_mv = n2b_last.pack_mv;}
++  n2b_last = s; n2b_last_ms = now; n2b_fail = 0;
++ } else if(n2b_last.soc_valid && now - n2b_last_ms <= (uint64_t)nord2_bat_hold_s * 1000ull){
++  n2b_fail++; s = n2b_last; valid = true; stale = true;
++ } else {
++  n2b_fail++;
++ }
++ int amps = s.avg_valid ? s.avg_current_ma : (s.current_valid ? s.current_ma : 0);
++ bool ampsValid = s.avg_valid || s.current_valid;
++ unsigned shown = valid ? s.percent : 0;
++ if(valid && nord2_bat_filter && n2b_shown <= 100 && ampsValid){
++  /* one-step flicker against the current direction is not shown */
++  if(shown == n2b_shown + 1 && amps < -50) shown = n2b_shown;
++  else if(shown + 1 == n2b_shown && amps > 50) shown = n2b_shown;
++ }
++ if(valid) n2b_shown = shown;
++ bool ext = s.charger_valid && s.external;
++ bool full = ext && s.full;
++ bool chg = ext && s.charging && !full;
++ unsigned fcc = s.capacity_valid ? s.fcc_mah : 4500u;
++ unsigned rm = s.capacity_valid ? s.rm_mah : (4500u * shown + 50u) / 100u;
++ int minutes = -1;
++ if(valid && ampsValid && s.capacity_valid){
++  if(amps < -30) minutes = (int)((uint64_t)rm * 60u / (unsigned)(-amps));
++  else if(chg && amps > 30 && fcc > rm) minutes = (int)((uint64_t)(fcc - rm) * 60u / (unsigned)amps);
++ }
+  setBatteryInstalled(true);
+- setCurrentCapacity(valid ? s.percent : 0);
++ setCurrentCapacity(valid ? shown : 0);
+  setMaxCapacity(valid ? 100 : 0);
+- setTimeRemaining(-1);
+- setExternalConnected(s.charger_valid && s.external);
+- setExternalChargeCapable(s.charger_valid && s.external);
+- setIsCharging(s.charger_valid && s.charging);
++ setTimeRemaining(minutes);
++ setExternalConnected(ext);
++ setExternalChargeCapable(ext);
++ setIsCharging(chg);
+  setVoltage(s.voltage_valid ? s.pack_mv : 0);
+- setAmperage(s.current_valid ? s.current_ma : 0);
+- setAtWarnLevel(false); setAtCriticalLevel(false);
+- putBool("FullyCharged", s.charger_valid && s.full);
++ setAmperage(ampsValid ? amps : 0);
++ setAtWarnLevel(false);
++ setAtCriticalLevel(false);
++ putBool("FullyCharged", full);
++ putBool("AppleRawExternalConnected", ext);
++ putNumber("AppleRawCurrentCapacity", valid ? rm : 0);
++ putNumber("AppleRawMaxCapacity", valid ? fcc : 0);
++ putNumber("NominalChargeCapacity", fcc);
++ putNumber("DesignCapacity", 4500);
++ putNumber("AppleRawBatteryVoltage", s.voltage_valid ? s.pack_mv : 0);
++ putNumber("InstantAmperage", (UInt32)(s.current_valid ? s.current_ma : amps));
++ putNumber("AvgTimeToEmpty", (!chg && minutes > 0) ? (UInt32)minutes : 65535u);
++ putNumber("AvgTimeToFull", (chg && minutes > 0) ? (UInt32)minutes : 65535u);
++ putNumber("Nord2BatteryRawSOC", valid ? s.percent : 0);
+  putBool("Nord2BatterySOCValid", valid);
+  putBool("Nord2BatteryGaugeComputedSOC", valid);
+- putBool("Nord2BatterySOCStale", !valid);
++ putBool("Nord2BatterySOCStale", !valid || stale);
+  putBool("Nord2BatteryChargerValid", s.charger_valid);
+- putBool("Nord2BatteryCurrentValid", s.current_valid);
++ putBool("Nord2BatteryCurrentValid", ampsValid);
+  putBool("Nord2BatteryVoltageValid", s.voltage_valid);
+- putBool("Nord2BatteryTemperatureValid", s.temperature_valid);
++ putBool("Nord2BatteryTemperatureValid", s.temperature_valid && !stale);
+  putNumber("Temperature", s.temperature_valid ? (UInt32)s.temperature_centi_c : 0);
+  putBool("SweetBatterySOCEstimated", false);
+  putBool("SweetBatteryTemperatureEstimated", false);
+  putBool("SweetBatteryFallback", false);
++ if(ext){
++  OSDictionary *ad = OSDictionary::withCapacity(4);
++  if(ad){
++   unsigned vin = s.vin_mv ? s.vin_mv : 5000u, ilim = s.ilim_ma ? s.ilim_ma : 500u;
++   OSNumber *w = OSNumber::withNumber((unsigned long long)((vin * ilim + 500000u) / 1000000u), 32);
++   OSNumber *cu = OSNumber::withNumber((unsigned long long)ilim, 32);
++   OSNumber *vo = OSNumber::withNumber((unsigned long long)vin, 32);
++   OSString *de = OSString::withCString(nord2_chg_policy_type() ? nord2_chg_policy_name() : "usb");
++   if(w){ad->setObject("Watts", w); w->release();}
++   if(cu){ad->setObject("Current", cu); cu->release();}
++   if(vo){ad->setObject("Voltage", vo); vo->release();}
++   if(de){ad->setObject("Description", de); de->release();}
++   const OSSymbol *k = OSSymbol::withCString("AdapterDetails");
++   if(k){setPSProperty(k, ad); k->release();}
++   ad->release();
++  }
++ } else {
++  const OSSymbol *k = OSSymbol::withCString("AdapterDetails");
++  OSDictionary *none = OSDictionary::withCapacity(1);
++  if(k && none){setPSProperty(k, none);}
++  OSSafeReleaseNULL(none); OSSafeReleaseNULL(k);
++ }
+  const OSSymbol *error = OSSymbol::withCString(valid ? "" : "Battery sample unavailable");
+  if(error){setErrorCondition((OSSymbol *)error);error->release();}
+  updateStatus();
+  int mode = valid ? 2 : 3;
+  if(mode != fLastMode){IOLog("NORD2 BATTERY: soc_valid=%d percent=%u charger_valid=%u external=%u charging=%u\n",valid,valid?s.percent:0,s.charger_valid,s.external,s.charging);fLastMode=mode;}
++ bool change = shown != n2b_last_logged || s.power_good != n2b_last_pg || s.chg_state != n2b_last_state || stale;
++ if(change || now - n2b_log_ms >= (uint64_t)nord2_bat_log_s * 1000ull){
++  IOLog("NORD2 BAT14: t=%llus shown=%u raw=%u rm=%u fcc=%u mv=%u cur=%d avg=%d temp=%d.%02dC | chg valid=%u pg=%u state=%u ppm=%u aicl=%u"
++   " ntc=%u fault=%u vin=%umV iin=%umA ichg_adc=%umA ilim=%u ichg_set=%u en=%u hiz=%u | ios ext=%u charging=%u full=%u mins=%d stale=%u fails=%u policy=%s\n",
++   now / 1000ull, shown, valid ? s.percent : 0, s.rm_mah, s.fcc_mah, s.pack_mv, s.current_valid ? s.current_ma : 0, s.avg_valid ? s.avg_current_ma : 0,
++   s.temperature_centi_c / 100, (s.temperature_centi_c < 0 ? -s.temperature_centi_c : s.temperature_centi_c) % 100,
++   s.charger_valid, s.power_good, s.chg_state, s.ppm, s.aicl, s.ntc_fault, s.chg_fault, s.vin_mv, s.iin_ma, s.ichg_adc_ma, s.ilim_ma, s.ichg_set_ma,
++   s.chg_en, s.learn, ext, chg, full, minutes, stale, n2b_fail, nord2_chg_policy_type() ? nord2_chg_policy_name() : "off");
++  n2b_log_ms = now; n2b_last_logged = shown; n2b_last_pg = s.power_good; n2b_last_state = s.chg_state;
++ }
+ }
+ #endif
+ 
+@@ -308,7 +427,11 @@
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
+ 		self->poll();
++#if defined(NORD2)
++		{ unsigned ms = nord2_bat_poll_ms; sender->setTimeoutMS(ms < 2000 ? 2000 : ms > 60000 ? 60000 : ms); }   /* 0701 */
++#else
+ 		sender->setTimeoutMS(30000);
++#endif
+ 	}
+ }
+ 
+@@ -334,7 +457,11 @@
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
++#if defined(NORD2)
++			fTimer->setTimeoutMS(5000);   /* 0701: first real sample 5 s after start */
++#else
+ 			fTimer->setTimeoutMS(30000);
++#endif
+ 		} else {
+ 			fReal = false;
+ 			poll();
+--- a/iokit/Kernel/arm/mtk_i2c_read.c
++++ b/iokit/Kernel/arm/mtk_i2c_read.c
+@@ -5,8 +5,11 @@
+ /* Selected MT6893 I2Cv2 PIO derivative, GPL-2.0 source contract documented. */
+ #include "mtk_i2c_read.h"
+ static int allowed(unsigned b,unsigned s,unsigned cmd,unsigned n){
+- if(b==7&&s==0x55&&n==2)return cmd==0x2c||cmd==8||cmd==6||cmd==0x0c;
+- return b==11&&s==0x5c&&n==1&&(cmd==0x13||cmd==0x14);
++ /* 0701: + bq28z610/bq27541 standard 0x0a flags, 0x10 RM, 0x12 FCC, 0x14 AverageCurrent; MP2650 REG00..REG15 (byte)
++  * and its ADC words 0x16/0x18/0x1a/0x1c/0x1e/0x28 (oplus_mp2650.h, all read-only status/config registers). */
++ if(b==7&&s==0x55&&n==2)return cmd==0x2c||cmd==8||cmd==6||cmd==0x0c||cmd==0x0a||cmd==0x10||cmd==0x12||cmd==0x14;
++ if(b==11&&s==0x5c&&n==1)return cmd<=0x15;
++ return b==11&&s==0x5c&&n==2&&(cmd==0x16||cmd==0x18||cmd==0x1a||cmd==0x1c||cmd==0x1e||cmd==0x28);
+ }
+ int nbg_i2c_read(const struct nbg_i2c_io *o,void *c,struct nbg_i2c_state *s,
+  unsigned bus,unsigned slave,unsigned cmd,unsigned count,uint16_t *value){
+--- a/iokit/Kernel/arm/nord2_battery.c
++++ b/iokit/Kernel/arm/nord2_battery.c
+@@ -3,12 +3,31 @@
+ #endif
+ #if defined(NORD2)
+ #include "nord2_battery.h"
++/* 0701 knobs (sysctl in the kernel build; plain globals in host tests) */
++unsigned nord2_bat_poll_ms = 10000, nord2_bat_hold_s = 120, nord2_bat_filter = 1, nord2_bat_log_s = 60, nord2_bat_legacy = 0;
++unsigned nord2_chg_pg_active_low = 0;   /* 1 = the pre-0701 (wrong, v1 header) REG13 bit1 polarity */
++#if defined(KERNEL)
++#include <sys/types.h>
++#include <sys/sysctl.h>
++SYSCTL_UINT(_kern, OID_AUTO, n2bat_poll_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_bat_poll_ms, 0, "0701: battery poll period ms (2000..60000)");
++SYSCTL_UINT(_kern, OID_AUTO, n2bat_hold_s, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_bat_hold_s, 0, "0701: hold the last valid gauge sample s");
++SYSCTL_UINT(_kern, OID_AUTO, n2bat_filter, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_bat_filter, 0, "0701: 1 = hide one-step SOC flicker against the current");
++SYSCTL_UINT(_kern, OID_AUTO, n2bat_log_s, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_bat_log_s, 0, "0701: NORD2 BAT14 log period s");
++SYSCTL_UINT(_kern, OID_AUTO, n2bat_legacy, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_bat_legacy, 0, "0701: 1 = pre-0701 IOPMPowerSource publishing");
++SYSCTL_UINT(_kern, OID_AUTO, n2chg_pg_active_low, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_chg_pg_active_low, 0, "0701: 1 = old MP2650 power-good polarity");
++#endif
++/* 0702 replaces these with the charger policy; 0701 alone has no charger control. */
++unsigned nord2_chg_policy_type(void);
++const char *nord2_chg_policy_name(void);
++unsigned nord2_chg_policy_type(void) { return 0; }
++const char *nord2_chg_policy_name(void) { return "off"; }
+ static int get(const struct nbg_ops *o,void *c,unsigned bus,unsigned slave,unsigned reg,unsigned bytes,uint16_t *v){
+  return o->owned(c)||o->read(c,bus,slave,reg,bytes,v);
+ }
+ static int capture(const struct nbg_ops *o,void *c,struct nbg_sample *s,unsigned bit,unsigned bus,unsigned slave,unsigned reg,unsigned bytes,uint16_t *v){
+  int e=get(o,c,bus,slave,reg,bytes,v);if(!e)s->raw_valid|=1u<<bit;return e;
+ }
++static int signed_ma(uint16_t raw){return (raw&0x8000)?(int)raw-65536:(int)raw;}
+ int nbg_collect(const struct nbg_ops *o,void *c,unsigned enabled,unsigned identified,struct nbg_sample *s){
+  if(!s)return -1;
+  *s=(struct nbg_sample){0};s->error=-1;
+@@ -26,20 +45,57 @@
+   * Gauge current is positive charging; Linux getter negates for its API,
+   * IOPMPowerSource uses positive charging so preserve signed word here. */
+  if(identified==1&&!capture(o,c,s,4,7,0x55,0x0c,2,&s->raw_current)&&s->raw_current!=0x8000){
+-  s->current_ma=(s->raw_current&0x8000)?(int)s->raw_current-65536:s->raw_current;
++  s->current_ma=signed_ma(s->raw_current);
+   if(s->current_ma>=-15000&&s->current_ma<=15000)s->current_valid=1;
+  }
+- /* MP2650 source REG13 powergood active-low, charging[3:2], REG14 faults.
++ /* 0701: AverageCurrent (standard 0x14, signed mA, + = charging), capacities (mAh) and BatteryStatus. */
++ if(!capture(o,c,s,8,7,0x55,0x14,2,&s->raw_avg_current)&&s->raw_avg_current!=0x8000){
++  s->avg_current_ma=signed_ma(s->raw_avg_current);
++  if(s->avg_current_ma>=-15000&&s->avg_current_ma<=15000)s->avg_valid=1;
++ }
++ if(!capture(o,c,s,9,7,0x55,0x10,2,&s->raw_rm)&&!capture(o,c,s,10,7,0x55,0x12,2,&s->raw_fcc)&&
++    s->raw_fcc>=1000&&s->raw_fcc<=6000&&s->raw_rm<=s->raw_fcc+200){s->capacity_valid=1;s->rm_mah=s->raw_rm;s->fcc_mah=s->raw_fcc;}
++ (void)capture(o,c,s,11,7,0x55,0x0a,2,&s->raw_flags);
++ /* MP2650 REG13 (v2 HAL oplus_hal_mp2650.h, the corrected polarity): bit1 VIN power good = 1, charging[3:2],
++  * PPM bit4 (VINDPM/IINDPM active), AICL bit5.  REG14 faults.  0701 FIX: before, bit1 was read as active-low, so a
++  * connected charger (status 0x3b = good, fast charge) was reported as external=0 charging=0.
+   * Independent optional charger bus; do not infer cable solely from current. */
+  if(!capture(o,c,s,5,11,0x5c,0x13,1,&s->raw_status[0])&&
+     !capture(o,c,s,6,11,0x5c,0x14,1,&s->raw_fault)&&
+     !capture(o,c,s,7,11,0x5c,0x13,1,&s->raw_status[1])&&
+     s->raw_status[0]<=255&&s->raw_status[1]<=255&&s->raw_fault<=255&&
+     ((s->raw_status[0]^s->raw_status[1])&0x0e)==0){
+-  s->charger_valid=1;s->external=!(s->raw_status[1]&2);
+-  unsigned state=(s->raw_status[1]>>2)&3;
+-  s->charging=s->external&&(state==1||state==2)&&!(s->raw_fault&0x3f);
+-  s->full=s->external&&state==3&&!(s->raw_fault&0x3f);
++  s->charger_valid=1;
++  unsigned st=s->raw_status[1];
++  s->power_good=((st>>1)&1)^(nord2_chg_pg_active_low?1u:0u);s->external=s->power_good;
++  s->chg_state=(st>>2)&3;s->ppm=(st>>4)&1;s->aicl=(st>>5)&1;
++  s->ntc_fault=s->raw_fault&7;s->bat_ovp=(s->raw_fault>>3)&1;s->chg_fault=(s->raw_fault>>4)&3;
++  s->charging=s->external&&(s->chg_state==1||s->chg_state==2)&&!s->bat_ovp&&!s->chg_fault;
++  s->full=s->external&&s->chg_state==3&&!s->bat_ovp&&!s->chg_fault;
++  /* 0701: configuration + ADC snapshot (read only), only while the charger answers. */
++  for(unsigned r=0;r<NBG_CHG_REGS;r++){
++   uint16_t v=0;
++   if(r==0x13){s->chg_reg[r]=(uint8_t)st;s->chg_regs_valid|=1u<<r;continue;}
++   if(r==0x14){s->chg_reg[r]=(uint8_t)s->raw_fault;s->chg_regs_valid|=1u<<r;continue;}
++   if(get(o,c,11,0x5c,r,1,&v)||v>255)break;
++   s->chg_reg[r]=(uint8_t)v;s->chg_regs_valid|=1u<<r;
++  }
++  static const uint8_t words[NBG_CHG_WORDS]={0x16,0x18,0x1a,0x1c,0x1e,0x28};
++  for(unsigned i=0;i<NBG_CHG_WORDS&&s->chg_regs_valid==(1u<<NBG_CHG_REGS)-1;i++){
++   uint16_t v=0;if(get(o,c,11,0x5c,words[i],2,&v))break;
++   s->chg_word[i]=v;s->chg_words_valid|=1u<<i;
++  }
++  if(s->chg_regs_valid&1)s->ilim_ma=(s->chg_reg[0]&0x7f)*50u;
++  if(s->chg_regs_valid&2)s->vindpm_mv=s->chg_reg[1]*100u;
++  if(s->chg_regs_valid&4)s->ichg_set_ma=s->chg_reg[2]*50u;
++  if(s->chg_regs_valid&0x10)s->vfloat_cell_mv=(37125u+125u*((s->chg_reg[4]>>1)&0x3f))/10u;
++  if(s->chg_regs_valid&0x100){s->learn=(s->chg_reg[8]>>3)&1;s->chg_en=(s->chg_reg[8]>>4)&1;s->otg=(s->chg_reg[8]>>5)&1;}
++  if(s->chg_regs_valid&0x200)s->wdt=(s->chg_reg[9]>>4)&3;
++  if(s->chg_words_valid&1)s->vbat_chg_mv=(unsigned)((s->chg_word[0]>>6)*125u/10u);
++  if(s->chg_words_valid&4)s->ichg_adc_ma=(unsigned)((s->chg_word[2]>>6)*125u/10u);
++  if(s->chg_words_valid&8)s->vin_mv=(unsigned)((s->chg_word[3]>>6)*25u);
++  if(s->chg_words_valid&16)s->iin_ma=(unsigned)((s->chg_word[4]>>6)*625u/100u);
++  if(s->chg_words_valid&32)s->idis_ma=(unsigned)((s->chg_word[5]>>6)*125u/10u);
+  }
+  return 0;
+ }
+--- a/iokit/Kernel/arm/nord2_battery.h
++++ b/iokit/Kernel/arm/nord2_battery.h
+@@ -6,20 +6,35 @@
+  * Caller serializes against controller users/VOOC gauge master and proves
+  * the selected pre-VOOC default policy, correct bus/pinmux/clock ownership.
+  * If a VOOC protocol driver is later added it must supply its real dynamic
+- * allow_reading gate; this observer implements no fastcharge negotiation. */
++ * allow_reading gate; this observer implements no fastcharge negotiation.
++ * (0702 adds the only writes, in nord2_charger.h, through a separate entry point.) */
+ struct nbg_ops {
+  int (*owned)(void *);
+  int (*read)(void *,unsigned bus,unsigned slave,unsigned command,unsigned bytes,uint16_t *);
+  int (*delay_ms)(void *,unsigned);
+ };
+ /* current_register_identified must prove BQ28Z610/ZY0603 source identity;
+- * no arbitrary device-ID constants or automatic control writes here. */
++ * no arbitrary device-ID constants or automatic control writes here.
++ * 0701: the Nord 2 (20827) DT declares the gauge `qcom,batt_bq28z610` (cust_mt6893_oplus_charge_20827.dtsi
++ * bq27541-battery@55) and Oplus selects Current = 0x0c for it (oplus_bq27541.c gauge_set_device_type), so the platform
++ * passes identified = 1.  AverageCurrent 0x14, RemainingCapacity 0x10, FullChargeCapacity 0x12 and BatteryStatus 0x0a are
++ * standard commands of both bq27541 and bq28z610. */
++#define NBG_CHG_REGS  0x16u    /* MP2650 REG00..REG15 (1 byte each) */
++#define NBG_CHG_WORDS 6u       /* MP2650 ADC words 0x16 VBAT, 0x18 VSYS, 0x1a ICHG, 0x1c VIN, 0x1e IIN, 0x28 IDIS */
+ struct nbg_sample {
+  uint16_t raw_soc[2],raw_voltage,raw_temperature,raw_current,raw_status[2],raw_fault;
+- unsigned raw_valid; /*bits0/1SOC1/2,2voltage,3temp,4current,5status0,6fault,7status1*/
++ unsigned raw_valid; /*bits0/1SOC1/2,2voltage,3temp,4current,5status0,6fault,7status1,8avgcur,9rm,10fcc,11flags*/
+  unsigned soc_valid,voltage_valid,temperature_valid,current_valid,charger_valid;
+  unsigned percent,pack_mv;int temperature_centi_c,current_ma;
+  unsigned external,charging,full;int error;
++ /* 0701 */
++ uint16_t raw_avg_current,raw_rm,raw_fcc,raw_flags;
++ unsigned avg_valid,capacity_valid;int avg_current_ma;unsigned rm_mah,fcc_mah;
++ uint8_t chg_reg[NBG_CHG_REGS];unsigned chg_regs_valid;      /* bit n = REGn read */
++ uint16_t chg_word[NBG_CHG_WORDS];unsigned chg_words_valid;
++ unsigned vin_mv,iin_ma,ichg_adc_ma,vbat_chg_mv,idis_ma;
++ unsigned power_good,chg_state,ppm,aicl,ntc_fault,chg_fault,bat_ovp,chg_en,learn,otg,wdt;
++ unsigned ilim_ma,ichg_set_ma,vindpm_mv,vfloat_cell_mv;
+ };
+ int nbg_collect(const struct nbg_ops *,void *,unsigned enabled,unsigned current_register_identified,struct nbg_sample *);
+ #endif
+--- a/iokit/Kernel/arm/nord2_battery_platform.cpp
++++ b/iokit/Kernel/arm/nord2_battery_platform.cpp
+@@ -15,6 +15,7 @@
+ extern void IOLog(const char *,...) __attribute__((format(printf,1,2)));
+ extern vm_offset_t ml_io_map(vm_offset_t,vm_size_t);
+ extern void delay(int);
++extern volatile uint32_t nord2_chg_vbus_good;   /* 0700 sweet_usb.c: VBUS seen by the charger (late USB attach) */
+ }
+ struct nbg_map {uint32_t pa;vm_size_t size;vm_offset_t va;};
+ static struct nbg_map maps[]={{0x10000000,0x1000,0},{0x1000c000,0x1000,0},{0x10005000,0x1000,0},
+@@ -25,6 +26,23 @@
+ static int bus_last_rc[2];
+ static unsigned sample_logged,sample_last_valid;
+ static int sample_last_rc;
++/* 0701: charger configuration dump on change (ADC words excluded) or every 30th sample */
++static uint8_t chg_last[NBG_CHG_REGS];
++static unsigned chg_last_valid,chg_dumps,chg_samples;
++static void report_charger(const struct nbg_sample *s){
++ chg_samples++;
++ bool same=s->chg_regs_valid==chg_last_valid;
++ for(unsigned i=0;same&&i<NBG_CHG_REGS;i++)if(i!=0x13&&chg_last[i]!=s->chg_reg[i])same=false;
++ if(same&&(chg_samples%30))return;
++ for(unsigned i=0;i<NBG_CHG_REGS;i++)chg_last[i]=s->chg_reg[i];
++ chg_last_valid=s->chg_regs_valid;chg_dumps++;
++ const uint8_t *r=s->chg_reg;
++ IOLog("NORD2 CHG REGS: valid=%#x 00=%02x 01=%02x 02=%02x 03=%02x 04=%02x 05=%02x 06=%02x 07=%02x 08=%02x 09=%02x 0a=%02x 0b=%02x"
++  " 0c=%02x 0d=%02x 0e=%02x 0f=%02x 10=%02x 11=%02x 12=%02x 13=%02x 14=%02x 15=%02x\n",s->chg_regs_valid,
++  r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7],r[8],r[9],r[10],r[11],r[12],r[13],r[14],r[15],r[16],r[17],r[18],r[19],r[20],r[21]);
++ IOLog("NORD2 CHG CFG: dump=%u ilim=%umA vindpm=%umV ichg_set=%umA vfloat=%umV/cell chg_en=%u learn(hiz)=%u otg=%u wdt=%u words=%#x\n",chg_dumps,
++  s->ilim_ma,s->vindpm_mv,s->ichg_set_ma,s->vfloat_cell_mv,s->chg_en,s->learn,s->otg,s->wdt,s->chg_words_valid);
++}
+ static void report_bus(unsigned bus,int rc,const struct nbg_i2c_state *s){
+  unsigned i=bus==7?0:1;
+  if(bus_logged[i]&&bus_last_stage[i]==s->stage&&bus_last_failure[i]==s->failure&&bus_last_rc[i]==rc)return;
+@@ -72,7 +90,9 @@
+  if(!__sync_bool_compare_and_swap(&busy,0u,1u)){*s=(struct nbg_sample){};s->error=-1;return -1;}
+  /* Nocontrol-device-type query yet: SOC standardread available, current0c
+   * deliberately unavailable rather than guessing BQ/ZY installed identity. */
+- int e=nbg_collect(&ops,0,1,0,s);
++ int e=nbg_collect(&ops,0,1,1,s);   /* 0701: identified = 1, DT qcom,batt_bq28z610 (see nord2_battery.h) */
++ nord2_chg_vbus_good=s->charger_valid?s->power_good:(e?2u:nord2_chg_vbus_good);
++ if(s->charger_valid)report_charger(s);
+  unsigned valid=s->raw_valid|(s->soc_valid<<8)|(s->charger_valid<<9);
+  if(!sample_logged||sample_last_valid!=valid||sample_last_rc!=e){
+   sample_logged=1;sample_last_valid=valid;sample_last_rc=e;

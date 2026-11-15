@@ -1,0 +1,312 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -80,6 +80,39 @@
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * 0700 (usbchg-20261115): boot WITHOUT a USB host.
++ * Before 0700, mode 23 (the normal iOS boot) treated "no usable USB" as a diagnostic stop point: when the phone is powered on
++ * without a cable the preloader/LK never powers the SSUSB block, INFRA_CG3 keeps the USB clocks gated, nord2_usb_probe() went
++ * to `done` and nord2_stop_at(23) left XNU (stub chain-back to LK fastboot, the RTC AUTOFB bit) = the "kernel hangs" report.
++ * Now mode 23 logs the reason and keeps booting without the console; a late thread re-checks the USB state.
++ *   kern.n2usb_strict  1 = the old behaviour (any USB unavailability in mode 23 leaves XNU), default 0
++ *   kern.n2usb_late    0 = no late thread work, 1 = passive (read-only re-check of the clock/IP gates every 2 s, start the console
++ *                      when LK-equivalent state appears), 2 = also power the USB block up ourselves once VBUS is seen (clock
++ *                      ungating + IPPC device power-on, Linux mtu3 order; EXPERIMENTAL), default 1
++ *   kern.n2usb_state   (read) 0 not run, 1 console up at boot, 2 no USB at boot (booted on), 3 late console up, 4 refused, 5 stopped
++ *   kern.n2usb_reason  (read) why the console was unavailable (N2USB_WHY_*)
++ * Log: the NORD2 USB14 lines below.
++ */
++#include <sys/sysctl.h>
++enum { N2USB_WHY_NONE = 0, N2USB_WHY_SMP = 1, N2USB_WHY_MAP = 2, N2USB_WHY_CLOCK = 3, N2USB_WHY_INACTIVE = 4, N2USB_WHY_THREAD = 5,
++       N2USB_WHY_TIMEOUT = 6, N2USB_WHY_CPUS = 7, N2USB_WHY_REFUSED = 8 };
++static uint32_t n2usb_strict;
++static uint32_t n2usb_late = 1;
++static uint32_t n2usb_state;
++static uint32_t n2usb_reason;
++static uint32_t n2usb_late_checks, n2usb_powerups;
++/* written by the battery/charger poll (0701): 1 = MP2650 reports VIN power good, 0 = no VBUS, 2 = unknown (no sample yet) */
++extern volatile uint32_t nord2_chg_vbus_good;
++volatile uint32_t nord2_chg_vbus_good = 2;
++SYSCTL_UINT(_kern, OID_AUTO, n2usb_strict, CTLFLAG_RW | CTLFLAG_LOCKED, &n2usb_strict, 0,
++    "0700: 1 = mode 23 leaves XNU when USB is unavailable (old behaviour)");
++SYSCTL_UINT(_kern, OID_AUTO, n2usb_late, CTLFLAG_RW | CTLFLAG_LOCKED, &n2usb_late, 0,
++    "0700: 0 off, 1 passive USB re-check every 2 s, 2 + power the USB block up when VBUS is seen (experimental)");
++SYSCTL_UINT(_kern, OID_AUTO, n2usb_state, CTLFLAG_RD | CTLFLAG_LOCKED, &n2usb_state, 0, "0700: USB console state");
++SYSCTL_UINT(_kern, OID_AUTO, n2usb_reason, CTLFLAG_RD | CTLFLAG_LOCKED, &n2usb_reason, 0, "0700: why USB was unavailable");
++static void n2usb_no_host_boot(unsigned why);
++
+ void
+ nord2_usb_probe(void)
+ {
+@@ -90,6 +123,7 @@
+ 	}
+ 	if ((stop == 21 || stop == 22 || stop == 23) && !nord2_smp_userland_ready()) {
+ 		printf("NORD2 USB: all8 SMP pass required before USB/userland\n");
++		n2usb_reason = N2USB_WHY_SMP;
+ 		goto done;
+ 	}
+ 	if (stop == 13) {
+@@ -101,6 +135,7 @@
+ 	vm_offset_t top = ml_io_map(0x10000000, 0x1000);
+ 	if (!infra || !top) {
+ 		printf("NORD2 USB: clock mapping failed\n");
++		n2usb_reason = N2USB_WHY_MAP;
+ 		goto done;
+ 	}
+ 	uint32_t cg = nord2_usb_read(infra, 0xac);
+@@ -111,11 +146,13 @@
+ 	if ((cg & ((1u << 1) | (1u << 31))) || (cfg9 & (1u << 31)) ||
+ 	    (cfg10 & (1u << 7))) {
+ 		printf("NORD2 USB: clock gated; IPPC/MAC not read\n");
++		n2usb_reason = N2USB_WHY_CLOCK;
+ 		goto done;
+ 	}
+ 	vm_offset_t ippc = ml_io_map(0x11203e00, 0x100);
+ 	if (!ippc) {
+ 		printf("NORD2 USB: IPPC mapping failed\n");
++		n2usb_reason = N2USB_WHY_MAP;
+ 		goto done;
+ 	}
+ 	const uint16_t ipregs[] = {0, 4, 8, 0x10, 0x14, 0x18, 0x28,
+@@ -129,11 +166,13 @@
+ 	uint32_t port = nord2_usb_read(ippc, 0x50);
+ 	if ((power & 1) || !(status & 1) || (port & 7)) {
+ 		printf("NORD2 USB: device inactive; MAC not read\n");
++		n2usb_reason = N2USB_WHY_INACTIVE;
+ 		goto done;
+ 	}
+ 	vm_offset_t mac = ml_io_map(0x11201000, 0x2e00);
+ 	if (!mac) {
+ 		printf("NORD2 USB: MAC mapping failed\n");
++		n2usb_reason = N2USB_WHY_MAP;
+ 		goto done;
+ 	}
+ 	if (stop == 14 || stop == 15) {
+@@ -147,6 +186,7 @@
+ 		PE_parse_boot_argn("cpus", &cpus, sizeof(cpus));
+ 		if ((stop == 16 && cpus != 1) || ((stop == 21 || stop == 22 || stop == 23) && cpus != 8)) {
+ 			printf("NORD2 USB: invalid background CPU configuration\n");
++			n2usb_reason = N2USB_WHY_CPUS;
+ 			goto done;
+ 		}
+ 		thread_t thread;
+@@ -155,6 +195,7 @@
+ 		__atomic_store_n(&nusb_background_state, 0, __ATOMIC_RELEASE);
+ 		if (kernel_thread_start(nusb_background_thread, (void *)mac, &thread) != KERN_SUCCESS) {
+ 			printf("NORD2 USB: background thread creation failed\n");
++			n2usb_reason = N2USB_WHY_THREAD;
+ 			goto done;
+ 		}
+ 		thread_deallocate(thread);
+@@ -165,9 +206,11 @@
+ 		}
+ 		if (__atomic_load_n(&nusb_background_state, __ATOMIC_ACQUIRE) == 1) {
+ 			printf("NORD2 USB: background console ready; continuing BSD boot\n");
++			if (stop == 23) { n2usb_state = 1; printf("NORD2 USB14: console up at boot (host cable present)\n"); }
+ 			return;  /* Continue root selection while the bounded USB service runs. */
+ 		}
+ 		printf("NORD2 USB: background initialization failed or timed out\n");
++		n2usb_reason = __atomic_load_n(&nusb_background_state, __ATOMIC_ACQUIRE) == 2 ? N2USB_WHY_REFUSED : N2USB_WHY_TIMEOUT;
+ 		goto done;
+ 	}
+ 	/* Status registers are W1C, not read-to-clear. Never read the FIFOs. */
+@@ -183,6 +226,11 @@
+ 	}
+  done:
+ 	printf("NORD2 USB: MTU3 snapshot end\n");
++	/* 0700: in the normal iOS mode a missing/unusable USB is not a stop point (SMP failure still is). */
++	if (stop == 23 && !n2usb_strict && n2usb_reason != N2USB_WHY_SMP) {
++		n2usb_no_host_boot(n2usb_reason);
++		return;
++	}
+ 	nord2_stop_at((unsigned)stop, stop == 13 ? "after read-only MTU3 snapshot" :
+ 	    stop == 14 ? "after bounded MTU3 USB console" :
+ 	    stop == 15 ? "after bounded MTU3 PHY USB console" :
+@@ -658,10 +706,184 @@
+ 	nord2_usb_enumerate((vm_offset_t)arg, true, true);
+ 	__atomic_store_n(&nusb_background_state, 2, __ATOMIC_RELEASE);
+ 	/* Diagnostic modes time out; mode23 returns only if setup was refused. */
+-	nord2_stop_at(nusb_background_stop, "after background MTU3 USB console");
++	if (nusb_background_stop == 23 && !n2usb_strict) {
++		/* 0700: a refused/ended console no longer takes the running system down. */
++		n2usb_state = n2usb_state == 1 || n2usb_state == 3 ? 5 : 4;
++		printf("NORD2 USB14: console service ended (state %u); iOS keeps running without USB console\n", n2usb_state);
++	} else {
++		nord2_stop_at(nusb_background_stop, "after background MTU3 USB console");
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* ---- 0700: boot without a host, late console ---- */
++static const char *const n2usb_why_name[] = {"none", "SMP not ready", "mapping failed", "USB clocks gated (no cable at power-on)",
++    "USB IP inactive", "thread creation failed", "console start timed out", "cpus != 8", "console refused"};
++
++/* Read-only check of the same gates nord2_usb_probe() checks; 0 = the MAC can be used (mac returned). */
++static unsigned
++n2usb_gate_check(vm_offset_t *mac_out, uint32_t r[6])
++{
++	static vm_offset_t infra, top, ippc, mac;
++	r[0] = r[1] = r[2] = r[3] = r[4] = r[5] = 0;
++	if (!infra) { infra = ml_io_map(0x10001000, 0x1000); }
++	if (!top) { top = ml_io_map(0x10000000, 0x1000); }
++	if (!infra || !top) { return N2USB_WHY_MAP; }
++	r[0] = nord2_usb_read(infra, 0xac);
++	r[1] = nord2_usb_read(top, 0xa0);
++	r[2] = nord2_usb_read(top, 0xb0);
++	if ((r[0] & ((1u << 1) | (1u << 31))) || (r[1] & (1u << 31)) || (r[2] & (1u << 7))) { return N2USB_WHY_CLOCK; }
++	if (!ippc) { ippc = ml_io_map(0x11203e00, 0x100); }
++	if (!ippc) { return N2USB_WHY_MAP; }
++	r[3] = nord2_usb_read(ippc, 8);
++	r[4] = nord2_usb_read(ippc, 0x14);
++	r[5] = nord2_usb_read(ippc, 0x50);
++	if ((r[3] & 1) || !(r[4] & 1) || (r[5] & 7)) { return N2USB_WHY_INACTIVE; }
++	if (!mac) { mac = ml_io_map(0x11201000, 0x2e00); }
++	if (!mac) { return N2USB_WHY_MAP; }
++	*mac_out = mac;
++	return N2USB_WHY_NONE;
++}
++
++static void
++n2usb_wr32(vm_offset_t base, uint32_t offset, uint32_t value)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + offset) = value;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/*
++ * kern.n2usb_late=2 only (EXPERIMENTAL): what the preloader does when it sees a cable, Linux order (clk-mt6885.c gates,
++ * mtu3 ssusb_ip_sw_reset/mtu3_device_enable without the IP reset):  usb_sel PDN (CLK_CFG_9 bit 31) and ssusb_xhci_sel PDN
++ * (CLK_CFG_10 bit 7) cleared through the _CLR registers + CLK_CFG_UPDATE1 bits 8/9; INFRA_CG3 ifrao_ssusb (1) and
++ * ifrao_ssusb_xhci (31) ungated through CG3_CLR 0xa8; IPPC: device IP power on (CTRL2 bit 0 = 0), host IP down (CTRL1 bit 0),
++ * U2 port enabled/powered/device (U2_CTRL_P0 bits 0..2 = 0); wait for SYSPLL stable (STS1 bit 0) and U2 MAC reset release
++ * (STS2 bit 0), at most 200 ms.  Never touches the PHY analog, regulators, the MT6360 USB switch or the charger.
++ */
++static void
++n2usb_power_up(void)
++{
++	vm_offset_t top = ml_io_map(0x10000000, 0x1000), infra = ml_io_map(0x10001000, 0x1000);
++	if (!top || !infra) { printf("NORD2 USB14: power-up mapping failed\n"); return; }
++	uint32_t before = nord2_usb_read(infra, 0xac);
++	n2usb_wr32(top, 0xa8, 1u << 31);
++	n2usb_wr32(top, 0x8, 1u << 8);
++	n2usb_wr32(top, 0xb8, 1u << 7);
++	n2usb_wr32(top, 0x8, 1u << 9);
++	delay(20);
++	n2usb_wr32(infra, 0xa8, (1u << 1) | (1u << 31));
++	delay(20);
++	uint32_t cg = nord2_usb_read(infra, 0xac), c9 = nord2_usb_read(top, 0xa0), c10 = nord2_usb_read(top, 0xb0);
++	if ((cg & ((1u << 1) | (1u << 31))) || (c9 & (1u << 31)) || (c10 & (1u << 7))) {
++		printf("NORD2 USB14: power-up: clocks still gated CG3 %08x->%08x CFG9=%08x CFG10=%08x\n", before, cg, c9, c10);
++		return;
++	}
++	vm_offset_t ippc = ml_io_map(0x11203e00, 0x100);
++	if (!ippc) { printf("NORD2 USB14: power-up IPPC mapping failed\n"); return; }
++	n2usb_wr32(ippc, 8, nord2_usb_read(ippc, 8) & ~1u);
++	n2usb_wr32(ippc, 4, nord2_usb_read(ippc, 4) | 1u);
++	n2usb_wr32(ippc, 0x50, nord2_usb_read(ippc, 0x50) & ~7u);
++	uint32_t s1 = 0, s2 = 0;
++	unsigned ms = 0;
++	for (; ms < 200; ms++) {
++		s1 = nord2_usb_read(ippc, 0x10); s2 = nord2_usb_read(ippc, 0x14);
++		if ((s1 & 1) && (s2 & 1)) { break; }
++		nusb_sleep_ms(1);
++	}
++	printf("NORD2 USB14: power-up clocks CG3 %08x->%08x, IPPC ctrl2=%08x u2=%08x sts1=%08x sts2=%08x after %u ms%s\n",
++	    before, cg, nord2_usb_read(ippc, 8), nord2_usb_read(ippc, 0x50), s1, s2, ms, ms >= 200 ? " (NOT stable)" : "");
++}
++
++static bool
++n2usb_start_console(vm_offset_t mac)
++{
++	thread_t thread;
++	nusb_smp = true;
++	nusb_background_stop = 23;
++	__atomic_store_n(&nusb_background_state, 0, __ATOMIC_RELEASE);
++	if (kernel_thread_start(nusb_background_thread, (void *)mac, &thread) != KERN_SUCCESS) { return false; }
++	thread_deallocate(thread);
++	for (unsigned i = 0; !__atomic_load_n(&nusb_background_state, __ATOMIC_ACQUIRE) && i < 10000; i++) {
++		nusb_sleep_ms(1);
++	}
++	return __atomic_load_n(&nusb_background_state, __ATOMIC_ACQUIRE) == 1;
++}
++
++static void
++n2usb_late_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	unsigned last = ~0u;
++	for (;;) {
++		nusb_sleep_ms(2000);
++		if (!n2usb_late) { continue; }
++		n2usb_late_checks++;
++		vm_offset_t mac = 0;
++		uint32_t r[6];
++		unsigned why = n2usb_gate_check(&mac, r);
++		uint32_t vbus = nord2_chg_vbus_good;
++		if (why != last || (n2usb_late_checks % 150) == 0) {
++			printf("NORD2 USB14: late check %u why=%u CG3=%08x CFG9=%08x CFG10=%08x IPPC pw=%08x sts2=%08x u2=%08x vbus=%u late=%u\n",
++			    n2usb_late_checks, why, r[0], r[1], r[2], r[3], r[4], r[5], vbus, n2usb_late);
++			last = why;
++		}
++		if (why == N2USB_WHY_NONE) {
++			if (n2usb_start_console(mac)) {
++				n2usb_state = 3;
++				printf("NORD2 USB14: late console up after %u checks (%u power-ups)\n", n2usb_late_checks, n2usb_powerups);
++			} else {
++				printf("NORD2 USB14: late console start failed (state %u); late thread ends\n",
++				    __atomic_load_n(&nusb_background_state, __ATOMIC_ACQUIRE));
++			}
++			break;
++		}
++		if ((why == N2USB_WHY_CLOCK || why == N2USB_WHY_INACTIVE) && n2usb_late >= 2 && vbus == 1 && n2usb_powerups < 3) {
++			n2usb_powerups++;
++			n2usb_power_up();
++		}
++	}
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
++
++static void
++n2usb_no_host_boot(unsigned why)
++{
++	n2usb_state = 2;
++	printf("NORD2 USB14: no usable USB at boot (why=%u: %s); booting on without the USB console (kern.n2usb_strict=1 restores the stop)\n",
++	    why, why < sizeof(n2usb_why_name) / sizeof(n2usb_why_name[0]) ? n2usb_why_name[why] : "?");
++	if (why == N2USB_WHY_TIMEOUT || why == N2USB_WHY_REFUSED || why == N2USB_WHY_CPUS) {
++		return;   /* a console thread exists or the configuration is wrong: no second owner */
++	}
++	thread_t thread;
++	if (kernel_thread_start(n2usb_late_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("NORD2 USB14: late thread not started\n");
++	}
++}
++
++/* For the charger policy (0702): SETUP requests seen on EP0 since the console started (0 = no console).  Only SETUPs: a wall
++ * charger (DCP, D+/D- shorted) can make the MAC report bus resets, but never sends a SETUP packet. */
++uint32_t nord2_usb_host_events(void);
++uint32_t
++nord2_usb_host_events(void)
++{
++	return nusb.owned ? nusb.requests : 0;
++}
++uint32_t nord2_usb_configured(void);
++uint32_t
++nord2_usb_configured(void)
++{
++	return nusb.owned && nusb.configuration ? 1u : 0u;
++}
++uint32_t nord2_usb_console_state(void);
++uint32_t
++nord2_usb_console_state(void)
++{
++	return n2usb_state;
++}
+ #else /* Qualcomm DWC3; never accessed on Nord2. */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);

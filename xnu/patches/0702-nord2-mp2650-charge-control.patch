@@ -1,0 +1,297 @@
+--- a/iokit/Kernel/arm/mtk_i2c_read.c
++++ b/iokit/Kernel/arm/mtk_i2c_read.c
+@@ -11,14 +11,22 @@
+  if(b==11&&s==0x5c&&n==1)return cmd<=0x15;
+  return b==11&&s==0x5c&&n==2&&(cmd==0x16||cmd==0x18||cmd==0x1a||cmd==0x1c||cmd==0x1e||cmd==0x28);
+ }
+-int nbg_i2c_read(const struct nbg_i2c_io *o,void *c,struct nbg_i2c_state *s,
+- unsigned bus,unsigned slave,unsigned cmd,unsigned count,uint16_t *value){
+- if(!o||!o->read||!o->write||!o->delay_us||!s||s->offline||s->inflight||!value||!allowed(bus,slave,cmd,count))return -1;
++/* 0702: the only writable target: MP2650 (I2C11 0x5c) input current limits REG00/REG0F, VINDPM REG01, charge current REG02,
++ * REG08 (CHG_EN / LEARN(HiZ) bits; the caller never sets REG_RST/WTD_RST/OTG) and REG09 (watchdog timer field). */
++static int allowed_write(unsigned b,unsigned s,unsigned cmd){
++ return b==11&&s==0x5c&&(cmd==0x00||cmd==0x01||cmd==0x02||cmd==0x08||cmd==0x09||cmd==0x0f);
++}
++static int xfer(const struct nbg_i2c_io *o,void *c,struct nbg_i2c_state *s,
++ unsigned bus,unsigned slave,unsigned cmd,unsigned count,uint16_t *value,int write_only,unsigned wvalue){
++ if(!o||!o->read||!o->write||!o->delay_us||!s||s->offline||s->inflight||!value)return -1;
++ if(write_only?(!allowed_write(bus,slave,cmd)||wvalue>255):!allowed(bus,slave,cmd,count))return -1;
+  uint32_t base=bus==7?0x11d03000:0x1101a000,gate=bus==7?0x11d05000:0x11008000;
+  uint32_t bit=bus==7?8:4,v,oldgate=0;unsigned touched=0,gate_changed=0;
+  const uint32_t offs[]={4,8,0x10,0x14,0x18,0x1c,0x20,0x28,0x2c,0x30,0x34,0x40,0x44,0x48};
+  /* cnt_constraint1/div5/26M ->sample0/step26; v2timeout bit0. */
+  uint32_t next[]={0,0,0x3a,1,2,10,0x1b,0x8001,0x1a,0,3,1,0,0x404};
++ /* 0702 write-only (Linux I2C_MASTER_WR): CONTROL = ACKERR_DET_EN|CLK_EXT_EN (no RS/DIR_CHANGE), TRANSFER_LEN 2, TRANSAC_LEN 1. */
++ if(write_only){next[2]=0x28;next[3]=2;next[4]=1;}
+  uint32_t old[14];s->entered=1;s->polls=0;s->error=-1;
+  s->stage=1;s->failure=s->observed=s->last_valid=0;
+  s->mux=s->parent_hz=s->pinmux=s->initial_gate=s->completion_irq=0;s->prior_irq=s->prior_ack=0;
+@@ -73,11 +81,12 @@
+  }
+  s->stage=7;for(unsigned i=0;i<14;i++)R(base+offs[i],2,&old[i]);
+  s->stage=8;for(unsigned i=0;i<14;i++){
+-  uint32_t n=next[i];if(i==0)n=slave<<1;if(i==12)n=count;
++  uint32_t n=next[i];if(i==0)n=slave<<1;if(i==12)n=write_only?0:count;
+   touched=i+1;W(base+offs[i],2,n);
+  }
+  s->stage=9;W(base+0x38,2,1); /*sourceFIFOclear; preconditionFIFOempty*/
+  W(base,1,cmd); /* only target write is SMBus read command pointer */
++ if(write_only)W(base,1,wvalue); /* 0702: SMBus byte write: register, value */
+  s->stage=10;s->inflight=1;W(base+0x24,2,1);
+  s->stage=11;
+  for(unsigned i=0;i<2000;i++){
+@@ -88,7 +97,8 @@
+  if(!(v&1)||(v&0x1fe)){s->failure=(v&0x1fe)?14:13;goto unknown;}
+  s->stage=12;R(base+0x24,2,&v);if(v&3){s->failure=6;goto unknown;}
+  /* Known complete, no error: source reads exactly requested FIFO bytes. */
+- uint32_t lo,hi=0;R(base,1,&lo);if(count==2)R(base,1,&hi);
++ uint32_t lo=0,hi=0;
++ if(!write_only){R(base,1,&lo);if(count==2)R(base,1,&hi);}
+  if(lo>255||hi>255){s->failure=15;goto unknown;}
+  *value=(uint16_t)(lo|(hi<<8));s->error=0;s->inflight=0;
+  s->stage=13;W(base+0x0c,2,1);W(base+0x38,2,1);
+@@ -103,5 +113,13 @@
+ #undef R
+ #undef W
+ }
++int nbg_i2c_read(const struct nbg_i2c_io *o,void *c,struct nbg_i2c_state *s,
++ unsigned bus,unsigned slave,unsigned cmd,unsigned count,uint16_t *value){
++ return xfer(o,c,s,bus,slave,cmd,count,value,0,0);
++}
++int nbg_i2c_write8(const struct nbg_i2c_io *o,void *c,struct nbg_i2c_state *s,
++ unsigned bus,unsigned slave,unsigned reg,unsigned value){
++ uint16_t dummy=0;return xfer(o,c,s,bus,slave,reg,0,&dummy,1,value);
++}
+ 
+ #endif /* NORD2 */
+--- a/iokit/Kernel/arm/mtk_i2c_read.h
++++ b/iokit/Kernel/arm/mtk_i2c_read.h
+@@ -18,4 +18,6 @@
+  * No DMA/reset/pinmux/PLL change. Unknown completion ->offline, no cleanup.
+  * Supports26MHz or source-derived stable MAINPLL/UNIVPLL rate; noPLL retune. */
+ int nbg_i2c_read(const struct nbg_i2c_io *,void *,struct nbg_i2c_state *,unsigned,unsigned,unsigned,unsigned,uint16_t *);
++/* 0702: one SMBus byte write (register, value) to the allow-listed MP2650 registers only (mtk_i2c_read.c allowed_write). */
++int nbg_i2c_write8(const struct nbg_i2c_io *,void *,struct nbg_i2c_state *,unsigned bus,unsigned slave,unsigned reg,unsigned value);
+ #endif
+--- a/iokit/Kernel/arm/nord2_battery.c
++++ b/iokit/Kernel/arm/nord2_battery.c
+@@ -16,11 +16,8 @@
+ SYSCTL_UINT(_kern, OID_AUTO, n2bat_legacy, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_bat_legacy, 0, "0701: 1 = pre-0701 IOPMPowerSource publishing");
+ SYSCTL_UINT(_kern, OID_AUTO, n2chg_pg_active_low, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_chg_pg_active_low, 0, "0701: 1 = old MP2650 power-good polarity");
+ #endif
+-/* 0702 replaces these with the charger policy; 0701 alone has no charger control. */
+ unsigned nord2_chg_policy_type(void);
+ const char *nord2_chg_policy_name(void);
+-unsigned nord2_chg_policy_type(void) { return 0; }
+-const char *nord2_chg_policy_name(void) { return "off"; }
+ static int get(const struct nbg_ops *o,void *c,unsigned bus,unsigned slave,unsigned reg,unsigned bytes,uint16_t *v){
+  return o->owned(c)||o->read(c,bus,slave,reg,bytes,v);
+ }
+@@ -100,4 +97,157 @@
+  return 0;
+ }
+ 
++/*
++ * 0702 (usbchg-20261115): MP2650 charge control.  Root cause of "never charges with iOS": nothing on this port ever configured
++ * the 2S buck-boost charger; it keeps whatever the bootloader / its own reset left (an LK USB input limit, 500 mA on plug in
++ * Oplus' flow, or reset defaults), the MT6360 single-cell charger stays suspended (correct for the 2S pack), so with the display
++ * and GPU on the input power was below the load: discharge while "connected".  This policy, once per battery poll (10 s):
++ *   type   host (our USB console saw SET_CONFIGURATION / SETUPs after this plug-in)       -> kern.n2chg_sdp_ma   (500)
++ *          no host traffic 4 s after plug-in while the console runs (wall charger/DCP)  -> kern.n2chg_dcp_ma   (2000, DT input_current_charger_ma)
++ *          unknown (no USB console this boot)                                           -> kern.n2chg_unk_ma   (1500)
++ *   input limit REG00/REG0F ramps 500 mA per poll to the target while VIN (MP2650 ADC) stays >= kern.n2chg_aicl_mv (4500 mV);
++ *          a VIN below it steps back 500 mA and caps the ramp until the next plug-in (software AICL, Oplus mp2650 style);
++ *          VINDPM REG01 is kept in 4.3..4.6 V (4.4 V written otherwise) as the hardware AICL behind it.
++ *   charge current REG02 by gauge temperature (DT 20827 JEITA, rounded down): < 0 C off, 0..10 C 500 mA, 10..45 C kern.n2chg_ichg_ma
++ *          (1100), 45..50 C 600 mA, >= 50 C off (back on below 47 C / above 2 C); unknown temperature 500 mA.
++ *   REG08: LEARN(HiZ) bit 3 = 0, CHG_EN bit 4 per temperature/voltage guard (REG_RST/WTD_RST/OTG are never written as 1).
++ *   REG09: the I2C watchdog field is cleared: the MP2650 reset defaults are 3 A input / 3 A charge, so a watchdog reset after this
++ *          driver stops would be LESS safe than keeping the last (temperature-checked) setting.
++ *   guards: pack > 8900 mV (4.45 V/cell) or float > 4460 mV/cell -> CHG_EN 0 until pack < 8800 mV; never touches the float voltage,
++ *          OTG, MT6360, VOOC MCU or charge pump.  Each write is read back; 3 failures in a row -> control latched off for the boot.
++ *   kern.n2chg_ctl 0 = observe only (no writes, kill switch), 1 = control (default).
++ * Log: NORD2 CHG14 lines on every decision change and every write.
++ */
++#if defined(KERNEL)
++extern void IOLog(const char *, ...) __attribute__((format(printf, 1, 2)));
++#define N2C_LOG IOLog
++#else
++#include <stdio.h>
++#define N2C_LOG printf
++#endif
++unsigned nord2_chg_ctl = 1, nord2_chg_sdp_ma = 500, nord2_chg_dcp_ma = 2000, nord2_chg_unk_ma = 1500, nord2_chg_ichg_ma = 1100,
++         nord2_chg_aicl_mv = 4500;
++unsigned nord2_chg_type, nord2_chg_target_ma, nord2_chg_writes, nord2_chg_errors, nord2_chg_latched;
++#if defined(KERNEL)
++SYSCTL_UINT(_kern, OID_AUTO, n2chg_ctl, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_chg_ctl, 0, "0702: 1 = MP2650 charge control, 0 = observe only");
++SYSCTL_UINT(_kern, OID_AUTO, n2chg_sdp_ma, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_chg_sdp_ma, 0, "0702: input limit mA with a USB host (<= 1500)");
++SYSCTL_UINT(_kern, OID_AUTO, n2chg_dcp_ma, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_chg_dcp_ma, 0, "0702: input limit mA for a non-host source (<= 2000)");
++SYSCTL_UINT(_kern, OID_AUTO, n2chg_unk_ma, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_chg_unk_ma, 0, "0702: input limit mA when the source type is unknown (<= 2000)");
++SYSCTL_UINT(_kern, OID_AUTO, n2chg_ichg_ma, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_chg_ichg_ma, 0, "0702: battery charge current mA at 10..45 C (<= 2000)");
++SYSCTL_UINT(_kern, OID_AUTO, n2chg_aicl_mv, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_chg_aicl_mv, 0, "0702: software AICL VIN floor mV (4300..4800)");
++SYSCTL_UINT(_kern, OID_AUTO, n2chg_type, CTLFLAG_RD | CTLFLAG_LOCKED, &nord2_chg_type, 0, "0702: 0 none, 1 host, 2 deciding, 3 non-host, 4 unknown");
++SYSCTL_UINT(_kern, OID_AUTO, n2chg_target_ma, CTLFLAG_RD | CTLFLAG_LOCKED, &nord2_chg_target_ma, 0, "0702: input limit target mA");
++SYSCTL_UINT(_kern, OID_AUTO, n2chg_writes, CTLFLAG_RD | CTLFLAG_LOCKED, &nord2_chg_writes, 0, "0702: MP2650 register writes");
++SYSCTL_UINT(_kern, OID_AUTO, n2chg_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &nord2_chg_errors, 0, "0702: failed/unverified writes");
++#endif
++enum { N2C_NONE = 0, N2C_HOST = 1, N2C_DECIDING = 2, N2C_NONHOST = 3, N2C_UNKNOWN = 4 };
++static const char *const n2c_type_name[] = {"none", "usb host", "deciding", "charger", "unknown source"};
++static struct {
++	unsigned pg_prev, first_done, ev0, aicl_cap, temp_off, volt_off, fails, last_ichg, last_en, last_type, last_target, logs;
++	uint64_t plug_ms;
++} n2c;
++unsigned nord2_chg_policy_type(void) { return nord2_chg_ctl && !nord2_chg_latched ? (nord2_chg_type ? nord2_chg_type : 5u) : 0u; }
++const char *nord2_chg_policy_name(void) { return nord2_chg_type < 5 ? n2c_type_name[nord2_chg_type] : "?"; }
++static unsigned n2c_clamp(unsigned v, unsigned lo, unsigned hi) { return v < lo ? lo : v > hi ? hi : v; }
++static int n2c_write(const struct nbg_ops *o, const struct nbg_wops *w, void *c, unsigned reg, unsigned value, uint8_t *cache)
++{
++	uint16_t back = 0xffff;
++	int e = w->write8(c, 11, 0x5c, reg, value & 0xff);
++	if (!e) { e = o->read(c, 11, 0x5c, reg, 1, &back); }
++	nord2_chg_writes++;
++	if (e || back != (value & 0xff)) {
++		nord2_chg_errors++; n2c.fails++;
++		N2C_LOG("NORD2 CHG14: write REG%02x=%02x FAILED (rc=%d back=%#x, %u in a row)\n", reg, value & 0xff, e, back, n2c.fails);
++		if (n2c.fails >= 3) { nord2_chg_latched = 1; N2C_LOG("NORD2 CHG14: control latched off for this boot\n"); }
++		return -1;
++	}
++	n2c.fails = 0;
++	if (cache) { *cache = (uint8_t)value; }
++	N2C_LOG("NORD2 CHG14: write REG%02x=%02x ok\n", reg, value & 0xff);
++	return 0;
++}
++int nbg_charger_control(const struct nbg_ops *o, const struct nbg_wops *w, void *c, struct nbg_sample *s,
++    unsigned host_events, unsigned configured, unsigned console_up, uint64_t now_ms)
++{
++	if (!o || !w || !w->write8 || !s) { return -1; }
++	if (!s->charger_valid || s->chg_regs_valid != (1u << NBG_CHG_REGS) - 1) { return 0; }
++	unsigned pg = s->power_good;
++	if (!pg) {
++		nord2_chg_type = N2C_NONE; n2c.aicl_cap = 0;
++	} else if (!n2c.pg_prev || !n2c.first_done) {
++		n2c.plug_ms = now_ms; n2c.ev0 = host_events; n2c.aicl_cap = 0;
++		/* first sample of the boot with VBUS already there: a configured console means the host enumerated us at boot */
++		nord2_chg_type = (!n2c.first_done && configured) ? N2C_HOST : console_up ? N2C_DECIDING : N2C_UNKNOWN;
++	} else if (nord2_chg_type == N2C_DECIDING || nord2_chg_type == N2C_UNKNOWN) {
++		if (console_up && host_events != n2c.ev0) { nord2_chg_type = N2C_HOST; }
++		else if (console_up && now_ms - n2c.plug_ms >= 4000) { nord2_chg_type = N2C_NONHOST; }
++		else if (!console_up) { nord2_chg_type = N2C_UNKNOWN; }
++	} else if (nord2_chg_type == N2C_NONHOST && console_up && host_events != n2c.ev0) {
++		nord2_chg_type = N2C_HOST;      /* a late enumeration: back to the host limit */
++	}
++	n2c.pg_prev = pg; n2c.first_done = 1;
++	unsigned target = 500;
++	switch (nord2_chg_type) {
++	case N2C_HOST: target = n2c_clamp(nord2_chg_sdp_ma, 100, 1500); break;
++	case N2C_NONHOST: target = n2c_clamp(nord2_chg_dcp_ma, 100, 2000); break;
++	case N2C_UNKNOWN: target = n2c_clamp(nord2_chg_unk_ma, 100, 2000); break;
++	default: target = 500; break;
++	}
++	target = target / 50 * 50;
++	if (n2c.aicl_cap && target > n2c.aicl_cap) { target = n2c.aicl_cap; }
++	nord2_chg_target_ma = target;
++	/* temperature / voltage guards -> charge current and CHG_EN */
++	int t = s->temperature_centi_c; unsigned tv = s->temperature_valid;
++	if (tv && (t < 0 || t >= 5000)) { n2c.temp_off = 1; }
++	else if (tv && t >= 200 && t < 4700) { n2c.temp_off = 0; }
++	if (s->voltage_valid && s->pack_mv > 8900) { n2c.volt_off = 1; }
++	else if (s->voltage_valid && s->pack_mv < 8800) { n2c.volt_off = 0; }
++	unsigned float_bad = s->vfloat_cell_mv > 4460;
++	unsigned ichg = !tv ? 500 : t < 1000 ? 500 : t < 4500 ? n2c_clamp(nord2_chg_ichg_ma, 100, 2000) : 600;
++	ichg = ichg / 50 * 50;
++	unsigned en = !(n2c.temp_off || n2c.volt_off || float_bad);
++	if (nord2_chg_type != n2c.last_type || target != n2c.last_target || ichg != n2c.last_ichg || en != n2c.last_en || (++n2c.logs % 30) == 0) {
++		N2C_LOG("NORD2 CHG14: type=%s pg=%u target=%umA (aicl_cap %u) ichg=%umA en=%u (temp %d.%02dC valid=%u off=%u, pack %umV off=%u, float %umV/cell)"
++		    " | now ilim=%u ichg_set=%u vindpm=%u reg08=%02x reg09=%02x vin=%umV iin=%umA ppm=%u state=%u | ctl=%u latched=%u host_ev=%u cfg=%u console=%u\n",
++		    nord2_chg_type < 5 ? n2c_type_name[nord2_chg_type] : "?", pg, target, n2c.aicl_cap, ichg, en, t / 100, (t < 0 ? -t : t) % 100, tv,
++		    n2c.temp_off, s->pack_mv, n2c.volt_off, s->vfloat_cell_mv, s->ilim_ma, s->ichg_set_ma, s->vindpm_mv, s->chg_reg[8], s->chg_reg[9],
++		    s->vin_mv, s->iin_ma, s->ppm, s->chg_state, nord2_chg_ctl, nord2_chg_latched, host_events, configured, console_up);
++		n2c.last_type = nord2_chg_type; n2c.last_target = target; n2c.last_ichg = ichg; n2c.last_en = en;
++	}
++	if (!nord2_chg_ctl || nord2_chg_latched) { return 0; }
++	/* 1. REG08: CHG_EN per guard, LEARN(HiZ) off; bits 5..7 (OTG, WTD_RST, REG_RST) kept / never set */
++	unsigned r8 = s->chg_reg[8];
++	unsigned want8 = (r8 & ~0xd8u) | (en ? 0x10u : 0u);
++	if (r8 & 0x20u) { want8 = r8 & ~0xc0u; }          /* OTG on (not ours): leave the register alone */
++	if (want8 != r8 && n2c_write(o, w, c, 0x08, want8, &s->chg_reg[8])) { return -1; }
++	/* 2. REG09: no I2C watchdog (see above) */
++	if ((s->chg_reg[9] & 0x30u) && n2c_write(o, w, c, 0x09, s->chg_reg[9] & ~0x30u, &s->chg_reg[9])) { return -1; }
++	/* 3. VINDPM 4.3..4.6 V */
++	if ((s->vindpm_mv < 4300 || s->vindpm_mv > 4600) && n2c_write(o, w, c, 0x01, 44, &s->chg_reg[1])) { return -1; }
++	/* 4. charge current */
++	if (s->ichg_set_ma != ichg && n2c_write(o, w, c, 0x02, ichg / 50, &s->chg_reg[2])) { return -1; }
++	/* 5. input current limit: ramp / AICL */
++	unsigned cur = s->ilim_ma, next = cur;
++	unsigned floor_mv = n2c_clamp(nord2_chg_aicl_mv, 4300, 4800);
++	unsigned adc = s->vin_mv >= 3000;                     /* VIN ADC plausible */
++	if (!pg) { next = 500; }
++	else if (cur > target) { next = target; }
++	else if (adc && s->vin_mv < floor_mv && cur > 500) {
++		next = cur - 500 < 500 ? 500 : cur - 500; n2c.aicl_cap = next;
++		N2C_LOG("NORD2 CHG14: VIN %umV < %umV at %umA: back to %umA (cap until re-plug)\n", s->vin_mv, floor_mv, cur, next);
++	} else if (cur < target) {
++		unsigned step_to = cur + 500 > target ? target : cur + 500;
++		if (!adc && step_to > 1000) { step_to = cur < 1000 ? (target < 1000 ? target : 1000) : cur; }   /* no ADC: no ramp past 1 A */
++		if (!adc || s->vin_mv >= floor_mv + 100) { next = step_to; }
++	}
++	if (next < 100) { next = 100; }
++	if (next != cur) {
++		unsigned v = (next / 50) & 0x7f;
++		if (n2c_write(o, w, c, 0x00, (s->chg_reg[0] & 0x80u) | v, &s->chg_reg[0])) { return -1; }
++		if (n2c_write(o, w, c, 0x0f, (s->chg_reg[0x0f] & 0x80u) | v, &s->chg_reg[0x0f])) { return -1; }
++		s->ilim_ma = next;
++	}
++	return 0;
++}
++
+ #endif /* NORD2 */
+--- a/iokit/Kernel/arm/nord2_battery.h
++++ b/iokit/Kernel/arm/nord2_battery.h
+@@ -37,4 +37,8 @@
+  unsigned ilim_ma,ichg_set_ma,vindpm_mv,vfloat_cell_mv;
+ };
+ int nbg_collect(const struct nbg_ops *,void *,unsigned enabled,unsigned current_register_identified,struct nbg_sample *);
++/* 0702: MP2650 charge policy, called with the bus owned after nbg_collect (nord2_battery.c). */
++struct nbg_wops { int (*write8)(void *,unsigned bus,unsigned slave,unsigned reg,unsigned value); };
++int nbg_charger_control(const struct nbg_ops *,const struct nbg_wops *,void *,struct nbg_sample *,
++ unsigned host_events,unsigned configured,unsigned console_up,uint64_t now_ms);
+ #endif
+--- a/iokit/Kernel/arm/nord2_battery_platform.cpp
++++ b/iokit/Kernel/arm/nord2_battery_platform.cpp
+@@ -16,6 +16,9 @@
+ extern vm_offset_t ml_io_map(vm_offset_t,vm_size_t);
+ extern void delay(int);
+ extern volatile uint32_t nord2_chg_vbus_good;   /* 0700 sweet_usb.c: VBUS seen by the charger (late USB attach) */
++extern uint32_t nord2_usb_host_events(void);     /* 0700 sweet_usb.c */
++extern uint32_t nord2_usb_configured(void);
++extern uint32_t nord2_usb_console_state(void);
+ }
+ struct nbg_map {uint32_t pa;vm_size_t size;vm_offset_t va;};
+ static struct nbg_map maps[]={{0x10000000,0x1000,0},{0x1000c000,0x1000,0},{0x10005000,0x1000,0},
+@@ -85,6 +88,14 @@
+ }
+ static int ms(void *,unsigned n){if(n!=10)return -1;delay(10000);return 0;}
+ static const struct nbg_ops ops={owned,read,ms};
++/* 0702: byte writes, MP2650 bus only (the allow-list in mtk_i2c_read.c is the second fence) */
++static int write8(void *,unsigned bus,unsigned slave,unsigned reg,unsigned value){
++ if(bus!=11||busy!=1)return -1;
++ struct nbg_i2c_state *s=&buses[1];
++ int rc=nbg_i2c_write8(&io,nullptr,s,bus,slave,reg,value);
++ report_bus(bus,rc,s);return rc;
++}
++static const struct nbg_wops wops={write8};
+ extern "C" int nord2_battery_platform_sample(struct nbg_sample *s){
+  if(!s)return -1;
+  if(!__sync_bool_compare_and_swap(&busy,0u,1u)){*s=(struct nbg_sample){};s->error=-1;return -1;}
+@@ -93,6 +104,11 @@
+  int e=nbg_collect(&ops,0,1,1,s);   /* 0701: identified = 1, DT qcom,batt_bq28z610 (see nord2_battery.h) */
+  nord2_chg_vbus_good=s->charger_valid?s->power_good:(e?2u:nord2_chg_vbus_good);
+  if(s->charger_valid)report_charger(s);
++ if(s->charger_valid){   /* 0702 */
++  uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
++  uint32_t st=nord2_usb_console_state();
++  (void)nbg_charger_control(&ops,&wops,nullptr,s,nord2_usb_host_events(),nord2_usb_configured(),st==1||st==3,ns/1000000ull);
++ }
+  unsigned valid=s->raw_valid|(s->soc_valid<<8)|(s->charger_valid<<9);
+  if(!sample_logged||sample_last_valid!=valid||sample_last_rc!=e){
+   sample_logged=1;sample_last_valid=valid;sample_last_rc=e;

@@ -1,0 +1,180 @@
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -47,6 +47,7 @@
+ 	void poll(void);
+ #if defined(NORD2)
+ 	void pollNord2(void);
++	unsigned tickNord2(void);   /* 0703 */
+ #endif
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+@@ -233,12 +234,22 @@
+  */
+ extern "C" {
+ extern unsigned nord2_bat_poll_ms, nord2_bat_hold_s, nord2_bat_filter, nord2_bat_log_s, nord2_bat_legacy;
++extern unsigned nord2_bat_fast_ms;                 /* 0703 */
++int nord2_battery_platform_pg(unsigned *pg);       /* 0703 nord2_battery_platform.cpp: MP2650 REG13 power-good only */
+ extern unsigned nord2_chg_policy_type(void);      /* 0702 (0 = no charger control in this kernel), nord2_battery.c */
+ extern const char *nord2_chg_policy_name(void);
+ }
+ static struct nbg_sample n2b_last;
+ static uint64_t n2b_last_ms, n2b_log_ms;
+ static unsigned n2b_shown = 101, n2b_last_pg = 9, n2b_last_state = 9, n2b_last_logged = 101, n2b_fail;
++/* 0703: plug/unplug visible to iOS within ~0.5 s.  Before 0703 the VBUS state reached iOS only with the next full sample
++ * (kern.n2bat_poll_ms = 10 s: 0..10 s, ~5 s average, the ~8 s seen on the phone).  Now the timer ticks every kern.n2bat_fast_ms
++ * (500 ms; 0 = the 0701 behaviour) with ONE cheap read (MP2650 REG13 twice, power-good bit); on a change it runs the full sample
++ * at once (gauge + charger + 0702 policy + IOPMPowerSource publish) and two follow-ups +1 s / +3 s (the MP2650 enters
++ * pre/fast charge a moment after VIN good).  The full 10 s sample, the hold/stale logic and the 0702 ramp (now >= 5 s per step)
++ * are unchanged.  Log: NORD2 BAT15 lines. */
++static uint64_t n2b_next_full, n2b_edge_ms, n2b_fast_ms_at;
++static unsigned n2b_pub_pg = 2, n2b_fast_pg = 2, n2b_followups, n2b_edges, n2b_fast_fail;
+ static uint64_t
+ n2b_now_ms(void)
+ {
+@@ -280,6 +291,10 @@
+   n2b_last = s; n2b_last_ms = now; n2b_fail = 0;
+  } else if(n2b_last.soc_valid && now - n2b_last_ms <= (uint64_t)nord2_bat_hold_s * 1000ull){
+   n2b_fail++; s = n2b_last; valid = true; stale = true;
++  /* 0703: a fresh fast VBUS read beats the held sample for the plug state */
++  if(n2b_fast_pg < 2 && now - n2b_fast_ms_at <= 2000){
++   s.power_good = n2b_fast_pg; s.external = n2b_fast_pg; if(!n2b_fast_pg){s.charging = 0; s.full = 0;}
++  }
+  } else {
+   n2b_fail++;
+  }
+@@ -293,6 +308,7 @@
+  }
+  if(valid) n2b_shown = shown;
+  bool ext = s.charger_valid && s.external;
++ if(s.charger_valid) n2b_pub_pg = s.power_good ? 1u : 0u;   /* 0703: what iOS was told */
+  bool full = ext && s.full;
+  bool chg = ext && s.charging && !full;
+  unsigned fcc = s.capacity_valid ? s.fcc_mah : 4500u;
+@@ -373,6 +389,36 @@
+   n2b_log_ms = now; n2b_last_logged = shown; n2b_last_pg = s.power_good; n2b_last_state = s.chg_state;
+  }
+ }
++unsigned
++SweetBattery::tickNord2(void)
++{
++ unsigned full = nord2_bat_poll_ms < 2000 ? 2000 : nord2_bat_poll_ms > 60000 ? 60000 : nord2_bat_poll_ms;
++ unsigned fast = nord2_bat_fast_ms;
++ if(!fast || nord2_bat_legacy){ poll(); return full; }
++ fast = fast < 100 ? 100 : fast > 2000 ? 2000 : fast;
++ uint64_t now = n2b_now_ms();
++ bool doFull = now >= n2b_next_full;
++ if(!doFull){
++  unsigned pg = 2;
++  if(fReal && nord2_battery_platform_pg(&pg) == 0){
++   n2b_fast_pg = pg; n2b_fast_ms_at = now;
++   if(pg != n2b_pub_pg && n2b_pub_pg < 2 && now - n2b_edge_ms >= 1000){
++    n2b_edges++; n2b_edge_ms = now; n2b_followups = 2; doFull = true;
++    IOLog("NORD2 BAT15: VBUS %s at t=%llums (fast check, edge %u) -> immediate refresh\n", pg ? "ON" : "OFF", now, n2b_edges);
++   }
++  } else {
++   n2b_fast_fail++;
++  }
++ }
++ if(!doFull && n2b_followups && now - n2b_edge_ms >= (n2b_followups == 2 ? 1000ull : 3000ull)){ doFull = true; n2b_followups--; }
++ if(doFull){
++  poll();
++  n2b_next_full = n2b_now_ms() + full;
++  if(n2b_edge_ms && n2b_now_ms() - n2b_edge_ms < 4000)
++   IOLog("NORD2 BAT15: published pg=%u %llums after the edge (followups left %u, fast fails %u)\n", n2b_pub_pg, n2b_now_ms() - n2b_edge_ms, n2b_followups, n2b_fast_fail);
++ }
++ return fast;
++}
+ #endif
+ 
+ void
+@@ -426,10 +472,10 @@
+ {
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
+-		self->poll();
+ #if defined(NORD2)
+-		{ unsigned ms = nord2_bat_poll_ms; sender->setTimeoutMS(ms < 2000 ? 2000 : ms > 60000 ? 60000 : ms); }   /* 0701 */
++		sender->setTimeoutMS(self->tickNord2());   /* 0703: fast VBUS check + full sample every kern.n2bat_poll_ms */
+ #else
++		self->poll();
+ 		sender->setTimeoutMS(30000);
+ #endif
+ 	}
+--- a/iokit/Kernel/arm/nord2_battery.c
++++ b/iokit/Kernel/arm/nord2_battery.c
+@@ -5,7 +5,8 @@
+ #include "nord2_battery.h"
+ /* 0701 knobs (sysctl in the kernel build; plain globals in host tests) */
+ unsigned nord2_bat_poll_ms = 10000, nord2_bat_hold_s = 120, nord2_bat_filter = 1, nord2_bat_log_s = 60, nord2_bat_legacy = 0;
+-unsigned nord2_chg_pg_active_low = 0;   /* 1 = the pre-0701 (wrong, v1 header) REG13 bit1 polarity */
++unsigned nord2_chg_pg_active_low = 0;
++unsigned nord2_bat_fast_ms = 500;       /* 0703: plug/unplug check period ms (100..2000), 0 = only the full sample */   /* 1 = the pre-0701 (wrong, v1 header) REG13 bit1 polarity */
+ #if defined(KERNEL)
+ #include <sys/types.h>
+ #include <sys/sysctl.h>
+@@ -14,6 +15,7 @@
+ SYSCTL_UINT(_kern, OID_AUTO, n2bat_filter, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_bat_filter, 0, "0701: 1 = hide one-step SOC flicker against the current");
+ SYSCTL_UINT(_kern, OID_AUTO, n2bat_log_s, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_bat_log_s, 0, "0701: NORD2 BAT14 log period s");
+ SYSCTL_UINT(_kern, OID_AUTO, n2bat_legacy, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_bat_legacy, 0, "0701: 1 = pre-0701 IOPMPowerSource publishing");
++SYSCTL_UINT(_kern, OID_AUTO, n2bat_fast_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_bat_fast_ms, 0, "0703: VBUS fast check period ms, 0 = off");
+ SYSCTL_UINT(_kern, OID_AUTO, n2chg_pg_active_low, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_chg_pg_active_low, 0, "0701: 1 = old MP2650 power-good polarity");
+ #endif
+ unsigned nord2_chg_policy_type(void);
+@@ -144,7 +146,7 @@
+ static const char *const n2c_type_name[] = {"none", "usb host", "deciding", "charger", "unknown source"};
+ static struct {
+ 	unsigned pg_prev, first_done, ev0, aicl_cap, temp_off, volt_off, fails, last_ichg, last_en, last_type, last_target, logs;
+-	uint64_t plug_ms;
++	uint64_t plug_ms, step_ms;   /* 0703: step_ms = last ramp-up step (>= 5 s apart: 0703 runs extra samples after a plug edge) */
+ } n2c;
+ unsigned nord2_chg_policy_type(void) { return nord2_chg_ctl && !nord2_chg_latched ? (nord2_chg_type ? nord2_chg_type : 5u) : 0u; }
+ const char *nord2_chg_policy_name(void) { return nord2_chg_type < 5 ? n2c_type_name[nord2_chg_type] : "?"; }
+@@ -238,7 +240,7 @@
+ 	} else if (cur < target) {
+ 		unsigned step_to = cur + 500 > target ? target : cur + 500;
+ 		if (!adc && step_to > 1000) { step_to = cur < 1000 ? (target < 1000 ? target : 1000) : cur; }   /* no ADC: no ramp past 1 A */
+-		if (!adc || s->vin_mv >= floor_mv + 100) { next = step_to; }
++		if ((!adc || s->vin_mv >= floor_mv + 100) && now_ms - n2c.step_ms >= 5000) { next = step_to; }
+ 	}
+ 	if (next < 100) { next = 100; }
+ 	if (next != cur) {
+@@ -246,6 +248,7 @@
+ 		if (n2c_write(o, w, c, 0x00, (s->chg_reg[0] & 0x80u) | v, &s->chg_reg[0])) { return -1; }
+ 		if (n2c_write(o, w, c, 0x0f, (s->chg_reg[0x0f] & 0x80u) | v, &s->chg_reg[0x0f])) { return -1; }
+ 		s->ilim_ma = next;
++		if (next > cur) { n2c.step_ms = now_ms; }
+ 	}
+ 	return 0;
+ }
+--- a/iokit/Kernel/arm/nord2_battery_platform.cpp
++++ b/iokit/Kernel/arm/nord2_battery_platform.cpp
+@@ -17,6 +17,7 @@
+ extern void delay(int);
+ extern volatile uint32_t nord2_chg_vbus_good;   /* 0700 sweet_usb.c: VBUS seen by the charger (late USB attach) */
+ extern uint32_t nord2_usb_host_events(void);     /* 0700 sweet_usb.c */
++extern unsigned nord2_chg_pg_active_low;         /* 0701 nord2_battery.c */
+ extern uint32_t nord2_usb_configured(void);
+ extern uint32_t nord2_usb_console_state(void);
+ }
+@@ -96,6 +97,21 @@
+  report_bus(bus,rc,s);return rc;
+ }
+ static const struct nbg_wops wops={write8};
++/* 0703: cheap plug check, MP2650 REG13 read twice (the same consistency rule as nbg_collect), power-good bit only. */
++extern "C" int nord2_battery_platform_pg(unsigned *pg);
++extern "C" int nord2_battery_platform_pg(unsigned *pg){
++ if(!pg)return -1;
++ unsigned expect=0;
++ if(!__atomic_compare_exchange_n(&busy,&expect,1u,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED))return -1;
++ uint16_t a=0xffff,b=0xffff;
++ int e=read(nullptr,11,0x5c,0x13,1,&a);
++ if(!e)e=read(nullptr,11,0x5c,0x13,1,&b);
++ __atomic_store_n(&busy,0u,__ATOMIC_RELEASE);
++ if(e||a>255||b>255||((a^b)&2))return -1;
++ *pg=((a>>1)&1u)^(nord2_chg_pg_active_low?1u:0u);
++ nord2_chg_vbus_good=*pg;
++ return 0;
++}
+ extern "C" int nord2_battery_platform_sample(struct nbg_sample *s){
+  if(!s)return -1;
+  if(!__sync_bool_compare_and_swap(&busy,0u,1u)){*s=(struct nbg_sample){};s->error=-1;return -1;}
