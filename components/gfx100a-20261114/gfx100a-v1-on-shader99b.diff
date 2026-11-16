@@ -1,0 +1,301 @@
+--- redwoodmetal.m	2026-11-14 02:16:01.759251982 +0100
++++ ../src/redwoodmetal.m	2026-11-14 19:34:01.742678459 +0100
+@@ -3857,6 +3857,183 @@
+  *        'NORD2 GPU TEXLAYOUT: pid= name= layouts=N refused=R | textures ok=K (bytes B) refused=F' at 1, 2, 4, 8... events;
+  *        'I RES texlayout: ...' for the first layouts and textures, 'W RES texlayout: ...' for every kind of refusal.
+  */
++
++/*
++ * ---- gfx100a (2026-11-14): app switcher / App Library / Safari ----
++ * rw_gfx100a_pure.h has the why of the two fixes (XR alias, ASTC edge). Besides them, two diagnostics:
++ *   filelog   every record this process gives m2m_log is also appended to /var/db/nord2-metal/log/<process>.<pid>.log (when that
++ *             directory exists; payload gfx100a makes it 1777), at most 4 MiB a process. The kernel's log selector has a budget
++ *             of 16 KiB per client (patch 0084, logBytes), so a backboardd hours old says nothing on the console any more.
++ *   slotdiag  which pipelines draw with an empty texture slot (first 48 pipeline+slot pairs, by label), and the first 64 refused
++ *             IOSurface textures with their format, size and usage (the console's RW_AGAIN shows only every power of two).
++ * Switches (/var/db/nord2-metal/, read once per process): no-gfx100a (all), no-xralias, no-astcedge, no-filelog, no-slotdiag.
++ * Lines: 'I DEV NORD2 GPU GFX100A: pid= name= config ...' once; 'I RES gfx100a xralias: ...' at 1, 2, 4, 8... aliases.
++ */
++#include "rw_gfx100a_pure.h"
++
++enum { RW_G_XRALIAS, RW_G_ASTCEDGE, RW_G_FILELOG, RW_G_SLOTDIAG, RW_G_N };
++static const char *const rw_g_names[RW_G_N] = { "xralias", "astcedge", "filelog", "slotdiag" };
++static int rw_g_off[RW_G_N];
++static volatile int rw_g_ready;
++
++static void
++rw_gfx_config(void)
++{
++	static dispatch_once_t once;
++
++	if (rw_g_ready) {
++		return;
++	}
++	dispatch_once(&once, ^{
++		int all = access("/var/db/nord2-metal/no-gfx100a", F_OK) == 0;
++		char line[200] = "";
++		size_t used = 0;
++
++		for (int i = 0; i < RW_G_N; i++) {
++			char path[96];
++
++			snprintf(path, sizeof(path), "/var/db/nord2-metal/no-%s", rw_g_names[i]);
++			rw_g_off[i] = all || access(path, F_OK) == 0;
++			used += (size_t)snprintf(line + used, sizeof(line) - used, " %s=%s", rw_g_names[i], rw_g_off[i] ? "OFF" : "ON");
++			if (used >= sizeof(line)) {
++				used = sizeof(line) - 1;
++			}
++		}
++		__sync_synchronize();
++		rw_g_ready = 1;
++		m2m_log('I', "DEV", "NORD2 GPU GFX100A: pid=%d name=%s config%s%s gfx100a\n", getpid(), getprogname(), line,
++		    all ? " (no-gfx100a)" : "");
++	});
++}
++
++static int
++rw_gfx_on(int feature)
++{
++	rw_gfx_config();
++	return feature >= 0 && feature < RW_G_N && !rw_g_off[feature];
++}
++
++/* the format a texture/attachment of `pf` is made as (rw_gfx100a_pure.h); `where` names the caller in the log */
++static unsigned
++rw_gfx_alias(unsigned pf, const char *where)
++{
++	unsigned to = rw_gfx_xr_alias_of(pf);
++	static unsigned long n;
++
++	if (to == pf || !rw_gfx_on(RW_G_XRALIAS)) {
++		return pf;
++	}
++	unsigned long k = __sync_add_and_fetch(&n, 1);
++
++	if ((k & (k - 1)) == 0) {
++		m2m_log('I', "RES", "gfx100a xralias: pixel format %u served as %u (%s) [%lu so far]\n", pf, to, where, k);
++	}
++	return to;
++}
++
++/*
++ * The file sink, called by m2m_vlog (m2m.h) for every record of this process. No locks (it is also reached from the crash
++ * handler): the first caller opens, a caller that meets the open in progress drops its record.
++ */
++void
++rw_gfx_file_sink(const char *rec, size_t n)
++{
++	static int fd = -2;              /* -2 not tried yet, -1 off */
++	static volatile int opening;
++	static volatile unsigned long bytes;
++	char buf[1200];
++	size_t used;
++
++	if (fd == -1 || rec == NULL) {
++		return;
++	}
++	if (fd == -2) {
++		int f = -1;
++
++		if (__sync_lock_test_and_set(&opening, 1)) {
++			return;
++		}
++		if (access("/var/db/nord2-metal/no-gfx100a", F_OK) != 0 && access("/var/db/nord2-metal/no-filelog", F_OK) != 0 &&
++		    access("/var/db/nord2-metal/log", W_OK) == 0) {
++			char path[200];
++
++			snprintf(path, sizeof(path), "/var/db/nord2-metal/log/%s.%d.log", getprogname(), getpid());
++			f = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
++		}
++		__sync_synchronize();
++		fd = f >= 0 ? f : -1;
++		if (fd < 0) {
++			return;
++		}
++	}
++	if (bytes > (4ul << 20)) {
++		return;
++	}
++	{
++		struct timespec ts;
++		struct tm tm;
++
++		clock_gettime(CLOCK_REALTIME, &ts);
++		localtime_r(&ts.tv_sec, &tm);
++		used = (size_t)snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03ld ", tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000);
++	}
++	if (n > sizeof(buf) - used - 1) {
++		n = sizeof(buf) - used - 1;
++	}
++	memcpy(buf + used, rec, n);
++	used += n;
++	buf[used++] = '\n';
++	__sync_add_and_fetch(&bytes, used);
++	(void)write(fd, buf, used);
++}
++
++/* slotdiag: the first 48 (pipeline, slot) pairs that draw with an empty texture slot, by the pipeline's label */
++static void
++rw_gfx_slot_note(id render, unsigned slot, unsigned bound, unsigned reads)
++{
++	static const void *seen[48];
++	static unsigned seen_slot[48];
++	static volatile unsigned count;
++	static volatile int lock;
++
++	if (count >= 48 || !rw_gfx_on(RW_G_SLOTDIAG)) {
++		return;
++	}
++	while (__sync_lock_test_and_set(&lock, 1)) {
++	}
++	unsigned c = count;
++	for (unsigned i = 0; i < c; i++) {
++		if (seen[i] == (const void *)render && seen_slot[i] == slot) {
++			__sync_lock_release(&lock);
++			return;
++		}
++	}
++	if (c < 48) {
++		seen[c] = (const void *)render;
++		seen_slot[c] = slot;
++		count = c + 1;
++	}
++	__sync_lock_release(&lock);
++	if (c < 48) {
++		m2m_log('I', "CMD", "gfx100a slot: pipeline %s reads texture %u of %u and the application bound %u: empty (one clear texel)\n",
++		    [render respondsToSelector:@selector(label)] && [(id)render label] != nil ? [[(id)render label] UTF8String] : "(no label)",
++		    slot, reads, bound);
++	}
++}
++
++/* slotdiag: the first 64 IOSurface textures refused, with what was asked */
++static void
++rw_gfx_surface_refused(unsigned pf, unsigned asked, unsigned w, unsigned h, unsigned usage, NSUInteger plane, const char *why)
++{
++	static volatile unsigned n;
++
++	if (!rw_gfx_on(RW_G_SLOTDIAG) || __sync_add_and_fetch(&n, 1) > 64) {
++		return;
++	}
++	m2m_log('W', "SURF", "gfx100a refused: IOSurface texture format %u (asked %u) %ux%u usage 0x%x plane %lu: %s\n", pf, asked, w, h,
++	    usage, (unsigned long)plane, why);
++}
++
+ #include "rw_texlayout_pure.h"
+ 
+ static struct {
+@@ -3973,6 +4150,16 @@
+ 	const char *why = "a slice or a depth this 2D layout does not have";
+ 
+ 	(void)imageBytes;
++	/* gfx100a (astcedge): a region ending inside the last partial block is cut at the level's edge -- the same blocks */
++	if (level < _l.levels && rw_gfx_on(RW_G_ASTCEDGE)) {
++		uint64_t w = region.size.width, h = region.size.height;
++
++		if (rw_gfx_edge_clamp(region.origin.x, &w, _l.level[level].width, _l.block_w) |
++		    rw_gfx_edge_clamp(region.origin.y, &h, _l.level[level].height, _l.block_h)) {
++			region.size.width = (NSUInteger)w;
++			region.size.height = (NSUInteger)h;
++		}
++	}
+ 	if (slice != 0 || region.origin.z != 0 || region.size.depth > 1 || level >= _l.levels ||
+ 	    rwtl_copy_in(&_l, memory, (uint32_t)level, region.origin.x, region.origin.y, region.size.width, region.size.height,
+ 	    linear, offset, rowBytes, &why) != 0) {
+@@ -3995,6 +4182,15 @@
+ 	const char *why = "a slice or a depth this 2D layout does not have";
+ 
+ 	(void)imageBytes;
++	if (level < _l.levels && rw_gfx_on(RW_G_ASTCEDGE)) {   /* gfx100a (astcedge) */
++		uint64_t w = region.size.width, h = region.size.height;
++
++		if (rw_gfx_edge_clamp(region.origin.x, &w, _l.level[level].width, _l.block_w) |
++		    rw_gfx_edge_clamp(region.origin.y, &h, _l.level[level].height, _l.block_h)) {
++			region.size.width = (NSUInteger)w;
++			region.size.height = (NSUInteger)h;
++		}
++	}
+ 	if (slice != 0 || region.origin.z != 0 || region.size.depth > 1 || level >= _l.levels ||
+ 	    rwtl_copy_out(&_l, memory, (uint32_t)level, region.origin.x, region.origin.y, region.size.width, region.size.height,
+ 	    linear, offset, rowBytes, &why) != 0) {
+@@ -6389,6 +6585,7 @@
+ 		    [[descriptor colorAttachments] objectAtIndexedSubscript:i];
+ 		unsigned format = attachment != nil ? (unsigned)[attachment pixelFormat] : 0;
+ 
++		format = rw_gfx_alias(format, "render pipeline attachment");   /* gfx100a */
+ 		shape.color_format[i] = format;
+ 		if (format != 0) {
+ 			shape.color_count = i + 1;
+@@ -6964,7 +7161,7 @@
+ 		return nil;
+ 	}
+ 	struct rwa_texture_shape shape = {
+-		.pixel_format = (unsigned)[descriptor pixelFormat],
++		.pixel_format = rw_gfx_alias((unsigned)[descriptor pixelFormat], "texture"),   /* gfx100a */
+ 		.type = (unsigned)[descriptor textureType],
+ 		.width = (unsigned)[descriptor width],
+ 		.height = (unsigned)[descriptor height],
+@@ -7826,7 +8023,7 @@
+ 		return nil;
+ 	}
+ 	memset(&shape, 0, sizeof(shape));
+-	shape.pixel_format = (unsigned)[d pixelFormat];
++	shape.pixel_format = rw_gfx_alias((unsigned)[d pixelFormat], "IOSurface texture");   /* gfx100a */
+ 	shape.type = (unsigned)[d textureType];
+ 	shape.width = (unsigned)[d width];
+ 	shape.height = (unsigned)[d height];
+@@ -8035,6 +8232,7 @@
+ 		}
+ 	}
+ 	if (texture == NULL) {
++		rw_gfx_surface_refused(shape.pixel_format, (unsigned)[d pixelFormat], shape.width, shape.height, shape.usage, p, why);   /* gfx100a */
+ 		RW_AGAIN('E', "SURF", "no drawable: %s\n", why);
+ 		return nil;
+ 	}
+@@ -8483,7 +8681,7 @@
+ {
+ 	char why[256] = "the buffer's memory is the kernel's own, not the compiler library's";
+ 	struct rwa_texture_shape shape = {
+-		.pixel_format = (unsigned)[descriptor pixelFormat],
++		.pixel_format = rw_gfx_alias((unsigned)[descriptor pixelFormat], "buffer texture"),   /* gfx100a */
+ 		.type = (unsigned)[descriptor textureType],
+ 		.width = (unsigned)[descriptor width],
+ 		.height = (unsigned)[descriptor height],
+@@ -9713,6 +9911,8 @@
+ 	struct rwa_texture *view = NULL;
+ 	struct rwa_texture *parent = [self mesaTexture];
+ 
++	format = rw_gfx_alias((unsigned)format, "texture view");   /* gfx100a */
++
+ 	if (mesa.texture_view != NULL && parent != NULL) {
+ 		view = mesa.texture_view(parent, (unsigned)format, (unsigned)type,
+ 					 (unsigned)levels.location, (unsigned)levels.length,
+@@ -11758,6 +11958,7 @@
+ 				} else {
+ 					RW_AGAIN('W', "CMD", "a draw reads texture %u, which the application left empty (%u bound): one clear texel "
+ 					    "stands there\n", i, work->textureCount);
++					rw_gfx_slot_note(work->render, i, work->textureCount, reads);   /* gfx100a */
+ 				}
+ 			}
+ 		}
+--- m2m.h	2026-11-11 08:25:32.994098739 +0100
++++ ../src/m2m.h	2026-11-14 19:33:34.187342877 +0100
+@@ -35,6 +35,9 @@
+ };
+ #define M2M_IOC_CLIENT          _IOW('m', 1, struct m2m_client)
+ 
++#ifdef __OBJC__
++void rw_gfx_file_sink(const char *rec, size_t n);   /* gfx100a */
++#endif
+ static int m2m_fd = -1;
+ static pthread_once_t m2m_once = PTHREAD_ONCE_INIT;
+ 
+@@ -89,6 +92,9 @@
+ 	} else {
+ 		nrw_log_line(rec, (size_t)n);
+ 	}
++#ifdef __OBJC__
++	rw_gfx_file_sink(rec, (size_t)n);    /* gfx100a: also to /var/db/nord2-metal/log/<process>.<pid>.log (redwoodmetal.m) */
++#endif
+ }
+ 
+ static inline void m2m_log(char sev, const char *cat, const char *fmt, ...) __attribute__((format(printf, 3, 4)));

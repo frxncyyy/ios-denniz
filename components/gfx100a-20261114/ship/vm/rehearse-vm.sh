@@ -1,0 +1,16 @@
+#!/bin/bash
+# gfx100a VM rehearsals on the CURRENT mirror (shader99b), run under the global heavy lock: the txn path (generic_update_offline.py =
+# journal replay + guest in the VM on a throw-away overlay) + catalog check against owned-gfx100a.json, each guest CHAINED after
+# webxr1's own guest (the phone after the webxr1 transaction): chain (webxr1 + gfx100a), chain-off, chain-undo (webxr1 + gfx100a + undo).
+set -u
+W=$NORD2_WORK
+B=$W/gpu/build; T=$W/gpu/tools; H=$B/gfx100a-20261114/ship/vm; MAIN=$NORD2_REPO
+cd $H
+python3 -c "import json,os;m=\"$B/mirror/rootfs-mirror.img\";r=json.load(open(\"rehearsal-snapshot.json\"));r[\"root\"]=json.load(open(m+\".manifest.json\"))[\"root\"];r[\"bytes\"]=os.path.getsize(m);json.dump(r,open(\"rehearsal-snapshot.json\",\"w\"),indent=1);print(\"receipt root\",r[\"root\"])"
+for P in ${ONLY:-chain chain-off chain-undo}; do
+  rm -rf vm-$P
+  timeout 1500 python3 $B/apps-20261104/generic_update_offline.py --snapshot-receipt $H/rehearsal-snapshot.json --payload $H/payload-$P --guest $H/guest-$P.sh --output $H/vm-$P --initramfs $MAIN/research/nord2/rootfs-vm/initramfs > vm-$P.offline.log 2>&1; echo "offline EXIT $?" >> vm-$P.offline.log
+  python3 $T/check_update_catalog_fast.py --hfsx-read $MAIN/research/nord2/display-capabilities/hfsx-read.py --snapshot-receipt $H/rehearsal-snapshot.json --update $H/vm-$P --owned-json ../owned-gfx100a.json --output vm-$P-catalog.json > vm-$P-catalog.log 2>&1; echo "catalog EXIT $?" >> vm-$P-catalog.log
+  rm -f vm-$P/overlay.qcow2 vm-$P/delta.bin vm-$P/initrd.gz
+done
+echo REHEARSE_DONE

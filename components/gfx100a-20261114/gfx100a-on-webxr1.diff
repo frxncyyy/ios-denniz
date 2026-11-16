@@ -1,0 +1,524 @@
+--- redwoodmetal.m	2026-11-14 19:28:42.132990189 +0100
++++ ../../gfx100a-20261114/src2/redwoodmetal.m	2026-11-14 19:46:18.344055331 +0100
+@@ -3857,6 +3857,172 @@
+  *        'NORD2 GPU TEXLAYOUT: pid= name= layouts=N refused=R | textures ok=K (bytes B) refused=F' at 1, 2, 4, 8... events;
+  *        'I RES texlayout: ...' for the first layouts and textures, 'W RES texlayout: ...' for every kind of refusal.
+  */
++
++/*
++ * ---- gfx100a (2026-11-14): app switcher / App Library / Safari ----
++ * Built on webxr1 (gpu/build/webxr-20261114: the XR formats 550-555, which this block therefore does NOT touch; its
++ * rw_gfx_xr_alias_of in rw_gfx100a_pure.h is unused here). rw_gfx100a_pure.h has the why of the ASTC edge fix. And diagnostics:
++ *   filelog   every record this process gives m2m_log is also appended to /var/db/nord2-metal/log/<process>.<pid>.log (when that
++ *             directory exists; payload gfx100a makes it 1777), at most 4 MiB a process. The kernel's log selector has a budget
++ *             of 16 KiB per client (patch 0084, logBytes), so a backboardd hours old says nothing on the console any more.
++ *   slotdiag  which pipelines draw with an empty texture slot (first 48 pipeline+slot pairs, by label), and the first 64 refused
++ *             IOSurface textures with their format, size and usage (the console's RW_AGAIN shows only every power of two).
++ *   rtcopy    a ONE-plane IOSurface whose rows the GPU cannot address in place (not a multiple of 64 bytes) is served as a copy
++ *             (-redwoodCopySurface), and what the GPU RENDERED into that copy never reached the surface: y2s58 writes back
++ *             copied PLANES only. The app switcher's snapshots are such surfaces -- 788x1706 at 6304 bytes a row (8 bytes a
++ *             pixel, RGBA16Float), served as a copy in the logs (SpringBoard, and three without a name) -- so a snapshot drawn
++ *             into one stayed what the surface held before: transparent or black. Such a copy used as a colour attachment is
++ *             now written back into the surface when its command buffer has completed (-redwoodWriteBackWhole).
++ * Switches (/var/db/nord2-metal/, read once per process): no-gfx100a (all), no-astcedge, no-filelog, no-slotdiag, no-rtcopy.
++ * Lines: 'I DEV NORD2 GPU GFX100A: pid= name= config ...' once (the first time a feature is asked).
++ */
++#include "rw_gfx100a_pure.h"
++
++enum { RW_G_ASTCEDGE, RW_G_FILELOG, RW_G_SLOTDIAG, RW_G_RTCOPY, RW_G_N };
++static const char *const rw_g_names[RW_G_N] = { "astcedge", "filelog", "slotdiag", "rtcopy" };
++static int rw_g_off[RW_G_N];
++static volatile int rw_g_ready;
++
++static void
++rw_gfx_config(void)
++{
++	static dispatch_once_t once;
++
++	if (rw_g_ready) {
++		return;
++	}
++	dispatch_once(&once, ^{
++		int all = access("/var/db/nord2-metal/no-gfx100a", F_OK) == 0;
++		char line[200] = "";
++		size_t used = 0;
++
++		for (int i = 0; i < RW_G_N; i++) {
++			char path[96];
++
++			snprintf(path, sizeof(path), "/var/db/nord2-metal/no-%s", rw_g_names[i]);
++			rw_g_off[i] = all || access(path, F_OK) == 0;
++			used += (size_t)snprintf(line + used, sizeof(line) - used, " %s=%s", rw_g_names[i], rw_g_off[i] ? "OFF" : "ON");
++			if (used >= sizeof(line)) {
++				used = sizeof(line) - 1;
++			}
++		}
++		__sync_synchronize();
++		rw_g_ready = 1;
++		m2m_log('I', "DEV", "NORD2 GPU GFX100A: pid=%d name=%s config%s%s gfx100a\n", getpid(), getprogname(), line,
++		    all ? " (no-gfx100a)" : "");
++	});
++}
++
++static int
++rw_gfx_on(int feature)
++{
++	rw_gfx_config();
++	return feature >= 0 && feature < RW_G_N && !rw_g_off[feature];
++}
++
++/*
++ * The file sink, called by m2m_vlog (m2m.h) for every record of this process. No locks (it is also reached from the crash
++ * handler): the first caller opens, a caller that meets the open in progress drops its record.
++ */
++void
++rw_gfx_file_sink(const char *rec, size_t n)
++{
++	static int fd = -2;              /* -2 not tried yet, -1 off */
++	static volatile int opening;
++	static volatile unsigned long bytes;
++	char buf[1200];
++	size_t used;
++
++	if (fd == -1 || rec == NULL) {
++		return;
++	}
++	if (fd == -2) {
++		int f = -1;
++
++		if (__sync_lock_test_and_set(&opening, 1)) {
++			return;
++		}
++		if (access("/var/db/nord2-metal/no-gfx100a", F_OK) != 0 && access("/var/db/nord2-metal/no-filelog", F_OK) != 0 &&
++		    access("/var/db/nord2-metal/log", W_OK) == 0) {
++			char path[200];
++
++			snprintf(path, sizeof(path), "/var/db/nord2-metal/log/%s.%d.log", getprogname(), getpid());
++			f = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
++		}
++		__sync_synchronize();
++		fd = f >= 0 ? f : -1;
++		if (fd < 0) {
++			return;
++		}
++	}
++	if (bytes > (4ul << 20)) {
++		return;
++	}
++	{
++		struct timespec ts;
++		struct tm tm;
++
++		clock_gettime(CLOCK_REALTIME, &ts);
++		localtime_r(&ts.tv_sec, &tm);
++		used = (size_t)snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03ld ", tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000);
++	}
++	if (n > sizeof(buf) - used - 1) {
++		n = sizeof(buf) - used - 1;
++	}
++	memcpy(buf + used, rec, n);
++	used += n;
++	buf[used++] = '\n';
++	__sync_add_and_fetch(&bytes, used);
++	(void)write(fd, buf, used);
++}
++
++/* slotdiag: the first 48 (pipeline, slot) pairs that draw with an empty texture slot, by the pipeline's label */
++static void
++rw_gfx_slot_note(id render, unsigned slot, unsigned bound, unsigned reads)
++{
++	static const void *seen[48];
++	static unsigned seen_slot[48];
++	static volatile unsigned count;
++	static volatile int lock;
++
++	if (count >= 48 || !rw_gfx_on(RW_G_SLOTDIAG)) {
++		return;
++	}
++	while (__sync_lock_test_and_set(&lock, 1)) {
++	}
++	unsigned c = count;
++	for (unsigned i = 0; i < c; i++) {
++		if (seen[i] == (const void *)render && seen_slot[i] == slot) {
++			__sync_lock_release(&lock);
++			return;
++		}
++	}
++	if (c < 48) {
++		seen[c] = (const void *)render;
++		seen_slot[c] = slot;
++		count = c + 1;
++	}
++	__sync_lock_release(&lock);
++	if (c < 48) {
++		m2m_log('I', "CMD", "gfx100a slot: pipeline %s reads texture %u of %u and the application bound %u: empty (one clear texel)\n",
++		    [render respondsToSelector:@selector(label)] && [(id)render label] != nil ? [[(id)render label] UTF8String] : "(no label)",
++		    slot, reads, bound);
++	}
++}
++
++/* slotdiag: the first 64 IOSurface textures refused, with what was asked */
++static void
++rw_gfx_surface_refused(unsigned pf, unsigned asked, unsigned w, unsigned h, unsigned usage, NSUInteger plane, const char *why)
++{
++	static volatile unsigned n;
++
++	if (!rw_gfx_on(RW_G_SLOTDIAG) || __sync_add_and_fetch(&n, 1) > 64) {
++		return;
++	}
++	m2m_log('W', "SURF", "gfx100a refused: IOSurface texture format %u (asked %u) %ux%u usage 0x%x plane %lu: %s\n", pf, asked, w, h,
++	    usage, (unsigned long)plane, why);
++}
++
+ #include "rw_texlayout_pure.h"
+ 
+ static struct {
+@@ -3973,6 +4139,16 @@
+ 	const char *why = "a slice or a depth this 2D layout does not have";
+ 
+ 	(void)imageBytes;
++	/* gfx100a (astcedge): a region ending inside the last partial block is cut at the level's edge -- the same blocks */
++	if (level < _l.levels && rw_gfx_on(RW_G_ASTCEDGE)) {
++		uint64_t w = region.size.width, h = region.size.height;
++
++		if (rw_gfx_edge_clamp(region.origin.x, &w, _l.level[level].width, _l.block_w) |
++		    rw_gfx_edge_clamp(region.origin.y, &h, _l.level[level].height, _l.block_h)) {
++			region.size.width = (NSUInteger)w;
++			region.size.height = (NSUInteger)h;
++		}
++	}
+ 	if (slice != 0 || region.origin.z != 0 || region.size.depth > 1 || level >= _l.levels ||
+ 	    rwtl_copy_in(&_l, memory, (uint32_t)level, region.origin.x, region.origin.y, region.size.width, region.size.height,
+ 	    linear, offset, rowBytes, &why) != 0) {
+@@ -3995,6 +4171,15 @@
+ 	const char *why = "a slice or a depth this 2D layout does not have";
+ 
+ 	(void)imageBytes;
++	if (level < _l.levels && rw_gfx_on(RW_G_ASTCEDGE)) {   /* gfx100a (astcedge) */
++		uint64_t w = region.size.width, h = region.size.height;
++
++		if (rw_gfx_edge_clamp(region.origin.x, &w, _l.level[level].width, _l.block_w) |
++		    rw_gfx_edge_clamp(region.origin.y, &h, _l.level[level].height, _l.block_h)) {
++			region.size.width = (NSUInteger)w;
++			region.size.height = (NSUInteger)h;
++		}
++	}
+ 	if (slice != 0 || region.origin.z != 0 || region.size.depth > 1 || level >= _l.levels ||
+ 	    rwtl_copy_out(&_l, memory, (uint32_t)level, region.origin.x, region.origin.y, region.size.width, region.size.height,
+ 	    linear, offset, rowBytes, &why) != 0) {
+@@ -4092,6 +4277,9 @@
+  * into the surface's plane once the command buffer that wrote it has completed */
+ - (RedwoodMetalTexture *)redwoodWriteBackRoot;
+ - (void)redwoodWriteBack;
++/* gfx100a (rtcopy): a copied ONE-plane surface rendered into: the root to write back whole at completion, or nil */
++- (RedwoodMetalTexture *)redwoodRTCopyRoot;
++- (void)redwoodWriteBackWhole;
+ /* y2s60: a surface-backed texture the GPU writes IN PLACE (no copy): this texture, or nil */
+ - (RedwoodMetalTexture *)redwoodTouchRoot;
+ - (void)redwoodTouchSurface;
+@@ -8035,6 +8223,7 @@
+ 		}
+ 	}
+ 	if (texture == NULL) {
++		rw_gfx_surface_refused(shape.pixel_format, shape.pixel_format, shape.width, shape.height, shape.usage, p, why);   /* gfx100a */
+ 		RW_AGAIN('E', "SURF", "no drawable: %s\n", why);
+ 		return nil;
+ 	}
+@@ -8968,6 +9157,69 @@
+ 	return t->_copiedPlane && !t->_ycbcr && (t->_shape.usage & 2u) && t->_iosurface != NULL && t->_texture != NULL ? t : nil;
+ }
+ 
++/* gfx100a (rtcopy) */
++- (RedwoodMetalTexture *)redwoodRTCopyRoot
++{
++	RedwoodMetalTexture *t = self;
++
++	while (t->_parent != nil) {
++		t = t->_parent;
++	}
++	if (!t->_copied || t->_copiedPlane || t->_ycbcr || t->_iosurface == NULL || t->_texture == NULL || !rw_gfx_on(RW_G_RTCOPY)) {
++		return nil;
++	}
++	return t;
++}
++
++- (void)redwoodWriteBackWhole
++{
++	static uint64_t n, bytes;
++	static pthread_mutex_t wb_lock = PTHREAD_MUTEX_INITIALIZER;
++	char why[256] = { 0 };
++
++	if (_iosurface == NULL || _texture == NULL || mesa.texture_read == NULL || !rw_ios_load()) {
++		return;
++	}
++	pthread_mutex_lock(&wb_lock);
++	if (rw_ios.lock(_iosurface, 0 /* read-write */, NULL) != 0) {
++		pthread_mutex_unlock(&wb_lock);
++		RW_AGAIN('E', "SURF", "gfx100a rtcopy: surface %u could not be locked for writing\n", rwd_surface_id(_iosurface));
++		return;
++	}
++	void *base = rw_ios.base(_iosurface);
++	size_t (*row_of)(void *) = (size_t (*)(void *))dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
++	size_t row = row_of != NULL ? row_of(_iosurface) : 0;
++	size_t rows = rw_ios.height(_iosurface);
++	const unsigned origin[3] = { 0, 0, 0 };
++	const unsigned size[3] = { _shape.width, _shape.height, 1 };
++	int rc = -1;
++
++	if (base != NULL && row != 0 && rows >= _shape.height) {
++		rc = mesa.texture_read(_texture, 0, 0, origin, size, base, row, why, sizeof(why));
++	} else {
++		snprintf(why, sizeof(why), "the surface is %zu rows of %zu bytes at %p and the texture %ux%u", rows, row, base,
++		    _shape.width, _shape.height);
++	}
++	rw_ios.unlock(_iosurface, 0, NULL);
++	/* the surface now holds what the texture holds: the next use must not copy it in again */
++	_copySeed = rw_ios.seed != NULL ? rw_ios.seed(_iosurface) : _copySeed;
++	_copiedOnce = YES;
++	if (rc != 0) {
++		pthread_mutex_unlock(&wb_lock);
++		RW_AGAIN('E', "SURF", "gfx100a rtcopy: surface %u was not written back: %s\n", rwd_surface_id(_iosurface), why);
++		return;
++	}
++	n++;
++	bytes += (uint64_t)row * _shape.height;
++	uint64_t now_n = n, now_bytes = bytes;
++	pthread_mutex_unlock(&wb_lock);
++	if (now_n <= 8 || (now_n & (now_n - 1)) == 0) {
++		m2m_log('I', "SURF", "gfx100a rtcopy n=%llu bytes=%llu: surface %u (format %u %ux%u, %zu bytes a row) written back from "
++		    "the GPU's copy\n", (unsigned long long)now_n, (unsigned long long)now_bytes, rwd_surface_id(_iosurface),
++		    _shape.pixel_format, _shape.width, _shape.height, row);
++	}
++}
++
+ - (RedwoodMetalTexture *)redwoodTouchRoot
+ {
+ 	RedwoodMetalTexture *t = self;
+@@ -9713,6 +9965,7 @@
+ 	struct rwa_texture *view = NULL;
+ 	struct rwa_texture *parent = [self mesaTexture];
+ 
++
+ 	if (mesa.texture_view != NULL && parent != NULL) {
+ 		view = mesa.texture_view(parent, (unsigned)format, (unsigned)type,
+ 					 (unsigned)levels.location, (unsigned)levels.length,
+@@ -10899,7 +11152,9 @@
+ 
+ 	_writeBack = nil;
+ 	for (RedwoodMetalTexture *t in list) {
+-		if ([t redwoodWriteBackRoot] == t) {
++		if ([t redwoodRTCopyRoot] == t) {
++			[t redwoodWriteBackWhole];      /* gfx100a (rtcopy) */
++		} else if ([t redwoodWriteBackRoot] == t) {
+ 			[t redwoodWriteBack];
+ 		} else {
+ 			[t redwoodTouchSurface];
+@@ -11376,6 +11631,10 @@
+ 				id ct = work->color[ci];
+ 				RedwoodMetalTexture *root = [ct isKindOfClass:[RedwoodMetalTexture class]] ? [(RedwoodMetalTexture *)ct redwoodTGTargetRoot] : nil;
+ 
++				if (root == nil && [ct isKindOfClass:[RedwoodMetalTexture class]]) {
++					root = [(RedwoodMetalTexture *)ct redwoodRTCopyRoot];       /* gfx100a (rtcopy) */
++				}
++
+ 				if (root != nil) {
+ 					if (_writeBack == nil) {
+ 						_writeBack = [[NSMutableArray alloc] init];
+@@ -11758,6 +12017,7 @@
+ 				} else {
+ 					RW_AGAIN('W', "CMD", "a draw reads texture %u, which the application left empty (%u bound): one clear texel "
+ 					    "stands there\n", i, work->textureCount);
++					rw_gfx_slot_note(work->render, i, work->textureCount, reads);   /* gfx100a */
+ 				}
+ 			}
+ 		}
+--- m2m.h	2026-11-11 08:25:32.994098739 +0100
++++ ../../gfx100a-20261114/src2/m2m.h	2026-11-14 19:40:16.320952460 +0100
+@@ -35,6 +35,9 @@
+ };
+ #define M2M_IOC_CLIENT          _IOW('m', 1, struct m2m_client)
+ 
++#ifdef __OBJC__
++void rw_gfx_file_sink(const char *rec, size_t n);   /* gfx100a */
++#endif
+ static int m2m_fd = -1;
+ static pthread_once_t m2m_once = PTHREAD_ONCE_INIT;
+ 
+@@ -89,6 +92,9 @@
+ 	} else {
+ 		nrw_log_line(rec, (size_t)n);
+ 	}
++#ifdef __OBJC__
++	rw_gfx_file_sink(rec, (size_t)n);    /* gfx100a: also to /var/db/nord2-metal/log/<process>.<pid>.log (redwoodmetal.m) */
++#endif
+ }
+ 
+ static inline void m2m_log(char sev, const char *cat, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+--- /dev/null	2026-11-11 18:19:12.789553017 +0100
++++ ../../gfx100a-20261114/src2/rw_gfx100a_pure.h	2026-11-14 19:40:16.322326455 +0100
+@@ -0,0 +1,64 @@
++/*
++ * gfx100a (2026-11-14): the pure arithmetic of the gfx100a block of redwoodmetal.m, in a header the host test includes too.
++ *
++ * 1. XR ALIAS. Apple's extended-range formats 550-555 (BGRA10_XR, BGR10_XR and their _sRGB forms, plus the two private 'b3a8'
++ *    ones) and 94 (BGR10A2Unorm, 'l10r') have no texture in the compiler library, and Nord2Metal refused every one by name
++ *    ("no drawable: pixel format 554 is a ten-bit XR format ..."). The kernel already makes their surfaces as ordinary BGRA of the
++ *    same geometry (MiniIOSurface.cpp: 'w30r', 'l10r', 'w30R', 'b3a8' -> 'BGRA', 4 bytes a pixel), and everyone reads the format
++ *    back from the surface. So a texture of such a format is served as BGRA8Unorm (80) -- or BGRA8Unorm_sRGB (81) for the
++ *    _sRGB ones -- which is exactly what lies in the surface's memory. What is lost is the range above 1.0 and the two extra bits
++ *    a channel: this panel shows neither. Seen refusing: com.apple.WebKit.GPU (perf1a: Safari's page stays black), backboardd
++ *    (night7, recov4: 554 over 1125x2436 and 281x609 surfaces = screen snapshots for the app switcher and the blurred home).
++ *    552/553 over a surface the kernel did NOT substitute ('w40a', 8 bytes a pixel) still fail the FourCC check, by name.
++ *
++ * 2. ASTC EDGE. A copy into the layout of a block-compressed texture whose region ends inside the last, partial block row or
++ *    column (ImageIO writes whole blocks: "region 0,1704 787x4 of 787x1705") was refused as "a region that leaves the level", and
++ *    the last block row of every switcher snapshot was left empty. The region is clamped to the level's edge, which names the same
++ *    blocks (rwtl_region rounds the edge up again).
++ */
++#ifndef RW_GFX100A_PURE_H
++#define RW_GFX100A_PURE_H
++
++#include <stdint.h>
++
++/* the format a texture of `pf` is made as; `pf` itself when it is not one of the aliased ones */
++static inline unsigned
++rw_gfx_xr_alias_of(unsigned pf)
++{
++	switch (pf) {
++	case 94:        /* MTLPixelFormatBGR10A2Unorm ('l10r' -> 'BGRA') */
++	case 550:       /* private, 'b3a8' -> 'BGRA' */
++	case 552:       /* MTLPixelFormatBGRA10_XR */
++	case 554:       /* MTLPixelFormatBGR10_XR ('w30r' -> 'BGRA') */
++		return 80;  /* MTLPixelFormatBGRA8Unorm */
++	case 551:       /* private, 'b3a8' -> 'BGRA' */
++	case 553:       /* MTLPixelFormatBGRA10_XR_sRGB */
++	case 555:       /* MTLPixelFormatBGR10_XR_sRGB */
++		return 81;  /* MTLPixelFormatBGRA8Unorm_sRGB */
++	default:
++		return pf;
++	}
++}
++
++/*
++ * A region (x, w) along one axis of a level `size` texels long, in blocks of `block`: if it ends past the level's edge but not past
++ * the edge rounded up to a whole block, its length is cut to end at the edge. 1 when it was cut, 0 when it is left as it was
++ * (inside the level already, or out of it by more than the partial block -- which stays refused).
++ */
++static inline int
++rw_gfx_edge_clamp(uint64_t x, uint64_t *w, uint64_t size, uint32_t block)
++{
++	uint64_t rounded;
++
++	if (block == 0 || *w == 0 || x >= size || x + *w <= size) {
++		return 0;
++	}
++	rounded = (size + block - 1) / block * block;
++	if (x + *w > rounded) {
++		return 0;
++	}
++	*w = size - x;
++	return 1;
++}
++
++#endif
+--- /dev/null	2026-11-11 18:19:12.789553017 +0100
++++ ../../gfx100a-20261114/src2/rw_gfx100a_host_test.c	2026-11-14 19:40:16.322366146 +0100
+@@ -0,0 +1,98 @@
++/* gfx100a host test: rw_gfx100a_pure.h against an independent reference (alias table; edge clamp vs rwtl_region of
++ * rw_texlayout_pure.h, i.e. a clamped region is accepted by the real region check and names the same blocks as the asked one). */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "rw_texlayout_pure.h"
++#include "rw_gfx100a_pure.h"
++
++static int fails;
++#define CHECK(c, ...) do { if (!(c)) { fails++; if (fails < 20) { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); } } } while (0)
++
++int
++main(void)
++{
++	/* 1. alias: exactly 94, 550, 552, 554 -> 80 and 551, 553, 555 -> 81; every other value of 0..4095 unchanged */
++	for (unsigned pf = 0; pf < 4096; pf++) {
++		unsigned want = pf;
++
++		if (pf == 94 || pf == 550 || pf == 552 || pf == 554)
++			want = 80;
++		if (pf == 551 || pf == 553 || pf == 555)
++			want = 81;
++		CHECK(rw_gfx_xr_alias_of(pf) == want, "alias %u -> %u, want %u", pf, rw_gfx_xr_alias_of(pf), want);
++	}
++	/* 2. edge clamp against the real region check, for ASTC 4x4 .. 12x12 layouts of many sizes */
++	static const unsigned fmts[] = { 204, 205, 206, 207, 208, 210, 211, 212, 213, 214, 215, 216, 217, 218 };
++	unsigned long tried = 0, clamped = 0, fixed = 0;
++
++	for (unsigned fi = 0; fi < sizeof(fmts) / sizeof(fmts[0]); fi++) {
++		for (unsigned W = 1; W <= 70; W += 3) {
++			for (unsigned H = 1; H <= 70; H += 5) {
++				struct rwtl_layout l;
++				const char *why = "";
++
++				if (rwtl_init(&l, fmts[fi], W, H, 1, &why) != 0) {
++					CHECK(0, "init %u %ux%u: %s", fmts[fi], W, H, why);
++					continue;
++				}
++				const struct rwtl_level *v = &l.level[0];
++				for (unsigned y = 0; y < H; y += l.block_h)
++					for (unsigned h = 1; h <= H + 2 * l.block_h; h++) {
++						for (unsigned x = 0; x < W; x += l.block_w)
++							for (unsigned w = 1; w <= W + 2 * l.block_w; w += 1) {
++								uint32_t c0, r0, cs0, rs0, c1, r1, cs1, rs1;
++								uint64_t ww = w, hh = h;
++								int before = rwtl_region(&l, 0, x, y, w, h, &c0, &r0, &cs0, &rs0, &why);
++								int cut = rw_gfx_edge_clamp(x, &ww, v->width, l.block_w) |
++									  rw_gfx_edge_clamp(y, &hh, v->height, l.block_h);
++								int after = rwtl_region(&l, 0, x, y, ww, hh, &c1, &r1, &cs1, &rs1, &why);
++								/* the region in blocks that the asked one covers, and whether it stays inside the
++								 * level's whole blocks */
++								unsigned ac = (x + w + l.block_w - 1) / l.block_w - x / l.block_w;
++								unsigned ar = (y + h + l.block_h - 1) / l.block_h - y / l.block_h;
++								int inside = x + w <= v->cols * l.block_w && y + h <= v->rows * l.block_h;
++								int aligned_end = (w % l.block_w == 0 || x + w >= v->width) &&
++										  (h % l.block_h == 0 || y + h >= v->height);
++
++								tried++;
++								clamped += cut != 0;
++								if (before == 0) {
++									CHECK(!cut && after == 0 && c1 == c0 && cs1 == cs0 && r1 == r0 && rs1 == rs0,
++									    "an accepted region changed: %u,%u %ux%u of %ux%u", x, y, w, h, W, H);
++								} else if (after == 0) {
++									fixed++;
++									CHECK(cut && inside && aligned_end && cs1 == ac && rs1 == ar &&
++									    c1 == x / l.block_w && r1 == y / l.block_h,
++									    "fixed region wrong: fmt %u %u,%u %ux%u of %ux%u -> %llux%llu blocks %ux%u want %ux%u",
++									    fmts[fi], x, y, w, h, W, H, (unsigned long long)ww, (unsigned long long)hh,
++									    cs1, rs1, ac, ar);
++								} else {
++									/* still refused: either it leaves the whole blocks, or it was never an edge case */
++									CHECK(!inside || !aligned_end || w == 0 || h == 0,
++									    "an in-block region still refused: fmt %u %u,%u %ux%u of %ux%u (%s)", fmts[fi],
++									    x, y, w, h, W, H, why);
++								}
++							}
++					}
++			}
++		}
++	}
++	/* 3. the case from the phone: 787x1705 ASTC 4x4, region 0,1704 787x4 */
++	{
++		struct rwtl_layout l;
++		const char *why = "";
++		uint32_t c, r, cs, rs;
++		uint64_t w = 787, h = 4;
++
++		rwtl_init(&l, 204, 787, 1705, 1, &why);
++		CHECK(rwtl_region(&l, 0, 0, 1704, w, h, &c, &r, &cs, &rs, &why) != 0, "the phone's region was accepted before");
++		rw_gfx_edge_clamp(0, &w, 787, 4);
++		rw_gfx_edge_clamp(1704, &h, 1705, 4);
++		CHECK(rwtl_region(&l, 0, 0, 1704, w, h, &c, &r, &cs, &rs, &why) == 0 && r == 426 && rs == 1 && cs == 197,
++		    "the phone's region: %s row %u rows %u cols %u", why, r, rs, cs);
++	}
++	printf("rw_gfx100a: %s (alias 4096 values; %lu regions, %lu clamped, %lu refused before and accepted after)\n",
++	    fails ? "FAILED" : "ok", tried, clamped, fixed);
++	return fails != 0;
++}

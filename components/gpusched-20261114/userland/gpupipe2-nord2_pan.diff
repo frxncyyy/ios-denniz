@@ -1,0 +1,150 @@
+--- src/redwood-drm/nord2_pan.c	2026-11-14 21:13:27.368254191 +0100
++++ src4/redwood-drm/nord2_pan.c	2026-11-14 22:56:45.645072643 +0100
+@@ -97,6 +97,8 @@
+ static __thread unsigned gp_n;
+ static int gp_off = -1, gp_no_v3;
+ static uint64_t gp_v3, gp_v2, gp_full;
++static int gp_no_v4 = -1;                      /* gpupipe2 */
++static uint64_t gp_v4, gp_v4_trunc;
+ int redwood_pipe_enabled(void);
+ void redwood_submit_access(const uint8_t *access_set, unsigned count);
+ static const uint32_t pool_class_kib[NP_POOL_CLASSES] = { 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384 };
+@@ -354,9 +356,10 @@
+ 			if (m > 0)
+ 				np_log(b, (size_t)(m < (int)sizeof(b) ? m : (int)sizeof(b) - 1));
+ 		}
+-		if (gp_v3 || gp_full) {                              /* gpupipe1 */
+-			m = snprintf(b, sizeof(b), "np pipe: v3=%llu v2=%llu full=%llu off=%d no_v3=%d", (unsigned long long)gp_v3,
+-				     (unsigned long long)gp_v2, (unsigned long long)gp_full, gp_off, gp_no_v3);
++		if (gp_v3 || gp_full || gp_v4) {                     /* gpupipe1, gpupipe2 */
++			m = snprintf(b, sizeof(b), "np pipe: v3=%llu v2=%llu full=%llu off=%d no_v3=%d v4=%llu v4_trunc=%llu no_v4=%d", (unsigned long long)gp_v3,
++				     (unsigned long long)gp_v2, (unsigned long long)gp_full, gp_off, gp_no_v3, (unsigned long long)gp_v4,
++				     (unsigned long long)gp_v4_trunc, gp_no_v4);
+ 			if (m > 0)
+ 				np_log(b, (size_t)(m < (int)sizeof(b) ? m : (int)sizeof(b) - 1));
+ 		}
+@@ -712,6 +715,110 @@
+ 	gp_n = count;
+ }
+ 
++/* gpupipe2 (gpusched-20261114, kernel 0661): ABI v4 = up to 128 buffers per job, so the compositor's lists fit: its jobs get per-buffer
++ * maintenance (not the whole context) and, with an access set, the 0632 overlap.  More than 128 -> TRUNCATED (whole-context maintenance).
++ * A kernel that refuses v4 (no 0661) -> this process goes back to v3/v2 with 32.  Kill switch: /private/var/db/nord2-metal/no-gpuv4. */
++static int do_submit4(struct submit *r, const uint32_t *list, unsigned count, int head, uint64_t *seqno)
++{
++	struct nord2_gpu_submit_request4 q;
++	uint32_t pick[NORD2_GPU_SUBMIT4_MAX];
++	unsigned np = 0, valid = 0;
++	const uint8_t *acc = gp_acc && gp_n == count && redwood_pipe_enabled() ? gp_acc : NULL;
++
++	memset(&q, 0, sizeof(q));
++	q.version = NORD2_GPU_TRANSPORT_VERSION4;
++	q.kind = (r->requirements & REQ_FS) ? 3 : 1;
++	q.heads[q.kind == 3 ? 1 : 0] = r->jc;
++	pick[np++] = list[head];
++	for (unsigned i = 0; i < count; i++) {
++		uint32_t h = list[i];
++		int dup = 0;
++
++		if (!h || h > NP_BOS || !D.bos[h].kernel)
++			continue;
++		for (unsigned k = 0; k < np; k++)
++			dup |= pick[k] == h;
++		if (dup)
++			continue;
++		valid++;
++		if (np < NORD2_GPU_SUBMIT4_MAX)
++			pick[np++] = h;
++	}
++	int truncated = valid + 1 > np;
++	if (truncated) {
++		D.stats.submit_bos_dropped += valid + 1 - np;
++		D.stats.full_maint++;
++		gp_v4_trunc++;
++		q.flags |= NORD2_GPU_SUBMIT_TRUNCATED;
++	}
++	for (unsigned k = 0; k < np; k++) {
++		struct bo *b = &D.bos[pick[k]];
++
++		q.handles[k] = b->kernel;
++		if (!acc && b->noexec && !b->heap)
++			q.write_mask[k >> 5] |= 1u << (k & 31u);
++	}
++	q.nr_handles = np;
++	if (acc && !truncated) {
++		q.flags |= NORD2_GPU_SUBMIT_PRECISE;
++		for (unsigned i = 0; i < count; i++)
++			for (unsigned k = 0; k < np; k++) {
++				if (pick[k] != list[i])
++					continue;
++				if (acc[i] & 1u)
++					q.touch_mask[k >> 5] |= 1u << (k & 31u);
++				if ((acc[i] & 2u) && D.bos[pick[k]].noexec)
++					q.write_mask[k >> 5] |= 1u << (k & 31u);
++			}
++		q.touch_mask[0] |= 1u;
++	} else if (acc) {
++		for (unsigned k = 0; k < np; k++)          /* truncated: the conservative write rule */
++			if (D.bos[pick[k]].noexec && !D.bos[pick[k]].heap)
++				q.write_mask[k >> 5] |= 1u << (k & 31u);
++	}
++	for (int tries = 0;; tries++) {
++		uint64_t job = 0;
++		unsigned n = 1;
++		int e = kcall(NORD2_GPU_SEL_SUBMIT_JM, NULL, 0, &q, sizeof(q), &job, &n, NULL, NULL);
++
++		if (e == (int)0xe00002c2u && !gp_v4) {     /* no 0661: v3/v2 from now on */
++			char b[96];
++			int m = snprintf(b, sizeof(b), "np v4: the kernel refuses ABI v4 (no 0661): 32 buffers per job");
++
++			gp_no_v4 = 1;
++			if (m > 0)
++				np_log(b, (size_t)m);
++			return -2;
++		}
++		if (e == KIO_BUSY && tries < 3) {
++			if (wait_seq(D.submitted, PATIENCE_MS) && errno != EIO)
++				return -1;
++			continue;
++		}
++		if (e)
++			return np_fail(kerr(e));
++		if (n != 1 || !job)
++			return np_fail(EIO);
++		gp_v4++;
++		if (acc && !truncated)
++			gp_v3++;                 /* counted with the precise submits of the 'np pipe' line */
++		*seqno = job;
++		D.submitted = job > D.submitted ? job : D.submitted;
++		gnr1_note_submit(job, r->jc, q.kind, np > 32 ? 32 : np, truncated);   /* GNR1 */
++		break;
++	}
++	for (unsigned i = 0; i < count; i++) {
++		uint32_t h = list[i];
++
++		if (h && h <= NP_BOS && D.bos[h].kernel)
++			D.bos[h].last_seq = *seqno;
++	}
++	if (r->out_sync && r->out_sync <= NP_SYNCOBJS && D.syncobj[r->out_sync - 1] != ~0ull)
++		D.syncobj[r->out_sync - 1] = *seqno;
++	D.stats.submits++;
++	return 0;
++}
++
+ static int do_submit(struct submit *r, size_t size, uint64_t *seqno)
+ {
+ 	const uint32_t *list = (const uint32_t *)(uintptr_t)r->bo_handles;
+@@ -731,6 +838,13 @@
+ 		D.stats.no_head_bo++;
+ 		return np_fail(EINVAL);
+ 	}
++	if (gp_no_v4 < 0)
++		gp_no_v4 = access("/private/var/db/nord2-metal/no-gpuv4", F_OK) == 0;
++	if (!gp_no_v4) {
++		int r4 = do_submit4(r, list, count, head, seqno);
++		if (r4 != -2)
++			return r4;
++	}
+ 	/* The BO that holds the chain's head first, then the rest in order until 32 are taken. */
+ 	uint32_t pick[NP_KERNEL_BOS];
+ 	unsigned np = 0;
