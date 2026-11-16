@@ -8,13 +8,16 @@ OnePlus/MediaTek firmware and no device data. See [THIRD-PARTY.md](THIRD-PARTY.m
 - **XNU kernel modifications** (`xnu/patches/`, `xnu/stage-q10jfinal44ts/`, `shim/nord2-xnu/`): files derived from Apple's XNU are
   under the **Apple Public Source License 2.0** (APSL-2.0, see the headers). The APSL requires that the source of modifications to
   Covered Code that are deployed externally be made available; this tree is that publication for the pieces it contains.
-  Kernel files withheld for the licence decision (docs/EXCLUDED.md) are not covered by this publication yet.
+  The kernel GPU driver files are included; they are **derived from ios-tegu** — check the upstream licence (see THIRD-PARTY.md).
 - **SWEET shim/loader and tools** (`shim/`, `tools/`, `tests/`, `kmod/`): from ios-sweet (upstream of this repository, see its
   licence) and the port author's additions.
 - **Port tools, payload scripts, host tests** (`components/`, `hwcodec/`, `video/`, `host-tools/`, `build/`): the port author's
   own work, except files that carry their own licence header (kept unchanged).
 - **MediaTek MDP3 reference headers** (`components/mdp-20261114/upstream/`): copied from the Linux kernel (GPL-2.0, MediaTek
   authors named in the headers); used as register reference.
+- **GPU stack** (`gpu/`, GPU work directories under `components/`, the kernel GPU driver): the port's work, partly **derived
+  from ios-tegu (check upstream licence; not verified here)**, plus Mesa (MIT) patches and derived files, the hackios AIR frontend
+  (MIT) and metal2vulkan (GPL-2.0+/LGPL-3.0+). Licence headers and NOTICE/LICENSE files are kept as found.
 - **Camera userland** (`components/camera-userland-*`, `components/camprev-*`, `components/camflash-*`): contains code based on
   HakiOS (see `LICENSE.hakios` next to the sources).
 
@@ -33,7 +36,9 @@ OnePlus/MediaTek firmware and no device data. See [THIRD-PARTY.md](THIRD-PARTY.m
 - **HakiOS / hackios** by oosexgang (hakios-xnu-kernel, hackios-xnu-userland, hakios-mt6768) — ideas and reference for the audio
   HAL plug-in base, the MediaTek Bluetooth transport (0721/0722 derive from its APSL kernel files, credited in the sources) and
   the camera userland base.
-- **Mesa** (MIT) — the Valhall (arch9) compiler used by the GPU userland (the userland itself is not in this tree).
+- **Mesa** (MIT) — the Valhall (arch9) compiler and NIR used by the GPU userland; patches in `components/y2s-stage0/tools-mesa/`.
+- **ios-tegu** — private reference sources from which parts of the GPU driver/userland derive (licence to be checked upstream).
+- **Chlorophyll** (ry-diffusion, Bergamota) and **hackios-xnu-userland** — AIR -> NIR frontend (MIT).
 - **MediaTek** GPL Linux drivers (MiCode/MTK_kernel_modules connectivity/conninfra, mtk-mdp3, mtk_nanohub) and **OPLUS** kernel
   sources — read as hardware references.
 - **DenialOfGravity / ios-redfin** — description used for the HFS 'J' fsctl answer (0733, own code).

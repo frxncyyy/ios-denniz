@@ -5,8 +5,8 @@
 >   **[designed, never tested on a second Nord 2]**. Expect to be the first tester, and expect to stop at a `REFUSED` or
 >   `REBUILD_NEEDED` verdict.
 > - **This source tree alone cannot produce a bootable kernel.** The final kernel was built from a CI kernel object archive plus
->   local pieces; some kernel files (the GPU driver `Nord2GPU.cpp` and two headers) and the GPU userland are withheld pending a
->   licence decision (docs/EXCLUDED.md). The installer steps 7+ need a **kernel template** (`kernel.tpl` + `pins-map.json`) and an
+>   locally recompiled pieces; the archive, Apple's XNU tarball and the cross toolchain are not in this repository (README,
+>   "What still does not build"). The installer steps 7+ need a **kernel template** (`kernel.tpl` + `pins-map.json`) and an
 >   **ADT template** that only the author's release builder (`components/release-20261115/tools/make_release.sh`) produces from a
 >   built kernel. Until such a release is published, a recipient can run steps 0-6 (rescue, read-only dump, profile, own modem
 >   blob) and must stop before step 7. **This is the current blocker.**
@@ -120,7 +120,8 @@ from a release build; the initramfs binaries are not in this source tree. Payloa
    payload; the BT address is generated randomly on the first run on your phone.
 4. jbts (Sileo/OpenSSH/TrollStore): `components/jbts-20261115/build_jbts.py` after you populated `inputs/` (see README-INPUTS.md);
    it generates **your** SSH host keys and password; follow `components/jbts-20261115/SETUP.md`.
-The GPU userland payload (Metal driver) is not in this tree (licence decision pending).
+GPU userland: sources in `gpu/` and `components/gfx200-20261114/all17-src/` with the install script
+`components/gfx200-20261114/shipall/txn_gfxall.sh`; building the payload needs the iOS SDK (not included) and no built payload is shipped.
 
 ## 10. First-boot checks [V on the author's phone]
 - USB console log (`tools/nord2-usb-console.py`): `NORD2 MODEM: fs disk blob source: rootfs file` + a file count, no
