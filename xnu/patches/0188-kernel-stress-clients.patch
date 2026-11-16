@@ -1,0 +1,82 @@
+--- a/iokit/Kernel/arm/Nord2GPU.cpp
++++ b/iokit/Kernel/arm/Nord2GPU.cpp
+@@ -294,6 +294,7 @@
+         unsigned table_count = 0;
+         bool configure(IOService *);
+         static void tick(OSObject *, IOTimerEventSource *);
++        static void stressThread(void *, wait_result_t);   /* 0188: boot-arg n2stress=<seconds>, two kernel clients that hammer ALLOC/MAP/RELEASE */
+         static int powerOn(void *);
+         static int powerOff(void *);
+         static uint32_t clockRead(void *, enum n2clk_block, uint32_t);
+@@ -521,6 +522,8 @@
+                 setProperty("MetalPluginName", "Nord2Metal");
+                 setProperty("MetalPluginClassName", "TeguComputeDevice");
+         }
++        {   int sn = 0; thread_t th; PE_parse_boot_argn("n2stress", &sn, sizeof(sn));
++                for (unsigned i = 0; sn > 0 && i < 2; i++) if (kernel_thread_start((thread_continue_t)Nord2GPU::stressThread, this, &th) == KERN_SUCCESS) thread_deallocate(th); }
+         registerService(); return true;
+ }
+ void Nord2GPU::stop(IOService *provider) {
+@@ -1106,6 +1109,62 @@
+         }
+         return io_error(e);
+ }
++
++/* 0188: controlled stress of the buffer path (alloc, MMU map + flush, release) without touching the phone.  Boot-arg n2stress=<seconds> (default off): 45 s after the GPU is ready two kernel
++ * clients, each with its own context, allocate and release buffers of 16 KiB..12 MiB as fast as the driver lets them (a 3 s all-allocate burst every 10 s fills the handle table), bounded to
++ * 512 live buffers and 160 MiB per client.  The normal UI keeps running meanwhile.  Progress and failures are logged every 2 s as "NORD2 STRESS". */
++void Nord2GPU::stressThread(void *arg, wait_result_t) {
++        Nord2GPU *d = (Nord2GPU *)arg;
++        int secs = 0; PE_parse_boot_argn("n2stress", &secs, sizeof(secs));
++        if (secs <= 0 || !d) { thread_terminate(current_thread()); return; }
++        for (unsigned i = 0; i < 600 && !(d->ready && !d->stopping); i++) IOSleep(500);
++        IOSleep(45000);
++        static volatile int idCounter; int me = __atomic_fetch_add(&idCounter, 1, __ATOMIC_RELAXED);
++        IOLockLock(d->lock);
++        unsigned ctx = N2C_MAX_CTX;
++        if (!d->ready || d->stopping || !d->core || n2c_ctx_open(d->core, 0x57e550000ull + (uint64_t)me, NORD2_GPU_CONTEXT_LIMIT, false, &ctx) != N2C_OK) {
++                IOLockUnlock(d->lock); IOLog("NORD2 STRESS[%d]: cannot start (ready=%d)\n", me, (int)d->ready); thread_terminate(current_thread()); return;
++        }
++        IOLockUnlock(d->lock);
++        struct Live { uint32_t h; uint64_t bytes; };
++        const unsigned CAP = 512; Live *live = (Live *)IOMallocZero(CAP * sizeof(Live));
++        static const uint64_t sizes[] = { 16384, 16384, 16384, 65536, 65536, 262144, 1ull << 20, 4ull << 20, 12ull << 20 };
++        unsigned n = 0; uint64_t liveBytes = 0, allocs = 0, frees = 0, fails = 0, iter = 0, lastLog = now_ms(NULL), t0 = now_ms(NULL), peak = 0;
++        uint32_t rng = 0x9e3779b9u ^ (uint32_t)(me * 7919);
++        IOReturn lastErr = kIOReturnSuccess;
++        IOLog("NORD2 STRESS[%d]: start, %d s, ctx %u\n", me, secs, ctx);
++        while (now_ms(NULL) - t0 < (uint64_t)secs * 1000 && !d->stopping && live) {
++                rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
++                bool burst = ((now_ms(NULL) - t0) % 10000) < 3000;
++                bool doAlloc = n < CAP && liveBytes < (160ull << 20) && (burst || (rng % 100) < 52);
++                if (doAlloc) {
++                        uint64_t size = sizes[(rng >> 8) % (sizeof(sizes) / sizeof(sizes[0]))];
++                        uint32_t flags = (((rng >> 20) & 3) == 0 && (gAllocExt & 6u)) ? 4u : 0u;
++                        uint32_t h = 0; uint64_t va = 0, act = 0;
++                        IOLockLock(d->lock);
++                        IOReturn r = d->ready ? d->mapBuffer(ctx, size, flags, &h, &va, &act, true, NULL) : kIOReturnNotReady;
++                        IOLockUnlock(d->lock);
++                        if (r == kIOReturnSuccess) { live[n].h = h; live[n].bytes = act; n++; liveBytes += act; allocs++; if (liveBytes > peak) peak = liveBytes; }
++                        else { fails++; lastErr = r; }
++                } else if (n) {
++                        unsigned k = rng % n;
++                        IOLockLock(d->lock); (void)n2c_bo_release(d->core, ctx, live[k].h); IOLockUnlock(d->lock);
++                        liveBytes -= live[k].bytes; live[k] = live[--n]; frees++;
++                }
++                if ((++iter & 15) == 0) IOSleep(1);
++                uint64_t t = now_ms(NULL);
++                if (t - lastLog >= 2000) {
++                        lastLog = t;
++                        IOLog("NORD2 STRESS[%d]: t=%llu s iter=%llu allocs=%llu frees=%llu fails=%llu (last 0x%x) live=%u/%llu MiB peak=%llu MiB\n", me, (t - t0) / 1000, iter, allocs, frees, fails, (unsigned)lastErr, n, liveBytes >> 20, peak >> 20);
++                }
++        }
++        for (unsigned k = 0; k < n; k++) { IOLockLock(d->lock); (void)n2c_bo_release(d->core, ctx, live[k].h); IOLockUnlock(d->lock); }
++        enum n2c_error e; unsigned guard = 0;
++        do { IOLockLock(d->lock); e = d->core ? n2c_ctx_close(d->core, ctx) : N2C_OK; IOLockUnlock(d->lock); if (e == N2C_E_BUSY) IOSleep(1); } while (e == N2C_E_BUSY && ++guard < 5000);
++        IOLog("NORD2 STRESS[%d]: done, %llu iterations, %llu allocs, %llu frees, %llu failures, close=%d\n", me, iter, allocs, frees, fails, (int)e);
++        if (live) IOFree(live, CAP * sizeof(Live));
++        thread_terminate(current_thread());
++}
+ IOReturn Nord2GPU::importSurface(unsigned c, uint32_t id, uint32_t offset, uint32_t bytes,
+                                 uint32_t *h, uint64_t *va, uint64_t *actual) {
+         if (!ready || !core || c >= N2C_MAX_CTX || !bytes || (offset & 4095)) return kIOReturnBadArgument;

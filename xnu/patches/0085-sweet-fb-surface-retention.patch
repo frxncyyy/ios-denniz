@@ -1,0 +1,347 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -35,6 +35,7 @@
+  * the first swap on (it still reaches the persistent log; panics draw).
+  */
+ #include "SweetSurface.h"
++#include "sweet_fb_pending_surfaces.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ 
+@@ -87,6 +88,18 @@
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
++static void *
++sweet_fb_retain_surface(uint32_t id)
++{
++	return sweet_surface_copy(id);          /* retained, or NULL */
++}
++
++static void
++sweet_fb_release_surface(void *p)
++{
++	((SweetSurface *)p)->release();
++}
++
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+ };
+@@ -132,6 +145,7 @@
+ 	SweetFBDiagnostics fDiag;
+ 	void reportDiagnostics(const char *reason);
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
++	sweet_fb_swap_lifecycle fSwapLifecycle;             /* surface refs held until the panel copy */
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+@@ -140,8 +154,9 @@
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
++	void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void swap(const uint8_t *rec);
+-	void present(const uint8_t *rec);
++	bool present(const uint8_t *rec, SweetSurface *const surfaces[SWEET_FB_LAYERS]);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -179,6 +194,8 @@
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
++	fDirty = false;
++	sweet_fb_swap_lifecycle_init(&fSwapLifecycle);
+ #if defined(NORD2)
+ 	if (!nord2_display_info(&fPhys, &fWidth, &fHeight, &fRowBytes)) {
+ 		IOLog("NORD2 FB: display configuration refused\n");
+@@ -302,28 +319,47 @@
+ 		if (step <= 6) { (void)nord2_display_refresh(); }
+ #endif
+ 		if (diag_report) { fb->reportDiagnostics("timer-off"); }
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		if (!__atomic_load_n(&fb->fSwapLifecycle.stopped, __ATOMIC_ACQUIRE)) { sender->setTimeoutUS(SWEET_FB_VSYNC_US); }
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	uint8_t *rec = NULL;
++	sweet_fb_pending_surfaces surfaces;
++	sweet_fb_pending_surfaces_init(&surfaces);
+ 	if (flush) {
+ 		if (fb->fDiag.enabled) { __atomic_fetch_add(&fb->fDiag.flushes, 1, __ATOMIC_RELAXED); }
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+-			fb->fDirty = false;
++			/* Take the references captured at SwapEnd for this record. */
++			if (sweet_fb_swap_lifecycle_take(&fb->fSwapLifecycle, &surfaces)) {
++				fb->fDirty = false;
++			} else {
++				IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++				rec = NULL;
++			}
+ 		} else if (fb->fDiag.enabled) {
+ 			__atomic_fetch_add(&fb->fDiag.alloc_failed, 1, __ATOMIC_RELAXED);
+ 		}
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
+-		fb->present(rec);
++		bool shown = fb->present(rec, (SweetSurface *const *)surfaces.object);
++		if (!shown) {
++			/* Display ownership failed: keep the refs for the retry unless a
++			 * newer SwapEnd superseded this record. */
++			IOLockLock(fb->fLock);
++			if (sweet_fb_swap_lifecycle_requeue(&fb->fSwapLifecycle, fb->fDirty, &surfaces)) {
++				fb->fDirty = true;
++			}
++			IOLockUnlock(fb->fLock);
++		}
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
++	/* Safe to release only after the layer copy and display refresh are done. */
++	sweet_fb_pending_surfaces_release(&surfaces, sweet_fb_release_surface);
+ 	if (diag_report) { fb->reportDiagnostics("timer-on"); }
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	if (!__atomic_load_n(&fb->fSwapLifecycle.stopped, __ATOMIC_ACQUIRE)) { sender->setTimeoutUS(SWEET_FB_VSYNC_US); }
+ }
+ 
+ void
+@@ -385,10 +421,24 @@
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	/* Pin the surfaces now: present() runs up to a flush interval (100 ms at
++	 * the default 10 Hz) later, when the ids may have been recycled/destroyed. */
++	sweet_fb_pending_surfaces incoming, replaced;
++	uint32_t ids[SWEET_FB_LAYERS];
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		ids[layer] = get32(rec, 0x54 + 4 * layer);
++	}
++	sweet_fb_pending_surfaces_capture(&incoming, ids, get32(rec, 0x104),
++	    sweet_fb_retain_surface);
++	sweet_fb_pending_surfaces_init(&replaced);
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+-	fDirty = true;
++	if (sweet_fb_swap_lifecycle_queue(&fSwapLifecycle, &incoming, &replaced)) {
++		fDirty = true;
++	}
+ 	IOLockUnlock(fLock);
++	/* Superseded (or post-stop) references are released outside fLock. */
++	sweet_fb_pending_surfaces_release(&replaced, sweet_fb_release_surface);
+ 	if (fDiag.enabled) {
+ 		uint64_t accepted = __atomic_add_fetch(&fDiag.swaps, 1, __ATOMIC_RELAXED);
+ 		if (accepted <= 8) {
+@@ -404,8 +454,9 @@
+ 	}
+ }
+ 
+-void
+-AppleCLCD::present(const uint8_t *rec)
++/* Returns false only when the display could not be taken over (nothing shown). */
++bool
++AppleCLCD::present(const uint8_t *rec, SweetSurface *const surfaces[SWEET_FB_LAYERS])
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 	uint64_t diag_present = 0;
+@@ -423,13 +474,10 @@
+ 		if (!nord2_display_begin()) {
+ 			/* vsync consumed fDirty before calling us. Retry at the normal
+ 			 * flush cadence; never replace a newer fPending with this record. */
+-			IOLockLock(fLock);
+-			fDirty = true;
+-			IOLockUnlock(fLock);
+ 			if (fDiag.enabled && __atomic_add_fetch(&fDiag.begin_failed, 1, __ATOMIC_RELAXED) <= 4) {
+ 				reportDiagnostics("ownership-failed");
+ 			}
+-			return;
++			return false;       /* vsyncFired re-queues the record and its refs */
+ 		}
+ #endif
+ 		int quiet = 0;
+@@ -453,7 +501,14 @@
+ 			continue;
+ 		}
+ 		if (fDiag.enabled) { __atomic_fetch_add(&fDiag.active_layers, 1, __ATOMIC_RELAXED); }
+-		SweetSurface *s = sweet_surface_copy(id);
++		/* Use the reference captured at SwapEnd; fall back to a late lookup
++		 * only for ids that were not resolvable then (we own that ref). */
++		SweetSurface *s = surfaces[layer];
++		bool ownRef = false;
++		if (s == NULL) {
++			s = sweet_surface_copy(id);
++			ownRef = (s != NULL);
++		}
+ 		if (fDiag.enabled && s == NULL) { __atomic_fetch_add(&fDiag.missing_surfaces, 1, __ATOMIC_RELAXED); }
+ 		if (fDiag.enabled && s != NULL && (s->pixelFormat != SWEET_FB_FORMAT_BGRA || s->planeCount != 0)) {
+ 			__atomic_fetch_add(&fDiag.non_bgra, 1, __ATOMIC_RELAXED);
+@@ -466,7 +521,7 @@
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
+ 		if (s == NULL || s == fSurface) {
+-			OSSafeReleaseNULL(s);
++			if (ownRef) s->release();
+ 			continue;
+ 		}
+ 		uintptr_t src = s->kernelAddress();
+@@ -520,7 +575,7 @@
+ 				    (size_t)w * 4);
+ 			}
+ 		}
+-		s->release();
++		if (ownRef) s->release();
+ 	}
+ 	if (diag_present && diag_present == __atomic_load_n(&fDiag.begin_failed, __ATOMIC_RELAXED) + 1) {
+ 		reportDiagnostics("first-present");
+@@ -533,6 +588,27 @@
+ 		IOLog("NORD2 FB: command-mode present %u done=%d\n", logged, done);
+ 	}
+ #endif
++	return true;
++}
++
++void
++AppleCLCD::stop(IOService *provider)
++{
++	sweet_fb_pending_surfaces pending;
++	sweet_fb_pending_surfaces_init(&pending);
++	/* Stop first so an in-flight vsync callback cannot re-arm the timer. */
++	if (fLock != NULL) {
++		IOLockLock(fLock);
++		sweet_fb_swap_lifecycle_stop(&fSwapLifecycle, &pending);
++		fDirty = false;
++		IOLockUnlock(fLock);
++	}
++	if (fVsync != NULL) {
++		fVsync->cancelTimeout();
++		fVsync->disable();
++	}
++	sweet_fb_pending_surfaces_release(&pending, sweet_fb_release_surface);
++	IOService::stop(provider);
+ }
+ 
+ bool
+--- /dev/null
++++ b/iokit/Kernel/arm/sweet_fb_pending_surfaces.h
+@@ -0,0 +1,120 @@
++#ifndef SWEET_FB_PENDING_SURFACES_H
++#define SWEET_FB_PENDING_SURFACES_H
++/*
++ * Surface references captured at SwapEnd and held until the panel copy for
++ * that record has finished (adapted from ios-tegu 0142).  Pure bookkeeping,
++ * host-testable: it never touches IOKit.  All lifecycle transitions are
++ * called with the owner's queue lock held; retain/release callbacks run
++ * outside it.
++ */
++#include <stdbool.h>
++#include <stdint.h>
++
++enum { SWEET_FB_PENDING_SURFACE_COUNT = 4 };
++typedef struct sweet_fb_pending_surfaces {
++	void *object[SWEET_FB_PENDING_SURFACE_COUNT];
++} sweet_fb_pending_surfaces;
++typedef void *(*sweet_fb_retain_id_fn)(uint32_t id);
++typedef void (*sweet_fb_release_fn)(void *object);
++
++typedef struct sweet_fb_swap_lifecycle {
++	bool stopped;
++	sweet_fb_pending_surfaces pending;
++} sweet_fb_swap_lifecycle;
++
++static inline void
++sweet_fb_pending_surfaces_init(sweet_fb_pending_surfaces *set)
++{
++	for (unsigned i = 0; i < SWEET_FB_PENDING_SURFACE_COUNT; ++i) set->object[i] = 0;
++}
++
++static inline bool
++sweet_fb_pending_surfaces_any(const sweet_fb_pending_surfaces *set)
++{
++	for (unsigned i = 0; i < SWEET_FB_PENDING_SURFACE_COUNT; ++i)
++		if (set->object[i] != 0) return true;
++	return false;
++}
++
++/* Retain only surfaces referenced by the enabled layer mask. A NULL result
++ * (id already gone) stays NULL and falls back to a late lookup at present. */
++static inline void
++sweet_fb_pending_surfaces_capture(sweet_fb_pending_surfaces *set,
++    const uint32_t ids[SWEET_FB_PENDING_SURFACE_COUNT], uint32_t mask,
++    sweet_fb_retain_id_fn retain_id)
++{
++	sweet_fb_pending_surfaces_init(set);
++	for (unsigned i = 0; i < SWEET_FB_PENDING_SURFACE_COUNT; ++i)
++		if ((mask & (1u << i)) && ids[i] != 0) set->object[i] = retain_id(ids[i]);
++}
++
++static inline void
++sweet_fb_pending_surfaces_release(sweet_fb_pending_surfaces *set,
++    sweet_fb_release_fn release_object)
++{
++	for (unsigned i = 0; i < SWEET_FB_PENDING_SURFACE_COUNT; ++i) {
++		void *object = set->object[i];
++		set->object[i] = 0;
++		if (object != 0) release_object(object);
++	}
++}
++
++static inline void
++sweet_fb_swap_lifecycle_init(sweet_fb_swap_lifecycle *state)
++{
++	state->stopped = false;
++	sweet_fb_pending_surfaces_init(&state->pending);
++}
++
++/* New SwapEnd: `incoming` refs move into the queue, the superseded set moves
++ * to `replaced` (release it outside the lock). After stop, incoming is handed
++ * back in `replaced` so nothing leaks. Returns whether the record was queued. */
++static inline bool
++sweet_fb_swap_lifecycle_queue(sweet_fb_swap_lifecycle *state,
++    sweet_fb_pending_surfaces *incoming, sweet_fb_pending_surfaces *replaced)
++{
++	if (state->stopped) {
++		*replaced = *incoming;
++		sweet_fb_pending_surfaces_init(incoming);
++		return false;
++	}
++	*replaced = state->pending;
++	state->pending = *incoming;
++	sweet_fb_pending_surfaces_init(incoming);
++	return true;
++}
++
++/* Detach the queued set for presentation; the caller owns the references. */
++static inline bool
++sweet_fb_swap_lifecycle_take(sweet_fb_swap_lifecycle *state,
++    sweet_fb_pending_surfaces *taken)
++{
++	if (state->stopped) return false;
++	*taken = state->pending;
++	sweet_fb_pending_surfaces_init(&state->pending);
++	return true;
++}
++
++/* Present could not start (display ownership failed): put the references back
++ * for the retry unless a newer SwapEnd already superseded this record (then
++ * `taken` keeps the stale refs and the caller releases them). */
++static inline bool
++sweet_fb_swap_lifecycle_requeue(sweet_fb_swap_lifecycle *state, bool newer_pending,
++    sweet_fb_pending_surfaces *taken)
++{
++	if (state->stopped || newer_pending) return false;
++	state->pending = *taken;
++	sweet_fb_pending_surfaces_init(taken);
++	return true;
++}
++
++static inline void
++sweet_fb_swap_lifecycle_stop(sweet_fb_swap_lifecycle *state,
++    sweet_fb_pending_surfaces *taken)
++{
++	state->stopped = true;
++	*taken = state->pending;
++	sweet_fb_pending_surfaces_init(&state->pending);
++}
++
++#endif

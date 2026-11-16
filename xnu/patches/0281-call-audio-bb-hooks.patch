@@ -1,0 +1,94 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -6756,6 +6756,33 @@
+ 	    n2net.attempts, n2net.dns_ok, n2net.icmp_ok);
+ }
+ 
++/* 0281: call audio. bsd/dev/audio_call.c (patch 0280) installs these at boot: CCCI_PCM_RX (ch 4, ccci_aud) packets go to
++ * it, its CCCI_PCM_TX (ch 5) speech messages are sent from the steady loop, and the bridge reports the call state. */
++void (*nord2_call_ccci_rx_hook)(const uint8_t *, uint32_t);
++unsigned (*nord2_call_ccci_take_hook)(uint8_t *, unsigned);
++void (*nord2_call_state_hook)(unsigned, unsigned);
++
++static unsigned sweet_call_tx;
++static void
++sweet_call_tick(void)
++{
++	uint8_t pkt[192];
++	unsigned n, k;
++
++	if (nord2_call_ccci_take_hook == NULL || !sweet_md_ready) {
++		return;
++	}
++	for (k = 0; k < 4 && (n = nord2_call_ccci_take_hook(pkt, sizeof(pkt))) != 0; k++) {
++		uint32_t msg = n == 16 ? sweet_rd32(pkt + 4) >> 16 : sweet_rd32(pkt + 12) >> 16;
++		int rc = sweet_ring_tx(0, pkt, n);          /* ccci_aud: tx queue 0 (port_cfg.c) */
++		sweet_call_tx++;
++		if (sweet_call_tx <= 200 || rc != 0) {
++			printf("NORD2 CALL: tx ch5 q0 msg 0x%04x len %u -> %s (rc %d, seq %u, t=%u ms, %s loop)\n", msg, n, rc == 0 ? "sent" : "FAILED",
++			    rc, sweet_seq_out[5] - 1, sweet_tick_ms, sweet_steady ? "steady" : "boot");
++		}
++	}
++}
++
+ /* port dispatch (proxy_dispatch_recv_skb) of one MD->AP packet (ccci_header + payload) */
+ static void
+ sweet_ccci_rx_pkt(unsigned q, const uint8_t *p, uint32_t plen)
+@@ -6785,6 +6812,10 @@
+ 			sweet_seq_in[ch] = (int)seq;
+ 		}
+ 	}
++	if (ch == 4 && nord2_call_ccci_rx_hook != NULL) {      /* 0281: CCCI_PCM_RX speech messages -> audio_call.c */
++		nord2_call_ccci_rx_hook(p, plen);
++		return;
++	}
+ 	switch (ch) {
+ 	case 0:                                             /* CCCI_CONTROL_RX: ccci_fsm_recv_control_packet */
+ 		if (d1 == 0 /* MD_INIT_START_BOOT */ && resv != 0x5555FFFFU) {
+@@ -7179,6 +7210,7 @@
+ 		}
+ 		sweet_net_poll();                                   /* N2NET: DPMAIF DL/UL */
+ 		sweet_at_tick();
++		sweet_call_tick();                                  /* 0281: call-audio speech messages */
+ 		sweet_net_tick();                                   /* N2NET: pdp_ip0 address/routes, self-test */
+ 		if (sweet_cnt_rx + sweet_cnt_tx != before || sweet_tx_pending) {
+ 			idle = 0;
+@@ -7375,6 +7407,7 @@
+ 		uint32_t rch = ccif[0x10 / 4], busy = ccif[0x04 / 4], start = ccif[0x08 / 4];
+ 		sweet_tick_ms = k * 50;
+ 		sweet_at_tick();
++		sweet_call_tick();                                   /* 0281: speech messages also during the (up to 300 s) boot loop */
+ 		sweet_net_tick();                                    /* N2NET: pdp_ip0, self-test, stats */
+ 		{
+ 			unsigned qq;
+--- a/iokit/Kernel/arm/Nord2Baseband.cpp
++++ b/iokit/Kernel/arm/Nord2Baseband.cpp
+@@ -3191,6 +3191,20 @@
+   for (uint32_t id = 1; id < 8; id++) if (bb_calls[id].used) return true;
+   return false;
+ }
++// 0281: call audio (bsd/dev/audio_call.c, patch 0280; the hook is NULL without it): speech on while a call is dialing,
++// alerting, active or held, off otherwise (an incoming call rings through iOS until it is answered).
++extern "C" void (*nord2_call_state_hook)(unsigned want, unsigned mode);
++static void bb_call_audio_update(void)
++{
++  unsigned want = 0;
++  for (uint32_t id = 1; id < 8; id++) {
++    const bb_call &c = bb_calls[id];
++    if (c.used && (c.state == NBM_CALL_ORIGINATION || c.state == NBM_CALL_CONVERSATION || c.state == NBM_CALL_ALERTING ||
++                   c.state == NBM_CALL_HOLD)) want = 1;
++  }
++  if (bb_speech_on) want = 1;                            // 0277ba: the modem's speech path is up (+ESPEECH: 1, early media too)
++  if (nord2_call_state_hook) nord2_call_state_hook(want, (unsigned)bb_call_mode());
++}
+ static void bb_clcc_done(int final, const char *text, unsigned len)
+ {
+   bb_clcc_inflight = 0;
+@@ -3286,6 +3300,7 @@
+     thread_call_enter_delayed(bb_ics_call, deadline);
+     bb_ics_armed = 1;
+   }
++  bb_call_audio_update();                                  // 0281
+   if (bb_clcc_again) { bb_clcc_again = 0; bb_clcc_poll(); }
+   else if (bb_calls_active() || bb_dial_active) bb_clcc_soon(bb_dial_active && bb_dial_atd_ok ? 300 : BB_CLCC_MS);
+ }

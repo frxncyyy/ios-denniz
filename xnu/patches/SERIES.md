@@ -91,6 +91,8 @@ pieces differ from the file here only by context; the exact compiled result is `
 | 0081 | `0081-sweet-usb-link-state.patch` | early bring-up (SWEET shim era: UFS, display, input, Wi-Fi, audio) | pre-0394 base/superseded | W-xnu |  |
 | 0082 | `0082-nord2-early-probe.patch` | early bring-up (SWEET shim era: UFS, display, input, Wi-Fi, audio) | pre-0394 base/superseded | W-xnu |  |
 | 0083 | `0083-nord2-keystore-compat.patch` | early bring-up (SWEET shim era: UFS, display, input, Wi-Fi, audio) | pre-0394 base/superseded | W-xnu |  |
+| 0084 | `0084-nord2-gpu.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | W-xnu |  |
+| 0085 | `0085-sweet-fb-surface-retention.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
 | 0086 | `0086-nord2-gpu-import-budget.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
 | 0087 | `0087-scope-cache-maintenance-to-job-buffers.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
 | 0088 | `0088-raise-private-budget-log-rejections.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
@@ -115,7 +117,9 @@ pieces differ from the file here only by context; the exact compiled result is `
 | 0108 | `0108-wait-seq-zero-is-a-successful-probe.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
 | 0109 | `0109-mcupm-readonly-probe-n2mcu.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
 | 0110 | `0110-scoped-invalidate-by-write-mask-n2wm.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
+| 0111 | `0111-iokit-trap-fast-path.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
 | 0112 | `0112-display-surface-reservation.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
+| 0113 | `0113-transport-trap-block-yields-to-frontend.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
 | 0114 | `0114-mcupm-readonly-probe2-n2mcu2.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
 | 0115 | `0115-mcupm-stage2-ping-n2mcuping.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
 | 0116 | `0116-cpu-dvfs-bringup-n2dvfs.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
@@ -190,6 +194,8 @@ pieces differ from the file here only by context; the exact compiled result is `
 | 0185 | `0185-p57-release-reclaim.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
 | 0186 | `0186-handle-slots-4096.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
 | 0187 | `0187-handle-slots-8192-retained-count.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
+| 0188 | `0188-kernel-stress-clients.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
+| 0189 | `0189-stress-bootarg-n2st.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
 | 0190 | `0190-te-locked-heartbeat-safe-window.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
 | 0191 | `0191-ovl-underrun-diagnostics.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
 | 0192 | `0192-copy-recheck-diagnostics.patch` | GPU kernel driver (Nord2GPU), framebuffer, power, stress | pre-0394 base/superseded | kernel-p1-20261026 |  |
@@ -261,6 +267,8 @@ pieces differ from the file here only by context; the exact compiled result is `
 | 0258 | `0258-nord2-modem-exp-ring-locate.patch` | platform: display/touch/battery/modem bring-up | pre-0394 base/superseded | kernel-p1-20261026 |  |
 | 0259 | `0259-nord2-modem-rings-after-bootup.patch` | platform: display/touch/battery/modem bring-up | pre-0394 base/superseded | kernel-p1-20261026 |  |
 | 0264 | `0264-nord2-modem-q10ak-16exp.patch` | modem (CCCI/DPMAIF, AT client) | pre-0394 base/superseded | kernel-p1-20261026 |  |
+| 0281 | `0281-call-audio-bb-hooks.patch` | telephony UI, proximity, ringtone, autotest, hwcodec base | pre-0394 base/superseded | patch-backup-20261108 |  |
+| 0282 | `0282-audio-install-upgrade.patch` | telephony UI, proximity, ringtone, autotest, hwcodec base | pre-0394 base/superseded | patch-backup-20261108 |  |
 | 0285 | `0285-nord2-applog-applog_name.patch` | telephony UI, proximity, ringtone, autotest, hwcodec base | pre-0394 base/superseded | applog-20261110 |  |
 | 0286 | `0286-nord2-applog-report-fd-null.patch` | telephony UI, proximity, ringtone, autotest, hwcodec base | pre-0394 base/superseded | applog-20261110b |  |
 | 0287 | `0287-nord2-applog-amfi-dev-env-vars.patch` | telephony UI, proximity, ringtone, autotest, hwcodec base | pre-0394 base/superseded | applog-20261110c |  |
@@ -478,25 +486,19 @@ pieces differ from the file here only by context; the exact compiled result is `
 
 | file | reason |
 |---|---|
-| `0084-nord2-gpu.patch` | tegu |
-| `0085-sweet-fb-surface-retention.patch` | tegu |
-| `0111-iokit-trap-fast-path.patch` | tegu |
-| `0113-transport-trap-block-yields-to-frontend.patch` | tegu |
-| `0188-kernel-stress-clients.patch` | tegu |
-| `0189-stress-bootarg-n2st.patch` | tegu |
-| `0260-nord2-modem-fs-server.patch` | embedded modem NVRAM blob |
-| `0261-nord2-modem-device-maps-early-rings.patch` | embedded modem NVRAM blob |
-| `0262-nord2-modem-nvdisk-fallback.patch` | embedded modem NVRAM blob |
-| `0263-nord2-modem-at-client.patch` | embedded modem NVRAM blob |
-| `0265-nord2-modem-full-start3s.patch` | embedded modem NVRAM blob |
-| `0266-nord2-modem-full-start3s-nopause.patch` | embedded modem NVRAM blob |
-| `0267-nord2-modem-full-start10s.patch` | embedded modem NVRAM blob |
-| `0268-nord2-modem-one-ring-mapping.patch` | embedded modem NVRAM blob |
-| `0269-nord2-modem-ccb-ctrl.patch` | embedded modem NVRAM blob |
-| `0270-nord2-modem-at-registration-poll.patch` | embedded modem NVRAM blob |
-| `0271-nord2-modem-at-data.patch` | embedded modem NVRAM blob |
-| `0272-nord2-modem-persistent-p1-test.patch` | embedded modem NVRAM blob |
-| `0273-nord2-modem-daily.patch` | embedded modem NVRAM blob |
-| `0274-nord2-modem-dpmaif-datapath.patch` | embedded modem NVRAM blob |
-| `0275-nord2-modem-p2t.patch` | embedded modem NVRAM blob |
-| `0276-nord2-modem-p2f.patch` | embedded modem NVRAM blob |
+| `0260-nord2-modem-fs-server.patch` | embedded modem NVRAM blob of the author's phone |
+| `0261-nord2-modem-device-maps-early-rings.patch` | embedded modem NVRAM blob of the author's phone |
+| `0262-nord2-modem-nvdisk-fallback.patch` | embedded modem NVRAM blob of the author's phone |
+| `0263-nord2-modem-at-client.patch` | embedded modem NVRAM blob of the author's phone |
+| `0265-nord2-modem-full-start3s.patch` | embedded modem NVRAM blob of the author's phone |
+| `0266-nord2-modem-full-start3s-nopause.patch` | embedded modem NVRAM blob of the author's phone |
+| `0267-nord2-modem-full-start10s.patch` | embedded modem NVRAM blob of the author's phone |
+| `0268-nord2-modem-one-ring-mapping.patch` | embedded modem NVRAM blob of the author's phone |
+| `0269-nord2-modem-ccb-ctrl.patch` | embedded modem NVRAM blob of the author's phone |
+| `0270-nord2-modem-at-registration-poll.patch` | embedded modem NVRAM blob of the author's phone |
+| `0271-nord2-modem-at-data.patch` | embedded modem NVRAM blob of the author's phone |
+| `0272-nord2-modem-persistent-p1-test.patch` | embedded modem NVRAM blob of the author's phone |
+| `0273-nord2-modem-daily.patch` | embedded modem NVRAM blob of the author's phone |
+| `0274-nord2-modem-dpmaif-datapath.patch` | embedded modem NVRAM blob of the author's phone |
+| `0275-nord2-modem-p2t.patch` | embedded modem NVRAM blob of the author's phone |
+| `0276-nord2-modem-p2f.patch` | embedded modem NVRAM blob of the author's phone |
