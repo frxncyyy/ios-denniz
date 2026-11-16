@@ -1,0 +1,47 @@
+--- a/gpu/tests/nord2_metal_bridge_test.c
++++ b/gpu/tests/nord2_metal_bridge_test.c
+@@ -27,6 +27,29 @@
+ };
+ static uint64_t get64(const void *v) {const unsigned char *p=v;return tegu_pipeline_word(p)|((uint64_t)tegu_pipeline_word(p+4)<<32);}
+ static void collect(struct fake *f,unsigned h) {struct buffer *b=&f->buffers[h];assert(b->active);free(b->data);b->data=NULL;b->active=0;f->live--;}
++/* 0087: the kernel cleans/invalidates only the buffers named in the submit list,
++ * so every GPU address stored in a listed (CPU-written) command/descriptor
++ * buffer must point into another listed buffer.  Independent of the bridge:
++ * scan listed buffers up to 256 KiB for 64-bit words inside any live buffer. */
++static unsigned closure_checked;
++static void check_list_closure(struct fake *f,const struct nord2_gpu_submit_request *r) {
++ for(unsigned k=0;k<r->nr_handles;k++) {
++  const struct buffer *src=&f->buffers[r->handles[k]];assert(src->active);
++  if(src->size>262144||src->exec)continue;
++  for(uint64_t off=0;off+8<=src->size;off+=8) {
++   uint64_t v=get64(src->data+off);
++   if(v<0x1000000000ull||v>=0x1000000000ull+(uint64_t)COUNT*0x2000000ull)continue;
++   for(unsigned h=1;h<=f->next;h++) {
++    const struct buffer *dst=&f->buffers[h];
++    if(!dst->active||v<dst->va||v>=dst->va+dst->size)continue;
++    unsigned listed=0;for(unsigned j=0;j<r->nr_handles;j++)listed|=r->handles[j]==h;
++    if(!listed)fprintf(stderr,"UNLISTED GPU pointer %llx (handle %u) in listed handle %u at +%llx, kind %u\n",
++     (unsigned long long)v,h,r->handles[k],(unsigned long long)off,r->kind);
++    assert(listed);closure_checked++;
++   }
++  }
++ }
++}
+ static int call(void *p,unsigned s,const uint64_t *in,unsigned ni,const void *bytes,size_t size,uint64_t *out,unsigned *no,void *ob,size_t *os) {
+  struct fake *f=p;
+  switch(s) {
+@@ -72,6 +95,7 @@
+   assert(!ni&&size==160&&bytes&&*no==1);
+   const struct nord2_gpu_submit_request *r=bytes;
+   assert(r->version==2);
++  check_list_closure(f,r);
+   if(r->kind==2){
+    assert(r->nr_handles>=5&&r->heads[0]&&r->heads[1]);
+    unsigned command=0;
+@@ -328,5 +352,6 @@
+  }
+  puts("PASS matrix wait failure: no pixel readback or later jobs; pending buffers retained until context close");
+  puts("PASS graphics CLEAR/LOAD,feedback snapshot,ordered2-stage submission,allocation/map/submit/wait failures");
++ assert(closure_checked>0);printf("PASS 0087 list closure: %u GPU pointers stored in listed buffers all point into listed buffers\n",closure_checked);
+  puts("PASS real TGP -> arch9 JM transport: eight lifetime/failure cases,80 concurrent dispatches,CSF rejection; no hardware execution");
+ }

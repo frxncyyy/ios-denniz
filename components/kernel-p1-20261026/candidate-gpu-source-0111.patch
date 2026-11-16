@@ -1,0 +1,340 @@
+--- a/gpu/include/nord2_gpu_transport.h
++++ b/gpu/include/nord2_gpu_transport.h
+@@ -261,4 +261,56 @@
+         return ni == expected_ni && no >= expected_no && si == expected_si &&
+                so >= minimum_so;
+ }
++
++/* ---- IOConnectTrap6 fast path (0111) ---------------------------------------------------------------------------------------------------
++ * IOConnectTrap6(conn, NORD2_GPU_TRAP_CALL, &call, sizeof(call), 0, 0, 0, 0) runs the same handler as IOConnectCallMethod on the caller's thread
++ * without a Mach message (the frontend's probe is gpu/metal/tegu/nord2_transport.inc; the layout below is byte-identical to its copy and the
++ * host test compares both).  XNU answers success without running anything when a client has no trap at the index, so `done` is the only proof
++ * that the call executed; the method's own IOReturn is in `result`. */
++#define NORD2_GPU_TRAP_CALL 0u
++#define NORD2_GPU_TRAP_MAGIC 0x4e325443u   /* 'N2TC' */
++#define NORD2_GPU_TRAP_DONE 0x4e325444u    /* 'N2TD' */
++#define NORD2_GPU_TRAP_SCALARS 4u
++#define NORD2_GPU_TRAP_STRUCT_IN_MAX 16384u   /* the LOG selector's bound */
++#define NORD2_GPU_TRAP_STRUCT_OUT_MAX 256u    /* largest reply is nord2_gpu_status (88 bytes) */
++struct nord2_gpu_trap_call {
++        uint32_t magic, selector, scalar_in_count, scalar_out_count;
++        uint64_t scalar_in[4], scalar_out[4];
++        uint64_t struct_in, struct_in_size, struct_out, struct_out_size;
++        int32_t result;
++        uint32_t done;
++};
++
++/* Reject a trap call before any byte of it is used.  `size_arg` is p2 of the trap.  The selector and the counts are checked again, with the
++ * buffers, by nord2_gpu_call_valid() inside the shared handler. */
++static inline bool nord2_gpu_trap_call_ok(const struct nord2_gpu_trap_call *c, uint64_t size_arg)
++{
++        if (!c || size_arg != sizeof(*c) || c->magic != NORD2_GPU_TRAP_MAGIC || c->done != 0)
++                return false;
++        if (c->scalar_in_count > NORD2_GPU_TRAP_SCALARS || c->scalar_out_count > NORD2_GPU_TRAP_SCALARS)
++                return false;
++        if (c->struct_in_size > NORD2_GPU_TRAP_STRUCT_IN_MAX || (c->struct_in_size && !c->struct_in))
++                return false;
++        if (c->struct_out_size > NORD2_GPU_TRAP_STRUCT_OUT_MAX || (c->struct_out_size && !c->struct_out))
++                return false;
++        return true;
++}
++
++/* Fill the reply of an executed call from what the shared handler left in its argument block; counts are clamped to what the caller offered
++ * and to the 4 scalars of the ABI.  Returns the number of bytes of struct output to copy out. */
++static inline uint64_t nord2_gpu_trap_finish(struct nord2_gpu_trap_call *c, int32_t method_result, const uint64_t *scalars,
++                                              uint32_t scalar_count, uint64_t struct_out_size)
++{
++        c->result = method_result;
++        c->scalar_out_count = scalar_count > NORD2_GPU_TRAP_SCALARS ? NORD2_GPU_TRAP_SCALARS : scalar_count;
++        for (uint32_t i = 0; i < c->scalar_out_count; i++)
++                c->scalar_out[i] = scalars[i];
++        for (uint32_t i = c->scalar_out_count; i < NORD2_GPU_TRAP_SCALARS; i++)
++                c->scalar_out[i] = 0;
++        if (struct_out_size > NORD2_GPU_TRAP_STRUCT_OUT_MAX)
++                struct_out_size = NORD2_GPU_TRAP_STRUCT_OUT_MAX;
++        c->struct_out_size = struct_out_size;
++        c->done = NORD2_GPU_TRAP_DONE;
++        return struct_out_size;
++}
+ #endif
+--- a/gpu/src/Nord2GPU.cpp
++++ b/gpu/src/Nord2GPU.cpp
+@@ -20,6 +20,7 @@
+ #include <kern/sched_prim.h>
+ #include <kern/thread.h>
+ #include <kern/cpu_data.h>
++#include <sys/proc.h>
+ #include "SweetSurface.h"
+ extern "C" {
+ extern unsigned long gPhysBase, gPhysSize;
+@@ -906,6 +907,8 @@
+         IOReturn clientDied() APPLE_KEXT_OVERRIDE { return clientClose(); }
+         IOReturn clientMemoryForType(UInt32,IOOptionBits *,IOMemoryDescriptor **) APPLE_KEXT_OVERRIDE;
+         IOReturn externalMethod(uint32_t,IOExternalMethodArguments *,IOExternalMethodDispatch *,OSObject *,void *) APPLE_KEXT_OVERRIDE;
++        IOExternalTrap *getTargetAndTrapForIndex(IOService **,UInt32) APPLE_KEXT_OVERRIDE;
++        IOReturn trapCall(void *,void *,void *,void *,void *,void *);
+ };
+ OSDefineMetaClassAndStructors(Nord2GPUUserClient,IOUserClient);
+ bool Nord2GPUUserClient::initWithTask(task_t t,void *security,UInt32 type) {
+@@ -951,6 +954,41 @@
+         if(o && o->md){*memory=o->md;(*memory)->retain();}
+         IOLockUnlock(gpu->lock);IOLockUnlock(lock);return *memory?kIOReturnSuccess:kIOReturnNotFound;
+ }
++/* IOConnectTrap6 fast path (0111, nord2_gpu_transport.h): the same handler as externalMethod, on the caller's thread, no Mach message.  Everything the user
++ * passed is copied in first and validated (nord2_gpu_trap_call_ok); the shared handler then validates selector, counts and buffers exactly like the MIG
++ * path.  The IOReturn of the method goes to `result`; the trap itself returns success once the call ran (`done` is the proof), and a refusal before
++ * running leaves `done` unset so the caller falls back to IOConnectCallMethod. */
++IOExternalTrap *Nord2GPUUserClient::getTargetAndTrapForIndex(IOService **target,UInt32 index) {
++        static IOExternalTrap trap={NULL,(IOTrap)&Nord2GPUUserClient::trapCall};
++        if(index!=NORD2_GPU_TRAP_CALL||!target)return NULL;
++        *target=this;return &trap;
++}
++IOReturn Nord2GPUUserClient::trapCall(void *p1,void *p2,void *,void *,void *,void *) {
++        struct nord2_gpu_trap_call c;user_addr_t ua=(user_addr_t)(uintptr_t)p1;
++        if((uint64_t)(uintptr_t)p2!=sizeof(c)||!ua||copyin(ua,&c,sizeof(c))!=0||!nord2_gpu_trap_call_ok(&c,sizeof(c)))return kIOReturnBadArgument;
++        uint8_t inline_in[256];uint8_t *in=NULL;size_t in_bytes=(size_t)c.struct_in_size;bool heap_in=false;
++        if(in_bytes){
++                if(in_bytes<=sizeof(inline_in))in=inline_in;
++                else{in=(uint8_t *)IOMallocData(in_bytes);if(!in)return kIOReturnNoMemory;heap_in=true;}
++                if(copyin((user_addr_t)c.struct_in,in,in_bytes)!=0){if(heap_in)IOFreeData(in,in_bytes);return kIOReturnBadArgument;}
++        }
++        uint8_t out[NORD2_GPU_TRAP_STRUCT_OUT_MAX];bzero(out,sizeof(out));uint64_t sout[NORD2_GPU_TRAP_SCALARS]={0};
++        /* Prove the reply memory is writable BEFORE running anything: a refusal after the method ran would make the caller repeat it through MIG (a double SUBMIT). */
++        if((c.struct_out_size&&copyout(out,(user_addr_t)c.struct_out,(size_t)c.struct_out_size)!=0)||copyout(&c,ua,sizeof(c))!=0){if(heap_in)IOFreeData(in,in_bytes);return kIOReturnBadArgument;}
++        IOExternalMethodArguments a;bzero(&a,sizeof(a));
++        a.version=kIOExternalMethodArgumentsCurrentVersion;a.selector=c.selector;
++        a.scalarInput=c.scalar_in;a.scalarInputCount=c.scalar_in_count;
++        a.structureInput=in_bytes?in:NULL;a.structureInputSize=(uint32_t)in_bytes;
++        a.scalarOutput=sout;a.scalarOutputCount=c.scalar_out_count;
++        a.structureOutput=c.struct_out_size?out:NULL;a.structureOutputSize=(uint32_t)c.struct_out_size;
++        IOReturn r=externalMethod(c.selector,&a,NULL,NULL,NULL);
++        if(heap_in)IOFreeData(in,in_bytes);
++        uint64_t nout=nord2_gpu_trap_finish(&c,(int32_t)r,sout,a.scalarOutputCount,a.structureOutputSize);
++        if(nout>(uint64_t)a.structureOutputSize||nout>sizeof(out))nout=0;
++        /* Both copy-outs were proven possible above; a failure now can only be a concurrent unmap by the caller itself. */
++        if(nout&&copyout(out,(user_addr_t)c.struct_out,(size_t)nout)!=0)return kIOReturnBadArgument;
++        return copyout(&c,ua,sizeof(c))==0?kIOReturnSuccess:kIOReturnBadArgument;
++}
+ IOReturn Nord2GPUUserClient::externalMethod(uint32_t sel,IOExternalMethodArguments *a,IOExternalMethodDispatch *,OSObject *,void *) {
+         if(!a || !gpu || !lock)return kIOReturnBadArgument;
+         if(!nord2_gpu_call_valid(sel,a->scalarInputCount,a->scalarOutputCount,a->structureInputSize,a->structureOutputSize,
+--- a/shim/nord2-xnu/nord2_gpu_transport.h
++++ b/shim/nord2-xnu/nord2_gpu_transport.h
+@@ -261,4 +261,56 @@
+         return ni == expected_ni && no >= expected_no && si == expected_si &&
+                so >= minimum_so;
+ }
++
++/* ---- IOConnectTrap6 fast path (0111) ---------------------------------------------------------------------------------------------------
++ * IOConnectTrap6(conn, NORD2_GPU_TRAP_CALL, &call, sizeof(call), 0, 0, 0, 0) runs the same handler as IOConnectCallMethod on the caller's thread
++ * without a Mach message (the frontend's probe is gpu/metal/tegu/nord2_transport.inc; the layout below is byte-identical to its copy and the
++ * host test compares both).  XNU answers success without running anything when a client has no trap at the index, so `done` is the only proof
++ * that the call executed; the method's own IOReturn is in `result`. */
++#define NORD2_GPU_TRAP_CALL 0u
++#define NORD2_GPU_TRAP_MAGIC 0x4e325443u   /* 'N2TC' */
++#define NORD2_GPU_TRAP_DONE 0x4e325444u    /* 'N2TD' */
++#define NORD2_GPU_TRAP_SCALARS 4u
++#define NORD2_GPU_TRAP_STRUCT_IN_MAX 16384u   /* the LOG selector's bound */
++#define NORD2_GPU_TRAP_STRUCT_OUT_MAX 256u    /* largest reply is nord2_gpu_status (88 bytes) */
++struct nord2_gpu_trap_call {
++        uint32_t magic, selector, scalar_in_count, scalar_out_count;
++        uint64_t scalar_in[4], scalar_out[4];
++        uint64_t struct_in, struct_in_size, struct_out, struct_out_size;
++        int32_t result;
++        uint32_t done;
++};
++
++/* Reject a trap call before any byte of it is used.  `size_arg` is p2 of the trap.  The selector and the counts are checked again, with the
++ * buffers, by nord2_gpu_call_valid() inside the shared handler. */
++static inline bool nord2_gpu_trap_call_ok(const struct nord2_gpu_trap_call *c, uint64_t size_arg)
++{
++        if (!c || size_arg != sizeof(*c) || c->magic != NORD2_GPU_TRAP_MAGIC || c->done != 0)
++                return false;
++        if (c->scalar_in_count > NORD2_GPU_TRAP_SCALARS || c->scalar_out_count > NORD2_GPU_TRAP_SCALARS)
++                return false;
++        if (c->struct_in_size > NORD2_GPU_TRAP_STRUCT_IN_MAX || (c->struct_in_size && !c->struct_in))
++                return false;
++        if (c->struct_out_size > NORD2_GPU_TRAP_STRUCT_OUT_MAX || (c->struct_out_size && !c->struct_out))
++                return false;
++        return true;
++}
++
++/* Fill the reply of an executed call from what the shared handler left in its argument block; counts are clamped to what the caller offered
++ * and to the 4 scalars of the ABI.  Returns the number of bytes of struct output to copy out. */
++static inline uint64_t nord2_gpu_trap_finish(struct nord2_gpu_trap_call *c, int32_t method_result, const uint64_t *scalars,
++                                              uint32_t scalar_count, uint64_t struct_out_size)
++{
++        c->result = method_result;
++        c->scalar_out_count = scalar_count > NORD2_GPU_TRAP_SCALARS ? NORD2_GPU_TRAP_SCALARS : scalar_count;
++        for (uint32_t i = 0; i < c->scalar_out_count; i++)
++                c->scalar_out[i] = scalars[i];
++        for (uint32_t i = c->scalar_out_count; i < NORD2_GPU_TRAP_SCALARS; i++)
++                c->scalar_out[i] = 0;
++        if (struct_out_size > NORD2_GPU_TRAP_STRUCT_OUT_MAX)
++                struct_out_size = NORD2_GPU_TRAP_STRUCT_OUT_MAX;
++        c->struct_out_size = struct_out_size;
++        c->done = NORD2_GPU_TRAP_DONE;
++        return struct_out_size;
++}
+ #endif
+--- a/shim/nord2-xnu/Nord2GPU.cpp
++++ b/shim/nord2-xnu/Nord2GPU.cpp
+@@ -20,6 +20,7 @@
+ #include <kern/sched_prim.h>
+ #include <kern/thread.h>
+ #include <kern/cpu_data.h>
++#include <sys/proc.h>
+ #include "SweetSurface.h"
+ extern "C" {
+ extern unsigned long gPhysBase, gPhysSize;
+@@ -906,6 +907,8 @@
+         IOReturn clientDied() APPLE_KEXT_OVERRIDE { return clientClose(); }
+         IOReturn clientMemoryForType(UInt32,IOOptionBits *,IOMemoryDescriptor **) APPLE_KEXT_OVERRIDE;
+         IOReturn externalMethod(uint32_t,IOExternalMethodArguments *,IOExternalMethodDispatch *,OSObject *,void *) APPLE_KEXT_OVERRIDE;
++        IOExternalTrap *getTargetAndTrapForIndex(IOService **,UInt32) APPLE_KEXT_OVERRIDE;
++        IOReturn trapCall(void *,void *,void *,void *,void *,void *);
+ };
+ OSDefineMetaClassAndStructors(Nord2GPUUserClient,IOUserClient);
+ bool Nord2GPUUserClient::initWithTask(task_t t,void *security,UInt32 type) {
+@@ -951,6 +954,41 @@
+         if(o && o->md){*memory=o->md;(*memory)->retain();}
+         IOLockUnlock(gpu->lock);IOLockUnlock(lock);return *memory?kIOReturnSuccess:kIOReturnNotFound;
+ }
++/* IOConnectTrap6 fast path (0111, nord2_gpu_transport.h): the same handler as externalMethod, on the caller's thread, no Mach message.  Everything the user
++ * passed is copied in first and validated (nord2_gpu_trap_call_ok); the shared handler then validates selector, counts and buffers exactly like the MIG
++ * path.  The IOReturn of the method goes to `result`; the trap itself returns success once the call ran (`done` is the proof), and a refusal before
++ * running leaves `done` unset so the caller falls back to IOConnectCallMethod. */
++IOExternalTrap *Nord2GPUUserClient::getTargetAndTrapForIndex(IOService **target,UInt32 index) {
++        static IOExternalTrap trap={NULL,(IOTrap)&Nord2GPUUserClient::trapCall};
++        if(index!=NORD2_GPU_TRAP_CALL||!target)return NULL;
++        *target=this;return &trap;
++}
++IOReturn Nord2GPUUserClient::trapCall(void *p1,void *p2,void *,void *,void *,void *) {
++        struct nord2_gpu_trap_call c;user_addr_t ua=(user_addr_t)(uintptr_t)p1;
++        if((uint64_t)(uintptr_t)p2!=sizeof(c)||!ua||copyin(ua,&c,sizeof(c))!=0||!nord2_gpu_trap_call_ok(&c,sizeof(c)))return kIOReturnBadArgument;
++        uint8_t inline_in[256];uint8_t *in=NULL;size_t in_bytes=(size_t)c.struct_in_size;bool heap_in=false;
++        if(in_bytes){
++                if(in_bytes<=sizeof(inline_in))in=inline_in;
++                else{in=(uint8_t *)IOMallocData(in_bytes);if(!in)return kIOReturnNoMemory;heap_in=true;}
++                if(copyin((user_addr_t)c.struct_in,in,in_bytes)!=0){if(heap_in)IOFreeData(in,in_bytes);return kIOReturnBadArgument;}
++        }
++        uint8_t out[NORD2_GPU_TRAP_STRUCT_OUT_MAX];bzero(out,sizeof(out));uint64_t sout[NORD2_GPU_TRAP_SCALARS]={0};
++        /* Prove the reply memory is writable BEFORE running anything: a refusal after the method ran would make the caller repeat it through MIG (a double SUBMIT). */
++        if((c.struct_out_size&&copyout(out,(user_addr_t)c.struct_out,(size_t)c.struct_out_size)!=0)||copyout(&c,ua,sizeof(c))!=0){if(heap_in)IOFreeData(in,in_bytes);return kIOReturnBadArgument;}
++        IOExternalMethodArguments a;bzero(&a,sizeof(a));
++        a.version=kIOExternalMethodArgumentsCurrentVersion;a.selector=c.selector;
++        a.scalarInput=c.scalar_in;a.scalarInputCount=c.scalar_in_count;
++        a.structureInput=in_bytes?in:NULL;a.structureInputSize=(uint32_t)in_bytes;
++        a.scalarOutput=sout;a.scalarOutputCount=c.scalar_out_count;
++        a.structureOutput=c.struct_out_size?out:NULL;a.structureOutputSize=(uint32_t)c.struct_out_size;
++        IOReturn r=externalMethod(c.selector,&a,NULL,NULL,NULL);
++        if(heap_in)IOFreeData(in,in_bytes);
++        uint64_t nout=nord2_gpu_trap_finish(&c,(int32_t)r,sout,a.scalarOutputCount,a.structureOutputSize);
++        if(nout>(uint64_t)a.structureOutputSize||nout>sizeof(out))nout=0;
++        /* Both copy-outs were proven possible above; a failure now can only be a concurrent unmap by the caller itself. */
++        if(nout&&copyout(out,(user_addr_t)c.struct_out,(size_t)nout)!=0)return kIOReturnBadArgument;
++        return copyout(&c,ua,sizeof(c))==0?kIOReturnSuccess:kIOReturnBadArgument;
++}
+ IOReturn Nord2GPUUserClient::externalMethod(uint32_t sel,IOExternalMethodArguments *a,IOExternalMethodDispatch *,OSObject *,void *) {
+         if(!a || !gpu || !lock)return kIOReturnBadArgument;
+         if(!nord2_gpu_call_valid(sel,a->scalarInputCount,a->scalarOutputCount,a->structureInputSize,a->structureOutputSize,
+--- a/gpu/tests/nord2_trap_abi_test.c
++++ b/gpu/tests/nord2_trap_abi_test.c
+@@ -0,0 +1,97 @@
++/* IOConnectTrap6 fast path (0111): ABI of the call block, validation and reply packing, checked against the frontend's own copy of the
++ * struct (gpu/metal/tegu/nord2_transport.inc, copied verbatim below) and against the MIG path's validator. */
++#include "nord2_gpu_transport.h"
++#include <assert.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <string.h>
++
++/* ---- verbatim from nord2_transport.inc ---- */
++#define FE_TRAP_CALL 0u
++#define FE_TRAP_MAGIC 0x4e325443u /* 'N2TC' */
++#define FE_TRAP_DONE 0x4e325444u  /* 'N2TD' */
++struct fe_trap_call {
++ uint32_t magic,selector,scalar_in_count,scalar_out_count;
++ uint64_t scalar_in[4],scalar_out[4];
++ uint64_t struct_in,struct_in_size,struct_out,struct_out_size;
++ int32_t result;uint32_t done;
++};
++/* ---- end verbatim ---- */
++
++#define SAME(f) assert(offsetof(struct fe_trap_call,f)==offsetof(struct nord2_gpu_trap_call,f))
++static struct nord2_gpu_trap_call good(void)
++{
++	struct nord2_gpu_trap_call c;
++	memset(&c, 0, sizeof(c));
++	c.magic = NORD2_GPU_TRAP_MAGIC;
++	return c;
++}
++
++int main(void)
++{
++	/* layout and constants are the frontend's */
++	assert(sizeof(struct fe_trap_call) == sizeof(struct nord2_gpu_trap_call) && sizeof(struct nord2_gpu_trap_call) == 120);
++	SAME(magic); SAME(selector); SAME(scalar_in_count); SAME(scalar_out_count); SAME(scalar_in); SAME(scalar_out);
++	SAME(struct_in); SAME(struct_in_size); SAME(struct_out); SAME(struct_out_size); SAME(result); SAME(done);
++	assert(FE_TRAP_CALL == NORD2_GPU_TRAP_CALL && FE_TRAP_MAGIC == NORD2_GPU_TRAP_MAGIC && FE_TRAP_DONE == NORD2_GPU_TRAP_DONE);
++	assert(NORD2_GPU_TRAP_MAGIC == (('N' << 24) | ('2' << 16) | ('T' << 8) | 'C') && NORD2_GPU_TRAP_DONE == (('N' << 24) | ('2' << 16) | ('T' << 8) | 'D'));
++	/* the frontend's availability probe expects an 88-byte STATUS reply */
++	assert(sizeof(struct nord2_gpu_status) == 88);
++	assert(NORD2_GPU_TRAP_STRUCT_OUT_MAX >= sizeof(struct nord2_gpu_status) && NORD2_GPU_TRAP_STRUCT_OUT_MAX >= sizeof(struct nord2_gpu_fault_info));
++	assert(NORD2_GPU_TRAP_STRUCT_IN_MAX >= sizeof(struct nord2_gpu_submit_request) && NORD2_GPU_TRAP_STRUCT_IN_MAX == 16384);
++
++	/* validation */
++	struct nord2_gpu_trap_call c = good();
++	assert(nord2_gpu_trap_call_ok(&c, sizeof(c)));
++	assert(!nord2_gpu_trap_call_ok(NULL, sizeof(c)));
++	assert(!nord2_gpu_trap_call_ok(&c, sizeof(c) - 1) && !nord2_gpu_trap_call_ok(&c, sizeof(c) + 8) && !nord2_gpu_trap_call_ok(&c, 0));
++	c = good(); c.magic ^= 1; assert(!nord2_gpu_trap_call_ok(&c, sizeof(c)));
++	c = good(); c.done = NORD2_GPU_TRAP_DONE; assert(!nord2_gpu_trap_call_ok(&c, sizeof(c)));         /* a stale reply is not a request */
++	c = good(); c.done = 1; assert(!nord2_gpu_trap_call_ok(&c, sizeof(c)));
++	c = good(); c.scalar_in_count = 4; c.scalar_out_count = 4; assert(nord2_gpu_trap_call_ok(&c, sizeof(c)));
++	c = good(); c.scalar_in_count = 5; assert(!nord2_gpu_trap_call_ok(&c, sizeof(c)));
++	c = good(); c.scalar_out_count = 5; assert(!nord2_gpu_trap_call_ok(&c, sizeof(c)));
++	c = good(); c.struct_in = 0x1000; c.struct_in_size = NORD2_GPU_TRAP_STRUCT_IN_MAX; assert(nord2_gpu_trap_call_ok(&c, sizeof(c)));
++	c.struct_in_size++; assert(!nord2_gpu_trap_call_ok(&c, sizeof(c)));
++	c = good(); c.struct_in_size = 16; assert(!nord2_gpu_trap_call_ok(&c, sizeof(c)));                  /* size without a pointer */
++	c = good(); c.struct_out = 0x1000; c.struct_out_size = NORD2_GPU_TRAP_STRUCT_OUT_MAX; assert(nord2_gpu_trap_call_ok(&c, sizeof(c)));
++	c.struct_out_size++; assert(!nord2_gpu_trap_call_ok(&c, sizeof(c)));
++	c = good(); c.struct_out_size = 88; assert(!nord2_gpu_trap_call_ok(&c, sizeof(c)));
++	c = good(); c.struct_in = 0x1000; c.struct_in_size = 0; assert(nord2_gpu_trap_call_ok(&c, sizeof(c)));  /* pointer without size: nothing is read */
++	c = good(); c.struct_in_size = ~0ull; c.struct_in = 1; assert(!nord2_gpu_trap_call_ok(&c, sizeof(c)));
++	c = good(); c.struct_out_size = ~0ull; c.struct_out = 1; assert(!nord2_gpu_trap_call_ok(&c, sizeof(c)));
++
++	/* the calls the frontend makes pass the SAME validator as the MIG path (counts and sizes as bridge/probe build them) */
++	uint64_t in[4] = { 0 }, out[4] = { 0 };
++	struct nord2_gpu_status st; struct nord2_gpu_submit_request rq; struct nord2_gpu_fault_info fi;
++	c = good(); c.selector = NORD2_GPU_SEL_STATUS; c.struct_out = 0x1000; c.struct_out_size = sizeof(st);     /* the availability probe */
++	assert(nord2_gpu_trap_call_ok(&c, sizeof(c)) && nord2_gpu_call_valid(c.selector, c.scalar_in_count, c.scalar_out_count, 0, c.struct_out_size, in, out, NULL, &st));
++	c = good(); c.selector = NORD2_GPU_SEL_SUBMIT_JM; c.scalar_out_count = 1; c.struct_in = 0x1000; c.struct_in_size = sizeof(rq);
++	assert(nord2_gpu_trap_call_ok(&c, sizeof(c)) && nord2_gpu_call_valid(c.selector, 0, c.scalar_out_count, c.struct_in_size, 0, in, out, &rq, NULL));
++	c = good(); c.selector = NORD2_GPU_SEL_WAIT_SEQ; c.scalar_in_count = 2; c.scalar_out_count = 3;
++	assert(nord2_gpu_trap_call_ok(&c, sizeof(c)) && nord2_gpu_call_valid(c.selector, 2, 3, 0, 0, in, out, NULL, NULL));
++	c.struct_out = 0x1000; c.struct_out_size = sizeof(fi);
++	assert(nord2_gpu_trap_call_ok(&c, sizeof(c)) && nord2_gpu_call_valid(c.selector, 2, 3, 0, c.struct_out_size, in, out, NULL, &fi));
++	c = good(); c.selector = NORD2_GPU_SEL_LOG; c.struct_in = 0x1000; c.struct_in_size = 16384;
++	assert(nord2_gpu_trap_call_ok(&c, sizeof(c)));
++	/* a wrong shape that the trap block accepts is still refused by the shared validator (the handler runs the same check) */
++	c = good(); c.selector = NORD2_GPU_SEL_WAIT_SEQ; c.scalar_in_count = 1; c.scalar_out_count = 3;
++	assert(nord2_gpu_trap_call_ok(&c, sizeof(c)) && !nord2_gpu_call_valid(c.selector, 1, 3, 0, 0, in, out, NULL, NULL));
++
++	/* reply packing */
++	c = good(); c.selector = NORD2_GPU_SEL_WAIT_SEQ; c.scalar_in_count = 2; c.scalar_out_count = 3;
++	uint64_t sc[8] = { 4, 7, 0, 9, 9, 9, 9, 9 };
++	assert(nord2_gpu_trap_finish(&c, 0, sc, 3, 0) == 0 && c.done == NORD2_GPU_TRAP_DONE && c.result == 0);
++	assert(c.scalar_out_count == 3 && c.scalar_out[0] == 4 && c.scalar_out[1] == 7 && c.scalar_out[2] == 0 && c.scalar_out[3] == 0);
++	c = good(); assert(nord2_gpu_trap_finish(&c, (int32_t)0xe00002c2u, sc, 8, 0) == 0);                      /* more than 4 scalars: clamped */
++	assert(c.scalar_out_count == 4 && c.scalar_out[3] == 9 && c.result == (int32_t)0xe00002c2u && c.done == NORD2_GPU_TRAP_DONE);
++	c = good(); c.scalar_out[3] = 77; (void)nord2_gpu_trap_finish(&c, 0, sc, 1, 0);
++	assert(c.scalar_out_count == 1 && c.scalar_out[1] == 0 && c.scalar_out[3] == 0);                           /* unused slots are cleared */
++	c = good(); assert(nord2_gpu_trap_finish(&c, 0, sc, 0, 88) == 88 && c.struct_out_size == 88);
++	c = good(); assert(nord2_gpu_trap_finish(&c, 0, sc, 0, 100000) == NORD2_GPU_TRAP_STRUCT_OUT_MAX && c.struct_out_size == NORD2_GPU_TRAP_STRUCT_OUT_MAX);
++	/* a failed method still completes the trap: the result carries the error, done proves it ran */
++	c = good(); (void)nord2_gpu_trap_finish(&c, (int32_t)0xe00002bcu, sc, 0, 0);
++	assert(c.done == NORD2_GPU_TRAP_DONE && (uint32_t)c.result == 0xe00002bcu);
++	puts("nord2_trap_abi_test OK");
++	return 0;
++}
