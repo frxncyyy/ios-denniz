@@ -1,0 +1,106 @@
+--- a/gpu/metal/nord2_metal_bridge.c
++++ b/gpu/metal/nord2_metal_bridge.c
+@@ -75,6 +75,10 @@
+      * draw waits for its job before returning, so an evicted entry has no
+      * GPU user. */
+     struct bo *code[16];size_t code_len[16];uint64_t code_used[16],code_clock,code_total;
++    /* Host-memory copy of each cached binary: lookups compare against it,
++     * never against the BO's CPU mapping (GPU memory). NULL: compare the
++     * mapping (copy allocation failed). */
++    uint8_t *code_copy[16];
+     /* Entries used after this clock value belong to the job being built and
+      * are never reclaimed (UINT64_MAX outside a draw: all reclaimable). */
+     uint64_t code_protect;
+@@ -220,7 +224,8 @@
+ static unsigned code_reclaim(struct bridge *b){
+     unsigned n=0;
+     for(unsigned i=0;i<16;i++)if(b->code[i]&&b->code_used[i]<=b->code_protect){
+-        b->code_total-=b->code_len[i];(void)drop(b,b->code[i]);b->code[i]=NULL;b->code_len[i]=0;n++;}
++        b->code_total-=b->code_len[i];(void)drop(b,b->code[i]);b->code[i]=NULL;b->code_len[i]=0;
++        free(b->code_copy[i]);b->code_copy[i]=NULL;n++;}
+     return n;
+ }
+ static unsigned cmdpool_reclaim(struct bridge *b);
+@@ -502,6 +507,7 @@
+     int result=b->ops.close(b->ops.opaque);
+     b->ops.unlock(b->ops.opaque);
+     if(b->ops.destroy)b->ops.destroy(b->ops.opaque);
++    for(unsigned i=0;i<16;i++)free(b->code_copy[i]);
+     free(b);return result;
+ }
+ static int capabilities(struct bridge *b,uint64_t *out,unsigned *count) {
+@@ -1296,7 +1302,22 @@
+  * allocated, mapped, copied and released for every draw (c6gc: the 0.8 MB
+  * QuartzCore blur fragment binaries were re-uploaded per draw). */
+ #define CODE_CACHE_BYTES (8ull<<20)
+-static int code_equal(const uint8_t *a,const uint8_t *b,size_t n){ /* freestanding: no memcmp */
++/* freestanding: no memcmp. 8 bytes per step (memcpy loads: any alignment),
++ * after a first/last-word reject. c6p host profile: the byte loop over the
++ * cache BO's mapping was ~55% of all execute CPU (every draw compares its
++ * vertex and fragment binaries; QuartzCore blur fragments are ~0.8 MB). */
++static int code_equal(const uint8_t *a,const uint8_t *b,size_t n){
++ if(n>=8) {
++  uint64_t x,y;
++  memcpy(&x,a,8);memcpy(&y,b,8);if(x!=y)return 0;
++  memcpy(&x,a+n-8,8);memcpy(&y,b+n-8,8);if(x!=y)return 0;
++  size_t i=0;
++  for(;i+32<=n;i+=32){uint64_t p[4],q[4];memcpy(p,a+i,32);memcpy(q,b+i,32);
++   if((p[0]^q[0])|(p[1]^q[1])|(p[2]^q[2])|(p[3]^q[3]))return 0;}
++  for(;i+8<=n;i+=8){memcpy(&x,a+i,8);memcpy(&y,b+i,8);if(x!=y)return 0;}
++  for(;i<n;i++)if(a[i]!=b[i])return 0;
++  return 1;
++ }
+  for(size_t i=0;i<n;i++)if(a[i]!=b[i])return 0;
+  return 1;
+ }
+@@ -1305,7 +1326,8 @@
+ static int cached_code(struct bridge *b,const uint8_t *bytes,size_t n,uint64_t pin,struct bo **out){
+  if(!bytes||!n)return BAD;
+  for(unsigned i=0;i<16;i++){struct bo *o=b->code[i];
+-  if(o&&o->handle&&o->cpu&&b->code_len[i]==n&&code_equal((const uint8_t *)(uintptr_t)o->cpu,bytes,n)){
++  if(o&&o->handle&&o->cpu&&b->code_len[i]==n&&
++     code_equal(b->code_copy[i]?b->code_copy[i]:(const uint8_t *)(uintptr_t)o->cpu,bytes,n)){
+    b->code_used[i]=++b->code_clock;*out=o;return 0;}}
+  struct bo *o=NULL;int e=copy_code(b,bytes,n,&o);if(e){if(o&&o->handle)(void)drop(b,o);return e;}
+  unsigned slot=16;
+@@ -1318,9 +1340,11 @@
+    if(slot!=16&&b->code_total+n<=CODE_CACHE_BYTES)break;
+    if(victim==16){slot=16;break;}
+    b->code_total-=b->code_len[victim];(void)drop(b,b->code[victim]);b->code[victim]=NULL;b->code_len[victim]=0;
++   free(b->code_copy[victim]);b->code_copy[victim]=NULL;
+   }
+  }
+- if(slot<16){b->code[slot]=o;b->code_len[slot]=n;b->code_used[slot]=++b->code_clock;b->code_total+=n;}
++ if(slot<16){b->code[slot]=o;b->code_len[slot]=n;b->code_used[slot]=++b->code_clock;b->code_total+=n;
++  free(b->code_copy[slot]);b->code_copy[slot]=calloc(1,n);if(b->code_copy[slot])memcpy(b->code_copy[slot],bytes,n);}
+  *out=o;return slot<16?0:1; /* 1: caller owns an uncached BO */
+ }
+ static void clear_pixel(const struct tegu_generic_draw_request *q,uint8_t pixel[16]){
+@@ -1878,6 +1902,7 @@
+ static int draw_batch_locked(struct bridge *b,const struct n2mb_batch_draw *dr,const struct n2mb_render_targets *const *tg,
+  unsigned count,uint64_t *out,unsigned *count_out){
+  struct bo *cmd=NULL,*uncached[2*N2MB_BATCH_CAPACITY+2]={0};unsigned nuncached=0;uint64_t pooled_job=0;
++ struct bo *prev_vs=NULL,*prev_fs=NULL; /* the previous draw's code BOs (shared-shader reuse) */
+  struct n2c_mrt *mts=NULL; /* true-MRT: per-draw prepared target sets */
+  b->code_protect=b->chain.frames?b->chain.code_clock:b->code_clock;
+  int e=BAD;if(b->broken){e=NOTREADY;N2MB_BATCH_FAIL();}
+@@ -1932,10 +1957,15 @@
+   a.heap_bytes=b->tiler.heap_bytes;a.heap_chunk_enum1=b->tiler.chunk_enum1;
+   a.hierarchy_mask=b->tiler.mask;a.no_secondary=b->tiler.no_secondary;
+   struct bo *vs=NULL,*fs=NULL;
+-  e=cached_code(b,dr[k].shader->vertex_code,dr[k].shader->vertex_bytes,b->code_protect,&vs);
+-  if(e==1){uncached[nuncached++]=vs;e=0;}if(e)N2MB_BATCH_FAIL();
+-  e=cached_code(b,dr[k].shader->fragment_code,dr[k].shader->fragment_bytes,b->code_protect,&fs);
+-  if(e==1){uncached[nuncached++]=fs;e=0;}if(e)N2MB_BATCH_FAIL();
++  /* Draws of one batch usually share their shader: the same bytes (same
++   * pointer and length, within this call) resolve to the same code BO. */
++  if(k&&dr[k].shader->vertex_code==dr[k-1].shader->vertex_code&&dr[k].shader->vertex_bytes==dr[k-1].shader->vertex_bytes&&prev_vs)vs=prev_vs;
++  else{e=cached_code(b,dr[k].shader->vertex_code,dr[k].shader->vertex_bytes,b->code_protect,&vs);
++   if(e==1){uncached[nuncached++]=vs;e=0;}if(e)N2MB_BATCH_FAIL();}
++  if(k&&dr[k].shader->fragment_code==dr[k-1].shader->fragment_code&&dr[k].shader->fragment_bytes==dr[k-1].shader->fragment_bytes&&prev_fs)fs=prev_fs;
++  else{e=cached_code(b,dr[k].shader->fragment_code,dr[k].shader->fragment_bytes,b->code_protect,&fs);
++   if(e==1){uncached[nuncached++]=fs;e=0;}if(e)N2MB_BATCH_FAIL();}
++  prev_vs=vs;prev_fs=fs;
+   if(add_ref(&req,vs,0)||add_ref(&req,fs,0)){e=BAD;N2MB_BATCH_FAIL();}
+   a.command=frame+(uint64_t)k*N2R_BLOCK;a.frame=frame;a.heap=heap_va;
+   a.vertex_code=vs->va;a.fragment_code=fs->va;

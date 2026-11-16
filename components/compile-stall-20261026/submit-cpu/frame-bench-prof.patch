@@ -1,0 +1,62 @@
+--- a/gpu/tools/frame_bench_main.m
++++ b/gpu/tools/frame_bench_main.m
+@@ -136,6 +136,34 @@
+  [e drawIndexedPrimitives:3 indexCount:6 indexType:0 indexBuffer:fb_ib indexBufferOffset:0];
+ }
+ 
++/* FB_PROF=<file>: SIGPROF sampling (process CPU time, every 100 us) of the
++ * execution phase only ([commit] .. [waitUntilCompleted]), each sample a
++ * backtrace(); written at exit as hex return addresses plus the image base
++ * (gpu/tools/fb_prof_report.py resolves them). Host CPU shape, not device time. */
++#include <execinfo.h>
++#include <signal.h>
++#include <sys/time.h>
++#define FB_PROF_MAX 200000u
++#define FB_PROF_DEPTH 24
++static volatile int fb_prof_on;static void *(*fb_prof_buf)[FB_PROF_DEPTH];static unsigned char *fb_prof_n;static volatile unsigned fb_prof_count;
++static void fb_prof_handler(int sig){(void)sig;if(!fb_prof_on||!fb_prof_buf)return;unsigned i=__atomic_fetch_add(&fb_prof_count,1,__ATOMIC_RELAXED);
++ if(i>=FB_PROF_MAX)return;fb_prof_n[i]=(unsigned char)backtrace(fb_prof_buf[i],FB_PROF_DEPTH);}
++static void fb_prof_start(void){
++ if(!getenv("FB_PROF")||fb_prof_buf)return;
++ fb_prof_buf=calloc(FB_PROF_MAX,sizeof(*fb_prof_buf));fb_prof_n=calloc(FB_PROF_MAX,1);
++ {void *warm[4];(void)backtrace(warm,4);} /* load the unwinder outside the handler */
++ struct sigaction sa;memset(&sa,0,sizeof(sa));sa.sa_handler=fb_prof_handler;sa.sa_flags=SA_RESTART;sigaction(SIGPROF,&sa,0);
++ struct itimerval it={{0,100},{0,100}};setitimer(ITIMER_PROF,&it,0);
++}
++static void fb_prof_dump(void){
++ const char *path=getenv("FB_PROF");if(!path||!fb_prof_buf)return;
++ struct itimerval off={{0,0},{0,0}};setitimer(ITIMER_PROF,&off,0);
++ FILE *o=fopen(path,"w");if(!o)return;
++ {FILE *m=fopen("/proc/self/maps","r");char line[512];while(m&&fgets(line,sizeof(line),m))fprintf(o,"map %s",line);if(m)fclose(m);}
++ unsigned n=fb_prof_count<FB_PROF_MAX?fb_prof_count:FB_PROF_MAX;
++ for(unsigned i=0;i<n;i++){for(unsigned k=0;k<fb_prof_n[i];k++)fprintf(o,"%s%p",k?" ":"",fb_prof_buf[i][k]);fputc('\n',o);}
++ fclose(o);fprintf(stderr,"FB_PROF samples=%u file=%s\n",n,path);
++}
+ struct fb_frame {unsigned draws,passes;};
+ static struct fb_frame fb_build(TeguCommand *c,const struct fb_scn *s){
+  struct fb_frame fr={0,0};
+@@ -201,7 +229,7 @@
+  double wall1=tegu_enc_clock(),th1=fb_thread_cpu();uint64_t in1=fb_ins();
+  unsigned invalid=c->invalid,jobs_enc=c->count;
+  const char *at=c->invalidFunction?c->invalidFunction:"-";unsigned line=c->invalidLine;
+- [c commit];[c waitUntilCompleted];
++ fb_prof_on=1;[c commit];[c waitUntilCompleted];fb_prof_on=0;
+  double wall2=tegu_enc_clock();
+  unsigned long fb_status=(unsigned long)[c status];struct tegu_perf_batch pbv=c->perfBatch;
+  while(poolCount>fb_pool_base)[pool[--poolCount] release]; /* no run loop: drain only this frame's autoreleased objects */
+@@ -236,6 +264,7 @@
+ }
+ 
+ int main(int argc,char **argv){
++ fb_prof_start();
+  assert(argc>=11);
+  unsigned steady=argc>11?(unsigned)atoi(argv[11]):4;if(!steady)steady=1;
+  const char *only=argc>12&&argv[12][0]?argv[12]:0;
+@@ -404,6 +433,7 @@
+  printf("FB_PLAN ring=%u hits=%llu misses=%llu tmpl_made=%llu tmpl_refused=%llu tmpl_hits=%llu\n",fb_ring,
+   (unsigned long long)tegu_plan_memo_hits,(unsigned long long)tegu_plan_memo_misses,
+   (unsigned long long)tegu_plan_tmpl_made,(unsigned long long)tegu_plan_tmpl_refused,(unsigned long long)tegu_plan_tmpl_hits);
++ fb_prof_dump();
+  printf("FB_DONE\n");
+  return 0;
+ }

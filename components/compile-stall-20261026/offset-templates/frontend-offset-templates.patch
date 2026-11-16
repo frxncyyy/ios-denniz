@@ -1,0 +1,527 @@
+--- a/gpu/metal/tegu/render_pipeline.inc
++++ b/gpu/metal/tegu/render_pipeline.inc
+@@ -1265,6 +1265,10 @@
+  TeguAIRVertexLayout layouts[8];
+  TeguAIRGenericPlan plan;
+  TeguAIRGraphicsSpecializationPlan spec;
++ /* templated: buffer records outside the vertex layouts are keyed by their
++  * bind-shape class and the plan is rebased per hit (tegu_plan_memo_rebase). */
++ uint32_t templated;
++ TeguAIRGenericBufferTemplates tmpl;
+  TeguAIRRenderResource resources[]; /* key copies, count entries */
+ };
+ struct tegu_render_plan_memo {
+@@ -1277,6 +1281,9 @@
+  * count: only the draw record differs, only texture extents, only buffer
+  * offset/length, anything else, or no comparable entry. */
+ static U64 tegu_plan_miss_draw,tegu_plan_miss_extent,tegu_plan_miss_offset,tegu_plan_miss_other,tegu_plan_miss_cold;
++/* Buffer-offset templates: entries made templated, template requests the
++ * bridge or the probe refused, and hits rebased from a template. */
++static U64 tegu_plan_tmpl_made,tegu_plan_tmpl_refused,tegu_plan_tmpl_hits;
+ /* Vertex layout slots (bit = Metal buffer index) whose record may be keyed
+  * canonically. */
+ static uint32_t tegu_plan_memo_layout_slots(const TeguRenderPipeline *p,unsigned layoutCount) {
+@@ -1303,7 +1310,25 @@
+  if(r->kind!=2||r->texture_type!=2||!r->width||!r->height||r->width>16384||r->height>16384)return 0;
+  return r->width==776&&r->height==24?2u:1u;
+ }
++/* A templated entry's key for a buffer record outside the vertex layouts:
++ * the two bind-shape classes of metal2vulkan::bind::state (KEEP IN SYNC:
++ * offset_alignment - the largest power of two up to MAX_VERTEX_ALIGNMENT,
++ * which the template carries, dividing the offset; length_class - the bit
++ * length of the length rounded up to 16).  Everything else the plan reads
++ * from the record is rebased from the template on a hit, and the planner's
++ * own record checks (0 < length <= 2^32, offset <= length) are re-made. */
++#define TEGU_PLAN_MEMO_CLASS_MARK 0x434c5331u
++static uint64_t tegu_plan_memo_offset_class(uint64_t offset,uint32_t maxAlignment) {
++ uint64_t a=maxAlignment?maxAlignment:1u;
++ while(a>1&&offset%a)a/=2;
++ return a;
++}
++static uint64_t tegu_plan_memo_length_class(uint64_t length) {
++ uint64_t padded=(length+15u)&~(uint64_t)15u; /* length <= 2^32 here */
++ return padded?64u-(uint64_t)__builtin_clzll(padded):0u;
++}
+ static int tegu_plan_memo_key(TeguAIRRenderResource *out,const TeguAIRRenderResource *in,uint32_t canonicalSlots,
++ const TeguAIRGenericBufferTemplates *tmpl,uint32_t layoutSlots,
+  const TeguRenderPipeline *p,unsigned layoutCount,const TeguAIRRenderDraw *draw) {
+  const size_t head=offsetof(TeguAIRRenderResource,address_mode_identity)+sizeof(in->address_mode_identity);
+  const size_t tail=offsetof(TeguAIRRenderResource,length);
+@@ -1312,6 +1337,13 @@
+  memcpy((unsigned char *)out+tail,(const unsigned char *)in+tail,sizeof(*in)-tail);
+  {uint32_t cls=tegu_plan_memo_extent_class(in);
+   if(cls){out->width=cls;out->height=0;out->reserved=TEGU_PLAN_MEMO_EXTENT_MARK;return 0;}}
++ if(tmpl&&in->kind==1&&!(in->stage==1&&in->index<31&&(layoutSlots&(1u<<in->index)))) {
++  if(!in->length||in->length>(1ull<<32)||in->offset>in->length)return -1;
++  out->offset=tegu_plan_memo_offset_class(in->offset,tmpl->max_vertex_alignment);
++  out->length=tegu_plan_memo_length_class(in->length);
++  out->reserved=TEGU_PLAN_MEMO_CLASS_MARK;
++  return 0;
++ }
+  if(in->kind!=1||in->stage!=1||in->index>=31||!(canonicalSlots&(1u<<in->index)))return 0;
+  /* compositor_plan_inputs_mode: 0<length<=2^32, offset<=length. */
+  if(!in->length||in->length>(1ull<<32)||in->offset>in->length)return -1;
+@@ -1363,31 +1395,155 @@
+  }
+  return h?h:1;
+ }
+-/* Diagnostic only: which input class separates this miss from the closest
+- * comparable entry (fewest differing classes). */
+-static void tegu_plan_memo_classify(const struct tegu_render_plan_memo *m,const TeguRenderPipeline *p,
++/* Which input class separates this miss from the closest comparable entry
++ * (fewest differing classes), counted for TEGU_PERF_PLANMISS.  Returns 1 for
++ * an offset-only miss that a buffer-offset template may serve: not when a
++ * templated entry already holds this draw's bind-shape classes (its rebase
++ * refused this draw, and a second template would refuse it too). */
++static int tegu_plan_memo_classify(const struct tegu_render_plan_memo *m,const TeguRenderPipeline *p,
+  const TeguAIRRenderResource *keys,size_t count,unsigned layoutCount,const TeguAIRRenderDraw *draw) {
+- unsigned best=0;int seen=0;
++ unsigned best=0;int seen=0,refused=0;
+  for(unsigned w=0;m&&w<TEGU_PLAN_MEMO_WAYS;w++) {
+   const struct tegu_render_plan_memo_entry *e=m->ways[w];
+   if(!e||!e->valid||e->compiled!=p->compiled||e->count!=count||e->layoutCount!=layoutCount||
+      memcmp(e->layouts,p->genericLayouts,layoutCount*sizeof(e->layouts[0])))continue;
+   TeguAIRRenderDraw da=tegu_plan_memo_draw_key(&e->draw,e->drawCanon&&tegu_plan_memo_count_ok(draw)),
+    db=tegu_plan_memo_draw_key(draw,e->drawCanon&&tegu_plan_memo_count_ok(draw));
+-  unsigned diff=memcmp(&da,&db,sizeof(da))?1u:0u;
++  unsigned diff=memcmp(&da,&db,sizeof(da))?1u:0u,classDiff=0;
+   for(size_t i=0;i<count&&diff<16u;i++) {
+    const TeguAIRRenderResource *a=&e->resources[i],*b=&keys[i];
+    if(!memcmp(a,b,sizeof(*a)))continue;
+    TeguAIRRenderResource x=*a,y=*b;
++   if(e->templated&&x.kind==1&&y.kind==1&&x.reserved==TEGU_PLAN_MEMO_CLASS_MARK&&y.reserved!=TEGU_PLAN_MEMO_SLOT_MARK&&
++      (x.offset!=tegu_plan_memo_offset_class(y.offset,e->tmpl.max_vertex_alignment)||x.length!=tegu_plan_memo_length_class(y.length)))classDiff=1;
+    if(x.kind==2&&y.kind==2){x.width=y.width;x.height=y.height;if(!memcmp(&x,&y,sizeof(x))){diff|=2u;continue;}}
+    if(x.kind==1&&y.kind==1){x.offset=y.offset;x.length=y.length;x.reserved=y.reserved;if(!memcmp(&x,&y,sizeof(x))){diff|=4u;continue;}}
+    diff|=16u;
+   }
++  if(e->templated&&diff==4u&&!classDiff)refused=1;
+   if(!seen||__builtin_popcount(diff)<__builtin_popcount(best)){best=diff;seen=1;}
+  }
+  U64 *c=!seen?&tegu_plan_miss_cold:(best&16u)||__builtin_popcount(best)!=1?&tegu_plan_miss_other:
+   best==1u?&tegu_plan_miss_draw:best==2u?&tegu_plan_miss_extent:&tegu_plan_miss_offset;
+  __atomic_fetch_add(c,1,__ATOMIC_RELAXED);
++ return c==&tegu_plan_miss_offset&&!refused;
++}
++/* metal2vulkan bind::instantiate::descriptor_range for one template slot
++ * (KEEP IN SYNC; every templated entry is probed against a fresh plan once,
++ * and host TEGU_PLAN_MEMO_VERIFY re-plans every hit): the range [lo, hi) of
++ * a buffer bound at `b` in an allocation of `length` bytes and the residual
++ * b - lo, -1 where instantiation refuses it. */
++static int tegu_plan_memo_descriptor_range(uint64_t bindOffset,uint64_t length,const TeguAIRGenericBufferTemplate *t,
++ uint64_t *offsetOut,uint64_t *rangeOut,uint32_t *residualOut) {
++ typedef __int128 i128;
++ const i128 end=(i128)(length>UINT64_MAX-15u?UINT64_MAX&~(uint64_t)15u:(length+15u)&~(uint64_t)15u);
++ if(end==0)return -1;
++ const i128 a=(i128)(t->alignment>4u?t->alignment:4u),b=(i128)bindOffset;
++#define TEGU_PLAN_DOWN(x) ((x)-((((x)%a)+a)%a))
++ i128 lo,hi;
++ if(t->window_kind==1u) {
++  const i128 st=b+(i128)t->window_start;
++  lo=TEGU_PLAN_DOWN(st>0?st:(i128)0);hi=(st+(i128)t->window_len+15)&~(i128)15;
++ } else if(t->window_kind==2u){lo=TEGU_PLAN_DOWN(b);hi=end;}
++ else return -1;
++ if(hi>end)hi=end;
++ if(hi-lo<16) {
++  const i128 d=TEGU_PLAN_DOWN(end-16);
++  if(d<lo)lo=d;
++  if(hi<lo+16)hi=lo+16;
++ }
++#undef TEGU_PLAN_DOWN
++ if(lo<0||hi<=lo||(i128)(hi-lo)>(i128)t->max_range)return -1;
++ {const i128 m=(i128)1<<32;*residualOut=(uint32_t)((((b-lo)%m)+m)%m);}
++ *offsetOut=(uint64_t)lo;*rangeOut=(uint64_t)(hi-lo);
++ return 0;
++}
++/* Rebase a templated entry's plan onto this draw's buffer records: every
++ * template slot's GenericBinding offsets and lengths, descriptor range and
++ * its residual and guest-base push copies (air_bridge.rs
++ * generic_buffer_templates), with generic_plan_mode's containment check.
++ * -1: not restated here (the caller plans in full). */
++static void tegu_plan_memo_put(uint8_t *at,uint64_t v,unsigned n) {for(unsigned i=0;i<n;i++)at[i]=(uint8_t)(v>>(8u*i));}
++static int tegu_plan_memo_rebase(const TeguAIRGenericBufferTemplates *t,const TeguAIRRenderResource *res,size_t count,
++ TeguAIRGenericPlan *plan) {
++ if(t->version!=1u||t->count>16u)return -1;
++ for(uint32_t i=0;i<t->count;i++) {
++  const TeguAIRGenericBufferTemplate *s=&t->slots[i];const TeguAIRRenderResource *r=0;
++  for(size_t k=0;k<count;k++)if(res[k].kind==1&&res[k].stage==s->stage&&res[k].index==s->index){r=&res[k];break;}
++  if(!r)return -1;
++  uint64_t lo,range;uint32_t residual;
++  if(tegu_plan_memo_descriptor_range(r->offset,r->length,s,&lo,&range,&residual)||lo+range>r->length)return -1;
++  unsigned bound=0;
++  for(uint32_t b=0;b<plan->binding_count&&b<16;b++) {
++   TeguAIRGenericBinding *g=&plan->bindings[b];
++   if(g->kind!=TEGU_AIR_GENERIC_BUFFER||g->binding!=s->binding)continue;
++   g->bind_offset=r->offset;g->resource_length=r->length;g->descriptor_offset=lo;g->descriptor_length=range;bound++;
++  }
++  if(!bound||s->residual_count>4u||s->guest_count>4u)return -1;
++  for(uint32_t j=0;j<s->residual_count;j++) {
++   if(s->residual_at[j]>sizeof(plan->push_bytes)-4u)return -1;
++   tegu_plan_memo_put(plan->push_bytes+s->residual_at[j],residual,4u);
++  }
++  for(uint32_t j=0;j<s->guest_count;j++) {
++   if(s->guest_at[j]>sizeof(plan->push_bytes)-8u)return -1;
++   tegu_plan_memo_put(plan->push_bytes+s->guest_at[j],r->offset,8u); /* guest address 0 + offset */
++  }
++ }
++ return 0;
++}
++static int tegu_plan_templates_enabled(void) {
++ static int state=-1;
++ if(state<0){const char *env=getenv("NORD2_METAL_PLAN_TEMPLATES");state=!(env&&env[0]=='0');}
++ return state;
++}
++static void tegu_plan_template_trace(const char *what,const char *detail) {
++ static int state=-1;
++ if(state<0)state=getenv("TEGU_TRACE_PLAN_TEMPLATES")!=0;
++ if(state){char line[320];int n=snprintf(line,sizeof(line),"TEGU_PLAN_TEMPLATE %s %s\n",what,detail?detail:"");
++  if(n>0)write(2,line,(size_t)n<sizeof(line)?(size_t)n:sizeof(line)-1);}
++}
++/* Make this miss's templates and probe them once: every template slot's
++ * record is moved by alignment + MAX_VERTEX_ALIGNMENT (its bind-shape classes
++ * stay), planned in full, and the rebased plan must equal it byte for byte.
++ * 0: `out` holds templates for this entry. */
++static int tegu_plan_memo_templates(TeguRenderPipeline *p,const TeguAIRRenderResource *resources,size_t count,
++ const TeguAIRRenderDraw *draw,const TeguAIRGenericPlan *plan,const TeguAIRGraphicsSpecializationPlan *spec,
++ TeguAIRGenericBufferTemplates *out) {
++ char err[256]={0};int ok=-1;
++ if(tegu_air_render_pipeline_plan_generic_buffer_templates(p->compiled,resources,count,p->genericLayouts,
++    p->genericLayoutCount,draw,plan,out,err,sizeof(err))||out->version!=1u||out->count>16u) {
++  tegu_plan_template_trace("refused",err);return -1;
++ }
++ TeguAIRRenderResource *moved=malloc((count?count:1)*sizeof(*moved));
++ TeguAIRGenericPlan *fp=malloc(sizeof(*fp)),*rp=malloc(sizeof(*rp));
++ TeguAIRGraphicsSpecializationPlan *fs=malloc(sizeof(*fs));
++ if(moved&&fp&&rp&&fs) {
++  memcpy(moved,resources,count*sizeof(*moved));
++  unsigned movedAny=0;
++  for(uint32_t i=0;i<out->count;i++) {
++   const TeguAIRGenericBufferTemplate *s=&out->slots[i];
++   const uint64_t mva=out->max_vertex_alignment?out->max_vertex_alignment:1u;
++   uint64_t d=(s->alignment>4u?s->alignment:4u)+mva;if(d%mva)d=mva;
++   for(size_t k=0;k<count;k++) {
++    TeguAIRRenderResource *r=&moved[k];
++    if(r->kind!=1||r->stage!=s->stage||r->index!=s->index)continue;
++    if(r->offset<=r->length&&d<=r->length-r->offset){r->offset+=d;movedAny++;}
++    else if(r->offset>=d){r->offset-=d;movedAny++;}
++    break;
++   }
++  }
++  if(!movedAny)ok=0; /* nothing can move: the bridge checked every restated value against `plan` */
++  else if(tegu_air_render_pipeline_plan_generic_specialized(p->compiled,moved,count,p->genericLayouts,
++           p->genericLayoutCount,draw,fp,fs,err,sizeof(err)))tegu_plan_template_trace("probe-unplanned",err);
++  else {
++   memcpy(rp,plan,sizeof(*rp));
++   if(tegu_plan_memo_rebase(out,moved,count,rp))tegu_plan_template_trace("probe-unrebased",0);
++   else if(memcmp(rp,fp,sizeof(*rp))||memcmp(spec,fs,sizeof(*fs)))tegu_plan_template_trace("probe-mismatch",0);
++   else ok=0;
++  }
++ }
++ free(moved);free(fp);free(rp);free(fs);
++ return ok;
+ }
+ static void tegu_render_plan_memo_free(TeguRenderPipeline *p) {
+  if(!p||!p->genericPlanMemo)return;
+@@ -1420,7 +1576,8 @@
+     if(memcmp(&da,&db,sizeof(da)))continue;}
+    {size_t i=0;
+     for(;i<count;i++){TeguAIRRenderResource k;
+-     if(tegu_plan_memo_key(&k,&resources[i],e->canonicalSlots,p,layoutCount,draw)||memcmp(&k,&e->resources[i],sizeof(k)))break;}
++     if(tegu_plan_memo_key(&k,&resources[i],e->canonicalSlots,e->templated?&e->tmpl:0,fullSlots,p,layoutCount,draw)||
++        memcmp(&k,&e->resources[i],sizeof(k)))break;}
+     if(i!=count)continue;}
+    memcpy(plan,&e->plan,sizeof(*plan));memcpy(spec,&e->spec,sizeof(*spec));
+    /* The bound textures' own extents (the key holds only their class). */
+@@ -1428,6 +1585,10 @@
+     if(g->kind!=TEGU_AIR_GENERIC_TEXTURE&&g->kind!=TEGU_AIR_GENERIC_COMBINED&&g->kind!=TEGU_AIR_GENERIC_COMBINED_IMMUTABLE)continue;
+     for(size_t r=0;r<count;r++)if(resources[r].kind==2&&resources[r].stage==g->stage&&resources[r].index==g->index){
+      g->width=resources[r].width;g->height=resources[r].height;break;}}
++   if(e->templated) {
++    if(tegu_plan_memo_rebase(&e->tmpl,resources,count,plan))continue; /* plan in full below */
++    __atomic_fetch_add(&tegu_plan_tmpl_hits,1,__ATOMIC_RELAXED);
++   }
+    tegu_unlock(&p->genericPlanMemoLock);
+    __atomic_fetch_add(&tegu_plan_memo_hits,1,__ATOMIC_RELAXED);
+ #ifdef TEGU_FRONTEND_HOST
+@@ -1448,11 +1609,12 @@
+   tegu_unlock(&p->genericPlanMemoLock);
+  }
+  __atomic_fetch_add(&tegu_plan_memo_misses,1,__ATOMIC_RELAXED);
++ int offsetMiss=0;
+  {TeguAIRRenderResource *keys=cacheable?malloc((count?count:1)*sizeof(*keys)):0;int keyed=keys!=0;
+-  for(size_t i=0;keys&&i<count;i++)if(tegu_plan_memo_key(&keys[i],&resources[i],fullSlots,p,layoutCount,draw))keyed=0;
++  for(size_t i=0;keys&&i<count;i++)if(tegu_plan_memo_key(&keys[i],&resources[i],fullSlots,0,fullSlots,p,layoutCount,draw))keyed=0;
+   if(keyed) {
+    tegu_lock(&p->genericPlanMemoLock);
+-   tegu_plan_memo_classify(p->genericPlanMemo,p,keys,count,layoutCount,draw);
++   offsetMiss=tegu_plan_memo_classify(p->genericPlanMemo,p,keys,count,layoutCount,draw);
+    tegu_unlock(&p->genericPlanMemoLock);
+   } else __atomic_fetch_add(&tegu_plan_miss_other,1,__ATOMIC_RELAXED);
+   free(keys);}
+@@ -1464,6 +1626,17 @@
+  uint32_t canonicalSlots=tegu_plan_memo_layout_slots(p,layoutCount);
+  for(uint32_t i=0;i<plan->binding_count&&i<16;i++){const TeguAIRGenericBinding *b=&plan->bindings[i];
+   if(b->kind==TEGU_AIR_GENERIC_BUFFER&&b->stage==1&&b->index<31)canonicalSlots&=~(1u<<b->index);}
++ /* A draw that differs from an entry only in buffer offsets/lengths: key
++  * this entry by the buffers' bind-shape classes and rebase its plan per hit
++  * (CA binds its per-draw data at advancing offsets; c6m device: 93% of plan
++  * misses, ~48% of draw-encode time). */
++ TeguAIRGenericBufferTemplates *tmpl=0;
++ if(offsetMiss&&canonicalSlots==fullSlots&&tegu_plan_templates_enabled()) {
++  tmpl=malloc(sizeof(*tmpl));
++  if(tmpl&&tegu_plan_memo_templates(p,resources,count,draw,plan,spec,tmpl)) {
++   free(tmpl);tmpl=0;__atomic_fetch_add(&tegu_plan_tmpl_refused,1,__ATOMIC_RELAXED);
++  } else if(tmpl)__atomic_fetch_add(&tegu_plan_tmpl_made,1,__ATOMIC_RELAXED);
++ }
+  tegu_lock(&p->genericPlanMemoLock);
+  if(!p->genericPlanMemo)p->genericPlanMemo=calloc(1,sizeof(*p->genericPlanMemo));
+  struct tegu_render_plan_memo *m=p->genericPlanMemo;
+@@ -1480,15 +1653,17 @@
+    e->canonicalSlots=canonicalSlots;
+    memset(e->layouts,0,sizeof(e->layouts));memcpy(e->layouts,p->genericLayouts,layoutCount*sizeof(e->layouts[0]));
+    int keyed=1;
+-   for(size_t i=0;i<count;i++)if(tegu_plan_memo_key(&e->resources[i],&resources[i],canonicalSlots,p,layoutCount,draw))keyed=0;
++   for(size_t i=0;i<count;i++)if(tegu_plan_memo_key(&e->resources[i],&resources[i],canonicalSlots,tmpl,fullSlots,p,layoutCount,draw))keyed=0;
++   e->templated=tmpl!=0;if(tmpl)e->tmpl=*tmpl;
+    memcpy(&e->plan,plan,sizeof(*plan));memcpy(&e->spec,spec,sizeof(*spec));
+    e->drawCanon=canonicalSlots==fullSlots&&tegu_plan_memo_count_ok(draw);
+    {TeguAIRRenderDraw dk=tegu_plan_memo_draw_key(draw,e->drawCanon);
+-    e->hash=keyed&&canonicalSlots==fullSlots?tegu_plan_memo_hash(&dk,resources,count,fullSlots):0;}
++    e->hash=keyed&&canonicalSlots==fullSlots&&!tmpl?tegu_plan_memo_hash(&dk,resources,count,fullSlots):0;}
+    e->valid=keyed;
+   }
+  }
+  tegu_unlock(&p->genericPlanMemoLock);
++ free(tmpl);
+  return 0;
+ }
+ /* Re-translate a pipeline for RT0 only and compile it for the generic draw,
+--- a/gpu/metal/tegu/render_encoder.inc
++++ b/gpu/metal/tegu/render_encoder.inc
+@@ -3118,12 +3118,16 @@
+   (unsigned long long)__atomic_exchange_n(&tegu_enc_bytes_calls,0,__ATOMIC_RELAXED));
+  /* Plan-memo miss causes (render_pipeline.inc tegu_plan_memo_classify): its own
+   * short line so the perf line stays under the console's write limit. */
+- char why[160];int wk=snprintf(why,sizeof(why),"TEGU_PERF_PLANMISS %s draw=%llu extent=%llu offset=%llu other=%llu cold=%llu\n",abTag,
++ char why[240];int wk=snprintf(why,sizeof(why),"TEGU_PERF_PLANMISS %s draw=%llu extent=%llu offset=%llu other=%llu cold=%llu"
++  " tmpl=%llu tmpl_refused=%llu tmpl_hit=%llu\n",abTag,
+   (unsigned long long)__atomic_exchange_n(&tegu_plan_miss_draw,0,__ATOMIC_RELAXED),
+   (unsigned long long)__atomic_exchange_n(&tegu_plan_miss_extent,0,__ATOMIC_RELAXED),
+   (unsigned long long)__atomic_exchange_n(&tegu_plan_miss_offset,0,__ATOMIC_RELAXED),
+   (unsigned long long)__atomic_exchange_n(&tegu_plan_miss_other,0,__ATOMIC_RELAXED),
+-  (unsigned long long)__atomic_exchange_n(&tegu_plan_miss_cold,0,__ATOMIC_RELAXED));
++  (unsigned long long)__atomic_exchange_n(&tegu_plan_miss_cold,0,__ATOMIC_RELAXED),
++  (unsigned long long)__atomic_exchange_n(&tegu_plan_tmpl_made,0,__ATOMIC_RELAXED),
++  (unsigned long long)__atomic_exchange_n(&tegu_plan_tmpl_refused,0,__ATOMIC_RELAXED),
++  (unsigned long long)__atomic_exchange_n(&tegu_plan_tmpl_hits,0,__ATOMIC_RELAXED));
+  tegu_enc_window=now;tegu_enc_lines++;
+  if(k>0)write(2,line,(size_t)k<sizeof(line)?(size_t)k:sizeof(line)-1);
+  if(wk>0&&planMisses)write(2,why,(size_t)wk<sizeof(why)?(size_t)wk:sizeof(why)-1);
+--- a/gpu/metal/tegu/air_bridge.rs
++++ b/gpu/metal/tegu/air_bridge.rs
+@@ -2606,6 +2606,128 @@
+  })}{Some((generic,spec))=>{unsafe{*out=generic;*specialization=spec};0},None=>-1}
+ }
+ 
++/* Buffer-offset templates for the frontend plan memo (render_pipeline.inc
++ * tegu_plan_memo_rebase).  A generic plan depends on a buffer record outside
++ * the vertex layouts only through (a) its bind shape (length_class and
++ * offset_alignment of metal2vulkan::bind::state), (b) instantiation's
++ * descriptor range and SlotBindOffset residual of a descriptor-form slot
++ * (BufferSlotTemplate::descriptor_range), (c) a SlotGuestBase field (gpu
++ * address 0 + offset: compositor_plan_inputs_impl admits no guest address),
++ * (d) the GenericBinding bind_offset/resource_length/descriptor_offset/
++ * descriptor_length and generic_plan_mode's containment check, and (e) the
++ * uniform-view aliasing check against written slots.  This entry restates
++ * (b)-(d) per used slot of a plan already made for exactly these inputs and
++ * refuses (-1) whatever it does not restate: a written or device-address
++ * slot, a slot that is also a vertex layout slot, a push field outside the
++ * plan's push spans, a buffer binding no template covers.  It re-plans and
++ * requires `given` to be that plan byte for byte, and checks every restated
++ * value against it.  The frontend keeps (a) in its key and probes each
++ * template once with a moved offset against a fresh plan before using it. */
++#[repr(C)]
++#[derive(Clone,Copy,Default,Debug,PartialEq,Eq)]
++pub struct GenericBufferTemplate {pub stage:u32,pub index:u32,pub binding:u32,pub window_kind:u32,
++ pub window_start:i64,pub window_len:u64,pub alignment:u64,pub max_range:u64,
++ pub residual_count:u32,pub guest_count:u32,pub residual_at:[u32;4],pub guest_at:[u32;4]}
++#[repr(C)]
++#[derive(Clone,Copy,Debug,PartialEq,Eq)]
++pub struct GenericBufferTemplates {pub version:u32,pub count:u32,pub max_vertex_alignment:u32,pub reserved:u32,
++ pub slots:[GenericBufferTemplate;16]}
++impl Default for GenericBufferTemplates {fn default()->Self{Self{version:0,count:0,max_vertex_alignment:0,reserved:0,
++ slots:[GenericBufferTemplate::default();16]}}}
++const _:()=assert!(size_of::<GenericBufferTemplate>()==88&&size_of::<GenericBufferTemplates>()==1424);
++
++fn generic_buffer_templates(handle:&RenderPipelineHandle,resources:&[RenderResource],layouts:&[VertexLayout],
++ d:&RenderDraw,given:&GenericPlan)->Result<GenericBufferTemplates,String>{
++ use metal2vulkan::{bind::{BoundBuffer,FieldLocation},pipeline::{PushField,Stage,Window}};
++ let (fresh,_)=generic_plan_mode(handle,resources,layouts,d,true)?;
++ if fresh!=*given{return Err("buffer templates: the given plan is not this draw's plan".into());}
++ /* The state and plan generic_plan_mode instantiated (KEEP IN SYNC with its
++  * prefix; it has validated every input above). */
++ let mut state=compositor_plan_state(resources,true)?;
++ let vertex_end=(d.vertex_start+d.vertex_count) as u64;let instance_end=(d.base_instance+d.instance_count) as u64;
++ for layout in layouts {
++  let count=if layout.step_function==1{vertex_end}else{instance_end};
++  let vertex_stage=state.stages.get_mut(&Stage::Vertex).ok_or("generic vertex stage missing")?;
++  vertex_stage.buffers.insert(layout.index,BoundBuffer::Buffer{length:count*layout.stride as u64,offset:0,gpu_address:0,
++   device_address:None,attribute_stride:Some(layout.stride)});
++ }
++ let mut plan_ref=handle.cached_plan(&state)?;
++ if !plan_ref.variant.is_empty(){let v=handle.variant_for(&plan_ref.variant)?;plan_ref=v.plan(&handle._device,&state)?;}
++ let plan=&*plan_ref;
++ let stage_id=|s:Stage|match s {Stage::Vertex=>Ok(1u32),Stage::Fragment=>Ok(2u32),_=>Err("buffer template stage unsupported".to_owned())};
++ let stage_bit=|s:Stage|match s {Stage::Vertex=>1u32,Stage::Fragment=>0x10u32,_=>0};
++ let slots=plan.buffer_slot_templates();
++ if slots.iter().any(|t|t.written){return Err("buffer templates: the plan writes a buffer slot".into());}
++ let mut out=GenericBufferTemplates::default();
++ out.version=1;out.max_vertex_alignment=metal2vulkan::metal::vertex::MAX_VERTEX_ALIGNMENT;
++ for t in &slots {
++  let stage=stage_id(t.slot.stage)?;
++  let Some(r)=resources.iter().find(|r|r.kind==1&&r.stage==stage&&r.index==t.slot.index) else{continue};
++  if stage==1&&layouts.iter().any(|l|l.index==t.slot.index){return Err("buffer templates: a vertex layout slot is planned".into());}
++  let Some((0,binding))=t.descriptor else{return Err("buffer templates: a slot is not a set-0 descriptor".into())};
++  let (offset,range,residual)=t.descriptor_range(r.offset,r.length).ok_or("buffer templates: range refused")?;
++  let mut e=GenericBufferTemplate{stage,index:t.slot.index,binding,alignment:t.alignment,max_range:t.max_range,..Default::default()};
++  match t.window {Window::Bounded{start,len}=>{e.window_kind=1;e.window_start=start;e.window_len=len;},Window::Whole=>e.window_kind=2,
++   _=>return Err("buffer templates: window form unsupported".into())}
++  let mut covered=0;
++  for b in &given.bindings[..given.binding_count as usize] {
++   if b.kind!=GENERIC_BUFFER||b.binding!=binding{continue;}
++   if b.stage!=stage||b.index!=t.slot.index||b.bind_offset!=r.offset||b.resource_length!=r.length||
++      b.descriptor_offset!=offset||b.descriptor_length!=range{return Err("buffer templates: a binding is not restated".into());}
++   covered+=1;
++  }
++  if covered==0{return Err("buffer templates: a planned slot has no binding".into());}
++  for f in &plan.push.fields {
++   let guest=match f.field {PushField::SlotBindOffset(s) if s==t.slot=>false,PushField::SlotGuestBase(s) if s==t.slot=>true,_=>continue};
++   let FieldLocation::PushWindow{offset:o}=f.location else{return Err("buffer templates: a slot field is spilled".into())};
++   let want:Vec<u8>=if guest{r.offset.to_le_bytes().to_vec()}else{residual.to_le_bytes().to_vec()};
++   if f.size as usize!=want.len(){return Err("buffer templates: a slot field has another size".into());}
++   let bit=stage_bit(f.stage);let mut placed=0;
++   for s in &given.pushes[..given.push_count as usize] {
++    if s.stage&bit==0||o<s.offset||o as u64+f.size as u64>s.offset as u64+s.length as u64{continue;}
++    let at=(s.bytes_offset+(o-s.offset)) as usize;
++    if given.push_bytes.get(at..at+want.len())!=Some(&want[..]){return Err("buffer templates: push bytes are not restated".into());}
++    let (n,list)=if guest{(&mut e.guest_count,&mut e.guest_at)}else{(&mut e.residual_count,&mut e.residual_at)};
++    if *n as usize>=list.len(){return Err("buffer templates: too many field copies".into());}
++    list[*n as usize]=at as u32;*n+=1;placed+=1;
++   }
++   if placed==0{return Err("buffer templates: a slot field is outside the push spans".into());}
++  }
++  if out.count as usize>=out.slots.len(){return Err("buffer templates: too many slots".into());}
++  out.slots[out.count as usize]=e;out.count+=1;
++ }
++ for b in &given.bindings[..given.binding_count as usize] {
++  if b.kind==GENERIC_BUFFER&&!out.slots[..out.count as usize].iter().any(|t|t.binding==b.binding){
++   return Err("buffer templates: a buffer binding has no template".into());}
++ }
++ Ok(out)
++}
++
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn tegu_air_render_pipeline_plan_generic_buffer_templates(
++ pipeline:*const RenderPipelineHandle,resources:*const RenderResource,count:usize,
++ layouts:*const VertexLayout,layout_count:usize,draw:*const RenderDraw,given:*const GenericPlan,
++ out:*mut GenericBufferTemplates,error:*mut c_char,cap:usize)->i32 {
++ if out.is_null(){unsafe{error_copy(error,cap,"null buffer template output")};return -1;}
++ let out_addr=out as usize;let err_addr=error as usize;
++ let input_spans=[(resources as usize,if resources.is_null(){0}else{count.saturating_mul(size_of::<RenderResource>())}),
++  (layouts as usize,if layouts.is_null(){0}else{layout_count.saturating_mul(size_of::<VertexLayout>())}),
++  (draw as usize,if draw.is_null(){0}else{size_of::<RenderDraw>()}),
++  (given as usize,if given.is_null(){0}else{size_of::<GenericPlan>()}),
++  (pipeline as usize,if pipeline.is_null(){0}else{size_of::<RenderPipelineHandle>()})];
++ if compositor_ranges_overlap(out_addr,size_of::<GenericBufferTemplates>(),err_addr,cap)||
++    input_spans.iter().any(|(p,n)|compositor_ranges_overlap(out_addr,size_of::<GenericBufferTemplates>(),*p,*n)||
++      compositor_ranges_overlap(err_addr,cap,*p,*n)){return -1;}
++ unsafe{*out=GenericBufferTemplates::default();}
++ match unsafe{attempt(error,cap,||{
++  if pipeline.is_null()||draw.is_null()||given.is_null()||(count!=0&&resources.is_null())||count>186||
++     (layout_count!=0&&layouts.is_null())||layout_count>8{return Err("invalid buffer template inputs".into());}
++  let resources=if count==0{&[][..]}else{slice::from_raw_parts(resources,count)};
++  let layouts=if layout_count==0{&[][..]}else{slice::from_raw_parts(layouts,layout_count)};
++  generic_buffer_templates(&*pipeline,resources,layouts,&*draw,&*given)
++ })}{Some(value)=>{unsafe{*out=value};0},None=>-1}
++}
++
+ /// Pure metadata-only RenderPipeline::plan + BindingPlan::instantiate_draw for
+ /// a bounded typed render draw. No native approval or execution.
+ #[unsafe(no_mangle)]
+--- a/gpu/metal/tegu/air_bridge.h
++++ b/gpu/metal/tegu/air_bridge.h
+@@ -552,6 +552,29 @@
+  "graphics specialization ABI");
+ _Static_assert(sizeof(TeguAIRGraphicsSpecializationPlan)==3360,"graphics specialization plan ABI");
+ #endif
++/* Buffer-offset templates of a generic plan (air_bridge.rs
++ * generic_buffer_templates): per used descriptor-form buffer slot, its window
++ * (kind 1 bounded [start,start+len), 2 whole), descriptor base alignment and
++ * maximum range, its set-0 binding, and the push_bytes offsets of its
++ * SlotBindOffset residual (u32) and SlotGuestBase (u64) copies.  -1 when the
++ * plan is not restated by these (written or device-address slots, ...). */
++typedef struct {
++ uint32_t stage,index,binding,window_kind;
++ int64_t window_start;uint64_t window_len,alignment,max_range;
++ uint32_t residual_count,guest_count,residual_at[4],guest_at[4];
++} TeguAIRGenericBufferTemplate;
++typedef struct {
++ uint32_t version,count,max_vertex_alignment,reserved;
++ TeguAIRGenericBufferTemplate slots[16];
++} TeguAIRGenericBufferTemplates;
++int32_t tegu_air_render_pipeline_plan_generic_buffer_templates(const TeguAIRRenderPipeline *,
++ const TeguAIRRenderResource *,size_t,const TeguAIRVertexLayout *,size_t,const TeguAIRRenderDraw *,
++ const TeguAIRGenericPlan *,TeguAIRGenericBufferTemplates *,char *,size_t);
++#if defined(__cplusplus)
++static_assert(sizeof(TeguAIRGenericBufferTemplate)==88&&sizeof(TeguAIRGenericBufferTemplates)==1424,"buffer template ABI");
++#else
++_Static_assert(sizeof(TeguAIRGenericBufferTemplate)==88&&sizeof(TeguAIRGenericBufferTemplates)==1424,"buffer template ABI");
++#endif
+ void tegu_air_blob_free(TeguAIRBlob *);
+ #ifdef __cplusplus
+ }
+--- a/gpu/tools/frame_bench_main.m
++++ b/gpu/tools/frame_bench_main.m
+@@ -90,10 +90,21 @@
+ static TeguRenderPipeline *fb_pf,*fb_pl,*fb_pd,*fb_pn;
+ static TeguTexture *fb_disp,*fb_t1,*fb_b43,*fb_c43,*fb_s0,*fb_img,*fb_lut,*fb_small[4],*fb_small2[4];
+ static TeguBuffer *fb_ib,*fb_fbuf,*fb_vb;static TeguSampler *fb_samp;
++/* FB_OFFSET_RING=1: bind the per-draw buffers at advancing 256-byte offsets
++ * of one 64 KiB buffer, as QuartzCore binds its per-draw data (c6m device:
++ * 93% of plan-memo misses differ from an entry only in buffer offsets);
++ * FB_OFFSET_RING=2 also varies the offset's low bits (4-byte steps). */
++static unsigned fb_ring,fb_ring_next;
++static NSUInteger fb_ring_offset(void){
++ if(!fb_ring)return 0;
++ unsigned k=fb_ring_next++;
++ return (NSUInteger)(k%224u)*256u+(fb_ring>1u?(NSUInteger)(k%4u)*4u:0u);
++}
+ 
+ static void fb_draw(TeguRenderEncoder *e,TeguRenderPipeline *p,unsigned k,int fetch,unsigned tw,unsigned th){
+  [e setRenderPipelineState:p];[e setVertexBuffer:fb_vb offset:0 atIndex:1];
+- for(unsigned bi=0;bi<4;bi++){[e setFragmentBuffer:fb_fbuf offset:0 atIndex:bi];if(bi!=1)[e setVertexBuffer:fb_fbuf offset:0 atIndex:bi];}
++ {NSUInteger o=fb_ring_offset();
++  for(unsigned bi=0;bi<4;bi++){[e setFragmentBuffer:fb_fbuf offset:o atIndex:bi];if(bi!=1)[e setVertexBuffer:fb_fbuf offset:o atIndex:bi];}}
+  [e setFragmentTexture:(fetch?fb_lut:fb_img) atIndex:(fetch?0:3)];[e setFragmentSamplerState:fb_samp atIndex:0];
+  {unsigned w=tw/2<150?tw/2:150,h=th/2<150?th/2:150; /* inside the target: out-of-target scissors invalidate the command */
+   [e setScissorRect:(TeguScissorRect){(k*37)%(tw-w+1),(k*53)%(th-h+1),w,h}];}
+@@ -255,7 +266,8 @@
+  fb_img=new_sample(d,80,194,237,1,2,1);fb_lut=new_sample(d,10,128,1,1,2,1);fb_samp=new_sampler(d,3);
+  assert(fb_t1&&fb_b43&&fb_c43&&fb_s0&&fb_img&&fb_lut&&fb_samp&&fb_small[0]);
+  fb_ib=[d newBufferWithLength:64 options:0];uint16_t idx[6]={0,1,2,2,1,3};memcpy([fb_ib contents],idx,sizeof(idx));
+- fb_fbuf=[d newBufferWithLength:1024 options:0];memset([fb_fbuf contents],0,1024);
++ {const char *r=getenv("FB_OFFSET_RING");fb_ring=r?(unsigned)atoi(r):0u;}
++ {NSUInteger n=fb_ring?65536u:1024u;fb_fbuf=[d newBufferWithLength:n options:0];memset([fb_fbuf contents],0,n);}
+  printf("FB_ENV ins_counter=%d pid=%d live_kib=%llu\n",fb_ins()?1:0,(int)getpid(),fb_live_bytes/1024);
+  fb_pool_base=poolCount; /* everything created above is persistent */
+  /* Draw-time variant fallback: the runtime-specialization variants are
+@@ -286,6 +298,9 @@
+   }
+  }
+  tegu_jm_batch_force=-1;
++ printf("FB_PLAN ring=%u hits=%llu misses=%llu tmpl_made=%llu tmpl_refused=%llu tmpl_hits=%llu\n",fb_ring,
++  (unsigned long long)tegu_plan_memo_hits,(unsigned long long)tegu_plan_memo_misses,
++  (unsigned long long)tegu_plan_tmpl_made,(unsigned long long)tegu_plan_tmpl_refused,(unsigned long long)tegu_plan_tmpl_hits);
+  printf("FB_DONE\n");
+  return 0;
+ }

@@ -1,0 +1,81 @@
+--- a/crates/metal2vulkan/src/pipeline/compile.rs	2026-10-24 01:09:01.000000000 +0200
++++ b/crates/metal2vulkan/src/pipeline/compile.rs	2026-10-26 22:32:30.249231826 +0100
+@@ -1792,6 +1792,36 @@
+     before: reflection::UnspecializedReads,
+ }
+ 
++/// How many decoded modules [`decode_reused`] keeps per process (least recently used first out).
++const DECODED_KEPT: usize = 4;
++
++/// [`air::decode`] of `bitcode`, whose SHA-256 is `air_hash`, reusing this process's last decodes:
++/// a pipeline's stages decode the same function modules again and again (QuartzCore's
++/// `fixed_vert`/`fixed_frag` for every variant), and decoding is a pure function of the bytes.
++/// The kept module is cloned out, so the caller owns and consumes its copy as before. A failed
++/// decode is not kept: it fails again the same way.
++fn decode_reused(air_hash: &Hash256, bitcode: &[u8], m: &mut Meter) -> Result<air::Decoded, Error> {
++    use std::sync::{Mutex, OnceLock};
++    static KEPT: OnceLock<Mutex<VecDeque<(Hash256, Arc<air::Decoded>)>>> = OnceLock::new();
++    let kept = KEPT.get_or_init(|| Mutex::new(VecDeque::new()));
++    if let Ok(mut k) = kept.lock() {
++        if let Some(i) = k.iter().position(|(h, _)| h == air_hash) {
++            let hit = k.remove(i).expect("position is in range");
++            let decoded = air::Decoded::clone(&hit.1);
++            k.push_back(hit);
++            return Ok(decoded);
++        }
++    }
++    let decoded = air::decode(bitcode, m)?;
++    if let Ok(mut k) = kept.lock() {
++        if k.len() >= DECODED_KEPT {
++            k.pop_front();
++        }
++        k.push_back((*air_hash, Arc::new(decoded.clone())));
++    }
++    Ok(decoded)
++}
++
+ /// Decode, cross-check a metallib function's container tags, and specialize: the AIR hash, the
+ /// entry name, the specialized entry, and what its code read before.
+ fn specialize_one(r: &Request<'_>, m: &mut Meter) -> Result<Specialized, Error> {
+@@ -1804,7 +1834,7 @@
+         return Ok(Specialized::clone(&kept));
+     }
+     let air_hash = container::sha256(r.bitcode);
+-    let mut decoded = air::decode(r.bitcode, m)?;
++    let mut decoded = decode_reused(&air_hash, r.bitcode, m)?;
+     if let Some(f) = r.container {
+         decoded.abi.check_container(&decoded.module, f, m)?;
+     }
+--- a/crates/metal2vulkan/src/device/profile.rs	2026-10-24 01:09:01.000000000 +0200
++++ b/crates/metal2vulkan/src/device/profile.rs	2026-10-26 21:43:40.006043442 +0100
+@@ -352,12 +352,29 @@
+                 Ok(())
+             }
+         }
++        // Every compile takes the fingerprint for its key and a process compiles under one profile:
++        // the last answer is kept with the fields it hashed and reused for equal fields (derived
++        // `Eq` over plain data without floats, so equal fields render the same `Debug` text).
++        use std::sync::{Mutex, OnceLock};
++        static LAST: OnceLock<Mutex<Option<(ProfileFields, Hash256)>>> = OnceLock::new();
++        let last = LAST.get_or_init(|| Mutex::new(None));
++        if let Ok(l) = last.lock() {
++            if let Some((fields, hash)) = l.as_ref() {
++                if *fields == self.fields {
++                    return *hash;
++                }
++            }
++        }
+         let mut h = Hashing(Sha256::new());
+         h.0.update(b"metal2vulkan/device-profile/v1\0");
+         // `Hashing` never fails, and `Debug` of these plain-data types only fails when the
+         // writer does.
+         let _ = write!(h, "{:?}", self.fields);
+-        h.0.finalize().into()
++        let hash: Hash256 = h.0.finalize().into();
++        if let Ok(mut l) = last.lock() {
++            *l = Some((self.fields.clone(), hash));
++        }
++        hash
+     }
+ }
+ 

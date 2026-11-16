@@ -1,0 +1,203 @@
+diff --git a/gpu/metal/tegu/render_pipeline.inc b/gpu/metal/tegu/render_pipeline.inc
+index 7d67bc8..39b16bb 100644
+--- a/gpu/metal/tegu/render_pipeline.inc
++++ b/gpu/metal/tegu/render_pipeline.inc
+@@ -841,11 +863,17 @@ static int tegu_render_generic_variant_select(TeguRenderPipeline *p,unsigned rt,
+  * the raw key. CPU index expansion and ring-buffered vertex data move that
+  * offset on every draw, which otherwise defeated this memo. Revisit if
+  * generic_plan_mode changes how layout slots are bound. */
+-#define TEGU_PLAN_MEMO_WAYS 4u
++/* A UI frame draws one pipeline with many binding shapes (CA: a fixed_frag
++ * variant for layers of many sizes), and round-robin replacement over fewer
++ * ways than the shapes a frame cycles through never hits (c6l: 59% misses
++ * with 4 ways).  Each entry is ~7 KB, allocated on first use. */
++#define TEGU_PLAN_MEMO_WAYS 16u
+ #define TEGU_PLAN_MEMO_MAX_RESOURCES 160u
+ struct tegu_render_plan_memo_entry {
+  const TeguAIRRenderPipeline *compiled;
+  uint32_t count,layoutCount,valid,canonicalSlots;
++ uint64_t hash; /* tegu_plan_memo_hash of the key; 0 = compare in full */
++ uint32_t drawCanon; /* every layout slot canonical: the vertex count is not part of the key */
+  TeguAIRRenderDraw draw;
+  TeguAIRVertexLayout layouts[8];
+  TeguAIRGenericPlan plan;
+@@ -858,6 +886,10 @@ struct tegu_render_plan_memo {
+  unsigned next;
+ };
+ static U64 tegu_plan_memo_hits,tegu_plan_memo_misses;
++/* Miss causes against the nearest same-pipeline entry with the same record
++ * count: only the draw record differs, only texture extents, only buffer
++ * offset/length, anything else, or no comparable entry. */
++static U64 tegu_plan_miss_draw,tegu_plan_miss_extent,tegu_plan_miss_offset,tegu_plan_miss_other,tegu_plan_miss_cold;
+ /* Vertex layout slots (bit = Metal buffer index) whose record may be keyed
+  * canonically. */
+ static uint32_t tegu_plan_memo_layout_slots(const TeguRenderPipeline *p,unsigned layoutCount) {
+@@ -870,6 +902,20 @@ static uint32_t tegu_plan_memo_layout_slots(const TeguRenderPipeline *p,unsigned
+  * unspecified), and the vertex-slot marker described above. Returns -1 when
+  * a canonical-slot record fails the planner's own checks (no memo use). */
+ #define TEGU_PLAN_MEMO_SLOT_MARK 0x4d454d4fu
++/* A 2D texture's extent reaches the generic plan only through
++ * air_bridge.rs compositor_plan_inputs_impl - the range check 1..16384 per
++ * side and the observed 776x24 blur chain (rich_types, the only other
++ * extent predicates, never admits type 2) - and the GenericPlan binding's
++ * verbatim width/height (generic_plan_mode texture_facts), which a hit
++ * rewrites from the current record. TextureFacts carries no extent, so the
++ * translator's plan and push fields never read it. Keyed: class 1 (in
++ * range), 2 (776x24); out of range stays raw (the planner refuses it).
++ * KEEP IN SYNC with compositor_plan_inputs_impl's extent predicates. */
++#define TEGU_PLAN_MEMO_EXTENT_MARK 0x45585431u
++static uint32_t tegu_plan_memo_extent_class(const TeguAIRRenderResource *r) {
++ if(r->kind!=2||r->texture_type!=2||!r->width||!r->height||r->width>16384||r->height>16384)return 0;
++ return r->width==776&&r->height==24?2u:1u;
++}
+ static int tegu_plan_memo_key(TeguAIRRenderResource *out,const TeguAIRRenderResource *in,uint32_t canonicalSlots,
+  const TeguRenderPipeline *p,unsigned layoutCount,const TeguAIRRenderDraw *draw) {
+  const size_t head=offsetof(TeguAIRRenderResource,address_mode_identity)+sizeof(in->address_mode_identity);
+@@ -877,6 +923,8 @@ static int tegu_plan_memo_key(TeguAIRRenderResource *out,const TeguAIRRenderReso
+  memset(out,0,sizeof(*out));
+  memcpy(out,in,head);
+  memcpy((unsigned char *)out+tail,(const unsigned char *)in+tail,sizeof(*in)-tail);
++ {uint32_t cls=tegu_plan_memo_extent_class(in);
++  if(cls){out->width=cls;out->height=0;out->reserved=TEGU_PLAN_MEMO_EXTENT_MARK;return 0;}}
+  if(in->kind!=1||in->stage!=1||in->index>=31||!(canonicalSlots&(1u<<in->index)))return 0;
+  /* compositor_plan_inputs_mode: 0<length<=2^32, offset<=length. */
+  if(!in->length||in->length>(1ull<<32)||in->offset>in->length)return -1;
+@@ -892,6 +940,68 @@ static int tegu_plan_memo_key(TeguAIRRenderResource *out,const TeguAIRRenderReso
+  out->offset=0;out->length=0;out->reserved=TEGU_PLAN_MEMO_SLOT_MARK;
+  return 0;
+ }
++/* The planning record's vertex count reaches the plan only through (a) the
++ * planner's range check 1..2^24, (b) each layout slot's bounds check, which
++ * tegu_plan_memo_key re-evaluates for every canonical slot with the actual
++ * record on every lookup, and (c) the length bound at a layout slot, which
++ * the plan reads only for a slot that is also a descriptor binding (a raw
++ * slot: such an entry keeps the full record). No push field the translator
++ * fills reads it (PushField: BaseVertexInstance reads vertex_start and
++ * base_instance, which stay keyed; IndexCapacity is indexed-only), and the
++ * plan's draw command is checked equal to the record, not copied. So when an
++ * entry has no raw layout slot, records that differ only in an in-range
++ * vertex count share it (CA draws its quads with varying counts). */
++static int tegu_plan_memo_count_ok(const TeguAIRRenderDraw *d) {return d->vertex_count>=1u&&d->vertex_count<=(1u<<24);}
++static TeguAIRRenderDraw tegu_plan_memo_draw_key(const TeguAIRRenderDraw *d,int canon) {
++ TeguAIRRenderDraw k=*d;if(canon)k.vertex_count=0;return k;
++}
++/* A cheap pre-check before the full comparison, never a substitute for it:
++ * a multiply-xor hash of the (count-canonical) draw record and, per record,
++ * its kind/stage/index/format, extent and (outside canonical layout slots)
++ * offset/length - the fields CA draws vary. Entries keyed with a raw layout
++ * slot store 0 and are always compared in full. */
++static inline uint64_t tegu_plan_memo_step(uint64_t h,uint64_t w) {h=(h^w)*0x9e3779b97f4a7c15ull;return h^(h>>29);}
++static uint64_t tegu_plan_memo_hash(const TeguAIRRenderDraw *draw,const TeguAIRRenderResource *r,size_t count,uint32_t slots) {
++ uint64_t h=0x243f6a8885a308d3ull;
++ h=tegu_plan_memo_step(h,(uint64_t)draw->version|((uint64_t)draw->vertex_start<<32));
++ h=tegu_plan_memo_step(h,(uint64_t)draw->vertex_count|((uint64_t)draw->instance_count<<32));
++ h=tegu_plan_memo_step(h,draw->base_instance);
++ for(size_t i=0;i<count;i++) {
++  const TeguAIRRenderResource *x=&r[i];
++  const int canon=x->kind==1&&x->stage==1&&x->index<31&&(slots&(1u<<x->index));
++  h=tegu_plan_memo_step(h,(uint64_t)x->kind|((uint64_t)x->stage<<8)|((uint64_t)x->index<<16)|((uint64_t)x->format<<32));
++  {uint32_t cls=tegu_plan_memo_extent_class(x);
++   h=tegu_plan_memo_step(h,cls?(uint64_t)cls<<62:(uint64_t)x->width|((uint64_t)x->height<<32));}
++  if(!canon)h=tegu_plan_memo_step(h,x->offset^(x->length*0x100000001b3ull));
++ }
++ return h?h:1;
++}
++/* Diagnostic only: which input class separates this miss from the closest
++ * comparable entry (fewest differing classes). */
++static void tegu_plan_memo_classify(const struct tegu_render_plan_memo *m,const TeguRenderPipeline *p,
++ const TeguAIRRenderResource *keys,size_t count,unsigned layoutCount,const TeguAIRRenderDraw *draw) {
++ unsigned best=0;int seen=0;
++ for(unsigned w=0;m&&w<TEGU_PLAN_MEMO_WAYS;w++) {
++  const struct tegu_render_plan_memo_entry *e=m->ways[w];
++  if(!e||!e->valid||e->compiled!=p->compiled||e->count!=count||e->layoutCount!=layoutCount||
++     memcmp(e->layouts,p->genericLayouts,layoutCount*sizeof(e->layouts[0])))continue;
++  TeguAIRRenderDraw da=tegu_plan_memo_draw_key(&e->draw,e->drawCanon&&tegu_plan_memo_count_ok(draw)),
++   db=tegu_plan_memo_draw_key(draw,e->drawCanon&&tegu_plan_memo_count_ok(draw));
++  unsigned diff=memcmp(&da,&db,sizeof(da))?1u:0u;
++  for(size_t i=0;i<count&&diff<16u;i++) {
++   const TeguAIRRenderResource *a=&e->resources[i],*b=&keys[i];
++   if(!memcmp(a,b,sizeof(*a)))continue;
++   TeguAIRRenderResource x=*a,y=*b;
++   if(x.kind==2&&y.kind==2){x.width=y.width;x.height=y.height;if(!memcmp(&x,&y,sizeof(x))){diff|=2u;continue;}}
++   if(x.kind==1&&y.kind==1){x.offset=y.offset;x.length=y.length;x.reserved=y.reserved;if(!memcmp(&x,&y,sizeof(x))){diff|=4u;continue;}}
++   diff|=16u;
++  }
++  if(!seen||__builtin_popcount(diff)<__builtin_popcount(best)){best=diff;seen=1;}
++ }
++ U64 *c=!seen?&tegu_plan_miss_cold:(best&16u)||__builtin_popcount(best)!=1?&tegu_plan_miss_other:
++  best==1u?&tegu_plan_miss_draw:best==2u?&tegu_plan_miss_extent:&tegu_plan_miss_offset;
++ __atomic_fetch_add(c,1,__ATOMIC_RELAXED);
++}
+ static void tegu_render_plan_memo_free(TeguRenderPipeline *p) {
+  if(!p||!p->genericPlanMemo)return;
+  for(unsigned i=0;i<TEGU_PLAN_MEMO_WAYS;i++)free(p->genericPlanMemo->ways[i]);
+@@ -901,18 +1011,36 @@ static int tegu_render_plan_generic_cached(TeguRenderPipeline *p,const TeguAIRRe
+  const TeguAIRRenderDraw *draw,TeguAIRGenericPlan *plan,TeguAIRGraphicsSpecializationPlan *spec,char *error,size_t size) {
+  const unsigned layoutCount=p->genericLayoutCount<=8?p->genericLayoutCount:8;
+  int cacheable=count<=TEGU_PLAN_MEMO_MAX_RESOURCES&&p->genericLayoutCount<=8&&draw;
++ /* Key records under the pipeline's full layout-slot mask, hashed once; an
++  * entry keyed under another mask (a raw descriptor slot) is compared in
++  * full as before. */
++ const uint32_t fullSlots=tegu_plan_memo_layout_slots(p,layoutCount);
++ uint64_t hash=0;
++ if(cacheable) {
++  TeguAIRRenderDraw dk=tegu_plan_memo_draw_key(draw,tegu_plan_memo_count_ok(draw));
++  hash=tegu_plan_memo_hash(&dk,resources,count,fullSlots);
++ }
+  if(cacheable) {
+   tegu_lock(&p->genericPlanMemoLock);
+   struct tegu_render_plan_memo *m=p->genericPlanMemo;
+   for(unsigned w=0;m&&w<TEGU_PLAN_MEMO_WAYS;w++) {
+    const struct tegu_render_plan_memo_entry *e=m->ways[w];
+    if(!e||!e->valid||e->compiled!=p->compiled||e->count!=count||e->layoutCount!=layoutCount||
+-      memcmp(&e->draw,draw,sizeof(*draw))||memcmp(e->layouts,p->genericLayouts,layoutCount*sizeof(e->layouts[0])))continue;
+-   size_t i=0;
+-   for(;i<count;i++){TeguAIRRenderResource k;
+-    if(tegu_plan_memo_key(&k,&resources[i],e->canonicalSlots,p,layoutCount,draw)||memcmp(&k,&e->resources[i],sizeof(k)))break;}
+-   if(i!=count)continue;
++      (e->hash&&hash&&e->hash!=hash)||
++      memcmp(e->layouts,p->genericLayouts,layoutCount*sizeof(e->layouts[0])))continue;
++   {const int canon=e->drawCanon&&tegu_plan_memo_count_ok(draw);
++    TeguAIRRenderDraw da=tegu_plan_memo_draw_key(&e->draw,canon),db=tegu_plan_memo_draw_key(draw,canon);
++    if(memcmp(&da,&db,sizeof(da)))continue;}
++   {size_t i=0;
++    for(;i<count;i++){TeguAIRRenderResource k;
++     if(tegu_plan_memo_key(&k,&resources[i],e->canonicalSlots,p,layoutCount,draw)||memcmp(&k,&e->resources[i],sizeof(k)))break;}
++    if(i!=count)continue;}
+    memcpy(plan,&e->plan,sizeof(*plan));memcpy(spec,&e->spec,sizeof(*spec));
++   /* The bound textures' own extents (the key holds only their class). */
++   for(uint32_t b=0;b<plan->binding_count&&b<16;b++){TeguAIRGenericBinding *g=&plan->bindings[b];
++    if(g->kind!=TEGU_AIR_GENERIC_TEXTURE&&g->kind!=TEGU_AIR_GENERIC_COMBINED&&g->kind!=TEGU_AIR_GENERIC_COMBINED_IMMUTABLE)continue;
++    for(size_t r=0;r<count;r++)if(resources[r].kind==2&&resources[r].stage==g->stage&&resources[r].index==g->index){
++     g->width=resources[r].width;g->height=resources[r].height;break;}}
+    tegu_unlock(&p->genericPlanMemoLock);
+    __atomic_fetch_add(&tegu_plan_memo_hits,1,__ATOMIC_RELAXED);
+ #ifdef TEGU_FRONTEND_HOST
+@@ -933,6 +1061,14 @@ static int tegu_render_plan_generic_cached(TeguRenderPipeline *p,const TeguAIRRe
+   tegu_unlock(&p->genericPlanMemoLock);
+  }
+  __atomic_fetch_add(&tegu_plan_memo_misses,1,__ATOMIC_RELAXED);
++ {TeguAIRRenderResource *keys=cacheable?malloc((count?count:1)*sizeof(*keys)):0;int keyed=keys!=0;
++  for(size_t i=0;keys&&i<count;i++)if(tegu_plan_memo_key(&keys[i],&resources[i],fullSlots,p,layoutCount,draw))keyed=0;
++  if(keyed) {
++   tegu_lock(&p->genericPlanMemoLock);
++   tegu_plan_memo_classify(p->genericPlanMemo,p,keys,count,layoutCount,draw);
++   tegu_unlock(&p->genericPlanMemoLock);
++  } else __atomic_fetch_add(&tegu_plan_miss_other,1,__ATOMIC_RELAXED);
++  free(keys);}
+  int rc=tegu_air_render_pipeline_plan_generic_specialized(p->compiled,resources,count,
+   p->genericLayouts,p->genericLayoutCount,draw,plan,spec,error,size);
+  if(rc||!cacheable)return rc;
+@@ -958,7 +1094,11 @@ static int tegu_render_plan_generic_cached(TeguRenderPipeline *p,const TeguAIRRe
+    memset(e->layouts,0,sizeof(e->layouts));memcpy(e->layouts,p->genericLayouts,layoutCount*sizeof(e->layouts[0]));
+    int keyed=1;
+    for(size_t i=0;i<count;i++)if(tegu_plan_memo_key(&e->resources[i],&resources[i],canonicalSlots,p,layoutCount,draw))keyed=0;
+-   memcpy(&e->plan,plan,sizeof(*plan));memcpy(&e->spec,spec,sizeof(*spec));e->valid=keyed;
++   memcpy(&e->plan,plan,sizeof(*plan));memcpy(&e->spec,spec,sizeof(*spec));
++   e->drawCanon=canonicalSlots==fullSlots&&tegu_plan_memo_count_ok(draw);
++   {TeguAIRRenderDraw dk=tegu_plan_memo_draw_key(draw,e->drawCanon);
++    e->hash=keyed&&canonicalSlots==fullSlots?tegu_plan_memo_hash(&dk,resources,count,fullSlots):0;}
++   e->valid=keyed;
+   }
+  }
+  tegu_unlock(&p->genericPlanMemoLock);

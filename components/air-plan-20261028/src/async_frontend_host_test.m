@@ -1,0 +1,71 @@
+/* Real ObjC command frontend and FIFO, controlled async/completion backend. */
+#define main synchronous_frontend_main
+#include "frontend_host_test.m"
+#undef main
+struct AsyncObject { unsigned refs, pending, target; };
+static unsigned asyncObjects, waits, runs, failGroup;
+static unsigned scheduledCallbacks;
+static void (*pendingWork)(void *);
+static void *pendingContext;
+static unsigned pendingTarget;
+extern void *_Block_copy(const void *);
+extern void _Block_release(const void *);
+static struct AsyncObject *async_object(unsigned target) {
+ struct AsyncObject *o=calloc(1,sizeof(*o));assert(o);o->refs=1;o->target=target;asyncObjects++;return o;
+}
+static void async_retain(void *p) {struct AsyncObject *o=p;assert(o->refs);o->refs++;}
+static void async_release(void *p) {struct AsyncObject *o=p;assert(o->refs);if(!--o->refs){assert(!o->pending);asyncObjects--;free(o);}}
+static void async_schedule(void *p,void *context,void (*work)(void *)) {
+ assert(!pendingWork);pendingWork=work;pendingContext=context;pendingTarget=((struct AsyncObject *)p)->target;
+}
+static void *group_create(void) {return failGroup?0:async_object(0);}
+static void group_enter(void *p) {struct AsyncObject *o=p;assert(!o->pending);o->pending++;}
+static void group_leave(void *p) {struct AsyncObject *o=p;assert(o->pending==1);o->pending--;}
+static void pump_async(void) {
+ assert(pendingWork);void (*work)(void *)=pendingWork;void *context=pendingContext;
+ assert(pendingTarget==runs+1);pendingWork=0;runs++;work(context);
+}
+static long group_wait(void *p,U64 timeout) {
+ struct AsyncObject *o=p;assert(timeout==~(U64)0);waits++;
+ while(o->pending)pump_async();return 0;
+}
+int main(void) {
+ TeguComputeDevice *d=[TeguComputeDevice alloc];d->scalar=call;d->method=method;d->map=map;d->unmap=unmap;
+ TeguQueue *q=[d newCommandQueue];
+ q->submissions.ops=(struct tegu_submission_ops){async_retain,async_release,async_schedule};
+ q->blockCopy=_Block_copy;q->blockRelease=_Block_release;
+ q->groupCreate=group_create;q->groupEnter=group_enter;q->groupLeave=group_leave;q->groupWait=group_wait;
+ failGroup=1;assert(![q commandBuffer]);failGroup=0;
+ unsigned char package[72]={0};unsigned words[16]={TEGU_PIPELINE_MAGIC,1,8,TEGU_PIPELINE_GPU,32,43,0,0x02000000,7,1,1,1,0,0,1,0};
+ for(unsigned i=0;i<16;i++)tegu_pipeline_put(package+4*i,words[i]);
+ TeguPipeline *p=[d newTeguPipelineWithPackage:package length:72];
+ TeguBuffer *a=[d newBufferWithLength:1152 options:0],*b=[d newBufferWithLength:1152 options:0],*s=[d newBufferWithLength:4 options:0];
+ struct AsyncObject *first=async_object(1),*second=async_object(2);
+ [q setSubmissionQueue:first];async_release(first);
+ TeguCommand *c1=[[q commandBuffer] retain];
+ void *c1Identity=c1;
+ [c1 addScheduledHandler:^(id value){assert(value==c1Identity);assert([value status]==3);scheduledCallbacks++;}];
+ [c1 enqueue];assert([c1 status]==1);
+ /* Enqueue reserves a queue position without closing the command buffer. */
+ TeguEncoder *e=[c1 computeCommandEncoder];
+ [e setComputePipelineState:p];[e setBuffer:a offset:128 atIndex:0];[e setBuffer:b offset:128 atIndex:1];[e setBuffer:s offset:0 atIndex:2];
+ [e dispatchThreadgroups:(MTLSize){256,1,1} threadsPerThreadgroup:(MTLSize){1,1,1}];[e endEncoding];
+ [c1 commit];[c1 commit];assert([c1 status]==2&&![c1 error]&&dispatched==0&&!scheduledCallbacks);
+ /* Unsupported GPU priorities must not poison a committed or future job. */
+ for(NSUInteger priority=0;priority<7;priority++) {
+  assert(![q setGPUPriority:priority]);assert(![q setBackgroundGPUPriority:priority]);
+ }
+ assert(![q setGPUPriority:~(NSUInteger)0]);
+ assert([c1 status]==2&&!q->submissionFailed);
+ [q setSubmissionQueue:second];async_release(second);
+ TeguCommand *c2=[[q commandBuffer] retain];
+ [c2 computeCommandEncoder];[c2 commit]; /* unfinished encoder fails in worker */
+ [q setSubmissionQueue:0];
+ [p release];[a release];[b release];[s release];[q release];[d release];drain();
+ assert(freed==0&&runs==0&&[c2 status]==2);
+ [c1 waitUntilCompleted];assert([c1 status]==4&&![c1 error]&&dispatched==1&&runs==1&&waits==1&&scheduledCallbacks==1&&c1->scheduledCallbacksDone);
+ [c1 commit];assert(dispatched==1);[c1 release];assert(allocated==freed);
+ [c2 waitUntilCompleted];assert([c2 status]==5&&[c2 error]&&runs==2&&waits==2);
+ [c2 release];drain();assert(!live&&!asyncObjects&&!pendingWork);
+ puts("PASS async frontend: target routing, FIFO, completion wait, errors, pending resources, group allocation failure");
+}

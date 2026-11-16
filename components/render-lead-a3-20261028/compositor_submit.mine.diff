@@ -1,0 +1,237 @@
+182a183,383
+> /* A3: GPU conversion of decode shadows. A new or changed YCbCr ('420v' &c.)
+>  * or Apple XR IOSurface used to be decoded on the CPU here, inside the submit
+>  * path (device: 170-236 ms per >=4 MB surface on CA's thread). Now its source
+>  * bytes are copied unchanged (rows, 1.5 B/px for 4:2:0) into a pooled staging
+>  * buffer and ONE full-target draw converts them into the shadow: authored
+>  * GLSL (tests/shaders/nord2_{ycbcr,xr}_convert.frag) compiled at build time by
+>  * the pinned arch9 compiler (tools/generate_convert.c -> nord2_convert.h),
+>  * the exact integer model of ycbcr_decode.h / table lookups of
+>  * xr_decode_table.h, submitted through the public n2mb_draw with legacy
+>  * uint-texture bindings. Ordering: the draw is submitted before the
+>  * command's own jobs (GPU order makes them see it, and makes it wait for
+>  * earlier readers of the shadow); the CPU touches only the staging slot,
+>  * after waiting for the jobs that list it. The CPU decode stays the fallback
+>  * (refusals, other builds) and the kill switch: TEGU_SHADOW_GPU=0 (all CPU),
+>  * =ycbcr (XR on the CPU). Only tegu_shadow_refresh_jobs (the execute path)
+>  * enables it; direct tegu_shadow_sync_jobs calls decode on the CPU. */
+> #if defined(NORD2_JM_TRANSPORT)&&defined(TEGU_GRAPHICS_BRIDGE)&&defined(__has_include)
+> #if __has_include("nord2_convert.h")
+> #include "nord2_convert.h"
+> #define TEGU_SHADOW_GPU_BUILD 1
+> #endif
+> #endif
+> static __thread TeguComputeDevice *tegu_shadow_gpu_device; /* set by tegu_shadow_refresh_jobs */
+> /* TEGU_PERF_SURFACE: conversions on the GPU, CPU decodes (kill switch, not
+>  * eligible, or no execute context), CPU fallbacks after a GPU refusal, and
+>  * the CPU microseconds per surface of each. */
+> static U64 tegu_surface_gpu,tegu_surface_cpu,tegu_surface_fallback,tegu_surface_gpu_ns,tegu_surface_cpu_ns,tegu_surface_max_ns;
+> static unsigned tegu_surface_print_lock;static double tegu_surface_window;
+> static void tegu_surface_account(int gpu,int fallback,double seconds) {
+>  U64 ns=seconds>0?(U64)(seconds*1e9):0,max;
+>  __atomic_fetch_add(gpu?&tegu_surface_gpu:&tegu_surface_cpu,1,__ATOMIC_RELAXED);
+>  if(fallback)__atomic_fetch_add(&tegu_surface_fallback,1,__ATOMIC_RELAXED);
+>  __atomic_fetch_add(gpu?&tegu_surface_gpu_ns:&tegu_surface_cpu_ns,ns,__ATOMIC_RELAXED);
+>  max=__atomic_load_n(&tegu_surface_max_ns,__ATOMIC_RELAXED);
+>  while(ns>max&&!__atomic_compare_exchange_n(&tegu_surface_max_ns,&max,ns,1,__ATOMIC_RELAXED,__ATOMIC_RELAXED));
+>  double now=tegu_host_seconds();
+>  if(__sync_lock_test_and_set(&tegu_surface_print_lock,1))return;
+>  if(!tegu_surface_window)tegu_surface_window=now;
+>  if(now-tegu_surface_window>=2.0) {
+>   U64 g=__atomic_exchange_n(&tegu_surface_gpu,0,__ATOMIC_RELAXED),c=__atomic_exchange_n(&tegu_surface_cpu,0,__ATOMIC_RELAXED);
+>   U64 f=__atomic_exchange_n(&tegu_surface_fallback,0,__ATOMIC_RELAXED),gn=__atomic_exchange_n(&tegu_surface_gpu_ns,0,__ATOMIC_RELAXED);
+>   U64 cn=__atomic_exchange_n(&tegu_surface_cpu_ns,0,__ATOMIC_RELAXED),mn=__atomic_exchange_n(&tegu_surface_max_ns,0,__ATOMIC_RELAXED);
+>   char line[200];int len=snprintf(line,sizeof(line),"TEGU_PERF_SURFACE window_ms=%u gpu=%llu cpu=%llu cpu_fallback=%llu gpu_us_per=%llu cpu_us_per=%llu max_us=%llu\n",
+>    (unsigned)((now-tegu_surface_window)*1e3),g,c,f,g?gn/g/1000:0,c?cn/c/1000:0,mn/1000);
+>   if(len>0)write(2,line,(size_t)len<sizeof(line)?(size_t)len:sizeof(line)-1);
+>   tegu_surface_window=now;
+>  }
+>  __sync_lock_release(&tegu_surface_print_lock);
+> }
+> /* 0 off (CPU decode), 1 YCbCr only, 2 YCbCr and XR (default). */
+> static int tegu_shadow_gpu_mode(void) {
+>  static int mode=-1;
+>  if(mode<0){const char *v=getenv("TEGU_SHADOW_GPU");mode=!v?2:!strcmp(v,"0")?0:!strcmp(v,"ycbcr")?1:2;}
+>  return mode;
+> }
+> #ifdef TEGU_SHADOW_GPU_BUILD
+> static size_t tegu_align64(size_t v){return (v+63u)&~(size_t)63u;}
+> /* The staging layout of a decode shadow's source: up to two texel tables
+>  * (plane 0/1 or the XR rows) and a lookup table, as legacy uint bindings. */
+> struct tegu_shadow_staging {
+>  unsigned kind; /* 1 YCbCr, 2 XR */
+>  struct tegu_ycbcr_layout l;unsigned cw,ch;
+>  uint32_t format[3],width[3],height[3],row[3];size_t offset[3],copy[2],size;
+> };
+> /* Whether the shadow converts on the GPU (same answer at the B2 wait and at
+>  * the copy; the copy may still fall back after a refusal). */
+> static int tegu_shadow_gpu_layout(TeguTexture *t,struct tegu_shadow_staging *s) {
+>  int mode=tegu_shadow_gpu_mode();
+>  if(!mode||!t||!t->shadowSurface||!t->buffer||!t->buffer->handle||!t->buffer->owner||
+>     !(t->buffer->owner->capabilities&TEGU_GPU_CAP_GENERIC_JOB)||t->levelCount!=1||(t->rowBytes&63)||(t->mip[0].offset&63)||
+>     !t->textureWidth||!t->textureHeight||t->textureWidth>4096||t->textureHeight>4096)return 0;
+>  unsigned w=(unsigned)t->textureWidth,h=(unsigned)t->textureHeight;
+>  memset(s,0,sizeof(*s));
+>  if(t->shadowConvert==TEGU_SHADOW_CONVERT_YCBCR) {
+>   tegu_ycbcr_unpack(t->shadowYcbcr,&s->l);
+>   unsigned internal=s->l.output==TEGU_YCBCR_OUT_CONVERTED?90:s->l.output==TEGU_YCBCR_OUT_SRGB?115:s->l.bits==8?70:90;
+>   if(t->format!=internal||(s->l.bits!=8&&s->l.bits!=10)||(s->l.packed&&s->l.bits!=10)||s->l.sub>2||s->l.matrix>2)return 0;
+>   s->kind=1;s->cw=s->l.sub==TEGU_YCBCR_SUB_444?w:(w+1)/2;s->ch=s->l.sub==TEGU_YCBCR_SUB_420?(h+1)/2:h;
+>   /* Luma codes: R8Uint / R16Uint / R32Uint (packed); chroma pairs:
+>    * RG8Uint / RG16Uint / R32Uint (packed codes, Cb Cr interleaved). */
+>   s->format[0]=s->l.packed?53:s->l.bits==8?13:23;s->width[0]=s->l.packed?(w+2)/3:w;
+>   s->format[1]=s->l.packed?53:s->l.bits==8?33:63;s->width[1]=s->l.packed?(2*s->cw+2)/3:s->cw;
+>   s->height[0]=h;s->height[1]=s->ch;
+>   s->copy[0]=tegu_ycbcr_row_bytes(&s->l,w);s->copy[1]=tegu_ycbcr_row_bytes(&s->l,2*(size_t)s->cw);
+>   s->format[2]=23;s->width[2]=513;s->height[2]=1;s->row[2]=(uint32_t)tegu_align64(513*2);
+>  } else if(mode>=2&&tegu_xr_source_bpp(t->shadowConvert)&&t->format==115) {
+>   size_t bpp=tegu_xr_source_bpp(t->shadowConvert);
+>   s->kind=2;s->format[0]=bpp==4?53:103;s->width[0]=w;s->height[0]=h;s->copy[0]=w*bpp;
+>   s->format[1]=23;s->width[1]=1024;s->height[1]=2;s->row[1]=2048;
+>  } else return 0;
+>  for(unsigned i=0;i<(s->kind==1?2u:1u);i++)s->row[i]=(uint32_t)tegu_align64(s->copy[i]);
+>  for(unsigned i=0;i<3;i++){if(!s->width[i])break;
+>   if(s->width[i]>4096||s->row[i]>65536)return 0;
+>   s->offset[i]=s->size;s->size+=tegu_align64((size_t)s->row[i]*s->height[i]);}
+>  return 1;
+> }
+> static int tegu_shadow_gpu_eligible(TeguTexture *t){struct tegu_shadow_staging s;return tegu_shadow_gpu_layout(t,&s);}
+> /* Two pooled staging buffers per device, grown on demand: a slot is reused
+>  * after the jobs listing it completed (targeted wait; usually none). A
+>  * released slot's BO is freed by the kernel once its jobs are idle. */
+> static unsigned tegu_staging_lock,tegu_staging_next;
+> static TeguComputeDevice *tegu_staging_owner;static TeguBuffer *tegu_staging[2];
+> static TeguBuffer *tegu_staging_acquire(TeguComputeDevice *d,size_t size) {
+>  tegu_lock(&tegu_staging_lock);
+>  if(tegu_staging_owner!=d){for(unsigned i=0;i<2;i++){[tegu_staging[i] release];tegu_staging[i]=0;}tegu_staging_owner=d;}
+>  unsigned slot=tegu_staging_next++&1u;TeguBuffer *b=tegu_staging[slot];
+>  if(b&&b->logical<size){[b release];b=tegu_staging[slot]=0;}
+>  if(!b) {
+>   size_t grown=(size+(1u<<20)-1)&~(size_t)((1u<<20)-1); /* 1 MiB steps: fewer regrowths */
+>   b=tegu_staging[slot]=[d newBufferWithLength:grown options:0];
+>  } else {
+> #ifdef N2MB_HAVE_WAIT_HANDLES
+>   U64 h=b->handle;unsigned waited=0;
+>   if(n2mb_wait_handles(d->connection,&h,1,0,&waited)){tegu_unlock(&tegu_staging_lock);return 0;}
+> #else
+>   if(n2mb_wait_pending(d->connection,0)){tegu_unlock(&tegu_staging_lock);return 0;}
+> #endif
+>  }
+>  if(!b||!b->handle||!tegu_buffer_bytes(b)){tegu_unlock(&tegu_staging_lock);return 0;}
+>  return b; /* the caller releases tegu_staging_lock */
+> }
+> /* Copy the source (locked surface) into staging and submit the conversion.
+>  * 0 on success (the shadow will hold the converted surface once the draw
+>  * ran); nonzero: nothing was submitted, the caller decodes on the CPU. */
+> static int tegu_shadow_gpu_convert(TeguTexture *t,const struct TeguIOSurfaceAPI *api,void *surface,TeguComputeDevice *d,U64 *copied) {
+>  struct tegu_shadow_staging s;
+>  if(!tegu_shadow_gpu_layout(t,&s)||!d)return -1;
+>  const unsigned char *src[2]={0,0};size_t srcRow[2]={0,0};
+>  if(s.kind==1) {
+>   if(!api->getPlaneBase||!api->getPlaneRow)return -1;
+>   src[0]=(const unsigned char *)api->getPlaneBase(surface,0);src[1]=(const unsigned char *)api->getPlaneBase(surface,1);
+>   srcRow[0]=api->getPlaneRow(surface,0);srcRow[1]=api->getPlaneRow(surface,1);
+>   if(!src[0]||!src[1]||srcRow[0]<s.copy[0]||srcRow[1]<s.copy[1])return -1;
+>  } else {
+>   unsigned char *base=0;size_t row=0,sw=0,sh=0,salloc=0;
+>   if(!tegu_shadow_geometry(api,surface,t->shadowPlane,&base,&row,&sw,&sh,&salloc)||!base||
+>      sw<t->textureWidth||sh<t->textureHeight||row<s.copy[0]||salloc/row<t->textureHeight)return -1;
+>   src[0]=base;srcRow[0]=row;
+>  }
+>  TeguBuffer *staging=tegu_staging_acquire(d,s.size);
+>  if(!staging)return -1;
+>  unsigned char *out=(unsigned char *)tegu_buffer_bytes(staging);
+>  *copied=0;
+>  for(unsigned p=0;p<(s.kind==1?2u:1u);p++) {
+>   for(unsigned y=0;y<s.height[p];y++)memcpy(out+s.offset[p]+(size_t)y*s.row[p],src[p]+(size_t)y*srcRow[p],s.copy[p]);
+>   *copied+=(U64)s.copy[p]*s.height[p];
+>  }
+>  struct tegu_generic_draw_request q;memset(&q,0,sizeof(q));
+>  const struct tegu_generic_draw_shader *shader;
+>  if(s.kind==1) {
+>   memcpy(out+s.offset[2],tegu_srgb_knots_8192,sizeof(tegu_srgb_knots_8192));
+>   int k[3][2];tegu_ycbcr_coefficients(s.l.full_range,s.l.matrix,k);
+>   int32_t push[16]={(int32_t)s.cw,(int32_t)s.ch,0,0,(int32_t)s.l.bits,(int32_t)s.l.packed,(int32_t)s.l.sub,(int32_t)s.l.output,
+>    k[0][0],k[0][1],k[1][0],k[1][1],k[2][0],k[2][1],(int32_t)s.l.full_range,0};
+>   _Static_assert(sizeof(push)>=n2_ycbcr_convert_PUSH_BYTES&&sizeof(push)<=TEGU_GENERIC_DRAW_PUSH_BYTES,"YCbCr push block");
+>   memcpy(q.fragment_push,push,sizeof(push));q.fragment_push_bytes=sizeof(push);
+>   shader=&n2_ycbcr_convert_shader;q.binding_count=3;
+>  } else {
+>   const uint16_t *colour=t->shadowConvert==TEGU_SHADOW_CONVERT_BGR10_XR_SRGB||t->shadowConvert==TEGU_SHADOW_CONVERT_BGRA10_XR_SRGB?
+>    tegu_xr_half_srgb:tegu_xr_half_linear;
+>   memcpy(out+s.offset[1],colour,2048);memcpy(out+s.offset[1]+2048,tegu_xr_half_alpha,2048);
+>   int32_t push[4]={tegu_xr_source_bpp(t->shadowConvert)==4?0:1,0,0,0};
+>   _Static_assert(sizeof(push)>=n2_xr_convert_PUSH_BYTES,"XR push block");
+>   memcpy(q.fragment_push,push,sizeof(push));q.fragment_push_bytes=sizeof(push);
+>   shader=&n2_xr_convert_shader;q.binding_count=2;
+>  }
+>  for(unsigned i=0;i<q.binding_count;i++)
+>   q.bindings[i]=(struct tegu_generic_draw_binding){.binding=i,.kind=TEGU_GENERIC_DRAW_COMBINED,
+>    .memory={staging->handle,s.offset[i],(U64)s.row[i]*s.height[i]},.width=s.width[i],.height=s.height[i],.row_bytes=s.row[i],
+>    .sampler=0,.format=s.format[i]};
+>  q.target_format=(uint32_t)t->format;q.width=(uint32_t)t->textureWidth;q.height=(uint32_t)t->textureHeight;
+>  q.row_bytes=(uint32_t)t->rowBytes;q.load_action=0;q.vertex_count=3;q.primitive=TEGU_GENERIC_DRAW_TRIANGLES;
+>  q.scissor[2]=q.width;q.scissor[3]=q.height;
+>  q.target_token=t->buffer->handle;q.target_offset=t->mip[0].offset;q.target_length=t->buffer->logical;
+>  U64 reply[2]={0};unsigned n=2;
+>  int e=n2mb_draw(d->connection,shader,&q,(uint64_t *)reply,&n);
+>  tegu_unlock(&tegu_staging_lock);
+>  if(e) {
+>   static unsigned traces;
+>   if(__atomic_fetch_add(&traces,1,__ATOMIC_RELAXED)<8) {
+>    int n2r=0,site=n2mb_last_failure(d->connection,&n2r);char line[200];
+>    int len=snprintf(line,sizeof(line),"TEGU_SHADOW_GPU refused kind=%u fmt=%lu %lux%lu err=%d site=%d n2r=%d: CPU decode\n",
+>     s.kind,(unsigned long)t->format,(unsigned long)t->textureWidth,(unsigned long)t->textureHeight,e,site,n2r);
+>    if(len>0)write(2,line,(size_t)len<sizeof(line)?(size_t)len:sizeof(line)-1);
+>   }
+>  }
+>  return e;
+> }
+> /* A CPU decode after a GPU attempt or in the execute path: earlier queued
+>  * jobs may still read (or, for an XR target, write) the shadow. */
+> static void tegu_shadow_gpu_wait_target(TeguTexture *t,TeguComputeDevice *d) {
+>  if(!d||!t->buffer||!t->buffer->handle)return;
+> #ifdef N2MB_HAVE_WAIT_HANDLES
+>  U64 h=t->buffer->handle;unsigned waited=0;(void)n2mb_wait_handles(d->connection,&h,1,0,&waited);
+> #else
+>  (void)n2mb_wait_pending(d->connection,0);
+> #endif
+> }
+> #else
+> static int tegu_shadow_gpu_eligible(TeguTexture *t){(void)t;return 0;}
+> #endif
+189a391,410
+>  /* A decode refresh (YCbCr or XR, surface -> shadow) is timed for
+>   * TEGU_PERF_SURFACE; in the execute path an eligible one converts on the
+>   * GPU (A3, above) and falls back to the CPU decode below after a refusal. */
+>  const int decode=!toSurface&&t&&t->shadowConvert&&t->shadowSurface&&api&&t->buffer;
+>  const double decodeStart=decode?tegu_host_seconds():0;int fallback=0;
+> #ifdef TEGU_SHADOW_GPU_BUILD
+>  if(decode&&tegu_shadow_gpu_device&&tegu_shadow_gpu_eligible(t)) {
+>   void *surface=(void *)t->shadowSurface;U64 copied=0;
+>   t->shadowSeedValid=0;
+>   if(api->lock(surface,1,&seed))return 0;
+>   int e=tegu_shadow_gpu_convert(t,api,surface,tegu_shadow_gpu_device,&copied);
+>   uint32_t after=seed;int unlocked=api->unlock(surface,1,&after);
+>   if(!e) {
+>    if(!unlocked&&api->getSeed){t->shadowSeed=seed;t->shadowSeedValid=1;}
+>    tegu_surface_account(1,0,tegu_host_seconds()-decodeStart);
+>    return copied;
+>   }
+>   fallback=1;tegu_shadow_gpu_wait_target(t,tegu_shadow_gpu_device);
+>  }
+> #endif
+198a420
+>   if(ok)tegu_surface_account(0,fallback,tegu_host_seconds()-decodeStart);
+229a452
+>  if(s&&b&&decode)tegu_surface_account(0,fallback,tegu_host_seconds()-decodeStart);
+277a501
+>    if(tegu_shadow_gpu_eligible(t))continue; /* A3: the GPU rewrites it in order; the CPU writes only staging */
+325a550,556
+> }
+> /* The execute path's refresh (before the jobs): tegu_shadow_sync_jobs(...,0)
+>  * with eligible decode shadows converted on the GPU (A3). */
+> static U64 tegu_shadow_refresh_jobs(struct Dispatch *const *jobs,unsigned count,TeguComputeDevice *d) {
+>  tegu_shadow_gpu_device=d&&(d->capabilities&TEGU_GPU_CAP_GENERIC_JOB)?d:0;
+>  U64 bytes=tegu_shadow_sync_jobs(jobs,count,0);
+>  tegu_shadow_gpu_device=0;return bytes;

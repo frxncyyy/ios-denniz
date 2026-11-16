@@ -1,0 +1,45 @@
+--- a/gpu/metal/tegu/compute_frontend.m
++++ b/gpu/metal/tegu/compute_frontend.m
+@@ -793,9 +793,32 @@
+  * whole command. */
+ #define TEGU_JOB(chunks,i) ((chunks)[(i)/TEGU_JOB_CHUNK][(i)%TEGU_JOB_CHUNK])
+ struct TeguComputeRange {NSUInteger location,length;};
++/* Job chunks (TEGU_JOB_CHUNK large Dispatch structs) are recycled through a
++ * process-wide free list instead of a calloc per chunk per command buffer
++ * (c6q host encode profile: 13% of encode CPU; on the device a fresh chunk is
++ * fresh zero pages). A chunk is handed out zeroed exactly as calloc did:
++ * chunk by chunk, on first touch. */
++#define TEGU_JOB_POOL_MAX 32u
++static struct Dispatch *tegu_job_pool[TEGU_JOB_POOL_MAX];static unsigned tegu_job_pool_n,tegu_job_pool_lock;
++static void tegu_job_chunk_put(struct Dispatch *chunk) {
++ if(!chunk)return;
++ while(__atomic_exchange_n(&tegu_job_pool_lock,1u,__ATOMIC_ACQUIRE)){}
++ if(tegu_job_pool_n<TEGU_JOB_POOL_MAX){tegu_job_pool[tegu_job_pool_n++]=chunk;chunk=0;}
++ __atomic_store_n(&tegu_job_pool_lock,0u,__ATOMIC_RELEASE);
++ free(chunk);
++}
++static struct Dispatch *tegu_job_chunk_get(void) {
++ struct Dispatch *chunk=0;
++ while(__atomic_exchange_n(&tegu_job_pool_lock,1u,__ATOMIC_ACQUIRE)){}
++ if(tegu_job_pool_n)chunk=tegu_job_pool[--tegu_job_pool_n];
++ __atomic_store_n(&tegu_job_pool_lock,0u,__ATOMIC_RELEASE);
++ if(!chunk)return calloc(TEGU_JOB_CHUNK,sizeof(struct Dispatch));
++ memset(chunk,0,TEGU_JOB_CHUNK*sizeof(struct Dispatch));
++ return chunk;
++}
+ static struct Dispatch *tegu_command_job(TeguCommand *command,unsigned index) {
+  struct Dispatch **chunk=&command->jobChunks[index/TEGU_JOB_CHUNK];
+- if(!*chunk&&!(*chunk=calloc(TEGU_JOB_CHUNK,sizeof(struct Dispatch))))__builtin_trap();
++ if(!*chunk&&!(*chunk=tegu_job_chunk_get()))__builtin_trap();
+  return &(*chunk)[index%TEGU_JOB_CHUNK];
+ }
+ /* Keep the first rejected operation: a later encoder often observes only the
+@@ -2352,7 +2375,7 @@
+  while(node){struct TeguHandler *next=node->next;queue->blockRelease(node->block);free(node);node=next;}
+  if(completionTarget)queue->submissions.ops.release(completionTarget);
+  if(completion)queue->submissions.ops.release(completion);
+- for(unsigned c=0;c<TEGU_COMMAND_MAX_JOBS/TEGU_JOB_CHUNK;c++)free(jobChunks[c]);
++ for(unsigned c=0;c<TEGU_COMMAND_MAX_JOBS/TEGU_JOB_CHUNK;c++)tegu_job_chunk_put(jobChunks[c]);
+  tegu_command_indirect_free(self);
+  [debugLabel release]; [failure release]; [queue release]; [super dealloc];
+ }

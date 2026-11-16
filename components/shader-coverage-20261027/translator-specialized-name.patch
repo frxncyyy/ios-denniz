@@ -1,0 +1,183 @@
+diff --git a/crates/metal2vulkan-air/src/canon/devirt_tests.rs b/crates/metal2vulkan-air/src/canon/devirt_tests.rs
+index f3da82a..b87ec8f 100644
+--- a/crates/metal2vulkan-air/src/canon/devirt_tests.rs
++++ b/crates/metal2vulkan-air/src/canon/devirt_tests.rs
+@@ -229,6 +229,7 @@ fn candidates() -> LinkedModule {
+             .into_iter()
+             .zip(2..)
+             .map(|(name, word)| LinkedName {
++            source: None,
+                 name: name.as_bytes().into(),
+                 constants: Ok(BTreeMap::new()),
+                 handle: Some(word),
+@@ -384,6 +385,7 @@ fn a_table_call_without_candidates_needs_them_only_if_it_survives() {
+ fn an_unimportable_candidate_is_refused_at_a_surviving_call() {
+     let broken = || LinkedModule {
+         functions: vec![LinkedName {
++            source: None,
+             name: b"inc".as_slice().into(),
+             constants: Ok(BTreeMap::new()),
+             handle: Some(2),
+@@ -465,6 +467,7 @@ fn a_candidate_calling_through_its_table_recurses_on_a_call_stack() {
+     }];
+     let linked = LinkedModule {
+         functions: vec![LinkedName {
++            source: None,
+             name: b"rec".as_slice().into(),
+             constants: Ok(BTreeMap::new()),
+             handle: Some(2),
+@@ -736,6 +739,7 @@ fn pointer_candidates() -> LinkedModule {
+             .into_iter()
+             .zip(2..)
+             .map(|(name, word)| LinkedName {
++            source: None,
+                 name: name.as_bytes().into(),
+                 constants: Ok(BTreeMap::new()),
+                 handle: Some(word),
+@@ -1400,6 +1404,7 @@ fn inlining_candidates_at_every_table_call_is_capped() {
+     }];
+     let linked = LinkedModule {
+         functions: vec![LinkedName {
++            source: None,
+             name: b"big".as_slice().into(),
+             constants: Ok(BTreeMap::new()),
+             handle: Some(2),
+diff --git a/crates/metal2vulkan-air/src/canon/link.rs b/crates/metal2vulkan-air/src/canon/link.rs
+index 9c0c08f..cc4fcd5 100644
+--- a/crates/metal2vulkan-air/src/canon/link.rs
++++ b/crates/metal2vulkan-air/src/canon/link.rs
+@@ -76,6 +76,9 @@ pub struct LinkedModule {
+ pub struct LinkedName {
+     /// The Metal function name it links under.
+     pub name: Box<[u8]>,
++    /// The function's own name in the module when it links under another
++    /// (`MTLFunctionDescriptor.specializedName`); `None`: `name`.
++    pub source: Option<Box<[u8]>>,
+     /// The function-constant values it was specialized with, by index, or why they do not apply
+     /// to its module.
+     pub constants: Result<BTreeMap<u32, ConstValue>, Error>,
+@@ -806,11 +809,12 @@ fn plan(
+     if static_initializer(l) {
+         return Ok(Err(not_implemented(name, "air.static_init")));
+     }
++    let own: &[u8] = f.source.as_deref().unwrap_or(name);
+     let visible = l.abi.visible_functions.iter().find(|v| {
+         l.module
+             .func(v.func)
+             .and_then(|f| l.module.symbols().get(f.name))
+-            == Some(name)
++            == Some(own)
+     });
+     let Some(func) = visible.map(|v| v.func) else {
+         return Ok(Err(link_problem(name, LinkProblem::NotVisible)));
+diff --git a/crates/metal2vulkan-air/src/canon/link_tests.rs b/crates/metal2vulkan-air/src/canon/link_tests.rs
+index f669435..5e315bc 100644
+--- a/crates/metal2vulkan-air/src/canon/link_tests.rs
++++ b/crates/metal2vulkan-air/src/canon/link_tests.rs
+@@ -232,6 +232,7 @@ fn callee(name: &str, calls: &[&str]) -> LinkedModule {
+ fn linked(name: &str, module: Module, abi: AirAbi) -> LinkedModule {
+     LinkedModule {
+         functions: vec![LinkedName {
++            source: None,
+             name: name.as_bytes().into(),
+             constants: Ok(BTreeMap::new()),
+             handle: None,
+diff --git a/crates/metal2vulkan/src/pipeline/compile.rs b/crates/metal2vulkan/src/pipeline/compile.rs
+index 1a487de..165b258 100644
+--- a/crates/metal2vulkan/src/pipeline/compile.rs
++++ b/crates/metal2vulkan/src/pipeline/compile.rs
+@@ -220,6 +220,8 @@ pub struct StageInputs {
+ pub struct LinkedSource<'a> {
+     pub(crate) key: LinkedKey<'a>,
+     pub(crate) bitcode: &'a [u8],
++    /// The function's own name in `bitcode` (`key.name` is the name it links under).
++    pub(crate) source: &'a str,
+ }
+ 
+ impl<'a> LinkedSource<'a> {
+@@ -238,6 +240,7 @@ impl<'a> LinkedSource<'a> {
+                 constants,
+             },
+             bitcode,
++            source: name,
+         }
+     }
+ }
+@@ -250,7 +253,7 @@ pub(crate) fn linked_keys(linked: &LinkedFunctions) -> Vec<LinkedKey<'_>> {
+             let info = f.function.info();
+             LinkedKey {
+                 list,
+-                name: info.name,
++                name: f.link_name.as_deref().unwrap_or(info.name),
+                 air_hash: info.air_hash,
+                 constants: &f.constants,
+             }
+@@ -267,6 +270,7 @@ fn linked_sources(linked: &LinkedFunctions) -> Result<Vec<LinkedSource<'_>>, Err
+             Ok(LinkedSource {
+                 key,
+                 bitcode: f.function.bitcode()?,
++                source: f.function.info().name,
+             })
+         })
+         .collect()
+@@ -1263,6 +1267,7 @@ pub(crate) fn linked_modules(
+             };
+             m.charge(std::mem::size_of::<LinkedName>())?;
+             l.functions.push(LinkedName {
++                source: (s.source != key.name).then(|| s.source.as_bytes().into()),
+                 name: name.clone(),
+                 constants,
+                 handle: handle.map(|h| h.word()),
+@@ -1316,6 +1321,7 @@ pub(crate) fn linked_modules(
+         listed.push((key.air_hash, key.name, key.constants));
+         m.charge(std::mem::size_of::<LinkedName>() + key.name.len())?;
+         l.functions.push(LinkedName {
++            source: (s.source != key.name).then(|| s.source.as_bytes().into()),
+             name: key.name.as_bytes().into(),
+             constants,
+             handle: handle.map(|h| h.word()),
+diff --git a/crates/metal2vulkan/src/pipeline/descriptor.rs b/crates/metal2vulkan/src/pipeline/descriptor.rs
+index 4271176..793c6a3 100644
+--- a/crates/metal2vulkan/src/pipeline/descriptor.rs
++++ b/crates/metal2vulkan/src/pipeline/descriptor.rs
+@@ -252,6 +252,11 @@ pub struct LinkedFunction {
+     /// made pipeline state; the runtime checks it, refusing one that is not as Metal does. The
+     /// translation links the function's AIR either way, so it is not part of any key.
+     pub precompiled: bool,
++    /// The name the function links under when it is not the library function's own:
++    /// `MTLFunctionDescriptor.specializedName` of a function made by `newFunctionWithDescriptor:`
++    /// (`MTLFunction.name` is then that name, which visible-function references name). `None`:
++    /// the library function's name.
++    pub link_name: Option<String>,
+ }
+ 
+ impl LinkedFunction {
+@@ -261,9 +266,16 @@ impl LinkedFunction {
+             function,
+             constants: FunctionConstantValues::defaults(),
+             precompiled: false,
++            link_name: None,
+         }
+     }
+ 
++    /// This function, linked under `name` (`specializedName`) instead of its own name.
++    pub fn with_link_name(mut self, name: impl Into<String>) -> LinkedFunction {
++        self.link_name = Some(name.into());
++        self
++    }
++
+     /// This function specialized with `constants`.
+     pub fn with_constants(mut self, constants: FunctionConstantValues) -> LinkedFunction {
+         self.constants = constants;
+diff --git a/crates/metal2vulkan/src/tests/engine_linking.rs b/crates/metal2vulkan/src/tests/engine_linking.rs
+index bc40766..3a1150c 100644
+--- a/crates/metal2vulkan/src/tests/engine_linking.rs
++++ b/crates/metal2vulkan/src/tests/engine_linking.rs
+@@ -580,6 +580,7 @@ fn a_linked_function_s_constexpr_sampler_is_numbered() {
+             ..sample.key
+         },
+         bitcode: sample.bitcode,
++        source: sample.source,
+     };
+     let d = compile(SAMPLING, &[private]);
+     assert_eq!(d.interface.numbered_samplers, [sampler]);

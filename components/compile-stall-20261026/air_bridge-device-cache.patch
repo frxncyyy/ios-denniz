@@ -1,0 +1,58 @@
+diff --git a/gpu/metal/tegu/air_bridge.rs b/gpu/metal/tegu/air_bridge.rs
+index 2065019..c961a04 100644
+--- a/gpu/metal/tegu/air_bridge.rs
++++ b/gpu/metal/tegu/air_bridge.rs
+@@ -75,6 +75,23 @@ pub struct Pipeline {
+ }
+ const COMPUTE_VARIANTS:usize=8;
+ 
++/// The translator device of a profile text: derived once per distinct text in this process.
++/// A `Device` is immutable (`Arc`, `Send + Sync`) and every creation, deserialization and
++/// pack hit of a process passes the same profile, whose JSON parse and fingerprint
++/// (~0.5 MB of JSON) were a large part of a small pipeline's AIR time.  Failures are not
++/// cached and report exactly what the uncached derivation reports.
++fn device_for_profile(json:&str)->Result<Device,String> {
++    static CACHE:std::sync::Mutex<Vec<(Box<str>,Device)>>=std::sync::Mutex::new(Vec::new());
++    if let Ok(cache)=CACHE.lock() {
++        if let Some((_,device))=cache.iter().find(|(text,_)|&**text==json) {return Ok(device.clone());}
++    }
++    let description=DeviceDescription::from_khronos_json(json,None).map_err(|e|e.to_string())?;
++    let device=Device::new(description,DevicePolicy::default()).map_err(|e|e.to_string())?;
++    if let Ok(mut cache)=CACHE.lock() {
++        if cache.len()<4&&!cache.iter().any(|(text,_)|&**text==json) {cache.push((json.into(),device.clone()));}
++    }
++    Ok(device)
++}
+ /// Compile a kernel with the storage texture formats needed to create its pipeline state.
+ /// These formats answer creation-time compiler queries only. A resulting pipeline is never a
+ /// dispatch variant; dispatch requires a separate compile for the bound texture formats.
+@@ -416,8 +433,7 @@ unsafe fn render_pipeline_create(
+         let vertex=str::from_utf8(input(vertex_name,vertex_name_len,4096)?).map_err(|e|e.to_string())?;
+         let fragment=str::from_utf8(input(fragment_name,fragment_name_len,4096)?).map_err(|e|e.to_string())?;
+         let json=str::from_utf8(input(profile,profile_len,1024*1024)?).map_err(|e|e.to_string())?;
+-        let description=DeviceDescription::from_khronos_json(json,None).map_err(|e|e.to_string())?;
+-        let device=Device::new(description,DevicePolicy::default()).map_err(|e|e.to_string())?;
++        let device=device_for_profile(json)?;
+         let vertex=(&*vertex_library).descriptor(vertex)?;
+         let fragment=(&*fragment_library).descriptor(fragment)?;
+         let mut descriptor=RenderPipelineDescriptor::new(StageSource::Function(vertex));
+@@ -2503,8 +2519,7 @@ fn deserialize_render_handle(bytes:&[u8],profile:&str)->Result<RenderPipelineHan
+  let len=usize::try_from(r.u64()?).map_err(|_|"cached render pipeline length invalid")?;
+  let body=r.take(len)?;
+  if r.at!=bytes.len() {return Err("cached render pipeline has trailing bytes".into());}
+- let description=DeviceDescription::from_khronos_json(profile,None).map_err(|e|e.to_string())?;
+- let device=Device::new(description,DevicePolicy::default()).map_err(|e|e.to_string())?;
++ let device=device_for_profile(profile)?;
+  let pipeline=metal2vulkan::pipeline::RenderPipeline::from_bytes_for_key(body,&PipelineKey::new(key),&device).map_err(|e|format!("cached render pipeline rejected: {e:?}"))?;
+  Ok(RenderPipelineHandle{_device:device,_pipeline:pipeline,source_blend:if has_source{Some(source)}else{None},
+   requested_attachments,requested_attachment_blends:if has_blends{Some(blends)}else{None},color_format,explicit_targets,plan_cache:Default::default()})
+@@ -2605,8 +2620,7 @@ pub unsafe extern "C" fn tegu_air_pipeline_create(library:*const Library,name:*c
+         if library.is_null() {return Err("null library".into());}
+         let entry=str::from_utf8(input(name,name_len,4096)?).map_err(|e|e.to_string())?;
+         let json=str::from_utf8(input(profile,profile_len,1024*1024)?).map_err(|e|e.to_string())?;
+-        let description=DeviceDescription::from_khronos_json(json,None).map_err(|e|e.to_string())?;
+-        let device=Device::new(description,DevicePolicy::default()).map_err(|e|e.to_string())?;
++        let device=device_for_profile(json)?;
+         let function=(&*library).descriptor(entry)?;
+         let budget=Budget::standard();
+         let ((_,pipeline),creation_key,creation_only)=compile_compute_creation(&device,&function,&budget).map_err(|e|e.to_string())?;

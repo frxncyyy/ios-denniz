@@ -1,0 +1,81 @@
+## Fixes made tonight (gpu/metal/tegu/mali_graphics_compiler.c, generic pair path only)
+
+| # | where | what | functions unblocked (corpus) |
+|---|---|---|---|
+| 1 | `zero_undef_read_varyings` (above `compile_pair_specialized`) + call in its generic block | A Metal vertex function may return a struct member it never assigns (AIR `insertvalue` into undef, e.g. QuartzCore `std_vert0_lpf` texcoord0). The translator stores OpUndef, Mesa drops the store and the pair had no layout slot for a varying the FS reads ("Vertex varying layout does not cover interface"). Now a zero is stored, only for FS-read locations whose every store is undefined, so no compiling pair changes. | 18 QuartzCore pairs, 3 UI, 2 watch faces |
+| 2 | `mrt_format_ok` | True-MRT compile accepted only 10/70/80/115 while `air_bridge.rs` and n2r accept the blendable class; `render_pipeline.inc` sets genericTrueMrt for any >1 active bound targets, so RenderBox RGBA16F+RG16F and QuartzCore BGR5A1+RGBA16F MRT returned rc1 with an EMPTY message. Widened to the bridge class (texture-opus later appended 40/42/71/81/92). FS code is format independent (per-target blend word is runtime FAU). lowering-opus ACKed n2r. | 12 RenderBox + camera pairs |
+| 3 | `lower_clip_distance_varyings` + call | Metal `[[clip_distance]]` (SPIR-V ClipDistance, compact float[n<=8]): Valhall has no clip-distance hardware; same approach as Mesa `nir_lower_clip_fs`: distances go to free generic vec4 varyings and the FS discards where any is negative. Only when the VS actually writes ClipDistance (an unwritten gl_PerVertex member is left alone; an f3 build without that guard regressed check_tile_fetch_compiler and was replaced). The renderer already draws with FORCE_LATE pixel kill and shader_modifies_coverage, so a discarding FS needs no new flag. | 9 VectorKit (Maps) pairs |
+| 4 | noperspective check after the FS compile | Mesa reports only noperspective loads that survive FS optimisation (`pan_nir_lower_noperspective_fs`); a declared noperspective input whose load folded away made the exact-equality check refuse ("Fragment varying access mode unsupported"). Now refuses only an FS noperspective read that the VS did not prepare. | PridePoster ribbon, SolidRibbon |
+| 5 | `zero_undef_read_varyings` (same pass) | VS whose every declared varying is undefined while the FS reads none (VideoStabilization vertexDrawLines): Mesa dropped them all, leaving no IDVS varying program ("Missing or misaligned IDVS varying program"); the lowest one now gets a zero store. Only applies when the pair was refused before. | 1 camera pair |
+| 6 | `mrt_format_integer` + `select_mrt_outputs` type check | Preparation for texture-opus RT step 2b: integer Metal colour formats in a true-MRT target list require a uint/int output of matching signedness (BLEND register format follows the output type); float-class targets keep the exact old refusal. Inert until `mrt_format_ok` lists integer formats; verified with a scratch build listing 123/124: [BGRA8, RGBA32Uint] with vec4+uvec4 compiles, a signedness mismatch refuses. | 0 now; AppleMetalGLRenderer MRT clears once n2r has integer targets |
+| 7 | air_bridge.rs `ComputeExtra`, `compile_compute_creation_ex`, `compute_options`, NEW export `tegu_air_pipeline_create_ex` (+ air_bridge.h) | MTLComputePipelineDescriptor inputs the bridge could not carry: `linkedFunctions` (functions/private/binary lists, any library handle), `stageInputDescriptor`, `maxCallStackDepth`. Dispatch-time variants compile under the same inputs. `tegu_air_pipeline_create` = `_ex(NULL)`: 400 random compiling kernels produce byte-identical SPIR-V and Mali packages. | 10 SceneKit `[[stage_in]]` kernels (synthetic stage input descriptor). Linked functions: no installed kernel validates, because MPS/CoreRE reference specializedName symbols that exist in no metallib |
+| 8 | air_bridge.rs NEW export `tegu_air_render_pipeline_create_tessellated` + `render_outputs_for` branch; mali_graphics_compiler.c `tess_eval_spirv_as_vertex` + call at the top of `translate_specialized` | Tessellation emulation, compile side. The translator's evaluation stage already pulls control points and patch attributes from buffers. Its remaining inputs (TessCoord; patch inputs Location0 patch index, Location1 instance, Location2.. control-point element indices) become ordinary vertex inputs (TessCoord at Location 30), so it compiles as a VS with the normal generic pair. The existing create entries still refuse 4-stage pipelines (no behaviour change). The runtime tessellator (drawPatches) is api-surface's (a) and is not done, so no draw is claimed. | 214 post-tessellation pairs: 8 FaceID/BiometricKit UI, 206 AvatarKit/RoomPlan; 204 more AvatarKit pairs then stop at "Generic binding index above 15" (23 bindings > plan ABI 16) |
+| 9 | air_bridge.rs NEW export `tegu_air_tile_pipeline_create` | MTLTileRenderPipelineDescriptor via the translator's `compile_tile_pipeline`: the tile function becomes a compute pipeline that runs once per tile. QuartzCore `tile_downsample_*` refused "needs pipeline input: TileAttachments" (a wrong diagnostic input: the attachment formats were missing); with a synthetic BGRA8 colour 0 they compile through compute_v2. Runtime per-tile dispatch is not implemented, and these kernels were not seen in the device logs. | 4 QuartzCore kernels (CoreAnimation compute 3/7 -> 7/7) |
+| 10 | translator (references/metal2vulkan-tegu-pin, uncommitted, patch `translator-specialized-name.patch` 84ca910d): `LinkedFunction.link_name` + `with_link_name`, `LinkedSource.source`, `LinkedName.source`, and `plan()` looking up the module's own name; bridge `TeguAIRLinkedFunction.link_name` | MTLFunctionDescriptor.specializedName for linked visible functions. MPS kernels call `prefixPrimary_f`, `postfixPrimary_f`, ...; those symbols exist in no installed metallib, while MPSCore's visible functions are `prefixPrimary_f_to_f` and the like. The replay links `<symbol>_to_<type>` under the symbol (synthetic choice, origin recorded). No effect without link_name: 400 kernels and all 142 captured CA pipelines are byte-identical; bridge tests 34/34; metal2vulkan-air link tests 15/15. | 80 MPS kernels; 46 more link and then emit no code under synthetic constants; 9 have a signature mismatch (a wrong synthetic variant guess) |
+
+`check_graphics_draw_varyings.py`: `varyings/undefined_read_output_refused` became `..._zeroed` (deliberate contract change of fix 1); `mrt/invalid/bad_format` uses format 1, because 81 is now a valid MRT format.
+
+No translator (metal2vulkan) source change tonight: the translator-side refusals that were in the way turned out to be wrong diagnostic inputs (see below) or need runtime features owned elsewhere.
+
+## Replay harness corrections (wrong diagnostic inputs, not shader semantics)
+
+- Function constants are specialized against the WHOLE metallib, as production does. The single extracted AIR module has no MTLB CNST table, and `tegu_air_library_specialize` then refused with `Reflection` (QuartzCore fixed_frag_*: this was a harness artefact, not a translator gap).
+- QuartzCore pairs: constants whose name and type match a captured device record in corpus.txt take that record's value (origin `captured_donor(corpus.txt)`); this made all QuartzCore pairs except the 2 raster-order-group ones compile with donor values.
+- Compute kernels that the canonical synthetic values reduce to an EMPTY program ("Mali backend emitted no code") are retried once with the audit tool's alternate policy (bool 0, uint 2, sint -1, float 1.0, origin `synthetic_diagnostic:alternate`). 16 of 61 then compile; 43 stay empty. An empty kernel is a valid no-op, and the runtime could treat it as one (compute owner).
+- Values otherwise: the corpus_inputs plan (`compile-stall-20261026/censusall-base/variants.jsonl`, origin `synthetic_diagnostic:canonical`). Constants the plan does not list get the same rule (bool/int 1, float 0.5, origin `...(completion)`), iteratively, from the declared CNST table. No value is presented as captured.
+- Attachments: derived from the declared `air.render_target` outputs AND framebuffer reads. The format is chosen by declared type (float/half: 25/65/80/115, integer: the matching Sint/Uint format). An undeclared slot below the highest one is bound but masked, as `render_pipeline.inc` does (`fmt?fmt:80`, mask 0).
+- The compile entry mirrors `render_pipeline.inc`: options v1 `DRAW_PARAMETERS|EXTENDED_VARYINGS|THREAD_STORAGE`; options v2 `MULTI_TARGET` when more than one target is active and all are bound (at most 4); `SELECT_RT` on the first active target otherwise.
+- Compute: 593 kernels compile through TGP1 (`tegu_mali_compile`) and 6395 through `compute_v2` after TGP1 refused them, matching runtime_pipeline.inc. 6 kernels are creation-only storage-texture stand-ins (`dispatchable`=0); production compiles those at dispatch with the real formats, and the replay compiles the stand-in SPIR-V with v2.
+- CoreAnimation device pipelines: all 142 `TPC_MISS` records in `gpu/build/pipeline-corpus/corpus.txt` are replayed with their exact captured constants, targets, blends and vertex layouts (`p-NNN` cases).
+
+## Gates (host only; GPU_EXECUTED=0; nothing touched on the phone)
+
+Final sources at the C6m freeze: mali_graphics_compiler.c 4b7f6fb2 (private Mali f8 125b3382), air_bridge.rs e70125bb, air_bridge.h 16d1b8ab, check_graphics_draw_varyings.py d4274821, and the translator diff 84ca910d.
+
+
+- Pipeline-pack identity (`tools/pack_identity.sh`): the pack replay binary of `pipeline-pack-aa4073ac` runs the 142 records with base Mali (`be411e7a` source) vs f5 and f6. Result: 142/142 built, and all 463 cache entries are byte-identical. Codegen of the shipped pack is unchanged.
+- Corpus graphics: of 1016 pairs that compiled before, all 1016 still compile with byte-identical VS and FS code; 0 regressions; 63 more pairs compile.
+- Bridge (private cdylib 105fee5a from air_bridge.rs e70125bb + translator diff 84ca910d): cargo test 34/34, metal2vulkan-air link tests 15/15, metal2vulkan engine_linking/argument_tables/recursion 31/31. 400 random compiling kernels and all 142 captured CA pipelines produce byte-identical SPIR-V and code.
+- Compiler checks with f4/f5/f6/f7/f8: check_graphics_draw_varyings 81/81 (with `--baseline` byte identity), check_tile_fetch_compiler PASS, check_generic_texture_lowering 58/58, check_graphics_specialization 66/66.
+- run_host_tests.sh / metal_resource_integration_test.py --candidate / texture_format_frontend_test.py: see `gates/` (they run against the shared tree, which has other agents' in-flight edits).
+
+## Not done, with owner and evidence
+
+- Tessellation, 830 functions (AvatarKit Memoji, FaceID UI `LocalAuthenticationPrivateUI` tessellation_vertex_*, BiometricKitUI MTLSpline, RoomPlan). Post-tessellation vertex functions translate to expanded stages; `air_bridge.rs` render_outputs refuses `stages.len()!=2`. arch9 Mali has no tessellator. This needs a CPU or compute tessellator at drawPatches, plus a translator mode that turns position_in_patch/patch_id/patch_control_point into ordinary VS inputs and buffer fetch. Multi-day work across translator, bridge and runtime.
+- Integer and non-blendable colour targets, 330 functions (248 AppleMetalGLRenderer clears/blits, about 70 camera/video). The bridge's bounded format class refuses them. This is texture-opus "RT step 2b"; once n2r has the formats, the compiler side also needs `select_mrt_outputs` to accept int/uint outputs (offered).
+- Runtime inputs the bridge API cannot carry, 174 functions: MTLLinkedFunctions (98 MPS), visible function tables (20), tile render pass attachments (QuartzCore `tile_downsample_*`; not seen in device logs), compute stage_in descriptors (10).
+- Argument-buffer device pointers, 115 functions (Metal.framework BVH builder, VFX, MPS RayIntersector). `air.indirect_buffer` structs of device pointers. TGP2 needs physical addressing and `gpuAddress` (it returns 0 in api_surface.inc).
+- Viewport arrays (142 CoreRE `*_multiple_viewports_*` variants) and layered rendering (16 SceneKit/SceneIntelligence). The runtime refuses amplification above 1. Correct refusal.
+- FS depth output (17) and sample mask (4). The renderer has no depth-stencil path yet (`depth_function=ALWAYS`).
+- FS storage-image writes (RenderBox resolve_*; 2 UI) and generic binding index >15 (31, e.g. SpriteKit PointLight). The generic plan ABI has 16 bindings (`TEGU_MALI_GENERIC_MAX_BINDINGS`), which renderer/encode own.
+- Dynamic-mip storage image writes (SiriUICore `SiriBlur`, NTK Blur::downsample, 5). The translator emits a storage-image array[16] indexed by LOD; TGP2 refuses descriptor arrays even though the manifest has `array_count`. Needs runtime per-level views plus a dynamic table index; compute owner.
+- Compile budget, 110 functions (97 MPS). All are in the Mali phase (more than 30 s CPU, many more than 240 s). The rerun with a 240 s budget is in `runs/timeouts-long`. This is a compiler-speed item, not a refusal.
+- Translator: Imageblocks / UnknownIntrinsic `air.get_imageblock*` (about 18 camera kernels), Lowering(Access) (3), StaticInitializer (1), CallTypeMismatch (4), and the legacy `air.intersect` signature (56 MTLReplayer).
+
+## Reproduce
+
+```
+cd gpu/build/shader-coverage-20261027
+python3 tools/replay.py --run NAME [--kind compute|graphics|captured|all] [--filter ids.txt] --jobs N \
+   --bridge <libtegu_air_bridge.so> --compiler <libnord2_mali_runtime.so> --profile <tegu-air-profile.h>
+bash tools/build_mali_so.sh <dir with mali_*.c/.h> libs/<name>      # private host Mali runtime (shared libs untouched)
+tools/pack_identity.sh libs/<name> <tag>; diff pack-gate/base/entries.sha256 pack-gate/<tag>/entries.sha256
+python3 tools/ledger.py runs/before runs/after .
+```
+runs/before = runs/base compute + runs/base-g2 graphics/captured (shared libs). runs/after = the same compute rows + runs/after-f7 graphics/captured. Compute rows are shared because mali_compute_compiler.c is byte-identical (419f8227) in the shared build, base and f5, and the bridge is the same.
+
+## Attribution of the final after-run
+
+The final graphics after-run (`runs/after-f8`) uses a private cdylib built from the working-tree air_bridge.rs. That tree also carries texture-opus's newer colour-target formats in the bridge, and 83 pairs that the f7 run refused with "attachment format ... outside bounded class" compile because of those formats, not because of my changes. Relative to f7: +214 tessellation pairs (fix 8), +10 stage_in kernels (fix 7), +83 from texture-opus formats, 0 regressions. All 1019 pairs that compiled before have byte-identical code. Pipeline pack: 463/463 entries identical (f8).
+
+## Binding index >15 (root item 3): not cheap
+
+TEGU_MALI_GENERIC_MAX_BINDINGS 16 sizes `struct tegu_mali_generic_plan` (stored inside pipeline-cache entries), and TEGU_GENERIC_DRAW_MAX_BINDINGS 16 sizes the render-side draw records (generic_job_ui.h, draw_reorder.inc, render_encoder.inc:2360/2933, nord2_metal_render.c:211-216/328, nord2_metal_render.h `binding[16]`). AvatarKit needs 23 distinct bindings across VS+FS, so this is a count limit and not only an index limit; remapping indices cannot fix it. Widening means a versioned cache key/pack rebuild plus render-lead transport changes, which is not a one-owner edit.
+
+## Post-C6m (after 672108e, translator pin 33ce982a)
+
+- air_bridge.rs `tegu_air_function_patch`: MTLFunction.patchType/patchControlPointCount (FaceID tessellation_vertex_main quad/4, AvatarKit quad/16, CA none/-1).
+- air_bridge.rs `tegu_air_pipeline_function_handle`: functionHandleWithFunction: for visible-function tables (MPS linked prefixPrimary_4xf -> word 2; the same function without its specializedName -> not placeable).
+- Translator diff 5277f32c (uncommitted, `translator-function-handle-linkname.patch`): `LinkedFunctions::function_handle` compares the link_name.
+- Gates: bridge 34/34; metal2vulkan table/linking/argument-table tests 140/140; 400 kernels plus 142 captured CA pipelines byte-identical; pack 463/463 byte-identical.
+- Not done: drawPatches end to end. render_pipeline.inc does not yet create tessellation pipelines (see STABLE 6 on the board for the four-step plan); tegu_pipeline_tess_info stays NULL outside the api-surface host spy.

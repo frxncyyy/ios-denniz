@@ -1,0 +1,104 @@
+diff --git a/gpu/metal/tegu/air_bridge.rs b/gpu/metal/tegu/air_bridge.rs
+index 2065019..6342cff 100644
+--- a/gpu/metal/tegu/air_bridge.rs
++++ b/gpu/metal/tegu/air_bridge.rs
+@@ -75,6 +75,23 @@ pub struct Pipeline {
+ }
+ const COMPUTE_VARIANTS:usize=8;
+ 
++/// The translator device of a profile text: derived once per distinct text in this process.
++/// A `Device` is immutable (`Arc`, `Send + Sync`) and every creation, deserialization and
++/// pack hit of a process passes the same profile, whose JSON parse and fingerprint
++/// (~0.5 MB of JSON) were a large part of a small pipeline's AIR time.  Failures are not
++/// cached and report exactly what the uncached derivation reports.
++fn device_for_profile(json:&str)->Result<Device,String> {
++    static CACHE:std::sync::Mutex<Vec<(Box<str>,Device)>>=std::sync::Mutex::new(Vec::new());
++    if let Ok(cache)=CACHE.lock() {
++        if let Some((_,device))=cache.iter().find(|(text,_)|&**text==json) {return Ok(device.clone());}
++    }
++    let description=DeviceDescription::from_khronos_json(json,None).map_err(|e|e.to_string())?;
++    let device=Device::new(description,DevicePolicy::default()).map_err(|e|e.to_string())?;
++    if let Ok(mut cache)=CACHE.lock() {
++        if cache.len()<4&&!cache.iter().any(|(text,_)|&**text==json) {cache.push((json.into(),device.clone()));}
++    }
++    Ok(device)
++}
+ /// Compile a kernel with the storage texture formats needed to create its pipeline state.
+ /// These formats answer creation-time compiler queries only. A resulting pipeline is never a
+ /// dispatch variant; dispatch requires a separate compile for the bound texture formats.
+@@ -450,8 +614,36 @@ unsafe fn render_pipeline_create(
+             }
+         }
+         if attribute_count>0||layout_count>0 {descriptor.vertex_descriptor=Some(fetch);}
++        Ok((descriptor,attachment_snapshot))
++}}
++unsafe fn render_pipeline_create(
++ vertex_library:*const Library,vertex_name:*const u8,vertex_name_len:usize,
++ fragment_library:*const Library,fragment_name:*const u8,fragment_name_len:usize,
++ color_format:u32,attributes:*const VertexAttribute,attribute_count:usize,
++ layouts:*const VertexLayout,layout_count:usize,blend:*const RenderBlend,require_blend:bool,
++ profile:*const u8,profile_len:usize,
++ targets:*const RenderColorAttachment,target_count:usize,attachment_blends:*const RenderBlend,
++ vertex_spirv:*mut Blob,fragment_spirv:*mut Blob,metadata:*mut Blob,
++ error:*mut c_char,cap:usize)->*mut RenderPipelineHandle {
++    if vertex_spirv.is_null()||fragment_spirv.is_null()||metadata.is_null()||
++       vertex_spirv==fragment_spirv||vertex_spirv==metadata||fragment_spirv==metadata {
++        unsafe {error_copy(error,cap,"invalid or aliased render outputs")};
++        return ptr::null_mut();
++    }
++    unsafe {
++        *vertex_spirv=Blob{bytes:ptr::null_mut(),length:0};
++        *fragment_spirv=Blob{bytes:ptr::null_mut(),length:0};
++        *metadata=Blob{bytes:ptr::null_mut(),length:0};
++    }
++    let result=unsafe {attempt(error,cap,|| {
++        let (descriptor,attachment_snapshot)=render_descriptor_from_inputs(vertex_library,vertex_name,vertex_name_len,
++         fragment_library,fragment_name,fragment_name_len,color_format,attributes,attribute_count,layouts,layout_count,
++         blend,require_blend,targets,target_count,attachment_blends)?;
++        let json=str::from_utf8(input(profile,profile_len,1024*1024)?).map_err(|e|e.to_string())?;
++        let device=device_for_profile(json)?;
+         let pipeline=device.compile_render_pipeline(&descriptor,&Budget::standard()).map_err(|e|e.to_string())?;
+-        let handle=RenderPipelineHandle{_device:device,_pipeline:pipeline,source_blend:if blend.is_null(){None}else{Some(*blend)},requested_attachments:attachment_snapshot,requested_attachment_blends:if attachment_blends.is_null(){None}else{Some((0..target_count).map(|i|*attachment_blends.add(i)).collect())},color_format,explicit_targets:target_count>0,plan_cache:Default::default()};
++        let handle=RenderPipelineHandle{_device:device,_pipeline:pipeline,source_blend:if blend.is_null(){None}else{Some(*blend)},requested_attachments:attachment_snapshot,requested_attachment_blends:if attachment_blends.is_null(){None}else{Some((0..target_count).map(|i|*attachment_blends.add(i)).collect())},color_format,explicit_targets:target_count>0,plan_cache:Default::default(),
++            descriptor:std::sync::Mutex::new(Some(descriptor)),variants:Default::default()};
+         let (vertex,fragment,encoded)=render_outputs(&handle)?;
+         Ok((vertex,fragment,encoded,handle))
+     })};
+@@ -2502,12 +2788,23 @@ fn deserialize_render_handle(bytes:&[u8],profile:&str)->Result<RenderPipelineHan
+  let key:[u8;32]=r.take(32)?.try_into().unwrap();
+  let len=usize::try_from(r.u64()?).map_err(|_|"cached render pipeline length invalid")?;
+  let body=r.take(len)?;
+- if r.at!=bytes.len() {return Err("cached render pipeline has trailing bytes".into());}
+- let description=DeviceDescription::from_khronos_json(profile,None).map_err(|e|e.to_string())?;
+- let device=Device::new(description,DevicePolicy::default()).map_err(|e|e.to_string())?;
++ let device=device_for_profile(profile)?;
+  let pipeline=metal2vulkan::pipeline::RenderPipeline::from_bytes_for_key(body,&PipelineKey::new(key),&device).map_err(|e|format!("cached render pipeline rejected: {e:?}"))?;
++ let count=r.u32()? as usize;if count>RENDER_VARIANT_LIMIT {return Err("cached render pipeline variants invalid".into());}
++ let mut variants=Vec::with_capacity(count);
++ for _ in 0..count {
++  let klen=r.u32()? as usize;if klen>1<<20 {return Err("cached render variant key invalid".into());}
++  let vkey:VariantKey=serde_json::from_slice(r.take(klen)?).map_err(|e|format!("cached render variant key: {e}"))?;
++  let digest:[u8;32]=r.take(32)?.try_into().unwrap();
++  let blen=usize::try_from(r.u64()?).map_err(|_|"cached render variant length invalid")?;
++  let vbody=r.take(blen)?;
++  let vp=metal2vulkan::pipeline::RenderPipeline::from_bytes_for_key(vbody,&PipelineKey::new(digest),&device).map_err(|e|format!("cached render variant rejected: {e:?}"))?;
++  variants.push(std::sync::Arc::new(VariantPipeline{hash:variant_key_hash(&vkey),key:vkey,pipeline:vp,plan_cache:Default::default()}));
++ }
++ if r.at!=bytes.len() {return Err("cached render pipeline has trailing bytes".into());}
+  Ok(RenderPipelineHandle{_device:device,_pipeline:pipeline,source_blend:if has_source{Some(source)}else{None},
+-  requested_attachments,requested_attachment_blends:if has_blends{Some(blends)}else{None},color_format,explicit_targets,plan_cache:Default::default()})
++  requested_attachments,requested_attachment_blends:if has_blends{Some(blends)}else{None},color_format,explicit_targets,plan_cache:Default::default(),
++  descriptor:std::sync::Mutex::new(None),variants:std::sync::Mutex::new(variants)})
+ }
+ /// Bytes that rebuild this pipeline (handle, SPIR-V and metadata blobs) with
+ /// tegu_air_render_pipeline_deserialize under the same profile.
+@@ -2605,8 +2902,7 @@ pub unsafe extern "C" fn tegu_air_pipeline_create(library:*const Library,name:*c
+         if library.is_null() {return Err("null library".into());}
+         let entry=str::from_utf8(input(name,name_len,4096)?).map_err(|e|e.to_string())?;
+         let json=str::from_utf8(input(profile,profile_len,1024*1024)?).map_err(|e|e.to_string())?;
+-        let description=DeviceDescription::from_khronos_json(json,None).map_err(|e|e.to_string())?;
+-        let device=Device::new(description,DevicePolicy::default()).map_err(|e|e.to_string())?;
++        let device=device_for_profile(json)?;
+         let function=(&*library).descriptor(entry)?;
+         let budget=Budget::standard();
+         let ((_,pipeline),creation_key,creation_only)=compile_compute_creation(&device,&function,&budget).map_err(|e|e.to_string())?;

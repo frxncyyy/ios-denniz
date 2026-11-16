@@ -1,0 +1,687 @@
+--- metal/nord2_metal_bridge.c	2026-10-28 14:49:56.819178588 +0100
++++ metal/nord2_metal_bridge.c	2026-10-28 13:42:25.830940172 +0100
+@@ -96,7 +96,26 @@
+     /* Clear colours (n2mb_clear): 64-byte slots of one mapped slab, a slot
+      * reused once its clear job is reaped (job ids as in cmdpool). */
+     struct bo *clear_slab;uint64_t clear_slot_job[256];unsigned clear_next;
++    /* Chained submission (n2mb_chain_begin/end, NORD2_METAL_CHAIN). `req`
++     * collects every frame's handles; ttail/ftail are the CPU views of the
++     * last tiler and fragment job headers, tn/fn their indices; blocks and
++     * slots get the kernel id when the chain is submitted. */
++    struct {
++        unsigned mode,open,max,frames,probe;int slice_now;
++        struct bo *heap;uint64_t slice;uint32_t used;
++        struct nord2_gpu_submit_request req;
++        uint8_t *ttail,*ftail;unsigned tn,fn;
++        struct bo *blocks[N2MB_CHAIN_MAX_FRAMES];unsigned nblocks;
++        int slots[2*N2MB_CHAIN_MAX_FRAMES];unsigned nslots;
++        uint64_t code_clock,last_job,ends,st[N2MB_CHAIN_STATS];
++    } chain;
+ };
++enum {CHAIN_FLUSH_DEP=3,CHAIN_FLUSH_HANDLES=4,CHAIN_FLUSH_FULL=5,CHAIN_FLUSH_OTHER=6,CHAIN_FLUSH_END=7};
++static int chain_flush(struct bridge *b,unsigned reason);
++static int chain_holds(const struct bridge *b,uint64_t handle){
++    for(unsigned i=0;b->chain.frames&&i<b->chain.req.nr_handles;i++)if(b->chain.req.handles[i]==handle)return 1;
++    return 0;
++}
+ #ifndef NORD2_EXTENT_DEFAULT
+ #define NORD2_EXTENT_DEFAULT 1
+ #endif
+@@ -124,6 +143,8 @@
+ }
+ static int drop(struct bridge *b,struct bo *o) {
+     if(!o||!o->handle)return BAD;
++    /* A buffer of a not yet submitted chain: submit the chain first. */
++    if(chain_holds(b,o->handle)){int e=chain_flush(b,CHAIN_FLUSH_OTHER);if(e)return e;}
+     if(o->cpu&&!o->external_cpu) {
+         int e=b->ops.unmap(b->ops.opaque,o->handle,o->cpu);
+         if(e)return e;
+@@ -143,6 +164,7 @@
+  * of one context run in submission order). A failure or a wait error breaks
+  * the bridge exactly as a failed synchronous WAIT does. */
+ static int wait_pending(struct bridge *b){
++    if(b->chain.frames){int e=chain_flush(b,CHAIN_FLUSH_OTHER);if(e)return e;}
+     if(!b->pending)return 0;
+     for(unsigned tries=0;;tries++){
+         uint64_t in[2]={b->pending,5000},out[3]={0};unsigned n=3;
+@@ -326,6 +348,123 @@
+     uint64_t bytes=b->tiler.heap_bytes>HEAP_DEFAULT?b->tiler.heap_bytes:HEAP_DEFAULT;
+     return alloc(b,bytes,b->trace_geometry?0u:ALLOC_GPU_ONLY,1,&b->heap);
+ }
++/* ---- Chained submission (n2mb_chain_begin/end) ---------------------------
++ * One kernel job for a run of frames: the kernel starts JS1 at heads[0] and,
++ * once that chain completed, JS0 at heads[1]; the hardware follows each job
++ * header's Next. Every frame keeps its own blocks and tiler context; its tiler
++ * jobs are renumbered after the previous frame's (and depend on its last), its
++ * fragment job gets the next JS0 index, a dependency on the previous fragment
++ * job and the barrier, so frame k+1's fragments start after frame k's
++ * completed. All tiler jobs run before any fragment job: each frame has its
++ * own tiler-heap slice (a full HEAP_DEFAULT heap, as an unchained job), and a
++ * frame whose vertex stage may read what an earlier frame of the chain writes
++ * cannot join (the tiler would read it before that fragment job ran). */
++static void chain_put64(uint8_t *p,uint64_t v){memcpy(p,&v,8);}
++static uint64_t chain_get64(const uint8_t *p){uint64_t v;memcpy(&v,p,8);return v;}
++static int chain_written(const struct bridge *b,uint64_t handle){
++    const struct nord2_gpu_submit_request *r=&b->chain.req;
++    for(unsigned i=0;b->chain.frames&&i<r->nr_handles;i++)if(r->handles[i]==handle)return (r->write_mask>>i)&1u;
++    return 0;
++}
++static void chain_log(struct bridge *b){
++    const uint64_t *st=b->chain.st;char line[240];
++    int len=snprintf(line,sizeof(line),"TEGU_PERF_CHAIN mode=%u max=%u chains=%llu frames=%llu dep_links=%llu flush_dep=%llu "
++     "flush_handles=%llu flush_full=%llu flush_other=%llu flush_end=%llu most=%llu probe=%llu\n",b->chain.mode,b->chain.max,
++     (unsigned long long)st[0],(unsigned long long)st[1],(unsigned long long)st[2],(unsigned long long)st[3],(unsigned long long)st[4],
++     (unsigned long long)st[5],(unsigned long long)st[6],(unsigned long long)st[7],(unsigned long long)st[8],(unsigned long long)st[9]);
++    if(len>0&&(size_t)len<sizeof(line)){unsigned no=0;size_t bytes=0;
++        (void)b->ops.call(b->ops.opaque,NORD2_GPU_SEL_LOG,NULL,0,line,(size_t)len,NULL,&no,NULL,&bytes);}
++}
++static int chain_flush(struct bridge *b,unsigned reason){
++    if(!b->chain.frames)return 0;
++    struct nord2_gpu_submit_request req=b->chain.req;unsigned frames=b->chain.frames;
++    struct bo *blocks[N2MB_CHAIN_MAX_FRAMES];unsigned nblocks=b->chain.nblocks;memcpy(blocks,b->chain.blocks,sizeof(blocks));
++    int slots[2*N2MB_CHAIN_MAX_FRAMES];unsigned nslots=b->chain.nslots;memcpy(slots,b->chain.slots,sizeof(slots));
++    /* Reset first: a release inside the submit path must not re-enter. */
++    b->chain.frames=0;b->chain.used=0;b->chain.tn=b->chain.fn=0;b->chain.ttail=b->chain.ftail=NULL;
++    b->chain.nblocks=b->chain.nslots=0;memset(&b->chain.req,0,sizeof(b->chain.req));
++    if(reason<N2MB_CHAIN_STATS)b->chain.st[reason]++;
++    uint64_t job=0;int e=jm_submit(b,&req,0,&job);
++    if(!e){b->chain.st[0]++;b->chain.st[1]+=frames;if(frames>b->chain.st[8])b->chain.st[8]=frames;}
++    b->chain.last_job=e?0:job;
++    /* The blocks and colour slots belong to this job; on a refused submit
++     * nothing ran and they are free again (unless the bridge broke). */
++    uint64_t stamp=e?(b->broken?UINT64_MAX:0):job;
++    for(unsigned k=0;k<nblocks;k++)for(unsigned i=0;i<b->cmdpool_n;i++)if(b->cmdpool[i].o==blocks[k])b->cmdpool[i].job=stamp;
++    for(unsigned k=0;k<nslots;k++)if(slots[k]>=0&&slots[k]<256)b->clear_slot_job[slots[k]]=stamp;
++    return e;
++}
++/* Before building a frame: the tiler-heap VA it uses and the BO to list.
++ * A frame joins only when the chain is open and the frame is plain (no
++ * snapshot, thread storage, diagnostics or synchronous trace). */
++static struct bo *chain_heap(struct bridge *b,unsigned eligible,uint64_t *heap_va){
++    b->chain.slice_now=-1;*heap_va=b->heap->va;
++    if(!eligible||!b->chain.open||!b->chain.mode||b->tiler.heap_bytes!=HEAP_DEFAULT)return b->heap;
++    if(b->chain.heap&&b->chain.heap->size<(uint64_t)b->chain.max*b->chain.slice) { /* more frames per job since */
++        if(chain_flush(b,CHAIN_FLUSH_OTHER))return b->heap;
++        (void)drop(b,b->chain.heap);b->chain.heap=NULL;
++    }
++    if(!b->chain.heap) {
++        b->chain.slice=HEAP_DEFAULT;
++        if(alloc(b,(uint64_t)b->chain.max*b->chain.slice,ALLOC_GPU_ONLY,1,&b->chain.heap)){b->chain.heap=NULL;b->chain.mode=0;return b->heap;}
++    }
++    uint32_t full=(1u<<b->chain.max)-1u;
++    if((b->chain.used&full)==full&&chain_flush(b,CHAIN_FLUSH_FULL))return b->heap;
++    unsigned s=0;while(s<b->chain.max&&(b->chain.used>>s)&1u)s++;
++    if(s>=b->chain.max)return b->heap;
++    b->chain.slice_now=(int)s;*heap_va=b->chain.heap->va+(uint64_t)s*b->chain.slice;return b->chain.heap;
++}
++/* After building the frame into `cmd` (req.heads set): 1 = linked into the
++ * chain (no kernel job yet), 0 = submit it now (the chain was submitted
++ * first, keeping order), <0 = error. vertex_hazard: the frame's vertex stage
++ * may read a buffer an earlier frame of the chain writes. */
++static int chain_take(struct bridge *b,struct nord2_gpu_submit_request *req,struct bo *cmd,unsigned vertex_hazard){
++    int s=b->chain.slice_now;b->chain.slice_now=-1;
++    if(s<0){int e=chain_flush(b,CHAIN_FLUSH_OTHER);return e?e:0;}
++    unsigned dep=0,extra=0;
++    for(unsigned i=0;i<req->nr_handles;i++){
++        /* The chain heap is written by every frame, each in its own slice. */
++        if(chain_holds(b,req->handles[i])){if(chain_written(b,req->handles[i])&&req->handles[i]!=b->chain.heap->handle)dep=1;}
++        else extra++;
++    }
++    if(b->chain.frames&&(vertex_hazard||(dep&&b->chain.mode==2))){int e=chain_flush(b,CHAIN_FLUSH_DEP);if(e)return e;dep=0;}
++    else if(b->chain.frames&&b->chain.req.nr_handles+extra>32){int e=chain_flush(b,CHAIN_FLUSH_HANDLES);if(e)return e;dep=0;}
++    if(!cmd||!cmd->cpu)return BAD;
++    uint64_t lo=cmd->va,hi=cmd->va+cmd->size;
++    if(req->heads[0]<lo||req->heads[0]+32>hi||req->heads[1]<lo||req->heads[1]+32>hi)return BAD;
++    /* JS1: renumber this frame's tiler jobs after the chain's. */
++    unsigned base=b->chain.tn,top=base;uint8_t *last=NULL;
++    for(uint64_t h=req->heads[0],steps=0;h;steps++) {
++        if(h<lo||h+32>hi||steps>N2MB_BATCH_CAPACITY+2)return BAD;
++        uint8_t *jh=(uint8_t *)(uintptr_t)(cmd->cpu+(h-lo));uint32_t w4,w5;memcpy(&w4,jh+16,4);memcpy(&w5,jh+20,4);
++        unsigned index=(w4>>16)+base,d1=w5&0xffffu,d2=w5>>16;
++        if(index>0xffffu)return BAD;
++        if(d1)d1+=base;else if(!steps&&base)d1=base;
++        if(d2)d2+=base;
++        w4=(w4&0xffffu)|(index<<16);w5=(d1&0xffffu)|((d2&0xffffu)<<16);memcpy(jh+16,&w4,4);memcpy(jh+20,&w5,4);
++        if(index>top)top=index;
++        last=jh;h=chain_get64(jh+24);
++    }
++    if(!last)return BAD;
++    /* JS0: this frame's fragment job after the chain's last one. */
++    uint8_t *fj=(uint8_t *)(uintptr_t)(cmd->cpu+(req->heads[1]-lo));uint32_t w4,w5;memcpy(&w4,fj+16,4);
++    unsigned fidx=b->chain.fn+1;
++    w4=(w4&0xffffu)|(fidx<<16);if(b->chain.fn)w4|=1u<<8; /* barrier */
++    w5=b->chain.fn;memcpy(fj+16,&w4,4);memcpy(fj+20,&w5,4);
++    if(b->chain.ttail)chain_put64(b->chain.ttail+24,req->heads[0]);else b->chain.req.heads[0]=req->heads[0];
++    if(b->chain.ftail)chain_put64(b->chain.ftail+24,req->heads[1]);else b->chain.req.heads[1]=req->heads[1];
++    b->chain.ttail=last;b->chain.tn=top;b->chain.ftail=fj;b->chain.fn=fidx;
++    if(!b->chain.frames){b->chain.req.version=req->version;b->chain.req.kind=req->kind;b->chain.code_clock=b->code_protect;}
++    for(unsigned i=0;i<req->nr_handles;i++) {
++        unsigned n=0;for(;n<b->chain.req.nr_handles;n++)if(b->chain.req.handles[n]==req->handles[i])break;
++        if(n==b->chain.req.nr_handles){if(n==32)return BAD;b->chain.req.handles[b->chain.req.nr_handles++]=req->handles[i];}
++        if((req->write_mask>>i)&1u)b->chain.req.write_mask|=1u<<n;
++    }
++    b->chain.used|=1u<<s;b->chain.frames++;if(dep)b->chain.st[2]++;
++    if(b->chain.nblocks<N2MB_CHAIN_MAX_FRAMES)b->chain.blocks[b->chain.nblocks++]=cmd;
++    return 1;
++}
++static unsigned chain_env(const char *name,unsigned lo,unsigned hi,unsigned fallback);
+ uintptr_t n2mb_open(const struct n2mb_ops *ops) {
+     if(!ops||!ops->call||!ops->map||!ops->unmap||!ops->close||!ops->lock||!ops->unlock)return 0;
+     struct bridge *b=calloc(1,sizeof(*b));if(!b)return 0;b->ops=*ops;b->next_pipeline=1;b->code_protect=UINT64_MAX;
+@@ -341,6 +480,8 @@
+     const char *extent=getenv("NORD2_METAL_EXTENT");
+     b->extent=extent&&(extent[0]=='0'||extent[0]=='1')&&!extent[1]?(unsigned)(extent[0]-'0'):NORD2_EXTENT_DEFAULT;
+     const char *async=getenv("NORD2_METAL_ASYNC");b->async=async&&async[0]=='1'&&!async[1]?2:0;
++    b->chain.mode=chain_env("NORD2_METAL_CHAIN",0,2,0);b->chain.max=chain_env("NORD2_METAL_CHAIN_FRAMES",2,N2MB_CHAIN_MAX_FRAMES,4);
++    b->chain.probe=chain_env("NORD2_METAL_CHAIN_PROBE",0,1,1)?1:2;b->chain.slice_now=-1;
+     return (uintptr_t)b;
+ }
+ int n2mb_close(uintptr_t value) {
+@@ -370,6 +511,9 @@
+     struct bridge *b=(void *)value;if(!b||!count||(ni&&!in))return BAD;
+     int e=UNSUPPORTED;b->ops.lock(b->ops.opaque);
+     if(b->broken){e=NOTREADY;goto done;}
++    /* Selectors other than capabilities/allocation are ordered after an open
++     * chain (releases are covered by drop). */
++    if(sel>1&&b->chain.frames&&(e=chain_flush(b,CHAIN_FLUSH_OTHER)))goto done;
+     switch(sel) {
+     case 0:if(ni){e=BAD;break;}e=capabilities(b,out,count);break;
+     case 1: {
+@@ -404,6 +548,8 @@
+      * may already hold the mapping (n2mb_copy, feedback snapshot); both share
+      * the one kernel mapping of the BO. */
+     b->ops.lock(b->ops.opaque);struct bo *o=lookup(b,handle);
++    /* CPU access to a buffer of an open chain: submit the chain first. */
++    if(o&&!b->broken&&chain_holds(b,o->handle))(void)chain_flush(b,CHAIN_FLUSH_OTHER);
+     int e=b->broken?NOTREADY:!o||o->internal?BAD:o->cpu&&!o->external_cpu?0:map_bo(b,o);
+     if(!e){*address=o->cpu;*size=o->mapped;}b->ops.unlock(b->ops.opaque);return e;
+ }
+@@ -1079,6 +1225,8 @@
+     struct bridge *b=(void *)value;
+     if(!b||!count||(ni&&!in)||(size&&!bytes)||outbytes||(outsize&&*outsize))return BAD;
+     b->ops.lock(b->ops.opaque);int e=UNSUPPORTED;
++    if(b->chain.frames&&!b->broken&&(e=chain_flush(b,CHAIN_FLUSH_OTHER))){b->ops.unlock(b->ops.opaque);return e;}
++    e=UNSUPPORTED;
+     if(b->broken)e=NOTREADY;
+     else if((sel==5||sel==7)&&wait_pending(b))e=b->broken?NOTREADY:FAILED; /* compute runs after every graphics job */
+     else if(sel==5&&ni==0)e=import_pipeline(b,bytes,size,out,count);
+@@ -1452,7 +1600,8 @@
+  const struct n2mb_render_targets *mrt,uint64_t *out,unsigned *count,struct diag *d){
+  struct bo *owned[8]={0}; /* cmd, (unused), VS, FS, snapshot, preloadVS, preloadFS, VA spacer */
+  struct bo *tls=NULL,*pooled=NULL;uint64_t pooled_job=0;
+- b->code_protect=b->code_clock; /* code used from here on belongs to this job */
++ /* code used from here on belongs to this job (and an open chain's) */
++ b->code_protect=b->chain.frames?b->chain.code_clock:b->code_clock;
+  int e=BAD;if(b->broken){e=NOTREADY;N2MB_FAIL_AT();}
+  async_probe(b);
+  /* Diagnostics read GPU-written memory around the job: keep them ordered. */
+@@ -1525,7 +1674,10 @@
+  struct bo *code[4]={0};uint64_t pin=b->code_protect;
+  e=cached_code(b,s->vertex_code,s->vertex_bytes,pin,&code[0]);if(e==1){owned[2]=code[0];e=0;}if(e)N2MB_FAIL_AT();
+  e=cached_code(b,s->fragment_code,s->fragment_bytes,pin,&code[1]);if(e==1){owned[3]=code[1];e=0;}if(e)N2MB_FAIL_AT();
+- a.command=a.frame=owned[0]->va;a.heap=b->heap->va;a.vertex_code=code[0]->va;a.fragment_code=code[1]->va;
++ /* Chained submission: a plain frame takes a tiler-heap slice of the chain. */
++ uint64_t heap_va=0;
++ struct bo *heap_bo=chain_heap(b,!sync&&!d&&!snapshot&&!(opts&&(opts->thread_storage_bytes||opts->thread_storage_reserved)),&heap_va);
++ a.command=a.frame=owned[0]->va;a.heap=heap_va;a.vertex_code=code[0]->va;a.fragment_code=code[1]->va;
+  if(opts&&(opts->thread_storage_bytes||opts->thread_storage_reserved)) {
+   if(opts->version!=N2R_DRAW_OPTIONS_VERSION||
+      opts->thread_storage_bytes>N2R_THREAD_STORAGE_MAX||opts->thread_storage_reserved) {
+@@ -1609,9 +1761,22 @@
+  }
+  for(unsigned i=0;i<7;i++)if(owned[i]){e=add_ref(&req,owned[i],i<=1);if(e)N2MB_FAIL_AT();}
+  for(unsigned i=0;i<4;i++)if(code[i]){e=add_ref(&req,code[i],0);if(e)N2MB_FAIL_AT();} /* add_ref dedups */
+- if((e=add_ref(&req,b->heap,1)))N2MB_FAIL_AT();
++ if((e=add_ref(&req,heap_bo,1)))N2MB_FAIL_AT();
+  geometry_before(b,b->heap,a.heap_bytes);
+- uint64_t job=0;e=jm_submit(b,&req,sync,&job);pooled_job=job;if(e)N2MB_FAIL_AT();
++ uint64_t job=0;
++ {/* The vertex stage reads the vertex/index buffers and the bindings the
++   * encoder did not mark fragment-only. */
++  unsigned hazard=0;
++  if(b->chain.frames) {
++   hazard=(q->vertex.token&&chain_written(b,q->vertex.token))||(q->index.token&&chain_written(b,q->index.token));
++   for(unsigned i=0;i<q->binding_count;i++)if(q->bindings[i].memory.token&&chain_written(b,q->bindings[i].memory.token)&&
++      (!(q->bindings[i].reserved&N2MB_BINDING_STAGED)||(q->bindings[i].reserved&N2MB_BINDING_VERTEX)))hazard=1;
++  }
++  int taken=chain_take(b,&req,owned[0],hazard);
++  if(taken<0){e=taken;N2MB_FAIL_AT();}
++  if(taken)pooled_job=UINT64_MAX; /* stamped with the chain's job id */
++  else{e=jm_submit(b,&req,sync,&job);pooled_job=job;if(e)N2MB_FAIL_AT();}
++ }
+  tile_stat(b,m);
+  geometry_trace(b,b->heap,m,&a);
+  render_trace(b,m,&a,q,s,q->load_action==1&&!frame_preload);
+@@ -1621,7 +1786,7 @@
+  if(tls){int r=drop(b,tls);if(!e)e=r;}
+  if(pooled){int r=cmdpool_put(b,pooled,pooled_job);if(!e)e=r;owned[0]=NULL;}
+  for(unsigned i=0;i<8;i++)if(owned[i]){int r=drop(b,owned[i]);if(!e)e=r;}
+- b->code_protect=UINT64_MAX;
++ b->code_protect=b->chain.frames?b->chain.code_clock:UINT64_MAX;
+  return e;
+ }
+ static void tiler_matrix(struct bridge *b);
+@@ -1707,7 +1872,7 @@
+  unsigned count,uint64_t *out,unsigned *count_out){
+  struct bo *cmd=NULL,*uncached[2*N2MB_BATCH_CAPACITY+2]={0};unsigned nuncached=0;uint64_t pooled_job=0;
+  struct n2c_mrt *mts=NULL; /* true-MRT: per-draw prepared target sets */
+- b->code_protect=b->code_clock;
++ b->code_protect=b->chain.frames?b->chain.code_clock:b->code_clock;
+  int e=BAD;if(b->broken){e=NOTREADY;N2MB_BATCH_FAIL();}
+  async_probe(b);
+  const struct tegu_generic_draw_request *q0=dr[0].request;
+@@ -1729,6 +1894,7 @@
+  }
+  if(!b->heap&&(e=heap_alloc(b)))N2MB_BATCH_FAIL();
+  if(b->tiler.heap_bytes>b->heap->size){e=BAD;N2MB_BATCH_FAIL();}
++ uint64_t heap_va=0;struct bo *heap_bo=chain_heap(b,!b->trace_batches,&heap_va); /* chained: the frame's slice */
+  unsigned preload=!use_mrt&&q0->load_action==1,blocks=count+(mrt_loaded==2?2:1);
+  /* Pre-frame preload: block `count` holds the DCD array, not a job. */
+  unsigned frame_preload=preload&&preframe==1;
+@@ -1764,7 +1930,7 @@
+   e=cached_code(b,dr[k].shader->fragment_code,dr[k].shader->fragment_bytes,b->code_protect,&fs);
+   if(e==1){uncached[nuncached++]=fs;e=0;}if(e)N2MB_BATCH_FAIL();
+   if(add_ref(&req,vs,0)||add_ref(&req,fs,0)){e=BAD;N2MB_BATCH_FAIL();}
+-  a.command=frame+(uint64_t)k*N2R_BLOCK;a.frame=frame;a.heap=b->heap->va;
++  a.command=frame+(uint64_t)k*N2R_BLOCK;a.frame=frame;a.heap=heap_va;
+   a.vertex_code=vs->va;a.fragment_code=fs->va;
+   if(!k&&extent_valid){a.extent_valid=1;memcpy(a.extent,extent,sizeof(extent));}
+   if(frame_preload&&!k)a.frame_shader_dcds=frame+(uint64_t)count*N2R_BLOCK+N2R_FRAME_DCDS;
+@@ -1797,7 +1963,7 @@
+   if(add_ref(&req,pf,0)){e=BAD;N2MB_BATCH_FAIL();}
+   struct n2r_addresses pa={.target=target_va,.heap_bytes=b->tiler.heap_bytes,.heap_chunk_enum1=b->tiler.chunk_enum1,
+    .hierarchy_mask=b->tiler.mask,.no_secondary=b->tiler.no_secondary};
+-  pa.frame=frame;pa.heap=b->heap->va;
++  pa.frame=frame;pa.heap=heap_va;
+   uint32_t mask=0;
+   if(mrt_frame_preload(m+(size_t)count*N2R_BLOCK,frame+(uint64_t)count*N2R_BLOCK,&mts[0],pf->va,&pa,&mask)||
+      mask!=(mrt_loaded==2?3u:1u)){e=BAD;N2MB_BATCH_FAIL();}
+@@ -1811,7 +1977,7 @@
+   pre.bindings[0]=(struct tegu_generic_draw_binding){.binding=0,.kind=TEGU_GENERIC_DRAW_COMBINED,.memory={.token=q0->target_token,.offset=q0->target_offset,.bytes=target_bytes},.width=q0->width,.height=q0->height,.row_bytes=q0->row_bytes,.format=preload_format(q0->target_format)};
+   struct n2r_addresses pa={.target=target_va,.heap_bytes=b->tiler.heap_bytes,.heap_chunk_enum1=b->tiler.chunk_enum1,
+    .hierarchy_mask=b->tiler.mask,.no_secondary=b->tiler.no_secondary};
+-  pa.command=frame+(uint64_t)count*N2R_BLOCK;pa.frame=frame;pa.heap=b->heap->va;
++  pa.command=frame+(uint64_t)count*N2R_BLOCK;pa.frame=frame;pa.heap=heap_va;
+   pa.fragment_code=pf->va;pa.binding[0]=target_va;
+   e=n2r_build_frame_preload(m+(size_t)count*N2R_BLOCK,fps,&pre,&pa);if(e){e=BAD;N2MB_BATCH_FAIL();}
+  } else if(preload){
+@@ -1826,18 +1992,27 @@
+   pre.bindings[0]=(struct tegu_generic_draw_binding){.binding=0,.kind=TEGU_GENERIC_DRAW_COMBINED,.memory={.token=q0->target_token,.offset=q0->target_offset,.bytes=target_bytes},.width=q0->width,.height=q0->height,.row_bytes=q0->row_bytes,.format=preload_format(q0->target_format)};
+   struct n2r_addresses pa={.target=target_va,.heap_bytes=b->tiler.heap_bytes,.heap_chunk_enum1=b->tiler.chunk_enum1,
+    .hierarchy_mask=b->tiler.mask,.no_secondary=b->tiler.no_secondary};
+-  pa.command=frame+(uint64_t)count*N2R_BLOCK;pa.frame=frame;pa.heap=b->heap->va;
++  pa.command=frame+(uint64_t)count*N2R_BLOCK;pa.frame=frame;pa.heap=heap_va;
+   pa.vertex_code=pv->va;pa.fragment_code=pf->va;pa.binding[0]=target_va;
+   e=n2r_build(m+(size_t)count*N2R_BLOCK,ps,&pre,&pa,1,req.heads[0]);if(e){e=BAD;N2MB_BATCH_FAIL();}
+   req.heads[0]=pa.command+N2R_JOB;
+  }
+  if((e=add_ref(&req,cmd,1)))N2MB_BATCH_FAIL();
+- if((e=add_ref(&req,b->heap,1)))N2MB_BATCH_FAIL();
++ if((e=add_ref(&req,heap_bo,1)))N2MB_BATCH_FAIL();
+  /* NORD2_METAL_TRACE: the first 16 batches complete in order and report
+   * their shape and tiler-heap use (owner block TILER_HEAP bottom), so a
+   * probe can see the draws-per-job cap and the heap it needs on hardware. */
+  unsigned traced=b->trace_batches!=0;
+- uint64_t job=0;e=jm_submit(b,&req,traced,&job);pooled_job=job;if(e)N2MB_BATCH_FAIL();
++ uint64_t job=0;
++ {unsigned hazard=0;
++  for(unsigned k=0;b->chain.frames&&k<count;k++){const struct tegu_generic_draw_request *q=dr[k].request;
++   if((q->vertex.token&&chain_written(b,q->vertex.token))||(q->index.token&&chain_written(b,q->index.token)))hazard=1;
++   for(unsigned i=0;i<q->binding_count;i++)if(q->bindings[i].memory.token&&chain_written(b,q->bindings[i].memory.token)&&
++      (!(q->bindings[i].reserved&N2MB_BINDING_STAGED)||(q->bindings[i].reserved&N2MB_BINDING_VERTEX)))hazard=1;}
++  int taken=chain_take(b,&req,cmd,hazard);
++  if(taken<0){e=taken;N2MB_BATCH_FAIL();}
++  if(taken)pooled_job=UINT64_MAX; /* stamped with the chain's job id */
++  else{e=jm_submit(b,&req,traced,&job);pooled_job=job;if(e)N2MB_BATCH_FAIL();}}
+  tile_stat(b,m);
+  if(traced){
+   b->trace_batches--;uint64_t bottom=0;memcpy(&bottom,m+768+16,8);
+@@ -1851,7 +2026,7 @@
+  for(unsigned i=0;i<nuncached;i++){int r=drop(b,uncached[i]);if(!e)e=r;}
+  if(cmd){int r=cmdpool_put(b,cmd,pooled_job);if(!e)e=r;}
+  free(mts);
+- b->code_protect=UINT64_MAX;
++ b->code_protect=b->chain.frames?b->chain.code_clock:UINT64_MAX;
+  return e;
+ }
+ int n2mb_draw_batch(uintptr_t value,const struct n2mb_batch_draw *dr,unsigned count,uint64_t *out,unsigned *count_out){
+@@ -1918,6 +2093,7 @@
+ unsigned n2mb_async(uintptr_t value,unsigned mode){
+  struct bridge *b=(void *)value;if(!b)return 0;
+  b->ops.lock(b->ops.opaque);
++ if(b->chain.frames)(void)chain_flush(b,CHAIN_FLUSH_OTHER);
+  if(b->async==2)async_probe(b);
+  unsigned old=b->async;
+  if(mode==0){if(!wait_pending(b))b->async=0;}
+@@ -1939,6 +2115,7 @@
+  struct bridge *b=(void *)value;if(!b)return BAD;
+  b->ops.lock(b->ops.opaque);
+  if(failed_job)*failed_job=0;
++ if(b->chain.frames&&!b->broken)(void)chain_flush(b,CHAIN_FLUSH_OTHER);
+  if(b->broken){if(failed_job)*failed_job=b->async_failed;b->ops.unlock(b->ops.opaque);return NOTREADY;}
+  if(b->async!=1||!b->pending||!seq){b->ops.unlock(b->ops.opaque);return 0;}
+  if(seq>b->pending)seq=b->pending;
+@@ -2094,6 +2271,12 @@
+  b->ops.lock(b->ops.opaque);
+  /* The slot is reused after its job is reaped; never after an unknown outcome. */
+  if(slot>=0)b->clear_slot_job[slot]=!e?out[0]:b->broken?UINT64_MAX:0;
++ /* Chained (reply id 0): busy until the chain's job id is known. */
++ if(slot>=0&&!e&&!out[0]&&b->chain.frames) {
++  b->clear_slot_job[slot]=UINT64_MAX;
++  if(b->chain.nslots<2*N2MB_CHAIN_MAX_FRAMES)b->chain.slots[b->chain.nslots++]=slot;
++  else{(void)chain_flush(b,CHAIN_FLUSH_FULL);b->clear_slot_job[slot]=b->chain.last_job?b->chain.last_job:UINT64_MAX;}
++ }
+  if(color){int cleanup=drop(b,color);if(!e)e=cleanup;}b->ops.unlock(b->ops.opaque);return e;
+ }
+ 
+@@ -2207,3 +2390,94 @@
+  /* Keep later per-draw logs well inside the 16 KiB client quota. */
+  b->trace_draws=saved_draws>24?24:saved_draws;b->trace_geometry=0;
+ }
++
++/* ---- Chained submission: API and the visibility probe -------------------- */
++static unsigned chain_env(const char *name,unsigned lo,unsigned hi,unsigned fallback){
++    const char *v=getenv(name);unsigned x=0;
++    if(!v||!*v)return fallback;
++    for(const char *c=v;*c;c++){if(*c<'0'||*c>'9'||x>1000)return fallback;x=x*10+(unsigned)(*c-'0');}
++    return x>=lo&&x<=hi?x:fallback;
++}
++/* One GPU check, in one 4-frame chain: clear X to c0, copy X->Y0, clear X to
++ * c1, copy X->Y1 (copies: the LOAD preload program sampling X, fragment stage
++ * only). Y0==c0 and Y1==c1 (Y1 equal to X's final texel, Y0 different and
++ * not X's zero-initialised bytes) shows that a fragment job sees the previous
++ * fragment job's writes inside one chain, also for a line its texture cache
++ * read before (Y0). Anything else keeps mode 1 off (mode 2). */
++static unsigned chain_probe(struct bridge *b,uintptr_t value){
++    struct bo *x=NULL,*y[2]={NULL,NULL};unsigned result=3;
++    b->ops.lock(b->ops.opaque);
++    int e=alloc(b,16384,0,0,&x);if(!e)e=map_bo(b,x);
++    for(unsigned k=0;k<2&&!e;k++){e=alloc(b,16384,0,0,&y[k]);if(!e)e=map_bo(b,y[k]);}
++    if(!e){memset((void *)(uintptr_t)x->cpu,0,1024);memset((void *)(uintptr_t)y[0]->cpu,0,1024);memset((void *)(uintptr_t)y[1]->cpu,0,1024);}
++    unsigned max=b->chain.max,mode=b->chain.mode,open=b->chain.open;
++    b->chain.max=max<4?4:max;b->chain.mode=1;b->chain.open=1;
++    b->ops.unlock(b->ops.opaque);
++    static const float colour[2][4]={{0.0625f,0.25f,0.5f,1.0f},{0.75f,0.5f,0.125f,1.0f}};
++    for(unsigned k=0;k<2&&!e;k++) {
++        struct tegu_generic_draw_request c={.target_format=80,.width=16,.height=16,.row_bytes=64,.load_action=2,.vertex_count=3,
++            .scissor={0,0,16,16},.target_token=x->handle,.target_length=x->size};
++        double rgba[4]={colour[k][0],colour[k][1],colour[k][2],colour[k][3]};
++        if(n2r_clear(80,rgba,c.clear_words)){e=BAD;break;}
++        uint64_t out[2];unsigned n=2;e=n2mb_clear(value,&c,out,&n);if(e)break;
++        struct tegu_generic_draw_request q={.target_format=80,.width=16,.height=16,.row_bytes=64,.load_action=2,.vertex_count=3,
++            .scissor={0,0,16,16},.target_token=y[k]->handle,.target_length=y[k]->size,.binding_count=1};
++        q.bindings[0]=(struct tegu_generic_draw_binding){.binding=0,.kind=TEGU_GENERIC_DRAW_COMBINED,
++            .memory={.token=x->handle,.offset=0,.bytes=1024},.width=16,.height=16,.row_bytes=64,.format=80,.reserved=N2MB_BINDING_STAGED};
++        n=2;e=n2mb_draw(value,preload_shader(80),&q,out,&n);
++    }
++    b->ops.lock(b->ops.opaque);
++    unsigned chained=b->chain.frames;
++    int f=chain_flush(b,CHAIN_FLUSH_END);if(!e)e=f;
++    if(!e)e=wait_pending(b);
++    if(!e&&chained==4) {
++        uint32_t px,p0,p1;memcpy(&px,(const void *)(uintptr_t)x->cpu,4);memcpy(&p0,(const void *)(uintptr_t)y[0]->cpu,4);
++        memcpy(&p1,(const void *)(uintptr_t)y[1]->cpu,4);
++        result=p1==px&&p0!=p1&&p0!=0?1u:2u;
++        char line[160];int len=snprintf(line,sizeof(line),"NORD2_METAL chain-probe x=%08x y0=%08x y1=%08x %s\n",px,p0,p1,result==1?"visible":"stale");
++        if(len>0&&(size_t)len<sizeof(line)){unsigned no=0;size_t bytes=0;
++            (void)b->ops.call(b->ops.opaque,NORD2_GPU_SEL_LOG,NULL,0,line,(size_t)len,NULL,&no,NULL,&bytes);}
++    }
++    b->chain.max=max;b->chain.mode=mode;b->chain.open=open;
++    if(x)(void)drop(b,x);
++    for(unsigned k=0;k<2;k++)if(y[k])(void)drop(b,y[k]);
++    b->ops.unlock(b->ops.opaque);
++    return result;
++}
++unsigned n2mb_chain_begin(uintptr_t value){
++    struct bridge *b=(void *)value;if(!b)return 0;
++    b->ops.lock(b->ops.opaque);
++    unsigned mode=b->chain.mode,probe=b->chain.probe==1&&mode==1&&!b->broken;
++    if(probe)b->chain.probe=2;
++    b->ops.unlock(b->ops.opaque);
++    if(probe) {
++        unsigned r=chain_probe(b,value);
++        b->ops.lock(b->ops.opaque);b->chain.st[9]=r;if(r!=1&&b->chain.mode==1)b->chain.mode=2;b->ops.unlock(b->ops.opaque);
++    }
++    b->ops.lock(b->ops.opaque);
++    if(b->chain.mode&&!b->broken)b->chain.open=1;
++    mode=b->chain.open?b->chain.mode:0;
++    b->ops.unlock(b->ops.opaque);return mode;
++}
++int n2mb_chain_end(uintptr_t value,uint64_t *job){
++    struct bridge *b=(void *)value;if(!b)return BAD;
++    b->ops.lock(b->ops.opaque);
++    unsigned had=b->chain.frames;
++    int e=chain_flush(b,CHAIN_FLUSH_END);
++    if(job)*job=had&&!e?b->chain.last_job:0;
++    b->chain.open=0;b->code_protect=UINT64_MAX;
++    if(b->chain.mode&&!(++b->chain.ends%120u))chain_log(b);
++    b->ops.unlock(b->ops.opaque);return e;
++}
++unsigned n2mb_chain_mode(uintptr_t value,unsigned mode,unsigned frames){
++    struct bridge *b=(void *)value;if(!b)return 0;
++    b->ops.lock(b->ops.opaque);unsigned old=b->chain.mode;
++    if(b->chain.frames)(void)chain_flush(b,CHAIN_FLUSH_OTHER);
++    if(mode<=2){b->chain.mode=mode;b->chain.probe=2;}
++    if(frames>=2&&frames<=N2MB_CHAIN_MAX_FRAMES)b->chain.max=frames;
++    b->ops.unlock(b->ops.opaque);return old;
++}
++void n2mb_chain_stats(uintptr_t value,uint64_t out[N2MB_CHAIN_STATS]){
++    struct bridge *b=(void *)value;if(!b||!out)return;
++    b->ops.lock(b->ops.opaque);memcpy(out,b->chain.st,sizeof(b->chain.st));out[10]=b->chain.mode;b->ops.unlock(b->ops.opaque);
++}
+--- metal/nord2_metal_bridge.h	2026-10-28 14:49:56.821279764 +0100
++++ metal/nord2_metal_bridge.h	2026-10-28 13:57:29.017192375 +0100
+@@ -186,6 +186,42 @@
+  * submitting. 0 when async is off or nothing is queued. */
+ int n2mb_wait_seq(uintptr_t,uint64_t seq,uint64_t *failed_job);
+ int n2mb_copy(uintptr_t,uint64_t,uint64_t,uint64_t,uint64_t);
++/* Chained submission (NORD2_METAL_CHAIN=1|2, default off; A/B toggle).
++ * Between n2mb_chain_begin and n2mb_chain_end the frames of draws, batches
++ * and clears that qualify are not submitted one by one: each is linked into
++ * one kernel job (every frame's tiler jobs on the JS1 chain, its fragment job
++ * on the JS0 chain behind a barrier and a dependency on the previous one;
++ * every frame on its own tiler-heap slice). Their reply ids are 0 (no kernel
++ * job yet); n2mb_chain_end submits what is open and returns that job's id
++ * (0 when nothing was chained) - the command's completion id. Every other
++ * bridge call that needs ordering or CPU access (waits, copies, maps,
++ * scalar/method selectors, the release of a chained buffer, a frame that
++ * cannot join) submits the open chain first, so ids stay ordered.
++ * Mode 1 also chains a frame that reads what an earlier frame of the chain
++ * wrote (a blur level sampling the previous one) when its vertex stage reads
++ * none of it; mode 2 only independent frames. At the first begin
++ * (NORD2_METAL_CHAIN_PROBE, default 1) a 4-frame probe checks on the GPU that
++ * a fragment job sees the previous one's writes inside one chain (texture
++ * cache); otherwise mode 1 falls back to 2. NORD2_METAL_CHAIN_FRAMES (2..8,
++ * default 4) frames per job, each with a full tiler-heap slice. */
++#define N2MB_HAVE_CHAIN 1 /* compute_frontend.m guards its n2mb_chain_begin/end hook on this */
++#define N2MB_CHAIN_MAX_FRAMES 8u
++/* tegu_generic_draw_binding.reserved: the encoder knows each binding's stage
++ * (compiled stage_mask). STAGED marks the information present, VERTEX that
++ * the vertex stage reads it (an unstaged binding counts as vertex-read). */
++#define N2MB_BINDING_STAGED 1u
++#define N2MB_BINDING_VERTEX 2u
++unsigned n2mb_chain_begin(uintptr_t);
++int n2mb_chain_end(uintptr_t,uint64_t *job);
++/* Set the mode (0 off, 1, 2) and frames per job (0: keep), skipping the
++ * probe; returns the previous mode. Tests and A/B. */
++unsigned n2mb_chain_mode(uintptr_t,unsigned mode,unsigned frames);
++/* [0] chains submitted [1] frames in them [2] dependent links [3] flush:
++ * dependency [4] flush: handles [5] flush: full [6] flush: other call or
++ * frame [7] flush: end [8] most frames in one job [9] probe (0 not run,
++ * 1 visible, 2 stale, 3 failed) [10] mode. */
++#define N2MB_CHAIN_STATS 11u
++void n2mb_chain_stats(uintptr_t,uint64_t out[N2MB_CHAIN_STATS]);
+ int n2mb_clear(uintptr_t,const struct tegu_generic_draw_request *,uint64_t *,unsigned *);
+ /* Diagnostic: bridge line of the last refused draw, and n2r's refusal line. */
+ int n2mb_last_failure(uintptr_t,int *);
+--- metal/tegu/render_encoder.inc	2026-10-28 14:49:56.819827628 +0100
++++ metal/tegu/render_encoder.inc	2026-10-28 13:42:25.832085022 +0100
+@@ -3731,6 +3731,17 @@
+   }
+   q->binding_count++;
+  }
++#ifdef N2MB_BINDING_STAGED
++ /* Chained submission (bridge): which stage reads each binding (compiled
++  * stage_mask; bit 1 = vertex). Unknown bindings stay unstaged, which the
++  * bridge counts as vertex-read; tile attachments carry no flags. */
++ for(uint32_t k=0;k<q->binding_count;k++) {
++  struct tegu_generic_draw_binding *o=&q->bindings[k];
++  if(o->kind==TEGU_GENERIC_DRAW_TILE_ATTACHMENT)continue;
++  for(uint32_t c=0;compile&&c<compile->count;c++)if(compile->bindings[c].binding==o->binding){
++   o->reserved=N2MB_BINDING_STAGED|((compile->bindings[c].stage_mask&1u)?N2MB_BINDING_VERTEX:0u);break;}
++ }
++#endif
+  for(uint32_t i=0;i<plan.push_count;i++) {
+   const TeguAIRFixedUiR85PushSpan *s=&plan.pushes[i];
+   if(s->offset>TEGU_GENERIC_DRAW_PUSH_BYTES||s->length>TEGU_GENERIC_DRAW_PUSH_BYTES-s->offset||
+--- tests/nord2_metal_bridge_test.c	2026-10-28 14:49:56.821563049 +0100
++++ tests/nord2_metal_bridge_test.c	2026-10-28 13:42:25.832882779 +0100
+@@ -23,6 +23,8 @@
+  unsigned live,maps,closed,submitted,waited,bad_state,fail_alloc,fail_map,fail_submit,fail_wait,fail_release;
+  unsigned geometry_fixture,heap_logs,before_logs,after_logs,log_bytes,nonzero_before_logs;
+  unsigned sync_calls,fail_sync_at;
++ /* chained submission model: verify the multi-frame chains of one job */
++ unsigned chain_model,last_frames,last_tjobs;uint64_t last_heaps[8];
+  unsigned handle_limit; /* per-context handle cap (P8 256, P9 1024); 0 = unlimited */
+  /* tiler matrix model */
+  unsigned render_model,tm_logs,adopt_logs,draw_submits,heap_allocs,const_fs_seen,nosec_seen,mask_seen[4];
+@@ -44,6 +46,12 @@
+  unsigned char *surf_cpu[4];size_t surf_bytes[4];
+ };
+ #define KBUSY_TEST ((int)0xe00002d5u)
++/* Chained-submission model: the listed BO holding a GPU address. */
++static const unsigned char *fake_at(struct fake *f,const struct nord2_gpu_submit_request *r,uint64_t va){
++ for(unsigned k=0;k<r->nr_handles;k++){struct buffer *b=&f->buffers[r->handles[k]];
++  if(va>=b->va&&va+64<=b->va+b->size)return b->data+(va-b->va);}
++ assert(0);return NULL;
++}
+ 
+ static double fake_now(void) {struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (double)t.tv_sec+(double)t.tv_nsec*1e-9;}
+ static void fake_timed_submit(struct fake *f) {
+@@ -115,6 +123,22 @@
+   assert(r->version==2);
+   if(r->kind==2){
+    assert(r->nr_handles>=5&&r->heads[0]&&r->heads[1]);
++   if(f->chain_model){
++    /* JS1: tiler jobs 1..n, each depending on its predecessor; JS0: one
++     * fragment job per frame, 1..F, barrier and dependency on the previous;
++     * every frame's tiler heap (FBD -> its frame block -> TILER_HEAP base)
++     * distinct. All addresses inside listed BOs. */
++    unsigned steps=0;
++    for(uint64_t h=r->heads[0];h;steps++){const unsigned char *jh=fake_at(f,r,h);uint32_t w4,w5;memcpy(&w4,jh+16,4);memcpy(&w5,jh+20,4);
++     assert((w4>>16)==steps+1&&(w5&0xffff)==steps&&steps<4096);h=get64(jh+24);}
++    unsigned k=0;
++    for(uint64_t h=r->heads[1];h;k++){const unsigned char *jh=fake_at(f,r,h);uint32_t w4,w5;memcpy(&w4,jh+16,4);memcpy(&w5,jh+20,4);
++     assert((w4>>16)==k+1&&((w4>>8)&1)==(k>0)&&(w5&0xffff)==k&&((w4>>1)&0x7f)==9&&k<8);
++     uint64_t fbp=get64(jh+40)&~63ull;const unsigned char *fr=fake_at(f,r,fbp);uint64_t base=get64(fr+768+8);
++     for(unsigned j=0;j<k;j++)assert(f->last_heaps[j]!=base);f->last_heaps[k]=base;h=get64(jh+24);}
++    f->last_tjobs=steps;f->last_frames=k;f->draw_submits++;
++    goto accept_render;
++   }
+    unsigned command=0;
+    for(unsigned k=0;k<r->nr_handles;k++){
+     unsigned h=r->handles[k];assert(h<COUNT&&f->buffers[h].active);
+@@ -197,6 +221,7 @@
+      }
+     } else assert(!d);
+    }
++   accept_render:
+    if(f->fail_submit){f->fail_submit--;return -12;}
+    if(f->window&&f->inflight>=f->window)return KBUSY_TEST;
+    f->inflight++;if(f->inflight>f->max_inflight)f->max_inflight=f->inflight;
+@@ -842,6 +867,95 @@
+   n=2;assert(n2mb_clear(b,&q,out,&n));assert(f.draw_submits==1);
+   close_bridge(b,&f);
+  }
++ if(!(getenv("NORD2_METAL_TRACE")&&getenv("NORD2_METAL_TRACE")[0]=='1')){
++  /* Chained submission (default off; NORD2_METAL_CHAIN / n2mb_chain_mode):
++   * one kernel job per run of frames, every frame on its own heap slice.
++   * (Traced draws are synchronous and never chain.) */
++  struct fake f={.job=1ull<<32,.chain_model=1};uintptr_t b=open_bridge(&f);
++  uint64_t r=resource(b),t=resource(b),u=resource(b),v=resource(b),out[2],job=7,st[N2MB_CHAIN_STATS];unsigned n=2;
++  struct tegu_generic_draw_request q={.width=16,.height=16,.row_bytes=64,.load_action=2,.vertex_count=3,.scissor={0,0,16,16},
++   .binding_count=1,.target_token=r,.target_length=16384};
++  q.bindings[0]=(struct tegu_generic_draw_binding){.binding=0,.kind=TEGU_GENERIC_DRAW_COMBINED,.memory={.token=t,.bytes=1024},
++   .width=16,.height=16,.row_bytes=64,.format=80,.reserved=N2MB_BINDING_STAGED};
++  /* Off: begin reports 0 and draws submit one job each. */
++  unsigned subs=f.submitted;assert(n2mb_chain_begin(b)==0);
++  n=2;assert(!n2mb_draw(b,&n2_preload_shader,&q,out,&n)&&out[0]&&f.submitted==subs+1);
++  assert(!n2mb_chain_end(b,&job)&&!job);
++  assert(n2mb_chain_mode(b,1,4)==0&&n2mb_chain_begin(b)==1);
++  /* r <- t, u <- r, v <- u (a blur pyramid): one job, three frames. */
++  struct tegu_generic_draw_request q1=q,q2=q;q1.target_token=u;q1.bindings[0].memory.token=r;
++  q2.target_token=v;q2.bindings[0].memory.token=u;
++  subs=f.submitted;
++  n=2;assert(!n2mb_draw(b,&n2_preload_shader,&q,out,&n)&&!out[0]);
++  n=2;assert(!n2mb_draw(b,&n2_preload_shader,&q1,out,&n)&&!out[0]);
++  n=2;assert(!n2mb_draw(b,&n2_preload_shader,&q2,out,&n)&&!out[0]&&f.submitted==subs);
++  assert(!n2mb_chain_end(b,&job)&&job==f.job&&f.submitted==subs+1&&f.last_frames==3&&f.last_tjobs==3);
++  n2mb_chain_stats(b,st);assert(st[0]==1&&st[1]==3&&st[2]==2&&st[7]==1&&st[8]==3&&st[10]==1);
++  /* A LOAD frame (preload job + draw) chains with its two tiler jobs. */
++  assert(n2mb_chain_begin(b)==1);subs=f.submitted;
++  struct tegu_generic_draw_request ql=q1;ql.load_action=1;
++  n=2;assert(!n2mb_draw(b,&n2_preload_shader,&q,out,&n)&&!out[0]);
++  n=2;assert(!n2mb_draw(b,&n2_preload_shader,&ql,out,&n)&&!out[0]);
++  assert(!n2mb_chain_end(b,&job)&&f.submitted==subs+1&&f.last_frames==2&&f.last_tjobs==3);
++  /* The vertex stage may read the earlier frame's target (unstaged binding):
++   * the chain is submitted first, the frame starts the next one. */
++  assert(n2mb_chain_begin(b)==1);subs=f.submitted;q1.bindings[0].reserved=0;
++  n=2;assert(!n2mb_draw(b,&n2_preload_shader,&q,out,&n)&&!out[0]);
++  n=2;assert(!n2mb_draw(b,&n2_preload_shader,&q1,out,&n)&&!out[0]&&f.submitted==subs+1&&f.last_frames==1);
++  assert(!n2mb_chain_end(b,&job)&&f.submitted==subs+2&&f.last_frames==1);
++  q1.bindings[0].reserved=N2MB_BINDING_STAGED|N2MB_BINDING_VERTEX;
++  assert(n2mb_chain_begin(b)==1);subs=f.submitted;
++  n=2;assert(!n2mb_draw(b,&n2_preload_shader,&q,out,&n));
++  n=2;assert(!n2mb_draw(b,&n2_preload_shader,&q1,out,&n)&&f.submitted==subs+1);
++  assert(!n2mb_chain_end(b,&job)&&f.submitted==subs+2);q1.bindings[0].reserved=N2MB_BINDING_STAGED;
++  n2mb_chain_stats(b,st);assert(st[3]==2);
++  /* Mode 2: only independent frames. */
++  assert(n2mb_chain_mode(b,2,0)==1&&n2mb_chain_begin(b)==2);subs=f.submitted;
++  struct tegu_generic_draw_request qi=q;qi.target_token=v; /* t -> v: independent */
++  n=2;assert(!n2mb_draw(b,&n2_preload_shader,&q,out,&n));
++  n=2;assert(!n2mb_draw(b,&n2_preload_shader,&qi,out,&n)&&f.submitted==subs);
++  n=2;assert(!n2mb_draw(b,&n2_preload_shader,&q1,out,&n)&&f.submitted==subs+1&&f.last_frames==2); /* reads r */
++  assert(!n2mb_chain_end(b,&job)&&f.submitted==subs+2&&f.last_frames==1);
++  /* Full: two frames per job. */
++  assert(n2mb_chain_mode(b,1,2)==2&&n2mb_chain_begin(b)==1);subs=f.submitted;
++  for(unsigned k=0;k<3;k++){n=2;assert(!n2mb_draw(b,&n2_preload_shader,k==1?&qi:&q,out,&n));}
++  assert(f.submitted==subs+1&&f.last_frames==2);
++  assert(!n2mb_chain_end(b,&job)&&f.submitted==subs+2&&f.last_frames==1);
++  n2mb_chain_stats(b,st);assert(st[5]>=1);
++  /* Ordering calls submit the open chain: a wait, a map of a chained buffer. */
++  assert(n2mb_chain_mode(b,1,4)==1&&n2mb_chain_begin(b)==1);subs=f.submitted;
++  n=2;assert(!n2mb_draw(b,&n2_preload_shader,&q,out,&n)&&f.submitted==subs);
++  assert(!n2mb_wait_pending(b,NULL)&&f.submitted==subs+1);
++  n=2;assert(!n2mb_draw(b,&n2_preload_shader,&q,out,&n)&&f.submitted==subs+1);
++  {uint64_t addr=0,size=0;assert(!n2mb_map(b,(unsigned)r,0,&addr,&size,1)&&f.submitted==subs+2);}
++  assert(!n2mb_chain_end(b,&job)&&!job);
++  /* Clears and a batch in one chain; clear-colour slots wait for its id. */
++  assert(n2mb_chain_begin(b)==1);subs=f.submitted;
++  struct tegu_generic_draw_request qc=q;qc.binding_count=0;
++  n=2;assert(!n2mb_clear(b,&qc,out,&n)&&!out[0]);
++  struct tegu_generic_draw_request qb=qi;qb.load_action=1;
++  struct n2mb_batch_draw bd[2]={{&n2_preload_shader,&qb,NULL,NULL},{&n2_preload_shader,&qb,NULL,NULL}};
++  n=2;assert(!n2mb_draw_batch(b,bd,2,out,&n)&&!out[0]);
++  n=2;assert(!n2mb_clear(b,&qc,out,&n)&&!out[0]&&f.submitted==subs);
++  assert(!n2mb_chain_end(b,&job)&&job&&f.submitted==subs+1&&f.last_frames==3);
++  /* Outside begin/end nothing chains. */
++  subs=f.submitted;n=2;assert(!n2mb_draw(b,&n2_preload_shader,&q,out,&n)&&out[0]&&f.submitted==subs+1);
++  n2mb_chain_stats(b,st);
++  fprintf(stderr,"CHAIN chains=%llu frames=%llu dep=%llu flush_dep=%llu handles=%llu full=%llu other=%llu end=%llu most=%llu\n",
++   (unsigned long long)st[0],(unsigned long long)st[1],(unsigned long long)st[2],(unsigned long long)st[3],(unsigned long long)st[4],
++   (unsigned long long)st[5],(unsigned long long)st[6],(unsigned long long)st[7],(unsigned long long)st[8]);
++  close_bridge(b,&f);
++  /* NORD2_METAL_CHAIN=1: the first begin runs the 4-frame visibility probe
++   * as one job; the fake GPU writes nothing, so it reads 'stale' and mode 1
++   * falls back to 2 (independent frames only). */
++  setenv("NORD2_METAL_CHAIN","1",1);
++  struct fake g={.job=1ull<<32,.chain_model=1};uintptr_t gb=open_bridge(&g);unsetenv("NORD2_METAL_CHAIN");
++  unsigned before=g.submitted;assert(n2mb_chain_begin(gb)==2&&g.submitted==before+1&&g.last_frames==4);
++  n2mb_chain_stats(gb,st);assert(st[9]==2&&st[10]==2&&st[0]==1&&st[1]==4);
++  assert(!n2mb_chain_end(gb,&job)&&!job);
++  close_bridge(gb,&g);
++ }
++ puts("PASS chained submission: frames linked in one job (renumbered tiler chain, barriered fragment chain, distinct heap slices), dependent/vertex/mode-2/full/handle flushes, ordering calls, clears and batches");
+  puts("PASS matrix wait failure: no pixel readback or later jobs; pending buffers retained until context close");
+  puts("PASS graphics CLEAR/LOAD,feedback snapshot,ordered2-stage submission,allocation/map/submit/wait failures");
+  puts("PASS real TGP -> arch9 JM transport: eight lifetime/failure cases,80 concurrent dispatches,CSF rejection; no hardware execution");

@@ -1,0 +1,117 @@
+--- crates/metal2vulkan-air/src/canon/const_loads.rs	2026-10-24 01:08:51.163694498 +0200
++++ crates/metal2vulkan-air/src/canon/const_loads.rs	2026-10-26 20:59:21.469571871 +0100
+@@ -1,4 +1,4 @@
+-//! Pointers loaded from fields of constant globals.
++//! Loads from fields of constant globals.
+ //!
+ //! A constant global whose initializer is known once function constants are bound and the static
+ //! initializers have run may hold pointers: a program-scope `constexpr sampler` taken by value is
+@@ -16,11 +16,16 @@
+ //! load of the field as an integer of the pointer's size, then `inttoptr` to the field's type)
+ //! reads the same constant at its `inttoptr`. The global is never written (it is `constant`, and
+ //! initialized by no one else), so every run reads that constant: the address of the sampler
+-//! state, which the sampler family reads as the sampler it names. Only pointers are read this
+-//! way: a load of any other type from a constant global is lowered from the global's form (its
+-//! typed private copy, or the constant blob), and reading it here would change those modules
+-//! without changing what they compute. SCCP then runs again over a body this pass changed, so
+-//! what the constants decide (an aggregate of them, a phi of them, a member of either) folds too.
++//! state, which the sampler family reads as the sampler it names.
++//!
++//! A load of any other type at such a field reads its constant the same way (SCCP already reads a
++//! load of a whole constant global as its initializer). A state block that a static initializer
++//! fills from function constants (QuartzCore's `fixed_frag` reads its blend, texture and colour
++//! functions this way) is otherwise lowered from the global's form (its typed private copy, or the
++//! constant blob), so every case of the shader survives specialization: a 528 KB fragment module
++//! whose live code is 3 KB. Reading the field here computes the same value and lets SCCP prune the
++//! cases the constants exclude. SCCP then runs again over a body this pass changed, so what the
++//! constants decide (an aggregate of them, a phi of them, a member of either) folds too.
+ 
+ use crate::budget::Meter;
+ use crate::error::Error;
+@@ -29,9 +34,9 @@
+ 
+ use super::rewrite::{apply, scoped, BodyEdit};
+ 
+-/// Read every load of a pointer from a field of a constant global in `body`, and every
+-/// `inttoptr` of such a field's integer copy, as the field's constant (module docs), and say
+-/// whether there was one. Returns `body` itself when there is none.
++/// Read every load from a field of a constant global in `body`, and every `inttoptr` of such a
++/// field's integer copy, as the field's constant (module docs), and say whether there was one.
++/// Returns `body` itself when there is none.
+ pub(super) fn fold(
+     body: Body,
+     parts: &mut ModuleParts,
+@@ -61,8 +66,8 @@
+     }
+ }
+ 
+-/// Each instruction of `body` that reads a pointer field of a constant global (module docs), with
+-/// the field's constant.
++/// Each instruction of `body` that reads a field of a constant global (module docs), with the
++/// field's constant.
+ fn find(
+     body: &Body,
+     parts: &mut ModuleParts,
+@@ -71,13 +76,8 @@
+ ) -> Result<(), Error> {
+     for (id, inst) in body.insts.iter() {
+         m.tick(1)?;
+-        let Some(space) = parts.types.ptr_space(inst.ty) else {
+-            continue;
+-        };
+-        if !matches!(parts.types.get(inst.ty), Some(Type::Ptr { .. })) {
+-            continue;
+-        }
+         let ptr = match inst.kind {
++            // Any type: the field of a never-written constant global is its initializer's.
+             InstKind::Load {
+                 ptr,
+                 volatile: false,
+@@ -88,23 +88,31 @@
+             InstKind::Cast {
+                 op: CastOp::IntToPtr,
+                 v: Value::Inst(l),
+-            } => match body.insts.get(l).map(|l| (&l.kind, l.ty)) {
+-                Some((
+-                    &InstKind::Load {
+-                        ptr,
+-                        volatile: false,
+-                        atomic: None,
+-                        ..
+-                    },
+-                    ty,
+-                )) if parts.types.int_bits(ty).map(u32::from)
+-                    == Some(parts.data_layout.pointer(space.raw()).size_bits)
+-                    && !matches!(parts.types.get(ty), Some(Type::Vector { .. })) =>
+-                {
+-                    ptr
++            } => {
++                let Some(space) = parts.types.ptr_space(inst.ty) else {
++                    continue;
++                };
++                if !matches!(parts.types.get(inst.ty), Some(Type::Ptr { .. })) {
++                    continue;
+                 }
+-                _ => continue,
+-            },
++                match body.insts.get(l).map(|l| (&l.kind, l.ty)) {
++                    Some((
++                        &InstKind::Load {
++                            ptr,
++                            volatile: false,
++                            atomic: None,
++                            ..
++                        },
++                        ty,
++                    )) if parts.types.int_bits(ty).map(u32::from)
++                        == Some(parts.data_layout.pointer(space.raw()).size_bits)
++                        && !matches!(parts.types.get(ty), Some(Type::Vector { .. })) =>
++                    {
++                        ptr
++                    }
++                    _ => continue,
++                }
++            }
+             _ => continue,
+         };
+         let Some((g, path)) = field_address(body, parts, ptr) else {

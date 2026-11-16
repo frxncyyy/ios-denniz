@@ -1,0 +1,123 @@
+diff --git a/gpu/metal/tegu/compute_frontend.m b/gpu/metal/tegu/compute_frontend.m
+index 6105906..711aa83 100644
+--- a/gpu/metal/tegu/compute_frontend.m
++++ b/gpu/metal/tegu/compute_frontend.m
+@@ -50,6 +50,9 @@ extern void *memcpy(void *,const void *,NSUInteger);
+ extern void *memset(void *,int,NSUInteger);
+ extern void *dlopen(const char *, int);
+ extern void *dlsym(void *, const char *);
++/* P1 throttle outcomes (teguExecute): waits for an unfinished command, and
++ * waits that ran out (100 ms) - TEGU_PERF_FRAME early_wait/early_forced. */
++static U64 tegu_early_throttled,tegu_early_forced;
+ #ifdef NORD2_JM_TRANSPORT
+ #include "nord2_transport.inc"
+ /* Asynchronous submission (kernel 0090 WAIT_SEQ): the bridge returns from a
+@@ -518,6 +521,9 @@ struct TeguVariant { TeguPipeline *pipeline; unsigned count; TeguAIRNativeConsta
+   * wait for its own jobs overlaps the submission of the next one while
+   * completions stay in commit order. Unused (no target) when off. */
+  struct tegu_submission_queue finishes;unsigned asyncPipeline;
++ /* Pipelined commands reported scheduled at submission whose completion is
++  * still pending (P2/P1 throttle, see teguExecute). */
++ unsigned earlyInflight;
+ }
+ - (signed char)setGPUPriority:(NSUInteger)priority;
+ - (signed char)setBackgroundGPUPriority:(NSUInteger)priority;
+@@ -678,12 +684,15 @@ struct tegu_perf_batch {
+  /* Commands rendering into an imported (display) surface: commit ->
+   * GPU-complete and commit -> execution start, in microseconds (sums). */
+  unsigned presentCmds,presentLatUs,presentQueueUs;
++ /* Per attachment index 0/1 as Metal requested: load dontcare/load/clear,
++  * store dontcare/store/other, full-size targets (TEGU_PERF_RT). */
++ unsigned rtRawLoad[2][3],rtStore[2][3],rtFull[2];
+ };
+ #endif
+ /* teguExecute state its completion half (teguFinishGPU/teguFinishReport)
+  * needs; the completion half may run later on the queue's finish FIFO. */
+ struct tegu_exec_tail {
+- int error,async,deferred,queued;unsigned perfJob,perfBatched,commandTrace;
++ int error,async,deferred,queued,early;unsigned perfJob,perfBatched,commandTrace;
+  U64 perfShadow,asyncSeq,*asyncIds;double perfGpu,perfCpu,perfMark,perfMaxJob;const char *perfMaxName;
+ };
+ @interface TeguCommand : NSObject {
+@@ -1495,10 +1508,11 @@ static void tegu_perf_note(double start,double end,unsigned jobs,unsigned gpuJob
+     __atomic_exchange_n(&tegu_perf_compile_ns,0,__ATOMIC_RELAXED)/1000000,__atomic_exchange_n(&tegu_perf_compiles,0,__ATOMIC_RELAXED));
+    /* A short untruncated timing record. Completion rate is NOT panel FPS. */
+    frameBytes=snprintf(frameLine,sizeof(frameLine),
+-    "TEGU_PERF_FRAME %s window_ms=%u commands=%u mean_exec_us=%u mean_gpu_us=%u kernel_jobs=%u max_exec_us=%u\n",
++    "TEGU_PERF_FRAME %s window_ms=%u commands=%u mean_exec_us=%u mean_gpu_us=%u kernel_jobs=%u max_exec_us=%u early_wait=%u early_forced=%u\n",
+     abTag,(unsigned)((windowEnd-tegu_perf.windowStart)*1e3),tegu_perf.commands,
+     (unsigned)(tegu_perf.exec*1e6/tegu_perf.commands),(unsigned)(tegu_perf.gpu*1e6/tegu_perf.commands),
+-    tegu_perf.gpuJobs-tegu_perf.batched,(unsigned)(tegu_perf.maxCommand*1e6));
++    tegu_perf.gpuJobs-tegu_perf.batched,(unsigned)(tegu_perf.maxCommand*1e6),
++    (unsigned)__atomic_exchange_n(&tegu_early_throttled,0,__ATOMIC_RELAXED),(unsigned)__atomic_exchange_n(&tegu_early_forced,0,__ATOMIC_RELAXED));
+    /* Pipeline build split and cache outcome, a separate short record so the
+     * console cannot cut it off the end of the long line above. */
+    U64 pso[6]={__atomic_exchange_n(&tegu_perf_air_ns,0,__ATOMIC_RELAXED)/1000000,__atomic_exchange_n(&tegu_perf_mali_ns,0,__ATOMIC_RELAXED)/1000000,
+@@ -1695,6 +1709,28 @@ static unsigned short tegu_mip_float_to_half(float value) {
+ - (void)commitWithDeadline:(U64)deadline {
+  (void)deadline;[self commit];
+ }
++/* P2 (ansuz CA-METAL 8 "Pipelining"): a pipelined command (async submission,
++ * completion on the finish FIFO, no CPU shadow write-back) is reported
++ * scheduled as soon as all of its jobs are submitted, instead of after GPU
++ * completion. backboardd then swaps a surface the GPU may still be drawing:
++ * kernel 0097(c) holds such a swap (the bridge declares every render target,
++ * imported surfaces included, in the job's write_mask) until the jobs that
++ * write it are done, so the panel keeps the previous complete frame. Presents
++ * we issue ourselves still run at completion (teguFinishReport). P1: at most
++ * two such commands per queue may be unfinished; a third waits up to 100 ms
++ * for the oldest (then proceeds, as ansuz's display-frame throttle).
++ * NORD2_METAL_EARLY_SCHEDULED=0 reports scheduling at completion as before. */
++#ifndef TEGU_EARLY_SCHEDULED_DEFAULT
++#define TEGU_EARLY_SCHEDULED_DEFAULT 1
++#endif
++#define TEGU_EARLY_SCHEDULED_DEPTH 2u
++static int tegu_early_scheduled(void) {
++ static int state=-1;
++ if(state<0){extern char *getenv(const char *);const char *env=getenv("NORD2_METAL_EARLY_SCHEDULED");
++  state=env&&(env[0]=='0'||env[0]=='1')&&!env[1]?env[0]=='1':TEGU_EARLY_SCHEDULED_DEFAULT;}
++ return state;
++}
++static void tegu_wait_backoff(unsigned *spins);
+ - (void)teguExecute {
+  /* Jobs submit synchronously and return after GPU completion, so the command
+   * is reported scheduled only once every job has run (below).  Callers that
+@@ -1964,7 +2000,27 @@ static unsigned short tegu_mip_float_to_half(float value) {
+   tail.deferred=tail.queued&&pipeline&&async&&!error&&tail.asyncSeq&&!tegu_shadow_jobs_any(jobChunks,count,1);}
+ #endif
+  tegu_ab_exec_set=0;
++#ifdef NORD2_JM_TRANSPORT
++ if(tail.deferred&&tegu_early_scheduled()) {
++  if(__atomic_load_n(&queue->earlyInflight,__ATOMIC_ACQUIRE)>=TEGU_EARLY_SCHEDULED_DEPTH) {
++   /* 100 ms; a build without a clock (host default) bounds it by backoff
++    * steps instead (~5000 sleeps of >= 20 us). */
++   double began=tegu_host_seconds();unsigned spins=0;
++   __atomic_fetch_add(&tegu_early_throttled,1,__ATOMIC_RELAXED);
++   while(__atomic_load_n(&queue->earlyInflight,__ATOMIC_ACQUIRE)>=TEGU_EARLY_SCHEDULED_DEPTH) {
++    if(began>0?tegu_host_seconds()-began>=0.1:spins>=5600u){__atomic_fetch_add(&tegu_early_forced,1,__ATOMIC_RELAXED);break;}
++    tegu_wait_backoff(&spins);
++   }
++  }
++  __atomic_fetch_add(&queue->earlyInflight,1,__ATOMIC_ACQ_REL);tail.early=1;
++ }
++#endif
+  if(!tail.deferred)[self teguFinishGPU];
++ if(tail.early) {
++  /* Every job is submitted: scheduled now; completion follows on the FIFO. */
++  __atomic_store_n(&status,3,__ATOMIC_RELEASE);
++  tegu_command_scheduled(self);
++ }
+  if(!tail.queued)[self teguFinishReport];
+ }
+ /* Completion, GPU half: every job of this command (including those before a
+@@ -2031,8 +2087,9 @@ static unsigned short tegu_mip_float_to_half(float value) {
+   }
+   [presentation->drawable release];free(presentation);presentation=next;
+  }
+- tegu_command_scheduled(self);
++ if(!tail.early)tegu_command_scheduled(self); /* else run at submission (teguExecute) */
+  __atomic_store_n(&status,error?5:4,__ATOMIC_RELEASE);
++ if(tail.early)__atomic_fetch_sub(&queue->earlyInflight,1,__ATOMIC_ACQ_REL);
+ #ifndef TEGU_RENDER_TRACE
+  /* Quiet builds report only failures, capped. */
+  /* Capped per A/B phase (16 each), so the failure behind every

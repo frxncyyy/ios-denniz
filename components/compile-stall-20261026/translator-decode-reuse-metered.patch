@@ -1,0 +1,118 @@
+--- a/crates/metal2vulkan/src/pipeline/compile.rs
++++ b/crates/metal2vulkan/src/pipeline/compile.rs
+@@ -1792,6 +1792,73 @@
+     before: reflection::UnspecializedReads,
+ }
+ 
++/// How many decoded modules [`decode_reused`] keeps per process (least recently used first out).
++const DECODED_KEPT: usize = 4;
++
++/// A kept decode: the module and what decoding it costs a meter (work units, the ledger's peak
++/// above its start, and the bytes still charged when it returns).
++struct KeptDecode {
++    air_hash: Hash256,
++    decoded: Arc<air::Decoded>,
++    work: u64,
++    peak: u64,
++    held: u64,
++}
++
++/// [`air::decode`] of `bitcode`, whose SHA-256 is `air_hash`, reusing this process's last decodes:
++/// a pipeline's stages decode the same function modules again and again (QuartzCore's
++/// `fixed_vert`/`fixed_frag` for every variant), and decoding is a pure function of the bytes.
++///
++/// Every call, first or repeated, decodes (or reuses) under a meter of its own and then charges
++/// `m` exactly what that decode costs: its work units, its ledger peak (released down to what it
++/// still holds). So the deterministic caps refuse the same inputs with the same error whether the
++/// module was decoded before or not, and the ledger ends where a fresh decode leaves it. A failed
++/// decode is not kept: it fails again the same way.
++fn decode_reused(air_hash: &Hash256, bitcode: &[u8], m: &mut Meter) -> Result<air::Decoded, Error> {
++    use std::sync::{Mutex, OnceLock};
++    static KEPT: OnceLock<Mutex<VecDeque<KeptDecode>>> = OnceLock::new();
++    let kept = KEPT.get_or_init(|| Mutex::new(VecDeque::new()));
++    let hit = kept.lock().ok().and_then(|mut k| {
++        let i = k.iter().position(|e| e.air_hash == *air_hash)?;
++        let e = k.remove(i)?;
++        let out = (Arc::clone(&e.decoded), e.work, e.peak, e.held);
++        k.push_back(e);
++        Some(out)
++    });
++    let (decoded, work, peak, held) = match hit {
++        Some(h) => h,
++        None => {
++            let mut own = Meter::with_caps(&crate::budget::Budget::default(), u64::MAX, u64::MAX);
++            let decoded = Arc::new(air::decode(bitcode, &mut own)?);
++            let entry = KeptDecode {
++                air_hash: *air_hash,
++                decoded: Arc::clone(&decoded),
++                work: own.work(),
++                peak: own.ledger_peak(),
++                held: own.ledger(),
++            };
++            let out = (decoded, entry.work, entry.peak, entry.held);
++            if let Ok(mut k) = kept.lock() {
++                if k.len() >= DECODED_KEPT {
++                    k.pop_front();
++                }
++                k.push_back(entry);
++            }
++            out
++        }
++    };
++    // The decode's cost, charged to the caller's meter as a fresh decode would have charged it.
++    let mut left = work;
++    while left > 0 {
++        let step = u32::try_from(left).unwrap_or(u32::MAX);
++        m.tick(step)?;
++        left -= u64::from(step);
++    }
++    m.charge(usize::try_from(peak).unwrap_or(usize::MAX))?;
++    m.release(usize::try_from(peak - held.min(peak)).unwrap_or(usize::MAX));
++    Ok(air::Decoded::clone(&decoded))
++}
++
+ /// Decode, cross-check a metallib function's container tags, and specialize: the AIR hash, the
+ /// entry name, the specialized entry, and what its code read before.
+ fn specialize_one(r: &Request<'_>, m: &mut Meter) -> Result<Specialized, Error> {
+@@ -1804,7 +1871,7 @@
+         return Ok(Specialized::clone(&kept));
+     }
+     let air_hash = container::sha256(r.bitcode);
+-    let mut decoded = air::decode(r.bitcode, m)?;
++    let mut decoded = decode_reused(&air_hash, r.bitcode, m)?;
+     if let Some(f) = r.container {
+         decoded.abi.check_container(&decoded.module, f, m)?;
+     }
+--- a/crates/metal2vulkan/src/device/profile.rs
++++ b/crates/metal2vulkan/src/device/profile.rs
+@@ -352,12 +352,29 @@
+                 Ok(())
+             }
+         }
++        // Every compile takes the fingerprint for its key and a process compiles under one profile:
++        // the last answer is kept with the fields it hashed and reused for equal fields (derived
++        // `Eq` over plain data without floats, so equal fields render the same `Debug` text).
++        use std::sync::{Mutex, OnceLock};
++        static LAST: OnceLock<Mutex<Option<(ProfileFields, Hash256)>>> = OnceLock::new();
++        let last = LAST.get_or_init(|| Mutex::new(None));
++        if let Ok(l) = last.lock() {
++            if let Some((fields, hash)) = l.as_ref() {
++                if *fields == self.fields {
++                    return *hash;
++                }
++            }
++        }
+         let mut h = Hashing(Sha256::new());
+         h.0.update(b"metal2vulkan/device-profile/v1\0");
+         // `Hashing` never fails, and `Debug` of these plain-data types only fails when the
+         // writer does.
+         let _ = write!(h, "{:?}", self.fields);
+-        h.0.finalize().into()
++        let hash: Hash256 = h.0.finalize().into();
++        if let Ok(mut l) = last.lock() {
++            *l = Some((self.fields.clone(), hash));
++        }
++        hash
+     }
+ }
+ 

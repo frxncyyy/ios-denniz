@@ -1,0 +1,341 @@
+diff --git a/gpu/metal/tegu/compositor_submit.inc b/gpu/metal/tegu/compositor_submit.inc
+index 48c4f0b..49ae1a0 100644
+--- a/gpu/metal/tegu/compositor_submit.inc
++++ b/gpu/metal/tegu/compositor_submit.inc
+@@ -187,14 +187,17 @@ static U64 tegu_shadow_copy(TeguTexture *t,int toSurface) {
+   * Saves the lock/unlock and the full copy (device: ~1.7 MB per command). */
+  if(!toSurface&&t&&t->shadowSeedValid&&api&&api->getSeed&&t->shadowSurface&&
+     api->getSeed((void *)t->shadowSurface)==t->shadowSeed)return 0;
+- /* Byte-exact row copy of the shadow's own format (BGRA8 targets; RGBA8,
+-  * R8 and RG8 sampled-only surfaces). */
++ /* Byte-exact row copy of the shadow's own (uncompressed) format, or, for a
++  * decode shadow (shadowConvert: Apple XR formats), the surface's XR texels
++  * decoded to the RGBA16F backing. A decode shadow is never written back. */
+  NSUInteger bpp=t?tegu_texture_bytes_per_pixel(t->format):0;
+- if(!t||!t->shadowSurface||!api||!t->buffer||(t->format!=80&&t->format!=70&&t->format!=10&&t->format!=30)||
+-    !bpp||!t->textureWidth||!t->textureHeight)return 0;
++ NSUInteger sourceBpp=t&&t->shadowConvert?tegu_xr_source_bpp(t->shadowConvert):bpp;
++ if(!t||!t->shadowSurface||!api||!t->buffer||!bpp||!sourceBpp||tegu_texture_is_astc(t->format)||
++    (t->shadowConvert&&(toSurface||t->format!=115))||!t->textureWidth||!t->textureHeight)return 0;
+  void *surface=(void *)t->shadowSurface;
+  size_t row=api->getBytesPerRow(surface),width=t->textureWidth*bpp,height=t->textureHeight;
+- if(api->getWidth(surface)<t->textureWidth||api->getHeight(surface)<height||row<width||
++ size_t sourceWidth=t->textureWidth*sourceBpp;
++ if(api->getWidth(surface)<t->textureWidth||api->getHeight(surface)<height||row<sourceWidth||
+     api->getAllocSize(surface)/row<height||t->rowBytes<width||
+     t->mip[0].offset+(height-1)*t->rowBytes+width>t->buffer->logical)return 0;
+  t->shadowSeedValid=0;
+@@ -202,7 +205,8 @@ static U64 tegu_shadow_copy(TeguTexture *t,int toSurface) {
+  unsigned char *s=(unsigned char *)api->getBaseAddress(surface),*b=(unsigned char *)tegu_buffer_bytes(t->buffer);
+  if(s&&b)for(size_t y=0;y<height;y++) {
+   unsigned char *line=b+t->mip[0].offset+y*t->rowBytes;
+-  if(toSurface)memcpy(s+y*row,line,width);else memcpy(line,s+y*row,width);
++  if(t->shadowConvert)tegu_xr_decode_row(t->shadowConvert,s+y*row,(uint16_t *)(void *)line,t->textureWidth);
++  else if(toSurface)memcpy(s+y*row,line,width);else memcpy(line,s+y*row,width);
+  }
+  uint32_t after=seed;int unlocked=api->unlock(surface,toSurface?0:1,&after);
+  /* Read-only refresh: seed of the bytes copied. Write-back: the seed our own
+@@ -483,13 +487,14 @@ static unsigned tegu_jm_batch_draw_reason(const struct Dispatch *j,const struct
+   const struct tegu_render_generic_sidecar *c=(const void *)j->compositorPlan.bytes;
+   if(c->magic==TEGU_RENDER_SIDECAR_MAGIC&&c->version==TEGU_RENDER_SIDECAR_VERSION)sc=c;
+  }
+- if(sc&&(sc->count>1||sc->msaa))return TEGU_BREAK_MRT;
++ if(sc&&sc->count>1)return TEGU_BREAK_MRT;
++ if(sc&&sc->msaa)return TEGU_BREAK_MSAA;
+  const struct tegu_generic_draw_request *q=&j->genericDrawRequest,*q0=&j0->genericDrawRequest;
+  if((sc&&sc->tls)||q->target_format==10||!q->target_token)return TEGU_JM_BREAK_SHAPE;
+  for(unsigned i=0;i<q->binding_count;i++) {
+   unsigned kind=q->bindings[i].kind;
+-  if(kind==TEGU_GENERIC_DRAW_ATTACHMENT)return TEGU_JM_BREAK_READS; /* in-place memory fetch: per job */
+-  if(q->bindings[i].memory.token&&q->bindings[i].memory.token==q->target_token)return TEGU_JM_BREAK_READS;
++  if(kind==TEGU_GENERIC_DRAW_ATTACHMENT)return TEGU_BREAK_MEMFETCH; /* in-place memory fetch: per job */
++  if(q->bindings[i].memory.token&&q->bindings[i].memory.token==q->target_token)return TEGU_BREAK_OWNTEX;
+  }
+  if(!member)return 0;
+  if(j->nord2CopySources[0]||j->nord2CopySources[1])return TEGU_BREAK_PRECLEAR;
+diff --git a/gpu/metal/tegu/render_encoder.inc b/gpu/metal/tegu/render_encoder.inc
+index 06f2322..d83b72a 100644
+--- a/gpu/metal/tegu/render_encoder.inc
++++ b/gpu/metal/tegu/render_encoder.inc
+@@ -181,6 +181,10 @@ typedef struct {NSUInteger location,length;} TeguTextureViewRange;
+   * changing existing aggregate initializers or private-class comparisons. */
+  NSUInteger arrayLength,layers;
+  NSUInteger levelDepth[13],levelSliceStride[13],levelLayerStride[13];
++ /* Decode-on-sync shadow of an IOSurface whose Metal format Mali cannot
++  * sample (TEGU_SHADOW_CONVERT_*): -pixelFormat reports apiFormat, while the
++  * owned backing, n2t, gd and the planner see the internal `format`. */
++ NSUInteger apiFormat;unsigned shadowConvert;
+ }
+ - (id)device;
+ - (id)heap;
+@@ -214,6 +218,31 @@ static int tegu_texture_cpu_layer(TeguTexture *t,NSUInteger level,NSUInteger sli
+  *base=m.offset;*depth=kind==7?(t->textureDepth>>level?t->textureDepth>>level:1u):1u;
+  return 1;
+ }
++/* CPU access to a decode shadow (shadowConvert) goes to its IOSurface, whose
++ * bytes are the Metal format's; the owned RGBA16F backing is GPU-only data.
++ * Writes invalidate the shadow so the next command re-decodes it. */
++static unsigned tegu_xr_source_bpp_of(unsigned kind);
++static int tegu_shadow_convert_cpu(TeguTexture *t,void *bytes,NSUInteger stride,TeguRegion r,
++ NSUInteger level,NSUInteger slice,int write) {
++ const struct TeguIOSurfaceAPI *api=tegu_iosurface_api();uint32_t seed=0;
++ NSUInteger bpp=tegu_xr_source_bpp_of(t->shadowConvert);
++ void *surface=(void *)t->shadowSurface;
++ if(!api||!surface||!bytes||!bpp||level||slice||r.origin.z||r.size.depth!=1||
++    r.origin.x>t->textureWidth||r.size.width>t->textureWidth-r.origin.x||
++    r.origin.y>t->textureHeight||r.size.height>t->textureHeight-r.origin.y||
++    stride<r.size.width*bpp)return 0;
++ NSUInteger row=api->getBytesPerRow(surface);
++ if(api->getWidth(surface)<t->textureWidth||api->getHeight(surface)<t->textureHeight||row<t->textureWidth*bpp||
++    api->getAllocSize(surface)/row<t->textureHeight)return 0;
++ if(api->lock(surface,write?0:1,&seed))return 0;
++ unsigned char *base=(unsigned char *)api->getBaseAddress(surface);
++ if(base)for(NSUInteger y=0;y<r.size.height;y++) {
++  unsigned char *s=base+(r.origin.y+y)*row+r.origin.x*bpp,*c=(unsigned char *)bytes+y*stride;
++  if(write)memcpy(s,c,r.size.width*bpp);else memcpy(c,s,r.size.width*bpp);
++ }
++ if(write)t->shadowSeedValid=0;
++ return !api->unlock(surface,write?0:1,&seed)&&base;
++}
+ @implementation TeguTexture
+ - (id)device{return surfaceImported?importedOwner:(buffer?buffer->owner:transientOwner);}
+ /* Zero-copy view creation.  The format alias policy is the shared audited
+@@ -225,6 +254,8 @@ static TeguTexture *tegu_texture_view_alloc(TeguTexture *src,NSUInteger viewForm
+  v->viewSource=[src retain];
+  v->textureWidth=src->textureWidth;v->textureHeight=src->textureHeight;v->textureDepth=src->textureDepth;
+  v->textureKind=src->textureKind;v->textureSamples=src->textureSamples;v->format=viewFormat;
++ /* A decode shadow is viewable only as itself (its internal format). */
++ if(src->shadowConvert){v->format=src->format;v->apiFormat=src->apiFormat;v->shadowConvert=src->shadowConvert;}
+  v->textureUsage=src->textureUsage;v->textureResourceOptions=src->textureResourceOptions;
+  v->rowBytes=src->rowBytes;v->levelCount=src->levelCount;v->arrayLength=src->arrayLength;v->layers=src->layers;
+  v->surfaceAllocSize=src->surfaceAllocSize;v->surfaceRowBytes=src->surfaceRowBytes;
+@@ -258,6 +289,7 @@ fail:
+ }
+ - (id)newTextureViewWithPixelFormat:(NSUInteger)viewFormat {
+  struct n2t_format_info allocation,view;
++ if(shadowConvert)return viewFormat&&viewFormat==apiFormat?tegu_texture_view_alloc(self,viewFormat):0;
+  if(!viewFormat||n2t_view_format_check((uint32_t)format,(uint32_t)viewFormat,&allocation,&view)!=N2T_OK)return 0;
+  return tegu_texture_view_alloc(self,viewFormat);
+ }
+@@ -274,7 +306,7 @@ fail:
+ - (id)label{return debugLabel;}
+ - (void)setLabel:(id)value{id copy=[value copy];[debugLabel release];debugLabel=copy;}
+ - (NSUInteger)textureType{return textureKind;}
+-- (NSUInteger)pixelFormat{return format;}
++- (NSUInteger)pixelFormat{return apiFormat?apiFormat:format;}
+ - (NSUInteger)width{return textureWidth;}
+ - (NSUInteger)height{return textureHeight;}
+ - (NSUInteger)depth{return textureDepth;}
+@@ -296,6 +328,7 @@ fail:
+  if(surfaceImported&&surfaceTargetVersion){MARK("UNSUPPORTED compositor_iosurface_cpu_readback");return;}
+ #endif
+  if(level>=levelCount){MARK("FAIL texture_read_level");return;}
++ if(shadowConvert){if(!tegu_shadow_convert_cpu(self,bytes,stride,r,level,slice,0))MARK("FAIL texture_read_xr_surface");return;}
+  struct tegu_texture_level m=mip[level];
+  NSUInteger bytesPerPixel=tegu_texture_bytes_per_pixel(format);
+  NSUInteger layerBase=0,lvlDepth=0;
+@@ -355,6 +388,7 @@ fail:
+  if(surfaceImported&&surfaceTargetVersion){MARK("UNSUPPORTED compositor_iosurface_cpu_write");return;}
+ #endif
+  if(level>=levelCount){MARK("FAIL texture_write_level");return;}
++ if(shadowConvert){if(!tegu_shadow_convert_cpu(self,(void *)bytes,stride,r,level,slice,1))MARK("FAIL texture_write_xr_surface");return;}
+  struct tegu_texture_level m=mip[level];
+  if(tegu_texture_is_astc(format)) {
+   /* Compressed upload: rows of blocks; bytesPerRow is per block row. */
+@@ -733,6 +767,33 @@ static int tegu_texture_v2_general_layout(TeguTextureDescriptor *d,struct tegu_t
+  if(layerStride>64*1024*1024||layers>64*1024*1024/layerStride)return 0;
+  *totalBytes=layerStride*layers;*layersOut=layers;*layerStrideOut=layerStride;return 1;
+ }
++/* Minimal descriptor for frontend-internal allocations (decode shadows). */
++@interface TeguInternalTextureDescriptor : NSObject {
++@public NSUInteger type,format,width,height,depth,levels,samples,arrays,options,usage;
++}
++- (NSUInteger)textureType;
++- (NSUInteger)pixelFormat;
++- (NSUInteger)width;
++- (NSUInteger)height;
++- (NSUInteger)depth;
++- (NSUInteger)mipmapLevelCount;
++- (NSUInteger)sampleCount;
++- (NSUInteger)arrayLength;
++- (NSUInteger)resourceOptions;
++- (NSUInteger)usage;
++@end
++@implementation TeguInternalTextureDescriptor
++- (NSUInteger)textureType{return type;}
++- (NSUInteger)pixelFormat{return format;}
++- (NSUInteger)width{return width;}
++- (NSUInteger)height{return height;}
++- (NSUInteger)depth{return depth;}
++- (NSUInteger)mipmapLevelCount{return levels;}
++- (NSUInteger)sampleCount{return samples;}
++- (NSUInteger)arrayLength{return arrays;}
++- (NSUInteger)resourceOptions{return options;}
++- (NSUInteger)usage{return usage;}
++@end
+ @implementation TeguComputeDevice (RenderTextures)
+ - (id)newTextureWithDescriptor:(TeguTextureDescriptor *)d {
+  struct tegu_texture_level layout[13];NSUInteger bytes=0,generalLayers=0,generalLayerStride=0;
+@@ -800,6 +861,56 @@ static void tegu_iosurface_refused(TeguTextureDescriptor *d,id surface,NSUIntege
+   (unsigned long)(api?api->getAllocSize((void *)surface):0),(unsigned long)(api?api->getPlaneCount((void *)surface):0));
+  if(n>0)write(2,line,(size_t)n<sizeof(line)?(size_t)n:sizeof(line)-1);
+ }
++/* Single-plane IOSurface fourccs whose bytes per element are known. Metal's
++ * newTextureWithDescriptor:iosurface:plane: checks only that the texture
++ * format's bytes per pixel equal the surface's bytes per element, so the
++ * sampled shadow path accepts exactly that relation (0 = unknown fourcc). */
++static NSUInteger tegu_iosurface_fourcc_bpp(uint32_t fourcc) {
++ switch(fourcc) {
++ case 0x4c303038u: /* 'L008' */ case 0x41303038u: /* 'A008' */ return 1;
++ case 0x4c413038u: /* 'LA08' */ case 0x32433038u: /* '2C08' */
++ case 0x4c303136u: /* 'L016' */ case 0x4c303068u: /* 'L00h' */ return 2;
++ case TEGU_IOSURFACE_BGRA: case TEGU_IOSURFACE_RGBA: case 0x6c313072u: /* 'l10r' */
++ case 0x77333072u: /* 'w30r' */ case 0x4c303066u: /* 'L00f' */
++ case 0x32433136u: /* '2C16' */ case 0x32433068u: /* '2C0h' */ return 4;
++ case 0x52476841u: /* 'RGhA' */ case 0x77343061u: /* 'w40a' */ case 0x7734306du: /* 'w40m' */
++ case 0x32433066u: /* '2C0f' */ return 8;
++ case 0x52476641u: /* 'RGfA' */ return 16;
++ default: return 0;
++ }
++}
++/* Apple extended-range formats have no Mali texture format. A sampled-only
++ * IOSurface in one of them is decoded on every shadow refresh into an owned
++ * RGBA16Float texture: value = (code - 384) / 510 (Metal's XR code), the
++ * _sRGB twins' colour channels through the sign-preserving sRGB transfer,
++ * alpha clamped to [0,1]. Linear filtering of the decoded halves differs from
++ * Metal's exact XR filter by at most about one 1/510 step. */
++#include "xr_decode_table.h"
++enum {TEGU_SHADOW_CONVERT_NONE,TEGU_SHADOW_CONVERT_BGR10_XR,TEGU_SHADOW_CONVERT_BGR10_XR_SRGB,
++ TEGU_SHADOW_CONVERT_BGRA10_XR,TEGU_SHADOW_CONVERT_BGRA10_XR_SRGB};
++static unsigned tegu_xr_shadow_kind(NSUInteger format) {
++ switch(format){case 554:return TEGU_SHADOW_CONVERT_BGR10_XR;case 555:return TEGU_SHADOW_CONVERT_BGR10_XR_SRGB;
++ case 552:return TEGU_SHADOW_CONVERT_BGRA10_XR;case 553:return TEGU_SHADOW_CONVERT_BGRA10_XR_SRGB;default:return 0;}
++}
++static NSUInteger tegu_xr_source_bpp(unsigned kind) {
++ return kind==TEGU_SHADOW_CONVERT_BGR10_XR||kind==TEGU_SHADOW_CONVERT_BGR10_XR_SRGB?4:
++  kind==TEGU_SHADOW_CONVERT_BGRA10_XR||kind==TEGU_SHADOW_CONVERT_BGRA10_XR_SRGB?8:0;
++}
++static unsigned tegu_xr_source_bpp_of(unsigned kind){return (unsigned)tegu_xr_source_bpp(kind);}
++/* One row of XR texels to RGBA16F halves (tables: gen_xr_decode_table.py). */
++static void tegu_xr_decode_row(unsigned kind,const unsigned char *src,uint16_t *dst,size_t width) {
++ const uint16_t *colour=kind==TEGU_SHADOW_CONVERT_BGR10_XR_SRGB||kind==TEGU_SHADOW_CONVERT_BGRA10_XR_SRGB?
++  tegu_xr_half_srgb:tegu_xr_half_linear;
++ for(size_t x=0;x<width;x++) {
++  uint32_t r,g,b;uint16_t alpha=0x3c00u;
++  if(kind==TEGU_SHADOW_CONVERT_BGR10_XR||kind==TEGU_SHADOW_CONVERT_BGR10_XR_SRGB) {
++   uint32_t w;memcpy(&w,src+x*4,4);b=w&1023u;g=(w>>10)&1023u;r=(w>>20)&1023u;
++  } else {
++   uint16_t c[4];memcpy(c,src+x*8,8);b=c[0]>>6;g=c[1]>>6;r=c[2]>>6;alpha=tegu_xr_half_alpha[c[3]>>6];
++  }
++  dst[x*4+0]=colour[r];dst[x*4+1]=colour[g];dst[x*4+2]=colour[b];dst[x*4+3]=alpha;
++ }
++}
+ /* Owned BGRA8 copy of an IOSurface: refreshed from the surface before every
+  * command buffer that uses it and written back after one that renders into
+  * it (tegu_shadow_sync_jobs), so stride/placement need not satisfy the
+@@ -885,21 +996,30 @@ static TeguTexture *tegu_iosurface_shadow(TeguComputeDevice *self,TeguTextureDes
+     [d width]&&[d height]&&[d width]<=4096&&[d height]<=4096) {
+   const struct TeguIOSurfaceAPI *api=tegu_iosurface_api();
+   uint32_t fourcc=api?api->getPixelFormat((void *)surface):0;NSUInteger format=[d pixelFormat];
+-  int layout=(fourcc==TEGU_IOSURFACE_BGRA&&format==80)||(fourcc==TEGU_IOSURFACE_RGBA&&format==70)||
+-   (fourcc==0x4c303038u&&format==10)||        /* 'L008' one 8-bit component */
+-   (fourcc==0x4c413038u&&format==30)||        /* 'LA08' luminance+alpha, 2 bytes */
+-   (fourcc==0x32433038u&&format==30);         /* '2C08' two 8-bit components */
+-  NSUInteger bpp=tegu_texture_bytes_per_pixel(format),width=[d width],height=[d height];
++  /* XR formats: decode shadow (RGBA16F). Others: byte-exact shadow of the
++   * descriptor's own format, whose bytes per pixel must equal the surface's
++   * bytes per element (Metal's rule for IOSurface-backed textures). */
++  unsigned convert=tegu_xr_shadow_kind(format);
++  NSUInteger bpp=convert?tegu_xr_source_bpp(convert):tegu_texture_bytes_per_pixel(format),width=[d width],height=[d height];
++  int layout=bpp&&tegu_iosurface_fourcc_bpp(fourcc)==bpp;
+   NSUInteger row=api?api->getBytesPerRow((void *)surface):0,alloc=api?api->getAllocSize((void *)surface):0;
+   if(layout&&api&&api->getPlaneCount((void *)surface)==0&&api->getWidth((void *)surface)==width&&
+      api->getHeight((void *)surface)==height&&bpp&&row>=width*bpp&&row<=65536&&height<=SIZE_MAX/row&&alloc>=row*height) {
+-   TeguTexture *shadow=[self newTextureWithDescriptor:d];
+-   if(shadow&&shadow->buffer&&shadow->format==format&&shadow->levelCount==1&&!shadow->surfaceImported&&!(shadow->rowBytes&63)) {
++   TeguTexture *shadow=0;NSUInteger internal=format;
++   if(convert) {
++    TeguInternalTextureDescriptor *x=[[TeguInternalTextureDescriptor alloc] init];
++    if(x){x->type=2;x->format=115;x->width=width;x->height=height;x->depth=1;x->levels=1;x->samples=1;
++     x->arrays=1;x->options=0;x->usage=1;shadow=[self newTextureWithDescriptor:(TeguTextureDescriptor *)x];[x release];}
++    internal=115;
++   } else shadow=[self newTextureWithDescriptor:d];
++   if(shadow&&shadow->buffer&&shadow->format==internal&&shadow->levelCount==1&&!shadow->surfaceImported&&!(shadow->rowBytes&63)) {
+     shadow->shadowSurface=api->cfRetain((void *)surface);shadow->releaseImportedSurface=api->cfRelease;
++    if(convert){shadow->apiFormat=format;shadow->shadowConvert=convert;}
+     if(shadow->shadowSurface){tegu_shadow_trace(width,height,row);return shadow;}
+    }
+    [shadow release];tegu_iosurface_refused(d,surface,plane,"sampled-shadow-allocation");return 0;
+   }
++  if(!layout){tegu_iosurface_refused(d,surface,plane,bpp?"sampled-fourcc-size-mismatch":"sampled-format-unsupported");return 0;}
+  }
+  if(!(self->capabilities&512)){MARK("UNSUPPORTED iosurface_target_capability");
+   tegu_iosurface_refused(d,surface,plane,"outside-bgra8-target-class");return 0;}
+@@ -3941,6 +4061,18 @@ static void tegu_render_tile_refused(TeguRenderEncoder *e,const char *selector)
+   if(target&&(U64)target->textureWidth*target->textureHeight>=TEGU_PERF_FULL_PIXELS)pb->encFull++;else pb->encOff++;
+   if(skipPass)pb->encSkip++;else if(!perfJobs)pb->encEmpty++;
+   if(perfDontCare)pb->encDontCare++;else if(loadAction==1)pb->encLoad++;else pb->encClear++;
++  unsigned attachments=0,anyClear=0;
++  for(unsigned rt=0;rt<4;rt++) {
++   TeguTexture *t=renderTargetsValid?renderTargets[rt]:(rt?0:target);
++   if(!t)continue;
++   unsigned load=renderTargetsValid?renderLoads[rt]:(perfDontCare?0u:loadAction);
++   attachments++;pb->attLoad[load<=2?load:0]++;anyClear|=load==2;
++  }
++  if(attachments)pb->passAtt[attachments>=3?2:attachments-1]++;
++  pb->passDraws[!draws?0:draws==1?1:draws<=4?2:draws<=16?3:4]++;
++  if(!draws){if(anyClear)pb->passClearOnly++;else pb->passEmpty++;}
++  if(rasterSampleCount>1)pb->passMsaa++;
++  if(target&&target->surfaceImported)pb->passImported++;
+  }
+  ended=1;command->encoding=0;
+ }
+diff --git a/gpu/tests/iosurface_cpu_test.py b/gpu/tests/iosurface_cpu_test.py
+index d2671fc..ecad6e7 100644
+--- a/gpu/tests/iosurface_cpu_test.py
++++ b/gpu/tests/iosurface_cpu_test.py
+@@ -49,12 +49,13 @@ static const struct TeguIOSurfaceAPI *tegu_iosurface_api(void){static const stru
+ __attribute__((objc_root_class)) @interface TeguTexture {
+ @public Class isa;NSUInteger textureResourceOptions,surfaceImported,surfaceTargetVersion,levelCount,textureKind,textureDepth,format,surfaceRowBytes,surfaceAllocSize,textureWidth,textureHeight;
+ struct tegu_texture_level mip[1];NSUInteger layers,levelLayerStride[1];struct Buffer *buffer;void *importedSurface;
++void *shadowSurface;unsigned shadowConvert,shadowSeedValid;
+ }
+ - (void)getBytes:(void*)b bytesPerRow:(NSUInteger)s bytesPerImage:(NSUInteger)i fromRegion:(TeguRegion)r mipmapLevel:(NSUInteger)l slice:(NSUInteger)x;
+ - (void)replaceRegion:(TeguRegion)r mipmapLevel:(NSUInteger)l slice:(NSUInteger)x withBytes:(const void*)b bytesPerRow:(NSUInteger)s bytesPerImage:(NSUInteger)i;
+ @end
+ '''
+-head += helper + '\n@implementation TeguTexture\n'
++head += helper + '\nstatic unsigned tegu_xr_source_bpp_of(unsigned k){return k==1||k==2?4:k==3||k==4?8:0;}\n@implementation TeguTexture\n'
+ foot=r'''
+ @end
+ int main(void){
+@@ -80,7 +81,28 @@ int main(void){
+   for(unsigned i=0;i<sizeof(readback);i++)assert(readback[i]==0xa5);
+   assert(s.unlocks==oldUnlock);s.row=256;s.alloc=16384;s.fourcc=TEGU_IOSURFACE_BGRA;s.planes=0;s.w=64;s.failLock=0;t->textureResourceOptions=0;
+  }
+- object_dispose(t);puts("PASS production Nord2 IOSurface CPU access: stride/subregion/canaries and eight refusal cases");
++ object_dispose(t);
++ /* XR decode shadow (BGR10_XR 'w30r'): CPU access goes to the surface's own
++  * 4-byte texels, never to the RGBA16F backing; a write invalidates the
++  * shadow so the next command re-decodes it. */
++ struct Surface x={.w=16,.h=8,.row=64,.alloc=4096,.fourcc=0x77333072u};
++ for(unsigned i=0;i<sizeof(x.data);i++)x.data[i]=(unsigned char)(i*29+7);
++ uint8_t backing[16*8*8];memset(backing,0xee,sizeof(backing));struct Buffer xb={sizeof(backing),backing};
++ TeguTexture *xt=class_createInstance(objc_getClass("TeguTexture"),0);assert(xt);
++ xt->levelCount=1;xt->textureKind=2;xt->textureDepth=1;xt->format=115;xt->textureWidth=16;xt->textureHeight=8;
++ xt->mip[0]=(struct tegu_texture_level){16,8,128,0};xt->buffer=&xb;xt->shadowSurface=&x;xt->shadowConvert=1;xt->shadowSeedValid=1;
++ uint8_t xr[3*4*2+2];memset(xr,0xa5,sizeof(xr));TeguRegion xreg={{5,3,0},{3,2,1}};
++ [xt getBytes:xr+1 bytesPerRow:12 fromRegion:xreg mipmapLevel:0];
++ for(unsigned y=0;y<2;y++)assert(!memcmp(xr+1+y*12,x.data+(3+y)*64+5*4,12));
++ assert(xr[0]==0xa5&&xr[sizeof(xr)-1]==0xa5&&x.locks==1&&x.unlocks==1&&xt->shadowSeedValid==1);
++ uint8_t xpatch[8];memset(xpatch,0x3c,8);TeguRegion xw={{14,7,0},{2,1,1}};
++ [xt replaceRegion:xw mipmapLevel:0 withBytes:xpatch bytesPerRow:8];
++ assert(!memcmp(x.data+7*64+14*4,xpatch,8)&&xt->shadowSeedValid==0);
++ for(unsigned i=0;i<sizeof(backing);i++)assert(backing[i]==0xee);
++ TeguRegion xbad={{15,0,0},{2,1,1}};memset(xr,0xa5,sizeof(xr));
++ [xt getBytes:xr bytesPerRow:12 fromRegion:xbad mipmapLevel:0];for(unsigned i=0;i<sizeof(xr);i++)assert(xr[i]==0xa5);
++ object_dispose(xt);
++ puts("PASS production Nord2 IOSurface CPU access: stride/subregion/canaries, eight refusal cases, XR decode-shadow surface access");
+ }
+ '''
+ f=out/'iosurface_cpu.m';f.write_text(head+methods+foot)
