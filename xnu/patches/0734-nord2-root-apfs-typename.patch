@@ -1,0 +1,80 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -359,6 +359,69 @@
+ 	printf("NORD2 HFSAPFS: HFS vnop_ioctl wrapped (slot %d), mode %u\n", vnop_ioctl_desc.vdesc_offset, sweet_hfsapfs_mode);
+ }
+ 
++/*
++ * 0734 (jbts-20261115): the root volume reported to statfs()/getfsstat()/getattrlist() as "apfs" once fileproviderd starts.
++ * [V unified log, 43ts+fplog1 boot 647978C1] fileproviderd: "[INFO] Non-eligible device /dev/ufsroot0 [16777216]: non-apfs";
++ * [V disasm 20H392] -[FPDVolume isEligibleForFPFS:] takes the getfsstat64 entry and requires MNT_LOCAL, !MNT_RDONLY and
++ * strcasecmp(f_fstypename, "apfs") == 0; -[FPDVolumeManager loadSingleVolume:role:] skips a non-eligible volume ("Volume %s not
++ * eligible to store FP library, skipping"), so no FileProvider library exists and the LocalStorage ("On My iPhone") domain is never
++ * imported. XNU's own per-mount type-name override (vfs_mount_override_type_name, MNTK_TYPENAME_OVERRIDE: statfs/getattrlist only;
++ * the kernel keeps using vfc_name "hfs") is set on the root mount when the first fileproviderd binary is exec'd -- after launchd's
++ * boot tasks (fsck / mount -uw choose their helper from the type name). Global for statfs readers from then on.
++ *   kern.n2fsapfs  1 = do it (default), 0 = never / write 0 at run time = report "hfs" again (override set back to "hfs")
++ *   boot-arg n2fsapfs=0 disables.  Log "NORD2 FSAPFS: ...".
++ */
++static unsigned int sweet_fsapfs_mode = 1;
++static int sweet_fsapfs_done;
++static mount_t sweet_fsapfs_mp;
++static int
++sweet_fsapfs_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	unsigned int v = sweet_fsapfs_mode;
++	int error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	sweet_fsapfs_mode = v ? 1 : 0;
++	if (sweet_fsapfs_mp != NULL) {
++		vfs_mount_override_type_name(sweet_fsapfs_mp, v ? "apfs" : "hfs");
++		printf("NORD2 FSAPFS: root type name now reported as %s (sysctl)\n", v ? "apfs" : "hfs");
++	}
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, n2fsapfs, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sweet_fsapfs_sysctl, "I",
++    "0734: report the HFS root as apfs to statfs once fileproviderd runs (0 off)");
++
++static void
++sweet_fsapfs_check(struct vnode *vp)
++{
++	char path[256];
++	int len = sizeof(path);
++	mount_t mp;
++	unsigned int v;
++
++	if (sweet_fsapfs_done || vp == NULL || vnode_vtype(vp) != VREG || (mp = vnode_mount(vp)) == NULL ||
++	    !(vfs_flags(mp) & MNT_ROOTFS) || vn_getpath(vp, path, &len) != 0) {
++		return;
++	}
++	len = (int)strlen(path);
++	if (len < 14 || strcmp(path + len - 14, "/fileproviderd") != 0 || !__sync_bool_compare_and_swap(&sweet_fsapfs_done, 0, 1)) {
++		return;
++	}
++	if (PE_parse_boot_argn("n2fsapfs", &v, sizeof(v))) {
++		sweet_fsapfs_mode = v ? 1 : 0;
++	}
++	if (strncmp(vfs_statfs(mp)->f_fstypename, "hfs", MFSNAMELEN) != 0) {
++		printf("NORD2 FSAPFS: root fs is '%s', nothing done\n", vfs_statfs(mp)->f_fstypename);
++		return;
++	}
++	sweet_fsapfs_mp = mp;
++	if (sweet_fsapfs_mode) {
++		vfs_mount_override_type_name(mp, "apfs");
++	}
++	printf("NORD2 FSAPFS: %s exec'd: root type name reported as %s\n", path, sweet_fsapfs_mode ? "apfs" : "hfs (disabled)");
++}
++
+ static int
+ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+     __unused cpu_type_t cpu_type, struct cs_blob *cs_blob,
+@@ -369,6 +432,7 @@
+ 	mount_t mp = vnode_mount(vp);
+ 	*cs_flags |= CS_SIGNED;
+ 	sweet_hfsapfs_install(vp);                      /* 0733: once, HFS is registered long before the first exec */
++	sweet_fsapfs_check(vp);                         /* 0734 */
+ 	{                                               /* 0731: which file-provider binaries get loaded at all */
+ 		extern int sweet_sblog_sig(struct vnode *vp);
+ 		(void)sweet_sblog_sig(vp);

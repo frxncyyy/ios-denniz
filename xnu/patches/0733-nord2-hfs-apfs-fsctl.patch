@@ -1,0 +1,121 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -255,6 +255,110 @@
+  * platform binary. New signatures (ubc_cs_blob_add passes its writable copy;
+  * revalidation passes the read-only blob itself) get their entitlements here.
+  */
++/*
++ * 0733 (jbts-20261115): HFS answers FileProvider's APFS fsctls ('On My iPhone' missing in Files / document picker).
++ * iOS 16 FileProvider assumes APFS: e.g. fpfs_fget_parent_syncroot() = ffsctl(fd, 0x40084A4A = _IOR('J', 74, 8), buf, 0) [V disasm,
++ * FileProvider.framework 20H392]. Our HFS hfs_vnop_ioctl() ends in "default: return ENOTTY" [V source], so every APFS ('J') query of
++ * the file-provider stack fails with ENOTTY. Written from the description of DenialOfGravity/ios-redfin commit 101171d (same idea,
++ * own code): the HFS vnode-op vector's vnop_ioctl slot is wrapped once at the first exec; when HFS returns ENOTTY for a group 'J'
++ * command from fileproviderd / LocalStorageFileProvider / Files, a read-only command (IOC_OUT only, <= 64 bytes, buffer present) is
++ * answered with zeros and 0, any other 'J' command with ENOTSUP. Everything else (other processes, other groups, any result
++ * but ENOTTY) is passed through unchanged (redfin: answering launchd/keybagd/apfs_iosd broke boot).
++ *   kern.n2hfsapfs  0 = pass-through (old behaviour), 1 = answer (default); boot-arg n2hfsapfs=N
++ *   log "NORD2 HFSAPFS: <proc>[pid] cmd 0x.. ('J' n, len l, dir d) -> rc", first 16 distinct commands + every 64th call after
++ */
++#include <sys/ioccom.h>
++#include <sys/vnode_if.h>
++#include <sys/vnode_internal.h>
++#include <sys/sysctl.h>
++#include <pexpert/pexpert.h>
++static int (*sweet_hfsapfs_orig)(void *);
++static unsigned int sweet_hfsapfs_mode = 1;
++static uint32_t sweet_hfsapfs_seen[16];
++static unsigned int sweet_hfsapfs_nseen, sweet_hfsapfs_calls;
++SYSCTL_UINT(_kern, OID_AUTO, n2hfsapfs, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_hfsapfs_mode, 0,
++    "0733: HFS answers APFS 'J' fsctls of the file-provider stack: 0 off, 1 on");
++
++static int
++sweet_hfsapfs_watched(const char *n)
++{
++	return strcmp(n, "fileproviderd") == 0 || strncmp(n, "LocalStorageFile", 16) == 0 || strcmp(n, "Files") == 0;
++}
++
++static int
++sweet_hfsapfs_ioctl(void *v)
++{
++	struct vnop_ioctl_args *ap = v;
++	int rc = sweet_hfsapfs_orig(v), out = rc;
++	u_long cmd = ap->a_command;
++	char name[32];
++
++	if (rc != ENOTTY || sweet_hfsapfs_mode == 0 || IOCGROUP(cmd) != 'J') {
++		return rc;
++	}
++	proc_selfname(name, sizeof(name));
++	if (!sweet_hfsapfs_watched(name)) {
++		return rc;
++	}
++	if ((cmd & IOC_DIRMASK) == IOC_OUT && IOCPARM_LEN(cmd) <= 64 && ap->a_data != NULL) {
++		bzero(ap->a_data, IOCPARM_LEN(cmd));
++		out = 0;
++	} else {
++		out = ENOTSUP;
++	}
++	unsigned int calls = __sync_add_and_fetch(&sweet_hfsapfs_calls, 1);
++	int fresh = 1;
++	for (unsigned int i = 0; i < sweet_hfsapfs_nseen && i < 16; i++) {
++		if (sweet_hfsapfs_seen[i] == (uint32_t)cmd) {
++			fresh = 0;
++		}
++	}
++	if (fresh && sweet_hfsapfs_nseen < 16) {
++		sweet_hfsapfs_seen[sweet_hfsapfs_nseen++] = (uint32_t)cmd;
++	}
++	if (fresh || (calls % 64) == 0) {
++		printf("NORD2 HFSAPFS: %s[%d] cmd 0x%lx ('J' %lu, len %lu, dir 0x%lx) -> %d (call %u)\n", name, proc_selfpid(), cmd,
++		    (unsigned long)(cmd & 0xff), (unsigned long)IOCPARM_LEN(cmd), (unsigned long)(cmd & IOC_DIRMASK), out, calls);
++	}
++	return out;
++}
++
++static void
++sweet_hfsapfs_install(struct vnode *vp)
++{
++	static int done;
++	unsigned int v;
++	int (**ops)(void *);
++	mount_t mp;
++
++	/* the root volume's regular-file op vector is hfs_vnodeop_p (a local symbol of the HFS objects): take it from a signed
++	 * binary's vnode on the HFS root, once */
++	if (done || vp == NULL || vnode_vtype(vp) != VREG || (mp = vnode_mount(vp)) == NULL || !(vfs_flags(mp) & MNT_ROOTFS)) {
++		return;
++	}
++	if (strncmp(vfs_statfs(mp)->f_fstypename, "hfs", MFSNAMELEN) != 0) {
++		static int told;
++		if (!told++) {
++			printf("NORD2 HFSAPFS: root fs is '%s', not hfs: not installed\n", vfs_statfs(mp)->f_fstypename);
++		}
++		return;
++	}
++	if (!__sync_bool_compare_and_swap(&done, 0, 1)) {
++		return;
++	}
++	if (PE_parse_boot_argn("n2hfsapfs", &v, sizeof(v))) {
++		sweet_hfsapfs_mode = v;
++	}
++	ops = vp->v_op;
++	if (ops == NULL || ops[vnop_ioctl_desc.vdesc_offset] == NULL) {
++		printf("NORD2 HFSAPFS: no HFS vnode-op vector, not installed\n");
++		return;
++	}
++	sweet_hfsapfs_orig = ops[vnop_ioctl_desc.vdesc_offset];
++	ops[vnop_ioctl_desc.vdesc_offset] = sweet_hfsapfs_ioctl;
++	printf("NORD2 HFSAPFS: HFS vnop_ioctl wrapped (slot %d), mode %u\n", vnop_ioctl_desc.vdesc_offset, sweet_hfsapfs_mode);
++}
++
+ static int
+ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+     __unused cpu_type_t cpu_type, struct cs_blob *cs_blob,
+@@ -264,6 +368,7 @@
+ {
+ 	mount_t mp = vnode_mount(vp);
+ 	*cs_flags |= CS_SIGNED;
++	sweet_hfsapfs_install(vp);                      /* 0733: once, HFS is registered long before the first exec */
+ 	{                                               /* 0731: which file-provider binaries get loaded at all */
+ 		extern int sweet_sblog_sig(struct vnode *vp);
+ 		(void)sweet_sblog_sig(vp);

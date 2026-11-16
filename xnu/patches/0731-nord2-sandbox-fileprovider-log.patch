@@ -1,0 +1,161 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -264,6 +264,10 @@
+ {
+ 	mount_t mp = vnode_mount(vp);
+ 	*cs_flags |= CS_SIGNED;
++	{                                               /* 0731: which file-provider binaries get loaded at all */
++		extern int sweet_sblog_sig(struct vnode *vp);
++		(void)sweet_sblog_sig(vp);
++	}
+ 	if (mp != NULL && (vfs_flags(mp) & MNT_ROOTFS)) {
+ 		*cs_flags |= CS_PLATFORM_BINARY;
+ 	}
+@@ -584,8 +588,107 @@
+ 	return error;
+ }
+ 
++/*
++ * 0731 (jbts-20261115): diagnostic log of the Sandbox / AMFI policy calls and privilege denials of the file-provider stack
++ * ('On My iPhone' missing: fileproviderd never launches com.apple.FileProvider.LocalStorage). For processes whose name holds one of
++ * fileprovid, LocalStorage, Files, DocumentManag, pkd, extensionkit, TrollStore, launchd, every call is logged with its result:
++ *   "SWEET SBLOG: <proc>[pid] Sandbox op N -> rc"  (op 2 = sandbox_check: + subject pid/name, operation, filter type, argument)
++ *   "SWEET SBLOG: <proc>[pid] AMFI op N -> rc"     "SWEET SBLOG: <proc>[pid] privilege N denied"
++ * kern.n2sblog: 0 off, 1 on (default); kern.n2sblog_left: lines left (default 800; write a number to re-arm). launchd's op 2 lines
++ * are kept only when the subject is one of the watched names (it checks mach-lookups for everybody). Read-only, never changes a result.
++ */
++static unsigned int sweet_sblog_on = 1;
++static int sweet_sblog_left = 800;
++SYSCTL_UINT(_kern, OID_AUTO, n2sblog, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_sblog_on, 0, "0731: Sandbox/AMFI call log for the file-provider stack");
++SYSCTL_INT(_kern, OID_AUTO, n2sblog_left, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_sblog_left, 0, "0731: log lines left");
++
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
++sweet_sblog_watched(const char *n)
++{
++	static const char *const w[] = { "fileprovid", "LocalStorage", "Files", "DocumentManag", "pkd", "extensionkit", "TrollStore", "FileProvider" };
++	for (unsigned i = 0; i < sizeof(w) / sizeof(w[0]); i++) {
++		if (sweet_name_has(n, w[i])) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++static int
++sweet_sblog_take(void)
++{
++	if (!sweet_sblog_on || sweet_sblog_left <= 0) {
++		return 0;
++	}
++	return __sync_sub_and_fetch(&sweet_sblog_left, 1) >= 0;
++}
++
++static void
++sweet_sblog_sandbox(struct proc *p, int call, user_addr_t arg, int rc)
++{
++	char name[32], subject[32] = "", op[64] = "", what[160] = "";
++	uint64_t a[7];
++	size_t done = 0;
++	int is_launchd;
++
++	if (!sweet_sblog_on || sweet_sblog_left <= 0) {
++		return;
++	}
++	proc_name(proc_pid(p), name, sizeof(name));
++	is_launchd = strcmp(name, "launchd") == 0;
++	if (!is_launchd && !sweet_sblog_watched(name)) {
++		return;
++	}
++	if (call == 2 && arg != USER_ADDR_NULL && proc_is64bit(p) && copyin(arg, a, sizeof(a)) == 0) {
++		if (a[1] != 0 && a[1] <= (uint64_t)INT32_MAX) {
++			proc_name((int)a[1], subject, sizeof(subject));
++		}
++		if (a[2] != 0 && copyinstr((user_addr_t)a[2], op, sizeof(op), &done) != 0) {
++			strlcpy(op, "?", sizeof(op));
++		}
++		if ((a[3] == 1 || a[3] == 6 || a[3] == 7) && a[4] != 0 && copyinstr((user_addr_t)a[4], what, sizeof(what), &done) != 0) {
++			strlcpy(what, "?", sizeof(what));
++		}
++		if (is_launchd && !sweet_sblog_watched(subject)) {
++			return;
++		}
++		if (sweet_sblog_take()) {
++			printf("SWEET SBLOG: %s[%d] Sandbox op 2 -> %d subject %s[%d] '%s' type %llu '%s'\n", name, proc_pid(p), rc, subject,
++			    (int)a[1], op, (unsigned long long)a[3], what);
++		}
++		return;
++	}
++	if (is_launchd) {
++		return;
++	}
++	if (sweet_sblog_take()) {
++		printf("SWEET SBLOG: %s[%d] Sandbox op %d -> %d\n", name, proc_pid(p), call, rc);
++	}
++}
++
++int sweet_sblog_sig(struct vnode *vp);
++int
++sweet_sblog_sig(struct vnode *vp)
++{
++	char path[256], name[32];
++	int len = sizeof(path);
++
++	if (!sweet_sblog_on || sweet_sblog_left <= 0 || vp == NULL || vn_getpath(vp, path, &len) != 0) {
++		return 0;
++	}
++	if (!sweet_name_has(path, "FileProvider") && !sweet_name_has(path, "LocalStorage") && !sweet_name_has(path, "DocumentsApp") &&
++	    !sweet_name_has(path, "DocumentManager") && !sweet_name_has(path, "/Files.app/")) {
++		return 0;
++	}
++	if (sweet_sblog_take()) {
++		proc_selfname(name, sizeof(name));
++		printf("SWEET SBLOG: %s[%d] code signature %s\n", name, proc_selfpid(), path);
++	}
++	return 1;
++}
++
++static int
++sweet_sandbox_syscall_inner(struct proc *p, int call, user_addr_t arg)
+ {
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+ 		sweet_sandbox_seen |= 1ULL << call;
+@@ -611,6 +714,14 @@
+ 	}
+ }
+ 
++static int
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
++{
++	int rc = sweet_sandbox_syscall_inner(p, call, arg);
++	sweet_sblog_sandbox(p, call, arg, rc);         /* 0731 */
++	return rc;
++}
++
+ /*
+  * Policy "AMFI": dyld asks the kernel what a process may do before it expands
+  * @rpath, @executable_path and @loader_path, via __mac_syscall("AMFI", 90,
+@@ -641,6 +752,13 @@
+ sweet_amfi_policy_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+ 	char name[32];
++	{                                               /* 0731 */
++		char wn[32];
++		proc_name(proc_pid(p), wn, sizeof(wn));
++		if (call != SWEET_AMFI_OP_DYLD_POLICY && sweet_sblog_watched(wn) && sweet_sblog_take()) {
++			printf("SWEET SBLOG: %s[%d] AMFI op %d -> %d\n", wn, proc_pid(p), call, ENOPOLICY);
++		}
++	}
+ 	if (call >= 0 && call < 128 && call != SWEET_AMFI_OP_DYLD_POLICY &&
+ 	    !(sweet_amfi_seen & (1ULL << (call & 63)))) {
+ 		sweet_amfi_seen |= 1ULL << (call & 63);
+@@ -701,6 +819,9 @@
+ 	}
+ 	char name[20];
+ 	proc_selfname(name, sizeof(name));
++	if (sweet_sblog_watched(name) && sweet_sblog_take()) {      /* 0731 */
++		printf("SWEET SBLOG: %s privilege %d denied\n", name, priv);
++	}
+ 	for (int i = 0; i < sweet_priv_logged_count; i++) {
+ 		if (sweet_priv_logged[i].priv == priv &&
+ 		    strncmp(sweet_priv_logged[i].name, name, sizeof(name)) == 0) {

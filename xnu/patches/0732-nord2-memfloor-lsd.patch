@@ -1,0 +1,84 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -183,6 +183,64 @@
+ #include "kern_exec_internal.h"
+ 
+ static void nord2_memgov_start_once(void);      /* 0420 */
++/*
++ * 0732 (jbts-20261115): per-process memory limit floor for the LaunchServices/installer/file-provider daemons.
++ * com.apple.jetsamproperties.D22.plist gives lsd ActiveSoftMemoryLimit 16 / InactiveHardMemoryLimit 12 MB (Apple's values); on this
++ * port a full LaunchServices database rebuild (LS caches moved aside by an app install/undo payload) takes lsd past that and the
++ * kernel kills it ("CRASH lsd ... reason ns 1 code 0x7" = OS_REASON_JETSAM / JETSAM_REASON_MEMORY_PERPROCESSLIMIT, fp2 capture):
++ * the database never completes, apps registered at runtime (TrollStore) do not launch, PlugInKit lookups fail.
++ * When launchd/xpcproxy spawn lsd, installd, pkd, fileproviderd or containermanagerd with jetsam limits, a positive limit below
++ * kern.n2memfloor MB (default 128; 0 = off) is raised to it; fatal/non-fatal and the priority band are kept. Log "NORD2 MEMFLOOR:".
++ */
++static unsigned int nord2_memfloor_mb = 128;
++SYSCTL_UINT(_kern, OID_AUTO, n2memfloor, CTLFLAG_RW | CTLFLAG_LOCKED, &nord2_memfloor_mb, 0,
++    "0732: minimum per-process memory limit (MB) for lsd/installd/pkd/fileproviderd/containermanagerd, 0 off");
++static int
++nord2_memfloor_name(proc_t p)
++{
++	static const char *const names[] = { "lsd", "installd", "pkd", "fileproviderd", "containermanagerd" };
++	const char *n = p->p_name[0] ? p->p_name : p->p_comm;
++	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
++		if (strcmp(n, names[i]) == 0) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++/* the same floor for limits the process already carries (set when launchd spawned xpcproxy, kept across xpcproxy's exec) */
++static void
++nord2_memfloor_inherited(proc_t p)
++{
++	int32_t f = (int32_t)nord2_memfloor_mb, a = p->p_memstat_memlimit_active, i = p->p_memstat_memlimit_inactive;
++	if (f <= 0 || !nord2_memfloor_name(p) || !((a > 0 && a < f) || (i > 0 && i < f))) {
++		return;
++	}
++	memorystatus_update(p, p->p_memstat_requestedpriority, 0, FALSE, FALSE, TRUE,
++	    (a > 0 && a < f) ? f : a, (p->p_memstat_state & P_MEMSTAT_MEMLIMIT_ACTIVE_FATAL) ? TRUE : FALSE,
++	    (i > 0 && i < f) ? f : i, (p->p_memstat_state & P_MEMSTAT_MEMLIMIT_INACTIVE_FATAL) ? TRUE : FALSE);
++	printf("NORD2 MEMFLOOR: %s[%d] inherited limit active %d -> %d MB, inactive %d -> %d MB\n", p->p_name, proc_getpid(p), a,
++	    p->p_memstat_memlimit_active, i, p->p_memstat_memlimit_inactive);
++}
++
++static void
++nord2_memfloor_apply(proc_t p, struct _posix_spawnattr *sa)
++{
++	int32_t f = (int32_t)nord2_memfloor_mb, oa = sa->psa_memlimit_active, oi = sa->psa_memlimit_inactive;
++	const char *n = p->p_name[0] ? p->p_name : p->p_comm;
++
++	if (f <= 0 || !nord2_memfloor_name(p)) {
++		return;
++	}
++	if (sa->psa_memlimit_active > 0 && sa->psa_memlimit_active < f) {
++		sa->psa_memlimit_active = f;
++	}
++	if (sa->psa_memlimit_inactive > 0 && sa->psa_memlimit_inactive < f) {
++		sa->psa_memlimit_inactive = f;
++	}
++	printf("NORD2 MEMFLOOR: %s[%d] limit active %d -> %d MB, inactive %d -> %d MB (flags 0x%x)\n", n, proc_getpid(p), oa,
++	    sa->psa_memlimit_active, oi, sa->psa_memlimit_inactive, sa->psa_jetsam_flags);
++}
+ static void nord2_clockfloor_once(void);        /* 0530 */
+ static void nord2_memgov_note_exec(struct image_params *imgp, proc_t p);      /* 0484 */
+ 
+@@ -4461,6 +4519,7 @@
+ 
+ 		/* Has jetsam attributes? */
+ 		if (imgp->ip_px_sa != NULL && (px_sa.psa_jetsam_flags & POSIX_SPAWN_JETSAM_SET)) {
++			nord2_memfloor_apply(p, &px_sa);      /* 0732 */
+ 			/*
+ 			 * With 2-level high-water-mark support, POSIX_SPAWN_JETSAM_HIWATER_BACKGROUND is no
+ 			 * longer relevant, as background limits are described via the inactive limit slots.
+@@ -4487,6 +4546,8 @@
+ 			}
+ 		}
+ 
++		nord2_memfloor_inherited(p);          /* 0732 */
++
+ 		/* Has jetsam relaunch behavior? */
+ 		if (imgp->ip_px_sa != NULL && (px_sa.psa_jetsam_flags & POSIX_SPAWN_JETSAM_RELAUNCH_BEHAVIOR_MASK)) {
+ 			/*

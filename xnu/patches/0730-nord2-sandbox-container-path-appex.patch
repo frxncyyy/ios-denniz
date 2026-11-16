@@ -1,0 +1,161 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -442,6 +442,148 @@
+ 	return copyout(&handle, (user_addr_t)a[2], sizeof(handle));
+ }
+ 
++/*
++ * 0730 (jbts-20261115): "container path" (op 4) for app extensions.
++ * libsystem_sandbox sandbox_container_path_for_pid(pid, buf, len) = __mac_syscall("Sandbox", 4,
++ * { int64 pid (0 = self); u64 audit token pointer (0); u64 buf; u64 buflen; u64 0 }) [iOS 16.7 disasm].  PlugInKit checks it in
++ * EVERY extension process at start (func_1aaf39c64: error or strlen(path) <= 1 -> NSInternalInconsistencyException "plugin has
++ * invalid sandbox or container: error %d path %s" -> abort).  The stand-in answered ENOENT, so every .appex view service died at
++ * once: com.apple.DocumentManager.Service (UIDocumentPickerViewController) -> "Couldn't communicate with a helper application"
++ * in TrollStore "Install IPA File" (phone, ts1 capture: sig 6, bt objc_exception_throw <- PlugInKit).
++ * Answer (self only, no audit token) with the process's own HOME (xpcproxy/RunningBoard set it to the data container), read from
++ * its exec strings (the env block below user_stack, as KERN_PROCARGS2), else "/private/var/mobile".
++ *   kern.n2sbcont  0 = ENOENT for everyone (before 0730); 1 = processes whose executable is inside a ".appex/" (default);
++ *                  2 = also any process whose HOME is under /var/mobile/Containers/.  Boot-arg n2sbcont=N sets the start value.
++ * Log: "NORD2 SBCONT: <name>[pid] container -> <path> (<why>)", first 32 answers.
++ */
++#include <sys/sysctl.h>
++#include <sys/proc_internal.h>
++#include <kern/kalloc.h>
++#define SWEET_SBCONT_MIN(a, b) ((a) < (b) ? (a) : (b))
++static unsigned int sweet_sbcont_mode = 1;
++static int sweet_sbcont_bootarg_done;
++static unsigned int sweet_sbcont_logged;
++SYSCTL_UINT(_kern, OID_AUTO, n2sbcont, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_sbcont_mode, 0,
++    "0730: Sandbox container path for 0 none, 1 .appex processes, 2 + containerized HOME");
++
++/* Pure helper (host-tested in jbts-20261115/piece-0730/test): pick the answer from the executable path and the exec-string block. */
++int sweet_sbcont_pick(unsigned int mode, const char *exe, const char *blk, size_t blen, char *out, size_t outlen, const char **why);
++int
++sweet_sbcont_pick(unsigned int mode, const char *exe, const char *blk, size_t blen, char *out, size_t outlen, const char **why)
++{
++	const char *home = NULL;
++	size_t hlen = 0, i = 0;
++	int appex = 0, contained = 0;
++
++	if (mode == 0 || outlen < 2) {
++		return ENOENT;
++	}
++	for (const char *s = exe; s != NULL && *s; s++) {
++		if (strncmp(s, ".appex/", 7) == 0) {
++			appex = 1;
++			break;
++		}
++	}
++	while (blk != NULL && i < blen) {               /* NUL-separated strings; the last HOME= wins (env comes after argv) */
++		size_t n = strnlen(blk + i, blen - i);
++		if (n > 5 && strncmp(blk + i, "HOME=", 5) == 0 && blk[i + 5] == '/') {
++			home = blk + i + 5;
++			hlen = n - 5;
++		}
++		i += n + 1;
++	}
++	if (home != NULL && (strncmp(home, "/private/var/mobile/Containers/", 31) == 0 ||
++	    strncmp(home, "/var/mobile/Containers/", 23) == 0)) {
++		contained = 1;
++	}
++	if (!(appex || (mode >= 2 && contained))) {
++		return ENOENT;
++	}
++	if (home != NULL && hlen > 1) {
++		const char *pre = strncmp(home, "/var/", 5) == 0 ? "/private" : "";
++		size_t plen = strlen(pre);
++		if (plen + hlen + 1 > outlen) {
++			return ERANGE;
++		}
++		memcpy(out, pre, plen);
++		memcpy(out + plen, home, hlen);
++		out[plen + hlen] = '\0';
++		*why = contained ? "HOME container" : "HOME";
++		return 0;
++	}
++	if (outlen < sizeof("/private/var/mobile")) {
++		return ERANGE;
++	}
++	strlcpy(out, "/private/var/mobile", outlen);
++	*why = "no HOME, mobile home";
++	return 0;
++}
++
++static int
++sweet_sandbox_container_path(struct proc *p, user_addr_t arg)
++{
++	struct {
++		int64_t  pid;
++		uint64_t token;
++		uint64_t buf;
++		uint64_t len;
++		uint64_t flags;
++	} a;
++	char exe[MAXPATHLEN], ans[MAXPATHLEN];
++	const char *why = "";
++	int elen = sizeof(exe), error;
++	vnode_t vp;
++	char *blk = NULL;
++	size_t blen = 0;
++
++	if (!sweet_sbcont_bootarg_done) {
++		unsigned int v;
++		if (PE_parse_boot_argn("n2sbcont", &v, sizeof(v))) {
++			sweet_sbcont_mode = v;
++		}
++		sweet_sbcont_bootarg_done = 1;
++	}
++	if (sweet_sbcont_mode == 0 || arg == USER_ADDR_NULL || !proc_is64bit(p)) {
++		return ENOENT;
++	}
++	if (copyin(arg, &a, sizeof(a)) != 0) {
++		return EFAULT;
++	}
++	if ((a.pid != 0 && a.pid != proc_pid(p)) || a.token != 0 || a.buf == 0 || a.len < 2) {
++		return ENOENT;                          /* only "my own container" is answered */
++	}
++	exe[0] = '\0';
++	vp = proc_getexecutablevnode(p);
++	if (vp != NULLVP) {
++		if (vn_getpath(vp, exe, &elen) != 0) {
++			exe[0] = '\0';
++		}
++		vnode_put(vp);
++	}
++	if (p->p_argslen > 0 && p->user_stack != 0) {
++		blen = SWEET_SBCONT_MIN((size_t)p->p_argslen, (size_t)32768);        /* env strings are at the end of the block */
++		blk = kalloc_data(blen, Z_WAITOK);
++		if (blk != NULL && copyin(p->user_stack - blen, blk, blen) != 0) {
++			kfree_data(blk, blen);
++			blk = NULL;
++		}
++	}
++	error = sweet_sbcont_pick(sweet_sbcont_mode, exe, blk, blk != NULL ? blen : 0, ans, SWEET_SBCONT_MIN(sizeof(ans), (size_t)a.len), &why);
++	if (blk != NULL) {
++		kfree_data(blk, blen);
++	}
++	if (error == 0) {
++		error = copyout(ans, (user_addr_t)a.buf, strlen(ans) + 1);
++	}
++	if (error == 0 && sweet_sbcont_logged < 32) {
++		char name[32];
++		sweet_sbcont_logged++;
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("NORD2 SBCONT: %s[%d] container -> %s (%s)\n", name, proc_pid(p), ans, why);
++	}
++	return error;
++}
++
+ static int
+ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+@@ -460,7 +602,8 @@
+ 		return sweet_sandbox_extension_issue(p, arg);
+ 	case 6:         /* extension consume (0288) */
+ 		return sweet_sandbox_extension_consume(p, arg);
+-	case 4:         /* container path (audit token / pid) */
++	case 4:         /* container path (audit token / pid): 0730 answers app extensions */
++		return sweet_sandbox_container_path(p, arg);
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:
