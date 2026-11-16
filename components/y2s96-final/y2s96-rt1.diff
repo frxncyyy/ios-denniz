@@ -1,0 +1,749 @@
+diff -ru y2s96-final/base-src-y2s95/air_metal.c y2s96-final/src/air_metal.c
+--- y2s96-final/base-src-y2s95/air_metal.c	2026-11-13 12:49:07.807116721 +0100
++++ y2s96-final/src/air_metal.c	2026-11-13 13:47:00.492544678 +0100
+@@ -80,10 +80,41 @@
+ void rwa_tg_ubo_stats(uint64_t *zeroed, uint64_t *saved);
+ 
+ /* the Metal driver keeps its own copy of this struct (userland/src/redwoodmetal.m) */
+-_Static_assert(sizeof(struct rwa_draw) == 328 && offsetof(struct rwa_draw, viewport) == 296 &&
+-               offsetof(struct rwa_draw, color_level) == 304 && offsetof(struct rwa_draw, depth_level) == 320,
++_Static_assert(sizeof(struct rwa_draw) == 360 && offsetof(struct rwa_draw, viewport) == 296 &&
++               offsetof(struct rwa_draw, color_level) == 304 && offsetof(struct rwa_draw, depth_level) == 320 &&
++               offsetof(struct rwa_draw, load_actions) == 328 && offsetof(struct rwa_draw, fb_magic) == 352,
+                "struct rwa_draw must match userland/src/redwoodmetal.m");
+ 
++/* y2s96 (rt1): rwa_pan_fb.c, which reads and writes Panfrost's batch and resource state (see its header) */
++#ifdef GALLIUM_PANFROST
++struct rwa_fb_pass {
++   unsigned nr;
++   const unsigned *load, *store;
++   unsigned flags;
++};
++void rwa_fb_begin(struct pipe_context *pipe, const struct rwa_fb_pass *p);
++void rwa_fb_end(struct pipe_context *pipe, const struct rwa_fb_pass *p);
++void rwa_fb_flushed(void);
++void rwa_fb_note_read(struct pipe_resource *res);
++void rwa_fb_note_shared(struct pipe_resource *res);
++void rwa_fb_forget(struct pipe_resource *res, bool table);
++void rwa_fb_counters(uint64_t out[16]);
++void rwa_fb_count(unsigned which, unsigned n);
++#define RWA_FB_READ(res)   rwa_fb_note_read(res)
++#define RWA_FB_SHARED(res) rwa_fb_note_shared(res)
++#define RWA_FB_FORGET(res, table) rwa_fb_forget((res), (table))
++#define RWA_FB_FLUSHED()   rwa_fb_flushed()
++#define RWA_FB_COUNT(w, n) rwa_fb_count((w), (n))
++#else
++#define RWA_FB_READ(res)   ((void)0)
++#define RWA_FB_SHARED(res) ((void)0)
++#define RWA_FB_FORGET(res, table) ((void)0)
++#define RWA_FB_FLUSHED()   ((void)0)
++#define RWA_FB_COUNT(w, n) ((void)0)
++#endif
++/* the draw's y2s96 fields, only from a driver that fills them */
++#define DRAW_FB(d) ((d)->fb_magic == RWA_FB_MAGIC)
++
+ /*
+  * ONE THREAD AT A TIME in the Gallium context. A Metal device is used from every thread of a
+  * process and this library holds one pipe_context per device, which Mesa does not make safe to
+@@ -2194,7 +2225,10 @@
+    const struct rwa_surface_import import = {
+       .id = surface_id, .offset = offset, .row_bytes = row_bytes };
+ 
+-   return texture_of_shape(device, shape, &import, why, why_size);
++   struct rwa_texture *st = texture_of_shape(device, shape, &import, why, why_size);
++   if (st && st->res)
++      RWA_FB_SHARED(st->res);   /* y2s96: another process may read it */
++   return st;
+ }
+ 
+ struct rwa_texture *
+@@ -2212,7 +2246,10 @@
+       .id = surface_id, .offset = offset, .row_bytes = row_bytes,
+       .chroma_offset = chroma_offset, .chroma_row_bytes = chroma_row_bytes };
+ 
+-   return texture_of_shape(device, shape, &import, why, why_size);
++   struct rwa_texture *st = texture_of_shape(device, shape, &import, why, why_size);
++   if (st && st->res)
++      RWA_FB_SHARED(st->res);   /* y2s96 */
++   return st;
+ }
+ 
+ /*
+@@ -2256,7 +2293,10 @@
+       .id = (int)out.handle, .offset = (unsigned)offset, .row_bytes = (unsigned)row_bytes,
+       .kind = "buffer" };
+ 
+-   return texture_of_shape(device, shape, &import, why, why_size);
++   struct rwa_texture *bt = texture_of_shape(device, shape, &import, why, why_size);
++   if (bt && bt->res)
++      RWA_FB_SHARED(bt->res);   /* y2s96: the buffer's memory is read through the buffer too */
++   return bt;
+ }
+ 
+ /* Metal's view casts, from Apple's table for -newTextureViewWithPixelFormat:textureType:
+@@ -2437,6 +2477,7 @@
+     */
+    if (texture->view)
+       texture->device->pipe->sampler_view_destroy(texture->device->pipe, texture->view);
++   RWA_FB_FORGET(texture->res, !texture->is_view);   /* y2s96: no pointer to it kept in rwa_pan_fb.c (a cleared valid bit put back) */
+    pipe_surface_reference(&texture->surface, NULL);   /* (a pending batch holds its own) */
+    for (unsigned i = 0; i < texture->others; i++)
+       pipe_surface_reference(&texture->other[i].surface, NULL);
+@@ -2636,6 +2677,7 @@
+    struct pipe_box box;
+    size_t row;
+ 
++   RWA_FB_READ(texture->res);   /* y2s96 */
+    if (!bytes) {
+       say(why, why_size, "nowhere to read a texture into");
+       return -1;
+@@ -4192,6 +4234,7 @@
+ {
+    struct pipe_fence_handle *fence = NULL;
+    device->pipe->flush(device->pipe, &fence, 0);
++   RWA_FB_FLUSHED();   /* y2s96: every batch submitted */
+    if (!fence) {
+       if (!required)
+          return 0;
+@@ -4812,6 +4855,8 @@
+             break;
+          }
+       }
++      if (t)
++         RWA_FB_READ(t->res);   /* y2s96: sampled (or an image) */
+ 
+       switch (r->kind) {
+       case AIR_RESOURCE_DEVICE_BUFFER:
+@@ -5396,6 +5441,18 @@
+    return rc;
+ }
+ 
++/* y2s96: the rt1 / single-target counters (air_metal.h) */
++void
++rwa_fb_stats(uint64_t out[16])
++{
++   RWA_GUARD();
++#ifdef GALLIUM_PANFROST
++   rwa_fb_counters(out);
++#else
++   memset(out, 0, 16 * sizeof(uint64_t));
++#endif
++}
++
+ int
+ rwa_finish(struct rwa_device *device, char *why, size_t why_size)
+ {
+@@ -5416,6 +5473,7 @@
+    RWA_GUARD();
+    struct pipe_fence_handle *fence = NULL;
+    device->pipe->flush(device->pipe, &fence, 0);
++   RWA_FB_FLUSHED();   /* y2s96 */
+    return fence;
+ }
+ 
+@@ -6636,6 +6694,8 @@
+     * the draw binds the streams it names instead of the quad.
+     */
+    struct rwa_vertex_state vstate;
++
++   unsigned rt_write_mask;   /* y2s96: colour attachments this pipeline's blend state writes (any channel) */
+ };
+ 
+ /* Clone, finalise and compile one stage, handing the driver a copy it may steal. The
+@@ -6692,6 +6752,7 @@
+       say(why, why_size, "a copy with no %s texture", dst ? "source" : "destination");
+       return -1;
+    }
++   RWA_FB_READ(src->res);   /* y2s96 */
+    if (!texture_box(src, src_level, src_slice, src_origin, size, &sbox, why, why_size) ||
+        !texture_box(dst, dst_level, dst_slice, dst_origin, size, &dbox, why, why_size))
+       return -1;
+@@ -6768,6 +6829,7 @@
+    RWA_GUARD();
+    if (!texture || texture->levels <= 1)
+       return 0;
++   RWA_FB_READ(texture->res);   /* y2s96 */
+    struct pipe_context *pipe = texture->device->pipe;
+    bool volume = texture->res->target == PIPE_TEXTURE_3D;
+    unsigned first_layer = volume ? 0 : texture->base_layer;
+@@ -8163,6 +8225,9 @@
+                                &out.color_write_masks, why, why_size))
+       goto fail;
+    render->blend = device->pipe->create_blend_state(device->pipe, &blend);
++   for (unsigned i = 0; i < 8; i++)
++      if ((out.color_write_masks >> (4 * i)) & 0xf)
++         render->rt_write_mask |= 1u << i;
+    /* The pipeline's own depth/stencil state, and it is the ZEROED one on purpose: it is
+     * what a draw gets when the caller passes no rwa_depth_stencil, which is Metal's
+     * state before an application has set one. depth_enabled 0 is "no test", not
+@@ -8707,6 +8772,27 @@
+    struct pipe_framebuffer_state fb = { .width = w, .height = h,
+                                         .nr_cbufs = draw->color_count,
+                                         .samples = samples };
++   /* y2s96 (C, single target): an attachment >= 1 the driver found no draw of this command buffer's target writing is left
++    * out of the framebuffer (a NULL cbuf: no tile-buffer space, blend OFF, forward pixel kill allowed again) -- refused for
++    * this draw when its pipeline writes or fetches the slot or the pass clears it, so dropping it never changes a pixel:
++    * memory keeps what it held, which is what Load+Store of an unwritten attachment gives (and what DontCare permits). */
++   unsigned fb_drop = 0;
++   if (DRAW_FB(draw) && draw->fb_drop_mask) {
++      for (unsigned i = 1; i < draw->color_count && i < 8; i++) {
++         unsigned bit = 1u << i;
++         if (!(draw->fb_drop_mask & bit))
++            continue;
++         bool clears = (draw->clear_color && !draw->clear_color_mask) ||
++                       (draw->clear_colors && (draw->clear_color_mask & bit));
++         if ((render->rt_write_mask & bit) || (render->finfo.fbfetch_targets & bit) || clears) {
++            RWA_FB_COUNT(8, 1);
++            continue;
++         }
++         fb_drop |= bit;
++      }
++      if (fb_drop)
++         RWA_FB_COUNT(7, 1);
++   }
+    for (unsigned i = 0; i < draw->color_count; i++) {
+       surf[i] = texture_surface(device, draw->color[i], DRAW_LEVEL(draw, i), DRAW_LAYER(draw, i));
+       if (!surf[i]) {
+@@ -8714,7 +8800,7 @@
+              rwa_device_name(device), i);
+          return -1;
+       }
+-      fb.cbufs[i] = surf[i];
++      fb.cbufs[i] = (fb_drop & (1u << i)) ? NULL : surf[i];
+    }
+    if (draw->depth) {
+       zsurf = texture_surface(device, draw->depth, draw->depth_level, draw->depth_layer);
+@@ -8726,6 +8812,16 @@
+       fb.zsbuf = zsurf;
+    }
+    pipe->set_framebuffer_state(pipe, &fb);
++#ifdef GALLIUM_PANFROST
++   /* y2s96 (B): the load actions of attachments >= 1, before the clears and the draw (rwa_pan_fb.c) */
++   const struct rwa_fb_pass fbp = {
++      .nr = draw->color_count,
++      .load = DRAW_FB(draw) ? draw->load_actions : NULL,
++      .store = DRAW_FB(draw) ? draw->store_actions : NULL,
++      .flags = DRAW_FB(draw) ? draw->fb_flags : 0,
++   };
++   rwa_fb_begin(pipe, &fbp);
++#endif
+ 
+    /* The viewport, and now its z as well. Gallium's window depth is
+     * clip_z/w * scale[2] + translate[2], and with clip_halfz (the rasterizer state
+@@ -8937,6 +9033,9 @@
+       }
+       pipe->set_scissor_states(pipe, 0, 1, &scissor);
+       pipe->draw_vbo(pipe, &info, 0, NULL, &sc, 1);
++#ifdef GALLIUM_PANFROST
++      rwa_fb_end(pipe, &fbp);   /* y2s96 (B): the store actions, at the pass's last draw; before any flush */
++#endif
+    }
+ 
+    /* Waited for here, on the same grounds as a dispatch: a picture that was never drawn
+@@ -8950,6 +9049,15 @@
+    rc = draw->deferred ? 0 : finish_or_say_why(device, true, "draw", why, why_size);
+ 
+ unbind:
++#ifdef GALLIUM_PANFROST
++   if (rc != 0) {
++      /* y2s96: a draw refused after rwa_fb_begin: no store skipped, and a batch left without a fragment job gets back any
++       * valid bit begin cleared */
++      struct rwa_fb_pass failed = fbp;
++      failed.flags &= ~RWA_FB_LAST;
++      rwa_fb_end(pipe, &failed);
++   }
++#endif
+    unbind_stage(device, PIPE_SHADER_FRAGMENT, &fbound);
+    if (!render->generated_vertex)
+       unbind_stage(device, PIPE_SHADER_VERTEX, &vbound);
+@@ -8996,6 +9104,14 @@
+              rwa_device_name(device), i);
+          return -1;
+       }
++      /* y2s96 (C): the same attachment left out as for the draws of its target, so their batch keys stay equal; never one
++       * this clear clears */
++      if (i >= 1 && i < 8 && DRAW_FB(draw) && (draw->fb_drop_mask & (1u << i)) &&
++          !(draw->clear_color && !draw->clear_color_mask) &&
++          !(draw->clear_colors && (draw->clear_color_mask & (1u << i)))) {
++         fb.cbufs[i] = NULL;
++         RWA_FB_COUNT(11, 1);
++      }
+       w = w ? MIN2(w, tw) : tw;       /* the smallest attachment, as for a draw */
+       h = h ? MIN2(h, th) : th;
+       samples = MAX2(draw->color[i]->res->nr_samples, 1);
+@@ -9028,6 +9144,16 @@
+    fb.height = h;
+    fb.samples = samples;
+    pipe->set_framebuffer_state(pipe, &fb);
++#ifdef GALLIUM_PANFROST
++   /* y2s96 (B): a clear-only pass records which slots must be stored (keep) and skips no store itself (no LAST) */
++   const struct rwa_fb_pass fbp = {
++      .nr = draw->color_count,
++      .load = DRAW_FB(draw) ? draw->load_actions : NULL,
++      .store = DRAW_FB(draw) ? draw->store_actions : NULL,
++      .flags = DRAW_FB(draw) ? (draw->fb_flags & ~RWA_FB_LAST) : 0,
++   };
++   rwa_fb_begin(pipe, &fbp);
++#endif
+ 
+    union pipe_color_union clear;
+    unsigned mask = 0;
+@@ -9044,6 +9170,9 @@
+                   draw->clear_depth ? (double)*draw->clear_depth : 0.0,
+                   draw->clear_stencil ? *draw->clear_stencil & 0xff : 0);
+    clear_each_attachment(pipe, draw);
++#ifdef GALLIUM_PANFROST
++   rwa_fb_end(pipe, &fbp);
++#endif
+ 
+    int rc = draw->deferred ? 0 : finish_or_say_why(device, false, "clear", why, why_size);
+    pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
+@@ -9240,6 +9369,8 @@
+                           size_t why_size)
+ {
+    RWA_GUARD();
++   if (src && src->res)
++      RWA_FB_READ(src->res);   /* y2s96 */
+    return convert_ycbcr_impl(dst, src, matrix, full_range, false, why, why_size);
+ }
+ 
+@@ -9256,6 +9387,8 @@
+           dst->res->width0, dst->res->height0, src->res->width0, src->res->height0);
+       return -1;
+    }
++   if (src && src->res)
++      RWA_FB_READ(src->res);   /* y2s96 */
+    return convert_ycbcr_impl(dst, src, matrix, full_range, true, why, why_size);
+ }
+ 
+diff -ru y2s96-final/base-src-y2s95/air_metal.h y2s96-final/src/air_metal.h
+--- y2s96-final/base-src-y2s95/air_metal.h	2026-11-13 12:46:56.848789216 +0100
++++ y2s96-final/src/air_metal.h	2026-11-13 13:41:40.458739695 +0100
+@@ -1413,7 +1413,27 @@
+ 	const unsigned *color_level;
+ 	const unsigned *color_layer;
+ 	unsigned depth_level, depth_layer;
++	/* appended (y2s96, rt1): each colour attachment's MTLLoadAction and (final) MTLStoreAction, NULL or color_count
++	 * entries; fb_flags RWA_FB_* (B: honour DontCare on attachments >= 1; LAST: the last draw of its pass; DEADSTORE);
++	 * fb_drop_mask: (C) colour attachments the driver found no draw of this command buffer's target writes, left out of
++	 * the framebuffer (refused per draw if this pipeline writes or fetches the slot, or the pass clears it). Read only
++	 * when fb_magic is RWA_FB_MAGIC, so a driver built before these fields cannot be misread. */
++	const unsigned *load_actions;
++	const unsigned *store_actions;
++	unsigned fb_flags;
++	unsigned fb_drop_mask;
++	unsigned fb_magic;
++	unsigned fb_pad;
+ };
++#define RWA_FB_MAGIC     0x46423936u   /* 'FB96' */
++#define RWA_FB_B         1u
++#define RWA_FB_LAST      2u
++#define RWA_FB_DEADSTORE 4u
++
++/* y2s96: the rt1 counters since load (rwa_pan_fb.c): 0 rt1 drawn, 1 preload avoided, 2 store discarded, 3 restored,
++ * 4 violations, 5 ext discarded, 6 ext violations, 7 single-target draws, 8 single-target refused, 9 batches not seen from
++ * the start, 10 ext table full, 11 single-target clears. */
++void rwa_fb_stats(uint64_t out[16]);
+ 
+ /* A pass that clears and draws nothing: the attachments, clear values and `deferred` of
+  * `draw` are read, nothing else. */
+diff -ru y2s96-final/base-src-y2s95/build.sh y2s96-final/src/build.sh
+--- y2s96-final/base-src-y2s95/build.sh	2026-11-13 12:49:07.808891086 +0100
++++ y2s96-final/src/build.sh	2026-11-13 13:43:26.356634908 +0100
+@@ -66,6 +66,11 @@
+   eval "$(edit src/gallium/drivers/panfrost/libpanfrost.a.p/pan_screen.c.o -c $SRC/rwa_pressure_pan.c -o $OUT/obj/rwa_pressure_pan.o)"
+   PP=$OUT/obj/rwa_pressure_pan.o
+ fi
++# y2s96 (rt1): rwa_pan_fb.c of SRC (where there is one), compiled and linked the same way
++if [ -f $SRC/rwa_pan_fb.c ]; then
++  eval "$(edit src/gallium/drivers/panfrost/libpanfrost.a.p/pan_screen.c.o -c $SRC/rwa_pan_fb.c -o $OUT/obj/rwa_pan_fb.o)"
++  PP="$PP $OUT/obj/rwa_pan_fb.o"
++fi
+ # (the output must be NAMED libredwoodair.dylib: the ad-hoc signature carries the name)
+ eval "$(edit src/gallium/drivers/panfrost/libredwoodair.dylib -o $OUT/payload/Nord2Metal.bundle/libredwoodair.dylib \
+         -s "$AM=$OUT/obj/air_metal.o" -s "$RD=$RDO" -s src/compiler/air/libair.a=$OUT/obj/libair.a -s src/panfrost/lib/libpanfrost_lib.a=$PL -x "-Wl,-adhoc_codesign $PP")"
+diff -ru y2s96-final/base-src-y2s95/redwoodmetal.m y2s96-final/src/redwoodmetal.m
+--- y2s96-final/base-src-y2s95/redwoodmetal.m	2026-11-13 12:48:37.051827243 +0100
++++ y2s96-final/src/redwoodmetal.m	2026-11-13 13:58:55.464510118 +0100
+@@ -334,10 +334,23 @@
+ 	const unsigned *color_level;
+ 	const unsigned *color_layer;
+ 	unsigned depth_level, depth_layer;
++	/* appended with air_metal.h's (y2s96, rt1): load and final store action of each attachment, RWA_FB_* flags, the
++	 * attachments left out of the framebuffer (single target), and the magic that says these are filled */
++	const unsigned *load_actions;
++	const unsigned *store_actions;
++	unsigned fb_flags;
++	unsigned fb_drop_mask;
++	unsigned fb_magic;
++	unsigned fb_pad;
+ };
+-_Static_assert(sizeof(struct rwa_draw) == 328 && offsetof(struct rwa_draw, viewport) == 296 &&
+-	       offsetof(struct rwa_draw, color_level) == 304 && offsetof(struct rwa_draw, depth_level) == 320,
++_Static_assert(sizeof(struct rwa_draw) == 360 && offsetof(struct rwa_draw, viewport) == 296 &&
++	       offsetof(struct rwa_draw, color_level) == 304 && offsetof(struct rwa_draw, depth_level) == 320 &&
++	       offsetof(struct rwa_draw, load_actions) == 328 && offsetof(struct rwa_draw, fb_magic) == 352,
+ 	       "struct rwa_draw must match tools/mesa/air/air_metal.h");
++#define RWA_FB_MAGIC     0x46423936u   /* 'FB96' */
++#define RWA_FB_B         1u
++#define RWA_FB_LAST      2u
++#define RWA_FB_DEADSTORE 4u
+ 
+ /*
+  * The library's MTLVertexFormat table, checked against Apple's own header HERE, where the
+@@ -2528,6 +2541,7 @@
+  * before the layout existed. */
+ - (unsigned)vertexStreamMask;
+ - (unsigned)vertexStreamCount;
++- (unsigned)colorWriteMasks;            /* (y2s96) the library's write mask, four bits per attachment */
+ - (unsigned)fragmentTextureCount;       /* (y2s54) how many texture slots the fragment function reads: the highest index + 1 */
+ - (unsigned)fragmentBufferCount;        /* (y2s55) and buffer slots */
+ /* And the element array the compiler library built out of the descriptor and the module's
+@@ -3169,6 +3183,11 @@
+ 	id samplers[RW_MAX_BUFFERS];
+ 	unsigned count, textureCount, samplerCount;
+ 	unsigned groups[3], size[3];
++	/* y2s96 (rt1): every attachment's load action and (for the last draw of its pass: final) store action, whether this is
++	 * the pass's last draw, and (single target) the attachments -commit leaves out of the framebuffer */
++	unsigned loads[8], stores[8];
++	BOOL lastOfPass;
++	unsigned dropMask;
+ }
+ - (void)redwoodRetainReferences;
+ @end
+@@ -4588,6 +4607,192 @@
+ }
+ 
+ /* the CHECK: one block of a converted thumbnail against the CPU's conversion of the surface's bytes, on the background queue */
++/*
++ * y2s96 (rt1, single target). Switches in /var/db/nord2-metal/, read once per process:
++ *   no-rt1           B off: DontCare load/store of attachments >= 1 not honoured (gpufinal4/5 behaviour)
++ *   no-singletarget  C off: every attachment stays in the framebuffer
++ *   rt1-deadstore    (opt-in) B also treats a Store of an attachment >= 1 as DontCare for a texture never read in this process
++ * Line every 5 s while anything moved: 'NORD2 GPU FB: pid= name= rt1 drawn=.. preload avoided=.. store discarded=..
++ * violations=.. | restored=.. unseen=.. | single-target cbs=.. targets=.. draws=.. clears=.. refused=.. | deadstore ..'.
++ */
++static struct {
++	int init;
++	unsigned flags;          /* RWA_FB_B | RWA_FB_DEADSTORE */
++	BOOL single;
++	void (*stats)(uint64_t out[16]);
++	uint64_t cbs, targets, works;   /* command buffers / targets / works given a drop mask */
++} rw_fb;
++
++static void
++rw_fb_init(void)
++{
++	static dispatch_once_t once;
++
++	dispatch_once(&once, ^{
++		BOOL b = access("/var/db/nord2-metal/no-rt1", F_OK) != 0;
++		BOOL ds = access("/var/db/nord2-metal/rt1-deadstore", F_OK) == 0;
++
++		rw_fb.single = access("/var/db/nord2-metal/no-singletarget", F_OK) != 0;
++		rw_fb.flags = (b ? RWA_FB_B : 0u) | (b && ds ? RWA_FB_DEADSTORE : 0u);
++		if (mesa.handle != NULL) {
++			*(void **)&rw_fb.stats = dlsym(mesa.handle, "rwa_fb_stats");
++		}
++		m2m_log('I', "FB", "NORD2 GPU FB: pid=%d name=%s config rt1 %s (no-rt1 %d) single-target %s (no-singletarget %d) "
++		    "deadstore %s (rt1-deadstore %d) library %s\n", getpid(), getprogname(), b ? "on" : "OFF",
++		    access("/var/db/nord2-metal/no-rt1", F_OK) == 0, rw_fb.single ? "on" : "OFF",
++		    access("/var/db/nord2-metal/no-singletarget", F_OK) == 0, (rw_fb.flags & RWA_FB_DEADSTORE) ? "on" : "off", ds,
++		    rw_fb.stats != NULL ? "y2s96" : "older (fields ignored)");
++		rw_fb.init = 1;
++	});
++}
++
++static unsigned
++rw_fb_flags(void)
++{
++	rw_fb_init();
++	return rw_fb.flags;
++}
++
++/*
++ * (C) Per command buffer, per colour TARGET (attachment 0's texture, level and slice): when no render pass of this buffer
++ * into that target has a pipeline that writes attachment 1 (any writeMask channel), clears attachment 1, or has an
++ * attachment 1 that is attachment 0's own texture, attachment 1 is left out of the framebuffer for ALL of them (draws and
++ * clear-only passes alike), so the passes of the target keep one Panfrost batch key. The library checks each draw again
++ * (write mask, framebuffer fetch, clear) and keeps the slot where its check fails.
++ */
++#define RW_FB_TARGETS 64
++static void
++rw_fb_single_target(NSArray *works)
++{
++	struct { id t; unsigned level, slice; BOOL bad; } tg[RW_FB_TARGETS];
++	unsigned n = 0, good = 0, flagged = 0;
++
++	rw_fb_init();
++	if (!rw_fb.single || rw_fb.stats == NULL) {
++		return;
++	}
++	for (RedwoodMetalWork *w in works) {
++		if ((w->render == nil && !w->clearOnly) || w->colorCount != 2 || w->color[0] == nil || w->color[1] == nil) {
++			continue;
++		}
++		unsigned k;
++
++		for (k = 0; k < n; k++) {
++			if (tg[k].t == w->color[0] && tg[k].level == w->colorLevel[0] && tg[k].slice == w->colorSlice[0]) {
++				break;
++			}
++		}
++		if (k == n) {
++			if (n == RW_FB_TARGETS) {
++				continue;
++			}
++			tg[n].t = w->color[0];
++			tg[n].level = w->colorLevel[0];
++			tg[n].slice = w->colorSlice[0];
++			tg[n].bad = NO;
++			n++;
++		}
++		BOOL writes = w->render != nil && (([w->render colorWriteMasks] >> 4) & 0xf) != 0;
++
++		if (writes || (w->clearMask & 2u) || w->loads[1] == MTLLoadActionClear || w->color[1] == w->color[0]) {
++			tg[k].bad = YES;
++		}
++	}
++	for (unsigned k = 0; k < n; k++) {
++		good += !tg[k].bad;
++	}
++	if (good == 0) {
++		return;
++	}
++	for (RedwoodMetalWork *w in works) {
++		if ((w->render == nil && !w->clearOnly) || w->colorCount != 2 || w->color[0] == nil || w->color[1] == nil) {
++			continue;
++		}
++		for (unsigned k = 0; k < n; k++) {
++			if (tg[k].t == w->color[0] && tg[k].level == w->colorLevel[0] && tg[k].slice == w->colorSlice[0]) {
++				if (!tg[k].bad) {
++					w->dropMask = 2u;
++					flagged++;
++				}
++				break;
++			}
++		}
++	}
++	__sync_add_and_fetch(&rw_fb.cbs, 1);
++	__sync_add_and_fetch(&rw_fb.targets, good);
++	__sync_add_and_fetch(&rw_fb.works, flagged);
++}
++
++/*
++ * y2s96 (A, investigation only): with /var/db/nord2-metal/trace-cc present, backboardd does what com.redwood.metal.trace does
++ * (the next 3 command buffers written out draw by draw: 'TRACE trace: a command buffer of N steps (asked for)' + one
++ * 'TRACE trace:   pass ...' line per step) by itself: first 60 s after its first commit, then every 15 s, 20 times (5 minutes),
++ * so that Control Center held open over Photos in that window is caught without a shell on the phone. Absent: nothing.
++ */
++static void
++rw_trace_cc_maybe(void)
++{
++	static int on = -1;
++	static uint64_t next;
++	static unsigned shots;
++	static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
++	uint64_t now;
++
++	if (on == 0 || pthread_mutex_trylock(&lk) != 0) {
++		return;
++	}
++	now = rw_now_ns();
++	if (on < 0) {
++		on = strcmp(getprogname(), "backboardd") == 0 && access("/var/db/nord2-metal/trace-cc", F_OK) == 0;
++		next = now + 60000000000ULL;
++		if (on) {
++			m2m_log('I', "TRACE", "trace-cc: armed: 3 command buffers traced every 15 s from 60 s on, 20 times\n");
++		}
++	}
++	if (on > 0 && shots < 20 && now >= next) {
++		next = now + 15000000000ULL;
++		shots++;
++		if (rw_trace_force <= 0) {
++			rw_trace_force = 3;
++		}
++		m2m_log('I', "TRACE", "trace-cc: shot %u/20: the next 3 command buffers are written out draw by draw\n", shots);
++	}
++	pthread_mutex_unlock(&lk);
++}
++
++static void
++rw_fb_report_maybe(void)
++{
++	static uint64_t last, prev[16];
++	static uint64_t prev_works;
++	static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
++	uint64_t now = rw_now_ns(), c[16] = { 0 };
++
++	rw_fb_init();
++	if (rw_fb.stats == NULL || now - last < 5000000000ULL || pthread_mutex_trylock(&lk) != 0) {
++		return;
++	}
++	if (now - last < 5000000000ULL) {
++		pthread_mutex_unlock(&lk);
++		return;
++	}
++	last = now;
++	rw_fb.stats(c);
++	if (memcmp(c, prev, sizeof(c)) != 0 || rw_fb.works != prev_works) {
++		m2m_log('I', "FB", "NORD2 GPU FB: pid=%d name=%s rt1 drawn=%llu preload avoided=%llu store discarded=%llu violations=%llu | "
++		    "restored=%llu unseen=%llu | single-target cbs=%llu targets=%llu works=%llu draws=%llu clears=%llu refused=%llu | "
++		    "deadstore %s discarded=%llu violations=%llu tablefull=%llu\n", getpid(), getprogname(),
++		    (unsigned long long)c[0], (unsigned long long)c[1], (unsigned long long)c[2], (unsigned long long)c[4],
++		    (unsigned long long)c[3], (unsigned long long)c[9], (unsigned long long)rw_fb.cbs, (unsigned long long)rw_fb.targets,
++		    (unsigned long long)rw_fb.works, (unsigned long long)c[7], (unsigned long long)c[11], (unsigned long long)c[8],
++		    (rw_fb.flags & RWA_FB_DEADSTORE) ? "on" : "off", (unsigned long long)c[5], (unsigned long long)c[6],
++		    (unsigned long long)c[10]);
++		memcpy(prev, c, sizeof(c));
++		prev_works = rw_fb.works;
++	}
++	pthread_mutex_unlock(&lk);
++}
++
+ static void
+ rw_tg_report_maybe(void)
+ {
+@@ -4949,8 +5154,13 @@
+ 	static dispatch_once_t once;
+ 
+ 	dispatch_once(&once, ^{
+-		if (access("/var/db/nord2-metal/no-pressure", F_OK) == 0) {
+-			m2m_log('I', "MEM", "NORD2 MEM GPU CTX: pid=%d name=%s pressure handler OFF (no-pressure)\n", getpid(), getprogname());
++		/* y2s96: OFF unless /var/db/nord2-metal/pressure-on exists (gpufinal4 behaviour by default); no-pressure still wins */
++		if (access("/var/db/nord2-metal/pressure-on", F_OK) != 0 || access("/var/db/nord2-metal/no-pressure", F_OK) == 0) {
++			static int said;
++			if (!said++) {
++				m2m_log('I', "MEM", "NORD2 MEM GPU CTX: pid=%d name=%s pressure handler OFF (%s)\n", getpid(), getprogname(),
++				    access("/var/db/nord2-metal/no-pressure", F_OK) == 0 ? "no-pressure" : "no pressure-on");
++			}
+ 			return;
+ 		}
+ 		rw_mp.dryrun = access("/var/db/nord2-metal/pressure-dryrun", F_OK) == 0;
+@@ -9036,6 +9246,7 @@
+ - (struct rwa_render *)render { return _render; }
+ - (BOOL)writesDepth           { return _info.fragment_writes_depth != 0; }
+ - (unsigned)vertexStreamMask  { return _info.vertex_stream_mask; }
++- (unsigned)colorWriteMasks   { return _info.color_write_masks; }
+ - (unsigned)vertexStreamCount { return _info.vertex_streams; }
+ - (unsigned)fragmentTextureCount { return _info.fragment_textures; }
+ - (unsigned)fragmentBufferCount { return _info.fragment_buffers; }
+@@ -10205,6 +10416,7 @@
+ 
+ 	static unsigned rw_trace_done, rw_trace_seen;
+ 
++	rw_trace_cc_maybe();            /* y2s96 (A): /var/db/nord2-metal/trace-cc */
+ 	if (rw_trace_force > 0 && __sync_fetch_and_sub(&rw_trace_force, 1) > 0) {
+ 		trace = YES;
+ 		_tracing = YES;
+@@ -10233,6 +10445,8 @@
+ 		}
+ 	}
+ 	_status = RW_CB_COMMITTED;
++	rw_fb_single_target(_work);     /* y2s96 (C) */
++	rw_fb_report_maybe();           /* y2s96: 'NORD2 GPU FB:' every 5 s */
+ 	for (RedwoodMetalWork *work in _work) {
+ 		uint8_t before[16], after[16];
+ 		unsigned px = 0, py = 0;
+@@ -10712,6 +10926,12 @@
+ 		/* queued, and -commit waits once for the whole command buffer (rwm_trace: each
+ 		 * draw waited for, so that its effect can be read back) */
+ 		.deferred = mesa.finish != NULL && !_tracing && dump == 0,
++		/* y2s96 (rt1 / single target) */
++		.load_actions = work->loads,
++		.store_actions = work->stores,
++		.fb_flags = rw_fb_flags() | (work->lastOfPass ? RWA_FB_LAST : 0u),
++		.fb_drop_mask = work->dropMask,
++		.fb_magic = RWA_FB_MAGIC,
+ 	};
+ 
+ 	if (work->indexBuffer != nil && draw.index_buffer == NULL) {
+@@ -10877,13 +11097,21 @@
+ 		snprintf(ds, sizeof(ds), "%s ref%u", [w->depthStencilState redwoodSummary],
+ 		    w->stencilReference[0]);
+ 	}
++	/* y2s96: attachment 1 as well -- its texture, load/store, whether this pipeline writes it, the single-target drop and
++	 * whether this is the pass's last draw -- which is what the backdrop/rt1 design reads */
++	char a1[64] = "-";
++
++	if (w->colorCount > 1) {
++		rw_tex_desc(w->color[1], a1, sizeof(a1));
++	}
+ 	m2m_log('I', "TRACE", "trace:   pass %u -> %s(+%u) L%u ld%u st%u%s sc %u,%u %ux%u | %s | zs %s%s%s ds %s | "
+-	    "tex%s | %u%s verts x%u\n", w->pass, target, w->colorCount > 0 ? w->colorCount - 1 : 0,
++	    "tex%s | %u%s verts x%u | a1 %s ld%u st%u wm%x drop%x%s\n", w->pass, target, w->colorCount > 0 ? w->colorCount - 1 : 0,
+ 	    w->level, w->loadAction, w->storeAction, w->clears ? " CLEAR" : "",
+ 	    w->hasScissor ? w->scissor[0] : 0, w->hasScissor ? w->scissor[1] : 0,
+ 	    w->hasScissor ? w->scissor[2] : 0, w->hasScissor ? w->scissor[3] : 0, label, zs,
+ 	    w->clearsDepth ? " zclr" : "", w->clearsStencil ? " sclr" : "", ds, texs,
+-	    w->vertexCount, w->indexBuffer != nil ? "i" : "", w->instanceCount);
++	    w->vertexCount, w->indexBuffer != nil ? "i" : "", w->instanceCount, a1, w->loads[1], w->stores[1],
++	    w->render != nil ? ([w->render colorWriteMasks] >> 4) & 0xf : 0u, w->dropMask, w->lastOfPass ? " LAST" : "");
+ }
+ 
+ /*
+@@ -11160,6 +11388,11 @@
+ 		.color_layer = work->colorSlice,
+ 		.depth_level = work->depthLevel,
+ 		.depth_layer = work->depthSlice,
++		.load_actions = work->loads,         /* y2s96 */
++		.store_actions = work->stores,
++		.fb_flags = rw_fb_flags(),
++		.fb_drop_mask = work->dropMask,
++		.fb_magic = RWA_FB_MAGIC,
+ 	};
+ 	if (mesa.render_clear([[_queue device] mesaDevice], &draw, why, size) != 0) {
+ 		m2m_log('E', "CMD", "the clear failed: %s\n", why);
+@@ -11371,6 +11604,7 @@
+ 	unsigned _vertexBufferCount, _fragmentBufferCount;
+ 	unsigned _fragmentTextureCount, _fragmentSamplerCount;
+ 	BOOL _complained;
++	RedwoodMetalWork *_lastDraw;   /* y2s96: the last draw recorded by this pass (owned by the command buffer's list) */
+ }
+ 
+ - (instancetype)initWithRedwoodCommandBuffer:(RedwoodMetalCommandBuffer *)commandBuffer
+@@ -11744,6 +11978,9 @@
+ 	work->depthSlice = _depthSlice;
+ 	work->loadAction = _load[0];
+ 	work->storeAction = _store[0];
++	memcpy(work->loads, _load, sizeof(work->loads));     /* y2s96 */
++	memcpy(work->stores, _store, sizeof(work->stores));
++	_lastDraw = work;
+ 	work->stencilReference[0] = _stencilReference[0];
+ 	work->stencilReference[1] = _stencilReference[1];
+ 	work->depthRange[0] = _depthRange[0];
+@@ -12073,7 +12310,10 @@
+  */
+ - (void)setColorStoreAction:(NSUInteger)action atIndex:(NSUInteger)index
+ {
+-	(void)action; (void)index;
++	/* y2s96: recorded -- the pass's last draw carries it to the library, which honours DontCare on attachments >= 1 */
++	if (index < 8) {
++		_store[index] = (unsigned)action;
++	}
+ }
+ - (void)setDepthStoreAction:(NSUInteger)action                 { (void)action; }
+ - (void)setStencilStoreAction:(NSUInteger)action               { (void)action; }
+@@ -12781,11 +13021,19 @@
+ 		work->depthSlice = _depthSlice;
+ 		work->loadAction = _load[0];
+ 		work->storeAction = _store[0];
++		memcpy(work->loads, _load, sizeof(work->loads));     /* y2s96 */
++		memcpy(work->stores, _store, sizeof(work->stores));
+ 		[_commandBuffer recordWork:work];
+ 		[work release];
+ 		_clears = _clearsDepth = _clearsStencil = NO;
+ 		_clearMask = 0;
+ 	}
++	/* y2s96 (rt1): the pass's last draw carries the FINAL store actions (-setColorStoreAction: may have set them since) */
++	if (_lastDraw != nil) {
++		memcpy(_lastDraw->stores, _store, sizeof(_lastDraw->stores));
++		_lastDraw->lastOfPass = YES;
++		_lastDraw = nil;
++	}
+ 	/* MTLStoreActionMultisampleResolve: the attachment's samples averaged into the resolve
+ 	 * texture, a GPU blit queued after the pass's draws (SpringBoard asks for it) */
+ 	for (unsigned i = 0; i < _colorCount; i++) {
+Only in y2s96-final/src: rwa-pan-fb-host-test.sh
+Only in y2s96-final/src: rwa_pan_fb.c
+Only in y2s96-final/src: rwa_pan_fb_host_test.c

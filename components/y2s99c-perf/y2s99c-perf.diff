@@ -1,0 +1,182 @@
+--- base-src/redwood-drm/nord2_pan.c	2026-11-13 12:46:31.190792963 +0100
++++ src/redwood-drm/nord2_pan.c	2026-11-14 19:34:44.284608108 +0100
+@@ -77,6 +77,21 @@
+ #define NP_POOL_CLASSES 20u
+ #define NP_POOL_MAX_BOS 320u
+ #define NP_POOL_CAP     (200ull << 20)
++/*
++ * y2s99c (bigpool, perf-20261114): buffers above the largest pool class (16 MiB) were never kept: Maps (VectorKit) re-creates
++ * full-screen 4x-multisample / depth / intermediate textures of 12..44 MiB all the time (capture perf1a: 4573 creates / 3707
++ * closes in ~80 s, ~50 kernel maps a second = ~1.1 GB/s of fresh, zeroed, mapped GPU memory; newTextureWithDescriptor: 316 calls
++ * over 16 ms, 5.1 s in total, newBufferWithLength: 99 calls, 1.2 s, on the render thread).  A closed buffer of more than 16 MiB is
++ * now parked in one of NP_BIG_SLOTS slots (at most NP_BIG_CAP bytes in all, oldest given back first) and handed to the next
++ * request of the same size or up to 1/8 smaller once the GPU is done with it.  The slots are emptied with the pool (allocation
++ * refused, memory pressure).  Kill switch: /private/var/db/nord2-metal/no-bigpool (read at the first open: old behaviour).
++ */
++#define NP_BIG_SLOTS    4u
++#define NP_BIG_MIN      (16ull << 20)
++#define NP_BIG_CAP      (100ull << 20)
++static uint32_t big_h[NP_BIG_SLOTS];            /* parked handles, oldest first; 0 = free */
++static uint64_t big_bytes, big_hits, big_miss, big_parked, big_evicted;
++static int big_off = -1;                        /* -1 = not read yet */
+ static const uint32_t pool_class_kib[NP_POOL_CLASSES] = { 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384 };
+ /* how many buffers of each class are kept ready; the refill thread tops a class up when it falls under half of this */
+ static const unsigned pool_target[NP_POOL_CLASSES] = { 48, 32, 16, 32, 16, 24, 12, 16, 8, 12, 6, 10, 4, 8, 4, 4, 2, 2, 2, 1 };
+@@ -332,6 +347,13 @@
+ 			if (m > 0)
+ 				np_log(b, (size_t)(m < (int)sizeof(b) ? m : (int)sizeof(b) - 1));
+ 		}
++		if (big_hits + big_miss + big_parked) {               /* y2s99c */
++			m = snprintf(b, sizeof(b), "np bigpool: hits=%llu miss=%llu parked=%llu evicted=%llu held=%llu MiB off=%d",
++				     (unsigned long long)big_hits, (unsigned long long)big_miss, (unsigned long long)big_parked,
++				     (unsigned long long)big_evicted, (unsigned long long)(big_bytes >> 20), big_off);
++			if (m > 0)
++				np_log(b, (size_t)(m < (int)sizeof(b) ? m : (int)sizeof(b) - 1));
++		}
+ 	}
+ 
+ 	if (traced < 40 || (r && failed < 80)) {
+@@ -816,10 +838,86 @@
+ 	return 0;
+ }
+ 
++/* y2s99c: the parked big buffers, oldest first (caller holds D.lock) */
++static void big_remove(unsigned i)
++{
++	for (; i + 1 < NP_BIG_SLOTS; i++)
++		big_h[i] = big_h[i + 1];
++	big_h[NP_BIG_SLOTS - 1] = 0;
++}
++
++static unsigned big_drain(void)
++{
++	unsigned n = 0;
++
++	while (big_h[0]) {
++		uint32_t h = big_h[0];
++
++		big_remove(0);
++		big_bytes -= D.bos[h].size;
++		D.bos[h].pooled = 0;
++		if (bo_release_kernel(h) == 0)
++			n++;
++	}
++	return n;
++}
++
++/* a parked buffer for a request of size bytes: same size or up to 1/8 larger, the GPU done with it; the closest fit */
++static uint32_t big_take(uint64_t size)
++{
++	unsigned best = NP_BIG_SLOTS;
++
++	for (unsigned i = 0; i < NP_BIG_SLOTS && big_h[i]; i++) {
++		const struct bo *b = &D.bos[big_h[i]];
++
++		if (b->size < size || b->size - size > size / 8 || b->last_seq > D.completed)
++			continue;
++		if (best == NP_BIG_SLOTS || b->size < D.bos[big_h[best]].size)
++			best = i;
++	}
++	if (best == NP_BIG_SLOTS)
++		return 0;
++	uint32_t h = big_h[best];
++
++	big_remove(best);
++	big_bytes -= D.bos[h].size;
++	D.bos[h].pooled = 0;
++	D.bos[h].last_seq = 0;
++	return h;
++}
++
++/* park a closed big buffer; returns 1 if it was kept */
++static int big_park(uint32_t h)
++{
++	struct bo *b = &D.bos[h];
++	unsigned i;
++
++	if (b->size > NP_BIG_CAP)
++		return 0;
++	while (big_h[0] && (big_bytes + b->size > NP_BIG_CAP || big_h[NP_BIG_SLOTS - 1])) {     /* the oldest goes back first */
++		uint32_t o = big_h[0];
++
++		big_remove(0);
++		big_bytes -= D.bos[o].size;
++		D.bos[o].pooled = 0;
++		(void)bo_release_kernel(o);
++		big_evicted++;
++	}
++	for (i = 0; i < NP_BIG_SLOTS && big_h[i]; i++)
++		;
++	if (i == NP_BIG_SLOTS)
++		return 0;
++	big_h[i] = h;
++	big_bytes += b->size;
++	b->pooled = 1;
++	big_parked++;
++	return 1;
++}
++
+ /* Every pooled buffer back to the kernel: the pool is only a convenience and must never be what makes an allocation fail against the budget. */
+ static unsigned pool_drain(void)
+ {
+-	unsigned n = 0;
++	unsigned n = big_drain();
+ 
+ 	for (unsigned c = 0; c < NP_POOL_CLASSES; c++) {
+ 		while (D.pool_head[c]) {
+@@ -858,6 +956,19 @@
+ 		}
+ 		D.pool_miss++;
+ 	}
++	if (big_off < 0)
++		big_off = access("/private/var/db/nord2-metal/no-bigpool", F_OK) == 0;
++	if (cls < 0 && !big_off && D.pool_enabled && !nopool && (flags & NP_BO_NOEXEC) && !(flags & NP_BO_HEAP) && size > NP_BIG_MIN) {
++		h = big_take(size);
++		if (h) {
++			big_hits++;
++			*handle = h;
++			*va = D.bos[h].va;
++			D.stats.creates++;
++			return 0;
++		}
++		big_miss++;
++	}
+ 	if (cls >= 0)
+ 		size = (uint64_t)pool_class_kib[cls] << 10;         /* a pool-sized buffer, so that it fits its class when it comes back */
+ 
+@@ -901,7 +1012,7 @@
+ 		}
+ 	}
+ 	uint64_t in[2] = { size, want & 1u };
+-	if (e && kerr(e) != EIO && D.pool_count) {              /* refused with a pool full of idle buffers: give them back and ask again */
++	if (e && kerr(e) != EIO && (D.pool_count || big_h[0])) {      /* y2s99c: or parked big buffers */              /* refused with a pool full of idle buffers: give them back and ask again */
+ 		unsigned drained = pool_drain();
+ 
+ 		if (drained) {
+@@ -1009,6 +1120,11 @@
+ 		D.stats.closes++;
+ 		return 0;
+ 	}
++	if (big_off == 0 && D.pool_enabled && !np_holdoff() && b->cls == 0xff && !b->imported && !b->heap && b->noexec && b->size > NP_BIG_MIN &&
++	    big_park(h)) {                                                /* y2s99c: kept for the next request of this size */
++		D.stats.closes++;
++		return 0;
++	}
+ 	if (b->mapped && !b->imported && D.ops.unmap)
+ 		D.ops.unmap(D.ops.opaque, b->kernel, b->cpu);
+ 	if (b->imported)
+@@ -1502,12 +1618,12 @@
+ 		return -1;
+ 	}
+ 	if (drain) {
+-		uint64_t before = D.pool_bytes;
++		uint64_t before = D.pool_bytes + big_bytes;
+ 
+ 		if (holdoff_ms)
+ 			__atomic_store_n(&np_holdoff_until, now_ns() + (uint64_t)holdoff_ms * 1000000ull, __ATOMIC_RELAXED);
+ 		out[0] = pool_drain();
+-		out[1] = before - D.pool_bytes;
++		out[1] = before - D.pool_bytes - big_bytes;
+ 	}
+ 	for (uint32_t h = 1; h <= NP_BOS; h++) {
+ 		const struct bo *b = &D.bos[h];

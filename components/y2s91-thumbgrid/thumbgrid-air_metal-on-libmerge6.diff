@@ -1,0 +1,236 @@
+--- a/air_metal.c
++++ b/air_metal.c
+@@ -68,6 +68,17 @@
+ #include "util/u_debug.h"
+ #include "util/set.h"
+ 
++/* y2s91 (thumbgrid): this library's new calls, found by redwoodmetal.m with dlsym (rw_tg_*); declared here and not in air_metal.h so
++ * that the header of every other user of the library stays as it was */
++int rwa_texture_convert_ycbcr_exact(struct rwa_texture *dst, struct rwa_texture *src, int matrix, int full_range, char *why,
++                                    size_t why_size);
++int rwa_dispatch_buffers_deferred(struct rwa_compute *compute, const struct rwa_bindings *bindings,
++                                  const struct rwa_buffer_bind *table, unsigned table_count,
++                                  const unsigned groups[3], const unsigned group_size[3], char *why, size_t why_size);
++size_t rwa_buffer_recycle(struct rwa_buffer *buffer);
++int rwa_texture_recycle(struct rwa_texture *texture);
++void rwa_tg_ubo_stats(uint64_t *zeroed, uint64_t *saved);
++
+ /* the Metal driver keeps its own copy of this struct (userland/src/redwoodmetal.m) */
+ _Static_assert(sizeof(struct rwa_draw) == 328 && offsetof(struct rwa_draw, viewport) == 296 &&
+                offsetof(struct rwa_draw, color_level) == 304 && offsetof(struct rwa_draw, depth_level) == 320,
+@@ -978,6 +989,43 @@
+ /* constant buffer bindings: given to the GPU as they are, or copied (Panfrost uploads a user buffer at every draw) */
+ static uint64_t rwa_ubo_direct, rwa_ubo_copied, rwa_ubo_copied_bytes;
+ 
++/*
++ * y2s91 (thumbgrid): the zero tail of a padded constant-buffer copy. Up to y2s83 every such draw zeroed all of [left, can_read) --
++ * 32-64 KB a draw for a 48-byte block (176-290 MB per 5 s in MobileSlideShow, photosperf). The copy is static per stage and slot and
++ * only ever written here, so what lies past the largest `left` written since it was last zeroed is zero already: only
++ * [left, dirty) is cleared. The bytes the GPU is given are the same. Off (every draw zeroes all, as before) while
++ * /var/db/nord2-metal/no-thumbgrid-ubo or no-thumbgrid exists. Counted for rwa_tg_ubo_stats.
++ */
++#include <unistd.h>      /* (access; also included further down, where the pipeline cache uses it) */
++static uint64_t rwa_tg_ubo_zeroed, rwa_tg_ubo_saved;
++
++static void
++rwa_tg_ubo_tail(char *p, size_t left, size_t can_read, size_t *dirty)
++{
++   static int on = -1;
++
++   if (on < 0)
++      on = access("/var/db/nord2-metal/no-thumbgrid-ubo", F_OK) != 0 && access("/var/db/nord2-metal/no-thumbgrid", F_OK) != 0;
++   size_t end = on == 1 ? MIN2(MAX2(*dirty, left), can_read) : can_read;
++
++   if (end > left)
++      memset(p + left, 0, end - left);
++   p_atomic_add(&rwa_tg_ubo_zeroed, (uint64_t)(end > left ? end - left : 0));
++   p_atomic_add(&rwa_tg_ubo_saved, (uint64_t)(can_read - MAX2(end, left)));
++   /* [can_read, old dirty) was not cleared when can_read is the smaller: still dirty */
++   *dirty = *dirty > can_read ? *dirty : left;
++}
++
++/* y2s91: bytes zeroed and bytes NOT zeroed (saved) by rwa_tg_ubo_tail since the library was loaded */
++void
++rwa_tg_ubo_stats(uint64_t *zeroed, uint64_t *saved)
++{
++   if (zeroed)
++      *zeroed = p_atomic_read(&rwa_tg_ubo_zeroed);
++   if (saved)
++      *saved = p_atomic_read(&rwa_tg_ubo_saved);
++}
++
+ int
+ rwa_ubo_stats(uint64_t out[3])
+ {
+@@ -1118,6 +1166,33 @@
+    free(buffer);
+ }
+ 
++/*
++ * y2s91 (thumbgrid): a buffer handed to a NEW owner by redwoodmetal.m's pool (rw_tg_bufpool) instead of being destroyed: what
++ * rwa_buffer_destroy does to the records -- out of every argument-buffer record that named it, and its own records gone -- without
++ * the unmap and the free. The memory, its mapping and its GPU address stay. Returns the capacity.
++ */
++size_t
++rwa_buffer_recycle(struct rwa_buffer *buffer)
++{
++   RWA_GUARD();
++   if (!buffer)
++      return 0;
++   argbuf_scrub(buffer->device, buffer, NULL, NULL);
++   argbuf_forget_all(buffer);
++   return buffer->size;
++}
++
++/* y2s91: the same for a texture of the pool (rw_tg_texpool): out of the argument-buffer records; views, surfaces and the resource stay */
++int
++rwa_texture_recycle(struct rwa_texture *texture)
++{
++   RWA_GUARD();
++   if (!texture || texture->is_view)
++      return -1;
++   argbuf_scrub(texture->device, NULL, texture, NULL);
++   return 0;
++}
++
+ /* Metal's own numbers, which the contract hands over raw (air_metal.h) and which this
+  * file is the only one to have to know. Spelled out rather than compared as literals,
+  * because a refusal that says "type 9" helps nobody and the names are the vocabulary
+@@ -4743,16 +4818,19 @@
+          if (left < can_read && stage < PIPE_SHADER_TYPES) {
+             static char *padded[PIPE_SHADER_TYPES][PIPE_MAX_CONSTANT_BUFFERS];
+             static size_t padded_size[PIPE_SHADER_TYPES][PIPE_MAX_CONSTANT_BUFFERS];
++            /* y2s91 (thumbgrid): bytes from 0 that may be non-zero (everything past it is zero already) */
++            static size_t padded_dirty[PIPE_SHADER_TYPES][PIPE_MAX_CONSTANT_BUFFERS];
+             char **p = &padded[stage][r->index];
+ 
+             if (padded_size[stage][r->index] < can_read) {
+                free(*p);
+                *p = calloc(1, can_read);
+                padded_size[stage][r->index] = *p ? can_read : 0;
++               padded_dirty[stage][r->index] = 0;
+             }
+             if (*p) {
+                memcpy(*p, (const char *)b->map + boffset, left);
+-               memset(*p + left, 0, can_read - left);
++               rwa_tg_ubo_tail(*p, left, can_read, &padded_dirty[stage][r->index]);
+                p_atomic_inc(&rwa_ubo_copied);
+                p_atomic_add(&rwa_ubo_copied_bytes, (uint64_t)can_read);
+                cb.buffer = NULL;
+@@ -5118,6 +5196,11 @@
+                                why_size);
+ }
+ 
++static int dispatch_buffers_impl(struct rwa_compute *compute, const struct rwa_bindings *bindings,
++                                 const struct rwa_buffer_bind *table, unsigned table_count,
++                                 const unsigned groups[3], const unsigned group_size[3], bool wait,
++                                 char *why, size_t why_size);
++
+ int
+ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bindings,
+                      const struct rwa_buffer_bind *table, unsigned table_count,
+@@ -5125,6 +5208,32 @@
+                      char *why, size_t why_size)
+ {
+    RWA_GUARD();
++   return dispatch_buffers_impl(compute, bindings, table, table_count, groups, group_size, true, why, why_size);
++}
++
++/*
++ * y2s91 (thumbgrid): the same dispatch, QUEUED like a draw instead of waited for. The bindings are taken back right after launch_grid,
++ * as rwa_render_draw and rwa_texture_convert_ycbcr take theirs back after draw_vbo: the job's descriptors are already written into
++ * the batch, which holds its own references on every resource. Panfrost's batch tracking orders the job against later readers and
++ * writers of the resources it bound, and the caller's rwa_submit/rwa_fence_wait (or rwa_finish) is the wait. A GPU fault is then
++ * reported by that fence and not named by this call. Exported for redwoodmetal.m's rw_tg_dispatch (flag no-thumbgrid-async).
++ */
++int
++rwa_dispatch_buffers_deferred(struct rwa_compute *compute, const struct rwa_bindings *bindings,
++                              const struct rwa_buffer_bind *table, unsigned table_count,
++                              const unsigned groups[3], const unsigned group_size[3],
++                              char *why, size_t why_size)
++{
++   RWA_GUARD();
++   return dispatch_buffers_impl(compute, bindings, table, table_count, groups, group_size, false, why, why_size);
++}
++
++static int
++dispatch_buffers_impl(struct rwa_compute *compute, const struct rwa_bindings *bindings,
++                      const struct rwa_buffer_bind *table, unsigned table_count,
++                      const unsigned groups[3], const unsigned group_size[3], bool wait,
++                      char *why, size_t why_size)
++{
+    struct rwa_device *device = compute->device;
+    struct pipe_context *pipe = device->pipe;
+    const char *name = compute->info.entry_point ? compute->info.entry_point : "the shader";
+@@ -5208,7 +5317,7 @@
+     * and call it a result. rwa_finish is for a caller that wants to wait again, or to
+     * wait for work dispatched through another pipeline of the same device.
+     */
+-   int rc = finish_or_say_why(device, true, "dispatch", why, why_size);
++   int rc = wait ? finish_or_say_why(device, true, "dispatch", why, why_size) : 0;
+ #ifdef GALLIUM_PANFROST
+    clock_gettime(CLOCK_MONOTONIC, &gnr1_t1);                           /* GNR1 */
+    gnr1_say_dispatch(compute, bindings, table, table_count, groups, group_size, rc,
+@@ -9048,11 +9157,43 @@
+    return true;
+ }
+ 
++/*
++ * y2s91 (thumbgrid): the pass body, with the size the viewport spans given apart from the destination's. rwa_texture_convert_ycbcr spans
++ * the destination (vw/vh = dst's size: unchanged); rwa_texture_convert_ycbcr_exact spans the SOURCE, so pixel (x, y) of `dst` samples
++ * texel (x, y) of `src` at its centre and a 375x667 picture is converted straight out of a 376x668 (even-padded) planes import, the
++ * padding column and row clipped away by the framebuffer and scissor (dst's size) instead of a second texture and a copy.
++ */
++static int convert_ycbcr_impl(struct rwa_texture *dst, struct rwa_texture *src, int matrix, int full_range, bool exact, char *why,
++                              size_t why_size);
++
+ int
+ rwa_texture_convert_ycbcr(struct rwa_texture *dst, struct rwa_texture *src, int matrix, int full_range, char *why,
+                           size_t why_size)
+ {
+    RWA_GUARD();
++   return convert_ycbcr_impl(dst, src, matrix, full_range, false, why, why_size);
++}
++
++/* y2s91: exported; the caller (redwoodmetal.m rw_tg_*) finds it with dlsym and keeps the padded path where it is missing */
++int
++rwa_texture_convert_ycbcr_exact(struct rwa_texture *dst, struct rwa_texture *src, int matrix, int full_range, char *why,
++                                size_t why_size)
++{
++   RWA_GUARD();
++   if (dst && src && dst->res && src->res &&
++       (src->res->width0 < dst->res->width0 || src->res->height0 < dst->res->height0 ||
++        src->res->width0 > dst->res->width0 + 1 || src->res->height0 > dst->res->height0 + 1)) {
++      say(why, why_size, "an exact YCbCr conversion reads a source of the destination's size or one texel more (%ux%u from %ux%u)",
++          dst->res->width0, dst->res->height0, src->res->width0, src->res->height0);
++      return -1;
++   }
++   return convert_ycbcr_impl(dst, src, matrix, full_range, true, why, why_size);
++}
++
++static int
++convert_ycbcr_impl(struct rwa_texture *dst, struct rwa_texture *src, int matrix, int full_range, bool exact, char *why,
++                   size_t why_size)
++{
+    if (!dst || !src || !dst->res || !src->res || dst->device != src->device || dst == src) {
+       say(why, why_size, "a YCbCr conversion needs two textures of one device");
+       return -1;
+@@ -9115,14 +9256,16 @@
+    }
+ 
+    const unsigned w = dst->res->width0, h = dst->res->height0;
++   /* y2s91: the span of the viewport: dst's size (as before), or src's for an exact conversion */
++   const unsigned vw = exact ? src->res->width0 : w, vh = exact ? src->res->height0 : h;
+    struct pipe_framebuffer_state fb = { .width = w, .height = h, .nr_cbufs = 1, .samples = 1 };
+    fb.cbufs[0] = surface;
+    pipe->set_framebuffer_state(pipe, &fb);
+    /* y NOT flipped, unlike a Metal draw's viewport: clip (-1,-1) is pixel row 0 of `dst`, and the vertex stage gives that corner
+     * the coordinate (0,0), which is row 0 of `src`. Row for row, whatever either API calls the top. */
+    pipe->set_viewport_states(pipe, 0, 1, &(struct pipe_viewport_state){
+-      .scale = { w / 2.0f, h / 2.0f, 1.0f },
+-      .translate = { w / 2.0f, h / 2.0f, 0.0f } });
++      .scale = { vw / 2.0f, vh / 2.0f, 1.0f },
++      .translate = { vw / 2.0f, vh / 2.0f, 0.0f } });
+    pipe->bind_blend_state(pipe, device->ycbcr.blend);
+    pipe->bind_depth_stencil_alpha_state(pipe, device->ycbcr.dsa);
+    pipe->set_stencil_ref(pipe, (struct pipe_stencil_ref){ 0 });

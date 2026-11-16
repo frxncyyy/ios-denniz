@@ -1,0 +1,612 @@
+diff -ruN a/rw_thumbgrid_host_test.c b/rw_thumbgrid_host_test.c
+--- a/rw_thumbgrid_host_test.c	1970-01-01 01:00:00.000000000 +0100
++++ b/rw_thumbgrid_host_test.c	2026-11-12 23:41:14.202723270 +0100
+@@ -0,0 +1,342 @@
++/*
++ * y2s91 (thumbgrid) host test: no GPU, no phone. Built and run by thumbgrid-host-test.sh against the existing host Mesa (softpipe).
++ *   A. rwa_texture_convert_ycbcr_exact on softpipe: a 375x667 picture out of a 376x668 source whose padding column and row hold
++ *      garbage: every pixel is the conversion of ITS texel (no resampling, no padding), byte-identical to the old two-pass path
++ *      (convert into 376x668, copy 375x667); the old single pass over the padded source resamples (the bug y2s63's copy avoided).
++ *      Refusals; rwa_buffer_recycle / rwa_texture_recycle.
++ *   B. rwa_tg_ubo_tail (taken verbatim out of air_metal.c by the script): after every fill the padded copy equals one that is fully
++ *      re-zeroed (the old behaviour), over random (left, can_read) sequences.
++ *   C. rw_thumbgrid_pure.h: the submit ring against a model (out-of-order completions), the size classes, the CPU reference against
++ *      the per-pixel formula of rw_ycbcr_odd_note, the right-edge block with garbage in the luma padding, the compare classification,
++ *      the check blocks inside the picture.
++ * What it cannot show: Panfrost's two-plane sampling, Mali precision, the deferred dispatch on a real queue, the phone's pools.
++ */
++#include <math.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include "air_metal.h"
++#include "rw_thumbgrid_pure.h"
++
++int rwa_texture_convert_ycbcr_exact(struct rwa_texture *, struct rwa_texture *, int, int, char *, size_t);
++size_t rwa_buffer_recycle(struct rwa_buffer *);
++int rwa_texture_recycle(struct rwa_texture *);
++
++/* B: the function under test, verbatim (ubo_tail.inc is cut out of air_metal.c by the script) */
++#define MIN2(a, b) ((a) < (b) ? (a) : (b))
++#define MAX2(a, b) ((a) > (b) ? (a) : (b))
++#define p_atomic_add(p, v) (*(p) += (v))
++static uint64_t rwa_tg_ubo_zeroed, rwa_tg_ubo_saved;
++#include "ubo_tail.inc"
++
++static char why[512];
++#define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAILED line %d: %s (%s)\n", __LINE__, #x, why); return 1; } } while (0)
++
++static void
++reference(int y, int cb, int cr, int matrix, int full, int out[3])      /* B, G, R (ycbcr_gpu_host_test.c) */
++{
++	static const double k[3][2] = { { 0.299, 0.114 }, { 0.2126, 0.0722 }, { 0.2627, 0.0593 } };
++	const double kr = k[matrix][0], kb = k[matrix][1], kg = 1.0 - kr - kb;
++	double Y = full ? y / 255.0 : (y < 16 ? 0.0 : (y - 16) / 219.0), U = (cb - 128) / (full ? 255.0 : 224.0), V = (cr - 128) / (full ? 255.0 : 224.0);
++	double c[3] = { Y + 2.0 * (1.0 - kb) * U, Y - 2.0 * kb * (1.0 - kb) / kg * U - 2.0 * kr * (1.0 - kr) / kg * V, Y + 2.0 * (1.0 - kr) * V };
++
++	for (int i = 0; i < 3; i++) {
++		double v = floor(c[i] * 255.0 + 0.5);
++		out[i] = v < 0 ? 0 : v > 255 ? 255 : (int)v;
++	}
++}
++
++static int
++test_library(void)
++{
++	enum { W = 375, H = 667, PW = 376, PH = 668 };
++	static unsigned char src_px[PH][PW][4], exact_px[H][W][4], old_px[H][W][4], one_px[H][W][4];
++	const unsigned origin[3] = { 0, 0, 0 }, psize[3] = { PW, PH, 1 }, size[3] = { W, H, 1 };
++
++	setenv("RWA_SOFTWARE", "1", 1);
++	struct rwa_device *device = rwa_device_open(why, sizeof(why));
++	CHECK(device != NULL);
++	struct rwa_texture_shape s = { .pixel_format = 70, .type = 2, .width = PW, .height = PH, .depth = 1, .array_length = 1,
++				       .mip_levels = 1, .sample_count = 1, .usage = 1 };
++	struct rwa_texture *src = rwa_texture_create(device, &s, why, sizeof(why));
++	CHECK(src != NULL);
++	s.pixel_format = 80;
++	s.usage = 1 | 4;
++	struct rwa_texture *tmp = rwa_texture_create(device, &s, why, sizeof(why));     /* the old 376x668 picture */
++	CHECK(tmp != NULL);
++	s.width = W;
++	s.height = H;
++	struct rwa_texture *dst = rwa_texture_create(device, &s, why, sizeof(why));
++	CHECK(dst != NULL);
++	s.width = W + 3;
++	struct rwa_texture *wide = rwa_texture_create(device, &s, why, sizeof(why));
++	CHECK(wide != NULL);
++
++	srand(91);
++	for (int y = 0; y < PH; y++) {
++		for (int x = 0; x < PW; x++) {
++			unsigned char *p = src_px[y][x];
++
++			if (x == PW - 1 || y == PH - 1) {                       /* the padding: garbage that must never show */
++				p[0] = 255; p[1] = 0; p[2] = 255;
++			} else {
++				p[0] = (unsigned char)rand(); p[1] = (unsigned char)rand(); p[2] = (unsigned char)rand();
++			}
++			p[3] = 0;
++		}
++	}
++	CHECK(rwa_texture_write(src, 0, 0, origin, psize, src_px, PW * 4, why, sizeof(why)) == 0);
++
++	/* refusals: a source smaller than the destination, or more than one texel larger */
++	CHECK(rwa_texture_convert_ycbcr_exact(wide, src, 0, 1, why, sizeof(why)) == -1 && strstr(why, "exact"));
++	CHECK(rwa_texture_convert_ycbcr_exact(tmp, dst, 0, 1, why, sizeof(why)) == -1);
++	CHECK(rwa_texture_convert_ycbcr_exact(NULL, src, 0, 1, why, sizeof(why)) == -1);
++
++	int worst = 0;
++
++	for (int matrix = 0; matrix < 3; matrix++) {
++		for (int full = 0; full < 2; full++) {
++			why[0] = 0;
++			CHECK(rwa_texture_convert_ycbcr_exact(dst, src, matrix, full, why, sizeof(why)) == 0);
++			CHECK(rwa_finish(device, why, sizeof(why)) == 0);
++			CHECK(rwa_texture_read(dst, 0, 0, origin, size, exact_px, W * 4, why, sizeof(why)) == 0);
++			for (int y = 0; y < H; y++) {
++				for (int x = 0; x < W; x++) {
++					int want[3];
++
++					reference(src_px[y][x][0], src_px[y][x][1], src_px[y][x][2], matrix, full, want);
++					for (int c = 0; c < 3; c++) {
++						int d = abs((int)exact_px[y][x][c] - want[c]);
++
++						if (d > 1) {
++							fprintf(stderr, "FAILED exact matrix %d full %d at (%d,%d) ch %d: %d want %d\n", matrix, full, x, y, c,
++								exact_px[y][x][c], want[c]);
++							return 1;
++						}
++						worst = d > worst ? d : worst;
++					}
++				}
++			}
++			/* the old two passes give the same bytes */
++			CHECK(rwa_texture_convert_ycbcr(tmp, src, matrix, full, why, sizeof(why)) == 0);
++			CHECK(rwa_texture_copy(dst, 0, 0, origin, tmp, 0, 0, origin, size, why, sizeof(why)) == 0);
++			CHECK(rwa_finish(device, why, sizeof(why)) == 0);
++			CHECK(rwa_texture_read(dst, 0, 0, origin, size, old_px, W * 4, why, sizeof(why)) == 0);
++			CHECK(memcmp(old_px, exact_px, sizeof(old_px)) == 0);
++		}
++	}
++	/* the old ONE pass over the padded source resamples 376 texels onto 375 pixels: most pixels are not their texel */
++	CHECK(rwa_texture_convert_ycbcr(dst, src, 0, 1, why, sizeof(why)) == 0);
++	CHECK(rwa_finish(device, why, sizeof(why)) == 0);
++	CHECK(rwa_texture_read(dst, 0, 0, origin, size, one_px, W * 4, why, sizeof(why)) == 0);
++	unsigned long off = 0;
++
++	for (int y = 0; y < H; y++) {
++		for (int x = 0; x < W; x++) {
++			int want[3];
++
++			reference(src_px[y][x][0], src_px[y][x][1], src_px[y][x][2], 0, 1, want);
++			off += abs((int)one_px[y][x][0] - want[0]) > 1 || abs((int)one_px[y][x][1] - want[1]) > 1 ||
++			       abs((int)one_px[y][x][2] - want[2]) > 1;
++		}
++	}
++	CHECK(off > (unsigned long)W * H / 4);
++	printf("A: exact pass == texel conversion (worst %d level), == old padded+copy byte for byte; old single pass over the padding: %lu of "
++	       "%d pixels off\n", worst, off, W * H);
++
++	/* recycle hooks */
++	struct rwa_buffer *b = rwa_buffer_create(device, 65536, why, sizeof(why));
++	CHECK(b != NULL);
++	CHECK(rwa_buffer_recycle(b) == 65536);
++	CHECK(rwa_buffer_map(b) != NULL);
++	rwa_buffer_destroy(b);
++	CHECK(rwa_texture_recycle(dst) == 0);
++	CHECK(rwa_texture_recycle(NULL) == -1);
++	rwa_texture_destroy(src);
++	rwa_texture_destroy(tmp);
++	rwa_texture_destroy(dst);
++	rwa_texture_destroy(wide);
++	rwa_device_close(device);
++	printf("A: refusals and recycle hooks ok\n");
++	return 0;
++}
++
++static int
++test_ubo_tail(void)
++{
++	enum { CAP = 65536 };
++	static char a[CAP], ref[CAP], src[CAP];
++	size_t dirty = 0;
++	unsigned long steps = 0;
++
++	memset(a, 0, sizeof(a));
++	srand(7);
++	for (int i = 0; i < 200000; i++) {
++		size_t can_read = (size_t)(rand() % 4 == 0 ? 16 + rand() % 512 : 1 + rand() % CAP);
++		size_t left = (size_t)(rand() % (int)can_read);
++
++		for (size_t k = 0; k < left; k++) {
++			src[k] = (char)(rand() | 1);    /* never zero: a missed clear shows */
++		}
++		memcpy(a, src, left);
++		rwa_tg_ubo_tail(a, left, can_read, &dirty);
++		memcpy(ref, src, left);
++		memset(ref + left, 0, can_read - left);
++		if (memcmp(a, ref, can_read) != 0) {
++			fprintf(stderr, "FAILED ubo tail step %d: left %zu can_read %zu\n", i, left, can_read);
++			return 1;
++		}
++		/* and the invariant: nothing past `dirty` is non-zero */
++		for (size_t k = dirty; k < CAP; k += 61) {
++			if (a[k] != 0) {
++				fprintf(stderr, "FAILED ubo tail invariant step %d at %zu (dirty %zu)\n", i, k, dirty);
++				return 1;
++			}
++		}
++		steps++;
++	}
++	printf("B: ubo tail == full re-zero over %lu random fills; zeroed %llu KiB, saved %llu KiB (%.1f%% saved)\n", steps,
++	       (unsigned long long)(rwa_tg_ubo_zeroed >> 10), (unsigned long long)(rwa_tg_ubo_saved >> 10),
++	       100.0 * rwa_tg_ubo_saved / (double)(rwa_tg_ubo_saved + rwa_tg_ubo_zeroed));
++	return 0;
++}
++
++static int
++test_pure(void)
++{
++	/* submit ring vs model */
++	static struct rw_tg_seq q;
++	static uint8_t back[200000];
++	uint64_t outq[64];
++	int nout = 0;
++
++	rw_tg_seq_init(&q);
++	srand(3);
++	for (int i = 0; i < 150000; i++) {
++		int op = rand() % 3;
++
++		if (op == 0 && nout < 64) {
++			uint64_t s = rw_tg_seq_submit(&q);
++
++			CHECK(s != 0);
++			outq[nout++] = s;
++		} else if (op == 1 && nout > 0) {
++			int j = rand() % nout;
++
++			rw_tg_seq_done(&q, outq[j]);
++			back[outq[j]] = 1;
++			outq[j] = outq[--nout];
++		} else {
++			/* a mark now: safe exactly when every number below it is back */
++			uint64_t m = rw_tg_seq_mark(&q);
++			int want = 1;
++
++			for (int j = 0; j < nout; j++) {
++				want &= outq[j] >= m;
++			}
++			CHECK(rw_tg_seq_safe(&q, m) == want);
++			if (nout > 0) {
++				uint64_t o = outq[rand() % nout];
++
++				CHECK(!rw_tg_seq_safe(&q, o + 1));     /* something let go after `o` was submitted waits for it */
++			}
++		}
++	}
++	/* a full window: untracked submits block every mark until they come back */
++	rw_tg_seq_init(&q);
++	for (unsigned i = 0; i < RW_TG_SEQ_RING; i++) {
++		CHECK(rw_tg_seq_submit(&q) == i + 1);
++	}
++	CHECK(rw_tg_seq_submit(&q) == 0);
++	for (unsigned i = 0; i < RW_TG_SEQ_RING; i++) {
++		rw_tg_seq_done(&q, i + 1);
++	}
++	CHECK(!rw_tg_seq_safe(&q, rw_tg_seq_mark(&q)));
++	rw_tg_seq_done(&q, 0);
++	CHECK(rw_tg_seq_safe(&q, rw_tg_seq_mark(&q)));
++	printf("C: submit ring == model over 150000 steps, untracked submits block\n");
++
++	/* classes */
++	size_t prev = 0;
++
++	for (size_t len = 1; len < (40u << 20); len += len < 70000 ? 1 + len / 64 : 1 + len / 7) {
++		size_t c = rw_tg_class(len);
++
++		CHECK(c >= len && c >= prev && rw_tg_class(c) == c);
++		CHECK(len <= 4096 || c <= len * 2);
++		CHECK(len <= 65536 || c - len < 65536 + (len > (1u << 20) ? (1u << 20) : 0));
++		prev = c;
++	}
++	printf("C: size classes monotonic, fixed points, bounded waste\n");
++
++	/* reference vs the per-pixel formula, constant chroma (bilinear of a constant is the constant) */
++	enum { W = 375, H = 667, LROW = 384, CW = 188, CH = 334, CROW = 384 };
++	static uint8_t luma[LROW * 668], chroma[CROW * CH], out[16 * 16 * 4], out2[16 * 16 * 4];
++
++	for (int m = 0; m < 3; m++) {
++		for (int full = 0; full < 2; full++) {
++			int cb = 60 + 40 * m, cr = 200 - 30 * full;
++
++			for (int i = 0; i < LROW * 668; i++) luma[i] = (uint8_t)rand();
++			for (int y = 0; y < CH; y++) for (int x = 0; x < CW; x++) { chroma[y * CROW + 2 * x] = (uint8_t)cb; chroma[y * CROW + 2 * x + 1] = (uint8_t)cr; }
++			for (int k = 0; k < 50; k++) {
++				unsigned bx, by, bw, bh;
++				int edge;
++
++				rw_tg_check_block((unsigned long)k, W, H, &bx, &by, &bw, &bh, &edge);
++				CHECK(bx + bw <= W && by + bh <= H && bw == 16 && bh == 16);
++				rw_tg_ref_bgra(luma, LROW, chroma, CROW, W, H, m, full, bx, by, bw, bh, out);
++				for (unsigned j = 0; j < bh; j++) {
++					for (unsigned i = 0; i < bw; i++) {
++						int want[3];
++
++						reference(luma[(by + j) * LROW + bx + i], cb, cr, m, full, want);
++						for (int c = 0; c < 3; c++) {
++							CHECK(abs((int)out[(j * bw + i) * 4 + c] - want[c]) <= 1);
++						}
++					}
++				}
++			}
++		}
++	}
++	/* the right edge of a 375-wide picture: the luma padding column 375 and anything past chroma column 187 are never read */
++	for (int i = 0; i < LROW * 668; i++) luma[i] = (uint8_t)rand();
++	for (int i = 0; i < CROW * CH; i++) chroma[i] = (uint8_t)rand();
++	rw_tg_ref_bgra(luma, LROW, chroma, CROW, W, H, 0, 1, W - 16, H - 16, 16, 16, out);
++	for (int y = 0; y < 668; y++) for (int x = W; x < LROW; x++) luma[y * LROW + x] ^= 0xff;
++	for (int y = 0; y < CH; y++) for (int x = 2 * CW; x < CROW; x++) chroma[y * CROW + x] ^= 0xff;
++	for (int x = 0; x < LROW; x++) luma[667 * LROW + x] ^= 0xff;
++	rw_tg_ref_bgra(luma, LROW, chroma, CROW, W, H, 0, 1, W - 16, H - 16, 16, 16, out2);
++	CHECK(memcmp(out, out2, sizeof(out)) == 0);
++	printf("C: reference == formula (constant chroma, 3 matrices x 2 ranges, 50 blocks each); edge block blind to the padding\n");
++
++	/* compare classification */
++	struct rw_tg_cmp c;
++
++	memcpy(out2, out, sizeof(out));
++	rw_tg_compare(out, 64, out2, 64, 16, 16, 10, 48, &c);
++	CHECK(!rw_tg_is_mismatch(&c) && c.maxdiff == 0);
++	out2[4 * 7] ^= 8;                                       /* a filter-precision difference: fine */
++	rw_tg_compare(out, 64, out2, 64, 16, 16, 10, 48, &c);
++	CHECK(!rw_tg_is_mismatch(&c));
++	for (int i = 0; i < 16; i++) {                          /* a black right column: a thin edge line */
++		uint8_t *p = out2 + (i * 16 + 15) * 4;
++		p[0] = p[1] = p[2] = (uint8_t)(out[(i * 16 + 15) * 4] > 128 ? 0 : 255);
++	}
++	rw_tg_compare(out, 64, out2, 64, 16, 16, 10, 48, &c);
++	CHECK(rw_tg_is_mismatch(&c) && c.gross > 0);
++	printf("C: compare: identical/precision ok, edge line = gross mismatch\n");
++	return 0;
++}
++
++int
++main(void)
++{
++	if (test_pure() || test_ubo_tail() || test_library()) {
++		return 1;
++	}
++	printf("rw_thumbgrid_host_test: ALL OK\n");
++	return 0;
++}
+diff -ruN a/rw_thumbgrid_pure.h b/rw_thumbgrid_pure.h
+--- a/rw_thumbgrid_pure.h	1970-01-01 01:00:00.000000000 +0100
++++ b/rw_thumbgrid_pure.h	2026-11-12 23:41:14.201980783 +0100
+@@ -0,0 +1,221 @@
++/*
++ * y2s91 (thumbgrid): the parts of redwoodmetal.m's rw_tg_* code that touch neither Metal, IOSurface nor the GPU, in a header of their
++ * own so that rw_thumbgrid_host_test.c checks the very code the driver runs (no phone, no GPU).
++ *
++ *   rw_tg_ref_bgra      CPU reference of the GPU conversion pass (air_metal.c ycbcr_fragment_shader + the sampler of ycbcr_state):
++ *                       luma sampled at its texel centre, chroma BILINEAR at (x + 0.5) / 2 - 0.5 (centre-sited 4:2:0) with clamp to
++ *                       edge, BT.601/709/2020, full or video range; out BGRA8.
++ *   rw_tg_compare       the GPU's BGRA block against the reference: per-channel tolerance, "gross" (black cell, stripe) threshold.
++ *   rw_tg_class         size classes of the buffer pool.
++ *   rw_tg_seq_*         which command buffers are still on the GPU: a ring of submit sequence numbers, completions in any order.
++ */
++#ifndef RW_THUMBGRID_PURE_H
++#define RW_THUMBGRID_PURE_H
++
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++
++static inline float
++rw_tg_clampf(float v, float lo, float hi)
++{
++	return v < lo ? lo : v > hi ? hi : v;
++}
++
++/* one chroma channel (0 Cb, 1 Cr) of the interleaved plane, bilinear at chroma texel coordinates (cx, cy), clamp to edge */
++static inline float
++rw_tg_chroma(const uint8_t *chroma, size_t chroma_row, unsigned cw, unsigned ch, float cx, float cy, unsigned c)
++{
++	cx = rw_tg_clampf(cx, 0.0f, (float)(cw - 1));
++	cy = rw_tg_clampf(cy, 0.0f, (float)(ch - 1));
++	unsigned x0 = (unsigned)cx, y0 = (unsigned)cy;
++	unsigned x1 = x0 + 1 < cw ? x0 + 1 : x0, y1 = y0 + 1 < ch ? y0 + 1 : y0;
++	float fx = cx - (float)x0, fy = cy - (float)y0;
++	float a = chroma[(size_t)y0 * chroma_row + 2 * x0 + c], b = chroma[(size_t)y0 * chroma_row + 2 * x1 + c];
++	float d = chroma[(size_t)y1 * chroma_row + 2 * x0 + c], e = chroma[(size_t)y1 * chroma_row + 2 * x1 + c];
++
++	return ((a * (1 - fx) + b * fx) * (1 - fy) + (d * (1 - fx) + e * fx) * fy) / 255.0f;
++}
++
++/*
++ * The block (bx, by, bw, bh) of a width x height picture, as the pass converts it, into `out` (bw * 4 bytes a row, B G R A).
++ * cw/ch: the chroma plane's size in texels, (width + 1) / 2 x (height + 1) / 2 -- also when the GPU reads an even-padded import,
++ * whose chroma plane is the same plane (188 = 376 / 2 = (375 + 1) / 2).
++ */
++static inline void
++rw_tg_ref_bgra(const uint8_t *luma, size_t luma_row, const uint8_t *chroma, size_t chroma_row, unsigned width, unsigned height,
++	       int matrix, int full, unsigned bx, unsigned by, unsigned bw, unsigned bh, uint8_t *out)
++{
++	static const double kr_kb[3][2] = { { 0.299, 0.114 }, { 0.2126, 0.0722 }, { 0.2627, 0.0593 } };
++	const double kr = kr_kb[matrix < 0 || matrix > 2 ? 0 : matrix][0], kb = kr_kb[matrix < 0 || matrix > 2 ? 0 : matrix][1];
++	const double kg = 1.0 - kr - kb;
++	const float ys = full ? 1.0f : 255.0f / 219.0f, cs = full ? 1.0f : 255.0f / 224.0f;
++	const float y0 = full ? 0.0f : 16.0f / 255.0f, c0 = 128.0f / 255.0f;
++	const float rv = (float)(2.0 * (1.0 - kr)) * cs, gu = (float)(-2.0 * kb * (1.0 - kb) / kg) * cs;
++	const float gv = (float)(-2.0 * kr * (1.0 - kr) / kg) * cs, bu = (float)(2.0 * (1.0 - kb)) * cs;
++	const unsigned cw = (width + 1) / 2, ch = (height + 1) / 2;
++
++	for (unsigned j = 0; j < bh; j++) {
++		unsigned y = by + j < height ? by + j : height - 1;
++
++		for (unsigned i = 0; i < bw; i++) {
++			unsigned x = bx + i < width ? bx + i : width - 1;
++			float yy = (float)luma[(size_t)y * luma_row + x] / 255.0f;
++			float cx = ((float)x + 0.5f) * 0.5f - 0.5f, cy = ((float)y + 0.5f) * 0.5f - 0.5f;
++			float u = rw_tg_chroma(chroma, chroma_row, cw, ch, cx, cy, 0) - c0;
++			float v = rw_tg_chroma(chroma, chroma_row, cw, ch, cx, cy, 1) - c0;
++			float l = (yy - y0 > 0.0f ? yy - y0 : 0.0f) * ys;
++			float rgb[3] = { l + v * rv, l + u * gu + v * gv, l + u * bu };
++			uint8_t *o = out + (size_t)j * bw * 4 + (size_t)i * 4;
++
++			o[0] = (uint8_t)(rw_tg_clampf(rgb[2], 0, 1) * 255.0f + 0.5f);
++			o[1] = (uint8_t)(rw_tg_clampf(rgb[1], 0, 1) * 255.0f + 0.5f);
++			o[2] = (uint8_t)(rw_tg_clampf(rgb[0], 0, 1) * 255.0f + 0.5f);
++			o[3] = 255;
++		}
++	}
++}
++
++struct rw_tg_cmp {
++	unsigned over;          /* pixels with a channel beyond `tol` */
++	unsigned gross;         /* pixels with a channel beyond `gross_tol` (black cell, wrong picture, stripe) */
++	unsigned maxdiff;
++	unsigned sumdiff;       /* over all channels, for the mean */
++};
++
++/* both blocks bw x bh, B G R A, `a_row` / `b_row` bytes a row; alpha is not compared (the pass writes 1) */
++static inline void
++rw_tg_compare(const uint8_t *a, size_t a_row, const uint8_t *b, size_t b_row, unsigned bw, unsigned bh, unsigned tol,
++	      unsigned gross_tol, struct rw_tg_cmp *r)
++{
++	memset(r, 0, sizeof(*r));
++	for (unsigned j = 0; j < bh; j++) {
++		for (unsigned i = 0; i < bw; i++) {
++			const uint8_t *p = a + (size_t)j * a_row + 4 * i, *q = b + (size_t)j * b_row + 4 * i;
++			unsigned m = 0;
++
++			for (unsigned c = 0; c < 3; c++) {
++				unsigned d = p[c] > q[c] ? (unsigned)(p[c] - q[c]) : (unsigned)(q[c] - p[c]);
++
++				m = d > m ? d : m;
++				r->sumdiff += d;
++			}
++			r->over += m > tol;
++			r->gross += m > gross_tol;
++			r->maxdiff = m > r->maxdiff ? m : r->maxdiff;
++		}
++	}
++}
++
++/* a block is a MISMATCH when any pixel is gross or more than 2 of its pixels are beyond the tolerance */
++static inline int
++rw_tg_is_mismatch(const struct rw_tg_cmp *r)
++{
++	return r->gross > 0 || r->over > 2;
++}
++
++/*
++ * Which block of a width x height picture the k-th check reads (16x16, or the picture when smaller): a rotation of interior,
++ * right edge, bottom edge, bottom-right corner, top-left -- the right edge of 375-wide cells is where the thin lines were seen.
++ */
++static inline void
++rw_tg_check_block(unsigned long k, unsigned width, unsigned height, unsigned *bx, unsigned *by, unsigned *bw, unsigned *bh, int *edge)
++{
++	unsigned w = width < 16 ? width : 16, h = height < 16 ? height : 16;
++	uint32_t r = (uint32_t)(k * 2654435761u);
++
++	*bw = w;
++	*bh = h;
++	*edge = 1;
++	switch (k % 5) {
++	case 0: *bx = (r % (width - w + 1)); *by = ((r >> 16) % (height - h + 1)); *edge = 0; break;
++	case 1: *bx = width - w; *by = (r >> 8) % (height - h + 1); break;
++	case 2: *bx = (r >> 4) % (width - w + 1); *by = height - h; break;
++	case 3: *bx = width - w; *by = height - h; break;
++	default: *bx = 0; *by = 0; break;
++	}
++}
++
++/* the pool's size class of a request: powers of two from 4 KiB to 64 KiB, then 64 KiB steps to 1 MiB, then 1 MiB steps */
++static inline size_t
++rw_tg_class(size_t length)
++{
++	if (length <= 4096)
++		return 4096;
++	if (length <= 65536) {
++		size_t c = 4096;
++
++		while (c < length)
++			c <<= 1;
++		return c;
++	}
++	if (length <= (1u << 20))
++		return (length + 65535) & ~(size_t)65535;
++	return (length + (1u << 20) - 1) & ~(size_t)((1u << 20) - 1);
++}
++
++/*
++ * Submit sequence numbers: rw_tg_seq_submit gives the next one (it is on the GPU from then on), rw_tg_seq_done says it came back, in
++ * any order. rw_tg_seq_low is the oldest one still out (or the next to be given when none is): something let go when `next` was N
++ * is no longer read by the GPU once low > N - 1 ... i.e. once every submit up to N-1 has come back: rw_tg_seq_safe(s, N).
++ * One ring for the process; a window of RW_TG_SEQ_RING submits (beyond it rw_tg_seq_safe answers no). The caller holds the lock.
++ */
++#define RW_TG_SEQ_RING 4096u
++struct rw_tg_seq {
++	uint64_t next;                  /* the next number to give; numbers start at 1 */
++	uint64_t low;                   /* every number below it has come back */
++	uint64_t untracked;             /* submits given 0 (window full) and not back yet: nothing is safe while any is out */
++	uint8_t done[RW_TG_SEQ_RING];   /* came back, for numbers in [low, next) */
++};
++
++static inline void
++rw_tg_seq_init(struct rw_tg_seq *q)
++{
++	memset(q, 0, sizeof(*q));
++	q->next = 1;
++	q->low = 1;
++}
++
++static inline uint64_t
++rw_tg_seq_submit(struct rw_tg_seq *q)
++{
++	if (q->next - q->low >= RW_TG_SEQ_RING) {
++		q->untracked++;
++		return 0;               /* too many out: not tracked (0 = "unknown": nothing is safe until it is back) */
++	}
++	uint64_t s = q->next++;
++
++	q->done[s % RW_TG_SEQ_RING] = 0;
++	return s;
++}
++
++static inline void
++rw_tg_seq_done(struct rw_tg_seq *q, uint64_t s)
++{
++	if (s == 0) {
++		q->untracked -= q->untracked > 0;
++		return;
++	}
++	if (s < q->low || s >= q->next) {
++		return;
++	}
++	q->done[s % RW_TG_SEQ_RING] = 1;
++	while (q->low < q->next && q->done[q->low % RW_TG_SEQ_RING]) {
++		q->low++;
++	}
++}
++
++/* the mark of "now": what is let go now is safe to reuse once every submit given so far has come back */
++static inline uint64_t
++rw_tg_seq_mark(const struct rw_tg_seq *q)
++{
++	return q->next;
++}
++
++static inline int
++rw_tg_seq_safe(const struct rw_tg_seq *q, uint64_t mark)
++{
++	return q->low >= mark && q->untracked == 0;
++}
++
++#endif
+diff -ruN a/thumbgrid-host-test.sh b/thumbgrid-host-test.sh
+--- a/thumbgrid-host-test.sh	1970-01-01 01:00:00.000000000 +0100
++++ b/thumbgrid-host-test.sh	2026-11-12 23:41:14.202827284 +0100
+@@ -0,0 +1,37 @@
++#!/bin/bash
++# y2s91 (thumbgrid): rw_thumbgrid_host_test.c against the EXISTING host Mesa build (WP08, read only), plus the y2s38 ycbcr test again
++# (the old entry point after the refactor into convert_ycbcr_impl).
++#   T=<empty scratch dir> [H=<host mesa build>] bash thumbgrid-host-test.sh SRC
++set -euo pipefail
++G=$NORD2_WORK/gpu
++M=$G/build/y2s-stage0/mesa-25.0.7; HERE=$(cd "$1" && pwd); T=${T:?set T}; H=${H:-$G/video/build/WP08/hostmesa}
++mkdir -p $T; cd $T
++printf '#ifndef __ASSEMBLER__\n#include <pthread.h>\n#define __once_flag_defined 1\n#define once_flag pthread_once_t\n#endif\n' > hostfix.h
++printf '#include <stdint.h>\n#include <stdbool.h>\n#include "frontend/winsys_handle.h"\n#include "drm-uapi/drm_fourcc.h"\n' > hostfix2.h
++LIBS="src/gallium/auxiliary/libgallium.a src/compiler/nir/libnir.a src/compiler/libcompiler.a src/util/libmesa_util.a src/util/libmesa_util_sse41.a src/util/blake3/libblake3.a src/c11/impl/libmesa_util_c11.a src/gallium/auxiliary/libgalliumvl_stub.a src/gallium/winsys/sw/null/libws_null.a src/compiler/air/libair.a src/util/libxmlconfig.a src/gallium/drivers/softpipe/libsoftpipe.a"
++for l in $LIBS; do [ -f $H/$l ] || { echo "missing $H/$l"; exit 1; }; done
++INC=$(for d in src/gallium/drivers/panfrost include src src/mapi src/mesa src/gallium/include src/gallium/auxiliary src/gallium/winsys/sw src/gallium/winsys src/gallium/drivers src/compiler/air src/compiler/nir src/compiler src/panfrost src/panfrost/lib src/panfrost/util src/panfrost/compiler; do printf -- "-I$H/$d -I$M/$d "; done)
++DEF=$(grep -o '^DEF="[^"]*"' $HERE/host-tests.sh | sed 's/^DEF="//; s/"$//')
++CC="cc -std=gnu11 -O1 -g -include $T/hostfix.h -include $T/hostfix2.h $DEF $INC"
++A=$(for l in $LIBS; do printf "$H/$l "; done)
++for f in air_to_nir air_intrinsics; do
++  C=$(python3 -I -c "import json,sys
++for e in json.load(open('$H/compile_commands.json')):
++    if e['file'].endswith('compiler/air/$f.c'): print(e['command']); break")
++  (cd $H && eval "$(echo "$C" | sed "s| -MD -MQ [^ ]* -MF [^ ]*||; s| -o [^ ]*| -o $T/$f.c.o|; s| -c [^ ]*| -c $HERE/$f.c|; s|^cc |cc -I$M/src/compiler/air |")")
++done
++TR="air_to_nir.c.o air_intrinsics.c.o"
++LINK() { out=$1; shift; c++ -o $out "$@" $TR -Wl,--start-group $A -Wl,--end-group -lm -lz -lpthread -ldl -ldrm; }
++$CC -Wall -c $HERE/air_metal.c -o air_metal_host.o
++python3 -I - $HERE/air_metal.c ubo_tail.inc <<'PY'
++import sys
++s = open(sys.argv[1]).read()
++a = s.index('static void\nrwa_tg_ubo_tail(')
++b = s.index('\n}\n', a) + 3
++open(sys.argv[2], 'w').write(s[a:b])
++PY
++cc -std=gnu11 -O1 -g -Wall -I$HERE -I$T -c $HERE/rw_thumbgrid_host_test.c -o tg_test.o
++LINK rw_thumbgrid_host_test tg_test.o air_metal_host.o; ./rw_thumbgrid_host_test
++cc -std=gnu11 -O1 -g -I$HERE -c $HERE/ycbcr_gpu_host_test.c -o test.o
++LINK ycbcr_gpu_host_test test.o air_metal_host.o; ./ycbcr_gpu_host_test
++echo THUMBGRID_HOST_TEST_DONE

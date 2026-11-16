@@ -1,0 +1,131 @@
+--- orig/air_metal.c	2026-11-12 10:56:58.372125478 +0100
++++ src/air_metal.c	2026-11-12 10:58:48.377395943 +0100
+@@ -29,6 +29,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <time.h>   /* GNR1 */
+ 
+ #include "air_metal.h"
+ 
+@@ -5007,6 +5008,97 @@
+    }
+ }
+ 
++/*
++ * GNR1 (y2s63-gnr1, diagnostic only; changes no result). Run q10ik-vt12: GNR's registration dispatches came back
++ * "did not finish within two seconds", 25 times, while the kernel counted 24+6 FAULTED jobs of mediaserverd and
++ * the winsys's wait returned EIO at once: the jobs faulted, they did not hang, and nothing said WHICH kernel.
++ * Now a failed dispatch says its kernel, grid, group, threadgroup memory and every binding with its GPU range
++ * (the Panfrost handle's va/size from nord2_pan.c), so the fault address nord2_pan.c prints ("np GNR1 FAULT")
++ * can be matched to a binding. With /var/db/nord2-gpu-gnr1-trace present every dispatch of the process is said
++ * in one short line (name, grid, group, ms): the order of GNR's kernels up to the first fault.
++ */
++#ifdef GALLIUM_PANFROST
++extern int nord2_gnr1_bo_info(uint32_t h, uint64_t *va, uint64_t *size) __attribute__((weak));
++
++static void
++gnr1_range(struct rwa_device *device, struct pipe_resource *res, char *out, size_t size)
++{
++   struct winsys_handle wh = { .type = WINSYS_HANDLE_TYPE_KMS };
++   uint64_t va = 0, bytes = 0, stride = 0, offset = 0;
++
++   out[0] = 0;
++   if (!res || device->software || !device->screen->resource_get_handle)
++      return;
++   if (device->screen->resource_get_param) {
++      device->screen->resource_get_param(device->screen, NULL, res, 0, 0, 0, PIPE_RESOURCE_PARAM_STRIDE, 0, &stride);
++      device->screen->resource_get_param(device->screen, NULL, res, 0, 0, 0, PIPE_RESOURCE_PARAM_OFFSET, 0, &offset);
++   }
++   if (device->screen->resource_get_handle(device->screen, NULL, res, &wh, 0) && nord2_gnr1_bo_info &&
++       nord2_gnr1_bo_info(wh.handle, &va, &bytes) == 0)
++      snprintf(out, size, " bo %u va 0x%llx..0x%llx stride %llu off %llu", wh.handle, (unsigned long long)va,
++               (unsigned long long)(va + bytes), (unsigned long long)stride, (unsigned long long)offset);
++   else
++      snprintf(out, size, " (no gpu range) stride %llu off %llu", (unsigned long long)stride,
++               (unsigned long long)offset);
++}
++
++static int
++gnr1_trace_on(void)
++{
++   static int on = -1;
++   if (on < 0)
++      on = access("/private/var/db/nord2-gpu-gnr1-trace", F_OK) == 0;
++   return on;
++}
++
++static void
++gnr1_say_dispatch(struct rwa_compute *compute, const struct rwa_bindings *b,
++                  const struct rwa_buffer_bind *table, unsigned table_count,
++                  const unsigned groups[3], const unsigned group_size[3], int rc, double ms, const char *why)
++{
++   static unsigned said_failed;
++   struct rwa_device *device = compute->device;
++   const char *name = compute->info.entry_point ? compute->info.entry_point : "?";
++   char line[900], r[128];
++   int n;
++
++   if (rc == 0) {
++      if (!gnr1_trace_on())
++         return;
++      n = snprintf(line, sizeof(line), "GNR1 dispatch %s %ux%ux%u x %ux%ux%u %.2f ms", name, groups[0], groups[1],
++                   groups[2], group_size[0], group_size[1], group_size[2], ms);
++      np_log(line, (size_t)MIN2(n, (int)sizeof(line) - 1));
++      return;
++   }
++   if (said_failed++ >= 12)
++      return;
++   n = snprintf(line, sizeof(line), "GNR1 FAILED DISPATCH %s grid %ux%ux%u group %ux%ux%u (%.1f ms) shared %u B: %.160s",
++                name, groups[0], groups[1], groups[2], group_size[0], group_size[1], group_size[2], ms,
++                compute->caps.static_shared_bytes, why ? why : "");
++   np_log(line, (size_t)MIN2(n, (int)sizeof(line) - 1));
++   for (unsigned i = 0; b && i < b->buffer_count; i++) {
++      const struct rwa_buffer *x = b->buffers ? b->buffers[i] : NULL;
++      size_t off = table && i < table_count ? table[i].offset : 0;
++      if (!x)
++         continue;
++      gnr1_range(device, x->res, r, sizeof(r));
++      n = snprintf(line, sizeof(line), "GNR1   buffer %u: %zu bytes, bound at offset %zu (offset %% 64 = %zu)%s", i,
++                   x->size, off, off % 64, r);
++      np_log(line, (size_t)MIN2(n, (int)sizeof(line) - 1));
++   }
++   for (unsigned i = 0; b && i < b->texture_count; i++) {
++      const struct rwa_texture *t = b->textures ? b->textures[i] : NULL;
++      if (!t)
++         continue;
++      gnr1_range(device, t->res, r, sizeof(r));
++      n = snprintf(line, sizeof(line), "GNR1   texture %u: %s %ux%u type %u usage %#x levels %u%s%s", i,
++                   t->format_name ? t->format_name : "?", t->shape.width, t->shape.height, t->shape.type,
++                   t->shape.usage, t->levels, t->is_view ? " view" : "", r);
++      np_log(line, (size_t)MIN2(n, (int)sizeof(line) - 1));
++   }
++}
++#endif
++
+ int
+ rwa_dispatch(struct rwa_compute *compute, const struct rwa_bindings *bindings,
+              const unsigned groups[3], const unsigned group_size[3],
+@@ -5099,6 +5191,10 @@
+       .block = { group_size[0], group_size[1], group_size[2] },
+       .grid = { groups[0], groups[1], groups[2] },
+    };
++#ifdef GALLIUM_PANFROST
++   struct timespec gnr1_t0, gnr1_t1;                                   /* GNR1 */
++   clock_gettime(CLOCK_MONOTONIC, &gnr1_t0);
++#endif
+    pipe->launch_grid(pipe, &grid);
+ 
+    /* Waited for here, and not left to rwa_finish, because this is the call that can
+@@ -5108,6 +5204,11 @@
+     * wait for work dispatched through another pipeline of the same device.
+     */
+    int rc = finish_or_say_why(device, true, "dispatch", why, why_size);
++#ifdef GALLIUM_PANFROST
++   clock_gettime(CLOCK_MONOTONIC, &gnr1_t1);                           /* GNR1 */
++   gnr1_say_dispatch(compute, bindings, table, table_count, groups, group_size, rc,
++                     (gnr1_t1.tv_sec - gnr1_t0.tv_sec) * 1e3 + (gnr1_t1.tv_nsec - gnr1_t0.tv_nsec) / 1e6, why);
++#endif
+    unbind_stage(device, PIPE_SHADER_COMPUTE, &bound);
+    return rc;
+ }

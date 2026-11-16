@@ -1,0 +1,178 @@
+--- a/redwoodmetal.m	2026-11-12 20:12:14.999106391 +0100
++++ b/redwoodmetal.m	2026-11-12 22:46:07.724877143 +0100
+@@ -2934,6 +2934,90 @@
+ 	return rw_ios.usable;
+ }
+ 
++/*
++ * y2s84 (usecount): A TEXTURE OVER AN IOSURFACE HOLDS THE SURFACE'S USE COUNT WHILE IT EXISTS. Kernel 0398 made the IOSurface use
++ * count real (IOSurfaceIsInUse = state page +0x18, counted across processes); CVPixelBufferPool (CVPixelBufferBacking::okToReuse) and
++ * CoreAnimation's backing stores (buffer_is_unused) reuse a surface only when it is not in use. So with this hold a pool no longer hands
++ * out a buffer whose texture still exists (the root cause behind y2s76's freeze rule: thumbfix2/thumbfix5). One hold per texture, taken
++ * in -redwoodSetIOSurface:plane:, given back when the texture lets the surface go (another surface, or -dealloc).
++ * The first hold probes the kernel: IOSurfaceIsInUse right after IOSurfaceIncrementUseCount is true only when the count is real (an
++ * older kernel answers the traps and counts nothing). Flags (read once per process, /var/db/nord2-metal/):
++ *   usecount-off           no holds (the y2s83 behaviour);
++ *   usecount-keepfreeze    keep the MobileSlideShow freeze rule even when the kernel count is real (to compare);
++ *   photos-ycbcr-live      (as before) no freeze rule at all.
++ * Without flags: holds on; the freeze rule is dropped once the probe says the kernel count is real, kept when it is not.
++ * Logs: SURF "NORD2 SURF USE: metal ..." (probe, first holds, then every power of two / 1024th, and live/max).
++ */
++static struct {
++	pthread_once_t once;
++	void (*inc)(void *), (*dec)(void *);
++	unsigned char (*in_use)(void *);
++	int off, keepfreeze;
++	volatile int kernel;            /* -1 not probed, 0 the kernel counts nothing, 1 real */
++	volatile long taken, given, live, max_live;
++} rw_use = { .once = PTHREAD_ONCE_INIT, .kernel = -1 };
++
++static void
++rw_use_load(void)
++{
++	*(void **)&rw_use.inc = dlsym(RTLD_DEFAULT, "IOSurfaceIncrementUseCount");
++	*(void **)&rw_use.dec = dlsym(RTLD_DEFAULT, "IOSurfaceDecrementUseCount");
++	*(void **)&rw_use.in_use = dlsym(RTLD_DEFAULT, "IOSurfaceIsInUse");
++	rw_use.off = access("/var/db/nord2-metal/usecount-off", F_OK) == 0 || rw_use.inc == NULL || rw_use.dec == NULL;
++	rw_use.keepfreeze = access("/var/db/nord2-metal/usecount-keepfreeze", F_OK) == 0;
++	m2m_log('I', "SURF", "NORD2 SURF USE: metal: texture holds %s (usecount-off %d, IncrementUseCount %s), freeze rule %s\n",
++	    rw_use.off ? "OFF" : "on", access("/var/db/nord2-metal/usecount-off", F_OK) == 0, rw_use.inc != NULL ? "found" : "missing",
++	    rw_use.keepfreeze ? "kept (usecount-keepfreeze)" : "dropped once the kernel count is seen real");
++}
++
++/* 1 = the kernel's use count is real, 0 = not (old kernel), -1 = not known yet (no hold taken so far) or holds off */
++static int
++rw_use_kernel_state(void)
++{
++	pthread_once(&rw_use.once, rw_use_load);
++	return rw_use.off ? 0 : rw_use.kernel;
++}
++
++static BOOL
++rw_use_take(void *surface)
++{
++	pthread_once(&rw_use.once, rw_use_load);
++	if (rw_use.off || surface == NULL) {
++		return NO;
++	}
++	rw_use.inc(surface);
++	if (rw_use.kernel < 0 && rw_use.in_use != NULL) {
++		int k = rw_use.in_use(surface) ? 1 : 0;
++
++		if (__sync_bool_compare_and_swap(&rw_use.kernel, -1, k)) {
++			m2m_log('I', "SURF", "NORD2 SURF USE: metal: kernel use count %s (surface %u: IOSurfaceIsInUse after IncrementUseCount = %d)\n",
++			    k ? "REAL (0398)" : "a no-op (kernel without 0398): the freeze rule stays", rwd_surface_id(surface), k);
++		}
++	}
++	long n = __sync_add_and_fetch(&rw_use.taken, 1), live = __sync_add_and_fetch(&rw_use.live, 1), m = rw_use.max_live;
++
++	while (live > m && !__sync_bool_compare_and_swap(&rw_use.max_live, m, live)) {
++		m = rw_use.max_live;
++	}
++	if (n <= 4 || (n & (n - 1)) == 0 || n % 1024 == 0) {
++		m2m_log('I', "SURF", "NORD2 SURF USE: metal: hold n=%ld on surface %u (live %ld, max %ld, given back %ld)\n", n,
++		    rwd_surface_id(surface), live, rw_use.max_live, rw_use.given);
++	}
++	return YES;
++}
++
++static void
++rw_use_give(void *surface)
++{
++	rw_use.dec(surface);
++	long n = __sync_add_and_fetch(&rw_use.given, 1), live = __sync_sub_and_fetch(&rw_use.live, 1);
++
++	if (live < 0 || n <= 4 || (n & (n - 1)) == 0 || n % 1024 == 0) {
++		m2m_log(live < 0 ? 'E' : 'I', "SURF", "NORD2 SURF USE: metal: give-back n=%ld on surface %u (live %ld%s, max %ld, taken %ld)\n", n,
++		    rwd_surface_id(surface), live, live < 0 ? ": IMBALANCE" : "", rw_use.max_live, rw_use.taken);
++	}
++}
++
+ /* The two planes of `surface` as the converter wants them, checked against the surface's own allocation. The base addresses are only
+  * good while the caller keeps the surface (and are read under its lock when the pixels matter). */
+ struct rw_ycbcr_planes {
+@@ -3189,6 +3273,7 @@
+ 	BOOL _ycbcr;               /* y2s37: the copy is a conversion: _iosurface is two-plane YCbCr, _texture is BGRA8 */
+ 	uint64_t _convertedAt;     /* y2s60: when the conversion was set up (the young-texture rule of -redwoodRefreshConverted) */
+ 	BOOL _frozen;              /* y2s83: (MobileSlideShow) converted from a finished picture: not converted again */
++	BOOL _useHeld;             /* y2s84: this texture holds _iosurface's IOSurface use count (rw_use_take) */
+ 	unsigned _freezeTries;     /* y2s83: conversions made while the picture was not finished */
+ 	BOOL _raw540;
+ 	struct rwa_texture *_padTmp;   /* y2s63: the even-sized RGB picture an odd-sized surface is converted into (then copied) */
+@@ -5781,6 +5866,9 @@
+ 		}
+ 	}
+ 	if (_iosurface != NULL) {
++		if (_useHeld) {
++			rw_use_give(_iosurface);        /* y2s84: before the surface reference goes */
++		}
+ 		CFRelease(_iosurface);
+ 	}
+ 	[_parent release];
+@@ -6003,9 +6091,28 @@
+ 	 * before. While /var/db/nord2-metal/photos-ycbcr-live exists MobileSlideShow follows its surfaces too.
+ 	 */
+ 	static int freeze_rule = -1;
++	int rule = freeze_rule;
+ 
+-	if (freeze_rule < 0) {
+-		freeze_rule = rw_is_photos_proc() && access("/var/db/nord2-metal/photos-ycbcr-live", F_OK) != 0;
++	/*
++	 * y2s84 (usecount): the freeze rule only stood in for the missing use count. With the kernel's count real (rw_use_kernel_state()
++	 * 1: probed by the first hold) and this texture holding it, the pool no longer reuses the buffer while the texture exists, so the
++	 * texture follows its surface again (seed / probe / young rules) and a picture decoded after the texture was made is converted
++	 * when it lands. Kept with usecount-keepfreeze, with usecount-off, or when the kernel counts nothing; decided per call until the
++	 * probe has answered.
++	 */
++	if (rule < 0) {
++		int base = rw_is_photos_proc() && access("/var/db/nord2-metal/photos-ycbcr-live", F_OK) != 0;
++		int k = base ? rw_use_kernel_state() : 0;
++
++		if (!base || rw_use.keepfreeze || k == 0) {
++			freeze_rule = rule = base;
++		} else if (k == 1) {
++			freeze_rule = rule = 0;
++			m2m_log('I', "SURF", "NORD2 SURF USE: metal: MobileSlideShow freeze rule (thumbfix2/5) DROPPED: textures hold their "
++			    "surfaces' use count (usecount-keepfreeze keeps it)\n");
++		} else {
++			rule = base;            /* probe not answered yet: freeze this time, decide again at the next call */
++		}
+ 	}
+ 	/*
+ 	 * y2s83 (thumbfix5): ... but only once the picture IS finished. Run v (q10jfe): the grid stays, but some cells are black or show a
+@@ -6016,12 +6123,12 @@
+ 	 * the last luma row of the surface holds data (a cleared buffer is luma 0 there; the decoder writes the rows in order). Until then
+ 	 * every use converts again (the young rule's GPU pass); after 3 s the picture is taken as it is (a photo that is black indeed).
+ 	 */
+-	if (freeze_rule == 1 && _frozen && _ycbcr) {
++	if (rule == 1 && _frozen && _ycbcr) {
+ 		return YES;
+ 	}
+ 	BOOL freeze_now = NO, unfinished = NO;
+ 
+-	if (freeze_rule == 1 && _ycbcr && _iosurface != NULL && rw_ios.lock(_iosurface, 1 /* read-only */, NULL) == 0) {
++	if (rule == 1 && _ycbcr && _iosurface != NULL && rw_ios.lock(_iosurface, 1 /* read-only */, NULL) == 0) {
+ 		struct rw_ycbcr_planes fv;
+ 		BOOL finished = NO;
+ 
+@@ -6324,13 +6431,20 @@
+ 
+ - (void)redwoodSetIOSurface:(void *)surface plane:(NSUInteger)plane
+ {
++	BOOL held = NO;
++
+ 	if (surface != NULL) {
+ 		CFRetain(surface);
++		held = rw_use_take(surface);    /* y2s84: in use while this texture exists */
+ 	}
+ 	if (_iosurface != NULL) {
++		if (_useHeld) {
++			rw_use_give(_iosurface);
++		}
+ 		CFRelease(_iosurface);
+ 	}
+ 	_iosurface = surface;
++	_useHeld = held;
+ 	_iosurfacePlane = plane;
+ }
+ 

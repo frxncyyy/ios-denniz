@@ -1,0 +1,513 @@
+diff -ruN -x '*.o' y2s70-libmerge2/src/air_isp.c y2s72-libmerge3/src/air_isp.c
+--- y2s70-libmerge2/src/air_isp.c	2026-11-12 13:49:41.036589775 +0100
++++ y2s72-libmerge3/src/air_isp.c	2026-11-12 15:25:33.815682732 +0100
+@@ -549,7 +549,7 @@
+  * y2s65: THE FRAME'S STATISTICS (rwa_isp_api.h, struct rwa_isp_output's stats), camera_isp.c's isp_measure() on the GPU: a texture of
+  * stats_w * RWA_ISP_STATS_KINDS x stats_h RGBA32F texels; texel (bx * KINDS + k, by) is kind k of block (bx, by), the block being
+  * RWA_ISP_STATS_BLOCK x RWA_ISP_STATS_BLOCK of the cells isp_measure() looks at (cell (si * step, sj * step), si < ceil(cells_w / step)).
+- * Every fragment walks its block's 64 cells (unrolled) with isp_measure()'s whole numbers and keeps what its kind sums. Words of the
++ * Every fragment walks its block's 64 cells with isp_measure()'s whole numbers and keeps what its kind sums. Words of the
+  * block: q[0] step, q[1] cells_w, q[2] cells_h, q[3] fair_top (white * 85 / 100), q[4] the blocks across; black, r_place, b_place as ever.
+  */
+ static nir_def *
+@@ -560,6 +560,8 @@
+    return nir_imax(b, nir_isub(b, isp_raw(b, format, px, py), black), nir_imm_int(b, 0));
+ }
+ 
++_Static_assert((RWA_ISP_STATS_BLOCK & (RWA_ISP_STATS_BLOCK - 1)) == 0, "the stats loop splits a cell number by shifts");
++
+ static nir_shader *
+ isp_stats_shader(const struct nir_shader_compiler_options *options, unsigned format)
+ {
+@@ -574,14 +576,31 @@
+    nir_def *bx = nir_udiv_imm(&b, x, RWA_ISP_STATS_KINDS), *k = nir_isub(&b, x, nir_imul_imm(&b, bx, RWA_ISP_STATS_KINDS)), *by = y;
+    nir_def *base = nir_imul_imm(&b, nir_iadd_imm(&b, k, -3), 4);           /* the first histogram bin of kinds 3..18 */
+    nir_def *zero = nir_imm_float(&b, 0.0f);
+-   nir_def *acc[4] = { zero, zero, zero, zero };
+    nir_def *cw1 = nir_iadd_imm(&b, cw, -1), *ch1 = nir_iadd_imm(&b, ch, -1);
+    nir_def *is_hist = nir_iand(&b, nir_ige_imm(&b, k, 3), nir_ilt_imm(&b, k, 19)), *is_edge = nir_ieq_imm(&b, k, 19);
++   /*
++    * y2s72: the block's cells in a LOOP, not unrolled. Unrolled (y2s65..y2s70) this was 64 x 12 cell reads of straight-line code: Panfrost's
++    * Valhall compiler made 183 KB of code of it in 42-48 s on the host (pan_compile_new_host_test), minutes on the phone's cores -- the
++    * camera's pictures thread (redwood-campic2) compiled it at the first GPU picture, under the library's lock, at 100 % of a core, and no
++    * picture was ever made (run of 12 November 15:11, libmerge2). The loop goes over the cells in the same order (row j, then column i:
++    * cell = j * BLOCK + i), so every sum is added in the same order as before and is the same float.
++    */
++   nir_variable *acc_var = nir_local_variable_create(b.impl, glsl_vec4_type(), "stats_acc");
++   nir_variable *cell_var = nir_local_variable_create(b.impl, glsl_uint_type(), "stats_cell");
++
++   nir_store_var(&b, acc_var, nir_vec4(&b, zero, zero, zero, zero), 0xf);
++   nir_store_var(&b, cell_var, nir_imm_int(&b, 0), 0x1);
++   nir_loop *cells_loop = nir_push_loop(&b);
++   {
++      nir_def *cell = nir_load_var(&b, cell_var);
+ 
+-   for (unsigned j = 0; j < RWA_ISP_STATS_BLOCK; j++) {
+-      for (unsigned i = 0; i < RWA_ISP_STATS_BLOCK; i++) {
+-         nir_def *cx = nir_imul(&b, nir_iadd_imm(&b, nir_imul_imm(&b, bx, RWA_ISP_STATS_BLOCK), i), step);
+-         nir_def *cy = nir_imul(&b, nir_iadd_imm(&b, nir_imul_imm(&b, by, RWA_ISP_STATS_BLOCK), j), step);
++      nir_push_if(&b, nir_uge_imm(&b, cell, RWA_ISP_STATS_BLOCK * RWA_ISP_STATS_BLOCK));
++      nir_jump(&b, nir_jump_break);
++      nir_pop_if(&b, NULL);
++      nir_def *i = nir_iand_imm(&b, cell, RWA_ISP_STATS_BLOCK - 1), *j = nir_ushr_imm(&b, cell, util_logbase2(RWA_ISP_STATS_BLOCK));
++      {
++         nir_def *cx = nir_imul(&b, nir_iadd(&b, nir_imul_imm(&b, bx, RWA_ISP_STATS_BLOCK), i), step);
++         nir_def *cy = nir_imul(&b, nir_iadd(&b, nir_imul_imm(&b, by, RWA_ISP_STATS_BLOCK), j), step);
+          nir_def *valid = nir_iand(&b, nir_ilt(&b, cx, cw), nir_ilt(&b, cy, ch));
+          nir_def *cxc = nir_imin(&b, cx, cw1), *cyc = nir_imin(&b, cy, ch1), *v[4];
+ 
+@@ -623,11 +642,15 @@
+             nir_bcsel(&b, is_edge, e, nir_bcsel(&b, is_hist, c3[2], nir_fmul(&b, fb, t))),
+             nir_bcsel(&b, is_edge, zero, nir_bcsel(&b, is_hist, c3[3], t)),
+          };
+-         for (unsigned c = 0; c < 4; c++)
+-            acc[c] = nir_fadd(&b, acc[c], add[c]);
++         nir_def *acc = nir_load_var(&b, acc_var);
++
++         nir_store_var(&b, acc_var, nir_vec4(&b, nir_fadd(&b, nir_channel(&b, acc, 0), add[0]), nir_fadd(&b, nir_channel(&b, acc, 1), add[1]),
++                                             nir_fadd(&b, nir_channel(&b, acc, 2), add[2]), nir_fadd(&b, nir_channel(&b, acc, 3), add[3])), 0xf);
+       }
++      nir_store_var(&b, cell_var, nir_iadd_imm(&b, cell, 1), 0x1);
+    }
+-   nir_store_var(&b, out, nir_vec4(&b, acc[0], acc[1], acc[2], acc[3]), 0xf);
++   nir_pop_loop(&b, cells_loop);
++   nir_store_var(&b, out, nir_load_var(&b, acc_var), 0xf);
+    return isp_fragment_end(&b, 1);
+ }
+ 
+@@ -1632,6 +1655,196 @@
+    return RWA_ISP_OK;
+ }
+ 
++/* ---- y2s72: the camera never waits on the GPU path without a bound ---------------------------------------------------------------- */
++
++/*
++ * (1) The shaders of a render (the ISP pass of the frame's format and mode, luma, chroma, the statistics, the seven noise passes) are made
++ * by a thread of the library's own the first time they are wanted, not on the caller's: rwa_isp_render waits for them at most
++ * ISP_WARM_WAIT_MS (a timed wait on a condition, never a spin) and otherwise answers RWA_ISP_E_GPU at once -- the caller makes that picture
++ * on the processor (rwcam_render.c), and its statistics are the processor's (no stats_w). Run of 12 November 15:11 (libmerge2): the
++ * unrolled statistics shader took minutes to compile on the pictures thread, which made no picture at all and held the reader of the
++ * shown camera. (2) ISP_BAD_LIMIT renders in a row that failed or took longer than ISP_SLOW_NS (wall clock, the wait included) turn the
++ * GPU path off for the process: every later render answers RWA_ISP_E_GPU at once. Each is said in one line of the log.
++ */
++#define ISP_WARM_WAIT_MS        250
++#define ISP_BAD_LIMIT           3
++#define ISP_SLOW_NS             1000000000ull
++
++enum { ISP_WARM_NONE, ISP_WARM_RUNNING, ISP_WARM_READY, ISP_WARM_FAILED };
++
++static pthread_mutex_t isp_warm_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t isp_warm_cond = PTHREAD_COND_INITIALIZER;
++static int isp_warm_state[2][2];                /* [RWA_ISP_MODE_FULL][format 4]; under isp_warm_lock */
++static uint64_t isp_warm_since[2][2];           /* (ns) */
++static unsigned isp_bad;                        /* failed or slow renders in a row; under isp_warm_lock */
++static bool isp_off;                            /* the GPU path off for this process; under isp_warm_lock */
++
++static void isp_note(const char *fmt, ...) PRINTFLIKE(1, 2);
++
++static void
++isp_note(const char *fmt, ...)
++{
++   char line[400];
++   va_list ap;
++
++   va_start(ap, fmt);
++   int n = vsnprintf(line, sizeof(line), fmt, ap);
++   va_end(ap);
++   if (n < 0)
++      return;
++#ifdef GALLIUM_PANFROST
++   np_log(line, (size_t)MIN2(n, (int)sizeof(line) - 1));
++#else
++   fprintf(stderr, "%s\n", line);
++#endif
++}
++
++struct isp_warm_job {
++   struct rwa_device *device;
++   unsigned format, full;
++};
++
++static void *
++isp_warm_thread(void *arg)
++{
++   struct isp_warm_job job = *(struct isp_warm_job *)arg;
++   struct rwa_device *device = job.device;
++   const unsigned variant = job.format == 4;
++   char why[256] = "";
++   uint64_t t0 = os_time_get_nano(), t_stats = 0;
++   bool ok;
++
++   free(arg);
++#ifdef __APPLE__
++   pthread_setname_np("redwoodair-ispwarm");
++#else
++   pthread_setname_np(pthread_self(), "rwa-ispwarm");
++#endif
++   {
++      RWA_GUARD();
++      void **slot = job.full ? &device->isp.full[variant] : &device->isp.cells[variant];
++
++      ok = ycbcr_state(device, why, sizeof(why));
++      ok = ok && (*slot != NULL || isp_shader(device, slot, job.full ? isp_full_shader(device->nir_options, job.format)
++                                                                     : isp_cells_shader(device->nir_options, job.format), why, sizeof(why)) != NULL);
++      ok = ok && (device->isp.luma != NULL || isp_shader(device, &device->isp.luma, isp_luma_shader(device->nir_options), why, sizeof(why)) != NULL);
++      ok = ok && (device->isp.chroma != NULL ||
++                  isp_shader(device, &device->isp.chroma, isp_chroma_shader(device->nir_options), why, sizeof(why)) != NULL);
++      if (ok) {
++         /* (the statistics and the noise are optional: without their shaders the render makes none, and the caller's processor does them) */
++         uint64_t ts = os_time_get_nano();
++         char why2[256] = "";
++
++         if (device->isp.stats[variant] == NULL &&
++             isp_shader(device, &device->isp.stats[variant], isp_stats_shader(device->nir_options, job.format), why2, sizeof(why2)) == NULL)
++            isp_note("camera ISP: the statistics shader (format %u) was not made (%.160s): the processor measures the frames", job.format, why2);
++         t_stats = os_time_get_nano() - ts;
++         for (unsigned i = 0; i < 7; i++)
++            (void)isp_nr_fs(device, i, why2, sizeof(why2));
++      }
++   }
++   double ms = (double)(os_time_get_nano() - t0) / 1e6;
++
++   pthread_mutex_lock(&isp_warm_lock);
++   isp_warm_state[job.full][variant] = ok ? ISP_WARM_READY : ISP_WARM_FAILED;
++   pthread_cond_broadcast(&isp_warm_cond);
++   pthread_mutex_unlock(&isp_warm_lock);
++   if (ok)
++      isp_note("camera ISP: the GPU's shaders for format %u (%s) made in %.0f ms (statistics %.0f ms), off the camera's thread", job.format,
++               job.full ? "full" : "cells", ms, (double)t_stats / 1e6);
++   else
++      isp_note("camera ISP: the GPU's shaders for format %u NOT made after %.0f ms (%.160s): the processor makes the pictures", job.format, ms, why);
++   return NULL;
++}
++
++/* RWA_ISP_OK when this render's shaders are there (waiting for them at most ISP_WARM_WAIT_MS), else RWA_ISP_E_GPU and why */
++static int
++isp_warm(struct rwa_isp *isp, const struct rwa_isp_frame *f, const struct rwa_isp_params *p, char *why, size_t why_size)
++{
++   if (f == NULL || p == NULL || (f->format != 1 && f->format != 4))
++      return RWA_ISP_OK;                       /* (isp_check refuses it with its own reason) */
++   const unsigned variant = f->format == 4, full = p->mode == RWA_ISP_MODE_FULL;
++   int state;
++
++   pthread_mutex_lock(&isp_warm_lock);
++   if (isp_off) {
++      pthread_mutex_unlock(&isp_warm_lock);
++      say(why, why_size, "the GPU's camera path is off for this process after %u failed or slow renders", ISP_BAD_LIMIT);
++      return RWA_ISP_E_GPU;
++   }
++   state = isp_warm_state[full][variant];
++   if (state == ISP_WARM_NONE) {
++      struct isp_warm_job *job = malloc(sizeof(*job));
++      pthread_attr_t attr;
++      pthread_t thread;
++      bool started = false;
++
++      if (job != NULL) {
++         *job = (struct isp_warm_job){ .device = isp->device, .format = f->format, .full = full };
++         pthread_attr_init(&attr);
++         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++         pthread_attr_setstacksize(&attr, 4u << 20);       /* (the compiler's recursion: more than a secondary thread's 512 KiB) */
++         started = pthread_create(&thread, &attr, isp_warm_thread, job) == 0;
++         pthread_attr_destroy(&attr);
++         if (!started)
++            free(job);
++      }
++      if (!started) {
++         /* (no thread: made here, as before y2s72) */
++         isp_warm_state[full][variant] = ISP_WARM_READY;
++         pthread_mutex_unlock(&isp_warm_lock);
++         return RWA_ISP_OK;
++      }
++      isp_warm_state[full][variant] = state = ISP_WARM_RUNNING;
++      isp_warm_since[full][variant] = os_time_get_nano();
++   }
++   if (state == ISP_WARM_RUNNING) {
++      struct timespec until;
++
++      clock_gettime(CLOCK_REALTIME, &until);
++      until.tv_nsec += (long)ISP_WARM_WAIT_MS * 1000000L;
++      until.tv_sec += until.tv_nsec / 1000000000L;
++      until.tv_nsec %= 1000000000L;
++      while (isp_warm_state[full][variant] == ISP_WARM_RUNNING) {
++         if (pthread_cond_timedwait(&isp_warm_cond, &isp_warm_lock, &until) != 0)
++            break;
++      }
++      state = isp_warm_state[full][variant];
++   }
++   uint64_t since = isp_warm_since[full][variant];
++
++   pthread_mutex_unlock(&isp_warm_lock);
++   if (state == ISP_WARM_READY)
++      return RWA_ISP_OK;
++   if (state == ISP_WARM_RUNNING) {
++      say(why, why_size, "the GPU's camera shaders are still being made (%.0f ms so far, off this thread): the processor makes this picture",
++          (double)(os_time_get_nano() - since) / 1e6);
++      return RWA_ISP_E_GPU;
++   }
++   say(why, why_size, "the GPU's camera shaders could not be made: the processor makes the pictures");
++   return RWA_ISP_E_GPU;
++}
++
++/* after a render that got as far as the GPU: count it as good or bad; ISP_BAD_LIMIT bad ones in a row turn the path off */
++static void
++isp_account(int error, uint64_t ns)
++{
++   bool bad = error == RWA_ISP_E_GPU || error == RWA_ISP_E_MEMORY || ns > ISP_SLOW_NS, now_off = false;
++   unsigned n;
++
++   pthread_mutex_lock(&isp_warm_lock);
++   isp_bad = bad ? isp_bad + 1 : error == RWA_ISP_OK ? 0 : isp_bad;      /* (a surface or argument refusal is no GPU failure, and no success) */
++   n = isp_bad;
++   if (bad && n >= ISP_BAD_LIMIT && !isp_off)
++      isp_off = now_off = true;
++   pthread_mutex_unlock(&isp_warm_lock);
++   if (bad && n <= ISP_BAD_LIMIT)
++      isp_note("camera ISP: render %s (%.0f ms, error %d): %u of %u in a row before the GPU path is turned off", error == RWA_ISP_OK ? "slow" : "failed",
++               (double)ns / 1e6, error, n, ISP_BAD_LIMIT);
++   if (now_off)
++      isp_note("camera ISP: the GPU path is OFF for this process: the processor makes every picture and its statistics from now on");
++}
++
+ /* ---- the calls of rwa_isp_api.h --------------------------------------------------------------------------------------------------- */
+ 
+ unsigned
+@@ -1765,7 +1978,12 @@
+       say(why, why_size, "the camera's GPU render was given no context, no output surface, or a struct smaller than this library's");
+       return RWA_ISP_E_ARGUMENT;
+    }
+-   int error;
++   /* y2s72: the shaders made off this thread, waited for a bounded time; the path off after ISP_BAD_LIMIT bad renders */
++   int error = isp_warm(isp, frame, params, why, why_size);
++
++   if (error != RWA_ISP_OK)
++      return error;
++   const uint64_t t_call = os_time_get_nano();
+ 
+    {
+       /* the planes and the passes that write them under ONE hold of the lock: nothing can let the planes go in between */
+@@ -1784,7 +2002,11 @@
+          result->flags |= imported ? RWA_ISP_DID_IMPORT : 0;
+       }
+    }
+-   if (error != RWA_ISP_OK)
++   if (error != RWA_ISP_OK) {
++      isp_account(error, os_time_get_nano() - t_call);
+       return error;
+-   return isp_finish(isp, fence, output->flags & RWA_ISP_OUT_ASYNC, result, why, why_size);
++   }
++   error = isp_finish(isp, fence, output->flags & RWA_ISP_OUT_ASYNC, result, why, why_size);
++   isp_account(error, os_time_get_nano() - t_call);
++   return error;
+ }
+diff -ruN -x '*.o' y2s70-libmerge2/src/isp_warm_host_test.c y2s72-libmerge3/src/isp_warm_host_test.c
+--- y2s70-libmerge2/src/isp_warm_host_test.c	1970-01-01 01:00:00.000000000 +0100
++++ y2s72-libmerge3/src/isp_warm_host_test.c	2026-11-12 15:26:04.611624288 +0100
+@@ -0,0 +1,107 @@
++/*
++ * y2s72: host test of the bounded wait (air_isp.c isp_warm, isp_account) on softpipe: the shaders are made by the library's own thread,
++ * the caller waits at most ISP_WARM_WAIT_MS on a condition (it must come back in well under a second whatever happens), the shaders are
++ * then there; ISP_BAD_LIMIT failures in a row turn the path off and every later call answers RWA_ISP_E_GPU at once.
++ * Also: a render with the statistics after the warm-up (rwa_isp_render_textures with rwa_isp_want_stats) still gives them.
++ */
++#include "air_metal.c"
++#include <time.h>
++
++static double
++now_ms(void)
++{
++   struct timespec t;
++
++   clock_gettime(CLOCK_MONOTONIC, &t);
++   return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
++}
++
++int
++main(void)
++{
++   char why[512] = "";
++   int failures = 0;
++
++   setenv("RWA_SOFTWARE", "1", 1);
++   struct rwa_isp *isp = rwa_isp_create(why, sizeof(why));
++   if (isp == NULL) {
++      fprintf(stderr, "FAILED: no context: %s\n", why);
++      return 1;
++   }
++   static uint8_t raw[640 * 5 / 4 * 480];
++   static uint8_t gamma[4096];
++   struct rwa_isp_frame f = { .size = sizeof(f), .width = 640, .height = 480, .stride = 800, .format = 4, .bayer = 3, .black = 64, .raw = raw };
++   struct rwa_isp_params p = { .size = sizeof(p), .mode = RWA_ISP_MODE_CELLS, .wb = { 1, 1, 1 }, .digital = 1, .zoom = 1, .gamma = gamma };
++
++   for (int i = 0; i < 4096; i++)
++      gamma[i] = (uint8_t)(i >> 4);
++   double t0 = now_ms();
++   int e = isp_warm(isp, &f, &p, why, sizeof(why));
++   double t1 = now_ms();
++   printf("first isp_warm: %d after %.1f ms (%s)\n", e, t1 - t0, e ? why : "ready");
++   if (t1 - t0 > ISP_WARM_WAIT_MS + 200) {
++      fprintf(stderr, "FAILED: the first call waited %.1f ms, more than the bound\n", t1 - t0);
++      failures++;
++   }
++   for (int k = 0; k < 100 && e != RWA_ISP_OK; k++) {
++      struct timespec d = { 0, 100000000L };
++
++      nanosleep(&d, NULL);
++      e = isp_warm(isp, &f, &p, why, sizeof(why));
++   }
++   if (e != RWA_ISP_OK || isp->device->isp.cells[1] == NULL || isp->device->isp.luma == NULL || isp->device->isp.chroma == NULL ||
++       isp->device->isp.stats[1] == NULL || isp->device->isp.nr[0] == NULL || isp->device->isp.nr[6] == NULL) {
++      fprintf(stderr, "FAILED: the shaders are not there after the warm-up (%d: %s)\n", e, why);
++      failures++;
++   }
++   /* a render with the statistics, now that its shaders were made by the other thread */
++   {
++      struct rwa_device *device = rwa_isp_device(isp);
++      struct rwa_texture_shape s = { .pixel_format = 10, .type = 2, .width = 320, .height = 240, .depth = 1, .array_length = 1, .mip_levels = 1,
++                                     .sample_count = 1, .usage = 1 | 4 };
++      struct rwa_texture *luma = rwa_texture_create(device, &s, why, sizeof(why));
++      s.pixel_format = 30; s.width = 160; s.height = 120;
++      struct rwa_texture *chroma = rwa_texture_create(device, &s, why, sizeof(why));
++      static float stats[64 * 64 * RWA_ISP_STATS_KINDS * 4];
++      struct rwa_isp_result r = { .size = sizeof(r) };
++
++      for (size_t i = 0; i < sizeof(raw); i++)
++         raw[i] = (uint8_t)(i * 37 + (i >> 7));
++      rwa_isp_want_stats(isp, stats, sizeof(stats) / sizeof(stats[0]));
++      e = rwa_isp_render_textures(isp, &f, &p, luma, chroma, 320, 240, 0, &r, why, sizeof(why));
++      printf("render with statistics: %d, %ux%u blocks of step %u\n", e, r.stats_w, r.stats_h, r.stats_step);
++      if (e != RWA_ISP_OK || r.stats_w == 0 || r.stats_h == 0) {
++         fprintf(stderr, "FAILED: render %d (%s), statistics %ux%u\n", e, why, r.stats_w, r.stats_h);
++         failures++;
++      }
++      rwa_texture_destroy(luma);
++      rwa_texture_destroy(chroma);
++   }
++   /* the failure count: good renders keep it on; ISP_BAD_LIMIT bad ones in a row turn it off, at once and for good */
++   isp_account(RWA_ISP_OK, 1000000);
++   isp_account(RWA_ISP_E_GPU, 1000000);
++   isp_account(RWA_ISP_OK, 1000000);                  /* (resets) */
++   isp_account(RWA_ISP_E_SURFACE, 1000000);           /* (neither) */
++   if (isp_warm(isp, &f, &p, why, sizeof(why)) != RWA_ISP_OK) {
++      fprintf(stderr, "FAILED: off after one failure\n");
++      failures++;
++   }
++   for (int i = 0; i < ISP_BAD_LIMIT - 1; i++)
++      isp_account(i ? RWA_ISP_E_GPU : RWA_ISP_OK, ISP_SLOW_NS + 1);    /* (a slow good one counts as bad) */
++   if (isp_warm(isp, &f, &p, why, sizeof(why)) != RWA_ISP_OK) {
++      fprintf(stderr, "FAILED: off before %u bad renders\n", ISP_BAD_LIMIT);
++      failures++;
++   }
++   isp_account(RWA_ISP_E_GPU, 1000000);
++   t0 = now_ms();
++   e = isp_warm(isp, &f, &p, why, sizeof(why));
++   t1 = now_ms();
++   printf("after %u bad renders: %d in %.2f ms (%s)\n", ISP_BAD_LIMIT, e, t1 - t0, why);
++   if (e != RWA_ISP_E_GPU || t1 - t0 > 5) {
++      fprintf(stderr, "FAILED: not off, or not at once\n");
++      failures++;
++   }
++   rwa_isp_destroy(isp);
++   printf("isp_warm_host_test: %s\n", failures ? "FAILED" : "bounded, made off the thread, off after the limit");
++   return failures != 0;
++}
+diff -ruN -x '*.o' y2s70-libmerge2/src/pan-new-host-test.sh y2s72-libmerge3/src/pan-new-host-test.sh
+--- y2s70-libmerge2/src/pan-new-host-test.sh	1970-01-01 01:00:00.000000000 +0100
++++ y2s72-libmerge3/src/pan-new-host-test.sh	2026-11-12 15:26:15.450670182 +0100
+@@ -0,0 +1,31 @@
++#!/bin/bash
++# y2s72: (1) the statistics (y2s65) and noise (y2s70) shaders through Panfrost's Valhall compiler for the Mali-G77, on the host, against an
++# EXISTING host Mesa build (softpipe + panfrost), READ ONLY: this directory's translator objects and air_metal.c are built in $T.
++# (2) isp_warm_host_test: the bounded wait for the shaders and the failure limit (air_isp.c isp_warm, isp_account) on softpipe.
++#   T=<empty scratch dir> [H=<host mesa build dir>] [TIMEOUT=s] bash pan-new-host-test.sh [shader index]
++set -euo pipefail
++G=$NORD2_WORK/gpu
++M=$G/build/y2s-stage0/mesa-25.0.7; HERE=$(cd "$(dirname "$0")" && pwd); T=${T:?set T to an empty scratch directory}
++H=${H:-$G/video/build/WP08/hostmesa}
++mkdir -p $T; cd $T
++printf '#ifndef __ASSEMBLER__\n#include <pthread.h>\n#define __once_flag_defined 1\n#define once_flag pthread_once_t\n#endif\n' > hostfix.h
++printf '#include <stdint.h>\n#include <stdbool.h>\n#include "frontend/winsys_handle.h"\n#include "drm-uapi/drm_fourcc.h"\n' > hostfix2.h
++LIBS="src/gallium/auxiliary/libgallium.a src/compiler/nir/libnir.a src/compiler/libcompiler.a src/util/libmesa_util.a src/util/libmesa_util_sse41.a src/util/blake3/libblake3.a src/c11/impl/libmesa_util_c11.a src/gallium/auxiliary/libgalliumvl_stub.a src/gallium/winsys/sw/null/libws_null.a src/compiler/air/libair.a src/util/libxmlconfig.a src/gallium/drivers/softpipe/libsoftpipe.a"
++PAN="src/panfrost/compiler/libpanfrost_bifrost.a src/panfrost/compiler/libpanfrost_bifrost_disasm.a src/panfrost/compiler/valhall/libpanfrost_valhall_disasm.a src/panfrost/lib/libpanfrost_lib.a src/panfrost/util/libpanfrost_util.a src/panfrost/shared/libpanfrost_shared.a"
++for l in $LIBS $PAN; do [ -f $H/$l ] || { echo "missing $H/$l"; exit 1; }; done
++INC=$(for d in src/gallium/drivers/panfrost include src src/mapi src/mesa src/gallium/include src/gallium/auxiliary src/gallium/winsys/sw src/gallium/winsys src/gallium/drivers src/compiler/air src/compiler/nir src/compiler src/panfrost src/panfrost/lib src/panfrost/util src/panfrost/compiler; do printf -- "-I$H/$d -I$M/$d "; done)
++DEF=$(grep -o '^DEF="[^"]*"' $G/build/y2s63-vt23/src/host-tests.sh | sed 's/^DEF="//; s/"$//')
++CC="cc -std=gnu11 -O1 -g -include $T/hostfix.h -include $T/hostfix2.h $DEF $INC"
++A=$(for l in $LIBS; do printf "$H/$l "; done); P=$(for l in $PAN; do printf "$H/$l "; done)
++for f in air_to_nir air_intrinsics; do
++  C=$(python3 -I -c "import json,sys
++for e in json.load(open('$H/compile_commands.json')):
++    if e['file'].endswith('compiler/air/$f.c'): print(e['command']); break")
++  (cd $H && eval "$(echo "$C" | sed "s| -MD -MQ [^ ]* -MF [^ ]*||; s| -o [^ ]*| -o $T/$f.c.o|; s| -c [^ ]*| -c $HERE/$f.c|; s|^cc |cc -I$M/src/compiler/air |")")
++done
++$CC -I$HERE -c $HERE/pan_compile_new_host_test.c -o pan_new.o
++c++ -o pan_compile_new_host_test pan_new.o air_to_nir.c.o air_intrinsics.c.o -Wl,--start-group $A $P -Wl,--end-group -lm -lz -lpthread -ldl -ldrm
++timeout ${TIMEOUT:-600} ./pan_compile_new_host_test "$@"
++$CC -I$HERE -c $HERE/isp_warm_host_test.c -o warm.o
++c++ -o isp_warm_host_test warm.o air_to_nir.c.o air_intrinsics.c.o -Wl,--start-group $A -Wl,--end-group -lm -lz -lpthread -ldl -ldrm
++timeout 120 ./isp_warm_host_test
+diff -ruN -x '*.o' y2s70-libmerge2/src/pan_compile_new_host_test.c y2s72-libmerge3/src/pan_compile_new_host_test.c
+--- y2s70-libmerge2/src/pan_compile_new_host_test.c	1970-01-01 01:00:00.000000000 +0100
++++ y2s72-libmerge3/src/pan_compile_new_host_test.c	2026-11-12 15:18:47.382951852 +0100
+@@ -0,0 +1,61 @@
++/* y2s72: pan_compile_host_test.c's compile() over the statistics and noise shaders (see main) */
++/* Host check (no GPU): the shaders of the YCbCr pass (y2s38) and of the camera's ISP (y2s39) through Panfrost's own Valhall compiler for the
++ * Mali-G77 (0x9091), with asserts and NIR validation on. The gallium driver's passes around it (sysvals, resource indices, the viewport
++ * transform in the vertex stage) are not run, and nothing is executed. */
++#include "air_metal.c"
++#include "panfrost/compiler/bifrost_compile.h"
++#include "panfrost/util/pan_ir.h"
++#include "util/u_dynarray.h"
++#include <time.h>
++
++static int
++compile(nir_shader *nir, struct pipe_screen *screen, const char *what)
++{
++   nir_shader *clone = nir_shader_clone(NULL, nir);
++   finalize_for_gallium(clone, screen);
++   nir_shader_gather_info(clone, nir_shader_get_entrypoint(clone));
++   bifrost_preprocess_nir(clone, 0x9091);
++   struct panfrost_compile_inputs inputs = { .gpu_id = 0x9091 };
++   if (clone->info.stage == MESA_SHADER_FRAGMENT)
++      inputs.valhall.use_ld_var_buf = true;
++   if (clone->info.stage == MESA_SHADER_VERTEX)       /* as the gallium driver does (pan_shader.c) */
++      NIR_PASS(_, clone, pan_nir_lower_static_noperspective, 0);
++   struct util_dynarray binary;
++   struct pan_shader_info info = { 0 };
++   util_dynarray_init(&binary, NULL);
++   struct timespec t0, t1;
++   fprintf(stderr, "compiling %s ...\n", what);
++   clock_gettime(CLOCK_MONOTONIC, &t0);
++   bifrost_compile_shader_nir(clone, &inputs, &binary, &info);
++   clock_gettime(CLOCK_MONOTONIC, &t1);
++   printf("%-28s %6u bytes of Valhall code, %.1f ms\n", what, (unsigned)binary.size, (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
++   fflush(stdout);
++   int ok = binary.size > 0;
++   util_dynarray_fini(&binary);
++   ralloc_free(clone);
++   ralloc_free(nir);
++   return ok;
++}
++
++int
++main(int argc, char **argv)
++{
++   struct pipe_screen screen = { 0 };
++   const nir_shader_compiler_options *options = &bifrost_nir_options_v9;
++   int ok = 1, only = argc > 1 ? atoi(argv[1]) : -1;
++
++   glsl_type_singleton_init_or_ref();
++   /* y2s72: the shaders y2s65 (statistics) and y2s70 (noise) added, which no host test had put through Panfrost's compiler */
++   if (only < 0 || only == 0) ok &= compile(isp_luma_shader(options), &screen, "isp luma (reference)");
++   if (only < 0 || only == 1) ok &= compile(isp_nr_smooth_shader(options, 1), &screen, "nr smooth y");
++   if (only < 0 || only == 2) ok &= compile(isp_nr_smooth_shader(options, 2), &screen, "nr smooth c");
++   if (only < 0 || only == 3) ok &= compile(isp_nr_diff_shader(options), &screen, "nr diff");
++   if (only < 0 || only == 4) ok &= compile(isp_nr_apply_shader(options, 1), &screen, "nr apply y");
++   if (only < 0 || only == 5) ok &= compile(isp_nr_apply_shader(options, 2), &screen, "nr apply c");
++   if (only < 0 || only == 6) ok &= compile(isp_nr_copy_shader(options, 1), &screen, "nr copy y");
++   if (only < 0 || only == 7) ok &= compile(isp_nr_copy_shader(options, 2), &screen, "nr copy c");
++   if (only < 0 || only == 8) ok &= compile(isp_stats_shader(options, 1), &screen, "isp stats, MIPI RAW10");
++   if (only < 0 || only == 9) ok &= compile(isp_stats_shader(options, 4), &screen, "isp stats, 40-bit words");
++   printf(ok ? "pan_compile_new_host_test: all compiled\n" : "pan_compile_new_host_test: FAILED\n");
++   return !ok;
++}

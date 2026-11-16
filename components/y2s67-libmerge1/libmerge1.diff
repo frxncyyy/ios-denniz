@@ -1,0 +1,715 @@
+diff -ru orig/src/air_isp.c src/air_isp.c
+--- orig/src/air_isp.c	2026-11-10 19:06:43.978610373 +0100
++++ src/air_isp.c	2026-11-12 11:55:41.317673031 +0100
+@@ -101,6 +101,11 @@
+    uint64_t clock;
+    struct pipe_fence_handle *pending[ISP_PENDING];
+    unsigned pendings;
++   /* y2s65: the frame's statistics (isp_stats_shader): the texture, and what the caller asked of this render */
++   struct rwa_texture *stats;
++   uint32_t stats_tw, stats_th;                 /* the texture's size */
++   float *stats_out;
++   uint32_t stats_floats, stats_w, stats_h, stats_step;   /* stats_w 0: not made by this render */
+ };
+ 
+ static struct rwa_device *isp_device;           /* the process's, opened by the first rwa_isp_create and kept */
+@@ -535,19 +540,115 @@
+    return isp_fragment_end(&b, 1);
+ }
+ 
++
++/*
++ * y2s65: THE FRAME'S STATISTICS (rwa_isp_api.h, struct rwa_isp_output's stats), camera_isp.c's isp_measure() on the GPU: a texture of
++ * stats_w * RWA_ISP_STATS_KINDS x stats_h RGBA32F texels; texel (bx * KINDS + k, by) is kind k of block (bx, by), the block being
++ * RWA_ISP_STATS_BLOCK x RWA_ISP_STATS_BLOCK of the cells isp_measure() looks at (cell (si * step, sj * step), si < ceil(cells_w / step)).
++ * Every fragment walks its block's 64 cells (unrolled) with isp_measure()'s whole numbers and keeps what its kind sums. Words of the
++ * block: q[0] step, q[1] cells_w, q[2] cells_h, q[3] fair_top (white * 85 / 100), q[4] the blocks across; black, r_place, b_place as ever.
++ */
++static nir_def *
++isp_cell_value(nir_builder *b, unsigned format, nir_def *cx, nir_def *cy, unsigned n, nir_def *black)
++{
++   nir_def *px = nir_iadd_imm(b, nir_ishl_imm(b, cx, 1), n & 1), *py = nir_iadd_imm(b, nir_ishl_imm(b, cy, 1), n >> 1);
++
++   return nir_imax(b, nir_isub(b, isp_raw(b, format, px, py), black), nir_imm_int(b, 0));
++}
++
++static nir_shader *
++isp_stats_shader(const struct nir_shader_compiler_options *options, unsigned format)
++{
++   nir_variable *uv, *out;
++   nir_builder b = isp_fragment_begin(options, "isp_stats", &uv, &out);
++   nir_def *x, *y;
++
++   isp_pixel_xy(&b, uv, &x, &y);
++   nir_def *step = isp_word(&b, ISP_U_Q), *cw = isp_word(&b, ISP_U_Q + 1), *ch = isp_word(&b, ISP_U_Q + 2);
++   nir_def *ft = isp_word(&b, ISP_U_Q + 3), *black = isp_word(&b, ISP_U_BLACK);
++   nir_def *rp = isp_word(&b, ISP_U_R_PLACE), *bp = isp_word(&b, ISP_U_B_PLACE);
++   nir_def *bx = nir_udiv_imm(&b, x, RWA_ISP_STATS_KINDS), *k = nir_isub(&b, x, nir_imul_imm(&b, bx, RWA_ISP_STATS_KINDS)), *by = y;
++   nir_def *base = nir_imul_imm(&b, nir_iadd_imm(&b, k, -3), 4);           /* the first histogram bin of kinds 3..18 */
++   nir_def *zero = nir_imm_float(&b, 0.0f);
++   nir_def *acc[4] = { zero, zero, zero, zero };
++   nir_def *cw1 = nir_iadd_imm(&b, cw, -1), *ch1 = nir_iadd_imm(&b, ch, -1);
++   nir_def *is_hist = nir_iand(&b, nir_ige_imm(&b, k, 3), nir_ilt_imm(&b, k, 19)), *is_edge = nir_ieq_imm(&b, k, 19);
++
++   for (unsigned j = 0; j < RWA_ISP_STATS_BLOCK; j++) {
++      for (unsigned i = 0; i < RWA_ISP_STATS_BLOCK; i++) {
++         nir_def *cx = nir_imul(&b, nir_iadd_imm(&b, nir_imul_imm(&b, bx, RWA_ISP_STATS_BLOCK), i), step);
++         nir_def *cy = nir_imul(&b, nir_iadd_imm(&b, nir_imul_imm(&b, by, RWA_ISP_STATS_BLOCK), j), step);
++         nir_def *valid = nir_iand(&b, nir_ilt(&b, cx, cw), nir_ilt(&b, cy, ch));
++         nir_def *cxc = nir_imin(&b, cx, cw1), *cyc = nir_imin(&b, cy, ch1), *v[4];
++
++         for (unsigned n = 0; n < 4; n++)
++            v[n] = isp_cell_value(&b, format, cxc, cyc, n, black);
++         nir_def *all = nir_iadd(&b, nir_iadd(&b, v[0], v[1]), nir_iadd(&b, v[2], v[3]));
++         nir_def *vr = nir_bcsel(&b, nir_ieq_imm(&b, rp, 0), v[0], nir_bcsel(&b, nir_ieq_imm(&b, rp, 1), v[1],
++                                 nir_bcsel(&b, nir_ieq_imm(&b, rp, 2), v[2], v[3])));
++         nir_def *vb = nir_bcsel(&b, nir_ieq_imm(&b, bp, 0), v[0], nir_bcsel(&b, nir_ieq_imm(&b, bp, 1), v[1],
++                                 nir_bcsel(&b, nir_ieq_imm(&b, bp, 2), v[2], v[3])));
++         nir_def *g = nir_ushr_imm(&b, nir_isub(&b, nir_isub(&b, all, vr), vb), 1);
++         nir_def *fair = nir_iand(&b, valid, nir_iand(&b, nir_ige_imm(&b, g, 8), nir_iand(&b, nir_ilt(&b, vr, ft),
++                                  nir_iand(&b, nir_ilt(&b, g, ft), nir_ilt(&b, vb, ft)))));
++         nir_def *g10 = nir_imul_imm(&b, g, 10);
++         nir_def *grey = nir_iand(&b, fair, nir_iand(&b, nir_ige(&b, g, vr), nir_iand(&b, nir_ige(&b, nir_imul_imm(&b, vr, 28), g10),
++                                  nir_iand(&b, nir_ige(&b, g10, nir_imul_imm(&b, vb, 11)), nir_ige(&b, nir_imul_imm(&b, vb, 36), g10)))));
++         nir_def *bin = nir_imin(&b, nir_ushr_imm(&b, g, 4), nir_imm_int(&b, 63));
++         /* sharpness: this cell and its right and lower neighbours (isp_sharpness), where they are in the frame */
++         nir_def *edge_ok = nir_iand(&b, valid, nir_iand(&b, nir_ilt(&b, nir_iadd_imm(&b, cx, 1), cw), nir_ilt(&b, nir_iadd_imm(&b, cy, 1), ch)));
++         nir_def *cxr = nir_imin(&b, nir_iadd_imm(&b, cxc, 1), cw1), *cyb = nir_imin(&b, nir_iadd_imm(&b, cyc, 1), ch1);
++         nir_def *r4 = nir_imm_int(&b, 0), *b4 = nir_imm_int(&b, 0);
++
++         for (unsigned n = 0; n < 4; n++) {
++            r4 = nir_iadd(&b, r4, isp_cell_value(&b, format, cxr, cyc, n, black));
++            b4 = nir_iadd(&b, b4, isp_cell_value(&b, format, cxc, cyb, n, black));
++         }
++         nir_def *here = nir_i2f32(&b, all), *dr = nir_fsub(&b, nir_i2f32(&b, r4), here), *db = nir_fsub(&b, nir_i2f32(&b, b4), here);
++         nir_def *edges = nir_fadd(&b, nir_fmul(&b, dr, dr), nir_fmul(&b, db, db));
++         nir_def *fr = nir_i2f32(&b, vr), *fg = nir_i2f32(&b, g), *fb = nir_i2f32(&b, vb);
++         nir_def *take = nir_bcsel(&b, nir_ieq_imm(&b, k, 0), valid, nir_bcsel(&b, nir_ieq_imm(&b, k, 1), fair, grey));
++         nir_def *c3[4];
++
++         for (unsigned c = 0; c < 4; c++)
++            c3[c] = nir_b2f32(&b, nir_iand(&b, valid, nir_ieq(&b, bin, nir_iadd_imm(&b, base, c))));
++         nir_def *t = nir_b2f32(&b, take), *e = nir_b2f32(&b, edge_ok);
++         nir_def *add[4] = {
++            nir_bcsel(&b, is_edge, nir_fmul(&b, edges, e), nir_bcsel(&b, is_hist, c3[0], nir_fmul(&b, fr, t))),
++            nir_bcsel(&b, is_edge, nir_fmul(&b, here, e), nir_bcsel(&b, is_hist, c3[1], nir_fmul(&b, fg, t))),
++            nir_bcsel(&b, is_edge, e, nir_bcsel(&b, is_hist, c3[2], nir_fmul(&b, fb, t))),
++            nir_bcsel(&b, is_edge, zero, nir_bcsel(&b, is_hist, c3[3], t)),
++         };
++         for (unsigned c = 0; c < 4; c++)
++            acc[c] = nir_fadd(&b, acc[c], add[c]);
++      }
++   }
++   nir_store_var(&b, out, nir_vec4(&b, acc[0], acc[1], acc[2], acc[3]), 0xf);
++   return isp_fragment_end(&b, 1);
++}
++
++/* y2s65: camera_isp.c's isp_measure() choice of step for a frame of cw x ch cells (the whole frame) */
++static uint32_t
++isp_stats_step(uint32_t cw, uint32_t ch)
++{
++   uint32_t step = cw >= 1024 && ch >= 768 ? 8 : cw >= 256 && ch >= 192 ? 4 : 2;
++
++   return cw < 256 ? 4 : step;
++}
++
+ static void
+ isp_state_destroy(struct rwa_device *device)
+ {
+    struct pipe_context *pipe = device->pipe;
+-   void *fs[6] = { device->isp.cells[0], device->isp.cells[1], device->isp.full[0], device->isp.full[1], device->isp.luma,
+-                   device->isp.chroma };
++   void *fs[8] = { device->isp.cells[0], device->isp.cells[1], device->isp.full[0], device->isp.full[1], device->isp.luma,
++                   device->isp.chroma, device->isp.stats[0], device->isp.stats[1] };
+    bool any = device->isp.nearest != NULL;
+ 
+-   for (unsigned i = 0; i < 6; i++)
++   for (unsigned i = 0; i < 8; i++)
+       any = any || fs[i] != NULL;
+    if (any)
+       pipe->bind_fs_state(pipe, NULL);
+-   for (unsigned i = 0; i < 6; i++)
++   for (unsigned i = 0; i < 8; i++)
+       if (fs[i])
+          pipe->delete_fs_state(pipe, fs[i]);
+    if (device->isp.nearest)
+@@ -924,12 +1025,54 @@
+        isp_pass(device, luma, fs_luma, rgb_texture, 1, &block, "luma", why, why_size) != 0 ||
+        isp_pass(device, chroma, fs_chroma, rgb_texture, 1, &block, "chroma", why, why_size) != 0)
+       return RWA_ISP_E_GPU;
++   /* y2s65: the frame's statistics, one more pass over the frame alone, when the caller asked for them and has room */
++   isp->stats_w = isp->stats_h = isp->stats_step = 0;
++   if (isp->stats_out != NULL) {
++      uint32_t cw = f->width / 2, ch = f->height / 2, step = isp_stats_step(cw, ch);
++      uint32_t nw = (cw + step - 1) / step, nh = (ch + step - 1) / step;
++      uint32_t gw = (nw + RWA_ISP_STATS_BLOCK - 1) / RWA_ISP_STATS_BLOCK, gh = (nh + RWA_ISP_STATS_BLOCK - 1) / RWA_ISP_STATS_BLOCK;
++      uint32_t tw = gw * RWA_ISP_STATS_KINDS, th = gh;
++
++      if ((uint64_t)tw * th * 4 <= isp->stats_floats && tw <= 8192 && th <= 8192) {
++         void *fs_stats = device->isp.stats[variant] != NULL ? device->isp.stats[variant]
++                        : isp_shader(device, &device->isp.stats[variant], isp_stats_shader(device->nir_options, f->format), why, why_size);
++
++         if (isp->stats != NULL && (isp->stats_tw != tw || isp->stats_th != th)) {
++            rwa_texture_destroy(isp->stats);
++            isp->stats = NULL;
++         }
++         if (fs_stats != NULL && isp->stats == NULL) {
++            isp->stats = isp_texture(device, 125 /* RGBA32Float */, tw, th, RWA_USAGE_SHADER_READ | RWA_USAGE_RENDER_TARGET, why, why_size);
++            isp->stats_tw = tw;
++            isp->stats_th = th;
++         }
++         if (fs_stats != NULL && isp->stats != NULL) {
++            struct isp_block sb = block;
++            struct rwa_texture *const stats_textures[1] = { frame };
++            int white = 1023 - (int)f->black;
++
++            white = white < 64 ? 64 : white;
++            sb.q[0] = (int32_t)step;
++            sb.q[1] = (int32_t)cw;
++            sb.q[2] = (int32_t)ch;
++            sb.q[3] = white * 85 / 100;
++            sb.q[4] = (int32_t)gw;
++            sb.out_w = (int32_t)tw;
++            sb.out_h = (int32_t)th;
++            if (isp_pass(device, isp->stats, fs_stats, stats_textures, 1, &sb, "statistics", why, why_size) == 0) {
++               isp->stats_w = gw;
++               isp->stats_h = gh;
++               isp->stats_step = step;
++            }
++         }
++      }
++   }
+    device->pipe->flush(device->pipe, fence, 0);
+    if (isp->rgb != NULL && (uint64_t)width * height * 4 > ISP_KEEP_BYTES) {
+       rwa_texture_destroy(isp->rgb);          /* a still's: the queued passes hold what they use */
+       isp->rgb = NULL;
+    }
+-   if (result != NULL && result->size >= sizeof(*result)) {
++   if (result != NULL && result->size >= RWA_ISP_RESULT_SIZE_1) {
+       result->flags = zero_copy ? RWA_ISP_DID_ZERO_COPY : 0;
+       result->prepare_ns = t1 - t0;
+       result->queue_ns = os_time_get_nano() - t1;
+@@ -962,6 +1105,10 @@
+    if (async) {
+       struct pipe_fence_handle *oldest = NULL;
+ 
++      isp->stats_out = NULL;                   /* (y2s65: no statistics without the wait) */
++      if (result != NULL && result->size >= sizeof(*result))
++         result->stats_w = result->stats_h = result->stats_step = 0;
++
+       pthread_mutex_lock(&rwa_lock);
+       if (isp->pendings == ISP_PENDING) {
+          oldest = isp->pending[0];
+@@ -975,8 +1122,25 @@
+    uint64_t t = os_time_get_nano();
+    int error = isp_fence_wait(isp, fence, why, why_size);
+ 
+-   if (result != NULL && result->size >= sizeof(*result))
++   if (result != NULL && result->size >= RWA_ISP_RESULT_SIZE_1)
+       result->wait_ns = os_time_get_nano() - t;
++   /* y2s65: the statistics, read back now that the passes are done */
++   uint32_t sw = 0, sh = 0;
++
++   if (error == RWA_ISP_OK && isp->stats_out != NULL && isp->stats_w != 0 && isp->stats != NULL) {
++      const unsigned origin[3] = { 0, 0, 0 }, size[3] = { isp->stats_tw, isp->stats_th, 1 };
++
++      if (rwa_texture_read(isp->stats, 0, 0, origin, size, isp->stats_out, (size_t)isp->stats_tw * 16, why, why_size) == 0) {
++         sw = isp->stats_w;
++         sh = isp->stats_h;
++      }
++   }
++   if (result != NULL && result->size >= sizeof(*result)) {
++      result->stats_w = sw;
++      result->stats_h = sh;
++      result->stats_step = sw != 0 ? isp->stats_step : 0;
++   }
++   isp->stats_out = NULL;
+    return error;
+ }
+ 
+@@ -998,6 +1162,17 @@
+    return error != RWA_ISP_OK ? error : isp_finish(isp, fence, flags & RWA_ISP_OUT_ASYNC, result, why, why_size);
+ }
+ 
++/* y2s65, for tests (not in rwa_isp_api.h): the next rwa_isp_render_textures also makes the statistics into `stats' */
++void rwa_isp_want_stats(struct rwa_isp *isp, float *stats, uint32_t floats);
++void
++rwa_isp_want_stats(struct rwa_isp *isp, float *stats, uint32_t floats)
++{
++   if (isp != NULL) {
++      isp->stats_out = stats;
++      isp->stats_floats = stats != NULL ? floats : 0;
++   }
++}
++
+ /* the device the contexts share, for a caller of rwa_isp_render_textures to make its textures on */
+ struct rwa_device *
+ rwa_isp_device(struct rwa_isp *isp)
+@@ -1206,9 +1381,9 @@
+       if (isp->slot[i].buffer != NULL)
+          rwa_buffer_destroy(isp->slot[i].buffer);
+    }
+-   struct rwa_texture *own[5] = { isp->raw_own, isp->columns, isp->rows, isp->gamma, isp->rgb };
++   struct rwa_texture *own[6] = { isp->raw_own, isp->columns, isp->rows, isp->gamma, isp->rgb, isp->stats };
+ 
+-   for (int i = 0; i < 5; i++)
++   for (int i = 0; i < 6; i++)
+       if (own[i] != NULL)
+          rwa_texture_destroy(own[i]);
+    free(isp);
+@@ -1260,7 +1435,7 @@
+    struct pipe_fence_handle *fence = NULL;
+    bool imported = false;
+ 
+-   if (isp == NULL || output == NULL || output->size < sizeof(*output) || output->iosurface == NULL || params == NULL ||
++   if (isp == NULL || output == NULL || output->size < RWA_ISP_OUTPUT_SIZE_1 || output->iosurface == NULL || params == NULL ||
+        params->size < sizeof(*params)) {
+       say(why, why_size, "the camera's GPU render was given no context, no output surface, or a struct smaller than this library's");
+       return RWA_ISP_E_ARGUMENT;
+@@ -1272,11 +1447,14 @@
+       RWA_GUARD();
+       uint64_t t = os_time_get_nano();
+ 
++      /* y2s65: the statistics, when the caller's struct has their fields and gave room */
++      isp->stats_out = output->size >= sizeof(*output) && output->stats != NULL && !(output->flags & RWA_ISP_OUT_ASYNC) ? output->stats : NULL;
++      isp->stats_floats = isp->stats_out != NULL ? output->stats_floats : 0;
+       error = isp_surface_planes(isp, output, params->video_range, &luma, &chroma, &imported, why, why_size);
+       t = os_time_get_nano() - t;
+       if (error == RWA_ISP_OK)
+          error = isp_render_locked(isp, frame, params, luma, chroma, output->width, output->height, &fence, result, why, why_size);
+-      if (error == RWA_ISP_OK && result != NULL && result->size >= sizeof(*result)) {
++      if (error == RWA_ISP_OK && result != NULL && result->size >= RWA_ISP_RESULT_SIZE_1) {
+          result->prepare_ns += t;
+          result->flags |= imported ? RWA_ISP_DID_IMPORT : 0;
+       }
+diff -ru orig/src/air_metal.c src/air_metal.c
+--- orig/src/air_metal.c	2026-11-11 08:25:32.950956688 +0100
++++ src/air_metal.c	2026-11-12 11:55:55.505315467 +0100
+@@ -29,6 +29,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <time.h>   /* GNR1 */
+ 
+ #include "air_metal.h"
+ 
+@@ -196,6 +197,7 @@
+    /* y2s39: the camera's ISP on the GPU (air_isp.c, included at the end of this file): its fragment shaders, per frame format */
+    struct {
+       void *cells[2], *full[2], *luma, *chroma, *nearest;
++      void *stats[2];           /* y2s65: the frame's statistics, per frame format (air_isp.c isp_stats_shader) */
+    } isp;
+ };
+ 
+@@ -5007,6 +5009,97 @@
+    }
+ }
+ 
++/*
++ * GNR1 (y2s63-gnr1, diagnostic only; changes no result). Run q10ik-vt12: GNR's registration dispatches came back
++ * "did not finish within two seconds", 25 times, while the kernel counted 24+6 FAULTED jobs of mediaserverd and
++ * the winsys's wait returned EIO at once: the jobs faulted, they did not hang, and nothing said WHICH kernel.
++ * Now a failed dispatch says its kernel, grid, group, threadgroup memory and every binding with its GPU range
++ * (the Panfrost handle's va/size from nord2_pan.c), so the fault address nord2_pan.c prints ("np GNR1 FAULT")
++ * can be matched to a binding. With /var/db/nord2-gpu-gnr1-trace present every dispatch of the process is said
++ * in one short line (name, grid, group, ms): the order of GNR's kernels up to the first fault.
++ */
++#ifdef GALLIUM_PANFROST
++extern int nord2_gnr1_bo_info(uint32_t h, uint64_t *va, uint64_t *size) __attribute__((weak));
++
++static void
++gnr1_range(struct rwa_device *device, struct pipe_resource *res, char *out, size_t size)
++{
++   struct winsys_handle wh = { .type = WINSYS_HANDLE_TYPE_KMS };
++   uint64_t va = 0, bytes = 0, stride = 0, offset = 0;
++
++   out[0] = 0;
++   if (!res || device->software || !device->screen->resource_get_handle)
++      return;
++   if (device->screen->resource_get_param) {
++      device->screen->resource_get_param(device->screen, NULL, res, 0, 0, 0, PIPE_RESOURCE_PARAM_STRIDE, 0, &stride);
++      device->screen->resource_get_param(device->screen, NULL, res, 0, 0, 0, PIPE_RESOURCE_PARAM_OFFSET, 0, &offset);
++   }
++   if (device->screen->resource_get_handle(device->screen, NULL, res, &wh, 0) && nord2_gnr1_bo_info &&
++       nord2_gnr1_bo_info(wh.handle, &va, &bytes) == 0)
++      snprintf(out, size, " bo %u va 0x%llx..0x%llx stride %llu off %llu", wh.handle, (unsigned long long)va,
++               (unsigned long long)(va + bytes), (unsigned long long)stride, (unsigned long long)offset);
++   else
++      snprintf(out, size, " (no gpu range) stride %llu off %llu", (unsigned long long)stride,
++               (unsigned long long)offset);
++}
++
++static int
++gnr1_trace_on(void)
++{
++   static int on = -1;
++   if (on < 0)
++      on = access("/private/var/db/nord2-gpu-gnr1-trace", F_OK) == 0;
++   return on;
++}
++
++static void
++gnr1_say_dispatch(struct rwa_compute *compute, const struct rwa_bindings *b,
++                  const struct rwa_buffer_bind *table, unsigned table_count,
++                  const unsigned groups[3], const unsigned group_size[3], int rc, double ms, const char *why)
++{
++   static unsigned said_failed;
++   struct rwa_device *device = compute->device;
++   const char *name = compute->info.entry_point ? compute->info.entry_point : "?";
++   char line[900], r[128];
++   int n;
++
++   if (rc == 0) {
++      if (!gnr1_trace_on())
++         return;
++      n = snprintf(line, sizeof(line), "GNR1 dispatch %s %ux%ux%u x %ux%ux%u %.2f ms", name, groups[0], groups[1],
++                   groups[2], group_size[0], group_size[1], group_size[2], ms);
++      np_log(line, (size_t)MIN2(n, (int)sizeof(line) - 1));
++      return;
++   }
++   if (said_failed++ >= 12)
++      return;
++   n = snprintf(line, sizeof(line), "GNR1 FAILED DISPATCH %s grid %ux%ux%u group %ux%ux%u (%.1f ms) shared %u B: %.160s",
++                name, groups[0], groups[1], groups[2], group_size[0], group_size[1], group_size[2], ms,
++                compute->caps.static_shared_bytes, why ? why : "");
++   np_log(line, (size_t)MIN2(n, (int)sizeof(line) - 1));
++   for (unsigned i = 0; b && i < b->buffer_count; i++) {
++      const struct rwa_buffer *x = b->buffers ? b->buffers[i] : NULL;
++      size_t off = table && i < table_count ? table[i].offset : 0;
++      if (!x)
++         continue;
++      gnr1_range(device, x->res, r, sizeof(r));
++      n = snprintf(line, sizeof(line), "GNR1   buffer %u: %zu bytes, bound at offset %zu (offset %% 64 = %zu)%s", i,
++                   x->size, off, off % 64, r);
++      np_log(line, (size_t)MIN2(n, (int)sizeof(line) - 1));
++   }
++   for (unsigned i = 0; b && i < b->texture_count; i++) {
++      const struct rwa_texture *t = b->textures ? b->textures[i] : NULL;
++      if (!t)
++         continue;
++      gnr1_range(device, t->res, r, sizeof(r));
++      n = snprintf(line, sizeof(line), "GNR1   texture %u: %s %ux%u type %u usage %#x levels %u%s%s", i,
++                   t->format_name ? t->format_name : "?", t->shape.width, t->shape.height, t->shape.type,
++                   t->shape.usage, t->levels, t->is_view ? " view" : "", r);
++      np_log(line, (size_t)MIN2(n, (int)sizeof(line) - 1));
++   }
++}
++#endif
++
+ int
+ rwa_dispatch(struct rwa_compute *compute, const struct rwa_bindings *bindings,
+              const unsigned groups[3], const unsigned group_size[3],
+@@ -5099,6 +5192,10 @@
+       .block = { group_size[0], group_size[1], group_size[2] },
+       .grid = { groups[0], groups[1], groups[2] },
+    };
++#ifdef GALLIUM_PANFROST
++   struct timespec gnr1_t0, gnr1_t1;                                   /* GNR1 */
++   clock_gettime(CLOCK_MONOTONIC, &gnr1_t0);
++#endif
+    pipe->launch_grid(pipe, &grid);
+ 
+    /* Waited for here, and not left to rwa_finish, because this is the call that can
+@@ -5108,6 +5205,11 @@
+     * wait for work dispatched through another pipeline of the same device.
+     */
+    int rc = finish_or_say_why(device, true, "dispatch", why, why_size);
++#ifdef GALLIUM_PANFROST
++   clock_gettime(CLOCK_MONOTONIC, &gnr1_t1);                           /* GNR1 */
++   gnr1_say_dispatch(compute, bindings, table, table_count, groups, group_size, rc,
++                     (gnr1_t1.tv_sec - gnr1_t0.tv_sec) * 1e3 + (gnr1_t1.tv_nsec - gnr1_t0.tv_nsec) / 1e6, why);
++#endif
+    unbind_stage(device, PIPE_SHADER_COMPUTE, &bound);
+    return rc;
+ }
+Only in src: isp_stats_host_test.c
+diff -ru orig/src/redwood-drm/nord2_pan.c src/redwood-drm/nord2_pan.c
+--- orig/src/redwood-drm/nord2_pan.c	2026-11-12 11:55:20.596156951 +0100
++++ src/redwood-drm/nord2_pan.c	2026-11-12 11:55:55.506666279 +0100
+@@ -91,6 +91,7 @@
+ 	uint64_t last_seq;              /* newest job that listed it */
+ 	uint8_t noexec, heap, imported, mapped;
+ 	uint32_t surface;               /* IOSurface ID of an imported buffer */
++	int import_fd;                  /* thumbrc: the DRM descriptor (one per Mesa screen) the import was made for */
+ 	uint8_t pooled, cls;            /* closed by the client but kept (kernel buffer and CPU mapping alive) for the next CREATE_BO of its size class */
+ 	uint32_t pool_next;
+ };
+@@ -351,6 +352,132 @@
+ 		D.completed = seq;
+ }
+ 
++/* GNR1 (y2s63-gnr1, diagnostic): the kernel has always returned what a failed job died of (JS status, the
++ * context's MMU FAULTSTATUS and FAULTADDRESS) in WAIT_SEQ's structure output, and nothing here read it: every
++ * failure became "EIO" and, one level up, "did not finish within two seconds".  Now: the job's kind and chain
++ * head (from a ring of the last submits), the JS status and the MMU fault decoded, and which buffer object the
++ * address is in or nearest to (va, size, imported surface).  First 24 faults of a process. */
++#define GNR1_RING 128u
++static struct { uint64_t seq, jc; uint32_t kind, nbos, dropped; } gnr1_ring[GNR1_RING];
++static unsigned gnr1_faults_said;
++
++static void gnr1_note_submit(uint64_t seq, uint64_t jc, uint32_t kind, uint32_t nbos, uint32_t dropped)
++{
++	unsigned i = (unsigned)(seq % GNR1_RING);
++
++	gnr1_ring[i].seq = seq; gnr1_ring[i].jc = jc; gnr1_ring[i].kind = kind;
++	gnr1_ring[i].nbos = nbos; gnr1_ring[i].dropped = dropped;
++}
++
++static const char *gnr1_js_name(uint32_t s)
++{
++	switch (s & 0xff) {
++	case 0x00: return "no exception"; case 0x02: return "interrupted"; case 0x03: return "stopped";
++	case 0x04: return "terminated"; case 0x08: return "active"; case 0x40: return "job configuration fault";
++	case 0x41: return "job power fault"; case 0x42: return "job read fault"; case 0x43: return "job write fault";
++	case 0x44: return "job affinity fault"; case 0x48: return "job bus fault";
++	case 0x50: return "instruction invalid PC"; case 0x51: return "instruction invalid encoding";
++	case 0x52: return "instruction type mismatch"; case 0x53: return "instruction operand fault";
++	case 0x54: return "instruction TLS fault"; case 0x55: return "instruction barrier fault";
++	case 0x56: return "instruction alignment fault"; case 0x58: return "data invalid fault";
++	case 0x59: return "tile range fault"; case 0x5a: return "address range fault"; case 0x60: return "out of memory";
++	default:
++		if ((s & 0xf8) == 0xc0) return "MMU translation fault";
++		if ((s & 0xf8) == 0xc8) return "MMU permission fault";
++		if ((s & 0xf8) == 0xd8) return "MMU access flag fault";
++		return "other";
++	}
++}
++
++static const char *gnr1_mmu_kind(uint32_t fs)
++{
++	static const char *k[8] = { "translation", "permission", "translation table bus", "access flag",
++				    "address size", "memory attributes", "?6", "?7" };
++	return fs ? k[(fs >> 3) & 7] : "none";
++}
++
++static const char *gnr1_mmu_access(uint32_t fs)
++{
++	static const char *a[4] = { "atomic", "execute", "read", "write" };
++	return a[(fs >> 8) & 3];
++}
++
++/* the buffer object an address is in, else the nearest one below it (an overrun) and above it */
++static void gnr1_where(uint64_t addr, char *out, size_t size)
++{
++	uint32_t in = 0, below = 0, above = 0;
++
++	for (uint32_t h = 1; h <= NP_BOS; h++) {
++		const struct bo *x = &D.bos[h];
++
++		if (!x->kernel || !x->size)
++			continue;
++		if (addr >= x->va && addr < x->va + x->size) { in = h; break; }
++		if (x->va + x->size <= addr && (!below || x->va + x->size > D.bos[below].va + D.bos[below].size))
++			below = h;
++		if (x->va > addr && (!above || x->va < D.bos[above].va))
++			above = h;
++	}
++	if (in) {
++		const struct bo *x = &D.bos[in];
++		snprintf(out, size, "INSIDE bo %u (va 0x%llx size %llu, +%llu%s%s, surface %u)", in,
++			 (unsigned long long)x->va, (unsigned long long)x->size, (unsigned long long)(addr - x->va),
++			 x->imported ? ", imported" : "", x->noexec ? "" : ", executable", x->surface);
++		return;
++	}
++	int n = snprintf(out, size, "in NO buffer object");
++	if (below && n > 0 && (size_t)n < size) {
++		const struct bo *x = &D.bos[below];
++		n += snprintf(out + n, size - n, "; %llu bytes past the end of bo %u (va 0x%llx size %llu%s)",
++			      (unsigned long long)(addr - (x->va + x->size)), below, (unsigned long long)x->va,
++			      (unsigned long long)x->size, x->imported ? ", imported" : "");
++	}
++	if (above && n > 0 && (size_t)n < size) {
++		const struct bo *x = &D.bos[above];
++		snprintf(out + n, size - n, "; %llu bytes before bo %u (va 0x%llx size %llu)",
++			 (unsigned long long)(x->va - addr), above, (unsigned long long)x->va, (unsigned long long)x->size);
++	}
++}
++
++static void gnr1_say_fault(uint64_t waited, const uint64_t *out, unsigned n, const struct nord2_gpu_fault_info *fi)
++{
++	char b[512], where[224] = "";
++	uint64_t id = ((uint64_t)fi->job_id_hi << 32) | fi->job_id_lo;
++	uint64_t failed = id ? id : (n >= 3 ? out[2] : waited);
++	unsigned r = (unsigned)(failed % GNR1_RING);
++	int known = gnr1_ring[r].seq == failed;
++
++	if (gnr1_faults_said >= 24)
++		return;
++	gnr1_faults_said++;
++	if (fi->fault_address)
++		gnr1_where(fi->fault_address, where, sizeof(where));
++	int m = snprintf(b, sizeof(b),
++			 "np GNR1 FAULT pid=%d waited seq %llu: job %llu (%s, chain 0x%llx, %u bos%s) state %u out0 %llu; "
++			 "JS status 0x%x (%s); MMU faultstatus 0x%x (%s, %s access, source id 0x%x) address 0x%llx %s; "
++			 "first incomplete task %u",
++			 getpid(), (unsigned long long)waited, (unsigned long long)failed,
++			 known ? (gnr1_ring[r].kind == 3 ? "fragment" : "vertex/tiler/compute") : "not in the ring",
++			 known ? (unsigned long long)gnr1_ring[r].jc : 0ull, known ? gnr1_ring[r].nbos : 0,
++			 known && gnr1_ring[r].dropped ? ", list FULL" : "", fi->state,
++			 n >= 1 ? (unsigned long long)out[0] : 0ull, fi->status, gnr1_js_name(fi->status),
++			 fi->fault_status, gnr1_mmu_kind(fi->fault_status), gnr1_mmu_access(fi->fault_status),
++			 fi->fault_status >> 16, (unsigned long long)fi->fault_address, where, fi->first_incomplete_task);
++	if (m > 0)
++		np_log(b, (size_t)(m < (int)sizeof(b) ? m : (int)sizeof(b) - 1));
++}
++
++/* for air_metal.c's dispatch report: a Panfrost (KMS) handle's GPU range */
++int nord2_gnr1_bo_info(uint32_t h, uint64_t *va, uint64_t *size);
++__attribute__((visibility("default"))) int nord2_gnr1_bo_info(uint32_t h, uint64_t *va, uint64_t *size)
++{
++	if (!h || h > NP_BOS || !D.bos || !D.bos[h].kernel)
++		return -1;
++	*va = D.bos[h].va;
++	*size = D.bos[h].size;
++	return 0;
++}
++
+ /* Wait until every job <= seq is terminal.  lock held.  0 done, ETIMEDOUT, EIO (failed job, reaped). */
+ static int wait_seq(uint64_t seq, uint64_t ms)
+ {
+@@ -382,6 +509,7 @@
+ 			return 0;
+ 		}
+ 		if (n >= 1 && out[0] != 2) {
++			gnr1_say_fault(seq, out, n, &fi);       /* GNR1 */
+ 			note_done(seq);                 /* terminal: faulted, cancelled or reset, and reaped */
+ 			D.stats.faults++;
+ 			D.last_fault_seq = n >= 3 ? out[2] : seq;
+@@ -602,6 +730,7 @@
+ 			return np_fail(EIO);
+ 		*seqno = job;
+ 		D.submitted = job > D.submitted ? job : D.submitted;
++		gnr1_note_submit(job, r->jc, q.kind, np, np == NP_KERNEL_BOS);   /* GNR1 */
+ 		break;
+ 	}
+ 	for (unsigned i = 0; i < count; i++) {
+@@ -823,6 +952,35 @@
+ 	return new_bo_ex(size, flags, 0, handle, va);
+ }
+ 
++/*
++ * thumbrc (12 Nov 2026): ONE IMPORT PER SURFACE AND SCREEN. Mesa shares an imported buffer within one pipe_screen (pan_lookup_bo by
++ * GEM handle, one GEM_CLOSE when its last user goes), and expects a second screen to get its own handle, as a DRM file
++ * descriptor does. On iOS os_same_file_description() cannot tell two dup()s of the connection apart, so every rwa_device gets a
++ * screen of its own, while this layer handed all of them the SAME handle for a surface: the first screen to let the surface go
++ * closed the kernel buffer under the others, whose GPU addresses then fell on whatever buffer took that range next (run ph11: the
++ * Photos grid's surfaces read back as vertex floats, BGRA texels, zeros). The descriptor of the import (drmPrimeFDToHandle, through
++ * np_set_import_fd) is now part of the key: a screen gets its own handle and kernel buffer, and its GEM_CLOSE closes only that.
++ * Logged: the first 48 imports and closes of imported buffers ('np import ...', 'np close ...').
++ */
++static __thread int np_import_fd = -1;
++void np_set_import_fd(int fd);
++void np_set_import_fd(int fd) { np_import_fd = fd; }
++
++static void import_note(const char *what, uint32_t surface, int fd, uint32_t h, uint64_t va, uint64_t size)
++{
++	static unsigned said;
++	char b[200];
++	int m;
++
++	if (said >= 48)
++		return;
++	said++;
++	m = snprintf(b, sizeof(b), "np %s: IOSurface %u fd %d -> handle %u va 0x%llx size %llu", what, surface, fd, h,
++		     (unsigned long long)va, (unsigned long long)size);
++	if (m > 0)
++		np_log(b, (size_t)m);
++}
++
+ static int do_close(uint32_t h)
+ {
+ 	struct bo *b;
+@@ -840,6 +998,8 @@
+ 	}
+ 	if (b->mapped && !b->imported && D.ops.unmap)
+ 		D.ops.unmap(D.ops.opaque, b->kernel, b->cpu);
++	if (b->imported)
++		import_note("close", b->surface, b->import_fd, h, b->va, b->size);
+ 	uint64_t in[1] = { b->kernel };
+ 	unsigned n = 0;
+ 	int e = kcall(NORD2_GPU_SEL_RELEASE, in, 1, NULL, 0, NULL, &n, NULL, NULL);
+@@ -898,7 +1058,7 @@
+ 	return 0;               /* a mapping lives until the buffer is closed */
+ }
+ 
+-/* An IOSurface's pixels as a buffer: the same surface is the same buffer. */
++/* An IOSurface's pixels as a buffer: the same surface is the same buffer (for one screen: thumbrc). */
+ /* the first 40 failed imports of a process, with the reason: a failed import is a missing texture */
+ static void surf_note(uint32_t surface, const char *why, int err)
+ {
+@@ -944,7 +1104,7 @@
+ 		return 0;
+ 	}
+ 	for (uint32_t h = 1; h <= NP_BOS; h++)
+-		if (D.bos[h].kernel && D.bos[h].imported && D.bos[h].surface == q->surface) {
++		if (D.bos[h].kernel && D.bos[h].imported && D.bos[h].surface == q->surface && D.bos[h].import_fd == np_import_fd) {
+ 			q->handle = h;
+ 			return 0;
+ 		}
+@@ -975,9 +1135,10 @@
+ 		return np_fail(EIO);
+ 	}
+ 	D.bos[h] = (struct bo){ .kernel = (uint32_t)reply[0], .va = reply[1], .size = in.size, .cpu = in.cpu,
+-				.noexec = 1, .imported = 1, .mapped = 1, .surface = q->surface };
++				.noexec = 1, .imported = 1, .mapped = 1, .surface = q->surface, .import_fd = np_import_fd };
+ 	D.next_bo = h;
+ 	q->handle = h;
++	import_note("import", q->surface, np_import_fd, h, reply[1], in.size);
+ 	return 0;
+ }
+ 
+diff -ru orig/src/redwood-drm/redwood_drm.c src/redwood-drm/redwood_drm.c
+--- orig/src/redwood-drm/redwood_drm.c	2026-11-12 11:55:20.596245039 +0100
++++ src/redwood-drm/redwood_drm.c	2026-11-12 11:55:47.186688502 +0100
+@@ -213,8 +213,9 @@
+ 		*handle = (uint32_t)surface & ~REDWOOD_PRIME_LOCAL;
+ 		return 0;
+ 	}
++	np_set_import_fd(fd);           /* thumbrc: the import is this descriptor's (one per Mesa screen) */
+ 	error = call(REDWOOD_GPU_SURFACE, &request, sizeof(request));
+-	(void)fd;
++	np_set_import_fd(-1);
+ 	if (error != 0) {
+ 		errno = error;
+ 		return -1;
+diff -ru orig/src/rwa_isp_api.h src/rwa_isp_api.h
+--- orig/src/rwa_isp_api.h	2026-11-10 18:57:55.409537525 +0100
++++ src/rwa_isp_api.h	2026-11-12 11:55:41.317156373 +0100
+@@ -87,7 +87,25 @@
+ 	uint32_t        flags;          /* RWA_ISP_OUT_* */
+ 	void            *iosurface;     /* IOSurfaceRef: CVPixelBufferGetIOSurface(pixelBuffer). '420f' or '420v', two planes. */
+ 	uint32_t        width, height;  /* the picture: the surface's own size */
++	/*
++	 * y2s65 (still API version 1; a caller's smaller struct, ending here, is taken as before): the frame's statistics, made in the same
++	 * render by one more pass and read back after its wait (not with RWA_ISP_OUT_ASYNC). stats: room for stats_floats floats, NULL: none.
++	 * The library says what it wrote in result->stats_w / stats_h (0: nothing -- an older library leaves them as the caller set them).
++	 * The layout: blocks of RWA_ISP_STATS_BLOCK x RWA_ISP_STATS_BLOCK of the cells camera_isp.c's isp_measure() looks at (every
++	 * step-th 2x2 cell, step as it chooses for the frame), stats_w x stats_h of them, row by row; for each RWA_ISP_STATS_KINDS x 4 floats:
++	 *   kind 0      R, G, B sums (above black) and the number of cells      -- isp_stats.mean
++	 *   kind 1      the same of the 'fair' cells (neither near black nor clipped) -- isp_stats.fair
++	 *   kind 2      the same of the 'grey' ones among them                   -- isp_stats.grey
++	 *   kinds 3-18  the green histogram's 64 bins of 16 steps, four a kind   -- isp_stats.hist (and from it bright)
++	 *   kind 19     sharpness: the sum of (right - here)^2 + (below - here)^2 of the cells' brightness, the sum of here, the count
++	 * Summed over all blocks the first four are isp_measure()'s numbers exactly (whole numbers, exact in floats).
++	 */
++	float           *stats;
++	uint32_t        stats_floats;
+ };
++#define RWA_ISP_OUTPUT_SIZE_1   ((uint32_t)offsetof(struct rwa_isp_output, stats))
++#define RWA_ISP_STATS_BLOCK     8
++#define RWA_ISP_STATS_KINDS     20
+ 
+ #define RWA_ISP_DID_ZERO_COPY   1u      /* the frame was read by the GPU where it lay (rwa_isp_frame_memory) */
+ #define RWA_ISP_DID_IMPORT      2u      /* the output surface was imported by this call (not found among the context's kept ones) */
+@@ -98,7 +116,10 @@
+ 	uint64_t        prepare_ns;     /* the frame's upload (0 with zero copy), tables, imports */
+ 	uint64_t        queue_ns;       /* building and submitting the three passes */
+ 	uint64_t        wait_ns;        /* waiting for the GPU to finish them (0 with RWA_ISP_OUT_ASYNC) */
++	uint32_t        stats_w, stats_h;       /* y2s65: the statistics written (blocks across, down); 0: none */
++	uint32_t        stats_step;             /* y2s65: the cells' step the blocks are of */
+ };
++#define RWA_ISP_RESULT_SIZE_1   ((uint32_t)offsetof(struct rwa_isp_result, stats_w))
+ 
+ /*
+  * The functions, as the library exports them (look each up by its name with dlsym; RWA_ISP_DECLARE_POINTERS gives a struct of
+Only in src: stats-host-test.sh

@@ -1,0 +1,77 @@
+--- ../y2s93-final/src/redwoodmetal.m	2026-11-13 00:46:50.503032576 +0100
++++ src/redwoodmetal.m	2026-11-13 12:06:02.167772471 +0100
+@@ -3419,6 +3419,55 @@
+ 	return rw_use.off ? 0 : rw_use.kernel;
+ }
+ 
++/*
++ * y2s94 (final4): NO HOLD ON A VIDEO / CAMERA SURFACE OUTSIDE PHOTOS. Run cam1 (q10jgm, gpufinal3): mediaserverd's 'Preview Scaler'
++ * (BWPixelTransferNode) ran out of output buffers after a fixed count (7 video, 17 photo) and every later frame was a DROPPED SAMPLE
++ * 'PixelTransferFailure'. The camera processes themselves were already excluded (y2s93), but backboardd textures the preview's
++ * 420f/420v buffers (CAImageQueue / video layer contents) and, with y2s84, each texture held its surface's use count until -dealloc, so
++ * the CVPixelBufferPool in mediaserverd (okToReuse = not in use, kernel 0398) never saw them free. Rule: a texture over a YCbCr
++ * surface (two or more planes, or a packed 4:2:2 fourcc) takes no hold, EXCEPT in MobileSlideShow, whose converted YCbCr thumbnails
++ * are what the holds were for (thumbfix2/5 -> y2s84 follow-live; dropping them there would bring the black / torn cells back). The
++ * BGRA backing stores of UI layers (vanishing icons) keep their holds everywhere. /var/db/nord2-metal/usecount-yuv gives every process
++ * the y2s93 holds on YCbCr surfaces back. Read once per process. Lines: SURF "NORD2 SURF USE: metal: no hold on YCbCr surface ...".
++ */
++static bool rw_is_photos_proc(void);
++static struct {
++	pthread_once_t once;
++	int on;                         /* 1: skip holds on YCbCr surfaces in this process */
++	volatile long skipped;
++} rw_use_yuv = { .once = PTHREAD_ONCE_INIT };
++
++static void
++rw_use_yuv_load(void)
++{
++	rw_use_yuv.on = !rw_is_photos_proc() && access("/var/db/nord2-metal/usecount-yuv", F_OK) != 0 && rw_ios_load();
++	m2m_log('I', "SURF", "NORD2 SURF USE: metal: y2s94 YCbCr surfaces %s in %s (usecount-yuv %d, photos %d)\n",
++	    rw_use_yuv.on ? "take NO hold" : "keep their holds", getprogname(), access("/var/db/nord2-metal/usecount-yuv", F_OK) == 0,
++	    rw_is_photos_proc() ? 1 : 0);
++}
++
++static int
++rw_use_yuv_skip(void *surface)
++{
++	pthread_once(&rw_use_yuv.once, rw_use_yuv_load);
++	if (!rw_use_yuv.on) {
++		return 0;
++	}
++	uint32_t f = rw_ios.format(surface);
++	size_t planes = rw_ios.planes(surface);
++	int yuv = planes >= 2 || f == 0x32767579u /* '2vuy' */ || f == 0x79757673u /* 'yuvs' */ || f == 0x79757666u /* 'yuvf' */;
++
++	if (yuv) {
++		long n = __sync_add_and_fetch(&rw_use_yuv.skipped, 1);
++
++		if (n <= 4 || (n & (n - 1)) == 0 || n % 1024 == 0) {
++			m2m_log('I', "SURF", "NORD2 SURF USE: metal: no hold on YCbCr surface %u ('%c%c%c%c', %zu planes) n=%ld (y2s94)\n",
++			    rwd_surface_id(surface), (char)(f >> 24), (char)(f >> 16), (char)(f >> 8), (char)f, planes, n);
++		}
++	}
++	return yuv;
++}
++
+ static BOOL
+ rw_use_take(void *surface)
+ {
+@@ -3426,6 +3475,9 @@
+ 	if (rw_use.off || surface == NULL) {
+ 		return NO;
+ 	}
++	if (rw_use_yuv_skip(surface)) {    /* y2s94 */
++		return NO;
++	}
+ 	rw_use.inc(surface);
+ 	if (rw_use.kernel < 0 && rw_use.in_use != NULL) {
+ 		int k = rw_use.in_use(surface) ? 1 : 0;
+@@ -3467,7 +3519,7 @@
+  * photosperf: on/off (its behaviour changes act in MobileSlideShow only; counters per no-photosperf-log);
+  * gamepipe: on/off (pipeline reuse + asynchronous builds act in third-party applications only; slow commit anatomy everywhere).
+  */
+-#define RW_FINAL_VERSION "final (y2s93)"
++#define RW_FINAL_VERSION "final (y2s94)"
+ #define RW_FINAL_DB "/var/db/nord2-metal/"
+ 
+ static int

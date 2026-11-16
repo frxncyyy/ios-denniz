@@ -1,0 +1,1396 @@
+diff -ruN y2s96-final/src/redwoodmetal.m y2s98-texlayout/src/redwoodmetal.m
+--- y2s96-final/src/redwoodmetal.m	2026-11-13 13:58:55.464510118 +0100
++++ y2s98-texlayout/src/redwoodmetal.m	2026-11-13 23:09:33.319831727 +0100
+@@ -3822,6 +3822,213 @@
+ 	    dr <= 6 && dg <= 6 && db <= 6 ? "match" : "DIFFER");
+ }
+ 
++/*
++ * y2s98 (texlayout): the texture layout of block-compressed (ASTC) textures and the texture made over memory laid out by it.
++ *
++ * The two device selectors below (-newTextureLayoutWithDescriptor:isHeapOrBufferBacked: and
++ * -newTextureWithBytesNoCopy:length:descriptor:deallocator:) answered nil until now, and that is why every ASTC picture
++ * CoreAnimation is given as a CGImage -- the .atx snapshots PosterBoard shows in the wallpaper gallery and SpringBoard shows
++ * for the wallpaper and the application switcher -- was composited as NOTHING: ImageIO (ASTCTwiddler) builds the "texture
++ * memory" with the device's layout, CA::Render::CompressedImage carries it to the window server, and
++ * CA::OGL::MetalContext::update_texture makes the texture with -newTextureWithBytesNoCopy: (its only caller in QuartzCore;
++ * deallocator nil, the image keeps the bytes).  rw_texlayout_pure.h has the layout (linear rows of blocks, levels packed) and
++ * the evidence; the object here forwards to it.
++ *
++ * The texture is made by COPYING the levels in (-replaceRegion:'s path, rwa_texture_write), which the old comment refused
++ * for a caller that goes on writing to its pages.  A block-compressed picture is not such a caller: nobody encodes ASTC in
++ * place, CoreAnimation's CompressedImage is immutable, and only the formats rw_texlayout_pure.h serves get here -- every
++ * other descriptor is answered nil as before.
++ *
++ * Switch /var/db/nord2-metal/no-texlayout (read once per process): both selectors answer nil again (gpufinal6 behaviour).
++ * Lines: 'NORD2 GPU TEXLAYOUT: pid= name= config ON|OFF (no-texlayout n) y2s98' once per process that asks;
++ *        'NORD2 GPU TEXLAYOUT: pid= name= layouts=N refused=R | textures ok=K (bytes B) refused=F' at 1, 2, 4, 8... events;
++ *        'I RES texlayout: ...' for the first layouts and textures, 'W RES texlayout: ...' for every kind of refusal.
++ */
++#include "rw_texlayout_pure.h"
++
++static struct {
++	BOOL on;
++	unsigned long layouts, layouts_refused, textures, textures_refused, events;
++	unsigned long long bytes;
++} rw_tl;
++static pthread_mutex_t rw_tl_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static BOOL
++rw_tl_on(void)
++{
++	static dispatch_once_t once;
++
++	dispatch_once(&once, ^{
++		int off = access("/var/db/nord2-metal/no-texlayout", F_OK) == 0;
++
++		rw_tl.on = !off;
++		m2m_log('I', "RES", "NORD2 GPU TEXLAYOUT: pid=%d name=%s config %s (no-texlayout %d) y2s98\n", getpid(), getprogname(),
++		    off ? "OFF" : "ON", off);
++	});
++	return rw_tl.on;
++}
++
++/* which: 0 a layout made, 1 a layout refused, 2 a texture made (`bytes` copied), 3 a texture refused */
++static void
++rw_tl_count(int which, size_t bytes)
++{
++	unsigned long n, a, b, c, d;
++	unsigned long long by;
++
++	pthread_mutex_lock(&rw_tl_lock);
++	if (which == 0) {
++		rw_tl.layouts++;
++	} else if (which == 1) {
++		rw_tl.layouts_refused++;
++	} else if (which == 2) {
++		rw_tl.textures++;
++		rw_tl.bytes += bytes;
++	} else {
++		rw_tl.textures_refused++;
++	}
++	n = ++rw_tl.events;
++	a = rw_tl.layouts; b = rw_tl.layouts_refused; c = rw_tl.textures; d = rw_tl.textures_refused; by = rw_tl.bytes;
++	pthread_mutex_unlock(&rw_tl_lock);
++	if ((n & (n - 1)) == 0) {
++		m2m_log('I', "RES", "NORD2 GPU TEXLAYOUT: pid=%d name=%s layouts=%lu refused=%lu | textures ok=%lu (bytes %llu) "
++		    "refused=%lu\n", getpid(), getprogname(), a, b, c, by, d);
++	}
++}
++
++/* The layout of a descriptor, or -1 with *why: a 2D, one-slice, one-sample texture of a format rw_texlayout_pure.h serves. */
++static int
++rw_tl_of(MTLTextureDescriptor *descriptor, struct rwtl_layout *l, const char **why)
++{
++	if (descriptor == nil) {
++		*why = "no descriptor";
++		return -1;
++	}
++	if ([descriptor textureType] != 2 /* MTLTextureType2D */ || [descriptor depth] > 1 || [descriptor arrayLength] > 1 ||
++	    [descriptor sampleCount] > 1) {
++		*why = "not a plain 2D texture";
++		return -1;
++	}
++	if ([descriptor width] > RWTL_MAX_SIDE || [descriptor height] > RWTL_MAX_SIDE || [descriptor mipmapLevelCount] > RWTL_MAX_LEVELS) {
++		*why = "larger than this layout goes";
++		return -1;
++	}
++	return rwtl_init(l, (uint32_t)[descriptor pixelFormat], (uint32_t)[descriptor width], (uint32_t)[descriptor height],
++	    (uint32_t)[descriptor mipmapLevelCount], why);
++}
++
++struct rw_tl_watermark { uint64_t a, b; };      /* 16 bytes in x0/x1, as AGXTextureLayout's (-[AGXTextureLayout watermark]) */
++
++/* MTLTextureLayout, the selectors ImageIO and QuartzCore send (AGXTextureLayout's list). */
++@interface RedwoodMetalTextureLayout : NSObject {
++	struct rwtl_layout _l;
++}
++- (instancetype)initWithRedwoodLayout:(const struct rwtl_layout *)layout;
++@end
++
++@implementation RedwoodMetalTextureLayout
++
++- (instancetype)initWithRedwoodLayout:(const struct rwtl_layout *)layout
++{
++	self = [super init];
++	if (self != nil) {
++		_l = *layout;
++	}
++	return self;
++}
++
++- (NSUInteger)size                 { return _l.size; }
++/* what the callers round their allocation up to (ImageIO) or assert is no more than a page (CoreAnimation) */
++- (NSUInteger)alignment            { return 64; }
++- (MTLSize)copyGranularity         { return MTLSizeMake(_l.block_w, _l.block_h, 1); }
++/* 0: the layout the ATX files written while this driver had no layout are already in (rw_texlayout_pure.h) */
++- (struct rw_tl_watermark)watermark { struct rw_tl_watermark w = { 0, 0 }; return w; }
++
++/* AGX's is empty too, and it has to be: ImageIO sends it before EVERY level's copy, so clearing here would wipe the levels
++ * already copied. */
++- (void)initializeTextureMemory:(void *)memory { (void)memory; }
++- (void)finalizeTextureMemory:(void *)memory   { (void)memory; }
++
++- (void)copyFromLinearBytes:(const void *)linear
++	       linearOffset:(NSUInteger)offset
++	  linearBytesPerRow:(NSUInteger)rowBytes
++	linearBytesPerImage:(NSUInteger)imageBytes
++	    toTextureMemory:(void *)memory
++	       textureSlice:(NSUInteger)slice
++	       textureLevel:(NSUInteger)level
++	      textureRegion:(MTLRegion)region
++{
++	const char *why = "a slice or a depth this 2D layout does not have";
++
++	(void)imageBytes;
++	if (slice != 0 || region.origin.z != 0 || region.size.depth > 1 || level >= _l.levels ||
++	    rwtl_copy_in(&_l, memory, (uint32_t)level, region.origin.x, region.origin.y, region.size.width, region.size.height,
++	    linear, offset, rowBytes, &why) != 0) {
++		RW_AGAIN('W', "RES", "texlayout: blocks NOT copied into texture memory (%s): level %lu region %lu,%lu %lux%lu of "
++		    "%ux%u format %u, %lu bytes a row\n", why, (unsigned long)level, (unsigned long)region.origin.x,
++		    (unsigned long)region.origin.y, (unsigned long)region.size.width, (unsigned long)region.size.height, _l.width,
++		    _l.height, _l.format, (unsigned long)rowBytes);
++	}
++}
++
++- (void)copyFromTextureMemory:(const void *)memory
++		 textureSlice:(NSUInteger)slice
++		 textureLevel:(NSUInteger)level
++		textureRegion:(MTLRegion)region
++		toLinearBytes:(void *)linear
++		 linearOffset:(NSUInteger)offset
++	    linearBytesPerRow:(NSUInteger)rowBytes
++	  linearBytesPerImage:(NSUInteger)imageBytes
++{
++	const char *why = "a slice or a depth this 2D layout does not have";
++
++	(void)imageBytes;
++	if (slice != 0 || region.origin.z != 0 || region.size.depth > 1 || level >= _l.levels ||
++	    rwtl_copy_out(&_l, memory, (uint32_t)level, region.origin.x, region.origin.y, region.size.width, region.size.height,
++	    linear, offset, rowBytes, &why) != 0) {
++		RW_AGAIN('W', "RES", "texlayout: blocks NOT copied out of texture memory (%s): level %lu region %lu,%lu %lux%lu of "
++		    "%ux%u format %u, %lu bytes a row\n", why, (unsigned long)level, (unsigned long)region.origin.x,
++		    (unsigned long)region.origin.y, (unsigned long)region.size.width, (unsigned long)region.size.height, _l.width,
++		    _l.height, _l.format, (unsigned long)rowBytes);
++	}
++}
++
++@end
++
++/* Runs a -newTextureWithBytesNoCopy: deallocator when the texture it is tied to goes (CoreAnimation passes none). */
++@interface RedwoodMetalTextureBytes : NSObject {
++	void (^_deallocator)(void *, NSUInteger);
++	void *_bytes;
++	NSUInteger _length;
++}
++- (instancetype)initWithBytes:(void *)bytes length:(NSUInteger)length deallocator:(void (^)(void *, NSUInteger))deallocator;
++@end
++
++@implementation RedwoodMetalTextureBytes
++
++- (instancetype)initWithBytes:(void *)bytes length:(NSUInteger)length deallocator:(void (^)(void *, NSUInteger))deallocator
++{
++	self = [super init];
++	if (self != nil) {
++		_deallocator = [deallocator copy];
++		_bytes = bytes;
++		_length = length;
++	}
++	return self;
++}
++
++- (void)dealloc
++{
++	if (_deallocator != nil) {
++		_deallocator(_bytes, _length);
++		[_deallocator release];
++	}
++	[super dealloc];
++}
++
++@end
++
++static char rw_tl_bytes_key;
++
+ @interface RedwoodMetalTexture : _MTLResource {
+ 	RedwoodMetalDevice *_owner;
+ 	struct rwa_texture *_texture;
+@@ -6146,12 +6353,39 @@
+ - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)descriptor
+ 			isHeapOrBufferBacked:(BOOL)backed
+ {
+-	(void)descriptor;
++	struct rwtl_layout l;
++	const char *why = "";
++
+ 	(void)backed;
+-	RW_ONCE('W', "RES", "a texture layout was asked for and this driver has none to give; "
+-		"CoreAnimation sizes a surface with it before any texture exists, and nil is the "
+-		"answer until a boot says nil is not tolerated\n");
+-	return nil;
++	/*
++	 * y2s98: the boot said it. nil is tolerated by nothing that asks: ImageIO's ASTCTwiddler then writes and reads .atx
++	 * files with no texture memory at all and CoreAnimation's compressed images reach the window server without one, so
++	 * every such picture is transparent (rw_texlayout_pure.h). The layout of an ASTC texture is now answered; any other
++	 * descriptor still gets nil, by name.
++	 */
++	if (!rw_tl_on()) {
++		RW_ONCE('W', "RES", "a texture layout was asked for and this driver has none to give; "
++			"CoreAnimation sizes a surface with it before any texture exists, and nil is the "
++			"answer until a boot says nil is not tolerated\n");
++		return nil;
++	}
++	if (rw_tl_of(descriptor, &l, &why) != 0) {
++		RW_AGAIN('W', "RES", "texlayout: no layout for a %lux%lu texture of format %lu, %lu levels (%s)\n",
++		    (unsigned long)[descriptor width], (unsigned long)[descriptor height], (unsigned long)[descriptor pixelFormat],
++		    (unsigned long)[descriptor mipmapLevelCount], why);
++		rw_tl_count(1, 0);
++		return nil;
++	}
++	{
++		static unsigned said;
++
++		if (__sync_fetch_and_add(&said, 1) < 4) {
++			m2m_log('I', "RES", "texlayout: layout of a %ux%u texture of format %u, %u level%s: %zu bytes, rows of %zu\n",
++			    l.width, l.height, l.format, l.levels, l.levels == 1 ? "" : "s", l.size, l.level[0].row_bytes);
++		}
++	}
++	rw_tl_count(0, 0);
++	return [[RedwoodMetalTextureLayout alloc] initWithRedwoodLayout:&l];
+ }
+ 
+ /*
+@@ -6198,15 +6432,75 @@
+ 		     descriptor:(MTLTextureDescriptor *)descriptor
+ 		    deallocator:(void (^)(void *, NSUInteger))deallocator
+ {
+-	(void)bytes;
+-	(void)length;
+-	(void)descriptor;
+-	(void)deallocator;
+-	RW_ONCE('W', "RES", "a texture over the caller's own memory was asked for, and the "
+-		"contract has no import for a bare pointer -- only for an IOSurface. Copying "
+-		"instead would be worse than nil: the caller writes to its pages and expects the "
+-		"texture to follow\n");
+-	return nil;
++	struct rwtl_layout l;
++	const char *why = "";
++	char said[256] = { 0 };
++
++	/*
++	 * y2s98: served for memory laid out by -newTextureLayoutWithDescriptor: above, i.e. for the block-compressed formats
++	 * of rw_texlayout_pure.h and nothing else -- CoreAnimation's compressed image (update_texture, deallocator nil). The
++	 * levels are copied in once; that picture is immutable, so the objection above (a caller that goes on writing to its
++	 * pages) does not apply to it, and it still decides every other descriptor: nil, by name.
++	 */
++	if (!rw_tl_on() || rw_tl_of(descriptor, &l, &why) != 0) {
++		RW_ONCE('W', "RES", "a texture over the caller's own memory was asked for, and the "
++			"contract has no import for a bare pointer -- only for an IOSurface. Copying "
++			"instead would be worse than nil: the caller writes to its pages and expects the "
++			"texture to follow\n");
++		if (rw_tl_on()) {
++			RW_AGAIN('W', "RES", "texlayout: no texture over memory for a %lux%lu texture of format %lu, %lu levels (%s)\n",
++			    (unsigned long)[descriptor width], (unsigned long)[descriptor height],
++			    (unsigned long)[descriptor pixelFormat], (unsigned long)[descriptor mipmapLevelCount], why);
++			rw_tl_count(3, 0);
++		}
++		return nil;
++	}
++	if (bytes == NULL || length < l.size || mesa.texture_write == NULL) {
++		RW_AGAIN('W', "RES", "texlayout: no texture over memory: %lu bytes at %p for a %ux%u texture of format %u, %u levels, "
++		    "whose layout is %zu bytes%s\n", (unsigned long)length, bytes, l.width, l.height, l.format, l.levels, l.size,
++		    mesa.texture_write == NULL ? " (and the compiler library writes no texels)" : "");
++		rw_tl_count(3, 0);
++		return nil;
++	}
++	RedwoodMetalTexture *made = [self newTextureWithDescriptor:descriptor];   /* says why itself when it refuses */
++
++	if (made == nil) {
++		rw_tl_count(3, 0);
++		return nil;
++	}
++	for (uint32_t level = 0; level < l.levels; level++) {
++		uint32_t w = 0, h = 0;
++		size_t row = 0;
++		const void *from = rwtl_level_bytes(&l, bytes, length, level, &w, &h, &row, &why);
++		const unsigned origin[3] = { 0, 0, 0 };
++		const unsigned size[3] = { w, h, 1 };
++
++		if (from == NULL || mesa.texture_write([made mesaTexture], level, 0, origin, size, from, row, said, sizeof(said)) != 0) {
++			RW_AGAIN('E', "RES", "texlayout: level %u of a %ux%u texture of format %u could not be written from the "
++			    "caller's memory: %s\n", level, l.width, l.height, l.format, from == NULL ? why : said);
++			[made release];
++			rw_tl_count(3, 0);
++			return nil;
++		}
++	}
++	if (deallocator != nil) {
++		RedwoodMetalTextureBytes *holder = [[RedwoodMetalTextureBytes alloc] initWithBytes:bytes length:length
++										       deallocator:deallocator];
++
++		objc_setAssociatedObject(made, &rw_tl_bytes_key, holder, OBJC_ASSOCIATION_RETAIN);
++		[holder release];
++	}
++	{
++		static unsigned told;
++
++		if (__sync_fetch_and_add(&told, 1) < 8) {
++			m2m_log('I', "RES", "texlayout: texture over the caller's memory made by copy: %ux%u format %u, %u level%s, %zu "
++			    "of %lu bytes%s\n", l.width, l.height, l.format, l.levels, l.levels == 1 ? "" : "s", l.size,
++			    (unsigned long)length, deallocator != nil ? ", deallocator kept for its end" : "");
++		}
++	}
++	rw_tl_count(2, l.size);
++	return made;
+ }
+ 
+ - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+diff -ruN y2s96-final/src/rw-texlayout-host-test.sh y2s98-texlayout/src/rw-texlayout-host-test.sh
+--- y2s96-final/src/rw-texlayout-host-test.sh	1970-01-01 01:00:00.000000000 +0100
++++ y2s98-texlayout/src/rw-texlayout-host-test.sh	2026-11-13 23:15:05.239944602 +0100
+@@ -0,0 +1,129 @@
++#!/bin/bash
++# y2s98: rw_texlayout_pure.h on the build machine.  Nothing is installed, the phone is not touched, the mirror is only read.
++#   bash rw-texlayout-host-test.sh                 the pure test (ASan/UBSan, -Werror): prints 'rw_texlayout: ok ...'
++#   bash rw-texlayout-host-test.sh atx [SHEET.png] + every PosterBoard .atx of the mirror (gpu/build/mirror/rootfs-mirror.img, read with
++#                                                  autocycle/hfsx.py; no write, no journal replay on the image) through
++#                                                  rw_texlayout_atx_check (container as the fix expects it, layout size = chunk, decoded with
++#                                                  Mesa's software ASTC decoder): prints 'rw_texlayout_atx: ok N files ...'; SHEET.png = a
++#                                                  contact sheet of what the blocks decode to (needs Pillow).
++# Scratch: $T if set (must exist), else mktemp -d under $TMPDIR; removed at the end unless $T was given.
++set -euo pipefail
++D=$(cd "$(dirname "$0")" && pwd)
++W=$NORD2_WORK
++B=$W/gpu/build; M=$B/y2s-stage0/mesa-25.0.7
++if [ -n "${T:-}" ]; then S=$T; else S=$(mktemp -d); trap 'rm -rf "$S"' EXIT; fi
++cc -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -o "$S/t" "$D/rw_texlayout_host_test.c"
++"$S/t"
++[ "${1:-}" = atx ] || exit 0
++
++# Mesa's decoder (src/mesa/main/texcompress_astc.cpp, unchanged) with the three headers it includes replaced by the little it uses
++mkdir -p "$S/astc/util" "$S/files"
++cp "$M/src/mesa/main/texcompress_astc.cpp" "$S/astc/"
++cat > "$S/astc/texcompress_astc.h" <<'H'
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++typedef int mesa_format;                 /* here: (block width << 8) | block height, linear (not sRGB) */
++#ifdef __cplusplus
++extern "C" {
++#endif
++void _mesa_unpack_astc_2d_ldr(uint8_t *dst_row, unsigned dst_stride, const uint8_t *src_row, unsigned src_stride,
++    unsigned src_width, unsigned src_height, mesa_format format);
++#ifdef __cplusplus
++}
++#endif
++static inline bool _mesa_is_format_astc_2d(mesa_format f) { return f > 0; }
++static inline bool _mesa_is_format_srgb(mesa_format f) { (void)f; return false; }
++static inline void _mesa_get_format_block_size(mesa_format f, unsigned *bw, unsigned *bh) { *bw = (f >> 8) & 0xff; *bh = f & 0xff; }
++H
++cat > "$S/astc/macros.h" <<'H'
++#define MIN2(a, b) ((a) < (b) ? (a) : (b))
++#define MAX2(a, b) ((a) > (b) ? (a) : (b))
++#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
++#define unreachable(s) __builtin_unreachable()
++H
++cat > "$S/astc/util/half_float.h" <<'H'
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdarg.h>
++#define FP16_ONE  0x3C00
++#define FP16_ZERO 0
++static inline uint16_t _mesa_uint16_div_64k_to_half(uint16_t v) { (void)v; abort(); }   /* the HDR output path: not taken (unorm8) */
++H
++c++ -std=c++17 -O2 -w -I"$S/astc" -c "$S/astc/texcompress_astc.cpp" -o "$S/astc.o"
++cc -std=c11 -O1 -g -Wall -Wextra -Werror -I"$D" -c "$D/rw_texlayout_atx_check.c" -o "$S/check.o"
++c++ -o "$S/atx_check" "$S/check.o" "$S/astc.o"
++
++# every .atx under PosterBoard's data store in the mirror
++python3 -I - "$B" "$S/files" <<'PY'
++import os, struct, sys
++B, out = sys.argv[1:]
++sys.path.insert(0, B + '/autocycle')
++import hfsx
++img = hfsx.Img(B + '/mirror/rootfs-mirror.img'); img.replay(); fs = hfsx.HFS(img)
++ent = {}
++i = fs.cat.first
++while i:
++    flink, kind, _, recs = fs.cat.node(i)
++    for r in recs:
++        p, nm, d = fs.cat.catkey(r)
++        rt = struct.unpack('>h', d[:2])[0]
++        if rt in (1, 2): ent[struct.unpack('>I', d[8:12])[0]] = (p, nm, rt)
++    fs.cat.cache.clear(); i = flink
++def path(cn):
++    o = []
++    while cn in ent and cn != 2:
++        p, nm, _ = ent[cn]; o.append(nm); cn = p
++    return '/' + '/'.join(reversed(o))
++n = 0
++for cn, (p, nm, rt) in sorted(ent.items()):
++    if rt == 2 and nm.endswith('.atx') and not nm.startswith('.'):
++        pa = path(cn)
++        if '/PRBPosterExtensionDataStore/' not in pa: continue
++        c, rec = fs.lookup(pa)
++        data = fs.read_fork(fs.fork(rec[88:168]), c)
++        parts = pa.split('/')
++        ext = parts[parts.index('Extensions') + 1].split('.')[-1]
++        open('%s/%03d-%s-%s' % (out, n, ext, nm.split('-PROPERTIES')[0][:40]), 'wb').write(data); n += 1
++print('mirror: %d .atx files of PosterBoard' % n)
++PY
++ok=0; bad=0; : > "$S/atx.log"
++for f in "$S"/files/*; do
++  if "$S/atx_check" "$f" "$f.rgba" >> "$S/atx.log"; then ok=$((ok+1)); else bad=$((bad+1)); fi
++done
++sed "s|$S/files/||" "$S/atx.log" > "$S/atx.txt"
++awk -v n="${ATX_LINES:-12}" 'NR <= n {print "  " substr($0, 1, 250)}' "$S/atx.txt"
++[ "$bad" = 0 ] || { echo "rw_texlayout_atx: FAILED ($bad of $((ok+bad)) files are not what the fix expects; $S/atx.txt)"; exit 1; }
++python3 -I - "$S/atx.txt" <<'PY'
++import re, sys
++rows = [l for l in open(sys.argv[1]) if l.startswith('ATX-OK')]
++clear = [float(re.search(r'clear ([0-9.]+)%', l).group(1)) for l in rows]
++opaque = [float(re.search(r'opaque ([0-9.]+)%', l).group(1)) for l in rows]
++err = [float(re.search(r'error-colour ([0-9.]+)%', l).group(1)) for l in rows]
++sizes = sorted(set(re.search(r' (\d+x\d+) gl', l).group(1) for l in rows))
++full = sum(1 for o in opaque if o == 100.0)
++assert max(err) == 0.0, 'the decoder met an invalid block'
++print('rw_texlayout_atx: ok %d files (sizes %s): all pre-twiddled, watermark 0, chunk = layout size; decoded: %d fully opaque, '
++      'max clear %.1f%%, no invalid block' % (len(rows), ' '.join(sizes), full, max(clear)))
++PY
++if [ -n "${2:-}" ]; then
++python3 -I - "$S/files" "$S/atx.txt" "$2" <<'PY'
++import os, re, sys
++from PIL import Image
++files, log, out = sys.argv[1:]
++tiles = []
++sizes = sorted(set((int(m.group(1)), int(m.group(2))) for m in (re.match(r'ATX-OK (\d+)x(\d+) ', l) for l in open(log)) if m))
++for n in sorted(n for n in os.listdir(files) if n.endswith('.rgba')):
++    raw = open(os.path.join(files, n), 'rb').read()
++    for (w, h) in sizes:
++        if len(raw) == w * h * 4:
++            im = Image.frombytes('RGBA', (w, h), raw)
++            bg = Image.new('RGBA', (w, h), (255, 0, 255, 255)); bg.alpha_composite(im)      # transparency would show magenta
++            bg.thumbnail((151, 328)); tiles.append(bg.convert('RGB')); break
++cols = 12; rows = (len(tiles) + cols - 1) // cols
++sheet = Image.new('RGB', (cols * 155, rows * 332), (40, 40, 40))
++for i, t in enumerate(tiles): sheet.paste(t, ((i % cols) * 155 + 2, (i // cols) * 332 + 2))
++sheet.save(out); print('contact sheet: %s (%d pictures, transparency would be magenta)' % (out, len(tiles)))
++PY
++fi
+diff -ruN y2s96-final/src/rw_texlayout_atx_check.c y2s98-texlayout/src/rw_texlayout_atx_check.c
+--- y2s96-final/src/rw_texlayout_atx_check.c	1970-01-01 01:00:00.000000000 +0100
++++ y2s98-texlayout/src/rw_texlayout_atx_check.c	2026-11-13 23:12:56.909666288 +0100
+@@ -0,0 +1,146 @@
++/*
++ * y2s98: the .atx files of the phone (PosterBoard's snapshots, read from the mirror) through rw_texlayout_pure.h, on the build
++ * machine.  For every file given:
++ *   - the container as ImageIO wrote it (ATXWritePlugin::updateHeader / writeASTCData, 20H392): 'AAPL' magic, HEAD chunk
++ *     (GL format 0x93B0 = ASTC 4x4 RGBA, size, pre-twiddled flag, LZFSE flag, 16-byte watermark), FILL, then the data chunk:
++ *     'astc' = "pre-twiddled" (what the reader hands CoreAnimation as tiled texture memory, in place), 'ASTC' = linear;
++ *   - what the fix relies on: pre-twiddled = 1, watermark = 0 (= this layout's), chunk length = the layout's size;
++ *   - the window server's side: rwtl_level_bytes of that memory, decoded with Mesa's software ASTC decoder
++ *     (_mesa_unpack_astc_2d_ldr, the reference for "what a GPU shows for these blocks") -> alpha and colour statistics;
++ *     with a third argument, the RGBA picture is written there (width*height*4 bytes) for a contact sheet.
++ * Prints one line a file; exit 1 if any file is not what the fix expects.
++ *   rw_texlayout_atx_check FILE [RAW_OUT]
++ */
++#include "rw_texlayout_pure.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++
++typedef int mesa_format;
++void _mesa_unpack_astc_2d_ldr(uint8_t *dst_row, unsigned dst_stride, const uint8_t *src_row, unsigned src_stride,
++    unsigned src_width, unsigned src_height, mesa_format format);
++
++static uint32_t
++le32(const uint8_t *p)
++{
++	return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++int
++main(int argc, char **argv)
++{
++	if (argc < 2) {
++		return 2;
++	}
++	FILE *f = fopen(argv[1], "rb");
++
++	if (f == NULL) {
++		perror(argv[1]);
++		return 2;
++	}
++	fseek(f, 0, SEEK_END);
++	long n = ftell(f);
++
++	fseek(f, 0, SEEK_SET);
++	uint8_t *d = malloc((size_t)n + 16);
++
++	if (d == NULL || fread(d, 1, (size_t)n, f) != (size_t)n) {
++		return 2;
++	}
++	fclose(f);
++	if (n < 0x70 || memcmp(d, "AAPL\r\n\x1a\n", 8) != 0 || memcmp(d + 12, "HEAD", 4) != 0 || le32(d + 8) < 0x54) {
++		printf("NOT-ATX %s\n", argv[1]);
++		return 1;
++	}
++	const uint8_t *hd = d + 16;
++	uint32_t gl = le32(hd + 0x10), width = le32(hd + 0x18), height = le32(hd + 0x1c);
++	uint32_t pretwiddled = le32(hd + 0x30), lzfse = le32(hd + 0x34);
++	int wm_zero = 1;
++
++	for (int i = 0; i < 16; i++) {
++		wm_zero &= hd[0x3c + i] == 0;
++	}
++	/* the chunks after HEAD: [length][tag][length bytes] */
++	size_t at = 16 + le32(d + 8);
++	const uint8_t *data = NULL;
++	uint32_t data_size = 0;
++	char tag[5] = "none";
++
++	while (at + 8 <= (size_t)n) {
++		uint32_t len = le32(d + at);
++
++		if (memcmp(d + at + 4, "astc", 4) == 0 || memcmp(d + at + 4, "ASTC", 4) == 0) {
++			memcpy(tag, d + at + 4, 4);
++			data_size = le32(d + at + 8);
++			data = d + at + 12;
++			if (len != data_size + 4 || at + 12 + data_size > (size_t)n) {
++				printf("BAD-CHUNK %s\n", argv[1]);
++				return 1;
++			}
++			break;
++		}
++		if (memcmp(d + at + 4, "END ", 4) == 0) {
++			break;
++		}
++		at += 8 + len;
++	}
++	struct rwtl_layout l;
++	const char *why = "";
++	uint32_t metal = gl == 0x93b0 ? 204 : gl == 0x93b7 ? 212 : 0;       /* ASTCTextureImp::MetalFormatForGLFormat: 4x4, 8x8 */
++	int ok = data != NULL && rwtl_init(&l, metal, width, height, 1, &why) == 0;
++	int expected = ok && pretwiddled == 1 && lzfse == 0 && wm_zero && memcmp(tag, "astc", 4) == 0 && data_size == l.size &&
++	    (size_t)(data - d) % 16384 == 0;
++
++	if (!ok) {
++		printf("UNSERVED %s gl %#x %ux%u (%s)\n", argv[1], gl, width, height, why);
++		return 1;
++	}
++	uint32_t w = 0, h = 0;
++	size_t row = 0;
++	size_t length = (l.size + 16383) / 16384 * 16384;                  /* CoreAnimation rounds the length up to a page */
++	const uint8_t *level0 = rwtl_level_bytes(&l, data, length, 0, &w, &h, &row, &why);
++
++	if (level0 == NULL) {
++		printf("NO-LEVEL %s (%s)\n", argv[1], why);
++		return 1;
++	}
++	uint8_t *rgba = calloc((size_t)w * h, 4);
++
++	if (rgba == NULL) {
++		return 2;
++	}
++	_mesa_unpack_astc_2d_ldr(rgba, w * 4, level0, (unsigned)row, w, h, (mesa_format)((l.block_w << 8) | l.block_h));
++	unsigned long long sum[4] = { 0, 0, 0, 0 }, clear = 0, opaque = 0, magenta = 0;
++	uint8_t amin = 255;
++
++	for (size_t i = 0; i < (size_t)w * h; i++) {
++		const uint8_t *p = rgba + i * 4;
++
++		for (int c = 0; c < 4; c++) {
++			sum[c] += p[c];
++		}
++		clear += p[3] == 0;
++		opaque += p[3] == 255;
++		magenta += p[0] == 255 && p[1] == 0 && p[2] == 255;        /* the decoder's error colour */
++		if (p[3] < amin) {
++			amin = p[3];
++		}
++	}
++	size_t px = (size_t)w * h;
++
++	printf("%s %ux%u gl %#x tag %s pretwiddled %u lzfse %u watermark %s data %u at %#zx layout %zu | decoded: alpha min %u, "
++	    "opaque %.1f%%, clear %.1f%%, error-colour %.2f%%, mean rgba %llu %llu %llu %llu\n", expected ? "ATX-OK" : "ATX-UNEXPECTED",
++	    width, height, gl, tag, pretwiddled, lzfse, wm_zero ? "0" : "NONZERO", data_size, (size_t)(data - d), l.size, amin,
++	    100.0 * opaque / px, 100.0 * clear / px, 100.0 * magenta / px, sum[0] / px, sum[1] / px, sum[2] / px, sum[3] / px);
++	if (argc > 2) {
++		FILE *o = fopen(argv[2], "wb");
++
++		if (o == NULL || fwrite(rgba, 4, px, o) != px) {
++			return 2;
++		}
++		fclose(o);
++	}
++	free(rgba);
++	free(d);
++	return expected ? 0 : 1;
++}
+diff -ruN y2s96-final/src/rw_texlayout_host_test.c y2s98-texlayout/src/rw_texlayout_host_test.c
+--- y2s96-final/src/rw_texlayout_host_test.c	1970-01-01 01:00:00.000000000 +0100
++++ y2s98-texlayout/src/rw_texlayout_host_test.c	2026-11-13 23:12:27.549261744 +0100
+@@ -0,0 +1,483 @@
++/*
++ * y2s98: rw_texlayout_pure.h on the build machine (rw-texlayout-host-test.sh: ASan/UBSan, -Werror).
++ *
++ * 1  the format table and the layouts of the sizes the phone's .atx files have (their 'astc' chunk lengths)
++ * 2  refusals leave memory untouched
++ * 3  fuzz: random layouts, whole levels and block-aligned regions in and out, caller strides, canaries
++ * 4  the call sequences read from the 20H392 cache, with this layout in the place of AGX's:
++ *    W  ImageIO ATX writer (ASTCTwiddler ctor allocate=1, copyFromLinearData level 0, finalize, twiddledData/Size)
++ *       -> the bytes written are the encoder's linear bytes = what the nil-layout writer stored (its fallback)
++ *    R  ImageIO reader of a pre-twiddled file (data used in place) -> CoreAnimation by reference -> window server
++ *       -newTextureWithBytesNoCopy:(data, round_page(size)) -> per level -replaceRegion: arguments, checked against
++ *       rwa_texture_write's rules (air_metal.c) and uploaded into a model texture
++ *    C  CoreAnimation's own conversion (new_image_with_texture_data, layout path): initialize, a copy per level with the
++ *       file's level offsets and row lengths, finalize -> window server as in R
++ *    S  ImageIO's software decoder way back (copyFromTextureData: whole level out)
++ *    N  what the nil answers did (the bug): no layout -> size 0; the server's nil texture
++ */
++#include "rw_texlayout_pure.h"
++
++#include <assert.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++static uint64_t rng = 0x9e3779b97f4a7c15ull;
++static uint32_t
++rnd(uint32_t n)
++{
++	rng ^= rng << 13;
++	rng ^= rng >> 7;
++	rng ^= rng << 17;
++	return n ? (uint32_t)((rng >> 16) % n) : 0;
++}
++
++#define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); exit(1); } } while (0)
++
++static const uint32_t formats[] = { 186, 187, 188, 189, 190, 192, 193, 194, 195, 196, 197, 198, 199, 200,
++				    204, 205, 206, 207, 208, 210, 211, 212, 213, 214, 215, 216, 217, 218 };
++static const uint8_t feet[14][2] = { { 4, 4 }, { 5, 4 }, { 5, 5 }, { 6, 5 }, { 6, 6 }, { 8, 5 }, { 8, 6 }, { 8, 8 }, { 10, 5 },
++				     { 10, 6 }, { 10, 8 }, { 10, 10 }, { 12, 10 }, { 12, 12 } };
++
++/* The model of the compiler library's texture: rwa_texture_write's checks (air_metal.c: caller_stride, the block rule) and
++ * texture_subdata's copy, a level at a time. */
++struct model {
++	uint32_t bw, bh, width, height, levels;
++	uint8_t *level[RWTL_MAX_LEVELS];
++	uint32_t cols[RWTL_MAX_LEVELS], rows[RWTL_MAX_LEVELS];
++	int written[RWTL_MAX_LEVELS];
++};
++
++static void
++model_make(struct model *m, uint32_t format, uint32_t width, uint32_t height, uint32_t levels)
++{
++	memset(m, 0, sizeof(*m));
++	CHECK(rwtl_block_of(format, &m->bw, &m->bh));
++	m->width = width;
++	m->height = height;
++	m->levels = levels;
++	for (uint32_t i = 0; i < levels; i++) {
++		uint32_t w = rwtl_minify(width, i), h = rwtl_minify(height, i);
++
++		m->cols[i] = (w + m->bw - 1) / m->bw;
++		m->rows[i] = (h + m->bh - 1) / m->bh;
++		m->level[i] = calloc((size_t)m->cols[i] * m->rows[i], 16);
++		CHECK(m->level[i] != NULL);
++	}
++}
++
++static void
++model_free(struct model *m)
++{
++	for (uint32_t i = 0; i < m->levels; i++) {
++		free(m->level[i]);
++	}
++}
++
++/* rwa_texture_write(texture, level, 0, origin, size, bytes, stride): 0 or -1 */
++static int
++model_write(struct model *m, uint32_t level, const unsigned origin[3], const unsigned size[3], const void *bytes, size_t stride)
++{
++	if (bytes == NULL || level >= m->levels) {
++		return -1;
++	}
++	uint32_t lw = rwtl_minify(m->width, level), lh = rwtl_minify(m->height, level);
++
++	if (origin[2] != 0 || size[2] != 1 || size[0] == 0 || size[1] == 0 || origin[0] + size[0] > lw || origin[1] + size[1] > lh) {
++		return -1;
++	}
++	size_t least = (size_t)((size[0] + m->bw - 1) / m->bw) * 16;       /* util_format_get_stride */
++	size_t row = stride == 0 ? least : stride;
++
++	if (row < least) {
++		return -1;
++	}
++	if (origin[0] % m->bw || origin[1] % m->bh || (size[0] % m->bw && origin[0] + size[0] != lw) ||
++	    (size[1] % m->bh && origin[1] + size[1] != lh)) {
++		return -1;
++	}
++	uint32_t c0 = origin[0] / m->bw, r0 = origin[1] / m->bh, nc = (size[0] + m->bw - 1) / m->bw, nr = (size[1] + m->bh - 1) / m->bh;
++
++	for (uint32_t r = 0; r < nr; r++) {
++		memcpy(m->level[level] + ((size_t)(r0 + r) * m->cols[level] + c0) * 16, (const uint8_t *)bytes + (size_t)r * row,
++		    (size_t)nc * 16);
++	}
++	if (c0 == 0 && r0 == 0 && nc == m->cols[level] && nr == m->rows[level]) {
++		m->written[level] = 1;
++	}
++	return 0;
++}
++
++/* -newTextureWithBytesNoCopy:length:descriptor:deallocator: as redwoodmetal.m does it: 0 = texture made, -1 = nil */
++static int
++server_texture(struct model *m, uint32_t format, uint32_t width, uint32_t height, uint32_t levels, const void *bytes, size_t length)
++{
++	struct rwtl_layout l;
++	const char *why = "";
++
++	if (rwtl_init(&l, format, width, height, levels, &why) != 0 || bytes == NULL || length < l.size) {
++		return -1;
++	}
++	model_make(m, format, width, height, levels);
++	for (uint32_t level = 0; level < l.levels; level++) {
++		uint32_t w = 0, h = 0;
++		size_t row = 0;
++		const void *from = rwtl_level_bytes(&l, bytes, length, level, &w, &h, &row, &why);
++		const unsigned origin[3] = { 0, 0, 0 };
++		const unsigned size[3] = { w, h, 1 };
++
++		if (from == NULL || model_write(m, level, origin, size, from, row) != 0) {
++			model_free(m);
++			return -1;
++		}
++	}
++	for (uint32_t level = 0; level < levels; level++) {
++		CHECK(m->written[level]);
++	}
++	return 0;
++}
++
++static size_t
++round_up(size_t v, size_t to)
++{
++	return (v + to - 1) / to * to;
++}
++
++static void
++fill(uint8_t *p, size_t n)
++{
++	for (size_t i = 0; i < n; i++) {
++		p[i] = (uint8_t)rnd(256);
++	}
++}
++
++static void
++test_table(void)
++{
++	uint32_t bw, bh, n = 0;
++
++	for (uint32_t f = 0; f < 600; f++) {
++		int known = 0;
++
++		for (unsigned i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
++			if (formats[i] == f) {
++				known = 1;
++				CHECK(rwtl_block_of(f, &bw, &bh) && bw == feet[i % 14][0] && bh == feet[i % 14][1]);
++				n++;
++			}
++		}
++		if (!known) {
++			CHECK(!rwtl_block_of(f, &bw, &bh));
++		}
++	}
++	CHECK(n == 28);
++
++	struct rwtl_layout l;
++	const char *why = NULL;
++
++	/* the three sizes PosterBoard stores (mirror of 13 November): gallery 302x656, hero 192x192, full screen 1125x2436 */
++	CHECK(rwtl_init(&l, 204, 302, 656, 1, &why) == 0 && l.size == 199424 && l.level[0].cols == 76 && l.level[0].rows == 164 &&
++	    l.level[0].row_bytes == 1216 && l.level[0].offset == 0);
++	CHECK(rwtl_init(&l, 204, 192, 192, 1, &why) == 0 && l.size == 36864);
++	CHECK(rwtl_init(&l, 186, 1125, 2436, 1, &why) == 0 && l.size == 2747808 && l.level[0].cols == 282 && l.level[0].rows == 609);
++	/* a chain: 10x6 blocks, 37x13 -> 18x6 -> 9x3 -> 4x1 -> 2x1 -> 1x1 */
++	CHECK(rwtl_init(&l, 214, 37, 13, 6, &why) == 0);
++	CHECK(l.level[0].cols == 4 && l.level[0].rows == 3 && l.level[1].cols == 2 && l.level[1].rows == 1 && l.level[5].cols == 1);
++	CHECK(l.level[1].offset == 4 * 3 * 16 && l.level[2].offset == l.level[1].offset + 2 * 16 && l.size == (12 + 2 + 1 + 1 + 1 + 1) * 16);
++	CHECK(rwtl_init(&l, 214, 37, 13, 7, &why) == -1);                  /* 37x13 has 6 levels */
++	CHECK(rwtl_init(&l, 204, 0, 4, 1, &why) == -1 && rwtl_init(&l, 204, 4, 0, 1, &why) == -1);
++	CHECK(rwtl_init(&l, 204, 16385, 4, 1, &why) == -1 && rwtl_init(&l, 204, 4, 4, 0, &why) == -1);
++	CHECK(rwtl_init(&l, 80, 64, 64, 1, &why) == -1 && rwtl_init(&l, 115, 64, 64, 1, &why) == -1);     /* BGRA8, RGBA16Float */
++	CHECK(rwtl_init(&l, 160, 64, 64, 1, &why) == -1 && rwtl_init(&l, 222, 64, 64, 1, &why) == -1);    /* PVRTC, ASTC HDR */
++	CHECK(rwtl_init(&l, 204, 16384, 16384, 15, &why) == 0 && rwtl_full_chain(16384, 16384) == 15 && rwtl_full_chain(1, 1) == 1);
++}
++
++static void
++test_refusals(void)
++{
++	struct rwtl_layout l;
++	const char *why = NULL;
++	uint8_t mem[4 * 4 * 16 + 2 * 2 * 16], before[sizeof(mem)], lin[1024], lin0[1024];
++
++	CHECK(rwtl_init(&l, 204, 16, 16, 2, &why) == 0 && l.size == sizeof(mem));
++	fill(mem, sizeof(mem));
++	memcpy(before, mem, sizeof(mem));
++	fill(lin, sizeof(lin));
++	memcpy(lin0, lin, sizeof(lin));
++#define REFUSED_IN(level, x, y, w, h, row) \
++	CHECK(rwtl_copy_in(&l, mem, level, x, y, w, h, lin, 0, row, &why) == -1 && memcmp(mem, before, sizeof(mem)) == 0)
++#define REFUSED_OUT(level, x, y, w, h, row) \
++	CHECK(rwtl_copy_out(&l, mem, level, x, y, w, h, lin, 0, row, &why) == -1 && memcmp(lin, lin0, sizeof(lin)) == 0)
++	REFUSED_IN(2, 0, 0, 4, 4, 0);          /* no such level */
++	REFUSED_IN(0, 1, 0, 4, 4, 0);          /* not on a block */
++	REFUSED_IN(0, 0, 2, 4, 4, 0);
++	REFUSED_IN(0, 0, 0, 6, 4, 0);          /* ends inside a block, not at the edge */
++	REFUSED_IN(0, 0, 0, 4, 7, 0);
++	REFUSED_IN(0, 0, 0, 20, 4, 0);         /* leaves the level */
++	REFUSED_IN(0, 16, 0, 4, 4, 0);
++	REFUSED_IN(0, 0, 0, 0, 4, 0);          /* empty */
++	REFUSED_IN(0, 0, 0, 16, 16, 63);       /* 4 blocks a row need 64 bytes */
++	REFUSED_IN(1, 0, 0, 16, 16, 0);        /* level 1 is 8x8 */
++	REFUSED_IN(0, (uint64_t)1 << 40, 0, 4, 4, 0);
++	REFUSED_IN(0, 0, 0, (uint64_t)1 << 40, 4, 0);
++	REFUSED_OUT(2, 0, 0, 4, 4, 0);
++	REFUSED_OUT(0, 3, 0, 4, 4, 0);
++	REFUSED_OUT(0, 0, 0, 16, 16, 48);
++	CHECK(rwtl_copy_in(&l, NULL, 0, 0, 0, 16, 16, lin, 0, 0, &why) == -1);
++	CHECK(rwtl_copy_in(&l, mem, 0, 0, 0, 16, 16, NULL, 0, 0, &why) == -1);
++
++	uint32_t w, h;
++	size_t row;
++
++	CHECK(rwtl_level_bytes(&l, mem, sizeof(mem) - 1, 0, &w, &h, &row, &why) == NULL);
++	CHECK(rwtl_level_bytes(&l, NULL, sizeof(mem), 0, &w, &h, &row, &why) == NULL);
++	CHECK(rwtl_level_bytes(&l, mem, sizeof(mem), 2, &w, &h, &row, &why) == NULL);
++	CHECK(rwtl_level_bytes(&l, mem, sizeof(mem), 1, &w, &h, &row, &why) == mem + 256 && w == 8 && h == 8 && row == 32);
++}
++
++/* A linear picture of a layout: per level its tight rows of blocks, as an encoder gives them. */
++struct picture {
++	uint8_t *level[RWTL_MAX_LEVELS];
++};
++
++static void
++picture_make(struct picture *p, const struct rwtl_layout *l)
++{
++	for (uint32_t i = 0; i < l->levels; i++) {
++		p->level[i] = malloc(l->level[i].size);
++		CHECK(p->level[i] != NULL);
++		fill(p->level[i], l->level[i].size);
++	}
++}
++
++static void
++picture_free(struct picture *p, const struct rwtl_layout *l)
++{
++	for (uint32_t i = 0; i < l->levels; i++) {
++		free(p->level[i]);
++	}
++}
++
++static void
++random_layout(struct rwtl_layout *l)
++{
++	const char *why = NULL;
++	uint32_t f = formats[rnd(28)], w = 1 + rnd(rnd(4) == 0 ? 700 : 90), h = 1 + rnd(rnd(4) == 0 ? 700 : 90);
++	uint32_t chain = rwtl_full_chain(w, h), levels = rnd(3) == 0 ? chain : 1 + rnd(chain);
++
++	CHECK(rwtl_init(l, f, w, h, levels, &why) == 0);
++	size_t at = 0;
++
++	for (uint32_t i = 0; i < l->levels; i++) {         /* the invariants of the layout: packed, in order, no overlap */
++		CHECK(l->level[i].offset == at && l->level[i].size == (size_t)l->level[i].cols * l->level[i].rows * 16);
++		CHECK(l->level[i].cols == (l->level[i].width + l->block_w - 1) / l->block_w);
++		at += l->level[i].size;
++	}
++	CHECK(at == l->size);
++}
++
++static unsigned long fuzz_copies;
++
++static void
++test_fuzz(unsigned rounds)
++{
++	for (unsigned n = 0; n < rounds; n++) {
++		struct rwtl_layout l;
++		struct picture p;
++		const char *why = NULL;
++
++		random_layout(&l);
++		picture_make(&p, &l);
++		/* texture memory with canaries on both sides (and ASan around the allocation) */
++		uint8_t *block = malloc(l.size + 64), *mem = block + 32;
++
++		CHECK(block != NULL);
++		memset(block, 0xa5, l.size + 64);
++		/* whole levels in, with a caller stride of the exact row, 0 (tight) or longer */
++		for (uint32_t i = 0; i < l.levels; i++) {
++			const struct rwtl_level *v = &l.level[i];
++			size_t pad = rnd(3) == 0 ? 16 * rnd(5) + rnd(7) : 0, row = v->row_bytes + pad, off = rnd(2) ? rnd(40) : 0;
++			uint8_t *lin = malloc(off + row * v->rows);
++
++			CHECK(lin != NULL);
++			memset(lin, 0x5a, off + row * v->rows);
++			for (uint32_t r = 0; r < v->rows; r++) {
++				memcpy(lin + off + r * row, p.level[i] + r * v->row_bytes, v->row_bytes);
++			}
++			CHECK(rwtl_copy_in(&l, mem, i, 0, 0, v->width, v->height, lin, off, pad == 0 && rnd(2) ? 0 : row, &why) == 0);
++			free(lin);
++			fuzz_copies++;
++		}
++		for (unsigned i = 0; i < 32; i++) {
++			CHECK(block[i] == 0xa5 && block[32 + l.size + i] == 0xa5);
++		}
++		for (uint32_t i = 0; i < l.levels; i++) {          /* the memory IS the packed linear picture */
++			CHECK(memcmp(mem + l.level[i].offset, p.level[i], l.level[i].size) == 0);
++		}
++		/* a block-aligned region replaced, read back, and everything outside it untouched */
++		for (unsigned k = 0; k < 6; k++) {
++			uint32_t i = rnd(l.levels);
++			const struct rwtl_level *v = &l.level[i];
++			uint32_t c0 = rnd(v->cols), r0 = rnd(v->rows), nc = 1 + rnd(v->cols - c0), nr = 1 + rnd(v->rows - r0);
++			uint64_t x = (uint64_t)c0 * l.block_w, y = (uint64_t)r0 * l.block_h;
++			uint64_t w = c0 + nc == v->cols ? v->width - x : (uint64_t)nc * l.block_w;
++			uint64_t h = r0 + nr == v->rows ? v->height - y : (uint64_t)nr * l.block_h;
++			size_t row = (size_t)nc * 16 + (rnd(2) ? 16 * rnd(3) : 0);
++			uint8_t *lin = malloc(row * nr), *back = malloc(row * nr), *copy = malloc(l.size);
++
++			CHECK(lin != NULL && back != NULL && copy != NULL);
++			fill(lin, row * nr);
++			memset(back, 0x11, row * nr);
++			memcpy(copy, mem, l.size);
++			CHECK(rwtl_copy_in(&l, mem, i, x, y, w, h, lin, 0, row, &why) == 0);
++			for (uint32_t r = 0; r < nr; r++) {         /* the expected memory, built independently */
++				memcpy(copy + v->offset + ((size_t)(r0 + r) * v->cols + c0) * 16, lin + r * row, (size_t)nc * 16);
++				memcpy(p.level[i] + ((size_t)(r0 + r) * v->cols + c0) * 16, lin + r * row, (size_t)nc * 16);
++			}
++			CHECK(memcmp(copy, mem, l.size) == 0);
++			CHECK(rwtl_copy_out(&l, mem, i, x, y, w, h, back, 0, row, &why) == 0);
++			for (uint32_t r = 0; r < nr; r++) {
++				CHECK(memcmp(back + r * row, lin + r * row, (size_t)nc * 16) == 0);
++				for (size_t b = (size_t)nc * 16; b < row; b++) {
++					CHECK(back[r * row + b] == 0x11);         /* the caller's padding is not written */
++				}
++			}
++			free(lin);
++			free(back);
++			free(copy);
++			fuzz_copies += 2;
++		}
++		for (unsigned i = 0; i < 32; i++) {
++			CHECK(block[i] == 0xa5 && block[32 + l.size + i] == 0xa5);
++		}
++		/* R: the window server's texture over this memory, page-rounded length as CoreAnimation gives it */
++		struct model m;
++
++		CHECK(server_texture(&m, l.format, l.width, l.height, l.levels, mem, l.size) == 0);
++		for (uint32_t i = 0; i < l.levels; i++) {
++			CHECK(memcmp(m.level[i], p.level[i], l.level[i].size) == 0);
++		}
++		model_free(&m);
++		if (l.size > 0) {
++			CHECK(server_texture(&m, l.format, l.width, l.height, l.levels, mem, l.size - 1) == -1);
++		}
++		/* S: every level out whole, as the software decoder asks */
++		for (uint32_t i = 0; i < l.levels; i++) {
++			uint8_t *out = malloc(l.level[i].size);
++
++			CHECK(out != NULL);
++			CHECK(rwtl_copy_out(&l, mem, i, 0, 0, l.level[i].width, l.level[i].height, out, 0, l.level[i].row_bytes, &why) == 0);
++			CHECK(memcmp(out, p.level[i], l.level[i].size) == 0);
++			free(out);
++		}
++		picture_free(&p, &l);
++		free(block);
++	}
++}
++
++/* W: the ATX writer with this layout, against the bytes the nil-layout writer stored (the encoder's own). */
++static void
++test_writer(void)
++{
++	static const uint32_t sizes[][2] = { { 302, 656 }, { 192, 192 }, { 1125, 2436 }, { 5, 3 }, { 4, 4 }, { 1, 1 }, { 301, 655 } };
++
++	for (unsigned s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++) {
++		struct rwtl_layout l;
++		const char *why = NULL;
++		uint32_t w = sizes[s][0], h = sizes[s][1];
++
++		CHECK(rwtl_init(&l, 204, w, h, 1, &why) == 0);
++		size_t enc_row = (size_t)((w + 3) / 4) * 16, enc_size = enc_row * ((h + 3) / 4);    /* at_encoder's block counts */
++		uint8_t *enc = malloc(enc_size);
++
++		CHECK(enc != NULL);
++		fill(enc, enc_size);
++		/* ASTCTwiddler ctor: size, alignment, _ImageIO_Malloc(round up) */
++		size_t size = l.size, alignment = 64;
++		uint8_t *mem = calloc(1, round_up(size, alignment) + 1);
++
++		CHECK(mem != NULL);
++		/* copyFromLinearDataImp(enc, 0, enc_row, level 0): initialize (nothing), copy the whole level, finalize (nothing) */
++		CHECK(rwtl_copy_in(&l, mem, 0, 0, 0, rwtl_minify(w, 0), rwtl_minify(h, 0), enc, 0, enc_row, &why) == 0);
++		/* writeASTCData: 'astc', twiddledDataSize() bytes of twiddledData() -- the same bytes and count as the fallback */
++		CHECK(size == enc_size && memcmp(mem, enc, enc_size) == 0);
++		free(mem);
++		free(enc);
++	}
++}
++
++/* C: CoreAnimation's conversion of a linear mip chain (offsets and row lengths per level from CGImageTextureData). */
++static void
++test_ca_conversion(unsigned rounds)
++{
++	for (unsigned n = 0; n < rounds; n++) {
++		struct rwtl_layout l;
++		const char *why = NULL;
++
++		random_layout(&l);
++		/* the file's linear data: levels at arbitrary offsets with arbitrary (>= tight) row lengths */
++		size_t offs[RWTL_MAX_LEVELS], rows[RWTL_MAX_LEVELS], total = rnd(64);
++
++		for (uint32_t i = 0; i < l.levels; i++) {
++			rows[i] = l.level[i].row_bytes + (rnd(3) == 0 ? 16 * rnd(4) : 0);
++			offs[i] = total;
++			total += rows[i] * l.level[i].rows + rnd(48);
++		}
++		uint8_t *file = malloc(total + 1), *mem = malloc(round_up(l.size, 16384) + 16384);
++
++		CHECK(file != NULL && mem != NULL);
++		fill(file, total);
++		memset(mem, 0, round_up(l.size, 16384) + 16384);
++		for (uint32_t i = 0; i < l.levels; i++) {
++			/* [layout initializeTextureMemory:] before every level in ImageIO, once in CoreAnimation: must not clear */
++			CHECK(rwtl_copy_in(&l, mem, i, 0, 0, l.level[i].width, l.level[i].height, file, offs[i], rows[i], &why) == 0);
++		}
++		struct model m;
++
++		CHECK(server_texture(&m, l.format, l.width, l.height, l.levels, mem, round_up(l.size, 16384)) == 0);
++		for (uint32_t i = 0; i < l.levels; i++) {
++			for (uint32_t r = 0; r < l.level[i].rows; r++) {
++				CHECK(memcmp(m.level[i] + (size_t)r * l.level[i].row_bytes, file + offs[i] + r * rows[i], l.level[i].row_bytes) == 0);
++			}
++		}
++		model_free(&m);
++		free(file);
++		free(mem);
++	}
++}
++
++/* N: the nil answers, as the callers took them (what the phone did until y2s98). */
++static void
++test_nil(void)
++{
++	/* [nil size] = 0, [nil alignment] = 0: CA::Render::aligned_malloc(0) = NULL -> no image; ImageIO: no twiddler memory, the
++	 * 'astc' chunk gets the linear bytes and the reader hands them out as "tiled"; the server's texture is nil. With the
++	 * layout the same file bytes make a texture: */
++	struct rwtl_layout l;
++	const char *why = NULL;
++	struct model m;
++	uint8_t *chunk = malloc(199424);
++
++	CHECK(chunk != NULL);
++	fill(chunk, 199424);
++	CHECK(rwtl_init(&l, 204, 302, 656, 1, &why) == 0);
++	CHECK(server_texture(&m, 204, 302, 656, 1, chunk, round_up(199424, 16384)) == 0);
++	CHECK(memcmp(m.level[0], chunk, 199424) == 0);
++	model_free(&m);
++	/* a descriptor the layout does not serve stays nil (BGRA8 over caller memory: the old refusal) */
++	CHECK(server_texture(&m, 80, 302, 656, 1, chunk, 302 * 656 * 4) == -1);
++	free(chunk);
++}
++
++int
++main(void)
++{
++	test_table();
++	test_refusals();
++	test_writer();
++	test_nil();
++	test_fuzz(6000);
++	test_ca_conversion(3000);
++	printf("rw_texlayout: ok (table 28 formats, refusals, writer = linear bytes for 7 sizes, 6000 fuzz layouts / %lu copies, "
++	    "3000 CoreAnimation conversions, server texture model)\n", fuzz_copies);
++	return 0;
++}
+diff -ruN y2s96-final/src/rw_texlayout_pure.h y2s98-texlayout/src/rw_texlayout_pure.h
+--- y2s96-final/src/rw_texlayout_pure.h	1970-01-01 01:00:00.000000000 +0100
++++ y2s98-texlayout/src/rw_texlayout_pure.h	2026-11-13 23:08:21.634322274 +0100
+@@ -0,0 +1,275 @@
++/*
++ * rw_texlayout_pure.h (y2s98): the memory layout this driver gives a block-compressed texture, as plain C.
++ *
++ * WHY IT EXISTS.  CoreAnimation and ImageIO do not hand an ASTC picture (an .atx / .ktx file: every PosterBoard gallery and
++ * wallpaper snapshot, every SpringBoard application snapshot) to Metal through -replaceRegion:.  They ask the DEVICE for a
++ * texture layout (-newTextureLayoutWithDescriptor:isHeapOrBufferBacked:, protocol MTLTextureLayout), copy the blocks into
++ * "texture memory" with it, and the window server then makes the texture straight over that memory
++ * (-newTextureWithBytesNoCopy:length:descriptor:deallocator:).  Read from the 20H392 cache:
++ *   ImageIO   ASTCTwiddler::ASTCTwiddler (0x18bac8bd0)        -size -alignment, ATX writer and reader
++ *             ASTCTwiddlerImpl::copyFromLinearDataImp         -initializeTextureMemory: -copyFromLinearBytes:... -finalizeTextureMemory:
++ *             ASTCTwiddlerImpl::copyFromTextureDataImp        -copyFromTextureMemory:... (the software decoder's way back)
++ *             ASTCTwiddler::getWatermark                      -watermark (16 bytes; stored in the file, compared on reading)
++ *   QuartzCore CA::Render::CompressedImage::new_image_with_texture_data (0x18835864c), CA::OGL::MetalContext::update_texture
++ *             (0x188483ffc: bytes = the image's data, length = its size rounded up to a page, deallocator nil)
++ * A device that answers nil to both leaves every such picture without a texture: the layer is composited as nothing
++ * (transparent), which is what the wallpaper gallery showed.
++ *
++ * THE LAYOUT.  Mali samples ASTC from ordinary rows of blocks, so the "texture memory" of this driver is the linear one:
++ * level 0 first, each level its rows of blocks top to bottom, a row exactly ceil(width / block width) blocks of 16 bytes,
++ * the levels packed one after the other with no padding.  For a one-level picture that is byte for byte the file's linear
++ * encoder output, and it is also what ImageIO's ATX writer stored under the 'astc' (pre-twiddled) tag while this driver
++ * answered nil (ATXWritePlugin::writeASTCData falls back to the linear bytes when the twiddler has no memory, and the header
++ * keeps watermark 0) -- so the files already on the phone ARE in this layout, and the watermark of this layout is 0 so that
++ * they stay valid.  A file twiddled on Apple hardware carries AGX's watermark and is refused by ImageIO, as it should be.
++ *
++ * Everything here is arithmetic and memcpy; the Objective-C in redwoodmetal.m only forwards.  Host test:
++ * rw_texlayout_host_test.c (rw-texlayout-host-test.sh).
++ */
++#ifndef RW_TEXLAYOUT_PURE_H
++#define RW_TEXLAYOUT_PURE_H
++
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++#define RWTL_MAX_LEVELS 15u            /* a 16384 texel side has 15 levels; Metal's limit on this device is 16384 */
++#define RWTL_MAX_SIDE   16384u
++#define RWTL_BLOCK_BYTES 16u           /* every ASTC block, whatever its footprint */
++
++struct rwtl_level {
++	uint32_t width, height;        /* texels */
++	uint32_t cols, rows;           /* blocks */
++	size_t row_bytes;              /* cols * 16 */
++	size_t offset, size;           /* in the texture memory */
++};
++
++struct rwtl_layout {
++	uint32_t format;               /* MTLPixelFormat */
++	uint32_t block_w, block_h;     /* texels a block covers */
++	uint32_t width, height, levels;
++	size_t size;                   /* the whole texture memory */
++	struct rwtl_level level[RWTL_MAX_LEVELS];
++};
++
++/*
++ * The block footprint of a Metal pixel format this layout serves, or 0: the ASTC LDR family, sRGB (186..200) and linear
++ * (204..218), exactly the rows of air_metal.c's format table (y2s34).  Metal has no 191/201..203/209.
++ */
++static inline int
++rwtl_block_of(uint32_t format, uint32_t *bw, uint32_t *bh)
++{
++	static const uint8_t foot[15][2] = {
++		{ 4, 4 }, { 5, 4 }, { 5, 5 }, { 6, 5 }, { 6, 6 }, { 0, 0 }, { 8, 5 }, { 8, 6 }, { 8, 8 },
++		{ 10, 5 }, { 10, 6 }, { 10, 8 }, { 10, 10 }, { 12, 10 }, { 12, 12 },
++	};
++	uint32_t i;
++
++	if (format >= 186 && format <= 200) {
++		i = format - 186;
++	} else if (format >= 204 && format <= 218) {
++		i = format - 204;
++	} else {
++		return 0;
++	}
++	if (foot[i][0] == 0) {
++		return 0;
++	}
++	*bw = foot[i][0];
++	*bh = foot[i][1];
++	return 1;
++}
++
++static inline uint32_t
++rwtl_minify(uint32_t side, uint32_t level)
++{
++	uint32_t v = side >> level;
++
++	return v != 0 ? v : 1;
++}
++
++/* How many levels a full chain of this size has (Metal's own rule: down to 1x1). */
++static inline uint32_t
++rwtl_full_chain(uint32_t width, uint32_t height)
++{
++	uint32_t side = width > height ? width : height, n = 1;
++
++	while (side > 1) {
++		side >>= 1;
++		n++;
++	}
++	return n;
++}
++
++/*
++ * The layout of a 2D texture of `format`, `width` x `height`, `levels` levels.  0, or -1 with *why naming what is not served
++ * (and the layout untouched but for garbage: the caller does not use it).
++ */
++static inline int
++rwtl_init(struct rwtl_layout *l, uint32_t format, uint32_t width, uint32_t height, uint32_t levels, const char **why)
++{
++	uint32_t bw = 0, bh = 0;
++	size_t at = 0;
++
++	if (!rwtl_block_of(format, &bw, &bh)) {
++		*why = "not one of the ASTC LDR formats (186..200, 204..218)";
++		return -1;
++	}
++	if (width == 0 || height == 0 || width > RWTL_MAX_SIDE || height > RWTL_MAX_SIDE) {
++		*why = "a side of 0 or of more than 16384 texels";
++		return -1;
++	}
++	if (levels == 0 || levels > RWTL_MAX_LEVELS || levels > rwtl_full_chain(width, height)) {
++		*why = "no level, or more levels than the size has";
++		return -1;
++	}
++	memset(l, 0, sizeof(*l));
++	l->format = format;
++	l->block_w = bw;
++	l->block_h = bh;
++	l->width = width;
++	l->height = height;
++	l->levels = levels;
++	for (uint32_t i = 0; i < levels; i++) {
++		struct rwtl_level *v = &l->level[i];
++
++		v->width = rwtl_minify(width, i);
++		v->height = rwtl_minify(height, i);
++		v->cols = (v->width + bw - 1) / bw;
++		v->rows = (v->height + bh - 1) / bh;
++		v->row_bytes = (size_t)v->cols * RWTL_BLOCK_BYTES;
++		v->offset = at;
++		v->size = v->row_bytes * v->rows;          /* <= 4096 * 16 * 4096 = 2^28: no overflow in size_t */
++		at += v->size;
++	}
++	l->size = at;
++	return 0;
++}
++
++/*
++ * A region of one level in blocks.  Metal's rule for a compressed region (and rwa_texture_write's): it starts on a block and
++ * ends on one or at the level's edge.  0, or -1 with *why.
++ */
++static inline int
++rwtl_region(const struct rwtl_layout *l, uint32_t level, uint64_t x, uint64_t y, uint64_t w, uint64_t h,
++    uint32_t *col, uint32_t *row, uint32_t *cols, uint32_t *rows, const char **why)
++{
++	const struct rwtl_level *v;
++
++	if (level >= l->levels) {
++		*why = "a level the layout does not have";
++		return -1;
++	}
++	v = &l->level[level];
++	if (w == 0 || h == 0 || x >= v->width || y >= v->height || w > v->width - x || h > v->height - y) {
++		*why = "a region that is empty or leaves the level";
++		return -1;
++	}
++	if (x % l->block_w != 0 || y % l->block_h != 0 || (w % l->block_w != 0 && x + w != v->width) ||
++	    (h % l->block_h != 0 && y + h != v->height)) {
++		*why = "a region that does not start on a block and end on one or at the level's edge";
++		return -1;
++	}
++	*col = (uint32_t)(x / l->block_w);
++	*row = (uint32_t)(y / l->block_h);
++	*cols = (uint32_t)((w + l->block_w - 1) / l->block_w);
++	*rows = (uint32_t)((h + l->block_h - 1) / l->block_h);
++	return 0;
++}
++
++/* The caller's row length: 0 is Metal's "tightly packed"; anything shorter than the region's blocks is refused. */
++static inline int
++rwtl_linear_row(uint32_t cols, size_t linear_row_bytes, size_t *row, const char **why)
++{
++	size_t least = (size_t)cols * RWTL_BLOCK_BYTES;
++
++	if (linear_row_bytes == 0) {
++		*row = least;
++		return 0;
++	}
++	if (linear_row_bytes < least) {
++		*why = "fewer bytes a row than the region's blocks";
++		return -1;
++	}
++	*row = linear_row_bytes;
++	return 0;
++}
++
++/*
++ * -copyFromLinearBytes:linearOffset:linearBytesPerRow:linearBytesPerImage:toTextureMemory:textureSlice:textureLevel:textureRegion:
++ * `linear + linear_offset` is the first block row of the region, `linear_row_bytes` from one block row to the next.
++ */
++static inline int
++rwtl_copy_in(const struct rwtl_layout *l, void *memory, uint32_t level, uint64_t x, uint64_t y, uint64_t w, uint64_t h,
++    const void *linear, size_t linear_offset, size_t linear_row_bytes, const char **why)
++{
++	uint32_t col, row, cols, rows;
++	size_t lrow;
++
++	if (memory == NULL || linear == NULL) {
++		*why = "no memory";
++		return -1;
++	}
++	if (rwtl_region(l, level, x, y, w, h, &col, &row, &cols, &rows, why) != 0 ||
++	    rwtl_linear_row(cols, linear_row_bytes, &lrow, why) != 0) {
++		return -1;
++	}
++	const struct rwtl_level *v = &l->level[level];
++	const uint8_t *src = (const uint8_t *)linear + linear_offset;
++	uint8_t *dst = (uint8_t *)memory + v->offset + (size_t)row * v->row_bytes + (size_t)col * RWTL_BLOCK_BYTES;
++
++	for (uint32_t r = 0; r < rows; r++) {
++		memcpy(dst + (size_t)r * v->row_bytes, src + (size_t)r * lrow, (size_t)cols * RWTL_BLOCK_BYTES);
++	}
++	return 0;
++}
++
++/* -copyFromTextureMemory:textureSlice:textureLevel:textureRegion:toLinearBytes:linearOffset:linearBytesPerRow:linearBytesPerImage: */
++static inline int
++rwtl_copy_out(const struct rwtl_layout *l, const void *memory, uint32_t level, uint64_t x, uint64_t y, uint64_t w, uint64_t h,
++    void *linear, size_t linear_offset, size_t linear_row_bytes, const char **why)
++{
++	uint32_t col, row, cols, rows;
++	size_t lrow;
++
++	if (memory == NULL || linear == NULL) {
++		*why = "no memory";
++		return -1;
++	}
++	if (rwtl_region(l, level, x, y, w, h, &col, &row, &cols, &rows, why) != 0 ||
++	    rwtl_linear_row(cols, linear_row_bytes, &lrow, why) != 0) {
++		return -1;
++	}
++	const struct rwtl_level *v = &l->level[level];
++	const uint8_t *src = (const uint8_t *)memory + v->offset + (size_t)row * v->row_bytes + (size_t)col * RWTL_BLOCK_BYTES;
++	uint8_t *dst = (uint8_t *)linear + linear_offset;
++
++	for (uint32_t r = 0; r < rows; r++) {
++		memcpy(dst + (size_t)r * lrow, src + (size_t)r * v->row_bytes, (size_t)cols * RWTL_BLOCK_BYTES);
++	}
++	return 0;
++}
++
++/*
++ * -newTextureWithBytesNoCopy:length:descriptor:deallocator: -- where level `level` of a texture memory of `length` bytes is,
++ * as -replaceRegion: wants it (whole level, `*row_bytes` a block row).  NULL with *why when the memory cannot hold the layout.
++ */
++static inline const void *
++rwtl_level_bytes(const struct rwtl_layout *l, const void *memory, size_t length, uint32_t level, uint32_t *width,
++    uint32_t *height, size_t *row_bytes, const char **why)
++{
++	if (memory == NULL || length < l->size) {
++		*why = "the memory is shorter than the layout";
++		return NULL;
++	}
++	if (level >= l->levels) {
++		*why = "a level the layout does not have";
++		return NULL;
++	}
++	*width = l->level[level].width;
++	*height = l->level[level].height;
++	*row_bytes = l->level[level].row_bytes;
++	return (const uint8_t *)memory + l->level[level].offset;
++}
++
++#endif

@@ -1,0 +1,245 @@
+diff -ruN y2s75-libmerge4/lm5/src/air_isp.c y2s75-libmerge4/lm6/src/air_isp.c
+--- y2s75-libmerge4/lm5/src/air_isp.c	2026-11-12 17:38:31.781614029 +0100
++++ y2s75-libmerge4/lm6/src/air_isp.c	2026-11-12 18:05:38.432218883 +0100
+@@ -132,6 +132,11 @@
+    struct isp_linear nr_diff, nr_still;
+    bool nr_before;
+    uint32_t columns_n, rows_n;
++   /* libmerge6: a picture larger than the sensor's cells it shows (1080p from 2048x1152, 4K from 4096x3072, cells mode): the ISP pass is made once
++    * per DIFFERENT column and row of the sensor it reads (ucolumns x urows), and spread over the picture by two index tables (cidx, ridx) */
++   struct rwa_texture *ucolumns, *urows, *cidx, *ridx;
++   uint32_t ucolumns_n, urows_n, cidx_n, ridx_n, uc, ur;
++   bool expand;
+    struct isp_pooled pool[ISP_POOL];
+    uint64_t renders;                            /* the pool's clock */
+    struct isp_counts count;
+@@ -1167,6 +1172,26 @@
+    return isp_fragment_end(&b, which == ISP_NRG_ROWS || which == ISP_NRG_PARAMS ? 1 : 2);
+ }
+ 
++/*
++ * libmerge6: the RGB picture from the one made per different sensor column and row (texture 0, uc x ur), through the index tables (1: the
++ * columns', 2: the rows', R16Uint). isp_cells_shader looks at nothing of a pixel but the sensor place its two tables give, so every pixel of the
++ * picture is the texel of its place in the smaller one, byte for byte (an 8-bit texel read and written back as the same byte).
++ */
++static nir_shader *
++isp_expand_shader(const struct nir_shader_compiler_options *options)
++{
++   nir_variable *uv, *out;
++   nir_builder b = isp_fragment_begin(options, "isp_expand", &uv, &out);
++   nir_def *x, *y, *zero = nir_imm_int(&b, 0);
++
++   isp_pixel_xy(&b, uv, &x, &y);
++   nir_def *i = nir_channel(&b, isp_fetch(&b, 1, x, zero, nir_type_uint32), 0);
++   nir_def *j = nir_channel(&b, isp_fetch(&b, 2, y, zero, nir_type_uint32), 0);
++
++   nir_store_var(&b, out, isp_fetch(&b, 0, i, j, nir_type_float32), 0xf);
++   return isp_fragment_end(&b, 3);
++}
++
+ /* a plane as it is (into the surface, or kept as the picture before) */
+ static nir_shader *
+ isp_nr_copy_shader(const struct nir_shader_compiler_options *options, unsigned channels)
+@@ -1197,17 +1222,17 @@
+ isp_state_destroy(struct rwa_device *device)
+ {
+    struct pipe_context *pipe = device->pipe;
+-   void *fs[22] = { device->isp.cells[0], device->isp.cells[1], device->isp.full[0], device->isp.full[1], device->isp.luma,
++   void *fs[23] = { device->isp.cells[0], device->isp.cells[1], device->isp.full[0], device->isp.full[1], device->isp.luma,
+                     device->isp.chroma, device->isp.stats[0], device->isp.stats[1], device->isp.nr[0], device->isp.nr[1], device->isp.nr[2],
+                     device->isp.nr[3], device->isp.nr[4], device->isp.nr[5], device->isp.nr[6], device->isp.cellstat[0], device->isp.cellstat[1],
+-                    device->isp.nrg[0], device->isp.nrg[1], device->isp.nrg[2], device->isp.nrg[3], device->isp.nrg[4] };
++                    device->isp.nrg[0], device->isp.nrg[1], device->isp.nrg[2], device->isp.nrg[3], device->isp.nrg[4], device->isp.expand };
+    bool any = device->isp.nearest != NULL;
+ 
+-   for (unsigned i = 0; i < 22; i++)
++   for (unsigned i = 0; i < 23; i++)
+       any = any || fs[i] != NULL;
+    if (any)
+       pipe->bind_fs_state(pipe, NULL);
+-   for (unsigned i = 0; i < 22; i++)
++   for (unsigned i = 0; i < 23; i++)
+       if (fs[i])
+          pipe->delete_fs_state(pipe, fs[i]);
+    if (device->isp.nearest)
+@@ -1519,6 +1544,7 @@
+ }
+ 
+ static bool isp_no_linear;                      /* /private/var/db/nord2-isp-nolinear: libmerge3's reads through the driver (set once) */
++static bool isp_no_expand;                      /* /private/var/db/nord2-isp-noexpand: the ISP pass over every pixel, as libmerge5 */
+ static bool isp_nr_cpu;                         /* /private/var/db/nord2-isp-nrcpu: with_before()'s numbers by the processor (a mid-render wait) */
+ 
+ static struct rwa_texture *
+@@ -1638,9 +1664,41 @@
+ 
+ /* the ISP pass into rgb, and the Y into `y': in the same pass (fold) or by libmerge3's luma pass after it. lock held. */
+ static int
+-isp_rgb_and_y(struct rwa_device *device, struct rwa_texture *rgb, struct rwa_texture *y, void *fs_isp, struct rwa_texture *const *isp_textures,
++isp_rgb_and_y(struct rwa_isp *isp, struct rwa_texture *rgb, struct rwa_texture *y, void *fs_isp, struct rwa_texture *const *isp_textures,
+               const struct isp_block *block, char *why, size_t why_size)
+ {
++   struct rwa_device *device = isp->device;
++
++   if (isp->expand) {
++      /* libmerge6: the ISP pass once per different sensor place, then spread; then libmerge3's luma pass (no fold: its Y would be the small one's) */
++      void *fs_x = device->isp.expand != NULL ? device->isp.expand
++                 : isp_shader(device, &device->isp.expand, isp_expand_shader(device->nir_options), why, why_size);
++      void *fs_luma = device->isp.luma != NULL ? device->isp.luma
++                    : isp_shader(device, &device->isp.luma, isp_luma_shader(device->nir_options), why, why_size);
++      struct rwa_texture *small = fs_x && fs_luma ? isp_pool_take(isp, 70 /* RGBA8Unorm */, isp->uc, isp->ur, why, why_size) : NULL;
++
++      if (small == NULL)
++         return -1;
++      struct rwa_texture *const ut[5] = { isp_textures[0], isp->ucolumns, isp->urows, isp_textures[3], isp_textures[4] };
++      struct rwa_texture *const xt[3] = { small, isp->cidx, isp->ridx }, *const rgb_texture[1] = { rgb };
++      struct isp_block sb = *block;
++      bool fold = isp_feat_fold;
++
++      sb.out_w = (int32_t)isp->uc;
++      sb.out_h = (int32_t)isp->ur;
++      if (fold) {
++         /* (the cells shader writes a second output: give it the small picture's own Y to write, unread) */
++         struct rwa_texture *junk = isp_pool_take(isp, 10, isp->uc, isp->ur, why, why_size);
++         struct rwa_texture *const out[2] = { small, junk };
++
++         if (junk == NULL || isp_pass_to(device, out, 2, fs_isp, ut, 5, &sb, "ISP (places)", why, why_size) != 0)
++            return -1;
++      } else if (isp_pass(device, small, fs_isp, ut, 5, &sb, "ISP (places)", why, why_size) != 0) {
++         return -1;
++      }
++      return isp_pass(device, rgb, fs_x, xt, 3, block, "ISP (spread)", why, why_size) != 0 ||
++             isp_pass(device, y, fs_luma, rgb_texture, 1, block, "luma", why, why_size) != 0 ? -1 : 0;
++   }
+    if (isp_feat_fold) {
+       struct rwa_texture *const out[2] = { rgb, y };
+ 
+@@ -1679,7 +1737,7 @@
+    level = level > 2 ? 2 : level;
+    if (level == 0 || width < 8 || height < 8) {
+       isp->nr_before = false;                  /* (the picture before is not this one's any more) */
+-      return isp_rgb_and_y(device, rgb, luma, fs_isp, isp_textures, block, why, why_size) != 0 ||
++      return isp_rgb_and_y(isp, rgb, luma, fs_isp, isp_textures, block, why, why_size) != 0 ||
+              isp_pass(device, chroma, fs_chroma, rgb_texture, 1, block, "chroma", why, why_size) != 0 ? -1 : 0;
+    }
+    const uint32_t cw = (width + 1) / 2, ch = (height + 1) / 2;
+@@ -1697,7 +1755,7 @@
+ 
+    if (f_sy == NULL || f_sc == NULL || f_cy == NULL || f_cc == NULL || y0 == NULL || c0 == NULL || c1 == NULL)
+       return -1;
+-   if (isp_rgb_and_y(device, rgb, y0, fs_isp, isp_textures, block, why, why_size) != 0 ||
++   if (isp_rgb_and_y(isp, rgb, y0, fs_isp, isp_textures, block, why, why_size) != 0 ||
+        isp_pass(device, c0, fs_chroma, rgb_texture, 1, block, "chroma", why, why_size) != 0)
+       return -1;
+    /* (no picture before, or another size: this picture as made is its own picture before -- denoise()'s `fresh') */
+@@ -2129,6 +2187,39 @@
+       error = isp_table(device, &isp->columns, &isp->columns_n, 23 /* R16Uint */, width, columns, width * 2, why, why_size);
+       if (error == RWA_ISP_OK)
+          error = isp_table(device, &isp->rows, &isp->rows_n, 23, height, rows, height * 2, why, why_size);
++      /* libmerge6: the different columns and rows, in order (the tables only rise, or only fall), and each pixel's index among them */
++      isp->expand = false;
++      if (error == RWA_ISP_OK && p->mode == RWA_ISP_MODE_CELLS && !isp_no_expand) {
++         uint16_t *uc = malloc(sizeof(uint16_t) * 2 * ((size_t)width + height)), *ur = uc ? uc + width : NULL;
++         uint16_t *ci = uc ? ur + height : NULL, *ri = uc ? ci + width : NULL;
++         uint32_t nc = 0, nr = 0;
++         bool ok = uc != NULL;
++
++         for (uint32_t x = 0; ok && x < width; x++) {
++            if (nc == 0 || columns[x] != uc[nc - 1])
++               uc[nc++] = columns[x];
++            ci[x] = (uint16_t)(nc - 1);
++         }
++         for (uint32_t y = 0; ok && y < height; y++) {
++            if (nr == 0 || rows[y] != ur[nr - 1])
++               ur[nr++] = rows[y];
++            ri[y] = (uint16_t)(nr - 1);
++         }
++         /* (a table that went back to a place it had left would make two texels of one place: harmless, but not monotonic is not expected) */
++         if (ok && (uint64_t)nc * nr * 10 <= (uint64_t)width * height * 7) {
++            error = isp_table(device, &isp->ucolumns, &isp->ucolumns_n, 23, nc, uc, nc * 2, why, why_size);
++            if (error == RWA_ISP_OK)
++               error = isp_table(device, &isp->urows, &isp->urows_n, 23, nr, ur, nr * 2, why, why_size);
++            if (error == RWA_ISP_OK)
++               error = isp_table(device, &isp->cidx, &isp->cidx_n, 23, width, ci, width * 2, why, why_size);
++            if (error == RWA_ISP_OK)
++               error = isp_table(device, &isp->ridx, &isp->ridx_n, 23, height, ri, height * 2, why, why_size);
++            isp->expand = error == RWA_ISP_OK;
++            isp->uc = nc;
++            isp->ur = nr;
++         }
++         free(uc);
++      }
+       free(columns);
+       if (error != RWA_ISP_OK)
+          return error;
+@@ -2565,6 +2656,8 @@
+             (void)isp_nr_fs(device, i, why2, sizeof(why2));
+          for (unsigned i = 0; i < ISP_NRG_COUNT; i++)
+             (void)isp_nrg_fs(device, i, why2, sizeof(why2));
++         if (device->isp.expand == NULL)
++            (void)isp_shader(device, &device->isp.expand, isp_expand_shader(device->nir_options), why2, sizeof(why2));
+       }
+    }
+    double ms = (double)(os_time_get_nano() - t0) / 1e6;
+@@ -2689,11 +2782,11 @@
+       return;
+    const double n = (double)c->renders, ms = 1e6;
+ 
+-   isp_note("camera ISP: %.1f s of %ux%u from %ux%u (%s, noise %u%s): %llu renders; frame zero copy %llu, uploaded %llu (%.1f MB, %.2f ms each); "
++   isp_note("camera ISP: %.1f s of %ux%u from %ux%u (%s, noise %u%s; the ISP pass over %ux%u places): %llu renders; frame zero copy %llu, uploaded %llu (%.1f MB, %.2f ms each); "
+             "prepare %.2f, queue %.2f (noise blocks' wait+readback %.2f in %llu), wait %.2f, statistics readback %.2f ms; pool hits %llu, misses %llu "
+             "(%.1f MB made), %.1f MB kept; %.1f passes, %.1f submissions a render; linear reads %llu, driver reads %llu; surfaces imported %llu",
+             (double)(now - c->since) / 1e9, c->w, c->h, c->fw, c->fh, c->mode == RWA_ISP_MODE_FULL ? "full" : "cells", c->level,
+-            c->before ? " with the picture before" : "", (unsigned long long)c->renders, (unsigned long long)c->zero_copy,
++            c->before ? " with the picture before" : "", isp->expand ? isp->uc : c->w, isp->expand ? isp->ur : c->h, (unsigned long long)c->renders, (unsigned long long)c->zero_copy,
+             (unsigned long long)c->uploaded, c->uploaded ? (double)c->upload_bytes / (double)c->uploaded / 1e6 : 0.0,
+             c->uploaded ? (double)c->upload_ns / (double)c->uploaded / ms : 0.0, (double)c->prepare_ns / n / ms, (double)c->queue_ns / n / ms,
+             (double)c->readback_ns / n / ms, (unsigned long long)c->mid_waits, (double)c->wait_ns / n / ms, (double)c->stats_ns / n / ms,
+@@ -2735,9 +2828,10 @@
+       if (!said) {
+          said = true;
+          isp_no_linear = access("/private/var/db/nord2-isp-nolinear", F_OK) == 0;
++         isp_no_expand = access("/private/var/db/nord2-isp-noexpand", F_OK) == 0 || getenv("RWA_ISP_NOEXPAND") != NULL;
+          isp_nr_cpu = access("/private/var/db/nord2-isp-nrcpu", F_OK) == 0 || getenv("RWA_ISP_NRCPU") != NULL;
+-         isp_note("camera ISP: libmerge5 (y2s75/lm5): intermediates pooled, statistics from a cells pass, the noise's stillness one texel a pixel; "
+-                  "features (nord2-isp-features) %s; the noise's numbers %s; readbacks %s", isp_feat_text, isp_nr_cpu ? "by the processor (nord2-isp-nrcpu)" : "on the GPU, one submission",
++         isp_note("camera ISP: libmerge6 (y2s75/lm6): the ISP pass once per sensor place shown%s, intermediates pooled, statistics from a cells pass, the noise's stillness one texel a pixel; "
++                  "features (nord2-isp-features) %s; the noise's numbers %s; readbacks %s", isp_no_expand ? " (OFF: nord2-isp-noexpand)" : "", isp_feat_text, isp_nr_cpu ? "by the processor (nord2-isp-nrcpu)" : "on the GPU, one submission",
+                   isp_no_linear ? "through the driver (nord2-isp-nolinear)" : "out of linear buffers where the GPU lays textures over them");
+       }
+    }
+@@ -2792,10 +2886,10 @@
+       if (isp->slot[i].buffer != NULL)
+          rwa_buffer_destroy(isp->slot[i].buffer);
+    }
+-   struct rwa_texture *own[9] = { isp->raw_own, isp->raw_own32, isp->columns, isp->rows, isp->gamma, isp->nr_by, isp->nr_bc, isp->nr_by2,
+-                                  isp->nr_bc2 };
++   struct rwa_texture *own[13] = { isp->raw_own, isp->raw_own32, isp->columns, isp->rows, isp->gamma, isp->nr_by, isp->nr_bc, isp->nr_by2,
++                                   isp->nr_bc2, isp->ucolumns, isp->urows, isp->cidx, isp->ridx };
+ 
+-   for (int i = 0; i < 9; i++)
++   for (int i = 0; i < 13; i++)
+       if (own[i] != NULL)
+          rwa_texture_destroy(own[i]);
+    for (int i = 0; i < ISP_POOL; i++)
+diff -ruN y2s75-libmerge4/lm5/src/air_metal.c y2s75-libmerge4/lm6/src/air_metal.c
+--- y2s75-libmerge4/lm5/src/air_metal.c	2026-11-12 16:00:27.538577703 +0100
++++ y2s75-libmerge4/lm6/src/air_metal.c	2026-11-12 18:05:27.710171526 +0100
+@@ -200,6 +200,7 @@
+       void *stats[2];           /* y2s65: the frame's statistics, per frame format (air_isp.c isp_stats_shader) */
+       void *nr[7];              /* y2s70 NR2: smooth luma, smooth chroma, block difference, apply luma, apply chroma, copy luma, copy chroma */
+       void *cellstat[2];        /* y2s75 libmerge4: the statistics' cells, made once per frame for the 20 kinds (air_isp.c isp_stats_cells_shader) */
++      void *expand;             /* y2s75/lm6 libmerge6: the cells' picture spread over the picture (air_isp.c isp_expand_shader) */
+       void *nrg[5];             /* y2s75 libmerge4: with_before()'s numbers on the GPU (air_isp.c isp_nrg_shader): rows, calm, moving, params, still */
+    } isp;
+ };
+diff -ruN y2s75-libmerge4/lm5/src/pan_compile_new_host_test.c y2s75-libmerge4/lm6/src/pan_compile_new_host_test.c
+--- y2s75-libmerge4/lm5/src/pan_compile_new_host_test.c	2026-11-12 16:02:01.622672450 +0100
++++ y2s75-libmerge4/lm6/src/pan_compile_new_host_test.c	2026-11-12 18:05:38.432586964 +0100
+@@ -65,6 +65,7 @@
+    if (only < 0 || only == 14) ok &= compile(isp_stats_cells_shader(options, 1), &screen, "isp stats cells, MIPI RAW10");
+    if (only < 0 || only == 15) ok &= compile(isp_stats_cells_shader(options, 4), &screen, "isp stats cells, 40-bit");
+    if (only < 0 || only == 16) ok &= compile(isp_chroma_shader(options), &screen, "isp chroma");
++   if (only < 0 || only == 30) ok &= compile(isp_expand_shader(options), &screen, "isp expand (libmerge6)");
+    for (unsigned i = 0; i < ISP_NRG_COUNT; i++)
+       if (only < 0 || only == 17 + (int)i) ok &= compile(isp_nrg_shader(options, i), &screen, i == 0 ? "nrg rows" : i == 1 ? "nrg calm" : i == 2 ? "nrg moving" : i == 3 ? "nrg params" : "nrg still");
+    printf(ok ? "pan_compile_new_host_test: all compiled\n" : "pan_compile_new_host_test: FAILED\n");

@@ -1,0 +1,1184 @@
+diff -ruN base-src/redwooddrawable.m src/redwooddrawable.m
+--- base-src/redwooddrawable.m	2026-11-11 08:25:32.994429268 +0100
++++ src/redwooddrawable.m	2026-11-14 01:15:58.345750675 +0100
+@@ -73,6 +73,11 @@
+ 
+ #include "redwood_drawable.h"
+ #include "m2m.h"
++#include "rw_api99a_pure.h"     /* y2s99a (subrect) */
++
++/* y2s99a: in redwoodmetal.m (feature 1 = subrect) */
++int rw_api99a_on(int feature);
++void rw_api99a_count(int feature, int ok, const char *what);
+ 
+ /*
+  * The two requests this file needs, by the numbers the kernel answers them on
+@@ -891,6 +896,35 @@
+ 			fourcc = surface.pixelFormat;       /* (served: the sizes were just compared) */
+ 		}
+ 	}
++	/*
++	 * y2s99a (subrect): a texture SMALLER than its one-plane surface is the surface's top-left corner at the surface's own row
++	 * length -- what Metal allows (the texture's width and height at most the surface's) and what CoreMedia asks for in
++	 * mediaserverd ("surface N is 64x64 and the descriptor asks for 52x52", 288 refusals in the logs). The surface is
++	 * described to the checks below at the texture's size; the import lays the texture at the surface's offset and rows.
++	 */
++	if ((surface.width != want->width || surface.height != want->height) && rw_api99a_on(1 /* RW_A_SUBRECT */)) {
++		unsigned bpp = rwd_plain_format_size(want->pixel_format);
++
++		if (bpp == 0) {
++			bpp = bytes_per_pixel;
++		}
++		if (rw_subrect_ok(surface.width, surface.height, surface.rowBytes, surface.planes, want->width, want->height, bpp)) {
++			char what[96];
++			static unsigned said;
++
++			snprintf(what, sizeof(what), "%ux%u of %ux%u", want->width, want->height, surface.width, surface.height);
++			rw_api99a_count(1, 1, what);
++			if (__sync_fetch_and_add(&said, 1) < 8) {
++				m2m_log('I', "SURF", "subrect: a %ux%u texture of Metal format %u over the top-left corner of surface %u (%ux%u, "
++				    "%u bytes a row)", want->width, want->height, want->pixel_format, id, surface.width, surface.height,
++				    surface.rowBytes);
++			}
++			surface.width = want->width;
++			surface.height = want->height;
++		} else {
++			rw_api99a_count(1, 0, "not a sub-rectangle");
++		}
++	}
+ 	if (surface.width != want->width || surface.height != want->height) {
+ 		rwd_say(why, why_size, "surface %u is %ux%u and the descriptor asks for %ux%u",
+ 		    id, surface.width, surface.height, want->width, want->height);
+diff -ruN base-src/redwoodmetal.m src/redwoodmetal.m
+--- base-src/redwoodmetal.m	2026-11-13 23:09:33.319831727 +0100
++++ src/redwoodmetal.m	2026-11-14 01:20:32.197460243 +0100
+@@ -5678,6 +5678,349 @@
+ 	    rw_vt_selftest);
+ }
+ 
++/*
++ * ==== y2s99a (API gaps) =====================================================================================================
++ * The decisions are in rw_api99a_pure.h (with the evidence); here is the Objective-C around them.  Every feature has a switch
++ * file /var/db/nord2-metal/no-<feature> and all of them /var/db/nord2-metal/no-api99a, read once per process.
++ * Lines: 'NORD2 GPU APIGAP: pid= name= config plib=ON subrect=ON ... y2s99a' once per process that uses one;
++ *        'NORD2 GPU APIGAP: pid= name= <feature> ok=N refused=R (last: ...)' at the 1st, 2nd, 4th, 8th ... event;
++ *        'I RES plib: ...' / 'W RES plib: ...', 'I DEV family: ...', 'W CMD event: ...' for the first ones.
++ * Functions and methods of y2s99a: rw_api99a_* (here), rw_plc_init_hook, rw_plib_*_hook, RedwoodMetalFence,
++ * -[RedwoodMetalDevice newPipelineLibraryWithFilePath:error: newFence supportsFamily: supportsFeatureSet:],
++ * -[RedwoodMetalCommandBuffer encodeSignalEvent:value: encodeWaitForEvent:value: redwoodWaitEvents (from -commit)],
++ * -[RedwoodMetalTexture numFaces], the 'left empty' texture warning in -runDraw:, and rwd_texture_from_surface's sub-rectangle
++ * (redwooddrawable.m).
++ */
++#include "rw_api99a_pure.h"
++
++enum { RW_A_PLIB, RW_A_SUBRECT, RW_A_FENCE, RW_A_EVENTS, RW_A_FACES, RW_A_FAMLOG, RW_A_EMPTYSLOT, RW_A_N };
++static const char *const rw_a_names[RW_A_N] = { "plib", "subrect", "fence", "events", "faces", "famlog", "emptyslot" };
++static int rw_a_off[RW_A_N];
++static unsigned long rw_a_ok[RW_A_N], rw_a_bad[RW_A_N];
++static pthread_mutex_t rw_a_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static void
++rw_api99a_config(void)
++{
++	static dispatch_once_t once;
++
++	dispatch_once(&once, ^{
++		int all = access("/var/db/nord2-metal/no-api99a", F_OK) == 0;
++		char line[256] = "";
++		size_t used = 0;
++
++		for (int i = 0; i < RW_A_N; i++) {
++			char path[96];
++
++			snprintf(path, sizeof(path), "/var/db/nord2-metal/no-%s", rw_a_names[i]);
++			rw_a_off[i] = all || access(path, F_OK) == 0;
++			used += (size_t)snprintf(line + used, sizeof(line) - used, " %s=%s", rw_a_names[i], rw_a_off[i] ? "OFF" : "ON");
++			if (used >= sizeof(line)) {
++				used = sizeof(line) - 1;
++			}
++		}
++		m2m_log('I', "DEV", "NORD2 GPU APIGAP: pid=%d name=%s config%s%s y2s99a\n", getpid(), getprogname(), line,
++		    all ? " (no-api99a)" : "");
++	});
++}
++
++/* (also called from redwooddrawable.m) */
++int
++rw_api99a_on(int feature)
++{
++	rw_api99a_config();
++	return feature >= 0 && feature < RW_A_N && !rw_a_off[feature];
++}
++
++void
++rw_api99a_count(int feature, int ok, const char *what)
++{
++	unsigned long n, a, b;
++
++	if (feature < 0 || feature >= RW_A_N) {
++		return;
++	}
++	pthread_mutex_lock(&rw_a_lock);
++	if (ok) {
++		rw_a_ok[feature]++;
++	} else {
++		rw_a_bad[feature]++;
++	}
++	a = rw_a_ok[feature];
++	b = rw_a_bad[feature];
++	n = a + b;
++	pthread_mutex_unlock(&rw_a_lock);
++	if (rw_pow2_report(n)) {
++		m2m_log('I', "DEV", "NORD2 GPU APIGAP: pid=%d name=%s %s ok=%lu refused=%lu (last: %s)\n", getpid(), getprogname(),
++		    rw_a_names[feature], a, b, what != NULL ? what : "-");
++	}
++}
++
++/* ---- plib ---- */
++static __thread int rw_plib_opening;
++static char rw_plib_key;
++static id (*rw_plc_init)(id, SEL, id, BOOL, const void *);
++static id (*rw_plib_render_named)(id, SEL, id, NSUInteger, id *, NSError **);
++static id (*rw_plib_compute_named)(id, SEL, id, NSUInteger, id *, NSError **);
++static id (*rw_plib_function_cache)(id, SEL);
++static id (*rw_plib_pipeline_cache)(id, SEL);
++
++static BOOL
++rw_plib_ours(id library)
++{
++	return library != nil && objc_getAssociatedObject(library, &rw_plib_key) != nil;
++}
++
++/*
++ * -[_MTLPipelineCache initWithFilePath:readOnly:deviceInfo:] while this driver opens a pipeline library: a read-only cache
++ * file of the library that Metal cannot open (no pipelines.<this GPU>, or a function cache of another GPU's version) is
++ * answered with the EMPTY cache Metal itself makes for a nil path.  Metal's init releases the object when it fails, so it
++ * is retained first; the C++ cache it left at +0x10 (the slot -dealloc reads, 0x181a47fbc) is deleted the way -dealloc
++ * deletes it (vtable +0x8) before the object is initialised again.
++ */
++struct rw_plc_call {
++	SEL sel;
++	id path;
++	BOOL read_only;
++	const void *info;
++};
++
++static void *
++rw_plc_op_init(void *ctx, void *self, int use_path)
++{
++	struct rw_plc_call *c = ctx;
++
++	return (void *)rw_plc_init((id)self, c->sel, use_path ? c->path : nil, c->read_only, c->info);
++}
++
++static void rw_plc_op_retain(void *ctx, void *self)  { (void)ctx; [(id)self retain]; }
++static void rw_plc_op_release(void *ctx, void *self) { (void)ctx; [(id)self release]; }
++
++static void *
++rw_plc_op_take_cache(void *ctx, void *self)
++{
++	void **slot = (void **)((char *)self + 0x10);   /* the slot -[_MTLPipelineCache dealloc] reads (0x181a47fbc) */
++	void *cache = *slot;
++
++	(void)ctx;
++	*slot = NULL;
++	return cache;
++}
++
++static void
++rw_plc_op_delete_cache(void *ctx, void *cache)
++{
++	void (**vtable)(void *) = *(void (***)(void *))cache;
++
++	(void)ctx;
++	vtable[1](cache);                               /* as -dealloc: ldr x8, [x8, #0x8]; blr x8 */
++}
++
++static const struct rw_plc_ops rw_plc_objc_ops = {
++	rw_plc_op_init, rw_plc_op_retain, rw_plc_op_release, rw_plc_op_take_cache, rw_plc_op_delete_cache
++};
++
++static id
++rw_plc_init_hook(id self, SEL sel, id path, BOOL read_only, const void *info)
++{
++	const char *p;
++	id r;
++
++	if (rw_plib_opening <= 0 || path == nil || !read_only || ![path isKindOfClass:[NSString class]] ||
++	    !rw_plib_cache_path((p = [path UTF8String])) || class_getInstanceSize(object_getClass(self)) < 0x19) {
++		return rw_plc_init(self, sel, path, read_only, info);
++	}
++	{
++		struct rw_plc_call call = { sel, path, read_only, info };
++		int emptied = 0;
++
++		r = (id)rw_plc_dance(&rw_plc_objc_ops, &call, (void *)self, &emptied);
++		if (!emptied) {
++			return r;
++		}
++	}
++	{
++		static unsigned said;
++
++		if (__sync_fetch_and_add(&said, 1) < 24) {
++			m2m_log('I', "RES", "plib: %s cannot be opened for this GPU; an EMPTY cache stands for it (every pipeline of the "
++			    "library is compiled from its descriptor)%s\n", p, r == nil ? " -- and even that failed" : "");
++		}
++	}
++	return r;
++}
++
++/* the function and pipeline caches of a library opened with an empty cache are no caches at all, and say so */
++static id
++rw_plib_function_cache_hook(id self, SEL sel)
++{
++	return rw_plib_ours(self) ? nil : rw_plib_function_cache(self, sel);
++}
++
++static id
++rw_plib_pipeline_cache_hook(id self, SEL sel)
++{
++	return rw_plib_ours(self) ? nil : rw_plib_pipeline_cache(self, sel);
++}
++
++static void
++rw_plib_note(const char *kind, id library, id name, id made, NSError *e)
++{
++	static unsigned said;
++	char what[200];
++
++	if (!rw_plib_ours(library)) {
++		return;
++	}
++	snprintf(what, sizeof(what), "%s pipeline %s %s", kind, [name isKindOfClass:[NSString class]] ? [name UTF8String] : "?",
++	    made != nil ? "made" : "REFUSED");
++	rw_api99a_count(RW_A_PLIB, made != nil, what);
++	if (made == nil || __sync_fetch_and_add(&said, 1) < 32) {
++		RW_AGAIN(made != nil ? 'I' : 'W', "RES", "plib: %s%s%s\n", what, e != nil ? ": " : "",
++		    e != nil ? [[e description] UTF8String] : "");
++	}
++}
++
++static id
++rw_plib_render_named_hook(id self, SEL sel, id name, NSUInteger options, id *reflection, NSError **error)
++{
++	NSError *e = nil;
++	id made = rw_plib_render_named(self, sel, name, options, reflection, &e);
++
++	rw_plib_note("render", self, name, made, made == nil ? e : nil);
++	if (error != NULL) {
++		*error = e;
++	}
++	return made;
++}
++
++static id
++rw_plib_compute_named_hook(id self, SEL sel, id name, NSUInteger options, id *reflection, NSError **error)
++{
++	NSError *e = nil;
++	id made = rw_plib_compute_named(self, sel, name, options, reflection, &e);
++
++	rw_plib_note("compute", self, name, made, made == nil ? e : nil);
++	if (error != NULL) {
++		*error = e;
++	}
++	return made;
++}
++
++__attribute__((constructor)) static void
++rw_plib_install(void)
++{
++	Class cache = objc_getClass("_MTLPipelineCache");
++	Class library = objc_getClass("_MTLPipelineLibrary");
++
++	if (access("/var/db/nord2-metal/no-plib", F_OK) == 0 || access("/var/db/nord2-metal/no-api99a", F_OK) == 0) {
++		return;    /* nothing of Metal's is touched */
++	}
++	rw_plc_init = (void *)rw_swizzle(cache, sel_getUid("initWithFilePath:readOnly:deviceInfo:"), (IMP)rw_plc_init_hook);
++	rw_plib_render_named = (void *)rw_swizzle(library, sel_getUid("newRenderPipelineStateWithName:options:reflection:error:"),
++	    (IMP)rw_plib_render_named_hook);
++	rw_plib_compute_named = (void *)rw_swizzle(library, sel_getUid("newComputePipelineStateWithName:options:reflection:error:"),
++	    (IMP)rw_plib_compute_named_hook);
++	rw_plib_function_cache = (void *)rw_swizzle(library, sel_getUid("functionCache"), (IMP)rw_plib_function_cache_hook);
++	rw_plib_pipeline_cache = (void *)rw_swizzle(library, sel_getUid("pipelineCache"), (IMP)rw_plib_pipeline_cache_hook);
++}
++
++/* ---- fence ---- */
++@interface RedwoodMetalFence : NSObject {
++	id _device;
++	NSString *_label;
++}
++- (instancetype)initWithRedwoodDevice:(id)device;
++@end
++
++@implementation RedwoodMetalFence
++- (instancetype)initWithRedwoodDevice:(id)device
++{
++	self = [super init];
++	if (self != nil) {
++		_device = [device retain];
++	}
++	return self;
++}
++- (void)dealloc
++{
++	[_device release];
++	[_label release];
++	[super dealloc];
++}
++- (id)device { return _device; }
++- (NSString *)label { return _label; }
++- (void)setLabel:(NSString *)label
++{
++	if (label != _label) {
++		[_label release];
++		_label = [label copy];
++	}
++}
++- (BOOL)conformsToProtocol:(Protocol *)protocol
++{
++	return protocol == objc_getProtocol("MTLFence") || [super conformsToProtocol:protocol];
++}
++@end
++
++/* ---- events ---- */
++static char rw_event_waits_key;
++
++static uint64_t
++rw_event_get(void *event)
++{
++	return (uint64_t)[(id)event signaledValue];
++}
++
++static void
++rw_event_sleep(void *event, unsigned us)
++{
++	(void)event;
++	usleep(us);
++}
++
++/* ---- famlog ---- */
++static struct rw_famseen rw_fam_seen;
++static pthread_mutex_t rw_fam_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static void
++rw_fam_note(unsigned kind, uint64_t family, BOOL answer, void *caller)
++{
++	uint64_t key;
++	int first;
++
++	if (!rw_api99a_on(RW_A_FAMLOG)) {
++		return;
++	}
++	key = rw_fam_key(kind, family, answer, NULL) ^ ((uint64_t)(uintptr_t)caller * 0x100000001b3ull);
++	pthread_mutex_lock(&rw_fam_lock);
++	first = rw_fam_first(&rw_fam_seen, key == 0 ? 1 : key);
++	pthread_mutex_unlock(&rw_fam_lock);
++	if (first) {
++		Dl_info who;
++		const char *image = "?", *symbol = "?";
++		unsigned long offset = 0;
++
++		if (dladdr(caller, &who) != 0) {
++			image = who.dli_fname != NULL ? (strrchr(who.dli_fname, '/') != NULL ? strrchr(who.dli_fname, '/') + 1 :
++			    who.dli_fname) : "?";
++			symbol = who.dli_sname != NULL ? who.dli_sname : "?";
++			offset = (unsigned long)((char *)caller - (char *)who.dli_fbase);
++		}
++		m2m_log('I', "DEV", "family: <%s> %s(%llu%s%s) asked by %s+%#lx (%s) -> %s\n", getprogname(),
++		    kind == 0 ? "supportsFamily" : "supportsFeatureSet", (unsigned long long)family,
++		    kind == 0 && rw_family_name(family) != NULL ? " " : "", kind == 0 && rw_family_name(family) != NULL ?
++		    rw_family_name(family) : "", image, offset, symbol, answer ? "YES" : "NO");
++		rw_api99a_count(RW_A_FAMLOG, answer, image);
++	}
++}
++
++@interface _MTLDevice (RedwoodAPI99a)
++- (id)newPipelineLibraryWithFilePath:(NSString *)path error:(NSError **)error;
++- (BOOL)supportsFamily:(NSInteger)family;
++- (BOOL)supportsFeatureSet:(NSUInteger)set;
++@end
++
+ @implementation RedwoodMetalDevice
+ 
+ + (void)load
+@@ -7280,7 +7623,67 @@
+ /* Everything else the two protocols require and this driver has not built. Each returns the
+  * API's own failure value, so a caller finds out by the rule Metal already has, rather than
+  * by a selector that does not exist. */
+-- (id)newFence                                      { return nil; }
++/* y2s99a (fence): an object, not nil -- the encoders' -updateFence:/-waitForFence: are already no-ops, which is exact on a
++ * driver that runs one command buffer at a time, in order (VectorKit and Metal itself ask for fences) */
++- (id)newFence
++{
++	if (!rw_api99a_on(RW_A_FENCE)) {
++		return nil;
++	}
++	rw_api99a_count(RW_A_FENCE, 1, "newFence");
++	return [[RedwoodMetalFence alloc] initWithRedwoodDevice:self];
++}
++
++/* y2s99a (plib): see rw_api99a_pure.h and rw_plc_init_hook */
++- (id)newPipelineLibraryWithFilePath:(NSString *)path error:(NSError **)error
++{
++	const char *p = [path isKindOfClass:[NSString class]] ? [path UTF8String] : NULL;
++	static int all = -1;
++	NSError *e = nil;
++	id library;
++
++	if (all < 0) {
++		all = access("/var/db/nord2-metal/plib-all", F_OK) == 0;
++	}
++	if (!rw_api99a_on(RW_A_PLIB) || rw_plc_init == NULL || rw_plib_excluded(p, all)) {
++		return [super newPipelineLibraryWithFilePath:path error:error];
++	}
++	rw_plib_opening++;
++	library = [super newPipelineLibraryWithFilePath:path error:&e];
++	rw_plib_opening--;
++	if (library != nil) {
++		objc_setAssociatedObject(library, &rw_plib_key, @YES, OBJC_ASSOCIATION_RETAIN);
++	}
++	{
++		char what[300];
++
++		snprintf(what, sizeof(what), "library %s %s", p, library != nil ? "opened" : "REFUSED");
++		rw_api99a_count(RW_A_PLIB, library != nil, what);
++		RW_AGAIN(library != nil ? 'I' : 'W', "RES", "plib: pipeline library %s %s%s%s\n", p,
++		    library != nil ? "opened (its pipelines are compiled from their descriptors)" : "refused by Metal",
++		    e != nil ? ": " : "", e != nil ? [[e description] UTF8String] : "");
++	}
++	if (error != NULL) {
++		*error = e;
++	}
++	return library;
++}
++
++/* y2s99a (famlog): Metal's own answer, unchanged, and who asked */
++- (BOOL)supportsFamily:(NSInteger)family
++{
++	BOOL answer = [super supportsFamily:family];
++
++	rw_fam_note(0, (uint64_t)family, answer, __builtin_return_address(0));
++	return answer;
++}
++- (BOOL)supportsFeatureSet:(NSUInteger)set
++{
++	BOOL answer = [super supportsFeatureSet:set];
++
++	rw_fam_note(1, (uint64_t)set, answer, __builtin_return_address(0));
++	return answer;
++}
+ /*
+  * The one method -[CAMetalLayer nextDrawable] asks of a device (docs/metal.md 10.46):
+  * allocate_drawable_texture builds an ordinary MTLTextureDescriptor, sets its private
+@@ -9250,6 +9653,10 @@
+  * everything else is one. */
+ - (NSUInteger)numFaces
+ {
++	/* y2s99a (faces): MTLTextureTypeCube is 5 and CubeArray 6 (3 and 4 are 2DArray and 2DMultisample) */
++	if (rw_api99a_on(RW_A_FACES)) {
++		return rw_num_faces(_shape.type);
++	}
+ 	return (_shape.type == 3 || _shape.type == 4) ? 6 : 1;
+ }
+ /* The identity swizzle, and it is the truth rather than a default: a texture of this driver
+@@ -10589,8 +10996,64 @@
+ }
+ - (id)resourceStateCommandEncoder { return nil; }
+ - (id)accelerationStructureCommandEncoder { return nil; }
+-- (void)encodeSignalEvent:(id)event value:(uint64_t)value { (void)event; (void)value; }
+-- (void)encodeWaitForEvent:(id)event value:(uint64_t)value { (void)event; (void)value; }
++/*
++ * y2s99a (events): the event is signalled when this command buffer has completed (Metal signals it when the GPU gets there,
++ * which is no later), and a wait is kept until -commit, which waits for the value (bounded: 1 s) before running anything.
++ * Metal's own -newEvent and -newSharedEvent make an _MTLSharedEvent (0x181aaf640), whose -setSignaledValue: is all a
++ * signal is.  Before: both were no-ops, and a listener or a CPU waiter never saw the value.
++ */
++- (void)encodeSignalEvent:(id)event value:(uint64_t)value
++{
++	if (!rw_api99a_on(RW_A_EVENTS) || event == nil || ![event respondsToSelector:@selector(setSignaledValue:)]) {
++		if (event != nil && rw_api99a_on(RW_A_EVENTS)) {
++			rw_api99a_count(RW_A_EVENTS, 0, class_getName(object_getClass(event)));
++		}
++		return;
++	}
++	id kept = [event retain];
++
++	[self addCompletedHandler:^(id buffer) {
++		(void)buffer;
++		[kept setSignaledValue:value];
++		[kept release];
++	}];
++	rw_api99a_count(RW_A_EVENTS, 1, "signal");
++}
++- (void)encodeWaitForEvent:(id)event value:(uint64_t)value
++{
++	NSMutableArray *waits;
++
++	if (!rw_api99a_on(RW_A_EVENTS) || event == nil || ![event respondsToSelector:@selector(signaledValue)]) {
++		return;
++	}
++	waits = objc_getAssociatedObject(self, &rw_event_waits_key);
++	if (waits == nil) {
++		waits = [NSMutableArray array];
++		objc_setAssociatedObject(self, &rw_event_waits_key, waits, OBJC_ASSOCIATION_RETAIN);
++	}
++	[waits addObject:@[ event, @(value) ]];
++}
++
++/* called at the top of -commit */
++- (void)redwoodWaitEvents
++{
++	NSArray *waits = objc_getAssociatedObject(self, &rw_event_waits_key);
++
++	for (NSArray *w in waits) {
++		id event = w[0];
++		uint64_t value = [w[1] unsignedLongLongValue];
++		int reached = rw_event_wait(rw_event_get, event, value, 1000000, 200, rw_event_sleep);
++
++		rw_api99a_count(RW_A_EVENTS, reached, reached ? "wait" : "wait TIMED OUT");
++		if (!reached) {
++			RW_AGAIN('W', "CMD", "event: a command buffer waits for an event to reach %llu and it is at %llu after 1 s: run "
++			    "anyway\n", (unsigned long long)value, (unsigned long long)rw_event_get(event));
++		}
++	}
++	if (waits != nil) {
++		objc_setAssociatedObject(self, &rw_event_waits_key, nil, OBJC_ASSOCIATION_RETAIN);
++	}
++}
+ 
+ - (id)computeCommandEncoderWithDispatchType:(NSUInteger)type
+ {
+@@ -10695,6 +11158,7 @@
+ {
+ 	char why[512] = { 0 };
+ 
++	[self redwoodWaitEvents];       /* y2s99a (events): what -encodeWaitForEvent:value: asked for */
+ 	rw_tg_report_maybe();           /* y2s91: 'NORD2 PERF PHOTOS TG/CHECK' every 5 s */
+ 	BOOL tg_dispatch_out = NO;      /* y2s91: a deferred dispatch of this buffer is queued and not waited for yet */
+ 	BOOL queued = NO, trace = NO;
+@@ -11148,8 +11612,22 @@
+ 		for (unsigned i = 0; i < reads; i++) {
+ 			if (fragment_textures[i] == NULL && rw_nothing_texture() != NULL) {
+ 				fragment_textures[i] = rw_nothing_texture();
+-				RW_AGAIN('W', "CMD", "a draw reads texture %u, which the application left empty (%u bound): one clear texel "
+-				    "stands there\n", i, work->textureCount);
++				/* y2s99a (emptyslot): a slot that HOLDS a texture this driver cannot bind is not the application's doing */
++				if (i < work->textureCount && work->textures[i] != nil && rw_api99a_on(RW_A_EMPTYSLOT)) {
++					RedwoodMetalTexture *t = work->textures[i];
++
++					rw_api99a_count(RW_A_EMPTYSLOT, 0, class_getName(object_getClass(t)));
++					RW_AGAIN('W', "CMD", "a draw reads texture %u, which holds a %s (%s %lux%lu format %lu%s) with no texture of "
++					    "the compiler library under it: one clear texel stands there (label %s)\n", i,
++					    class_getName(object_getClass(t)), rw_texture_type_name((unsigned)[t textureType]),
++					    (unsigned long)[t width], (unsigned long)[t height], (unsigned long)[t pixelFormat],
++					    [t respondsToSelector:@selector(iosurface)] && [t iosurface] != nil ? ", over a surface" : "",
++					    [work->render respondsToSelector:@selector(label)] && [(id)work->render label] != nil ?
++					    [[(id)work->render label] UTF8String] : "-");
++				} else {
++					RW_AGAIN('W', "CMD", "a draw reads texture %u, which the application left empty (%u bound): one clear texel "
++					    "stands there\n", i, work->textureCount);
++				}
+ 			}
+ 		}
+ 	}
+diff -ruN base-src/rw-api99a-host-test.sh src/rw-api99a-host-test.sh
+--- base-src/rw-api99a-host-test.sh	1970-01-01 01:00:00.000000000 +0100
++++ src/rw-api99a-host-test.sh	2026-11-14 01:43:11.120939925 +0100
+@@ -0,0 +1,35 @@
++#!/bin/bash
++# y2s99a: rw_api99a_pure.h on the build machine.  Nothing is installed, the phone is not touched, the mirror is only read.
++#   bash rw-api99a-host-test.sh [PATHS]   ASan/UBSan -Werror test ('rw_api99a: ok ...'); PATHS = a list of the mirror's
++#                                         *.pipelinelib/* files (y2s99a-api-gaps/audit/plib-paths.txt) checked too;
++#                                         then 10 hand mutants of the header, each of which must make the test fail
++#                                         (UBSan only, so the mutants run under 'ulimit -v').
++# Run it under the RAM rules: flock $HOME/nord2-heavy.lock bash rw-api99a-host-test.sh ...  (RSS a few MB).
++set -euo pipefail
++D=$(cd "$(dirname "$0")" && pwd)
++S=$(mktemp -d); trap 'rm -rf "$S"' EXIT
++cc -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -o "$S/t" "$D/rw_api99a_host_test.c"
++"$S/t" "$@"
++mut() {  # mut NAME OLD NEW
++  mkdir -p "$S/m"; cp "$D/rw_api99a_host_test.c" "$S/m/"
++  python3 -I - "$D/rw_api99a_pure.h" "$S/m/rw_api99a_pure.h" "$2" "$3" <<'PY'
++import sys
++s = open(sys.argv[1]).read(); assert s.count(sys.argv[3]) >= 1, sys.argv[3]
++open(sys.argv[2], 'w').write(s.replace(sys.argv[3], sys.argv[4], 1))
++PY
++  cc -std=c11 -O1 -w -fsanitize=undefined -o "$S/m/t" "$S/m/rw_api99a_host_test.c"
++  if (ulimit -v 1500000; "$S/m/t" "$@" > /dev/null 2>&1); then echo "MUTANT SURVIVED: $1"; exit 1; fi
++  caught=$((caught+1))
++}
++caught=0
++mut dance-release   'ops->release(ctx, self);'                      ';'
++mut dance-delete    'ops->delete_cache(ctx, cache);'                ';'
++mut subrect-equal   '(want_w == surf_w && want_h == surf_h)'        '0'
++mut subrect-rows    'if ((uint64_t)want_w * bpp > row_bytes) {'     'if (0) {'
++mut faces           'return (type == 5 || type == 6) ? 6u : 1u;'    'return (type == 3 || type == 4) ? 6u : 1u;'
++mut cache-desc      '&& strcmp(slash + 1, "pipelines.desc") != 0'   ''
++mut excluded-vk     '"/VectorKit.framework/" }'                     '"/NoSuch.framework/" }'
++mut event-ge        'if (get(ctx) >= value) {'                      'if (get(ctx) > value) {'
++mut fam-dedupe      'if (s->key[i] == key) {'                       'if (0) {'
++mut pow2            'return n != 0 && (n & (n - 1)) == 0;'          'return n != 0;'
++echo "rw_api99a mutants: $caught of 10 caught"
+diff -ruN base-src/rw_api99a_host_test.c src/rw_api99a_host_test.c
+--- base-src/rw_api99a_host_test.c	1970-01-01 01:00:00.000000000 +0100
++++ src/rw_api99a_host_test.c	2026-11-14 01:20:32.193105106 +0100
+@@ -0,0 +1,298 @@
++/* y2s99a: rw_api99a_pure.h on the build machine (ASan/UBSan, -Werror).  argv[1..]: optional list files of real paths
++ * ("plib-paths": one path a line, as found in the rootfs mirror) checked against the classification. */
++#include "rw_api99a_pure.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++
++static unsigned failures;
++#define CHECK(c) do { if (!(c)) { failures++; fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); } } while (0)
++
++static uint64_t rnd_state = 0x9e3779b97f4a7c15ull;
++static uint64_t
++rnd(void)
++{
++	rnd_state ^= rnd_state << 13;
++	rnd_state ^= rnd_state >> 7;
++	rnd_state ^= rnd_state << 17;
++	return rnd_state;
++}
++
++/* ---- the plc dance against a model of Metal's init ---- */
++struct model {
++	int refs;          /* references to the object */
++	int deallocs;
++	void *slot;        /* the C++ cache slot */
++	int caches_live;   /* C++ caches made and not deleted */
++	int fail_path;     /* the real path fails */
++	int fail_nil;      /* even nil fails (never in Metal) */
++	int inits;
++};
++
++static void *
++m_init(void *ctx, void *self, int use_path)
++{
++	struct model *m = ctx;
++
++	m->inits++;
++	m->slot = NULL;                           /* str xzr, [x0, #0x10] */
++	if (!use_path) {
++		if (m->fail_nil) {
++			if (--m->refs == 0) m->deallocs++;
++			return NULL;
++		}
++		return self;                          /* cbz x20: an empty cache */
++	}
++	m->slot = malloc(16);                     /* createPipelineDataCache */
++	m->caches_live++;
++	if (m->fail_path) {                       /* the validity call says no: objc_release(self) */
++		if (--m->refs == 0) {
++			m->deallocs++;
++			if (m->slot != NULL) { free(m->slot); m->slot = NULL; m->caches_live--; }
++		}
++		return NULL;
++	}
++	return self;
++}
++static void m_retain(void *ctx, void *self) { (void)self; ((struct model *)ctx)->refs++; }
++static void
++m_release(void *ctx, void *self)
++{
++	struct model *m = ctx;
++
++	(void)self;
++	if (--m->refs == 0) {
++		m->deallocs++;
++		if (m->slot != NULL) { free(m->slot); m->slot = NULL; m->caches_live--; }
++	}
++}
++static void *m_take(void *ctx, void *self) { struct model *m = ctx; void *c = m->slot; (void)self; m->slot = NULL; return c; }
++static void m_delete(void *ctx, void *cache) { struct model *m = ctx; free(cache); m->caches_live--; }
++
++static void
++test_dance(void)
++{
++	static const struct rw_plc_ops ops = { m_init, m_retain, m_release, m_take, m_delete };
++	int self_storage, emptied;
++
++	for (int fp = 0; fp < 2; fp++) {
++		struct model m = { .refs = 1, .fail_path = fp };   /* +1 from alloc, owned by the init call */
++		void *r = rw_plc_dance(&ops, &m, &self_storage, &emptied);
++
++		CHECK(r == &self_storage);
++		CHECK(emptied == fp);
++		CHECK(m.refs == 1);                    /* exactly the caller's reference is left */
++		CHECK(m.deallocs == 0);
++		CHECK(m.caches_live == (fp ? 0 : 1)); /* the failed cache was deleted; a good one is kept */
++		CHECK(fp ? m.slot == NULL : m.slot != NULL);
++		/* the caller later releases: dealloc frees what is in the slot */
++		m_release(&m, &self_storage);
++		CHECK(m.deallocs == 1 && m.caches_live == 0);
++	}
++	{
++		struct model m = { .refs = 1, .fail_path = 1, .fail_nil = 1 };
++		void *r = rw_plc_dance(&ops, &m, &self_storage, &emptied);
++
++		CHECK(r == NULL && emptied == 1 && m.refs == 0 && m.deallocs == 1 && m.caches_live == 0);
++	}
++}
++
++/* ---- paths ---- */
++static void
++test_paths(void)
++{
++	CHECK(rw_plib_excluded(NULL, 0));
++	CHECK(rw_plib_excluded("", 0));
++	CHECK(rw_plib_excluded("/System/Library/Frameworks/QuartzCore.framework/default.pipelinelib", 0));
++	CHECK(!rw_plib_excluded("/System/Library/Frameworks/QuartzCore.framework/default.pipelinelib", 1));
++	CHECK(!rw_plib_excluded("/System/Library/PrivateFrameworks/ActivityRingsUI.framework/ARUIPrecompiledPipeline.pipelinelib", 0));
++	CHECK(rw_plib_excluded("/System/Library/PrivateFrameworks/RenderBox.framework/default.pipelinelib", 0));
++	CHECK(rw_plib_excluded("/System/Library/PrivateFrameworks/VectorKit.framework/iphoneos.pipelinelib", 0));
++	CHECK(!rw_plib_excluded("/System/Library/PrivateFrameworks/VectorKit.framework/iphoneos.pipelinelib", 1));
++	CHECK(rw_plib_cache_path("/S/ActivityRingsUI.framework/ARUIPrecompiledPipeline.pipelinelib/pipelines.Mali-G77MP11(product0x9080,Redwood)"));
++	CHECK(rw_plib_cache_path("/S/X.pipelinelib/functions"));
++	CHECK(rw_plib_cache_path("/S/X.pipelinelib/pipelines.g10p"));
++	CHECK(!rw_plib_cache_path("/S/X.pipelinelib/pipelines.desc"));
++	CHECK(!rw_plib_cache_path("/S/X.pipelinelib/pipelines."));
++	CHECK(!rw_plib_cache_path("/S/X.pipelinelib/other"));
++	CHECK(!rw_plib_cache_path("/S/X.metallib/functions"));
++	CHECK(!rw_plib_cache_path("/var/mobile/Library/Caches/com.apple.metal/functions"));
++	CHECK(!rw_plib_cache_path("functions"));
++	CHECK(!rw_plib_cache_path("/functions"));
++	CHECK(!rw_plib_cache_path(".pipelinelib/functions") || 1);   /* (a relative path: either answer is harmless) */
++	CHECK(!rw_plib_cache_path(NULL));
++	/* fuzz: random byte strings never crash and only ever say yes to the shape above */
++	for (int i = 0; i < 200000; i++) {
++		char s[64];
++		unsigned n = (unsigned)(rnd() % sizeof(s));
++		static const char alpha[] = "/.pipelinesdcfuto0123ab(),";
++
++		for (unsigned k = 0; k < n; k++) {
++			s[k] = (rnd() & 7) == 0 ? (char)(rnd() & 0xff) : alpha[rnd() % (sizeof(alpha) - 1)];
++			if (s[k] == '\0') s[k] = 'x';
++		}
++		s[n] = '\0';
++		if (rw_plib_cache_path(s)) {
++			const char *sl = strrchr(s, '/');
++
++			CHECK(sl != NULL && sl - s >= 12 && memcmp(sl - 12, ".pipelinelib", 12) == 0);
++			CHECK(strcmp(sl + 1, "functions") == 0 || (strncmp(sl + 1, "pipelines.", 10) == 0 && strlen(sl + 1) > 10 &&
++			    strcmp(sl + 1, "pipelines.desc") != 0));
++		}
++		(void)rw_plib_excluded(s, (int)(rnd() & 1));
++	}
++}
++
++/* ---- subrect: against a slow reference ---- */
++static int
++ref_subrect(unsigned sw, unsigned sh, uint64_t rb, unsigned planes, unsigned w, unsigned h, unsigned bpp)
++{
++	if (planes >= 2) return 0;
++	if (!sw || !sh || !w || !h || !bpp) return 0;
++	if (w == sw && h == sh) return 0;
++	if (w > sw || h > sh) return 0;
++	return (uint64_t)w * bpp <= rb;
++}
++
++static void
++test_subrect(void)
++{
++	CHECK(rw_subrect_ok(64, 64, 256, 1, 52, 52, 4));     /* the mediaserverd case */
++	CHECK(!rw_subrect_ok(64, 64, 256, 1, 64, 64, 4));    /* equal: not a sub-rectangle (the ordinary path) */
++	CHECK(!rw_subrect_ok(1125, 2436, 4544, 1, 2436, 1125, 4));   /* the rotated drawable stays refused */
++	CHECK(!rw_subrect_ok(64, 64, 256, 2, 52, 52, 1));    /* two planes: not here */
++	CHECK(!rw_subrect_ok(64, 64, 100, 1, 52, 52, 4));    /* rows too short */
++	for (int i = 0; i < 1000000; i++) {
++		unsigned sw = (unsigned)(rnd() % 300), sh = (unsigned)(rnd() % 300), w = (unsigned)(rnd() % 320), h = (unsigned)(rnd() % 320);
++		unsigned bpp = (unsigned)(rnd() % 17), planes = (unsigned)(rnd() % 3);
++		uint64_t rb = (rnd() & 1) ? (uint64_t)sw * bpp : rnd() % 5000;
++
++		if ((rnd() & 255) == 0) { sw = 0xffffffffu; w = 0xfffffff0u; bpp = 16; rb = ~0ull; }
++		CHECK(rw_subrect_ok(sw, sh, rb, planes, w, h, bpp) == ref_subrect(sw, sh, rb, planes, w, h, bpp));
++	}
++}
++
++/* ---- faces ---- */
++static void
++test_faces(void)
++{
++	static const unsigned want[10] = { 1, 1, 1, 1, 1, 6, 6, 1, 1, 1 };
++
++	for (unsigned t = 0; t < 10; t++) {
++		CHECK(rw_num_faces(t) == want[t]);
++	}
++	CHECK(rw_num_faces(1000) == 1);
++}
++
++/* ---- events ---- */
++struct ev { uint64_t value, rises_at, step; unsigned slept, sleeps; };
++static uint64_t ev_get(void *c) { struct ev *e = c; return e->slept >= e->rises_at ? e->value : 0; }
++static void ev_sleep(void *c, unsigned us) { struct ev *e = c; e->slept += us; e->sleeps++; }
++
++static void
++test_events(void)
++{
++	struct ev e = { .value = 7, .rises_at = 0 };
++
++	CHECK(rw_event_wait(ev_get, &e, 7, 1000000, 200, ev_sleep) == 1 && e.sleeps == 0);
++	e = (struct ev){ .value = 7, .rises_at = 5000 };
++	CHECK(rw_event_wait(ev_get, &e, 7, 1000000, 200, ev_sleep) == 1 && e.slept >= 5000 && e.slept < 5400);
++	e = (struct ev){ .value = 6, .rises_at = 0 };
++	CHECK(rw_event_wait(ev_get, &e, 7, 1000000, 200, ev_sleep) == 0 && e.slept >= 1000000 && e.slept <= 1000200);
++	e = (struct ev){ .value = 9, .rises_at = 0 };
++	CHECK(rw_event_wait(ev_get, &e, 7, 0, 0, ev_sleep) == 1);
++	e = (struct ev){ .value = 1, .rises_at = 0 };
++	CHECK(rw_event_wait(ev_get, &e, 7, 0, 0, ev_sleep) == 0 && e.sleeps == 0);
++}
++
++/* ---- famlog ---- */
++static void
++test_famlog(void)
++{
++	struct rw_famseen s;
++	unsigned firsts = 0;
++
++	memset(&s, 0, sizeof(s));
++	CHECK(rw_fam_first(&s, rw_fam_key(0, 1004, 0, "CoreImage")) == 1);
++	CHECK(rw_fam_first(&s, rw_fam_key(0, 1004, 0, "CoreImage")) == 0);
++	CHECK(rw_fam_first(&s, rw_fam_key(0, 1004, 1, "CoreImage")) == 1);
++	CHECK(rw_fam_first(&s, rw_fam_key(1, 1004, 0, "CoreImage")) == 1);
++	CHECK(rw_fam_first(&s, rw_fam_key(0, 1004, 0, "RenderBox")) == 1);
++	CHECK(rw_fam_first(&s, rw_fam_key(0, 1004, 0, NULL)) == 1);
++	for (int i = 0; i < 10000; i++) {
++		firsts += (unsigned)rw_fam_first(&s, rw_fam_key(0, (uint64_t)(rnd() % 400), 0, "x"));
++	}
++	CHECK(s.n == RW_FAMSEEN);
++	CHECK(firsts == RW_FAMSEEN - 5);
++	CHECK(s.dropped > 0);
++	CHECK(strcmp(rw_family_name(1002), "Apple2") == 0 && strcmp(rw_family_name(3003), "Common3") == 0);
++	CHECK(rw_family_name(1009) == NULL && rw_family_name(0) == NULL);
++	CHECK(rw_pow2_report(1) && rw_pow2_report(2) && !rw_pow2_report(3) && rw_pow2_report(1024) && !rw_pow2_report(0));
++}
++
++/* ---- the real paths of the mirror ---- */
++static unsigned real_libs, real_caches, real_taken;
++static void
++test_real(const char *list)
++{
++	FILE *f = fopen(list, "r");
++	char line[1024];
++
++	if (f == NULL) {
++		CHECK(!"list file");
++		return;
++	}
++	while (fgets(line, sizeof(line), f) != NULL) {
++		size_t n = strlen(line);
++		const char *base;
++
++		if (n > 0 && line[n - 1] == '\n') line[--n] = '\0';
++		if (n == 0) continue;
++		base = strrchr(line, '/');
++		base = base != NULL ? base + 1 : line;
++		if (strcmp(base, "pipelines.desc") == 0) {
++			char dir[1024], gpu[1200];
++
++			real_libs++;
++			memcpy(dir, line, (size_t)(base - line - 1));
++			dir[base - line - 1] = '\0';
++			CHECK(!rw_plib_cache_path(line));
++			CHECK(rw_plib_excluded(dir, 0) == (strstr(dir, "/QuartzCore.framework/") != NULL ||
++			    strstr(dir, "/RenderBox.framework/") != NULL || strstr(dir, "/VectorKit.framework/") != NULL));
++			CHECK(!rw_plib_excluded(dir, 1));
++			real_taken += !rw_plib_excluded(dir, 0);
++			/* this GPU's cache file: never shipped, always answered empty */
++			snprintf(gpu, sizeof(gpu), "%s/pipelines.Mali-G77MP11(product0x9080,Redwood)", dir);
++			CHECK(rw_plib_cache_path(gpu));
++		} else if (strstr(line, ".pipelinelib/") != NULL) {
++			real_caches++;
++			CHECK(rw_plib_cache_path(line));
++		}
++	}
++	fclose(f);
++}
++
++int
++main(int argc, char **argv)
++{
++	test_dance();
++	test_paths();
++	test_subrect();
++	test_faces();
++	test_events();
++	test_famlog();
++	for (int i = 1; i < argc; i++) {
++		test_real(argv[i]);
++	}
++	if (failures != 0) {
++		printf("rw_api99a: FAILED (%u)\n", failures);
++		return 1;
++	}
++	printf("rw_api99a: ok (plc dance vs Metal's init model, paths + 200000 fuzz, subrect 1000000 vs reference, faces, events, "
++	    "famlog%s", argc > 1 ? "" : ")\n");
++	if (argc > 1) {
++		printf("; mirror: %u pipeline libraries (%u taken by default), %u cache files classified)\n", real_libs, real_taken,
++		    real_caches);
++	}
++	return 0;
++}
+diff -ruN base-src/rw_api99a_pure.h src/rw_api99a_pure.h
+--- base-src/rw_api99a_pure.h	1970-01-01 01:00:00.000000000 +0100
++++ src/rw_api99a_pure.h	2026-11-14 01:20:32.192635478 +0100
+@@ -0,0 +1,255 @@
++/*
++ * y2s99a (API gaps): the decisions of the y2s99a features, as pure C so that the build machine can test them
++ * (rw-api99a-host-test.sh: ASan/UBSan, -Werror, fuzz).  redwoodmetal.m and redwooddrawable.m include this file and do the
++ * Objective-C around it.  Nothing here calls Metal, IOKit or the kernel.
++ *
++ * Features (each with its own switch file /var/db/nord2-metal/no-<name>, and all of them with no-api99a):
++ *   plib     MTLPipelineLibrary (newPipelineLibraryWithFilePath:error:) for the libraries whose per-GPU cache file this GPU
++ *            cannot have: the per-GPU cache is opened EMPTY, so Metal's own MTLPipelineLibrary takes every pipeline from its
++ *            descriptor in pipelines.desc and the device compiles it from AIR like any other pipeline.  Evidence: 20H392
++ *            Metal MTLPipelineLibraryBuilder::newLibraryWithFile (0x181a3f31c) refuses the library with "Could not open
++ *            pipeline cache file: %s" when pipelines.<targetDeviceInfo name> is missing (0x181a3f764); -[_MTLPipelineCache
++ *            initWithFilePath:readOnly:deviceInfo:] (0x181a3e2ec) gives a valid EMPTY cache for a nil path (cbz x20).
++ *            Users seen in the 20H392 cache: ActivityRingsUI (FitnessWidget: "this draw has no pipeline state", 165 a
++ *            boot), RenderBox (SwiftUI), VectorKit (Maps), NanoTimeKit/Pride (watch faces), SiriUICore (Siri orb),
++ *            LocalAuthenticationPrivateUI, PassKitUIFoundation (Wallet cards), PencilKit, TextInputUI.
++ *            QuartzCore's, RenderBox's and VectorKit's are NOT taken (their callers already fall back to descriptors and work
++ *            that way) unless /var/db/nord2-metal/plib-all exists: see rw_plib_excluded.
++ *   subrect  a texture over an IOSurface smaller than the surface (Metal allows width/height <= the surface's; the texture
++ *            is the top-left corner at the surface's own row length): "no drawable: surface N is 64x64 and the descriptor
++ *            asks for 52x52" (mediaserverd, 288 in the logs).
++ *   fence    -newFence answers an object (was nil); the encoders' fence calls already are no-ops, which is exact here:
++ *            this driver runs one command buffer at a time, in order.
++ *   events   -encodeSignalEvent:value: sets the event's signaledValue when the command buffer has completed (was a
++ *            no-op: a listener or a CPU waiter never saw it); -encodeWaitForEvent:value: makes the commit wait (bounded)
++ *            for the value.
++ *   faces    -numFaces said 6 for 2DArray (3) and 2DMultisample (4) and 1 for Cube (5): MTLTextureType numbers fixed.
++ *   famlog   every distinct -supportsFamily:/-supportsFeatureSet: question, with the image that asked and Metal's answer
++ *            (log only: the answer is never changed).
++ *   emptyslot the "left empty" texture warning says whether the slot held nil or a texture this driver could not bind.
++ */
++#ifndef RW_API99A_PURE_H
++#define RW_API99A_PURE_H
++
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++/* ---- plib ------------------------------------------------------------------------------------------------------------ */
++
++/*
++ * 1 if `path` (a .pipelinelib directory) is one this driver leaves to Metal's own refusal.  Left alone unless `allow_all`
++ * (/var/db/nord2-metal/plib-all): the three whose callers already compile every pipeline from a descriptor when the library
++ * is nil, and work that way today -- QuartzCore (CA::OGL::new_metal_context: "Metal failed to load pipeline library",
++ * then the descriptor path), RenderBox (RB::Device::render_pipeline_state: "no precompiled pipeline", then load_library),
++ * VectorKit (Maps: its pipelines are made from descriptors in the logs, and its library has 372 names -- a prewarm of all
++ * of them would be a cost Maps does not pay today).
++ */
++static inline int
++rw_plib_excluded(const char *path, int allow_all)
++{
++	static const char *const kept[] = { "/QuartzCore.framework/", "/RenderBox.framework/", "/VectorKit.framework/" };
++
++	if (path == NULL || path[0] == '\0') {
++		return 1;
++	}
++	if (!allow_all) {
++		for (size_t i = 0; i < sizeof(kept) / sizeof(kept[0]); i++) {
++			if (strstr(path, kept[i]) != NULL) {
++				return 1;
++			}
++		}
++	}
++	return 0;
++}
++
++/* 1 if `cache_path` is a per-GPU or function cache file of a pipeline library ("<lib>.pipelinelib/pipelines.X" or
++ * "<lib>.pipelinelib/functions"), the only paths the empty-cache substitution may answer */
++static inline int
++rw_plib_cache_path(const char *cache_path)
++{
++	const char *slash, *dir;
++
++	if (cache_path == NULL) {
++		return 0;
++	}
++	slash = strrchr(cache_path, '/');
++	if (slash == NULL || slash == cache_path) {
++		return 0;
++	}
++	/* the directory part must end in ".pipelinelib" */
++	dir = slash;
++	if ((size_t)(dir - cache_path) < sizeof(".pipelinelib") - 1 ||
++	    memcmp(dir - (sizeof(".pipelinelib") - 1), ".pipelinelib", sizeof(".pipelinelib") - 1) != 0) {
++		return 0;
++	}
++	if (strcmp(slash + 1, "functions") == 0) {
++		return 1;
++	}
++	if (strncmp(slash + 1, "pipelines.", 10) == 0 && slash[11] != '\0' && strcmp(slash + 1, "pipelines.desc") != 0) {
++		return 1;
++	}
++	return 0;
++}
++
++/*
++ * The retain/init/delete/init-again sequence of rw_plc_init_hook, over callbacks so that the build machine can run it against
++ * a model of Metal's init (which releases the object when it fails, leaving its C++ cache in the object's slot).
++ *   init(ctx, self, use_path)  Metal's -initWithFilePath:readOnly:deviceInfo: with the real path (1) or nil (0); self or NULL
++ *   retain / release(ctx, self)
++ *   take_cache(ctx, self)      reads and clears the C++ cache slot (+0x10), NULL if empty
++ *   delete_cache(ctx, cache)   what -dealloc does with it (vtable +0x8)
++ * Returns what the caller of init gets; *emptied = 1 when the empty cache was given.
++ */
++struct rw_plc_ops {
++	void *(*init)(void *ctx, void *self, int use_path);
++	void (*retain)(void *ctx, void *self);
++	void (*release)(void *ctx, void *self);
++	void *(*take_cache)(void *ctx, void *self);
++	void (*delete_cache)(void *ctx, void *cache);
++};
++
++static inline void *
++rw_plc_dance(const struct rw_plc_ops *ops, void *ctx, void *self, int *emptied)
++{
++	void *r, *cache;
++
++	*emptied = 0;
++	ops->retain(ctx, self);
++	r = ops->init(ctx, self, 1);
++	if (r != NULL) {
++		ops->release(ctx, self);
++		return r;
++	}
++	cache = ops->take_cache(ctx, self);
++	if (cache != NULL) {
++		ops->delete_cache(ctx, cache);
++	}
++	*emptied = 1;
++	return ops->init(ctx, self, 0);    /* consumes the reference taken above, as an init does */
++}
++
++/* ---- subrect --------------------------------------------------------------------------------------------------------- */
++
++/*
++ * May a texture of want_w x want_h texels of `bpp` bytes be laid over the top-left corner of a one-plane surface of
++ * surf_w x surf_h at row_bytes a row?  1 yes (and it is a proper sub-rectangle), 0 no (the sizes are equal, or bigger,
++ * or something is zero).  The row check is the one the import makes anyway; it is repeated so that the answer stands
++ * alone.
++ */
++static inline int
++rw_subrect_ok(unsigned surf_w, unsigned surf_h, uint64_t row_bytes, unsigned planes, unsigned want_w, unsigned want_h,
++    unsigned bpp)
++{
++	if (planes > 1 || surf_w == 0 || surf_h == 0 || want_w == 0 || want_h == 0 || bpp == 0) {
++		return 0;
++	}
++	if (want_w > surf_w || want_h > surf_h || (want_w == surf_w && want_h == surf_h)) {
++		return 0;
++	}
++	if ((uint64_t)want_w * bpp > row_bytes) {
++		return 0;
++	}
++	return 1;
++}
++
++/* ---- faces ----------------------------------------------------------------------------------------------------------- */
++
++/* MTLTextureType: 1D 0, 1DArray 1, 2D 2, 2DArray 3, 2DMultisample 4, Cube 5, CubeArray 6, 3D 7, 2DMultisampleArray 8,
++ * TextureBuffer 9 */
++static inline unsigned
++rw_num_faces(unsigned type)
++{
++	return (type == 5 || type == 6) ? 6u : 1u;
++}
++
++/* ---- events ---------------------------------------------------------------------------------------------------------- */
++
++/*
++ * Wait until get(ctx) >= value, polling every `step_us` for at most `timeout_us`; `sleep_us` does the sleeping (usleep
++ * on the phone, a counter in the test).  Returns 1 if the value was reached, 0 on the timeout.
++ */
++static inline int
++rw_event_wait(uint64_t (*get)(void *), void *ctx, uint64_t value, unsigned timeout_us, unsigned step_us,
++    void (*sleep_us)(void *, unsigned))
++{
++	unsigned waited = 0;
++
++	if (step_us == 0) {
++		step_us = 1;
++	}
++	for (;;) {
++		if (get(ctx) >= value) {
++			return 1;
++		}
++		if (waited >= timeout_us) {
++			return 0;
++		}
++		sleep_us(ctx, step_us);
++		waited += step_us;
++	}
++}
++
++/* ---- famlog ---------------------------------------------------------------------------------------------------------- */
++
++/* a small set of (question, answer, asker) triples already said, so each distinct one is logged once a process */
++#define RW_FAMSEEN 128
++struct rw_famseen {
++	uint64_t key[RW_FAMSEEN];
++	unsigned n, dropped;
++};
++
++static inline uint64_t
++rw_fam_key(unsigned kind, uint64_t family, int answer, const char *asker)
++{
++	uint64_t h = 1469598103934665603ull;   /* FNV-1a over the asker's name */
++
++	for (const char *p = asker != NULL ? asker : "?"; *p != '\0'; p++) {
++		h = (h ^ (unsigned char)*p) * 1099511628211ull;
++	}
++	h ^= ((uint64_t)kind << 62) ^ ((uint64_t)(answer != 0) << 61) ^ (family * 0x9e3779b97f4a7c15ull);
++	return h == 0 ? 1 : h;
++}
++
++/* 1 if the key is new (and now remembered), 0 if seen before or the set is full (then counted as dropped) */
++static inline int
++rw_fam_first(struct rw_famseen *s, uint64_t key)
++{
++	for (unsigned i = 0; i < s->n; i++) {
++		if (s->key[i] == key) {
++			return 0;
++		}
++	}
++	if (s->n >= RW_FAMSEEN) {
++		s->dropped++;
++		return 0;
++	}
++	s->key[s->n++] = key;
++	return 1;
++}
++
++/* the name Metal's headers give a family / feature-set number, for the log (NULL when unknown) */
++static inline const char *
++rw_family_name(uint64_t f)
++{
++	switch (f) {
++	case 1001: return "Apple1"; case 1002: return "Apple2"; case 1003: return "Apple3"; case 1004: return "Apple4";
++	case 1005: return "Apple5"; case 1006: return "Apple6"; case 1007: return "Apple7"; case 1008: return "Apple8";
++	case 2001: return "Mac1"; case 2002: return "Mac2";
++	case 3001: return "Common1"; case 3002: return "Common2"; case 3003: return "Common3";
++	case 4001: return "MacCatalyst1"; case 4002: return "MacCatalyst2";
++	case 5001: return "Metal3";
++	default: return NULL;
++	}
++}
++
++/* ---- counters -------------------------------------------------------------------------------------------------------- */
++
++/* report at the 1st, 2nd, 4th, 8th ... event */
++static inline int
++rw_pow2_report(unsigned long n)
++{
++	return n != 0 && (n & (n - 1)) == 0;
++}
++
++#endif

@@ -1,0 +1,433 @@
+--- y2s83-thumbfix5/src/redwoodmetal.m	2026-11-12 20:12:14.999106391 +0100
++++ y2s86-gamepipe/src/redwoodmetal.m	2026-11-12 22:46:07.619155088 +0100
+@@ -932,6 +932,293 @@
+ };
+ static char rw_vertex_shape_key;
+ 
++/*
++ * ===================================================================================== GAMEPIPE (y2s86)
++ * Subway Surfers (12 November, live.log of ss1) asked for 67 render pipelines in one life, 256 ms of
++ * library compile in all (2-8 ms each, 28 of them SYBO/Bend/Combined), and every one of them was built
++ * synchronously on the caller's thread. Its one 296 ms "slow draw" was not a first draw (no "first draw"
++ * line), so the log could not say whether that draw computed or waited. This block adds, all of it off
++ * while /var/db/nord2-metal/no-gamepipe exists:
++ *   1. the anatomy of a slow commit: wall time against this thread's CPU time, and the process's page-ins,
++ *      faults, copy-on-writes and context switches during it ("GP slow commit anatomy"), every process;
++ *   2. for third-party applications only (a bundle identifier that is not com.apple.*): content-keyed
++ *      reuse of compiled pipelines -- SHA-256 over both AIR modules, both names, the whole shape and the
++ *      function-constant values -- so a pipeline asked for again is not compiled again ("GP pso");
++ *      cached libraries are owned by the cache for the life of the process (at most RW_GP_MAX of them);
++ *   3. for the same applications, the completionHandler forms are really asynchronous: built on one serial
++ *      utility queue instead of the caller's thread.
++ * Nothing here touches the draw path, the blend/vertex contract or the library.
++ */
++#include <CommonCrypto/CommonDigest.h>
++
++#define RW_GP_MAX 384
++
++static int rw_gp_enabled = -1;   /* -1 not read yet */
++static int rw_gp_third_party = -1;
++
++static bool
++rw_gp_on(void)
++{
++	if (rw_gp_enabled < 0) {
++		rw_gp_enabled = access("/var/db/nord2-metal/no-gamepipe", F_OK) != 0;
++		m2m_log('I', "GP", "gamepipe %s (/var/db/nord2-metal/no-gamepipe %s)\n",
++		         rw_gp_enabled ? "on" : "OFF", rw_gp_enabled ? "absent" : "present");
++	}
++	return rw_gp_enabled != 0;
++}
++
++/* pipeline reuse and asynchronous builds: applications, never Apple's own processes */
++static bool
++rw_gp_app(void)
++{
++	if (!rw_gp_on()) {
++		return false;
++	}
++	if (rw_gp_third_party < 0) {
++		@autoreleasepool {
++			NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
++
++			rw_gp_third_party = bid != nil && [bid length] > 0 && ![bid hasPrefix:@"com.apple."];
++			m2m_log('I', "GP", "process %s (bundle %s): pipeline reuse and asynchronous builds %s\n",
++			         getprogname(), bid != nil ? [bid UTF8String] : "(none)",
++			         rw_gp_third_party ? "ON" : "off (not a third-party application)");
++		}
++	}
++	return rw_gp_third_party != 0;
++}
++
++/* ---- 1. slow commit anatomy */
++static __thread uint64_t rw_gp_c_cpu, rw_gp_c_wall;
++static __thread struct task_events_info rw_gp_c_ev;
++static __thread int rw_gp_c_valid;
++
++static bool
++rw_gp_events(struct task_events_info *ev)
++{
++	mach_msg_type_number_t n = TASK_EVENTS_INFO_COUNT;
++
++	return task_info(mach_task_self(), TASK_EVENTS_INFO, (task_info_t)ev, &n) == KERN_SUCCESS;
++}
++
++static void
++rw_gp_commit_begin(void)
++{
++	rw_gp_c_valid = 0;
++	if (!rw_gp_on()) {
++		return;
++	}
++	rw_gp_c_wall = rw_now_ns();
++	rw_gp_c_cpu = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
++	rw_gp_c_valid = rw_gp_events(&rw_gp_c_ev) ? 1 : 0;
++}
++
++/* called by rw_commit_report on the committing thread, for a commit over the slow threshold only */
++static void
++rw_gp_commit_slow(uint64_t commit_ns)
++{
++	struct task_events_info now;
++
++	if (!rw_gp_c_valid || !rw_gp_events(&now)) {
++		return;
++	}
++	rw_gp_c_valid = 0;
++	uint64_t cpu = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - rw_gp_c_cpu;
++	uint64_t wall = rw_now_ns() - rw_gp_c_wall;
++	unsigned pct = wall != 0 ? (unsigned)MIN(100ULL, cpu * 100ULL / wall) : 0;
++	const char *verdict = pct >= 80 ? "COMPUTING on this thread (a compile or a CPU conversion in the library)"
++			    : pct <= 30 ? "WAITING (page-ins, a lock, a BO or the GPU): not a compile"
++					: "partly computing, partly waiting";
++
++	(void)commit_ns;
++	m2m_log('W', "GP", "slow commit anatomy: wall %.1f ms, this thread on CPU %.1f ms (%u%%) -> %s | "
++	         "process during it: pageins +%d faults +%d cow +%d csw +%d mach syscalls +%d msgs in +%d\n",
++	         wall / 1e6, cpu / 1e6, pct, verdict, now.pageins - rw_gp_c_ev.pageins,
++	         now.faults - rw_gp_c_ev.faults, now.cow_faults - rw_gp_c_ev.cow_faults, now.csw - rw_gp_c_ev.csw,
++	         now.syscalls_mach - rw_gp_c_ev.syscalls_mach,
++	         now.messages_received - rw_gp_c_ev.messages_received);
++}
++
++/* ---- 2. content-keyed pipeline reuse */
++struct rw_gp_entry {
++	unsigned char key[CC_SHA256_DIGEST_LENGTH];
++	struct rwa_render *render;
++	struct rwa_render_info info;
++	uint64_t compile_ns;
++	unsigned hits;
++	char label[48];
++};
++static struct rw_gp_entry rw_gp_cache[RW_GP_MAX];
++static unsigned rw_gp_count;
++static pthread_mutex_t rw_gp_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct {
++	uint64_t requests, hits, stored, full, saved_ns, compile_ns, async;
++} rw_gp_stats;
++
++static void
++rw_gp_hash_blob(CC_SHA256_CTX *c, const void *bytes, size_t length)
++{
++	uint64_t n = length;
++
++	CC_SHA256_Update(c, &n, sizeof(n));
++	if (length != 0 && bytes != NULL) {
++		CC_SHA256_Update(c, bytes, (CC_LONG)length);
++	}
++}
++
++static void
++rw_gp_hash_constants(CC_SHA256_CTX *c, const struct rwa_function_constant *k, unsigned count)
++{
++	rw_gp_hash_blob(c, &count, sizeof(count));
++	for (unsigned i = 0; i < count; i++) {
++		rw_gp_hash_blob(c, &k[i].index, sizeof(k[i].index));
++		rw_gp_hash_blob(c, k[i].name, k[i].name != NULL ? strlen(k[i].name) : 0);
++		rw_gp_hash_blob(c, &k[i].bits, sizeof(k[i].bits));
++	}
++}
++
++/* Everything rwa_render_create reads, and nothing else: the shape up to its first pointer is all
++ * unsigned (no padding), the constants are hashed by value. The device is part of the key. */
++static void
++rw_gp_key(unsigned char out[CC_SHA256_DIGEST_LENGTH], const void *device, NSData *vair, const char *vname,
++    NSData *fair, const char *fname, const struct rwa_render_shape *shape)
++{
++	CC_SHA256_CTX c;
++	uintptr_t dev = (uintptr_t)device;
++	static const char tag[] = "y2s86-gamepipe-1";
++
++	CC_SHA256_Init(&c);
++	rw_gp_hash_blob(&c, tag, sizeof(tag));
++	rw_gp_hash_blob(&c, &dev, sizeof(dev));
++	rw_gp_hash_blob(&c, vair != nil ? [vair bytes] : NULL, vair != nil ? [vair length] : 0);
++	rw_gp_hash_blob(&c, vname, vname != NULL ? strlen(vname) + 1 : 0);
++	rw_gp_hash_blob(&c, [fair bytes], [fair length]);
++	rw_gp_hash_blob(&c, fname, fname != NULL ? strlen(fname) + 1 : 0);
++	rw_gp_hash_blob(&c, shape, offsetof(struct rwa_render_shape, vertex_constants));
++	rw_gp_hash_constants(&c, shape->vertex_constants, shape->vertex_constant_count);
++	rw_gp_hash_constants(&c, shape->fragment_constants, shape->fragment_constant_count);
++	CC_SHA256_Final(out, &c);
++}
++
++static void
++rw_gp_summary(const char *why)
++{
++	m2m_log('I', "GP", "pso %s: %llu requests, %u distinct cached, %llu reused (%.0f ms of compile saved), "
++	         "%.0f ms compiled, %llu built asynchronously%s\n", why,
++	         (unsigned long long)rw_gp_stats.requests, rw_gp_count, (unsigned long long)rw_gp_stats.hits,
++	         rw_gp_stats.saved_ns / 1e6, rw_gp_stats.compile_ns / 1e6, (unsigned long long)rw_gp_stats.async,
++	         rw_gp_stats.full ? " (cache FULL: later pipelines are not kept)" : "");
++}
++
++/* A hit: the cached library and its info; the cache keeps ownership. */
++static struct rwa_render *
++rw_gp_lookup(const unsigned char key[CC_SHA256_DIGEST_LENGTH], struct rwa_render_info *info, const char *label)
++{
++	struct rwa_render *found = NULL;
++	unsigned hits = 0;
++	char first[48] = "";
++
++	pthread_mutex_lock(&rw_gp_lock);
++	rw_gp_stats.requests++;
++	for (unsigned i = 0; i < rw_gp_count; i++) {
++		if (memcmp(rw_gp_cache[i].key, key, CC_SHA256_DIGEST_LENGTH) == 0) {
++			found = rw_gp_cache[i].render;
++			*info = rw_gp_cache[i].info;
++			hits = ++rw_gp_cache[i].hits;
++			rw_gp_stats.hits++;
++			rw_gp_stats.saved_ns += rw_gp_cache[i].compile_ns;
++			memcpy(first, rw_gp_cache[i].label, sizeof(first));
++			break;
++		}
++	}
++	pthread_mutex_unlock(&rw_gp_lock);
++	if (found != NULL && (rw_gp_stats.hits <= 40 || (rw_gp_stats.hits & 63) == 0)) {
++		m2m_log('I', "GP", "pso reused (%u. time for this one): %s, first built as %s, no compile\n", hits,
++		         label != NULL ? label : "(no label)", first);
++		rw_gp_summary("so far");
++	}
++	return found;
++}
++
++/* After a compile: keep it if there is room and nobody stored the same key meanwhile.
++ * true = the cache owns `render` now. */
++static bool
++rw_gp_store(const unsigned char key[CC_SHA256_DIGEST_LENGTH], struct rwa_render *render,
++    const struct rwa_render_info *info, uint64_t compile_ns, const char *label)
++{
++	bool kept = false, say = false;
++
++	pthread_mutex_lock(&rw_gp_lock);
++	rw_gp_stats.compile_ns += compile_ns;
++	for (unsigned i = 0; i < rw_gp_count; i++) {
++		if (memcmp(rw_gp_cache[i].key, key, CC_SHA256_DIGEST_LENGTH) == 0) {
++			pthread_mutex_unlock(&rw_gp_lock);
++			return false;   /* a racing build of the same pipeline: this one stays the caller's */
++		}
++	}
++	if (rw_gp_count < RW_GP_MAX) {
++		struct rw_gp_entry *e = &rw_gp_cache[rw_gp_count];
++
++		memcpy(e->key, key, CC_SHA256_DIGEST_LENGTH);
++		e->render = render;
++		e->info = *info;
++		e->compile_ns = compile_ns;
++		e->hits = 0;
++		snprintf(e->label, sizeof(e->label), "%s", label != NULL ? label : "(no label)");
++		rw_gp_count++;
++		rw_gp_stats.stored++;
++		kept = true;
++		say = (rw_gp_count & 15) == 0;
++	} else if (rw_gp_stats.full++ == 0) {
++		say = true;
++	}
++	pthread_mutex_unlock(&rw_gp_lock);
++	if (say) {
++		rw_gp_summary(kept ? "every 16 stored" : "cache full");
++	}
++	return kept;
++}
++
++/* true when `render` belongs to the cache (and must not be destroyed by a pipeline) */
++static bool
++rw_gp_owned(const struct rwa_render *render)
++{
++	bool owned = false;
++
++	if (render == NULL || rw_gp_count == 0) {
++		return false;
++	}
++	pthread_mutex_lock(&rw_gp_lock);
++	for (unsigned i = 0; i < rw_gp_count && !owned; i++) {
++		owned = rw_gp_cache[i].render == render;
++	}
++	pthread_mutex_unlock(&rw_gp_lock);
++	return owned;
++}
++
++/* what every pipeline does with its library when it goes: destroy it unless the cache owns it */
++static void
++rw_gp_release_render(struct rwa_render *render)
++{
++	if (render != NULL && !rw_gp_owned(render)) {
++		mesa.render_destroy(render);
++	}
++}
++
++/* ---- 3. the asynchronous builds' queue */
++static dispatch_queue_t
++rw_gp_queue(void)
++{
++	static dispatch_queue_t q;
++	static dispatch_once_t once;
++
++	dispatch_once(&once, ^{
++		q = dispatch_queue_create("com.redwood.metal.gamepipe",
++		    dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
++	});
++	return q;
++}
++/* ===================================================================================== end GAMEPIPE */
++
+ /* one line per distinct vertex descriptor */
+ static void
+ rw_vertex_layout_line(NSString *line)
+@@ -3937,8 +4224,23 @@
+ 
+ 	char why[512] = { 0 };
+ 	struct rwa_render_info info = { 0 };
++	/* (y2s86 gamepipe) a pipeline this process already compiled is not compiled again */
++	unsigned char gp_key[CC_SHA256_DIGEST_LENGTH];
++	bool gp = rw_gp_app();
++	struct rwa_render *render = NULL;
++
++	if (gp) {
++		NSString *gl = [descriptor label];
++
++		rw_gp_key(gp_key, self, vertex_air, vertex != nil ? [[vertex name] UTF8String] : NULL,
++		    fragment_air, [[fragment name] UTF8String], &shape);
++		render = rw_gp_lookup(gp_key, &info, gl != nil ? [gl UTF8String] : NULL);
++		if (render != NULL) {
++			goto gp_made;
++		}
++	}
+ 	uint64_t t_compile = rw_now_ns();
+-	struct rwa_render *render = mesa.render_create(_mesa,
++	render = mesa.render_create(_mesa,
+ 	    vertex_air != nil ? [vertex_air bytes] : NULL,
+ 	    vertex_air != nil ? [vertex_air length] : 0,
+ 	    vertex != nil ? [[vertex name] UTF8String] : NULL,
+@@ -3946,6 +4248,11 @@
+ 	    &shape, &info, why, sizeof(why));
+ 
+ 	t_compile = rw_now_ns() - t_compile;
++	if (gp && render != NULL) {
++		NSString *gl = [descriptor label];
++
++		rw_gp_store(gp_key, render, &info, t_compile, gl != nil ? [gl UTF8String] : NULL);
++	}
+ 	pthread_mutex_lock(&rw_stats_lock);
+ 	rw_perf.compiles++;
+ 	rw_perf.compile_ns += t_compile;
+@@ -4010,6 +4317,7 @@
+ 	if (shape.color_count > 0) {
+ 		rw_blend_result(info.blend_enabled_mask, info.color_write_masks);
+ 	}
++gp_made:;
+ 	RedwoodMetalRenderPipeline *made = [[RedwoodMetalRenderPipeline alloc]
+ 	    initWithRedwoodDevice:self render:render info:&info descriptor:descriptor];
+ 
+@@ -4055,6 +4363,26 @@
+ - (void)newRenderPipelineStateWithDescriptor:(id)descriptor
+ 			   completionHandler:(void (^)(id, NSError *))handler
+ {
++	/* (y2s86 gamepipe) as the options form below */
++	if (handler != NULL && descriptor != nil && rw_gp_app() &&
++	    [descriptor respondsToSelector:@selector(copyWithZone:)]) {
++		id copy = [descriptor copy];
++
++		pthread_mutex_lock(&rw_gp_lock);
++		rw_gp_stats.async++;
++		pthread_mutex_unlock(&rw_gp_lock);
++		dispatch_async(rw_gp_queue(), ^{
++			@autoreleasepool {
++				NSError *e = nil;
++				id s = [self newRenderPipelineStateWithDescriptor:copy error:&e];
++
++				handler(s, e);
++				[s release];
++				[copy release];
++			}
++		});
++		return;
++	}
+ 	NSError *error = nil;
+ 	id state = [self newRenderPipelineStateWithDescriptor:descriptor error:&error];
+ 
+@@ -4068,6 +4396,29 @@
+ 				     options:(NSUInteger)options
+ 			   completionHandler:(void (^)(id, id, NSError *))handler
+ {
++	/* (y2s86 gamepipe) really asynchronous for applications: a copy of the descriptor (the caller
++	 * may change its own as soon as this returns) built on the gamepipe queue */
++	if (handler != NULL && descriptor != nil && rw_gp_app() &&
++	    [descriptor respondsToSelector:@selector(copyWithZone:)]) {
++		id copy = [descriptor copy];
++
++		pthread_mutex_lock(&rw_gp_lock);
++		rw_gp_stats.async++;
++		pthread_mutex_unlock(&rw_gp_lock);
++		dispatch_async(rw_gp_queue(), ^{
++			@autoreleasepool {
++				NSError *e = nil;
++				id r = nil;
++				id s = [self newRenderPipelineStateWithDescriptor:copy options:options
++								       reflection:&r error:&e];
++
++				handler(s, r, e);
++				[s release];
++				[copy release];
++			}
++		});
++		return;
++	}
+ 	NSError *error = nil;
+ 	id reflection = nil;
+ 	id state = [self newRenderPipelineStateWithDescriptor:descriptor
+@@ -6798,7 +7149,7 @@
+ 	 * descriptor, for the reason the compute one learned at its own line 1504 */
+ 	self = [super initWithDevice:device pipelineStateDescriptor:descriptor];
+ 	if (self == nil) {
+-		mesa.render_destroy(render);
++		rw_gp_release_render(render);   /* y2s86: not one the gamepipe cache owns */
+ 		return nil;
+ 	}
+ 	_owner = device;
+@@ -6826,7 +7177,7 @@
+ - (void)dealloc
+ {
+ 	if (_render != NULL) {
+-		mesa.render_destroy(_render);
++		rw_gp_release_render(_render);  /* y2s86: not one the gamepipe cache owns */
+ 	}
+ 	[super dealloc];
+ }
+@@ -7965,6 +8316,7 @@
+ 	}
+ 	m2m_log('W', "PERF", "slow: %.1f ms commit (%.1f ms GPU wait), %llu draws: %s\n",
+ 	    commit_ns / 1e6, wait_ns / 1e6, (unsigned long long)draws, line);
++	rw_gp_commit_slow(commit_ns);   /* (y2s86 gamepipe) computing or waiting */
+ }
+ 
+ - (void)commit
+@@ -7973,6 +8325,8 @@
+ 
+ 	BOOL queued = NO, trace = NO;
+ 	uint64_t t_start = rw_now_ns(), t_wait = 0, draws = 0;
++
++	rw_gp_commit_begin();   /* (y2s86 gamepipe) the snapshot a slow commit's anatomy is measured from */
+ 	/* (rw_commit_report) what this commit is made of, in CoreAnimation's labels */
+ 	const char *top[RW_TOP] = { NULL };
+ 	unsigned topn[RW_TOP] = { 0 }, ntop = 0;

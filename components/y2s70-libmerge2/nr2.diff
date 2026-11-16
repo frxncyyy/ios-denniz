@@ -1,0 +1,863 @@
+diff -ruN -x '*.o' y2s67-libmerge1/src/air_isp.c y2s70-libmerge2/src/air_isp.c
+--- y2s67-libmerge1/src/air_isp.c	2026-11-12 11:55:41.317673031 +0100
++++ y2s70-libmerge2/src/air_isp.c	2026-11-12 13:49:41.036589775 +0100
+@@ -93,6 +93,10 @@
+    uint32_t raw_own_w, raw_own_h;
+    bool no_buffer_textures;
+    struct rwa_texture *columns, *rows, *gamma, *rgb;
++   /* y2s70 NR2: the planes as made (y0, c0), smoothed (y1, c1, c2), the picture before (by, bc: valid while nr_before) and the next one
++    * (by2, bc2), the blocks' difference and moves */
++   struct rwa_texture *nr_y0, *nr_y1, *nr_c0, *nr_c1, *nr_c2, *nr_by, *nr_bc, *nr_by2, *nr_bc2, *nr_diff, *nr_moves;
++   bool nr_before;
+    uint32_t columns_n, rows_n, rgb_w, rgb_h;
+    struct { uint32_t fw, fh, ow, oh, flip, zoom_bits, mode; bool valid; int shade_off; } map_key;
+    uint8_t gamma_now[4096];
+@@ -627,6 +631,147 @@
+    return isp_fragment_end(&b, 1);
+ }
+ 
++
++/*
++ * y2s70 NR2: THE NOISE (rwcam_render.c denoise(), smooth(), with_before()) on the GPU, every number the processor's. The planes are 8-bit
++ * textures (R8Unorm brightness, RG8Unorm colours: one texel = the Cb, Cr pair, so the processor's `step' of 2 bytes is the next texel); a
++ * texel is read as the float an 8-bit attachment holds and turned back into its byte exactly. Block words: q[0..4] per shader (below);
++ * out_w, out_h the size of what the pass writes.
++ */
++static nir_def *
++isp_nr_byte(nir_builder *b, nir_def *v)
++{
++   return nir_f2i32(b, nir_fround_even(b, nir_fmul_imm(b, v, 255.0)));
++}
++
++static nir_def *
++isp_nr_unorm(nir_builder *b, nir_def *i)
++{
++   return nir_fmul_imm(b, nir_i2f32(b, i), 1.0 / 255.0);
++}
++
++/* smooth_band(): 1 2 1 each way from the neighbours as they were; the first and last row and column as they are; q[0] near (0: always) */
++static nir_shader *
++isp_nr_smooth_shader(const struct nir_shader_compiler_options *options, unsigned channels)
++{
++   nir_variable *uv, *out;
++   nir_builder b = isp_fragment_begin(options, channels == 1 ? "isp_nr_smooth_y" : "isp_nr_smooth_c", &uv, &out);
++   nir_def *x, *y;
++
++   isp_pixel_xy(&b, uv, &x, &y);
++   nir_def *w = isp_word(&b, ISP_U_OUT_W), *h = isp_word(&b, ISP_U_OUT_H), *near = isp_word(&b, ISP_U_Q);
++   nir_def *x1 = nir_iadd_imm(&b, w, -1), *y1 = nir_iadd_imm(&b, h, -1);
++   nir_def *inner = nir_iand(&b, nir_iand(&b, nir_ige_imm(&b, x, 1), nir_ilt(&b, x, x1)), nir_iand(&b, nir_ige_imm(&b, y, 1), nir_ilt(&b, y, y1)));
++   nir_def *xl = nir_imax(&b, nir_iadd_imm(&b, x, -1), nir_imm_int(&b, 0)), *xr = nir_imin(&b, nir_iadd_imm(&b, x, 1), x1);
++   nir_def *ya = nir_imax(&b, nir_iadd_imm(&b, y, -1), nir_imm_int(&b, 0)), *yb = nir_imin(&b, nir_iadd_imm(&b, y, 1), y1);
++   nir_def *t_here = isp_fetch(&b, 0, x, y, nir_type_float32), *t_l = isp_fetch(&b, 0, xl, y, nir_type_float32);
++   nir_def *t_r = isp_fetch(&b, 0, xr, y, nir_type_float32), *t_a = isp_fetch(&b, 0, x, ya, nir_type_float32);
++   nir_def *t_b = isp_fetch(&b, 0, x, yb, nir_type_float32);
++   nir_def *o[4] = { nir_imm_float(&b, 0.0f), nir_imm_float(&b, 0.0f), nir_imm_float(&b, 0.0f), nir_imm_float(&b, 1.0f) };
++
++   for (unsigned c = 0; c < channels; c++) {
++      nir_def *hh = isp_nr_byte(&b, nir_channel(&b, t_here, c));
++      nir_def *v = nir_ishr_imm(&b, nir_iadd_imm(&b, nir_iadd(&b, nir_iadd(&b, isp_nr_byte(&b, nir_channel(&b, t_a, c)), isp_nr_byte(&b, nir_channel(&b, t_b, c))),
++                                nir_iadd(&b, nir_iadd(&b, isp_nr_byte(&b, nir_channel(&b, t_l, c)), isp_nr_byte(&b, nir_channel(&b, t_r, c))), nir_ishl_imm(&b, hh, 2))), 4), 3);
++      nir_def *close = nir_ior(&b, nir_ige(&b, nir_imm_int(&b, 0), near),
++                               nir_iand(&b, nir_ilt(&b, nir_isub(&b, v, hh), near), nir_ilt(&b, nir_isub(&b, hh, v), near)));
++
++      o[c] = isp_nr_unorm(&b, nir_bcsel(&b, nir_iand(&b, inner, close), v, hh));
++   }
++   nir_store_var(&b, out, nir_vec4(&b, o[0], o[1], o[2], o[3]), 0xf);
++   return isp_fragment_end(&b, 1);
++}
++
++/* with_before()'s first loop: each 8 x 8 block's mean |difference| over every other pixel, in quarters (sum * 4 / count), at most 255.
++ * Textures: 0 the brightness now, 1 the brightness before. q[0], q[1]: the picture's width and height. */
++static nir_shader *
++isp_nr_diff_shader(const struct nir_shader_compiler_options *options)
++{
++   nir_variable *uv, *out;
++   nir_builder b = isp_fragment_begin(options, "isp_nr_diff", &uv, &out);
++   nir_def *x, *y;
++
++   isp_pixel_xy(&b, uv, &x, &y);
++   nir_def *w = isp_word(&b, ISP_U_Q), *h = isp_word(&b, ISP_U_Q + 1);
++   nir_def *sum = nir_imm_int(&b, 0), *count = nir_imm_int(&b, 0);
++
++   for (unsigned yy = 0; yy < 8; yy += 2) {
++      for (unsigned xx = 0; xx < 8; xx += 2) {
++         nir_def *px = nir_iadd_imm(&b, nir_ishl_imm(&b, x, 3), xx), *py = nir_iadd_imm(&b, nir_ishl_imm(&b, y, 3), yy);
++         nir_def *ok = nir_iand(&b, nir_ilt(&b, px, w), nir_ilt(&b, py, h));
++         nir_def *pxc = nir_imin(&b, px, nir_iadd_imm(&b, w, -1)), *pyc = nir_imin(&b, py, nir_iadd_imm(&b, h, -1));
++         nir_def *d = nir_iabs(&b, nir_isub(&b, isp_nr_byte(&b, nir_channel(&b, isp_fetch(&b, 0, pxc, pyc, nir_type_float32), 0)),
++                                         isp_nr_byte(&b, nir_channel(&b, isp_fetch(&b, 1, pxc, pyc, nir_type_float32), 0))));
++
++         sum = nir_iadd(&b, sum, nir_bcsel(&b, ok, d, nir_imm_int(&b, 0)));
++         count = nir_iadd(&b, count, nir_b2i32(&b, ok));
++      }
++   }
++   nir_def *q = nir_bcsel(&b, nir_ilt_imm(&b, count, 1), nir_imm_int(&b, 0), nir_udiv(&b, nir_ishl_imm(&b, sum, 2), nir_imax(&b, count, nir_imm_int(&b, 1))));
++
++   q = nir_imin(&b, q, nir_imm_int(&b, 255));
++   nir_store_var(&b, out, nir_vec4(&b, isp_nr_unorm(&b, q), nir_imm_float(&b, 0.0f), nir_imm_float(&b, 0.0f), nir_imm_float(&b, 1.0f)), 0xf);
++   return isp_fragment_end(&b, 2);
++}
++
++/* before_piece(): a block that is still (not all moving, no moving block among its nine) draws each value `keep' of 256 of the way to the one
++ * before where they differ by less than `near'. Textures: 0 now, 1 before, 2 the blocks' moves (R8: 0 or 1). q[0] near, q[1] keep,
++ * q[2] all moving, q[3], q[4] the blocks across and down; chroma: a texel's block is (x / 4, y / 4), the brightness's (x / 8, y / 8). */
++static nir_shader *
++isp_nr_apply_shader(const struct nir_shader_compiler_options *options, unsigned channels)
++{
++   nir_variable *uv, *out;
++   nir_builder b = isp_fragment_begin(options, channels == 1 ? "isp_nr_apply_y" : "isp_nr_apply_c", &uv, &out);
++   nir_def *x, *y;
++
++   isp_pixel_xy(&b, uv, &x, &y);
++   nir_def *near = isp_word(&b, ISP_U_Q), *keep = isp_word(&b, ISP_U_Q + 1), *all = isp_word(&b, ISP_U_Q + 2);
++   nir_def *bw = isp_word(&b, ISP_U_Q + 3), *bh = isp_word(&b, ISP_U_Q + 4);
++   unsigned sh = channels == 1 ? 3 : 2;
++   nir_def *bx = nir_ushr_imm(&b, x, sh), *by = nir_ushr_imm(&b, y, sh);
++   nir_def *still = nir_ieq_imm(&b, all, 0);
++
++   for (int dy = -1; dy <= 1; dy++) {
++      for (int dx = -1; dx <= 1; dx++) {
++         nir_def *nx = nir_iadd_imm(&b, bx, dx), *ny = nir_iadd_imm(&b, by, dy);
++         nir_def *in = nir_iand(&b, nir_iand(&b, nir_ige_imm(&b, nx, 0), nir_ilt(&b, nx, bw)), nir_iand(&b, nir_ige_imm(&b, ny, 0), nir_ilt(&b, ny, bh)));
++         nir_def *nxc = nir_imin(&b, nir_imax(&b, nx, nir_imm_int(&b, 0)), nir_iadd_imm(&b, bw, -1));
++         nir_def *nyc = nir_imin(&b, nir_imax(&b, ny, nir_imm_int(&b, 0)), nir_iadd_imm(&b, bh, -1));
++         nir_def *m = nir_ine_imm(&b, isp_nr_byte(&b, nir_channel(&b, isp_fetch(&b, 2, nxc, nyc, nir_type_float32), 0)), 0);
++
++         still = nir_iand(&b, still, nir_inot(&b, nir_iand(&b, in, m)));
++      }
++   }
++   nir_def *now = isp_fetch(&b, 0, x, y, nir_type_float32), *was = isp_fetch(&b, 1, x, y, nir_type_float32);
++   nir_def *o[4] = { nir_imm_float(&b, 0.0f), nir_imm_float(&b, 0.0f), nir_imm_float(&b, 0.0f), nir_imm_float(&b, 1.0f) };
++
++   for (unsigned c = 0; c < channels; c++) {
++      nir_def *n = isp_nr_byte(&b, nir_channel(&b, now, c)), *d = nir_isub(&b, n, isp_nr_byte(&b, nir_channel(&b, was, c)));
++      nir_def *take = nir_iand(&b, still, nir_ilt(&b, nir_iabs(&b, d), near));
++
++      o[c] = isp_nr_unorm(&b, nir_bcsel(&b, take, nir_isub(&b, n, nir_ishr_imm(&b, nir_imul(&b, d, keep), 8)), n));
++   }
++   nir_store_var(&b, out, nir_vec4(&b, o[0], o[1], o[2], o[3]), 0xf);
++   return isp_fragment_end(&b, 3);
++}
++
++/* a plane as it is (into the surface, or kept as the picture before) */
++static nir_shader *
++isp_nr_copy_shader(const struct nir_shader_compiler_options *options, unsigned channels)
++{
++   nir_variable *uv, *out;
++   nir_builder b = isp_fragment_begin(options, channels == 1 ? "isp_nr_copy_y" : "isp_nr_copy_c", &uv, &out);
++   nir_def *x, *y;
++
++   isp_pixel_xy(&b, uv, &x, &y);
++   nir_def *t = isp_fetch(&b, 0, x, y, nir_type_float32);
++
++   nir_store_var(&b, out, nir_vec4(&b, nir_channel(&b, t, 0), channels > 1 ? nir_channel(&b, t, 1) : nir_imm_float(&b, 0.0f),
++                                   nir_imm_float(&b, 0.0f), nir_imm_float(&b, 1.0f)), 0xf);
++   return isp_fragment_end(&b, 1);
++}
++
++
+ /* y2s65: camera_isp.c's isp_measure() choice of step for a frame of cw x ch cells (the whole frame) */
+ static uint32_t
+ isp_stats_step(uint32_t cw, uint32_t ch)
+@@ -640,15 +785,16 @@
+ isp_state_destroy(struct rwa_device *device)
+ {
+    struct pipe_context *pipe = device->pipe;
+-   void *fs[8] = { device->isp.cells[0], device->isp.cells[1], device->isp.full[0], device->isp.full[1], device->isp.luma,
+-                   device->isp.chroma, device->isp.stats[0], device->isp.stats[1] };
++   void *fs[15] = { device->isp.cells[0], device->isp.cells[1], device->isp.full[0], device->isp.full[1], device->isp.luma,
++                    device->isp.chroma, device->isp.stats[0], device->isp.stats[1], device->isp.nr[0], device->isp.nr[1], device->isp.nr[2],
++                    device->isp.nr[3], device->isp.nr[4], device->isp.nr[5], device->isp.nr[6] };
+    bool any = device->isp.nearest != NULL;
+ 
+-   for (unsigned i = 0; i < 8; i++)
++   for (unsigned i = 0; i < 15; i++)
+       any = any || fs[i] != NULL;
+    if (any)
+       pipe->bind_fs_state(pipe, NULL);
+-   for (unsigned i = 0; i < 8; i++)
++   for (unsigned i = 0; i < 15; i++)
+       if (fs[i])
+          pipe->delete_fs_state(pipe, fs[i]);
+    if (device->isp.nearest)
+@@ -786,6 +932,185 @@
+    return rwa_texture_write(*texture, 0, 0, origin, size, values, stride, why, why_size) == 0 ? RWA_ISP_OK : RWA_ISP_E_GPU;
+ }
+ 
++
++enum { ISP_NR_SMOOTH_Y, ISP_NR_SMOOTH_C, ISP_NR_DIFF, ISP_NR_APPLY_Y, ISP_NR_APPLY_C, ISP_NR_COPY_Y, ISP_NR_COPY_C };
++
++static void *
++isp_nr_fs(struct rwa_device *device, unsigned which, char *why, size_t why_size)
++{
++   if (device->isp.nr[which] != NULL)
++      return device->isp.nr[which];
++   nir_shader *nir = which == ISP_NR_SMOOTH_Y ? isp_nr_smooth_shader(device->nir_options, 1)
++                   : which == ISP_NR_SMOOTH_C ? isp_nr_smooth_shader(device->nir_options, 2)
++                   : which == ISP_NR_DIFF ? isp_nr_diff_shader(device->nir_options)
++                   : which == ISP_NR_APPLY_Y ? isp_nr_apply_shader(device->nir_options, 1)
++                   : which == ISP_NR_APPLY_C ? isp_nr_apply_shader(device->nir_options, 2)
++                   : which == ISP_NR_COPY_Y ? isp_nr_copy_shader(device->nir_options, 1) : isp_nr_copy_shader(device->nir_options, 2);
++
++   return isp_shader(device, &device->isp.nr[which], nir, why, why_size);
++}
++
++/* a texture of the context's own, (re)made at this size and format */
++static struct rwa_texture *
++isp_nr_texture(struct rwa_device *device, struct rwa_texture **t, unsigned format, uint32_t w, uint32_t h, char *why, size_t why_size)
++{
++   if (*t != NULL && ((*t)->res->width0 != w || (*t)->res->height0 != h)) {
++      rwa_texture_destroy(*t);
++      *t = NULL;
++   }
++   if (*t == NULL)
++      *t = isp_texture(device, format, w, h, RWA_USAGE_SHADER_READ | RWA_USAGE_RENDER_TARGET, why, why_size);
++   return *t;
++}
++
++/* one noise pass: `fs' over `dst' from up to three textures, with the block's words q[0..4] and out = dst's size. lock held. */
++static int
++isp_nr_pass(struct rwa_device *device, struct rwa_texture *dst, void *fs, struct rwa_texture *t0, struct rwa_texture *t1, struct rwa_texture *t2,
++            const struct isp_block *base, const int32_t q[5], const char *what, char *why, size_t why_size)
++{
++   struct isp_block nb = *base;
++   struct rwa_texture *const tex[3] = { t0, t1, t2 };
++
++   for (int i = 0; i < 5; i++)
++      nb.q[i] = q[i];
++   nb.out_w = (int32_t)dst->res->width0;
++   nb.out_h = (int32_t)dst->res->height0;
++   return isp_pass(device, dst, fs, tex, t2 != NULL ? 3 : t1 != NULL ? 2 : 1, &nb, what, why, why_size);
++}
++
++/*
++ * y2s70 NR2: the luma and chroma passes, and the noise taken out (struct rwa_isp_params denoise, denoise_before) -- rwcam_render.c denoise():
++ * the colours smoothed once (twice at 2), the brightness at 2 (near 16), then with the picture before (with_before()). Without noise
++ * reduction the two passes write the surface's planes as before. lock held.
++ */
++static int
++isp_nr_planes(struct rwa_isp *isp, const struct rwa_isp_params *p, struct rwa_texture *luma, struct rwa_texture *chroma, void *fs_luma,
++              void *fs_chroma, struct rwa_texture *const *rgb_texture, const struct isp_block *block, uint32_t width, uint32_t height,
++              char *why, size_t why_size)
++{
++   struct rwa_device *device = isp->device;
++   uint32_t level = p->size >= sizeof(*p) ? p->denoise : 0, before = p->size >= sizeof(*p) ? p->denoise_before : 0;
++   const int32_t z[5] = { 0, 0, 0, 0, 0 };
++
++   level = level > 2 ? 2 : level;
++   if (level == 0 || width < 8 || height < 8) {
++      isp->nr_before = false;                  /* (the picture before is not this one's any more) */
++      return isp_pass(device, luma, fs_luma, rgb_texture, 1, block, "luma", why, why_size) != 0 ||
++             isp_pass(device, chroma, fs_chroma, rgb_texture, 1, block, "chroma", why, why_size) != 0 ? -1 : 0;
++   }
++   const uint32_t cw = (width + 1) / 2, ch = (height + 1) / 2;
++   void *f_sy = isp_nr_fs(device, ISP_NR_SMOOTH_Y, why, why_size), *f_sc = isp_nr_fs(device, ISP_NR_SMOOTH_C, why, why_size);
++   void *f_cy = isp_nr_fs(device, ISP_NR_COPY_Y, why, why_size), *f_cc = isp_nr_fs(device, ISP_NR_COPY_C, why, why_size);
++   struct rwa_texture *y0 = isp_nr_texture(device, &isp->nr_y0, 10 /* R8Unorm */, width, height, why, why_size);
++   struct rwa_texture *c0 = isp_nr_texture(device, &isp->nr_c0, 30 /* RG8Unorm */, cw, ch, why, why_size);
++   struct rwa_texture *c1 = isp_nr_texture(device, &isp->nr_c1, 30, cw, ch, why, why_size);
++
++   if (f_sy == NULL || f_sc == NULL || f_cy == NULL || f_cc == NULL || y0 == NULL || c0 == NULL || c1 == NULL)
++      return -1;
++   if (isp_pass(device, y0, fs_luma, rgb_texture, 1, block, "luma", why, why_size) != 0 ||
++       isp_pass(device, c0, fs_chroma, rgb_texture, 1, block, "chroma", why, why_size) != 0)
++      return -1;
++   /* (no picture before, or another size: this picture as made is its own picture before -- denoise()'s `fresh') */
++   bool temporal = before != 0;
++   if (isp->nr_by != NULL && (isp->nr_by->res->width0 != width || isp->nr_by->res->height0 != height))
++      isp->nr_before = false;                  /* (another size: the picture before is not this one's) */
++   if (temporal) {
++      if (isp_nr_texture(device, &isp->nr_by, 10, width, height, why, why_size) == NULL || isp_nr_texture(device, &isp->nr_bc, 30, cw, ch, why, why_size) == NULL ||
++          isp_nr_texture(device, &isp->nr_by2, 10, width, height, why, why_size) == NULL || isp_nr_texture(device, &isp->nr_bc2, 30, cw, ch, why, why_size) == NULL)
++         return -1;
++      if (!isp->nr_before) {
++         if (isp_nr_pass(device, isp->nr_by, f_cy, y0, NULL, NULL, block, z, "noise: before (brightness)", why, why_size) != 0 ||
++             isp_nr_pass(device, isp->nr_bc, f_cc, c0, NULL, NULL, block, z, "noise: before (colours)", why, why_size) != 0)
++            return -1;
++      }
++   } else {
++      isp->nr_before = false;
++   }
++   /* the colours, once or twice; the brightness at 2 */
++   struct rwa_texture *yc = y0, *cc = c1;
++   if (isp_nr_pass(device, c1, f_sc, c0, NULL, NULL, block, z, "noise: colours", why, why_size) != 0)
++      return -1;
++   if (level == 2) {
++      const int32_t near16[5] = { 16, 0, 0, 0, 0 };
++      struct rwa_texture *c2 = isp_nr_texture(device, &isp->nr_c2, 30, cw, ch, why, why_size);
++      struct rwa_texture *y1 = isp_nr_texture(device, &isp->nr_y1, 10, width, height, why, why_size);
++
++      if (c2 == NULL || y1 == NULL || isp_nr_pass(device, c2, f_sc, c1, NULL, NULL, block, z, "noise: colours again", why, why_size) != 0 ||
++          isp_nr_pass(device, y1, f_sy, y0, NULL, NULL, block, near16, "noise: brightness", why, why_size) != 0)
++         return -1;
++      cc = c2;
++      yc = y1;
++   }
++   if (!temporal) {
++      return isp_nr_pass(device, luma, f_cy, yc, NULL, NULL, block, z, "noise: out (brightness)", why, why_size) != 0 ||
++             isp_nr_pass(device, chroma, f_cc, cc, NULL, NULL, block, z, "noise: out (colours)", why, why_size) != 0 ? -1 : 0;
++   }
++   /* with_before(): the blocks' difference, read back; its numbers here; the moves to the GPU; the picture drawn to the one before */
++   const uint32_t bw = (width + 7) / 8, bh = (height + 7) / 8, n = bw * bh;
++   void *f_d = isp_nr_fs(device, ISP_NR_DIFF, why, why_size), *f_ay = isp_nr_fs(device, ISP_NR_APPLY_Y, why, why_size);
++   void *f_ac = isp_nr_fs(device, ISP_NR_APPLY_C, why, why_size);
++   struct rwa_texture *dt = isp_nr_texture(device, &isp->nr_diff, 10 /* R8Unorm */, bw, bh, why, why_size);
++   struct rwa_texture *mt = isp_nr_texture(device, &isp->nr_moves, 10, bw, bh, why, why_size);
++   uint8_t *diff = malloc(2 * (size_t)n), *moves = diff != NULL ? diff + n : NULL;
++   const int32_t dq[5] = { (int32_t)width, (int32_t)height, 0, 0, 0 };
++
++   if (f_d == NULL || f_ay == NULL || f_ac == NULL || dt == NULL || mt == NULL || diff == NULL ||
++       isp_nr_pass(device, dt, f_d, yc, isp->nr_by, NULL, block, dq, "noise: blocks", why, why_size) != 0) {
++      free(diff);
++      return -1;
++   }
++   const unsigned origin[3] = { 0, 0, 0 }, size[3] = { bw, bh, 1 };
++   if (rwa_texture_read(dt, 0, 0, origin, size, diff, bw, why, why_size) != 0) {
++      free(diff);
++      return -1;
++   }
++   uint64_t all = 0, calm = 0, calm_n = 0;
++   uint32_t moving = 0;
++   int near_y = level == 2 ? 18 : 10, keep_y = level == 2 ? 128 : 90, near_c = level == 2 ? 14 : 8, keep_c = level == 2 ? 140 : 102, limit;
++
++   for (uint32_t b = 0; b < n; b++)
++      all += diff[b];
++   for (uint32_t b = 0; b < n; b++) {
++      if ((uint64_t)diff[b] * n <= 2 * all) {
++         calm += diff[b];
++         calm_n++;
++      }
++   }
++   limit = (int)(1.7 * (calm_n ? (double)calm / (double)calm_n : 0) + 0.5);
++   limit = limit < 10 ? 10 : limit > 48 ? 48 : limit;
++   {
++      int noise3 = (int)(3.0 * (calm_n ? (double)calm / (double)calm_n : 0) / 4 + 0.5);
++
++      noise3 = noise3 > 40 ? 40 : noise3;
++      near_y = noise3 > near_y ? noise3 : near_y;
++      near_c = noise3 * 3 / 4 > near_c ? noise3 * 3 / 4 : near_c;
++   }
++   for (uint32_t b = 0; b < n; b++) {
++      moves[b] = diff[b] > limit ? 1 : 0;
++      moving += moves[b];
++   }
++   int error = rwa_texture_write(mt, 0, 0, origin, size, moves, bw, why, why_size);
++   free(diff);
++   if (error != 0)
++      return -1;
++   const int32_t all_moving = (double)moving > 0.35 * n ? 1 : 0;
++   const int32_t qy[5] = { near_y, keep_y, all_moving, (int32_t)bw, (int32_t)bh }, qc[5] = { near_c, keep_c, all_moving, (int32_t)bw, (int32_t)bh };
++
++   if (isp_nr_pass(device, luma, f_ay, yc, isp->nr_by, mt, block, qy, "noise: with the picture before (brightness)", why, why_size) != 0 ||
++       isp_nr_pass(device, isp->nr_by2, f_ay, yc, isp->nr_by, mt, block, qy, "noise: the next picture before (brightness)", why, why_size) != 0 ||
++       isp_nr_pass(device, chroma, f_ac, cc, isp->nr_bc, mt, block, qc, "noise: with the picture before (colours)", why, why_size) != 0 ||
++       isp_nr_pass(device, isp->nr_bc2, f_ac, cc, isp->nr_bc, mt, block, qc, "noise: the next picture before (colours)", why, why_size) != 0)
++      return -1;
++   struct rwa_texture *t = isp->nr_by;
++   isp->nr_by = isp->nr_by2;
++   isp->nr_by2 = t;
++   t = isp->nr_bc;
++   isp->nr_bc = isp->nr_bc2;
++   isp->nr_bc2 = t;
++   isp->nr_before = true;
++   return 0;
++}
++
+ /* the frame as texture 0. *zero_copy: it is read where the caller put it. lock held. */
+ static struct rwa_texture *
+ isp_frame_texture(struct rwa_isp *isp, const struct rwa_isp_frame *f, bool *zero_copy, int *error, char *why, size_t why_size)
+@@ -882,7 +1207,7 @@
+ static int
+ isp_check(const struct rwa_isp_frame *f, const struct rwa_isp_params *p, uint32_t width, uint32_t height, char *why, size_t why_size)
+ {
+-   if (f == NULL || p == NULL || f->size < sizeof(*f) || p->size < sizeof(*p) || f->raw == NULL || p->gamma == NULL) {
++   if (f == NULL || p == NULL || f->size < sizeof(*f) || p->size < RWA_ISP_PARAMS_SIZE_1 || f->raw == NULL || p->gamma == NULL) {
+       say(why, why_size, "the camera's GPU render was given no frame, no parameters, or a struct smaller than this library's");
+       return RWA_ISP_E_ARGUMENT;
+    }
+@@ -1022,8 +1347,7 @@
+    struct rwa_texture *const rgb_texture[1] = { isp->rgb };
+ 
+    if (isp_pass(device, isp->rgb, fs, isp_textures, 4, &block, "ISP", why, why_size) != 0 ||
+-       isp_pass(device, luma, fs_luma, rgb_texture, 1, &block, "luma", why, why_size) != 0 ||
+-       isp_pass(device, chroma, fs_chroma, rgb_texture, 1, &block, "chroma", why, why_size) != 0)
++       isp_nr_planes(isp, p, luma, chroma, fs_luma, fs_chroma, rgb_texture, &block, width, height, why, why_size) != 0)
+       return RWA_ISP_E_GPU;
+    /* y2s65: the frame's statistics, one more pass over the frame alone, when the caller asked for them and has room */
+    isp->stats_w = isp->stats_h = isp->stats_step = 0;
+@@ -1381,9 +1705,10 @@
+       if (isp->slot[i].buffer != NULL)
+          rwa_buffer_destroy(isp->slot[i].buffer);
+    }
+-   struct rwa_texture *own[6] = { isp->raw_own, isp->columns, isp->rows, isp->gamma, isp->rgb, isp->stats };
++   struct rwa_texture *own[17] = { isp->raw_own, isp->columns, isp->rows, isp->gamma, isp->rgb, isp->stats, isp->nr_y0, isp->nr_y1, isp->nr_c0,
++                                   isp->nr_c1, isp->nr_c2, isp->nr_by, isp->nr_bc, isp->nr_by2, isp->nr_bc2, isp->nr_diff, isp->nr_moves };
+ 
+-   for (int i = 0; i < 6; i++)
++   for (int i = 0; i < 17; i++)
+       if (own[i] != NULL)
+          rwa_texture_destroy(own[i]);
+    free(isp);
+@@ -1436,7 +1761,7 @@
+    bool imported = false;
+ 
+    if (isp == NULL || output == NULL || output->size < RWA_ISP_OUTPUT_SIZE_1 || output->iosurface == NULL || params == NULL ||
+-       params->size < sizeof(*params)) {
++       params->size < RWA_ISP_PARAMS_SIZE_1) {
+       say(why, why_size, "the camera's GPU render was given no context, no output surface, or a struct smaller than this library's");
+       return RWA_ISP_E_ARGUMENT;
+    }
+diff -ruN -x '*.o' y2s67-libmerge1/src/air_metal.c y2s70-libmerge2/src/air_metal.c
+--- y2s67-libmerge1/src/air_metal.c	2026-11-12 11:55:55.505315467 +0100
++++ y2s70-libmerge2/src/air_metal.c	2026-11-12 13:47:02.586886185 +0100
+@@ -198,6 +198,7 @@
+    struct {
+       void *cells[2], *full[2], *luma, *chroma, *nearest;
+       void *stats[2];           /* y2s65: the frame's statistics, per frame format (air_isp.c isp_stats_shader) */
++      void *nr[7];              /* y2s70 NR2: smooth luma, smooth chroma, block difference, apply luma, apply chroma, copy luma, copy chroma */
+    } isp;
+ };
+ 
+diff -ruN -x '*.o' y2s67-libmerge1/src/isp_nr_host_test.c y2s70-libmerge2/src/isp_nr_host_test.c
+--- y2s67-libmerge1/src/isp_nr_host_test.c	1970-01-01 01:00:00.000000000 +0100
++++ y2s70-libmerge2/src/isp_nr_host_test.c	2026-11-12 13:47:40.364948963 +0100
+@@ -0,0 +1,156 @@
++/*
++ * y2s70 NR2: isp_nr_host_test -- the noise reduction on the GPU (air_isp.c isp_nr_planes, rwa_isp_params denoise/denoise_before) on softpipe,
++ * against the bundle's own processor code (nr_reference.inc, cut out of rwcam_render.c: smooth(), with_before()) and denoise()'s order:
++ * a sequence of frames (noise over a gradient, a square that moves), levels 1 and 2, with and without the picture before, two sizes; every
++ * byte of both planes must be the processor's. Below: the description of isp_gpu_host_test.c, whose frame maker this is.
++ * Host test of the camera's ISP on the GPU (y2s39, air_isp.c) on softpipe, against the camera bundle's own processor ISP: the SAME frames
++ * through camera_isp.c's isp_render_nv12 / isp_render_full_nv12 and through rwa_isp_render_textures, plane by plane, byte by byte.
++ * No GPU, no phone, no IOSurface (the planes are two textures here; on the phone they are an IOSurface's planes imported in place).
++ * What it cannot show: Panfrost running the same shaders, the frame read out of a buffer, the import of a surface.
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <stdbool.h>
++#include "camera_isp.h"
++#include "air_metal.h"
++#include "rwa_isp_api.h"
++
++int rwa_isp_render_textures(struct rwa_isp *isp, const struct rwa_isp_frame *frame, const struct rwa_isp_params *params,
++			    struct rwa_texture *luma, struct rwa_texture *chroma, uint32_t width, uint32_t height, uint32_t flags,
++			    struct rwa_isp_result *result, char *why, size_t why_size);
++struct rwa_device *rwa_isp_device(struct rwa_isp *isp);
++/* the library's calls, linked here (the bundle looks them up: RWA_ISP_LOAD) */
++unsigned rwa_isp_api_version(void);
++struct rwa_isp *rwa_isp_create(char *why, size_t why_size);
++void rwa_isp_destroy(struct rwa_isp *isp);
++void *rwa_isp_frame_memory(struct rwa_isp *isp, unsigned slot, size_t header_bytes, size_t frame_bytes, char *why, size_t why_size);
++int rwa_isp_render(struct rwa_isp *isp, const struct rwa_isp_frame *frame, const struct rwa_isp_params *params,
++		   const struct rwa_isp_output *output, struct rwa_isp_result *result, char *why, size_t why_size);
++int rwa_isp_wait(struct rwa_isp *isp, char *why, size_t why_size);
++void rwa_isp_forget_surfaces(struct rwa_isp *isp);
++
++static unsigned long long rng = 88172645463325252ull;
++static unsigned rnd(void) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return (unsigned)(rng >> 16); }
++
++/* a frame of noise over a gradient, with a burnt-out patch and a black one, packed as the kernel packs it */
++static uint8_t *
++make_frame(struct redwood_camera_frame *f, uint32_t width, uint32_t height, uint32_t format, uint32_t bayer, uint32_t black, uint32_t extra)
++{
++	memset(f, 0, sizeof(*f));
++	memcpy(f->magic, REDWOOD_CAMERA_MAGIC, 8);
++	f->header_bytes = sizeof(*f); f->width = width; f->height = height; f->stride = (width + 3) / 4 * 5 + extra; f->format = format;
++	f->bayer = bayer; f->black = black;
++	uint8_t *raw = calloc(f->stride, height);
++	for (uint32_t y = 0; y < height; y++) {
++		for (uint32_t x = 0; x < width; x += 4) {
++			unsigned v[4];
++			uint8_t *g = raw + (size_t)y * f->stride + (x / 4) * 5;
++			for (int i = 0; i < 4; i++) {
++				unsigned base = (x + i) * 900 / width + (y * 300 / height);
++				v[i] = base / 2 + rnd() % 600;
++				if ((x + i) > width * 3 / 5 && (x + i) < width * 4 / 5 && y > height / 5 && y < height / 2) v[i] = 1000 + rnd() % 24;   /* burnt out */
++				if ((x + i) < width / 6 && y > height * 2 / 3) v[i] = rnd() % (black + 8);                                          /* black */
++				if ((x + i) > width / 3 && (x + i) < width / 2 && y < height / 6) v[i] = (i + y) & 1 ? 1023 : 850 + rnd() % 100;      /* one colour clipped */
++				v[i] = v[i] > 1023 ? 1023 : v[i];
++			}
++			if (format == REDWOOD_CAMERA_FORMAT_LE40_RAW10) {
++				uint64_t w = (uint64_t)v[0] | (uint64_t)v[1] << 10 | (uint64_t)v[2] << 20 | (uint64_t)v[3] << 30;
++				for (int i = 0; i < 5; i++) g[i] = (uint8_t)(w >> (8 * i));
++			} else {
++				for (int i = 0; i < 4; i++) g[i] = (uint8_t)(v[i] >> 2);
++				g[4] = (uint8_t)((v[0] & 3) | (v[1] & 3) << 2 | (v[2] & 3) << 4 | (v[3] & 3) << 6);
++			}
++		}
++		for (uint32_t i = (width + 3) / 4 * 5; i < f->stride; i++) raw[(size_t)y * f->stride + i] = (uint8_t)rnd();   /* the padding is not read */
++	}
++	return raw;
++}
++
++static struct { void (*apply)(size_t n, void *context, void (*work)(void *, size_t)); } R;      /* (the reference runs its pieces here) */
++#include "nr_reference.inc"
++static int failures, cases;
++
++/* a frame: make_frame()'s, with a bright square at (sx, sy) */
++static uint8_t *
++frame_with_square(struct redwood_camera_frame *f, uint32_t w, uint32_t h, uint32_t sx, uint32_t sy, unsigned long long seed)
++{
++	rng = seed;
++	uint8_t *raw = make_frame(f, w, h, 4, 3, 64, 0);
++	for (uint32_t y = sy; y < sy + h / 6 && y < h; y++)
++		for (uint32_t x = sx & ~3u; x < sx + w / 6 && x + 3 < w; x += 4) {
++			uint64_t v = 700 + (rnd() % 40), word = v | v << 10 | v << 20 | v << 30;
++			for (int i = 0; i < 5; i++) raw[(size_t)y * f->stride + (x / 4) * 5 + i] = (uint8_t)(word >> (8 * i));
++		}
++	return raw;
++}
++
++static void
++sequence(struct rwa_isp *gpu, uint32_t fw, uint32_t fh, uint32_t pw, uint32_t ph, int level, int with_before_on)
++{
++	char why[512] = "", name[96];
++	struct rwa_device *device = rwa_isp_device(gpu);
++	struct rwa_texture_shape s = { .pixel_format = 10, .type = 2, .width = pw, .height = ph, .depth = 1, .array_length = 1, .mip_levels = 1,
++				       .sample_count = 1, .usage = 1 | 4 };
++	struct rwa_texture *luma = rwa_texture_create(device, &s, why, sizeof(why));
++	uint32_t cw = (pw + 1) & ~1u, ch = (ph + 1) / 2;
++	s.pixel_format = 30; s.width = cw / 2; s.height = ch;
++	struct rwa_texture *chroma = rwa_texture_create(device, &s, why, sizeof(why));
++	uint8_t *y = malloc((size_t)pw * ph), *uv = malloc((size_t)cw * ch), *gy = malloc((size_t)pw * ph), *guv = malloc((size_t)cw * ch);
++	uint8_t *by = malloc((size_t)pw * ph), *buv = malloc((size_t)cw * ch);
++	bool have_before = false;
++	const unsigned origin[3] = { 0, 0, 0 }, ys[3] = { pw, ph, 1 }, cs[3] = { cw / 2, ch, 1 };
++	struct isp isp;
++
++	isp_init(&isp);
++	snprintf(name, sizeof(name), "%ux%u -> %ux%u level %d%s", fw, fh, pw, ph, level, with_before_on ? " with the picture before" : "");
++	for (int k = 0; k < 6; k++) {
++		struct redwood_camera_frame f;
++		uint8_t *raw = frame_with_square(&f, fw, fh, fw / 8 + (uint32_t)k * fw / 30, fh / 3, 1000 + (unsigned long long)k * 7);
++		cases++;
++		/* the processor: the picture, then denoise() as rwcam_render.c does it */
++		isp_render_nv12(&isp, &f, raw, y, pw, uv, cw, pw, ph, 0, ph, true);
++		if (with_before_on && !have_before) { memcpy(by, y, (size_t)pw * ph); memcpy(buv, uv, (size_t)cw * ch); have_before = true; }
++		for (int pass = 0; pass < level; pass++) smooth(uv, cw, cw, ch, 2, NULL, 0);
++		if (level == 2) smooth(y, pw, pw, ph, 1, NULL, 16);
++		if (with_before_on) with_before(y, pw, uv, cw, pw, ph, by, buv, level);
++		/* the GPU */
++		struct rwa_isp_frame frame = { .size = sizeof(frame), .width = f.width, .height = f.height, .stride = f.stride, .format = f.format,
++					       .bayer = f.bayer, .black = f.black, .raw = raw };
++		struct rwa_isp_params params = { .size = sizeof(params), .mode = RWA_ISP_MODE_CELLS, .wb = { isp.wb[0], isp.wb[1], isp.wb[2] },
++						 .digital = isp.digital, .falloff = isp.falloff, .zoom = isp.zoom, .flip = isp.flip, .video_range = 1,
++						 .gamma = isp.gamma, .denoise = (uint32_t)level, .denoise_before = (uint32_t)with_before_on };
++		for (int i = 0; i < 9; i++) params.ccm[i] = isp.ccm[i / 3][i % 3];
++		int rc = rwa_isp_render_textures(gpu, &frame, &params, luma, chroma, pw, ph, 0, NULL, why, sizeof(why));
++		if (rc != RWA_ISP_OK || rwa_texture_read(luma, 0, 0, origin, ys, gy, pw, why, sizeof(why)) != 0 ||
++		    rwa_texture_read(chroma, 0, 0, origin, cs, guv, cw, why, sizeof(why)) != 0) {
++			fprintf(stderr, "FAILED %s frame %d: render %d: %s\n", name, k, rc, why); failures++; free(raw); break;
++		}
++		size_t dy = 0, dc = 0; int worst = 0;
++		for (size_t i = 0; i < (size_t)pw * ph; i++) if (gy[i] != y[i]) { dy++; worst = abs(gy[i] - y[i]) > worst ? abs(gy[i] - y[i]) : worst; }
++		for (size_t i = 0; i < (size_t)cw * ch; i++) if (guv[i] != uv[i]) { dc++; worst = abs(guv[i] - uv[i]) > worst ? abs(guv[i] - uv[i]) : worst; }
++		if (dy || dc) { fprintf(stderr, "FAILED %s frame %d: %zu brightness and %zu colour bytes differ (worst %d)\n", name, k, dy, dc, worst); failures++; }
++		free(raw);
++	}
++	printf("  %s: 6 frames compared\n", name);
++	rwa_texture_destroy(luma); rwa_texture_destroy(chroma);
++	free(y); free(uv); free(gy); free(guv); free(by); free(buv);
++}
++
++int
++main(void)
++{
++	char why[512] = "";
++	setenv("RWA_SOFTWARE", "1", 1);
++	for (int level = 1; level <= 2; level++)
++		for (int wb = 0; wb <= 1; wb++) {
++			struct rwa_isp *gpu = rwa_isp_create(why, sizeof(why));      /* (a context of its own: no picture before from another run) */
++			if (gpu == NULL) { fprintf(stderr, "FAILED: no context: %s\n", why); return 1; }
++			sequence(gpu, 640, 480, 320, 240, level, wb);
++			sequence(gpu, 1024, 768, 642, 482, level, wb);          /* (a size not a multiple of 8, odd halves) */
++			rwa_isp_destroy(gpu);
++		}
++	printf("isp_nr_host_test: %d frames, %s\n", cases, failures ? "FAILED" : "every byte the processor's");
++	return failures != 0;
++}
+diff -ruN -x '*.o' y2s67-libmerge1/src/nr-host-test.sh y2s70-libmerge2/src/nr-host-test.sh
+--- y2s67-libmerge1/src/nr-host-test.sh	1970-01-01 01:00:00.000000000 +0100
++++ y2s70-libmerge2/src/nr-host-test.sh	2026-11-12 13:47:40.388962453 +0100
+@@ -0,0 +1,36 @@
++#!/bin/bash
++# y2s70 NR2: build and run isp_nr_host_test, isp_stats_host_test (and isp_gpu_host_test: the pictures unchanged) against an EXISTING host Mesa build of the same
++# Mesa tree, READ ONLY (this directory's translator objects are linked ahead of its libair.a, never copied into it).
++#   T=<empty scratch dir> [H=<host mesa build dir>] [QUICK=1] bash stats-host-test.sh
++set -euo pipefail
++G=$NORD2_WORK/gpu
++M=$G/build/y2s-stage0/mesa-25.0.7; HERE=$(cd "$(dirname "$0")" && pwd); T=${T:?set T to an empty scratch directory}
++H=${H:-$G/video/build/WP08/hostmesa}
++mkdir -p $T; cd $T
++printf '#ifndef __ASSEMBLER__\n#include <pthread.h>\n#define __once_flag_defined 1\n#define once_flag pthread_once_t\n#endif\n' > hostfix.h
++printf '#include <stdint.h>\n#include <stdbool.h>\n#include "frontend/winsys_handle.h"\n#include "drm-uapi/drm_fourcc.h"\n' > hostfix2.h
++LIBS="src/gallium/auxiliary/libgallium.a src/compiler/nir/libnir.a src/compiler/libcompiler.a src/util/libmesa_util.a src/util/libmesa_util_sse41.a src/util/blake3/libblake3.a src/c11/impl/libmesa_util_c11.a src/gallium/auxiliary/libgalliumvl_stub.a src/gallium/winsys/sw/null/libws_null.a src/compiler/air/libair.a src/util/libxmlconfig.a src/gallium/drivers/softpipe/libsoftpipe.a"
++for l in $LIBS; do [ -f $H/$l ] || { echo "missing $H/$l"; exit 1; }; done
++INC=$(for d in src/gallium/drivers/panfrost include src src/mapi src/mesa src/gallium/include src/gallium/auxiliary src/gallium/winsys/sw src/gallium/winsys src/gallium/drivers src/compiler/air src/compiler/nir src/compiler src/panfrost src/panfrost/lib src/panfrost/util src/panfrost/compiler; do printf -- "-I$H/$d -I$M/$d "; done)
++DEF=$(grep -o '^DEF="[^"]*"' $G/build/y2s63-vt23/src/host-tests.sh | sed 's/^DEF="//; s/"$//')
++CC="cc -std=gnu11 -O1 -g -include $T/hostfix.h -include $T/hostfix2.h $DEF $INC"
++A=$(for l in $LIBS; do printf "$H/$l "; done)
++for f in air_to_nir air_intrinsics; do
++  C=$(python3 -I -c "import json,sys
++for e in json.load(open('$H/compile_commands.json')):
++    if e['file'].endswith('compiler/air/$f.c'): print(e['command']); break")
++  (cd $H && eval "$(echo "$C" | sed "s| -MD -MQ [^ ]* -MF [^ ]*||; s| -o [^ ]*| -o $T/$f.c.o|; s| -c [^ ]*| -c $HERE/$f.c|; s|^cc |cc -I$M/src/compiler/air |")")
++done
++$CC -c $HERE/air_metal.c -o air_metal_host.o
++C=$G/build/camera-userland-20261109
++cc -std=gnu11 -O2 -g -I$C/src -c $C/src/camera_isp.c -o camera_isp.o
++cc -std=gnu11 -O1 -g -Wall -I$HERE -I$C/src -c $HERE/isp_stats_host_test.c -o stats_test.o
++c++ -o isp_stats_host_test stats_test.o camera_isp.o air_metal_host.o air_to_nir.c.o air_intrinsics.c.o -Wl,--start-group $A -Wl,--end-group -lm -lz -lpthread -ldl -ldrm
++./isp_stats_host_test
++C2=$G/build/camera-userland-20261112-hd60
++cc -std=gnu11 -O1 -g -Wall -Wno-unused-function -I$HERE -I$C2/src -c $HERE/isp_nr_host_test.c -o nr_test.o
++c++ -o isp_nr_host_test nr_test.o camera_isp.o air_metal_host.o air_to_nir.c.o air_intrinsics.c.o -Wl,--start-group $A -Wl,--end-group -lm -lz -lpthread -ldl -ldrm
++./isp_nr_host_test
++cc -std=gnu11 -O1 -g -Wall -I$HERE -I$C/src -c $HERE/isp_gpu_host_test.c -o isp_test.o
++c++ -o isp_gpu_host_test isp_test.o camera_isp.o air_metal_host.o air_to_nir.c.o air_intrinsics.c.o -Wl,--start-group $A -Wl,--end-group -lm -lz -lpthread -ldl -ldrm
++QUICK=1 ./isp_gpu_host_test
+diff -ruN -x '*.o' y2s67-libmerge1/src/nr_reference.inc y2s70-libmerge2/src/nr_reference.inc
+--- y2s67-libmerge1/src/nr_reference.inc	1970-01-01 01:00:00.000000000 +0100
++++ y2s70-libmerge2/src/nr_reference.inc	2026-11-12 13:47:40.364774971 +0100
+@@ -0,0 +1,205 @@
++/* y2s70: generated from camera-userland-20261112-hd60/src/rwcam_render.c (smooth, with_before): the CPU noise reduction, verbatim */
++#define SMOOTH_BANDS 8
++struct smooth_job {
++	uint8_t *p, *edges;             /* edges: for each band the row above its first and the row under its last, as they were */
++	size_t stride;
++	uint32_t bytes, rows;
++	unsigned step;
++	int near;
++};
++
++static void
++smooth_band(void *context, size_t band)
++{
++	const struct smooth_job *j = context;
++	uint32_t a = (uint32_t)(j->rows * band / SMOOTH_BANDS), b = (uint32_t)(j->rows * (band + 1) / SMOOTH_BANDS), bytes = j->bytes;
++	uint8_t *tmp = malloc(2 * (size_t)bytes), *above = tmp, *here = tmp != NULL ? tmp + bytes : NULL;
++	const uint8_t *top = j->edges + (size_t)(2 * band) * bytes, *bottom = top + bytes;
++
++	a = a < 1 ? 1 : a;
++	b = b > j->rows - 1 ? j->rows - 1 : b;
++	if (tmp == NULL || a >= b) {
++		free(tmp);
++		return;
++	}
++	memcpy(above, top, bytes);
++	for (uint32_t y = a; y < b; y++) {
++		uint8_t *row = j->p + (size_t)y * j->stride;
++		const uint8_t *below = y + 1 == b ? bottom : row + j->stride;
++
++		memcpy(here, row, bytes);
++		for (uint32_t x = j->step; x + j->step < bytes; x++) {
++			int v = (above[x] + below[x] + here[x - j->step] + here[x + j->step] + 4 * here[x] + 4) >> 3;
++
++			if (j->near <= 0 || (v - here[x] < j->near && here[x] - v < j->near)) {
++				row[x] = (uint8_t)v;
++			}
++		}
++		uint8_t *t = above;
++
++		above = here;
++		here = t;
++	}
++	free(tmp);
++}
++
++static void
++smooth(uint8_t *p, size_t stride, uint32_t bytes, uint32_t rows, unsigned step, uint8_t *tmp, int near)
++{
++	struct smooth_job j = { p, NULL, stride, bytes, rows, step, near };
++
++	(void)tmp;
++	if (rows < 3 || bytes < 3 * step || (j.edges = malloc(2 * SMOOTH_BANDS * (size_t)bytes)) == NULL) {
++		return;
++	}
++	for (uint32_t k = 0; k < SMOOTH_BANDS; k++) {
++		uint32_t a = rows * k / SMOOTH_BANDS, b = rows * (k + 1) / SMOOTH_BANDS;
++
++		a = a < 1 ? 1 : a;
++		b = b > rows - 1 ? rows - 1 : b;
++		memcpy(j.edges + (size_t)(2 * k) * bytes, p + (size_t)(a - 1) * stride, bytes);
++		memcpy(j.edges + (size_t)(2 * k + 1) * bytes, p + (size_t)b * stride, bytes);
++	}
++	if (R.apply != NULL) {
++		R.apply(SMOOTH_BANDS, &j, smooth_band);
++	} else {
++		for (size_t k = 0; k < SMOOTH_BANDS; k++) {
++			smooth_band(&j, k);
++		}
++	}
++	free(j.edges);
++}
++
++/*
++ * The picture and the one before it (run q10ia: "things that move drag a trail behind them, very annoying" -- each pixel by itself was drawn
++ * 60 % of the way to the picture before wherever it differed from it by less than 26, and something moving through the dark differs by less).
++ * By BLOCKS now: the brightness's mean difference from the picture before of each 8 x 8 block (every other pixel of it); the noise is what
++ * that is in the calmer blocks; a block that differs by more than RWCAM_NR_MOVES times the noise has something moving in it and is left as it
++ * is (and its eight neighbours, and the picture before forgotten there); when over RWCAM_NR_ALL of the blocks move (the camera does), all
++ * are. In the blocks that are still, each pixel goes `keep' of 256 of the way to the picture before where it differs by less than `near'.
++ *   near, keep: level 1 brightness 10, 90; colours 8, 102. Level 2 brightness 18, 128; colours 14, 140. `near' is at least three times the
++ *   noise (three quarters of that for the colours), 40 at most: with what moves left out by the blocks it can be that wide.
++ */
++#define RWCAM_NR_BLOCK  8
++#define RWCAM_NR_MOVES  1.7
++#define RWCAM_NR_ALL    0.35
++/* with_before()'s last step, the pixels, for the blocks of some of the rows of blocks: each block by itself, on the cores */
++struct before_job {
++	uint8_t *y, *uv, *by, *buv;
++	const uint8_t *moves;
++	size_t ys, uvs;
++	uint32_t width, height, bw, bh, cw, moving;
++	int near_y, keep_y, near_c, keep_c;
++};
++#define BEFORE_PIECES 8
++
++static void
++before_piece(void *context, size_t piece)
++{
++	const struct before_job *j = context;
++	uint8_t *y = j->y, *uv = j->uv, *by = j->by, *buv = j->buv;
++	const uint8_t *moves = j->moves;
++	size_t ys = j->ys, uvs = j->uvs;
++	uint32_t width = j->width, height = j->height, bw = j->bw, bh = j->bh, cw = j->cw, moving = j->moving, n = bw * bh;
++	int near_y = j->near_y, keep_y = j->keep_y, near_c = j->near_c, keep_c = j->keep_c;
++
++	for (uint32_t b = (uint32_t)(bh * piece / BEFORE_PIECES) * bw; b < (uint32_t)(bh * (piece + 1) / BEFORE_PIECES) * bw; b++) {
++		uint32_t bx = b % bw, byy = b / bw, x0 = bx * RWCAM_NR_BLOCK, y0 = byy * RWCAM_NR_BLOCK;
++		bool still = (double)moving <= RWCAM_NR_ALL * n;
++
++		for (int dy = -1; still && dy <= 1; dy++) {
++			for (int dx = -1; still && dx <= 1; dx++) {
++				int64_t nx = (int64_t)bx + dx, ny = (int64_t)byy + dy;
++
++				still = nx < 0 || ny < 0 || nx >= bw || ny >= bh || !(moves[ny * bw + nx] & 1);
++			}
++		}
++		for (uint32_t yy = y0; yy < y0 + RWCAM_NR_BLOCK && yy < height; yy++) {
++			uint8_t *row = y + (size_t)yy * ys, *before = by + (size_t)yy * width;
++
++			for (uint32_t x = x0; x < x0 + RWCAM_NR_BLOCK && x < width; x++) {
++				int d = (int)row[x] - (int)before[x], ad = d < 0 ? -d : d;
++				int v = still && ad < near_y ? (int)row[x] - ((d * keep_y) >> 8) : (int)row[x];
++
++				row[x] = (uint8_t)v;
++				before[x] = (uint8_t)v;
++			}
++		}
++		for (uint32_t yy = y0 / 2; yy < (y0 + RWCAM_NR_BLOCK) / 2 && yy < (height + 1) / 2; yy++) {
++			uint8_t *row = uv + (size_t)yy * uvs, *before = buv + (size_t)yy * cw;
++
++			for (uint32_t x = x0; x < x0 + RWCAM_NR_BLOCK && x < cw; x++) {
++				int d = (int)row[x] - (int)before[x], ad = d < 0 ? -d : d;
++				int v = still && ad < near_c ? (int)row[x] - ((d * keep_c) >> 8) : (int)row[x];
++
++				row[x] = (uint8_t)v;
++				before[x] = (uint8_t)v;
++			}
++		}
++	}
++}
++
++static void
++with_before(uint8_t *y, size_t ys, uint8_t *uv, size_t uvs, uint32_t width, uint32_t height, uint8_t *by, uint8_t *buv, int level)
++{
++	uint32_t bw = (width + RWCAM_NR_BLOCK - 1) / RWCAM_NR_BLOCK, bh = (height + RWCAM_NR_BLOCK - 1) / RWCAM_NR_BLOCK, cw = (width + 1) & ~1u;
++	uint32_t n = bw * bh, moving = 0;
++	uint8_t *diff = malloc(2 * (size_t)n), *moves = diff != NULL ? diff + n : NULL;
++	uint64_t all = 0, calm = 0, calm_n = 0;
++	int near_y = level == 2 ? 18 : 10, keep_y = level == 2 ? 128 : 90, near_c = level == 2 ? 14 : 8, keep_c = level == 2 ? 140 : 102, limit;
++
++	if (diff == NULL) {
++		return;
++	}
++	for (uint32_t b = 0; b < n; b++) {
++		uint32_t x0 = b % bw * RWCAM_NR_BLOCK, y0 = b / bw * RWCAM_NR_BLOCK, sum = 0, count = 0;
++
++		for (uint32_t yy = y0; yy < y0 + RWCAM_NR_BLOCK && yy < height; yy += 2) {
++			const uint8_t *row = y + (size_t)yy * ys, *before = by + (size_t)yy * width;
++
++			for (uint32_t x = x0; x < x0 + RWCAM_NR_BLOCK && x < width; x += 2) {
++				int d = (int)row[x] - (int)before[x];
++
++				sum += (uint32_t)(d < 0 ? -d : d);
++				count++;
++			}
++		}
++		sum = count ? sum * 4 / count : 0;      /* (in quarters of a level) */
++		diff[b] = (uint8_t)(sum > 255 ? 255 : sum);
++		all += diff[b];
++	}
++	/* the noise: the mean of the blocks that differ by less than twice the mean of all */
++	for (uint32_t b = 0; b < n; b++) {
++		if ((uint64_t)diff[b] * n <= 2 * all) {
++			calm += diff[b];
++			calm_n++;
++		}
++	}
++	limit = (int)(RWCAM_NR_MOVES * (calm_n ? (double)calm / (double)calm_n : 0) + 0.5);
++	limit = limit < 10 ? 10 : limit > 48 ? 48 : limit;      /* (2.5 to 12 levels) */
++	{
++		/* (in a block that is still, what a pixel differs by is noise up to three times the blocks' own: at least `near') */
++		int noise3 = (int)(3.0 * (calm_n ? (double)calm / (double)calm_n : 0) / 4 + 0.5);
++
++		noise3 = noise3 > 40 ? 40 : noise3;
++		near_y = noise3 > near_y ? noise3 : near_y;
++		near_c = noise3 * 3 / 4 > near_c ? noise3 * 3 / 4 : near_c;
++	}
++	for (uint32_t b = 0; b < n; b++) {
++		moves[b] = diff[b] > limit;
++		moving += moves[b];
++	}
++	{
++		struct before_job j = { y, uv, by, buv, moves, ys, uvs, width, height, bw, bh, cw, moving, near_y, keep_y, near_c, keep_c };
++
++		if (R.apply != NULL) {
++			R.apply(BEFORE_PIECES, &j, before_piece);
++		} else {
++			for (size_t k = 0; k < BEFORE_PIECES; k++) {
++				before_piece(&j, k);
++			}
++		}
++	}
++	free(diff);
++}
++
+diff -ruN -x '*.o' y2s67-libmerge1/src/rwa_isp_api.h y2s70-libmerge2/src/rwa_isp_api.h
+--- y2s67-libmerge1/src/rwa_isp_api.h	2026-11-12 11:55:41.317156373 +0100
++++ y2s70-libmerge2/src/rwa_isp_api.h	2026-11-12 13:47:02.585643547 +0100
+@@ -26,7 +26,7 @@
+ #endif
+ 
+ #define RWA_ISP_LIBRARY         "/System/Library/Extensions/Nord2Metal.bundle/libredwoodair.dylib"
+-#define RWA_ISP_API_VERSION     1
++#define RWA_ISP_API_VERSION     2       /* 2: struct rwa_isp_params has denoise and denoise_before (y2s70 NR2) */
+ 
+ /* What the calls answer. 0 is success; every failure is negative, leaves the output surface in an unspecified state (some of it
+  * may have been written) and comes with a sentence in `why`. The caller renders that frame on the processor. */
+@@ -78,7 +78,20 @@
+ 	uint32_t        video_range;    /* 0: full range ('420f'); not 0: video range ('420v') -- must be the output surface's own */
+ 	uint32_t        lens_shading;   /* isp->lsc.on: must be 0 (RWA_ISP_E_UNSUPPORTED otherwise: the table is not done on the GPU yet) */
+ 	const uint8_t   *gamma;         /* isp->gamma: 4096 bytes; read during the call, uploaded again only when its bytes change */
++	/*
++	 * API version 2 (a caller built for version 1 gives a `size` that ends at `gamma`: no noise reduction, as before).
++	 * denoise: 0 none; 1, 2: rwcam_render.c's levels (gain 3 and more, 8 and more), done on the GPU after the picture is made, bit for
++	 * bit as the processor does it: the colour planes smoothed (once, twice), at 2 the brightness smoothed away from edges.
++	 * denoise_before: not 0: the picture is also drawn towards the one this context made before it, by 8 x 8 blocks that are still
++	 * (rwcam_render.c with_before()); the picture before is kept by the context as a texture and never read back -- what IS read back,
++	 * in the call, is one byte for each block (how much it differs), so such a render waits for the GPU once even with
++	 * RWA_ISP_OUT_ASYNC. 0: nothing is kept (a still). The context forgets the picture before whenever a render does not ask for this,
++	 * or the picture's size changes.
++	 */
++	uint32_t        denoise;
++	uint32_t        denoise_before;
+ };
++#define RWA_ISP_PARAMS_SIZE_1   ((uint32_t)offsetof(struct rwa_isp_params, denoise))
+ 
+ #define RWA_ISP_OUT_ASYNC       1u      /* do not wait for the GPU: the planes are written when rwa_isp_wait() has returned 0 */
+ 

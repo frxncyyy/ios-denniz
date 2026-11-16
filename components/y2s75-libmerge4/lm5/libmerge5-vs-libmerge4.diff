@@ -1,0 +1,220 @@
+diff -ruN y2s75-libmerge4/src/air_isp.c y2s75-libmerge4/lm5/src/air_isp.c
+--- y2s75-libmerge4/src/air_isp.c	2026-11-12 16:18:57.466202983 +0100
++++ y2s75-libmerge4/lm5/src/air_isp.c	2026-11-12 17:38:31.781614029 +0100
+@@ -25,6 +25,7 @@
+  */
+ #include <dlfcn.h>
+ #include <unistd.h>
++#include <fcntl.h>
+ #include "util/os_time.h"
+ #include "rwa_isp_api.h"
+ 
+@@ -151,6 +152,46 @@
+ };
+ 
+ static struct rwa_device *isp_device;           /* the process's, opened by the first rwa_isp_create and kept */
++/*
++ * libmerge5 (y2s75/lm5): the three libmerge4 changes that only a real Mali can judge are OFF unless asked for, so that each can be tried on the
++ * phone in one boot. Run of 12 November (txn lm4): the GPU's pictures without noise reduction (the ones the bundle compares) were up to 14..35 of
++ * 255 off the processor's from the FIRST picture, previews (cells) and stills (full) alike, where libmerge3 had 0; softpipe gives 0 with all of
++ * them. Asked by words in /private/var/db/nord2-isp-features (or RWA_ISP_FEATURES), read once at the first rwa_isp_create:
++ *   fold   the luma pass folded into the ISP pass (two attachments: RGB and Y)           -- off: the ISP pass, then libmerge3's luma pass
++ *   r32    the frame read as 32-bit words (ISP cells without zoom, the statistics' cells) -- off: byte by byte, as libmerge3
++ *   mrt    the apply passes write the plane and the next picture before in one pass       -- off: two passes, as libmerge3
++ *   all    the three
++ */
++static bool isp_feat_fold, isp_feat_r32, isp_feat_mrt;
++static pthread_once_t isp_feat_once = PTHREAD_ONCE_INIT;
++static char isp_feat_text[96];
++
++static void
++isp_features_load(void)
++{
++   char text[256] = "";
++   const char *env = getenv("RWA_ISP_FEATURES");
++
++   if (env != NULL) {
++      snprintf(text, sizeof(text), "%s", env);
++   } else {
++      int fd = open("/private/var/db/nord2-isp-features", O_RDONLY);
++
++      if (fd >= 0) {
++         ssize_t n = read(fd, text, sizeof(text) - 1);
++
++         text[n > 0 ? n : 0] = 0;
++         close(fd);
++      }
++   }
++   bool all = strstr(text, "all") != NULL;
++
++   isp_feat_fold = all || strstr(text, "fold") != NULL;
++   isp_feat_r32 = all || strstr(text, "r32") != NULL;
++   isp_feat_mrt = all || strstr(text, "mrt") != NULL;
++   snprintf(isp_feat_text, sizeof(isp_feat_text), "fold %s, r32 %s, mrt %s", isp_feat_fold ? "ON" : "off", isp_feat_r32 ? "ON" : "off",
++            isp_feat_mrt ? "ON" : "off");
++}
+ static void isp_say(struct rwa_isp *isp);
+ 
+ /* ---- camera_isp.c's arithmetic, for the tables and the block ------------------------------------------------------------------ */
+@@ -449,11 +490,13 @@
+ static void
+ isp_store_rgb_y(nir_builder *b, nir_variable *out, nir_def *rgb[3], nir_def *byte[3])
+ {
++   nir_store_var(b, out, nir_vec4(b, rgb[0], rgb[1], rgb[2], nir_imm_float(b, 1.0f)), 0xf);
++   if (!isp_feat_fold)
++      return;                                  /* (libmerge5: the luma pass does it) */
+    nir_variable *out1 = isp_fragment_out1(b);
+    nir_def *luma = nir_ishr_imm(b, nir_iadd(b, isp_dot_k(b, 0, byte), isp_word(b, ISP_U_OY)), 16);
+    nir_def *value = nir_fmul_imm(b, nir_i2f32(b, luma), 1.0 / 255.0);
+ 
+-   nir_store_var(b, out, nir_vec4(b, rgb[0], rgb[1], rgb[2], nir_imm_float(b, 1.0f)), 0xf);
+    nir_store_var(b, out1, nir_vec4(b, value, nir_imm_float(b, 0.0f), nir_imm_float(b, 0.0f), nir_imm_float(b, 1.0f)), 0xf);
+ }
+ 
+@@ -475,6 +518,8 @@
+     * not eight; otherwise (any 2x2 of the sensor) byte by byte as before. The condition is the same for every pixel of a pass. */
+    nir_def *fast = nir_ieq_imm(&b, isp_word(&b, ISP_U_SHADE_OFF), 1), *fv[4], *sv[4];
+ 
++   if (!isp_feat_r32)
++      fast = nir_imm_false(&b);               /* (libmerge5: byte by byte unless r32; the branch folds away) */
+    nir_push_if(&b, fast);
+    {
+       isp_raw_pair(&b, 4, format, px, py, &fv[0]);
+@@ -692,8 +737,13 @@
+ {
+    nir_def *px = nir_ishl_imm(b, cx, 1), *py = nir_ishl_imm(b, cy, 1), *raw[4];
+ 
+-   isp_raw_pair(b, 0, format, px, py, &raw[0]);
+-   isp_raw_pair(b, 0, format, px, nir_iadd_imm(b, py, 1), &raw[2]);
++   if (isp_feat_r32) {
++      isp_raw_pair(b, 0, format, px, py, &raw[0]);
++      isp_raw_pair(b, 0, format, px, nir_iadd_imm(b, py, 1), &raw[2]);
++   } else {                                    /* (libmerge5: texture 0 is the frame's bytes) */
++      for (int n = 0; n < 4; n++)
++         raw[n] = isp_raw(b, format, nir_iadd_imm(b, px, n & 1), nir_iadd_imm(b, py, n >> 1));
++   }
+    for (int n = 0; n < 4; n++)
+       v[n] = nir_imax(b, nir_isub(b, raw[n], black), nir_imm_int(b, 0));
+ }
+@@ -915,7 +965,7 @@
+ {
+    nir_variable *uv, *out;
+    nir_builder b = isp_fragment_begin(options, channels == 1 ? "isp_nr_apply_y" : "isp_nr_apply_c", &uv, &out);
+-   nir_variable *out1 = isp_fragment_out1(&b);
++   nir_variable *out1 = isp_feat_mrt ? isp_fragment_out1(&b) : NULL;
+    nir_def *x, *y;
+ 
+    isp_pixel_xy(&b, uv, &x, &y);
+@@ -934,7 +984,8 @@
+       o[c] = isp_nr_unorm(&b, nir_bcsel(&b, take, nir_isub(&b, n, nir_ishr_imm(&b, nir_imul(&b, d, keep), 8)), n));
+    }
+    nir_store_var(&b, out, nir_vec4(&b, o[0], o[1], o[2], o[3]), 0xf);
+-   nir_store_var(&b, out1, nir_vec4(&b, o[0], o[1], o[2], o[3]), 0xf);
++   if (out1 != NULL)
++      nir_store_var(&b, out1, nir_vec4(&b, o[0], o[1], o[2], o[3]), 0xf);
+    return isp_fragment_end(&b, 3);
+ }
+ 
+@@ -1585,6 +1636,26 @@
+    return isp_nr_pass2(device, dst, NULL, fs, t0, t1, t2, base, q, what, why, why_size);
+ }
+ 
++/* the ISP pass into rgb, and the Y into `y': in the same pass (fold) or by libmerge3's luma pass after it. lock held. */
++static int
++isp_rgb_and_y(struct rwa_device *device, struct rwa_texture *rgb, struct rwa_texture *y, void *fs_isp, struct rwa_texture *const *isp_textures,
++              const struct isp_block *block, char *why, size_t why_size)
++{
++   if (isp_feat_fold) {
++      struct rwa_texture *const out[2] = { rgb, y };
++
++      return isp_pass_to(device, out, 2, fs_isp, isp_textures, 5, block, "ISP", why, why_size);
++   }
++   void *fs_luma = device->isp.luma != NULL ? device->isp.luma
++                 : isp_shader(device, &device->isp.luma, isp_luma_shader(device->nir_options), why, why_size);
++   struct rwa_texture *const rgb_texture[1] = { rgb };
++
++   if (fs_luma == NULL)
++      return -1;
++   return isp_pass(device, rgb, fs_isp, isp_textures, 5, block, "ISP", why, why_size) != 0 ||
++          isp_pass(device, y, fs_luma, rgb_texture, 1, block, "luma", why, why_size) != 0 ? -1 : 0;
++}
++
+ /*
+  * The picture's passes: the ISP pass (y2s75: the RGB picture and its Y in one), the chroma pass, and the noise taken out (struct rwa_isp_params
+  * denoise, denoise_before) -- rwcam_render.c denoise(): the colours smoothed once (twice at 2), the brightness at 2 (near 16), then with the
+@@ -1607,10 +1678,8 @@
+ 
+    level = level > 2 ? 2 : level;
+    if (level == 0 || width < 8 || height < 8) {
+-      struct rwa_texture *const out[2] = { rgb, luma };
+-
+       isp->nr_before = false;                  /* (the picture before is not this one's any more) */
+-      return isp_pass_to(device, out, 2, fs_isp, isp_textures, 5, block, "ISP", why, why_size) != 0 ||
++      return isp_rgb_and_y(device, rgb, luma, fs_isp, isp_textures, block, why, why_size) != 0 ||
+              isp_pass(device, chroma, fs_chroma, rgb_texture, 1, block, "chroma", why, why_size) != 0 ? -1 : 0;
+    }
+    const uint32_t cw = (width + 1) / 2, ch = (height + 1) / 2;
+@@ -1628,13 +1697,9 @@
+ 
+    if (f_sy == NULL || f_sc == NULL || f_cy == NULL || f_cc == NULL || y0 == NULL || c0 == NULL || c1 == NULL)
+       return -1;
+-   {
+-      struct rwa_texture *const out[2] = { rgb, y0 };
+-
+-      if (isp_pass_to(device, out, 2, fs_isp, isp_textures, 5, block, "ISP", why, why_size) != 0 ||
+-          isp_pass(device, c0, fs_chroma, rgb_texture, 1, block, "chroma", why, why_size) != 0)
+-         return -1;
+-   }
++   if (isp_rgb_and_y(device, rgb, y0, fs_isp, isp_textures, block, why, why_size) != 0 ||
++       isp_pass(device, c0, fs_chroma, rgb_texture, 1, block, "chroma", why, why_size) != 0)
++      return -1;
+    /* (no picture before, or another size: this picture as made is its own picture before -- denoise()'s `fresh') */
+    if (isp->nr_by != NULL && (isp->nr_by->res->width0 != width || isp->nr_by->res->height0 != height))
+       isp->nr_before = false;                  /* (another size: the picture before is not this one's) */
+@@ -1797,9 +1862,16 @@
+    const int32_t qy[5] = { 0, keep_y, 0, 0, 0 }, qc[5] = { 0, keep_c, 0, 0, 0 };
+ 
+    /* each plane and the next render's picture before, in one pass */
+-   if (isp_nr_pass2(device, luma, isp->nr_by2, f_ay, yc, isp->nr_by, st, block, qy, "noise: with the picture before (brightness)", why, why_size) != 0 ||
+-       isp_nr_pass2(device, chroma, isp->nr_bc2, f_ac, cc, isp->nr_bc, st, block, qc, "noise: with the picture before (colours)", why, why_size) != 0)
++   if (isp_feat_mrt) {
++      if (isp_nr_pass2(device, luma, isp->nr_by2, f_ay, yc, isp->nr_by, st, block, qy, "noise: with the picture before (brightness)", why, why_size) != 0 ||
++          isp_nr_pass2(device, chroma, isp->nr_bc2, f_ac, cc, isp->nr_bc, st, block, qc, "noise: with the picture before (colours)", why, why_size) != 0)
++         return -1;
++   } else if (isp_nr_pass(device, luma, f_ay, yc, isp->nr_by, st, block, qy, "noise: with the picture before (brightness)", why, why_size) != 0 ||
++              isp_nr_pass(device, isp->nr_by2, f_ay, yc, isp->nr_by, st, block, qy, "noise: the next picture before (brightness)", why, why_size) != 0 ||
++              isp_nr_pass(device, chroma, f_ac, cc, isp->nr_bc, st, block, qc, "noise: with the picture before (colours)", why, why_size) != 0 ||
++              isp_nr_pass(device, isp->nr_bc2, f_ac, cc, isp->nr_bc, st, block, qc, "noise: the next picture before (colours)", why, why_size) != 0) {
+       return -1;
++   }
+    struct rwa_texture *t = isp->nr_by;
+    isp->nr_by = isp->nr_by2;
+    isp->nr_by2 = t;
+@@ -2110,7 +2182,7 @@
+ 
+          if (target != NULL) {
+             struct isp_block sb = block;
+-            struct rwa_texture *const cells_textures[1] = { frame32 }, *const stats_textures[1] = { cells };
++            struct rwa_texture *const cells_textures[1] = { isp_feat_r32 ? frame32 : frame }, *const stats_textures[1] = { cells };
+             int white = 1023 - (int)f->black;
+ 
+             white = white < 64 ? 64 : white;
+@@ -2656,6 +2728,7 @@
+       return NULL;
+    }
+    isp->device = isp_device;
++   pthread_once(&isp_feat_once, isp_features_load);
+    {
+       static bool said;
+ 
+@@ -2663,8 +2736,8 @@
+          said = true;
+          isp_no_linear = access("/private/var/db/nord2-isp-nolinear", F_OK) == 0;
+          isp_nr_cpu = access("/private/var/db/nord2-isp-nrcpu", F_OK) == 0 || getenv("RWA_ISP_NRCPU") != NULL;
+-         isp_note("camera ISP: libmerge4 (y2s75): intermediates pooled, luma folded into the ISP pass, statistics from a cells pass, the noise's "
+-                  "numbers %s; readbacks %s", isp_nr_cpu ? "by the processor (nord2-isp-nrcpu)" : "on the GPU, one submission",
++         isp_note("camera ISP: libmerge5 (y2s75/lm5): intermediates pooled, statistics from a cells pass, the noise's stillness one texel a pixel; "
++                  "features (nord2-isp-features) %s; the noise's numbers %s; readbacks %s", isp_feat_text, isp_nr_cpu ? "by the processor (nord2-isp-nrcpu)" : "on the GPU, one submission",
+                   isp_no_linear ? "through the driver (nord2-isp-nolinear)" : "out of linear buffers where the GPU lays textures over them");
+       }
+    }

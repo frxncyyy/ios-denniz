@@ -1,0 +1,140 @@
+--- redwoodmetal.m	2026-11-12 20:12:14.999106391 +0100
++++ redwoodmetal.m	2026-11-12 23:26:03.492797687 +0100
+@@ -6665,6 +7549,7 @@
+ 		}
+ 	}
+ 	if (_iosurface != NULL) {
++		[self redwoodTGGiveBack];       /* y2s91 */
+ 		CFRelease(_iosurface);
+ 	}
+ 	[_parent release];
+@@ -7146,6 +8286,12 @@
+ 	if (freeze_rule < 0) {
+ 		freeze_rule = rw_is_photos_proc() && access("/var/db/nord2-metal/photos-ycbcr-live", F_OK) != 0;
+ 	}
++	/* y2s91 (thumbgrid): follow-live in place of the freeze, the young and the finished-row rules (-redwoodTGLiveDecision) */
++	int tg = [self redwoodTGLiveDecision];
++
++	if (tg == 0) {
++		return YES;
++	}
+ 	/*
+ 	 * y2s83 (thumbfix5): ... but only once the picture IS finished. Run v (q10jfe): the grid stays, but some cells are black or show a
+ 	 * strip of the photo and black elsewhere, always the same cells. The thumbnails are decoded into their pool buffers in place
+@@ -7155,12 +8301,12 @@
+ 	 * the last luma row of the surface holds data (a cleared buffer is luma 0 there; the decoder writes the rows in order). Until then
+ 	 * every use converts again (the young rule's GPU pass); after 3 s the picture is taken as it is (a photo that is black indeed).
+ 	 */
+-	if (freeze_rule == 1 && _frozen && _ycbcr) {
++	if (tg < 0 && freeze_rule == 1 && _frozen && _ycbcr) {
+ 		return YES;
+ 	}
+ 	BOOL freeze_now = NO, unfinished = NO;
+ 
+-	if (freeze_rule == 1 && _ycbcr && _iosurface != NULL && rw_ios.lock(_iosurface, 1 /* read-only */, NULL) == 0) {
++	if (tg < 0 && freeze_rule == 1 && _ycbcr && _iosurface != NULL && rw_ios.lock(_iosurface, 1 /* read-only */, NULL) == 0) {
+ 		struct rw_ycbcr_planes fv;
+ 		BOOL finished = NO;
+ 
+@@ -7208,9 +8354,9 @@
+ 	if (young_rule < 0) {
+ 		young_rule = rw_is_photos() && access("/var/db/nord2-metal/no-young-reconvert", F_OK) != 0;
+ 	}
+-	BOOL young = young_rule == 1 && _ycbcrSource != NULL && _convertedAt != 0 && rw_now_ns() - _convertedAt < 3000000000ULL;
++	BOOL young = tg < 0 && young_rule == 1 && _ycbcrSource != NULL && _convertedAt != 0 && rw_now_ns() - _convertedAt < 3000000000ULL;
+ 
+-	if (_copiedOnce && seed == _copySeed && probe_now == _ycbcrProbe && !young && !unfinished && !freeze_now) {
++	if (tg != 1 && _copiedOnce && seed == _copySeed && probe_now == _ycbcrProbe && !young && !unfinished && !freeze_now) {
+ 		return YES;
+ 	}
+ 	if (freeze_now) {
+@@ -7240,6 +8386,7 @@
+ 		mesa.texture_destroy(_ycbcrSource);
+ 		_ycbcrSource = NULL;
+ 		_padded = NO;
++		_tgExact = NO;                  /* y2s91 */
+ 	}
+ 	if (_ycbcrSource != NULL && (flush_rule == 1 || rw_is_photos()) && rw_ios.lock(_iosurface, 1, NULL) == 0) {
+ 		struct rw_ycbcr_planes cv;
+@@ -7308,6 +8459,7 @@
+ 			_copySeed = seed;
+ 			_ycbcrProbe = probe_now;
+ 			_copiedOnce = YES;
++			[self redwoodTGConverted:seed probe:probe_now gpu:YES];   /* y2s91 */
+ 			if (__sync_fetch_and_add(&said_gpu, 1) < 8) {
+ 				m2m_log('I', "SURF", "YCbCr surface %u (%ux%u '%c%c%c%c') is served as RGB: converted on the GPU from its two "
+ 				    "planes in place, %s matrix, %s range; the pass took %.3f ms to queue (no pixel touched by the CPU)\n",
+@@ -7374,6 +8527,7 @@
+ 				_copySeed = seed;
+ 				_ycbcrProbe = probe;
+ 				_copiedOnce = YES;
++				[self redwoodTGConverted:seed probe:probe gpu:NO];   /* y2s91 */
+ 			}
+ 			if (ok && __sync_fetch_and_add(&said, 1) < 8) {
+ 				uint64_t t_end = rw_now_ns();
+@@ -9121,6 +10281,8 @@
+ {
+ 	char why[512] = { 0 };
+ 
++	rw_tg_report_maybe();           /* y2s91: 'NORD2 PERF PHOTOS TG/CHECK' every 5 s */
++	BOOL tg_dispatch_out = NO;      /* y2s91: a deferred dispatch of this buffer is queued and not waited for yet */
+ 	BOOL queued = NO, trace = NO;
+ 	uint64_t t_start = rw_now_ns(), t_wait = 0, draws = 0;
+ 	/* (rw_commit_report) what this commit is made of, in CoreAnimation's labels */
+@@ -9205,6 +10373,23 @@
+ 		}
+ 		if (work->render != nil) {
+ 			draws++;
++			/* y2s91 rttouch: a plane of a YCbCr surface rendered into in place: touched (seed moved) at completion, and a write in
++			 * flight for the conversions of this process until then */
++			for (unsigned ci = 0; ci < work->colorCount && ci < 8; ci++) {
++				id ct = work->color[ci];
++				RedwoodMetalTexture *root = [ct isKindOfClass:[RedwoodMetalTexture class]] ? [(RedwoodMetalTexture *)ct redwoodTGTargetRoot] : nil;
++
++				if (root != nil) {
++					if (_writeBack == nil) {
++						_writeBack = [[NSMutableArray alloc] init];
++					}
++					if (![_writeBack containsObject:root]) {
++						[_writeBack addObject:root];
++						rw_tg_pending_add((void *)[root iosurface]);
++						__sync_add_and_fetch(&rw_tg_n.rt_touch, 1);
++					}
++				}
++			}
+ 			/* y2s59: the Photos grid's frames, probed after completion (rw_photos_probe) */
+ 			if (rw_is_photos() && work->colorCount > 0 && work->color[0] != nil && [work->color[0] width] >= 1000 &&
+ 			    [work->color[0] height] >= 2000) {
+@@ -9292,12 +10478,22 @@
+ 		 * through rwa_dispatch, and then a kernel with a set is refused by name
+ 		 * there and every offset is read as zero -- which is what an older library
+ 		 * did with one in any case, out loud. */
+-		int rc = mesa.dispatch_buffers != NULL
++		/* y2s91 async: queued like a draw and paid by this buffer's fence, instead of a flush and a wait per dispatch */
++		BOOL tg_deferred = rw_tg_async_usable(_tracing);
++		int rc = tg_deferred
++			    ? rw_tg.dispatch_deferred([work->pipeline compute], &bindings, table, work->count, work->groups, work->size, why,
++						      sizeof(why))
++			    : mesa.dispatch_buffers != NULL
+ 			    ? mesa.dispatch_buffers([work->pipeline compute], &bindings,
+ 						    table, work->count, work->groups,
+ 						    work->size, why, sizeof(why))
+ 			    : mesa.dispatch([work->pipeline compute], &bindings, work->groups,
+ 					    work->size, why, sizeof(why));
++		if (rc == 0 && tg_deferred) {
++			queued = YES;
++			tg_dispatch_out = YES;
++			__sync_add_and_fetch(&rw_tg_n.async_n, 1);
++		}
+ 		if (rc != 0) {
+ 			m2m_log('E', "CMD", "the dispatch failed: %s\n", why);
+ 			_error = [[NSError errorWithDomain:@"RedwoodMetal" code:2
+@@ -9318,6 +10514,8 @@
+ 		void *fence = mesa.submit([[_queue device] mesaDevice]);
+ 		uint64_t t_end = rw_now_ns();
+ 
++		rw_tg_seq_bind(fence);          /* y2s91: on the GPU until its fence (pool quarantine) */
++
+ 		rw_commit_report(draws, t_end - t_start, 0, top, topn, ntop);
+ 		_status = RW_CB_SCHEDULED;
+ 		[self redwoodMaybeSnap];

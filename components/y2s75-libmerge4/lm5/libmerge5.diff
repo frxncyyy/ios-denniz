@@ -1,0 +1,2178 @@
+diff -ruN y2s72-libmerge3/src/air_isp.c y2s75-libmerge4/lm5/src/air_isp.c
+--- y2s72-libmerge3/src/air_isp.c	2026-11-12 15:25:33.815682732 +0100
++++ y2s75-libmerge4/lm5/src/air_isp.c	2026-11-12 17:38:31.781614029 +0100
+@@ -24,6 +24,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ #include <dlfcn.h>
++#include <unistd.h>
++#include <fcntl.h>
+ #include "util/os_time.h"
+ #include "rwa_isp_api.h"
+ 
+@@ -45,7 +47,15 @@
+ #define ISP_SLOTS       4
+ #define ISP_SURFACES    8
+ #define ISP_PENDING     8
+-#define ISP_KEEP_BYTES  (16u << 20)     /* an intermediate picture larger than this is not kept after its render */
++/* y2s75 libmerge4: the intermediate textures of a render (the RGB picture, the noise's planes, its blocks) come out of a pool of the context's,
++ * by format and size, and go back to it after the render's submission: nothing is made or let go per frame (libmerge3 let an intermediate
++ * picture above 16 MiB go after every render -- 4K: 33 MB made, zeroed and mapped again for each picture, "GPU ALLOC SLOW ... 14758 us").
++ * What the pool keeps is bounded (ISP_POOL_BYTES of textures no render holds; the least recently used go first) and what no render has
++ * used for ISP_POOL_IDLE renders is let go (a still's 50 MB, some seconds after the still). */
++#define ISP_POOL        24
++#define ISP_POOL_BYTES  (192ull << 20)
++#define ISP_POOL_IDLE   600
++#define ISP_SAY_NS      5000000000ull   /* the library's own summary of the renders, every 5 s of a context's renders */
+ 
+ /* what the shaders are told, in 32-bit words (std140 has nothing to say about a block of scalars); the indices are the words */
+ struct isp_block {
+@@ -80,24 +90,51 @@
+    uint64_t used;
+ };
+ 
++struct isp_pooled {
++   struct rwa_texture *texture;
++   uint32_t format, width, height;
++   uint64_t used, bytes;
++   bool taken;                                  /* held by the render being built */
++};
++
++/* y2s75: a texture laid over a buffer of the device's, linear, that the processor reads (or writes) straight through the buffer's map, with no
++ * transfer (no tiled or AFBC copy-out by the driver); on softpipe, which lays no texture over a buffer, an ordinary texture read through the
++ * driver */
++struct isp_linear {
++   struct rwa_buffer *buffer;
++   struct rwa_texture *texture;
++   uint32_t format, width, height, row;
++};
++
++/* y2s75: what the context says every ISP_SAY_NS (isp_say) */
++struct isp_counts {
++   uint64_t since, renders, zero_copy, uploaded, upload_bytes, upload_ns, prepare_ns, queue_ns, wait_ns, readback_ns, stats_ns;
++   uint64_t pool_hits, pool_misses, pool_made_bytes, passes, submits, mid_waits, linear_reads, driver_reads, imports;
++   uint32_t fw, fh, w, h, mode, level, before;
++};
++
+ struct rwa_isp {
+    struct rwa_device *device;
+    /* the frame's bytes for the GPU: buffers of the device's (0..ISP_SLOTS-1 the caller's, ISP_SLOTS the copy's) and a texture over each */
+    struct {
+       struct rwa_buffer *buffer;
+       size_t header_bytes, frame_bytes, pad;    /* the frame's first byte is at map + pad + header_bytes */
+-      struct rwa_texture *texture;
++      struct rwa_texture *texture, *texture32;  /* y2s75: and the same bytes as 32-bit words (R32Uint, a quarter as wide) */
+       uint32_t stride, height;                  /* what `texture' was made for */
+    } slot[ISP_SLOTS + 1];
+-   struct rwa_texture *raw_own;                 /* softpipe, or a GPU that would not lay a texture over a buffer: an ordinary texture */
++   struct rwa_texture *raw_own, *raw_own32;     /* softpipe, or a GPU that would not lay a texture over a buffer: ordinary textures */
+    uint32_t raw_own_w, raw_own_h;
+    bool no_buffer_textures;
+-   struct rwa_texture *columns, *rows, *gamma, *rgb;
+-   /* y2s70 NR2: the planes as made (y0, c0), smoothed (y1, c1, c2), the picture before (by, bc: valid while nr_before) and the next one
+-    * (by2, bc2), the blocks' difference and moves */
+-   struct rwa_texture *nr_y0, *nr_y1, *nr_c0, *nr_c1, *nr_c2, *nr_by, *nr_bc, *nr_by2, *nr_bc2, *nr_diff, *nr_moves;
++   struct rwa_texture *columns, *rows, *gamma;
++   /* y2s70 NR2: the picture before (by, bc: valid while nr_before) and the next one (by2, bc2), kept from render to render; y2s75: the planes as
++    * made and smoothed come out of the pool, the blocks' difference and stillness are linear (isp_linear) */
++   struct rwa_texture *nr_by, *nr_bc, *nr_by2, *nr_bc2;
++   struct isp_linear nr_diff, nr_still;
+    bool nr_before;
+-   uint32_t columns_n, rows_n, rgb_w, rgb_h;
++   uint32_t columns_n, rows_n;
++   struct isp_pooled pool[ISP_POOL];
++   uint64_t renders;                            /* the pool's clock */
++   struct isp_counts count;
+    struct { uint32_t fw, fh, ow, oh, flip, zoom_bits, mode; bool valid; int shade_off; } map_key;
+    uint8_t gamma_now[4096];
+    bool gamma_valid;
+@@ -105,14 +142,57 @@
+    uint64_t clock;
+    struct pipe_fence_handle *pending[ISP_PENDING];
+    unsigned pendings;
+-   /* y2s65: the frame's statistics (isp_stats_shader): the texture, and what the caller asked of this render */
+-   struct rwa_texture *stats;
+-   uint32_t stats_tw, stats_th;                 /* the texture's size */
++   /* y2s65: the frame's statistics (isp_stats_shader): the texture, and what the caller asked of this render; y2s75: linear (read through
++    * the buffer's map after the wait, not copied out of a tiled texture by the driver), and the cells it is summed from */
++   struct isp_linear stats;
++   struct rwa_texture *stats_cells;
++   uint32_t stats_cw, stats_ch;
+    float *stats_out;
+    uint32_t stats_floats, stats_w, stats_h, stats_step;   /* stats_w 0: not made by this render */
+ };
+ 
+ static struct rwa_device *isp_device;           /* the process's, opened by the first rwa_isp_create and kept */
++/*
++ * libmerge5 (y2s75/lm5): the three libmerge4 changes that only a real Mali can judge are OFF unless asked for, so that each can be tried on the
++ * phone in one boot. Run of 12 November (txn lm4): the GPU's pictures without noise reduction (the ones the bundle compares) were up to 14..35 of
++ * 255 off the processor's from the FIRST picture, previews (cells) and stills (full) alike, where libmerge3 had 0; softpipe gives 0 with all of
++ * them. Asked by words in /private/var/db/nord2-isp-features (or RWA_ISP_FEATURES), read once at the first rwa_isp_create:
++ *   fold   the luma pass folded into the ISP pass (two attachments: RGB and Y)           -- off: the ISP pass, then libmerge3's luma pass
++ *   r32    the frame read as 32-bit words (ISP cells without zoom, the statistics' cells) -- off: byte by byte, as libmerge3
++ *   mrt    the apply passes write the plane and the next picture before in one pass       -- off: two passes, as libmerge3
++ *   all    the three
++ */
++static bool isp_feat_fold, isp_feat_r32, isp_feat_mrt;
++static pthread_once_t isp_feat_once = PTHREAD_ONCE_INIT;
++static char isp_feat_text[96];
++
++static void
++isp_features_load(void)
++{
++   char text[256] = "";
++   const char *env = getenv("RWA_ISP_FEATURES");
++
++   if (env != NULL) {
++      snprintf(text, sizeof(text), "%s", env);
++   } else {
++      int fd = open("/private/var/db/nord2-isp-features", O_RDONLY);
++
++      if (fd >= 0) {
++         ssize_t n = read(fd, text, sizeof(text) - 1);
++
++         text[n > 0 ? n : 0] = 0;
++         close(fd);
++      }
++   }
++   bool all = strstr(text, "all") != NULL;
++
++   isp_feat_fold = all || strstr(text, "fold") != NULL;
++   isp_feat_r32 = all || strstr(text, "r32") != NULL;
++   isp_feat_mrt = all || strstr(text, "mrt") != NULL;
++   snprintf(isp_feat_text, sizeof(isp_feat_text), "fold %s, r32 %s, mrt %s", isp_feat_fold ? "ON" : "off", isp_feat_r32 ? "ON" : "off",
++            isp_feat_mrt ? "ON" : "off");
++}
++static void isp_say(struct rwa_isp *isp);
+ 
+ /* ---- camera_isp.c's arithmetic, for the tables and the block ------------------------------------------------------------------ */
+ 
+@@ -279,6 +359,42 @@
+    return nir_ior(b, nir_ishl_imm(b, b0, 2), nir_iand_imm(b, nir_ushr(b, b4, shift), 3));
+ }
+ 
++/*
++ * y2s75: the two pixels px, px + 1 of line py (px EVEN: both in one group of five bytes) out of the frame read as 32-bit words (texture `unit',
++ * R32Uint over the same memory, a quarter as wide): the group's five bytes lie in two consecutive words, so two reads give both pixels, where
++ * isp_raw reads two bytes for each (four). The same bits as isp_raw's: byte j of the group is byte (g5 & 3) + j of the two words.
++ */
++static void
++isp_raw_pair(nir_builder *b, unsigned unit, unsigned format, nir_def *px, nir_def *py, nir_def *v[2])
++{
++   nir_def *g5 = nir_imul_imm(b, nir_ushr_imm(b, px, 2), 5), *o = nir_iand_imm(b, g5, 3), *q = nir_ushr_imm(b, g5, 2);
++   nir_def *w0 = nir_channel(b, isp_fetch(b, unit, q, py, nir_type_uint32), 0);
++   nir_def *w1 = nir_channel(b, isp_fetch(b, unit, nir_iadd_imm(b, q, 1), py, nir_type_uint32), 0);
++   nir_def *k = nir_iand_imm(b, px, 3), *byte[5];
++
++   for (int j = 0; j < 5; j++) {
++      nir_def *t = nir_iadd_imm(b, o, j), *sh = nir_ishl_imm(b, nir_iand_imm(b, t, 3), 3);
++
++      byte[j] = nir_iand_imm(b, nir_ushr(b, nir_bcsel(b, nir_ult_imm(b, t, 4), w0, w1), sh), 0xff);
++   }
++   /* (k is 0 or 2: pixel k uses bytes k, k + 1 (LE40) or k, 4 (MIPI); pixel k + 1 the next) */
++   nir_def *is2 = nir_ieq_imm(b, k, 2);
++   nir_def *bk = nir_bcsel(b, is2, byte[2], byte[0]), *bk1 = nir_bcsel(b, is2, byte[3], byte[1]);
++
++   if (format == 4) {
++      nir_def *bk2 = nir_bcsel(b, is2, byte[4], byte[2]);
++      nir_def *shift = nir_ishl_imm(b, k, 1);
++
++      v[0] = nir_iand_imm(b, nir_ushr(b, nir_ior(b, bk, nir_ishl_imm(b, bk1, 8)), shift), 0x3ff);
++      v[1] = nir_iand_imm(b, nir_ushr(b, nir_ior(b, bk1, nir_ishl_imm(b, bk2, 8)), nir_iadd_imm(b, shift, 2)), 0x3ff);
++   } else {
++      nir_def *shift = nir_ishl_imm(b, k, 1);
++
++      v[0] = nir_ior(b, nir_ishl_imm(b, bk, 2), nir_iand_imm(b, nir_ushr(b, byte[4], shift), 3));
++      v[1] = nir_ior(b, nir_ishl_imm(b, bk1, 2), nir_iand_imm(b, nir_ushr(b, byte[4], nir_iadd_imm(b, shift, 2)), 3));
++   }
++}
++
+ /* the picture's pixel this fragment is: the quad's coordinate times the picture's size, which at a pixel's centre is x + 0.5 */
+ static void
+ isp_pixel_xy(nir_builder *b, nir_variable *uv, nir_def **x, nir_def **y)
+@@ -304,11 +420,26 @@
+    return b;
+ }
+ 
++/* y2s75: a second attachment's output (FRAG_RESULT_DATA1) */
++static nir_variable *
++isp_fragment_out1(nir_builder *b)
++{
++   nir_variable *out = nir_variable_create(b->shader, nir_var_shader_out, glsl_vec4_type(), "color1");
++
++   out->data.location = FRAG_RESULT_DATA1;
++   out->data.driver_location = 1;
++   return out;
++}
++
+ static nir_shader *
+ isp_fragment_end(nir_builder *b, unsigned textures)
+ {
++   unsigned outputs = 0;
++
++   nir_foreach_shader_out_variable(var, b->shader)
++      outputs++;
+    b->shader->num_inputs = 1;
+-   b->shader->num_outputs = 1;
++   b->shader->num_outputs = outputs;
+    b->shader->info.num_textures = textures;
+    b->shader->info.num_ubos = 1;
+    for (unsigned i = 0; i < textures; i++) {
+@@ -339,14 +470,38 @@
+ 
+ /* the tone curve's table (texture `unit', 4096 x 1) at o, as the 0..1 an 8-bit attachment stores back as the same byte */
+ static nir_def *
+-isp_curve(nir_builder *b, unsigned unit, nir_def *o)
++isp_curve(nir_builder *b, unsigned unit, nir_def *o, nir_def **byte)
+ {
+    nir_def *i = nir_imin(b, nir_imax(b, o, nir_imm_int(b, 0)), nir_imm_int(b, 4095));
++   nir_def *v = nir_channel(b, isp_fetch(b, unit, i, nir_imm_int(b, 0), nir_type_uint32), 0);
++
++   *byte = v;
++   return nir_fmul_imm(b, nir_u2f32(b, v), 1.0 / 255.0);
++}
++
++static nir_def *isp_dot_k(nir_builder *b, unsigned first, nir_def *rgb[3]);
++
++/*
++ * y2s75: the luma pass folded into the ISP pass. The ISP shaders write the RGB picture (attachment 0, as before) AND the picture's Y
++ * (attachment 1: the surface's luma plane, or the noise's y0): nv12_pair()'s whole numbers from the same three bytes the RGB attachment
++ * stores (the tone curve's bytes: an 8-bit attachment stores byte / 255 back as that byte, which isp_luma_shader read back), so the Y is
++ * isp_luma_shader's bit for bit, without its pass over the whole picture.
++ */
++static void
++isp_store_rgb_y(nir_builder *b, nir_variable *out, nir_def *rgb[3], nir_def *byte[3])
++{
++   nir_store_var(b, out, nir_vec4(b, rgb[0], rgb[1], rgb[2], nir_imm_float(b, 1.0f)), 0xf);
++   if (!isp_feat_fold)
++      return;                                  /* (libmerge5: the luma pass does it) */
++   nir_variable *out1 = isp_fragment_out1(b);
++   nir_def *luma = nir_ishr_imm(b, nir_iadd(b, isp_dot_k(b, 0, byte), isp_word(b, ISP_U_OY)), 16);
++   nir_def *value = nir_fmul_imm(b, nir_i2f32(b, luma), 1.0 / 255.0);
+ 
+-   return nir_fmul_imm(b, nir_u2f32(b, nir_channel(b, isp_fetch(b, unit, i, nir_imm_int(b, 0), nir_type_uint32), 0)), 1.0 / 255.0);
++   nir_store_var(b, out1, nir_vec4(b, value, nir_imm_float(b, 0.0f), nir_imm_float(b, 0.0f), nir_imm_float(b, 1.0f)), 0xf);
+ }
+ 
+-/* render_line / render_line_window -> pixel_q. Textures: 0 the frame, 1 the columns, 2 the rows, 3 the tone curve. */
++/* render_line / render_line_window -> pixel_q. Textures: 0 the frame, 1 the columns, 2 the rows, 3 the tone curve, 4 (y2s75) the frame as
++ * 32-bit words. */
+ static nir_shader *
+ isp_cells_shader(const struct nir_shader_compiler_options *options, unsigned format)
+ {
+@@ -359,8 +514,29 @@
+    nir_def *py = nir_channel(&b, isp_fetch(&b, 2, y, zero, nir_type_uint32), 0);
+    nir_def *black = isp_word(&b, ISP_U_BLACK), *value[4];
+ 
++   /* y2s75: without zoom or flip (shade_off 1) the cell is at even (px, py): its four pixels out of the 32-bit words (texture 4), four reads,
++    * not eight; otherwise (any 2x2 of the sensor) byte by byte as before. The condition is the same for every pixel of a pass. */
++   nir_def *fast = nir_ieq_imm(&b, isp_word(&b, ISP_U_SHADE_OFF), 1), *fv[4], *sv[4];
++
++   if (!isp_feat_r32)
++      fast = nir_imm_false(&b);               /* (libmerge5: byte by byte unless r32; the branch folds away) */
++   nir_push_if(&b, fast);
++   {
++      isp_raw_pair(&b, 4, format, px, py, &fv[0]);
++      isp_raw_pair(&b, 4, format, px, nir_iadd_imm(&b, py, 1), &fv[2]);
++   }
++   nir_push_else(&b, NULL);
++   {
++      for (int i = 0; i < 4; i++)
++         sv[i] = isp_raw(&b, format, nir_iadd_imm(&b, px, i & 1), nir_iadd_imm(&b, py, i >> 1));
++   }
++   nir_pop_if(&b, NULL);
++   nir_def *raw4[4];
++
++   for (int i = 0; i < 4; i++)                 /* (the phis first: they open the block after the if) */
++      raw4[i] = nir_if_phi(&b, fv[i], sv[i]);
+    for (int i = 0; i < 4; i++)
+-      value[i] = nir_imax(&b, nir_isub(&b, isp_raw(&b, format, nir_iadd_imm(&b, px, i & 1), nir_iadd_imm(&b, py, i >> 1)), black), zero);
++      value[i] = nir_imax(&b, nir_isub(&b, raw4[i], black), zero);
+ 
+    /* value[i] is at place ^ i of a cell (place: where (px, py) is in its cell), so the cell's site s is value[place ^ s] */
+    nir_def *place = nir_ior(&b, nir_ishl_imm(&b, nir_iand_imm(&b, py, 1), 1), nir_iand_imm(&b, px, 1));
+@@ -394,17 +570,17 @@
+    nir_def *most = nir_imax(&b, nir_imax(&b, r, bl), nir_ushr_imm(&b, g2, 1));
+ 
+    isp_highlights(&b, v, most);
+-   nir_def *rgb[3];
++   nir_def *rgb[3], *byte[3];
+ 
+    for (int c = 0; c < 3; c++) {
+       nir_def *o = nir_imul(&b, isp_word(&b, ISP_U_Q + c * 3), v[0]);
+ 
+       o = nir_iadd(&b, o, nir_imul(&b, isp_word(&b, ISP_U_Q + c * 3 + 1), v[1]));
+       o = nir_iadd(&b, o, nir_imul(&b, isp_word(&b, ISP_U_Q + c * 3 + 2), v[2]));
+-      rgb[c] = isp_curve(&b, 3, nir_ishr_imm(&b, nir_iadd_imm(&b, o, 2048), 12));
++      rgb[c] = isp_curve(&b, 3, nir_ishr_imm(&b, nir_iadd_imm(&b, o, 2048), 12), &byte[c]);
+    }
+-   nir_store_var(&b, out, nir_vec4(&b, rgb[0], rgb[1], rgb[2], nir_imm_float(&b, 1.0f)), 0xf);
+-   return isp_fragment_end(&b, 4);
++   isp_store_rgb_y(&b, out, rgb, byte);
++   return isp_fragment_end(&b, 5);
+ }
+ 
+ /* full_line -> pixel: every pixel, the two colours a site has not from the same colour's sites in the 3x3 around it.
+@@ -456,7 +632,7 @@
+    nir_def *most = nir_f2i32(&b, nir_fmax(&b, nir_fmax(&b, colour[0], colour[1]), colour[2]));
+ 
+    isp_highlights(&b, v, most);
+-   nir_def *vf[3] = { nir_i2f32(&b, v[0]), nir_i2f32(&b, v[1]), nir_i2f32(&b, v[2]) }, *rgb[3];
++   nir_def *vf[3] = { nir_i2f32(&b, v[0]), nir_i2f32(&b, v[1]), nir_i2f32(&b, v[2]) }, *rgb[3], *byte[3];
+    nir_def *identity = nir_ine_imm(&b, isp_word(&b, ISP_U_IDENTITY), 0);
+ 
+    for (int c = 0; c < 3; c++) {
+@@ -466,9 +642,9 @@
+       all = nir_fadd(&b, all, nir_fmul(&b, isp_word(&b, ISP_U_M + c * 3 + 2), vf[2]));
+       nir_def *one_of = nir_fmul(&b, vf[c], isp_word(&b, ISP_U_M + c * 4));
+       /* curve(): (int)(v + 0.5f), then into the table's range */
+-      rgb[c] = isp_curve(&b, 3, nir_f2i32(&b, nir_fadd_imm(&b, nir_bcsel(&b, identity, one_of, all), 0.5)));
++      rgb[c] = isp_curve(&b, 3, nir_f2i32(&b, nir_fadd_imm(&b, nir_bcsel(&b, identity, one_of, all), 0.5)), &byte[c]);
+    }
+-   nir_store_var(&b, out, nir_vec4(&b, rgb[0], rgb[1], rgb[2], nir_imm_float(&b, 1.0f)), 0xf);
++   isp_store_rgb_y(&b, out, rgb, byte);
+    return isp_fragment_end(&b, 4);
+ }
+ 
+@@ -552,16 +728,72 @@
+  * Every fragment walks its block's 64 cells with isp_measure()'s whole numbers and keeps what its kind sums. Words of the
+  * block: q[0] step, q[1] cells_w, q[2] cells_h, q[3] fair_top (white * 85 / 100), q[4] the blocks across; black, r_place, b_place as ever.
+  */
+-static nir_def *
+-isp_cell_value(nir_builder *b, unsigned format, nir_def *cx, nir_def *cy, unsigned n, nir_def *black)
++_Static_assert((RWA_ISP_STATS_BLOCK & (RWA_ISP_STATS_BLOCK - 1)) == 0, "the stats loop splits a cell number by shifts");
++
++/* y2s75: the four values (above black) of cell (cx, cy) -- pixels (2 cx + (n & 1), 2 cy + (n >> 1)), n = 0..3 -- out of the frame as
++ * 32-bit words (texture 0) */
++static void
++isp_cell_values32(nir_builder *b, unsigned format, nir_def *cx, nir_def *cy, nir_def *black, nir_def *v[4])
+ {
+-   nir_def *px = nir_iadd_imm(b, nir_ishl_imm(b, cx, 1), n & 1), *py = nir_iadd_imm(b, nir_ishl_imm(b, cy, 1), n >> 1);
++   nir_def *px = nir_ishl_imm(b, cx, 1), *py = nir_ishl_imm(b, cy, 1), *raw[4];
+ 
+-   return nir_imax(b, nir_isub(b, isp_raw(b, format, px, py), black), nir_imm_int(b, 0));
++   if (isp_feat_r32) {
++      isp_raw_pair(b, 0, format, px, py, &raw[0]);
++      isp_raw_pair(b, 0, format, px, nir_iadd_imm(b, py, 1), &raw[2]);
++   } else {                                    /* (libmerge5: texture 0 is the frame's bytes) */
++      for (int n = 0; n < 4; n++)
++         raw[n] = isp_raw(b, format, nir_iadd_imm(b, px, n & 1), nir_iadd_imm(b, py, n >> 1));
++   }
++   for (int n = 0; n < 4; n++)
++      v[n] = nir_imax(b, nir_isub(b, raw[n], black), nir_imm_int(b, 0));
+ }
+ 
+-_Static_assert((RWA_ISP_STATS_BLOCK & (RWA_ISP_STATS_BLOCK - 1)) == 0, "the stats loop splits a cell number by shifts");
++/*
++ * y2s75: the cells first. libmerge3's shader walked its block's 64 cells once for EACH of the 20 kinds, and each cell is 12 pixels read out
++ * of two bytes each (its own four, its right and lower neighbours' four): 20 x 64 x 24 texel reads per block -- at 4096x3072, step 8, some
++ * 23.6 million reads per frame, more than the picture itself at 1080p. Now one pass over the cells the statistics look at (cells_w / step x
++ * cells_h / step texels, RGBA32Uint) reads each cell's pixels once and keeps the whole numbers the kinds are made of: x the sum of the four
++ * (above black), y red | blue << 16, z the right neighbour's sum, w the lower one's. The kinds' pass then reads one texel a cell and does the
++ * same arithmetic in the same order as before, so every float is the one libmerge3 made. Words: q[0] step, q[1] cells_w, q[2] cells_h.
++ */
++static nir_shader *
++isp_stats_cells_shader(const struct nir_shader_compiler_options *options, unsigned format)
++{
++   nir_variable *uv, *out;
++   nir_builder b = isp_fragment_begin(options, "isp_stats_cells", &uv, &out);
++   nir_def *x, *y;
++
++   out->type = glsl_uvec4_type();
++   isp_pixel_xy(&b, uv, &x, &y);
++   nir_def *step = isp_word(&b, ISP_U_Q), *cw = isp_word(&b, ISP_U_Q + 1), *ch = isp_word(&b, ISP_U_Q + 2), *black = isp_word(&b, ISP_U_BLACK);
++   nir_def *rp = isp_word(&b, ISP_U_R_PLACE), *bp = isp_word(&b, ISP_U_B_PLACE);
++   nir_def *cw1 = nir_iadd_imm(&b, cw, -1), *ch1 = nir_iadd_imm(&b, ch, -1);
++   nir_def *cxc = nir_imin(&b, nir_imul(&b, x, step), cw1), *cyc = nir_imin(&b, nir_imul(&b, y, step), ch1), *v[4];
++
++   /* (y2s75: a cell is at even sensor pixels: its four values out of the 32-bit words, texture 0, four reads not eight) */
++   isp_cell_values32(&b, format, cxc, cyc, black, v);
++   nir_def *all = nir_iadd(&b, nir_iadd(&b, v[0], v[1]), nir_iadd(&b, v[2], v[3]));
++   nir_def *vr = nir_bcsel(&b, nir_ieq_imm(&b, rp, 0), v[0], nir_bcsel(&b, nir_ieq_imm(&b, rp, 1), v[1],
++                           nir_bcsel(&b, nir_ieq_imm(&b, rp, 2), v[2], v[3])));
++   nir_def *vb = nir_bcsel(&b, nir_ieq_imm(&b, bp, 0), v[0], nir_bcsel(&b, nir_ieq_imm(&b, bp, 1), v[1],
++                           nir_bcsel(&b, nir_ieq_imm(&b, bp, 2), v[2], v[3])));
++   nir_def *cxr = nir_imin(&b, nir_iadd_imm(&b, cxc, 1), cw1), *cyb = nir_imin(&b, nir_iadd_imm(&b, cyc, 1), ch1);
++   nir_def *r4 = nir_imm_int(&b, 0), *b4 = nir_imm_int(&b, 0);
++
++   nir_def *vr4[4], *vb4[4];
++
++   isp_cell_values32(&b, format, cxr, cyc, black, vr4);
++   isp_cell_values32(&b, format, cxc, cyb, black, vb4);
++   for (unsigned n = 0; n < 4; n++) {
++      r4 = nir_iadd(&b, r4, vr4[n]);
++      b4 = nir_iadd(&b, b4, vb4[n]);
++   }
++   nir_store_var(&b, out, nir_vec4(&b, all, nir_ior(&b, vr, nir_ishl_imm(&b, vb, 16)), r4, b4), 0xf);
++   return isp_fragment_end(&b, 1);
++}
+ 
++/* The kinds (texture 0: the cells above). Words of the block: q[0] step, q[1] cells_w, q[2] cells_h, q[3] fair_top (white * 85 / 100), q[4]
++ * the blocks across, q[5], q[6] the cells' texture's size; r_place, b_place are in the cells already. */
+ static nir_shader *
+ isp_stats_shader(const struct nir_shader_compiler_options *options, unsigned format)
+ {
+@@ -569,21 +801,18 @@
+    nir_builder b = isp_fragment_begin(options, "isp_stats", &uv, &out);
+    nir_def *x, *y;
+ 
++   (void)format;
+    isp_pixel_xy(&b, uv, &x, &y);
+    nir_def *step = isp_word(&b, ISP_U_Q), *cw = isp_word(&b, ISP_U_Q + 1), *ch = isp_word(&b, ISP_U_Q + 2);
+-   nir_def *ft = isp_word(&b, ISP_U_Q + 3), *black = isp_word(&b, ISP_U_BLACK);
+-   nir_def *rp = isp_word(&b, ISP_U_R_PLACE), *bp = isp_word(&b, ISP_U_B_PLACE);
++   nir_def *ft = isp_word(&b, ISP_U_Q + 3);
++   nir_def *nw1 = nir_iadd_imm(&b, isp_word(&b, ISP_U_Q + 5), -1), *nh1 = nir_iadd_imm(&b, isp_word(&b, ISP_U_Q + 6), -1);
+    nir_def *bx = nir_udiv_imm(&b, x, RWA_ISP_STATS_KINDS), *k = nir_isub(&b, x, nir_imul_imm(&b, bx, RWA_ISP_STATS_KINDS)), *by = y;
+    nir_def *base = nir_imul_imm(&b, nir_iadd_imm(&b, k, -3), 4);           /* the first histogram bin of kinds 3..18 */
+    nir_def *zero = nir_imm_float(&b, 0.0f);
+-   nir_def *cw1 = nir_iadd_imm(&b, cw, -1), *ch1 = nir_iadd_imm(&b, ch, -1);
+    nir_def *is_hist = nir_iand(&b, nir_ige_imm(&b, k, 3), nir_ilt_imm(&b, k, 19)), *is_edge = nir_ieq_imm(&b, k, 19);
+    /*
+-    * y2s72: the block's cells in a LOOP, not unrolled. Unrolled (y2s65..y2s70) this was 64 x 12 cell reads of straight-line code: Panfrost's
+-    * Valhall compiler made 183 KB of code of it in 42-48 s on the host (pan_compile_new_host_test), minutes on the phone's cores -- the
+-    * camera's pictures thread (redwood-campic2) compiled it at the first GPU picture, under the library's lock, at 100 % of a core, and no
+-    * picture was ever made (run of 12 November 15:11, libmerge2). The loop goes over the cells in the same order (row j, then column i:
+-    * cell = j * BLOCK + i), so every sum is added in the same order as before and is the same float.
++    * y2s72: the block's cells in a LOOP, not unrolled (unrolled, Panfrost's compiler took minutes on the phone: libmerge2's hang). Over the
++    * cells in the same order (row j, then column i: cell = j * BLOCK + i), so every sum is added in the same order and is the same float.
+     */
+    nir_variable *acc_var = nir_local_variable_create(b.impl, glsl_vec4_type(), "stats_acc");
+    nir_variable *cell_var = nir_local_variable_create(b.impl, glsl_uint_type(), "stats_cell");
+@@ -599,18 +828,14 @@
+       nir_pop_if(&b, NULL);
+       nir_def *i = nir_iand_imm(&b, cell, RWA_ISP_STATS_BLOCK - 1), *j = nir_ushr_imm(&b, cell, util_logbase2(RWA_ISP_STATS_BLOCK));
+       {
+-         nir_def *cx = nir_imul(&b, nir_iadd(&b, nir_imul_imm(&b, bx, RWA_ISP_STATS_BLOCK), i), step);
+-         nir_def *cy = nir_imul(&b, nir_iadd(&b, nir_imul_imm(&b, by, RWA_ISP_STATS_BLOCK), j), step);
++         nir_def *si = nir_iadd(&b, nir_imul_imm(&b, bx, RWA_ISP_STATS_BLOCK), i), *sj = nir_iadd(&b, nir_imul_imm(&b, by, RWA_ISP_STATS_BLOCK), j);
++         nir_def *cx = nir_imul(&b, si, step), *cy = nir_imul(&b, sj, step);
+          nir_def *valid = nir_iand(&b, nir_ilt(&b, cx, cw), nir_ilt(&b, cy, ch));
+-         nir_def *cxc = nir_imin(&b, cx, cw1), *cyc = nir_imin(&b, cy, ch1), *v[4];
+-
+-         for (unsigned n = 0; n < 4; n++)
+-            v[n] = isp_cell_value(&b, format, cxc, cyc, n, black);
+-         nir_def *all = nir_iadd(&b, nir_iadd(&b, v[0], v[1]), nir_iadd(&b, v[2], v[3]));
+-         nir_def *vr = nir_bcsel(&b, nir_ieq_imm(&b, rp, 0), v[0], nir_bcsel(&b, nir_ieq_imm(&b, rp, 1), v[1],
+-                                 nir_bcsel(&b, nir_ieq_imm(&b, rp, 2), v[2], v[3])));
+-         nir_def *vb = nir_bcsel(&b, nir_ieq_imm(&b, bp, 0), v[0], nir_bcsel(&b, nir_ieq_imm(&b, bp, 1), v[1],
+-                                 nir_bcsel(&b, nir_ieq_imm(&b, bp, 2), v[2], v[3])));
++         /* (a cell outside the frame reads the last one: everything it would add is masked by `valid', as it was) */
++         nir_def *t4 = isp_fetch(&b, 0, nir_imin(&b, si, nw1), nir_imin(&b, sj, nh1), nir_type_uint32);
++         nir_def *all = nir_channel(&b, t4, 0), *rb = nir_channel(&b, t4, 1);
++         nir_def *vr = nir_iand_imm(&b, rb, 0xffff), *vb = nir_ushr_imm(&b, rb, 16);
++         nir_def *r4 = nir_channel(&b, t4, 2), *b4 = nir_channel(&b, t4, 3);
+          nir_def *g = nir_ushr_imm(&b, nir_isub(&b, nir_isub(&b, all, vr), vb), 1);
+          nir_def *fair = nir_iand(&b, valid, nir_iand(&b, nir_ige_imm(&b, g, 8), nir_iand(&b, nir_ilt(&b, vr, ft),
+                                   nir_iand(&b, nir_ilt(&b, g, ft), nir_ilt(&b, vb, ft)))));
+@@ -620,13 +845,6 @@
+          nir_def *bin = nir_imin(&b, nir_ushr_imm(&b, g, 4), nir_imm_int(&b, 63));
+          /* sharpness: this cell and its right and lower neighbours (isp_sharpness), where they are in the frame */
+          nir_def *edge_ok = nir_iand(&b, valid, nir_iand(&b, nir_ilt(&b, nir_iadd_imm(&b, cx, 1), cw), nir_ilt(&b, nir_iadd_imm(&b, cy, 1), ch)));
+-         nir_def *cxr = nir_imin(&b, nir_iadd_imm(&b, cxc, 1), cw1), *cyb = nir_imin(&b, nir_iadd_imm(&b, cyc, 1), ch1);
+-         nir_def *r4 = nir_imm_int(&b, 0), *b4 = nir_imm_int(&b, 0);
+-
+-         for (unsigned n = 0; n < 4; n++) {
+-            r4 = nir_iadd(&b, r4, isp_cell_value(&b, format, cxr, cyc, n, black));
+-            b4 = nir_iadd(&b, b4, isp_cell_value(&b, format, cxc, cyb, n, black));
+-         }
+          nir_def *here = nir_i2f32(&b, all), *dr = nir_fsub(&b, nir_i2f32(&b, r4), here), *db = nir_fsub(&b, nir_i2f32(&b, b4), here);
+          nir_def *edges = nir_fadd(&b, nir_fmul(&b, dr, dr), nir_fmul(&b, db, db));
+          nir_def *fr = nir_i2f32(&b, vr), *fg = nir_i2f32(&b, g), *fb = nir_i2f32(&b, vb);
+@@ -738,33 +956,24 @@
+ }
+ 
+ /* before_piece(): a block that is still (not all moving, no moving block among its nine) draws each value `keep' of 256 of the way to the one
+- * before where they differ by less than `near'. Textures: 0 now, 1 before, 2 the blocks' moves (R8: 0 or 1). q[0] near, q[1] keep,
+- * q[2] all moving, q[3], q[4] the blocks across and down; chroma: a texel's block is (x / 4, y / 4), the brightness's (x / 8, y / 8). */
++ * before where they differ by less than `near'. Textures: 0 now, 1 before, 2 the blocks' stillness (y2s75: RGBA8Uint, x 1 still / 0 not,
++ * y near for the brightness, z for the colours -- made by isp_nr_still_shader, or by the processor, with with_before()'s own test, all moving
++ * and the nine neighbours, so that this reads ONE texel a pixel, not nine). q[1] keep; chroma: a texel's block is (x / 4, y / 4), the brightness's (x / 8, y / 8). y2s75: the value goes to both
++ * attachments, the plane and the picture before of the next render (one pass, where libmerge3 drew the same thing twice). */
+ static nir_shader *
+ isp_nr_apply_shader(const struct nir_shader_compiler_options *options, unsigned channels)
+ {
+    nir_variable *uv, *out;
+    nir_builder b = isp_fragment_begin(options, channels == 1 ? "isp_nr_apply_y" : "isp_nr_apply_c", &uv, &out);
++   nir_variable *out1 = isp_feat_mrt ? isp_fragment_out1(&b) : NULL;
+    nir_def *x, *y;
+ 
+    isp_pixel_xy(&b, uv, &x, &y);
+-   nir_def *near = isp_word(&b, ISP_U_Q), *keep = isp_word(&b, ISP_U_Q + 1), *all = isp_word(&b, ISP_U_Q + 2);
+-   nir_def *bw = isp_word(&b, ISP_U_Q + 3), *bh = isp_word(&b, ISP_U_Q + 4);
++   nir_def *keep = isp_word(&b, ISP_U_Q + 1);
+    unsigned sh = channels == 1 ? 3 : 2;
+    nir_def *bx = nir_ushr_imm(&b, x, sh), *by = nir_ushr_imm(&b, y, sh);
+-   nir_def *still = nir_ieq_imm(&b, all, 0);
+-
+-   for (int dy = -1; dy <= 1; dy++) {
+-      for (int dx = -1; dx <= 1; dx++) {
+-         nir_def *nx = nir_iadd_imm(&b, bx, dx), *ny = nir_iadd_imm(&b, by, dy);
+-         nir_def *in = nir_iand(&b, nir_iand(&b, nir_ige_imm(&b, nx, 0), nir_ilt(&b, nx, bw)), nir_iand(&b, nir_ige_imm(&b, ny, 0), nir_ilt(&b, ny, bh)));
+-         nir_def *nxc = nir_imin(&b, nir_imax(&b, nx, nir_imm_int(&b, 0)), nir_iadd_imm(&b, bw, -1));
+-         nir_def *nyc = nir_imin(&b, nir_imax(&b, ny, nir_imm_int(&b, 0)), nir_iadd_imm(&b, bh, -1));
+-         nir_def *m = nir_ine_imm(&b, isp_nr_byte(&b, nir_channel(&b, isp_fetch(&b, 2, nxc, nyc, nir_type_float32), 0)), 0);
+-
+-         still = nir_iand(&b, still, nir_inot(&b, nir_iand(&b, in, m)));
+-      }
+-   }
++   nir_def *st = isp_fetch(&b, 2, bx, by, nir_type_uint32);
++   nir_def *still = nir_ine_imm(&b, nir_channel(&b, st, 0), 0), *near = nir_channel(&b, st, channels == 1 ? 1 : 2);
+    nir_def *now = isp_fetch(&b, 0, x, y, nir_type_float32), *was = isp_fetch(&b, 1, x, y, nir_type_float32);
+    nir_def *o[4] = { nir_imm_float(&b, 0.0f), nir_imm_float(&b, 0.0f), nir_imm_float(&b, 0.0f), nir_imm_float(&b, 1.0f) };
+ 
+@@ -775,9 +984,189 @@
+       o[c] = isp_nr_unorm(&b, nir_bcsel(&b, take, nir_isub(&b, n, nir_ishr_imm(&b, nir_imul(&b, d, keep), 8)), n));
+    }
+    nir_store_var(&b, out, nir_vec4(&b, o[0], o[1], o[2], o[3]), 0xf);
++   if (out1 != NULL)
++      nir_store_var(&b, out1, nir_vec4(&b, o[0], o[1], o[2], o[3]), 0xf);
+    return isp_fragment_end(&b, 3);
+ }
+ 
++/*
++ * y2s75: with_before()'s numbers on the GPU, so that a render with the picture before is ONE submission and one wait (libmerge3 read the blocks'
++ * differences back in the middle of the render: a flush, a wait for half the picture's passes, a copy out of the texture, a second submission).
++ * Every number is the processor's whole numbers; the two divisions it does in double are done here as exact fractions, and the one case where
++ * a fraction and the double can disagree -- a value that is EXACTLY n + 1/2 before the truncation, where the double may come out just below --
++ * is settled by a table of 64 bits the processor fills with the double's own answer (isp_nr_tie_masks): such a tie is one mean, the same for
++ * every pair of sums that gives it, and IEEE division rounds that one mean the same way every time.
++ * Passes, each of the blocks' rows (bh) or one texel (RGBA32Uint), then the blocks (bw x bh):
++ *   rows    x: the row's sum of differences
++ *   calm    the total (all); x, y: the row's calm sum and count (d * n <= 2 * all), z all
++ *   moving  the calm sums and counts of all rows; limit and noise3 as with_before() makes them; x: the row's moving blocks, y limit, z noise3
++ *   params  x all moving (moving > 0.35 n, as a count from the processor), y limit, z near (brightness), w near (colours)
++ *   still   RGBA8Uint per block: x still (not all moving, none of its nine moving), y, z the two nears
++ * Words: q[0] bw, q[1] bh, q[2] n, q[3] the least moving count that is "all moving", q[4], q[5] the nears' floors (brightness, colours),
++ * q[6], q[7] the limit's tie table, q[8] and gq[0] noise3's.
++ */
++enum { ISP_NRG_ROWS, ISP_NRG_CALM, ISP_NRG_MOVING, ISP_NRG_PARAMS, ISP_NRG_STILL, ISP_NRG_COUNT };
++
++/* a loop of `n' turns: i = 0 .. n - 1 (returns the counter's variable; the body goes between isp_loop_begin and isp_loop_end) */
++static nir_def *
++isp_loop_begin(nir_builder *b, nir_variable *counter, nir_def *n, nir_loop **loop)
++{
++   nir_store_var(b, counter, nir_imm_int(b, 0), 0x1);
++   *loop = nir_push_loop(b);
++   nir_def *i = nir_load_var(b, counter);
++
++   nir_push_if(b, nir_uge(b, i, n));
++   nir_jump(b, nir_jump_break);
++   nir_pop_if(b, NULL);
++   return i;
++}
++
++static void
++isp_loop_end(nir_builder *b, nir_variable *counter, nir_def *i, nir_loop *loop)
++{
++   nir_store_var(b, counter, nir_iadd_imm(b, i, 1), 0x1);
++   nir_pop_loop(b, loop);
++}
++
++static nir_def *
++isp_word_pair_bit(nir_builder *b, unsigned lo_word, unsigned hi_word, nir_def *bit)
++{
++   nir_def *lo = isp_word(b, lo_word), *hi = isp_word(b, hi_word);
++   nir_def *word = nir_bcsel(b, nir_ult_imm(b, bit, 32), lo, hi);
++
++   return nir_ine_imm(b, nir_iand_imm(b, nir_ushr(b, word, nir_iand_imm(b, bit, 31)), 1), 0);
++}
++
++/* (int)(num / den), and one less where the fraction is a whole number whose bit in the table says the double came out below it */
++static nir_def *
++isp_tie_floor(nir_builder *b, nir_def *num, nir_def *den, unsigned lo_word, unsigned hi_word)
++{
++   nir_def *d = nir_umax(b, den, nir_imm_int(b, 1)), *v = nir_udiv(b, num, d);
++   nir_def *tie = nir_iand(b, nir_ieq(b, nir_imul(b, v, d), num), nir_iand(b, nir_ult_imm(b, v, 64), nir_ine_imm(b, v, 0)));
++   nir_def *below = nir_iand(b, tie, nir_inot(b, isp_word_pair_bit(b, lo_word, hi_word, v)));
++
++   return nir_bcsel(b, nir_ieq_imm(b, den, 0), nir_imm_int(b, 0), nir_bcsel(b, below, nir_iadd_imm(b, v, -1), v));
++}
++
++static nir_shader *
++isp_nrg_shader(const struct nir_shader_compiler_options *options, unsigned which)
++{
++   static const char *names[ISP_NRG_COUNT] = { "isp_nrg_rows", "isp_nrg_calm", "isp_nrg_moving", "isp_nrg_params", "isp_nrg_still" };
++   nir_variable *uv, *out;
++   nir_builder b = isp_fragment_begin(options, names[which], &uv, &out);
++   nir_variable *i_var = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
++   nir_variable *acc = nir_local_variable_create(b.impl, glsl_uvec4_type(), "acc");
++   nir_def *x, *y, *zero = nir_imm_int(&b, 0);
++   nir_def *bw = isp_word(&b, ISP_U_Q), *bh = isp_word(&b, ISP_U_Q + 1), *n = isp_word(&b, ISP_U_Q + 2);
++   nir_loop *loop;
++   nir_def *i, *result;
++
++   out->type = glsl_uvec4_type();
++   isp_pixel_xy(&b, uv, &x, &y);
++   nir_store_var(&b, acc, nir_vec4(&b, zero, zero, zero, zero), 0xf);
++   switch (which) {
++   case ISP_NRG_ROWS:          /* texture 0: the blocks' differences */
++      i = isp_loop_begin(&b, i_var, bw, &loop);
++      {
++         nir_def *a = nir_load_var(&b, acc);
++         nir_def *d = isp_nr_byte(&b, nir_channel(&b, isp_fetch(&b, 0, i, y, nir_type_float32), 0));
++
++         nir_store_var(&b, acc, nir_vector_insert_imm(&b, a, nir_iadd(&b, nir_channel(&b, a, 0), d), 0), 0xf);
++      }
++      isp_loop_end(&b, i_var, i, loop);
++      result = nir_load_var(&b, acc);
++      break;
++   case ISP_NRG_CALM: {        /* textures: 0 the differences, 1 the rows' sums */
++      i = isp_loop_begin(&b, i_var, bh, &loop);
++      {
++         nir_def *a = nir_load_var(&b, acc);
++
++         nir_store_var(&b, acc, nir_vector_insert_imm(&b, a, nir_iadd(&b, nir_channel(&b, a, 2), nir_channel(&b, isp_fetch(&b, 1, zero, i, nir_type_uint32), 0)), 2), 0xf);
++      }
++      isp_loop_end(&b, i_var, i, loop);
++      nir_def *all2 = nir_ishl_imm(&b, nir_channel(&b, nir_load_var(&b, acc), 2), 1);
++
++      i = isp_loop_begin(&b, i_var, bw, &loop);
++      {
++         nir_def *a = nir_load_var(&b, acc);
++         nir_def *d = isp_nr_byte(&b, nir_channel(&b, isp_fetch(&b, 0, i, y, nir_type_float32), 0));
++         nir_def *calm = nir_uge(&b, all2, nir_imul(&b, d, n));
++
++         nir_store_var(&b, acc, nir_vec4(&b, nir_iadd(&b, nir_channel(&b, a, 0), nir_bcsel(&b, calm, d, zero)),
++                                         nir_iadd(&b, nir_channel(&b, a, 1), nir_b2i32(&b, calm)), nir_channel(&b, a, 2), zero), 0xf);
++      }
++      isp_loop_end(&b, i_var, i, loop);
++      result = nir_load_var(&b, acc);
++      break;
++   }
++   case ISP_NRG_MOVING: {      /* textures: 0 the differences, 1 the rows' calm sums and counts */
++      i = isp_loop_begin(&b, i_var, bh, &loop);
++      {
++         nir_def *a = nir_load_var(&b, acc), *t = isp_fetch(&b, 1, zero, i, nir_type_uint32);
++
++         nir_store_var(&b, acc, nir_vec4(&b, nir_iadd(&b, nir_channel(&b, a, 0), nir_channel(&b, t, 0)),
++                                         nir_iadd(&b, nir_channel(&b, a, 1), nir_channel(&b, t, 1)), zero, zero), 0xf);
++      }
++      isp_loop_end(&b, i_var, i, loop);
++      nir_def *sums = nir_load_var(&b, acc), *calm = nir_channel(&b, sums, 0), *cnt = nir_channel(&b, sums, 1);
++      /* limit = (int)(1.7 * calm / cnt + 0.5) = (17 calm + 5 cnt) / (10 cnt); noise3 = (int)(3.0 * calm / cnt / 4 + 0.5) = (3 calm + 2 cnt) / (4 cnt) */
++      nir_def *limit = isp_tie_floor(&b, nir_iadd(&b, nir_imul_imm(&b, calm, 17), nir_imul_imm(&b, cnt, 5)), nir_imul_imm(&b, cnt, 10),
++                                     ISP_U_Q + 6, ISP_U_Q + 7);
++      nir_def *noise3 = isp_tie_floor(&b, nir_iadd(&b, nir_imul_imm(&b, calm, 3), nir_imul_imm(&b, cnt, 2)), nir_imul_imm(&b, cnt, 4),
++                                      ISP_U_Q + 8, ISP_U_GQ);
++
++      limit = nir_umin(&b, nir_umax(&b, limit, nir_imm_int(&b, 10)), nir_imm_int(&b, 48));
++      noise3 = nir_umin(&b, noise3, nir_imm_int(&b, 40));
++      nir_store_var(&b, acc, nir_vec4(&b, zero, limit, noise3, zero), 0xf);
++      i = isp_loop_begin(&b, i_var, bw, &loop);
++      {
++         nir_def *a = nir_load_var(&b, acc);
++         nir_def *d = isp_nr_byte(&b, nir_channel(&b, isp_fetch(&b, 0, i, y, nir_type_float32), 0));
++
++         nir_store_var(&b, acc, nir_vector_insert_imm(&b, a, nir_iadd(&b, nir_channel(&b, a, 0), nir_b2i32(&b, nir_ilt(&b, limit, d))), 0), 0xf);
++      }
++      isp_loop_end(&b, i_var, i, loop);
++      result = nir_load_var(&b, acc);
++      break;
++   }
++   case ISP_NRG_PARAMS: {      /* texture 0: the rows' moving counts (and limit, noise3 in every row) */
++      i = isp_loop_begin(&b, i_var, bh, &loop);
++      {
++         nir_def *a = nir_load_var(&b, acc);
++
++         nir_store_var(&b, acc, nir_vector_insert_imm(&b, a, nir_iadd(&b, nir_channel(&b, a, 0), nir_channel(&b, isp_fetch(&b, 0, zero, i, nir_type_uint32), 0)), 0), 0xf);
++      }
++      isp_loop_end(&b, i_var, i, loop);
++      nir_def *t0 = isp_fetch(&b, 0, zero, zero, nir_type_uint32), *noise3 = nir_channel(&b, t0, 2);
++      nir_def *all_moving = nir_b2i32(&b, nir_uge(&b, nir_channel(&b, nir_load_var(&b, acc), 0), isp_word(&b, ISP_U_Q + 3)));
++
++      result = nir_vec4(&b, all_moving, nir_channel(&b, t0, 1), nir_imax(&b, noise3, isp_word(&b, ISP_U_Q + 4)),
++                        nir_imax(&b, nir_udiv_imm(&b, nir_imul_imm(&b, noise3, 3), 4), isp_word(&b, ISP_U_Q + 5)));
++      break;
++   }
++   default: {                  /* ISP_NRG_STILL. textures: 0 the differences, 1 the params */
++      nir_def *pr = isp_fetch(&b, 1, zero, zero, nir_type_uint32), *limit = nir_channel(&b, pr, 1);
++      nir_def *still = nir_ieq_imm(&b, nir_channel(&b, pr, 0), 0);
++
++      for (int dy = -1; dy <= 1; dy++) {
++         for (int dx = -1; dx <= 1; dx++) {
++            nir_def *nx = nir_iadd_imm(&b, x, dx), *ny = nir_iadd_imm(&b, y, dy);
++            nir_def *in = nir_iand(&b, nir_iand(&b, nir_ige_imm(&b, nx, 0), nir_ilt(&b, nx, bw)), nir_iand(&b, nir_ige_imm(&b, ny, 0), nir_ilt(&b, ny, bh)));
++            nir_def *nxc = nir_imin(&b, nir_imax(&b, nx, zero), nir_iadd_imm(&b, bw, -1));
++            nir_def *nyc = nir_imin(&b, nir_imax(&b, ny, zero), nir_iadd_imm(&b, bh, -1));
++            nir_def *d = isp_nr_byte(&b, nir_channel(&b, isp_fetch(&b, 0, nxc, nyc, nir_type_float32), 0));
++
++            still = nir_iand(&b, still, nir_inot(&b, nir_iand(&b, in, nir_ilt(&b, limit, d))));
++         }
++      }
++      result = nir_vec4(&b, nir_b2i32(&b, still), nir_channel(&b, pr, 2), nir_channel(&b, pr, 3), zero);
++      break;
++   }
++   }
++   nir_store_var(&b, out, result, 0xf);
++   return isp_fragment_end(&b, which == ISP_NRG_ROWS || which == ISP_NRG_PARAMS ? 1 : 2);
++}
++
+ /* a plane as it is (into the surface, or kept as the picture before) */
+ static nir_shader *
+ isp_nr_copy_shader(const struct nir_shader_compiler_options *options, unsigned channels)
+@@ -808,16 +1197,17 @@
+ isp_state_destroy(struct rwa_device *device)
+ {
+    struct pipe_context *pipe = device->pipe;
+-   void *fs[15] = { device->isp.cells[0], device->isp.cells[1], device->isp.full[0], device->isp.full[1], device->isp.luma,
++   void *fs[22] = { device->isp.cells[0], device->isp.cells[1], device->isp.full[0], device->isp.full[1], device->isp.luma,
+                     device->isp.chroma, device->isp.stats[0], device->isp.stats[1], device->isp.nr[0], device->isp.nr[1], device->isp.nr[2],
+-                    device->isp.nr[3], device->isp.nr[4], device->isp.nr[5], device->isp.nr[6] };
++                    device->isp.nr[3], device->isp.nr[4], device->isp.nr[5], device->isp.nr[6], device->isp.cellstat[0], device->isp.cellstat[1],
++                    device->isp.nrg[0], device->isp.nrg[1], device->isp.nrg[2], device->isp.nrg[3], device->isp.nrg[4] };
+    bool any = device->isp.nearest != NULL;
+ 
+-   for (unsigned i = 0; i < 15; i++)
++   for (unsigned i = 0; i < 22; i++)
+       any = any || fs[i] != NULL;
+    if (any)
+       pipe->bind_fs_state(pipe, NULL);
+-   for (unsigned i = 0; i < 15; i++)
++   for (unsigned i = 0; i < 22; i++)
+       if (fs[i])
+          pipe->delete_fs_state(pipe, fs[i]);
+    if (device->isp.nearest)
+@@ -851,15 +1241,19 @@
+    return t->view;
+ }
+ 
+-/* The quad over the whole of `dst' with `fs', textures 0..count-1 fetched by whole-number places, the block as constant buffer 0.
+- * Queued like a draw; the context is left as rwa_render_draw leaves it. lock held. */
++static uint64_t isp_passes;                     /* y2s75: passes queued (for isp_say); under the lock */
++
++/* The quad over the whole of `dsts[0]' with `fs', textures 0..count-1 fetched by whole-number places, the block as constant buffer 0;
++ * y2s75: into ndst attachments of one size (the shader's outputs 0..ndst-1). Queued like a draw; the context is left as rwa_render_draw
++ * leaves it. lock held. */
+ static int
+-isp_pass(struct rwa_device *device, struct rwa_texture *dst, void *fs, struct rwa_texture *const *textures, unsigned count,
+-         const struct isp_block *block, const char *what, char *why, size_t why_size)
++isp_pass_to(struct rwa_device *device, struct rwa_texture *const *dsts, unsigned ndst, void *fs, struct rwa_texture *const *textures,
++            unsigned count, const struct isp_block *block, const char *what, char *why, size_t why_size)
+ {
+    struct pipe_context *pipe = device->pipe;
+-   struct pipe_sampler_view *views[4] = { NULL };
+-   void *samplers[4] = { NULL }, *none[4] = { NULL };
++   struct pipe_sampler_view *views[6] = { NULL };
++   void *samplers[6] = { NULL }, *none[6] = { NULL };
++   struct rwa_texture *dst = dsts[0];
+    const unsigned w = dst->res->width0, h = dst->res->height0;
+ 
+    for (unsigned i = 0; i < count; i++) {
+@@ -870,15 +1264,17 @@
+          return -1;
+       }
+    }
+-   struct pipe_surface *surface = texture_surface(device, dst, 0, 0);
++   struct pipe_framebuffer_state fb = { .width = w, .height = h, .nr_cbufs = ndst, .samples = 1 };
+ 
+-   if (!surface) {
+-      say(why, why_size, "%s would not make a render surface for the camera's %s pass", rwa_device_name(device), what);
+-      return -1;
+-   }
+-   struct pipe_framebuffer_state fb = { .width = w, .height = h, .nr_cbufs = 1, .samples = 1 };
++   for (unsigned i = 0; i < ndst; i++) {
++      struct pipe_surface *surface = dsts[i]->res->width0 == w && dsts[i]->res->height0 == h ? texture_surface(device, dsts[i], 0, 0) : NULL;
+ 
+-   fb.cbufs[0] = surface;
++      if (!surface) {
++         say(why, why_size, "%s would not make a render surface for the camera's %s pass (attachment %u)", rwa_device_name(device), what, i);
++         return -1;
++      }
++      fb.cbufs[i] = surface;
++   }
+    pipe->set_framebuffer_state(pipe, &fb);
+    pipe->set_viewport_states(pipe, 0, 1, &(struct pipe_viewport_state){
+       .scale = { w / 2.0f, h / 2.0f, 1.0f },
+@@ -913,7 +1309,7 @@
+       struct pipe_draw_start_count_bias sc = { .start = 0, .count = 4 };
+       struct pipe_scissor_state scissor = { 0, 0, (uint16_t)MIN2(w, 65535u), (uint16_t)MIN2(h, 65535u) };
+ 
+-      pipe->clear(pipe, PIPE_CLEAR_COLOR0, NULL, &zero, 0.0, 0);        /* every pixel is written: nothing is read back in first */
++      pipe->clear(pipe, ndst > 1 ? PIPE_CLEAR_COLOR0 | PIPE_CLEAR_COLOR1 : PIPE_CLEAR_COLOR0, NULL, &zero, 0.0, 0);   /* every pixel is written: nothing is read back in first */
+       pipe->set_scissor_states(pipe, 0, 1, &scissor);
+       pipe->draw_vbo(pipe, &info, 0, NULL, &sc, 1);
+    }
+@@ -921,9 +1317,17 @@
+    pipe->set_sampler_views(pipe, PIPE_SHADER_FRAGMENT, 0, 0, count, false, NULL);
+    pipe->bind_sampler_states(pipe, PIPE_SHADER_FRAGMENT, 0, count, none);
+    pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
++   isp_passes++;
+    return 0;
+ }
+ 
++static int
++isp_pass(struct rwa_device *device, struct rwa_texture *dst, void *fs, struct rwa_texture *const *textures, unsigned count,
++         const struct isp_block *block, const char *what, char *why, size_t why_size)
++{
++   return isp_pass_to(device, &dst, 1, fs, textures, count, block, what, why, why_size);
++}
++
+ /* ---- what a context keeps --------------------------------------------------------------------------------------------------------- */
+ 
+ static struct rwa_texture *
+@@ -973,7 +1377,30 @@
+    return isp_shader(device, &device->isp.nr[which], nir, why, why_size);
+ }
+ 
+-/* a texture of the context's own, (re)made at this size and format */
++static void *
++isp_nrg_fs(struct rwa_device *device, unsigned which, char *why, size_t why_size)
++{
++   return device->isp.nrg[which] != NULL ? device->isp.nrg[which]
++                                         : isp_shader(device, &device->isp.nrg[which], isp_nrg_shader(device->nir_options, which), why, why_size);
++}
++
++/* The double's own answer at each tie (isp_nrg_shader): bit L of *limit_mask: (int)(1.7 * mean + 0.5) is L where the mean makes 1.7 * mean + 0.5
++ * exactly L (mean = (10 L - 5) / 17); bit N of *noise_mask: (int)(3.0 * mean / 4 + 0.5) is N where that is exactly N (mean = (4 N - 2) / 3) */
++static void
++isp_nr_tie_masks(uint64_t *limit_mask, uint64_t *noise_mask)
++{
++   *limit_mask = *noise_mask = 0;
++   for (int v = 1; v < 64; v++) {
++      double m1 = (double)(10 * v - 5) / 17.0, m2 = (double)(4 * v - 2) / 3.0;
++
++      if ((int)(1.7 * m1 + 0.5) == v)
++         *limit_mask |= 1ull << v;
++      if ((int)(3.0 * m2 / 4 + 0.5) == v)
++         *noise_mask |= 1ull << v;
++   }
++}
++
++/* a texture of the context's own, (re)made at this size and format (the picture before: kept from render to render) */
+ static struct rwa_texture *
+ isp_nr_texture(struct rwa_device *device, struct rwa_texture **t, unsigned format, uint32_t w, uint32_t h, char *why, size_t why_size)
+ {
+@@ -986,55 +1413,294 @@
+    return *t;
+ }
+ 
+-/* one noise pass: `fs' over `dst' from up to three textures, with the block's words q[0..4] and out = dst's size. lock held. */
++/* ---- y2s75: the pool of intermediate textures ----------------------------------------------------------------------------------------- */
++
++static uint64_t
++isp_format_bytes(uint32_t format)
++{
++   return format == 10 || format == 13 ? 1 : format == 30 ? 2 : format == 123 || format == 125 ? 16 : 4;
++}
++
++static void
++isp_pool_drop(struct isp_pooled *e)
++{
++   if (e->texture != NULL)
++      rwa_texture_destroy(e->texture);
++   memset(e, 0, sizeof(*e));
++}
++
++/* A render target (and sampled texture) of this format and size that no part of the render being built holds: one the pool has, or a new
++ * one. lock held. */
++static struct rwa_texture *
++isp_pool_take(struct rwa_isp *isp, uint32_t format, uint32_t width, uint32_t height, char *why, size_t why_size)
++{
++   struct isp_pooled *free_slot = NULL;
++   uint64_t idle_bytes = 0, bytes = (uint64_t)width * height * isp_format_bytes(format);
++
++   for (int i = 0; i < ISP_POOL; i++) {
++      struct isp_pooled *e = &isp->pool[i];
++
++      if (e->texture != NULL && !e->taken && e->format == format && e->width == width && e->height == height) {
++         e->taken = true;
++         e->used = isp->renders;
++         isp->count.pool_hits++;
++         return e->texture;
++      }
++      if (e->texture == NULL && free_slot == NULL)
++         free_slot = e;
++      if (e->texture != NULL && !e->taken)
++         idle_bytes += e->bytes;
++   }
++   /* room: the least recently used of those no render holds go until the new one fits the bound and has a slot */
++   while (free_slot == NULL || idle_bytes + bytes > ISP_POOL_BYTES) {
++      struct isp_pooled *oldest = NULL;
++
++      for (int i = 0; i < ISP_POOL; i++) {
++         struct isp_pooled *e = &isp->pool[i];
++
++         if (e->texture != NULL && !e->taken && (oldest == NULL || e->used < oldest->used))
++            oldest = e;
++      }
++      if (oldest == NULL)
++         break;
++      idle_bytes -= oldest->bytes;
++      isp_pool_drop(oldest);
++      if (free_slot == NULL)
++         free_slot = oldest;
++   }
++   if (free_slot == NULL) {
++      say(why, why_size, "the camera render holds all %d of its intermediate textures", ISP_POOL);
++      return NULL;
++   }
++   struct rwa_texture *t = isp_texture(isp->device, format, width, height, RWA_USAGE_SHADER_READ | RWA_USAGE_RENDER_TARGET, why, why_size);
++
++   if (t == NULL)
++      return NULL;
++   *free_slot = (struct isp_pooled){ .texture = t, .format = format, .width = width, .height = height, .used = isp->renders, .bytes = bytes,
++                                     .taken = true };
++   isp->count.pool_misses++;
++   isp->count.pool_made_bytes += bytes;
++   return t;
++}
++
++/* After the render's submission: everything back (the queued passes hold what they use), and what no render has used for a while goes */
++static void
++isp_pool_release(struct rwa_isp *isp)
++{
++   for (int i = 0; i < ISP_POOL; i++) {
++      struct isp_pooled *e = &isp->pool[i];
++
++      e->taken = false;
++      if (e->texture != NULL && e->used + ISP_POOL_IDLE < isp->renders)
++         isp_pool_drop(e);
++   }
++}
++
++static uint64_t
++isp_pool_kept(const struct rwa_isp *isp)
++{
++   uint64_t n = 0;
++
++   for (int i = 0; i < ISP_POOL; i++)
++      n += isp->pool[i].texture != NULL ? isp->pool[i].bytes : 0;
++   return n;
++}
++
++/* ---- y2s75: linear textures the processor reads or writes through the buffer's map ---------------------------------------------------- */
++
++static void
++isp_linear_drop(struct isp_linear *l)
++{
++   if (l->texture != NULL)
++      rwa_texture_destroy(l->texture);
++   if (l->buffer != NULL)
++      rwa_buffer_destroy(l->buffer);
++   memset(l, 0, sizeof(*l));
++}
++
++static bool isp_no_linear;                      /* /private/var/db/nord2-isp-nolinear: libmerge3's reads through the driver (set once) */
++static bool isp_nr_cpu;                         /* /private/var/db/nord2-isp-nrcpu: with_before()'s numbers by the processor (a mid-render wait) */
++
++static struct rwa_texture *
++isp_linear_get(struct rwa_isp *isp, struct isp_linear *l, uint32_t format, uint32_t width, uint32_t height, unsigned usage, char *why,
++               size_t why_size)
++{
++   struct rwa_device *device = isp->device;
++
++   if (l->texture != NULL && l->format == format && l->width == width && l->height == height)
++      return l->texture;
++   isp_linear_drop(l);
++   if (!device->software && !isp_no_linear) {
++      size_t row = ALIGN_POT((size_t)width * isp_format_bytes(format), 64);
++
++      l->buffer = rwa_buffer_create(device, row * height, why, why_size);
++      if (l->buffer != NULL && l->buffer->map != NULL) {
++         const struct rwa_texture_shape shape = { .pixel_format = format, .type = RWA_TYPE_2D, .width = width, .height = height, .depth = 1,
++                                                  .array_length = 1, .mip_levels = 1, .sample_count = 1, .usage = usage };
++
++         l->texture = rwa_texture_from_buffer(l->buffer, &shape, 0, row, why, why_size);
++         l->row = (uint32_t)row;
++      }
++      if (l->texture == NULL && l->buffer != NULL) {
++         rwa_buffer_destroy(l->buffer);
++         l->buffer = NULL;
++      }
++   }
++   if (l->texture == NULL)
++      l->texture = isp_texture(device, format, width, height, usage, why, why_size);
++   if (l->texture == NULL)
++      return NULL;
++   l->format = format;
++   l->width = width;
++   l->height = height;
++   return l->texture;
++}
++
++/* What the GPU wrote, once it has finished (the caller has waited for the passes that write it) */
+ static int
+-isp_nr_pass(struct rwa_device *device, struct rwa_texture *dst, void *fs, struct rwa_texture *t0, struct rwa_texture *t1, struct rwa_texture *t2,
+-            const struct isp_block *base, const int32_t q[5], const char *what, char *why, size_t why_size)
++isp_linear_read(struct rwa_isp *isp, struct isp_linear *l, void *bytes, size_t stride, char *why, size_t why_size)
++{
++   const size_t texel_row = (size_t)l->width * isp_format_bytes(l->format);
++
++   if (l->buffer != NULL) {
++      for (uint32_t y = 0; y < l->height; y++)
++         memcpy((uint8_t *)bytes + (size_t)y * stride, (const uint8_t *)l->buffer->map + (size_t)y * l->row, texel_row);
++      isp->count.linear_reads++;
++      return 0;
++   }
++   const unsigned origin[3] = { 0, 0, 0 }, size[3] = { l->width, l->height, 1 };
++
++   isp->count.driver_reads++;
++   return rwa_texture_read(l->texture, 0, 0, origin, size, bytes, stride, why, why_size);
++}
++
++/* Bytes for the GPU to read (the caller knows that nothing queued reads them now) */
++static int
++isp_linear_write(struct isp_linear *l, const void *bytes, size_t stride, char *why, size_t why_size)
++{
++   const size_t texel_row = (size_t)l->width * isp_format_bytes(l->format);
++
++   if (l->buffer != NULL) {
++      for (uint32_t y = 0; y < l->height; y++)
++         memcpy((uint8_t *)l->buffer->map + (size_t)y * l->row, (const uint8_t *)bytes + (size_t)y * stride, texel_row);
++      return 0;
++   }
++   const unsigned origin[3] = { 0, 0, 0 }, size[3] = { l->width, l->height, 1 };
++
++   return rwa_texture_write(l->texture, 0, 0, origin, size, bytes, stride, why, why_size);
++}
++
++/* what is queued, submitted, and waited for (the noise's blocks are needed by the processor in the middle of a render) */
++static int
++isp_flush_wait(struct rwa_isp *isp, char *why, size_t why_size)
++{
++   struct pipe_screen *screen = isp->device->screen;
++   struct pipe_fence_handle *fence = NULL;
++
++   isp->device->pipe->flush(isp->device->pipe, &fence, 0);
++   isp->count.submits++;
++   isp->count.mid_waits++;
++   if (fence == NULL)
++      return 0;
++   bool done = screen->fence_finish(screen, NULL, fence, RWA_FENCE_TIMEOUT_NS);
++
++   screen->fence_reference(screen, &fence, NULL);
++   if (!done) {
++      say(why, why_size, "the GPU did not finish the camera's passes within two seconds (the noise's blocks)");
++      return -1;
++   }
++   return 0;
++}
++
++/* one noise pass: `fs' over `dst' (y2s75: and dst2, when not NULL) from up to three textures, with the block's words q[0..4] and out = dst's
++ * size. lock held. */
++static int
++isp_nr_pass2(struct rwa_device *device, struct rwa_texture *dst, struct rwa_texture *dst2, void *fs, struct rwa_texture *t0,
++             struct rwa_texture *t1, struct rwa_texture *t2, const struct isp_block *base, const int32_t q[5], const char *what, char *why,
++             size_t why_size)
+ {
+    struct isp_block nb = *base;
+-   struct rwa_texture *const tex[3] = { t0, t1, t2 };
++   struct rwa_texture *const tex[3] = { t0, t1, t2 }, *const dsts[2] = { dst, dst2 };
+ 
+    for (int i = 0; i < 5; i++)
+       nb.q[i] = q[i];
+    nb.out_w = (int32_t)dst->res->width0;
+    nb.out_h = (int32_t)dst->res->height0;
+-   return isp_pass(device, dst, fs, tex, t2 != NULL ? 3 : t1 != NULL ? 2 : 1, &nb, what, why, why_size);
++   return isp_pass_to(device, dsts, dst2 != NULL ? 2 : 1, fs, tex, t2 != NULL ? 3 : t1 != NULL ? 2 : 1, &nb, what, why, why_size);
++}
++
++static int
++isp_nr_pass(struct rwa_device *device, struct rwa_texture *dst, void *fs, struct rwa_texture *t0, struct rwa_texture *t1, struct rwa_texture *t2,
++            const struct isp_block *base, const int32_t q[5], const char *what, char *why, size_t why_size)
++{
++   return isp_nr_pass2(device, dst, NULL, fs, t0, t1, t2, base, q, what, why, why_size);
++}
++
++/* the ISP pass into rgb, and the Y into `y': in the same pass (fold) or by libmerge3's luma pass after it. lock held. */
++static int
++isp_rgb_and_y(struct rwa_device *device, struct rwa_texture *rgb, struct rwa_texture *y, void *fs_isp, struct rwa_texture *const *isp_textures,
++              const struct isp_block *block, char *why, size_t why_size)
++{
++   if (isp_feat_fold) {
++      struct rwa_texture *const out[2] = { rgb, y };
++
++      return isp_pass_to(device, out, 2, fs_isp, isp_textures, 5, block, "ISP", why, why_size);
++   }
++   void *fs_luma = device->isp.luma != NULL ? device->isp.luma
++                 : isp_shader(device, &device->isp.luma, isp_luma_shader(device->nir_options), why, why_size);
++   struct rwa_texture *const rgb_texture[1] = { rgb };
++
++   if (fs_luma == NULL)
++      return -1;
++   return isp_pass(device, rgb, fs_isp, isp_textures, 5, block, "ISP", why, why_size) != 0 ||
++          isp_pass(device, y, fs_luma, rgb_texture, 1, block, "luma", why, why_size) != 0 ? -1 : 0;
+ }
+ 
+ /*
+- * y2s70 NR2: the luma and chroma passes, and the noise taken out (struct rwa_isp_params denoise, denoise_before) -- rwcam_render.c denoise():
+- * the colours smoothed once (twice at 2), the brightness at 2 (near 16), then with the picture before (with_before()). Without noise
+- * reduction the two passes write the surface's planes as before. lock held.
++ * The picture's passes: the ISP pass (y2s75: the RGB picture and its Y in one), the chroma pass, and the noise taken out (struct rwa_isp_params
++ * denoise, denoise_before) -- rwcam_render.c denoise(): the colours smoothed once (twice at 2), the brightness at 2 (near 16), then with the
++ * picture before (with_before()). Without noise reduction the ISP pass writes the surface's luma plane and the chroma pass its chroma plane.
++ * lock held.
+  */
+ static int
+-isp_nr_planes(struct rwa_isp *isp, const struct rwa_isp_params *p, struct rwa_texture *luma, struct rwa_texture *chroma, void *fs_luma,
+-              void *fs_chroma, struct rwa_texture *const *rgb_texture, const struct isp_block *block, uint32_t width, uint32_t height,
+-              char *why, size_t why_size)
++isp_planes(struct rwa_isp *isp, const struct rwa_isp_params *p, struct rwa_texture *luma, struct rwa_texture *chroma, void *fs_isp,
++           struct rwa_texture *const *isp_textures, void *fs_chroma, const struct isp_block *block, uint32_t width, uint32_t height,
++           char *why, size_t why_size)
+ {
+    struct rwa_device *device = isp->device;
+    uint32_t level = p->size >= sizeof(*p) ? p->denoise : 0, before = p->size >= sizeof(*p) ? p->denoise_before : 0;
+    const int32_t z[5] = { 0, 0, 0, 0, 0 };
++   struct rwa_texture *rgb = isp_pool_take(isp, 70 /* RGBA8Unorm */, width, height, why, why_size);
++
++   if (rgb == NULL)
++      return -1;
++   struct rwa_texture *const rgb_texture[1] = { rgb };
+ 
+    level = level > 2 ? 2 : level;
+    if (level == 0 || width < 8 || height < 8) {
+       isp->nr_before = false;                  /* (the picture before is not this one's any more) */
+-      return isp_pass(device, luma, fs_luma, rgb_texture, 1, block, "luma", why, why_size) != 0 ||
++      return isp_rgb_and_y(device, rgb, luma, fs_isp, isp_textures, block, why, why_size) != 0 ||
+              isp_pass(device, chroma, fs_chroma, rgb_texture, 1, block, "chroma", why, why_size) != 0 ? -1 : 0;
+    }
+    const uint32_t cw = (width + 1) / 2, ch = (height + 1) / 2;
+    void *f_sy = isp_nr_fs(device, ISP_NR_SMOOTH_Y, why, why_size), *f_sc = isp_nr_fs(device, ISP_NR_SMOOTH_C, why, why_size);
+    void *f_cy = isp_nr_fs(device, ISP_NR_COPY_Y, why, why_size), *f_cc = isp_nr_fs(device, ISP_NR_COPY_C, why, why_size);
+-   struct rwa_texture *y0 = isp_nr_texture(device, &isp->nr_y0, 10 /* R8Unorm */, width, height, why, why_size);
+-   struct rwa_texture *c0 = isp_nr_texture(device, &isp->nr_c0, 30 /* RG8Unorm */, cw, ch, why, why_size);
+-   struct rwa_texture *c1 = isp_nr_texture(device, &isp->nr_c1, 30, cw, ch, why, why_size);
++   /*
++    * y2s75: without the picture before, the last pass of each plane writes the surface's plane itself -- the brightness smoothed at 2 (as made at
++    * 1: the ISP pass's Y straight into the surface), the colours' last smoothing -- where libmerge3 smoothed into a texture of its own and copied
++    * that into the surface (two passes over the picture fewer at 4K; the copy wrote the same bytes).
++    */
++   const bool temporal = before != 0;
++   struct rwa_texture *y0 = !temporal && level == 1 ? luma : isp_pool_take(isp, 10 /* R8Unorm */, width, height, why, why_size);
++   struct rwa_texture *c0 = y0 ? isp_pool_take(isp, 30 /* RG8Unorm */, cw, ch, why, why_size) : NULL;
++   struct rwa_texture *c1 = c0 == NULL ? NULL : !temporal && level == 1 ? chroma : isp_pool_take(isp, 30, cw, ch, why, why_size);
+ 
+    if (f_sy == NULL || f_sc == NULL || f_cy == NULL || f_cc == NULL || y0 == NULL || c0 == NULL || c1 == NULL)
+       return -1;
+-   if (isp_pass(device, y0, fs_luma, rgb_texture, 1, block, "luma", why, why_size) != 0 ||
++   if (isp_rgb_and_y(device, rgb, y0, fs_isp, isp_textures, block, why, why_size) != 0 ||
+        isp_pass(device, c0, fs_chroma, rgb_texture, 1, block, "chroma", why, why_size) != 0)
+       return -1;
+    /* (no picture before, or another size: this picture as made is its own picture before -- denoise()'s `fresh') */
+-   bool temporal = before != 0;
+    if (isp->nr_by != NULL && (isp->nr_by->res->width0 != width || isp->nr_by->res->height0 != height))
+       isp->nr_before = false;                  /* (another size: the picture before is not this one's) */
+    if (temporal) {
+@@ -1055,8 +1721,8 @@
+       return -1;
+    if (level == 2) {
+       const int32_t near16[5] = { 16, 0, 0, 0, 0 };
+-      struct rwa_texture *c2 = isp_nr_texture(device, &isp->nr_c2, 30, cw, ch, why, why_size);
+-      struct rwa_texture *y1 = isp_nr_texture(device, &isp->nr_y1, 10, width, height, why, why_size);
++      struct rwa_texture *c2 = temporal ? isp_pool_take(isp, 30, cw, ch, why, why_size) : chroma;
++      struct rwa_texture *y1 = c2 == NULL ? NULL : temporal ? isp_pool_take(isp, 10, width, height, why, why_size) : luma;
+ 
+       if (c2 == NULL || y1 == NULL || isp_nr_pass(device, c2, f_sc, c1, NULL, NULL, block, z, "noise: colours again", why, why_size) != 0 ||
+           isp_nr_pass(device, y1, f_sy, y0, NULL, NULL, block, near16, "noise: brightness", why, why_size) != 0)
+@@ -1064,66 +1730,148 @@
+       cc = c2;
+       yc = y1;
+    }
+-   if (!temporal) {
+-      return isp_nr_pass(device, luma, f_cy, yc, NULL, NULL, block, z, "noise: out (brightness)", why, why_size) != 0 ||
+-             isp_nr_pass(device, chroma, f_cc, cc, NULL, NULL, block, z, "noise: out (colours)", why, why_size) != 0 ? -1 : 0;
+-   }
+-   /* with_before(): the blocks' difference, read back; its numbers here; the moves to the GPU; the picture drawn to the one before */
++   if (!temporal)
++      return 0;                                /* (the planes are written: yc is luma, cc chroma) */
++   /*
++    * with_before(): the blocks' difference, then its numbers and each block's stillness (not all moving, no moving block among its nine) with
++    * the nears into a texture the apply passes read one texel of. y2s75: all of it on the GPU (isp_nrg_shader), in the same submission; where
++    * those shaders are not there, a picture too large for their 32-bit sums, or /private/var/db/nord2-isp-nrcpu: libmerge3's way, the
++    * differences read back after a wait (out of a linear texture's buffer) and the numbers made here.
++    */
+    const uint32_t bw = (width + 7) / 8, bh = (height + 7) / 8, n = bw * bh;
++   const int keep_y = level == 2 ? 128 : 90, keep_c = level == 2 ? 140 : 102, near_y0 = level == 2 ? 18 : 10, near_c0 = level == 2 ? 14 : 8;
+    void *f_d = isp_nr_fs(device, ISP_NR_DIFF, why, why_size), *f_ay = isp_nr_fs(device, ISP_NR_APPLY_Y, why, why_size);
+    void *f_ac = isp_nr_fs(device, ISP_NR_APPLY_C, why, why_size);
+-   struct rwa_texture *dt = isp_nr_texture(device, &isp->nr_diff, 10 /* R8Unorm */, bw, bh, why, why_size);
+-   struct rwa_texture *mt = isp_nr_texture(device, &isp->nr_moves, 10, bw, bh, why, why_size);
+-   uint8_t *diff = malloc(2 * (size_t)n), *moves = diff != NULL ? diff + n : NULL;
+    const int32_t dq[5] = { (int32_t)width, (int32_t)height, 0, 0, 0 };
++   void *f_g[ISP_NRG_COUNT];
++   bool on_gpu = n <= 900000 && !isp_nr_cpu;
++   struct rwa_texture *st = NULL;
+ 
+-   if (f_d == NULL || f_ay == NULL || f_ac == NULL || dt == NULL || mt == NULL || diff == NULL ||
+-       isp_nr_pass(device, dt, f_d, yc, isp->nr_by, NULL, block, dq, "noise: blocks", why, why_size) != 0) {
+-      free(diff);
+-      return -1;
++   for (unsigned i = 0; i < ISP_NRG_COUNT; i++) {
++      char why2[160];
++
++      f_g[i] = device->isp.nrg[i] != NULL ? device->isp.nrg[i] : isp_nrg_fs(device, i, why2, sizeof(why2));
++      on_gpu = on_gpu && f_g[i] != NULL;
+    }
+-   const unsigned origin[3] = { 0, 0, 0 }, size[3] = { bw, bh, 1 };
+-   if (rwa_texture_read(dt, 0, 0, origin, size, diff, bw, why, why_size) != 0) {
+-      free(diff);
++   if (f_d == NULL || f_ay == NULL || f_ac == NULL)
+       return -1;
+-   }
+-   uint64_t all = 0, calm = 0, calm_n = 0;
+-   uint32_t moving = 0;
+-   int near_y = level == 2 ? 18 : 10, keep_y = level == 2 ? 128 : 90, near_c = level == 2 ? 14 : 8, keep_c = level == 2 ? 140 : 102, limit;
+-
+-   for (uint32_t b = 0; b < n; b++)
+-      all += diff[b];
+-   for (uint32_t b = 0; b < n; b++) {
+-      if ((uint64_t)diff[b] * n <= 2 * all) {
+-         calm += diff[b];
+-         calm_n++;
++   if (on_gpu) {
++      struct rwa_texture *dt = isp_pool_take(isp, 10 /* R8Unorm */, bw, bh, why, why_size);
++      struct rwa_texture *rows = dt ? isp_pool_take(isp, 123 /* RGBA32Uint */, 1, bh, why, why_size) : NULL;
++      struct rwa_texture *calm = rows ? isp_pool_take(isp, 123, 1, bh, why, why_size) : NULL;
++      struct rwa_texture *moving = calm ? isp_pool_take(isp, 123, 1, bh, why, why_size) : NULL;
++      struct rwa_texture *params = moving ? isp_pool_take(isp, 123, 1, 1, why, why_size) : NULL;
++
++      st = params ? isp_pool_take(isp, 73 /* RGBA8Uint */, bw, bh, why, why_size) : NULL;
++      if (st == NULL)
++         return -1;
++      uint64_t lm, nm;
++      struct isp_block gb = *block;
++      const double t = 0.35 * (double)n;
++
++      isp_nr_tie_masks(&lm, &nm);
++      gb.q[0] = (int32_t)bw;
++      gb.q[1] = (int32_t)bh;
++      gb.q[2] = (int32_t)n;
++      gb.q[3] = (int32_t)((uint32_t)t + 1);            /* (double)moving > 0.35 * n  <=>  moving >= floor(0.35 * n) + 1 */
++      gb.q[4] = near_y0;
++      gb.q[5] = near_c0;
++      gb.q[6] = (int32_t)(uint32_t)lm;
++      gb.q[7] = (int32_t)(uint32_t)(lm >> 32);
++      gb.q[8] = (int32_t)(uint32_t)nm;
++      gb.gq[0] = (int32_t)(uint32_t)(nm >> 32);
++      struct rwa_texture *const t_rows[1] = { dt }, *const t_calm[2] = { dt, rows }, *const t_moving[2] = { dt, calm };
++      struct rwa_texture *const t_params[1] = { moving }, *const t_still[2] = { dt, params };
++#define ISP_NRG_PASS(dst, which, tex, count, what) \
++      (gb.out_w = (int32_t)(dst)->res->width0, gb.out_h = (int32_t)(dst)->res->height0, \
++       isp_pass(device, dst, f_g[which], tex, count, &gb, what, why, why_size))
++
++      if (isp_nr_pass(device, dt, f_d, yc, isp->nr_by, NULL, block, dq, "noise: blocks", why, why_size) != 0 ||
++          ISP_NRG_PASS(rows, ISP_NRG_ROWS, t_rows, 1, "noise: rows") != 0 || ISP_NRG_PASS(calm, ISP_NRG_CALM, t_calm, 2, "noise: calm") != 0 ||
++          ISP_NRG_PASS(moving, ISP_NRG_MOVING, t_moving, 2, "noise: moving") != 0 ||
++          ISP_NRG_PASS(params, ISP_NRG_PARAMS, t_params, 1, "noise: numbers") != 0 || ISP_NRG_PASS(st, ISP_NRG_STILL, t_still, 2, "noise: still") != 0)
++         return -1;
++#undef ISP_NRG_PASS
++   } else {
++      struct rwa_texture *dt = isp_linear_get(isp, &isp->nr_diff, 10 /* R8Unorm */, bw, bh, RWA_USAGE_SHADER_READ | RWA_USAGE_RENDER_TARGET, why, why_size);
++      uint8_t *diff = malloc(6 * (size_t)n), *moves = diff != NULL ? diff + n : NULL, *still = diff != NULL ? diff + 2 * (size_t)n : NULL;
++
++      st = isp_linear_get(isp, &isp->nr_still, 73 /* RGBA8Uint */, bw, bh, RWA_USAGE_SHADER_READ, why, why_size);
++      if (dt == NULL || st == NULL || diff == NULL || isp_nr_pass(device, dt, f_d, yc, isp->nr_by, NULL, block, dq, "noise: blocks", why, why_size) != 0) {
++         free(diff);
++         return -1;
+       }
+-   }
+-   limit = (int)(1.7 * (calm_n ? (double)calm / (double)calm_n : 0) + 0.5);
+-   limit = limit < 10 ? 10 : limit > 48 ? 48 : limit;
+-   {
+-      int noise3 = (int)(3.0 * (calm_n ? (double)calm / (double)calm_n : 0) / 4 + 0.5);
++      uint64_t t_read = os_time_get_nano();
++      if (isp_flush_wait(isp, why, why_size) != 0 || isp_linear_read(isp, &isp->nr_diff, diff, bw, why, why_size) != 0) {
++         free(diff);
++         return -1;
++      }
++      uint64_t all = 0, calm = 0, calm_n = 0;
++      uint32_t moving = 0;
++      int near_y = near_y0, near_c = near_c0, limit;
++
++      for (uint32_t b = 0; b < n; b++)
++         all += diff[b];
++      for (uint32_t b = 0; b < n; b++) {
++         if ((uint64_t)diff[b] * n <= 2 * all) {
++            calm += diff[b];
++            calm_n++;
++         }
++      }
++      limit = (int)(1.7 * (calm_n ? (double)calm / (double)calm_n : 0) + 0.5);
++      limit = limit < 10 ? 10 : limit > 48 ? 48 : limit;
++      {
++         int noise3 = (int)(3.0 * (calm_n ? (double)calm / (double)calm_n : 0) / 4 + 0.5);
+ 
+-      noise3 = noise3 > 40 ? 40 : noise3;
+-      near_y = noise3 > near_y ? noise3 : near_y;
+-      near_c = noise3 * 3 / 4 > near_c ? noise3 * 3 / 4 : near_c;
+-   }
+-   for (uint32_t b = 0; b < n; b++) {
+-      moves[b] = diff[b] > limit ? 1 : 0;
+-      moving += moves[b];
+-   }
+-   int error = rwa_texture_write(mt, 0, 0, origin, size, moves, bw, why, why_size);
+-   free(diff);
+-   if (error != 0)
+-      return -1;
+-   const int32_t all_moving = (double)moving > 0.35 * n ? 1 : 0;
+-   const int32_t qy[5] = { near_y, keep_y, all_moving, (int32_t)bw, (int32_t)bh }, qc[5] = { near_c, keep_c, all_moving, (int32_t)bw, (int32_t)bh };
++         noise3 = noise3 > 40 ? 40 : noise3;
++         near_y = noise3 > near_y ? noise3 : near_y;
++         near_c = noise3 * 3 / 4 > near_c ? noise3 * 3 / 4 : near_c;
++      }
++      for (uint32_t b = 0; b < n; b++) {
++         moves[b] = diff[b] > limit ? 1 : 0;
++         moving += moves[b];
++      }
++      const int32_t all_moving = (double)moving > 0.35 * n ? 1 : 0;
++
++      /* before_piece()'s test, block by block: the shader read nine moves for every pixel; the answer is the same for all of a block's */
++      for (uint32_t by = 0; by < bh; by++) {
++         for (uint32_t bx = 0; bx < bw; bx++) {
++            bool s = !all_moving;
++
++            for (int dy = -1; dy <= 1 && s; dy++)
++               for (int dx = -1; dx <= 1 && s; dx++) {
++                  int64_t nx = (int64_t)bx + dx, ny = (int64_t)by + dy;
++
++                  if (nx >= 0 && nx < bw && ny >= 0 && ny < bh && moves[ny * bw + nx])
++                     s = false;
++               }
++            uint8_t *texel = still + 4 * ((size_t)by * bw + bx);
++
++            texel[0] = s ? 1 : 0;
++            texel[1] = (uint8_t)near_y;
++            texel[2] = (uint8_t)near_c;
++            texel[3] = 0;
++         }
++      }
++      int error = isp_linear_write(&isp->nr_still, still, 4 * (size_t)bw, why, why_size);
++      free(diff);
++      isp->count.readback_ns += os_time_get_nano() - t_read;
++      if (error != 0)
++         return -1;
++   }
++   const int32_t qy[5] = { 0, keep_y, 0, 0, 0 }, qc[5] = { 0, keep_c, 0, 0, 0 };
+ 
+-   if (isp_nr_pass(device, luma, f_ay, yc, isp->nr_by, mt, block, qy, "noise: with the picture before (brightness)", why, why_size) != 0 ||
+-       isp_nr_pass(device, isp->nr_by2, f_ay, yc, isp->nr_by, mt, block, qy, "noise: the next picture before (brightness)", why, why_size) != 0 ||
+-       isp_nr_pass(device, chroma, f_ac, cc, isp->nr_bc, mt, block, qc, "noise: with the picture before (colours)", why, why_size) != 0 ||
+-       isp_nr_pass(device, isp->nr_bc2, f_ac, cc, isp->nr_bc, mt, block, qc, "noise: the next picture before (colours)", why, why_size) != 0)
++   /* each plane and the next render's picture before, in one pass */
++   if (isp_feat_mrt) {
++      if (isp_nr_pass2(device, luma, isp->nr_by2, f_ay, yc, isp->nr_by, st, block, qy, "noise: with the picture before (brightness)", why, why_size) != 0 ||
++          isp_nr_pass2(device, chroma, isp->nr_bc2, f_ac, cc, isp->nr_bc, st, block, qc, "noise: with the picture before (colours)", why, why_size) != 0)
++         return -1;
++   } else if (isp_nr_pass(device, luma, f_ay, yc, isp->nr_by, st, block, qy, "noise: with the picture before (brightness)", why, why_size) != 0 ||
++              isp_nr_pass(device, isp->nr_by2, f_ay, yc, isp->nr_by, st, block, qy, "noise: the next picture before (brightness)", why, why_size) != 0 ||
++              isp_nr_pass(device, chroma, f_ac, cc, isp->nr_bc, st, block, qc, "noise: with the picture before (colours)", why, why_size) != 0 ||
++              isp_nr_pass(device, isp->nr_bc2, f_ac, cc, isp->nr_bc, st, block, qc, "noise: the next picture before (colours)", why, why_size) != 0) {
+       return -1;
++   }
+    struct rwa_texture *t = isp->nr_by;
+    isp->nr_by = isp->nr_by2;
+    isp->nr_by2 = t;
+@@ -1136,7 +1884,8 @@
+ 
+ /* the frame as texture 0. *zero_copy: it is read where the caller put it. lock held. */
+ static struct rwa_texture *
+-isp_frame_texture(struct rwa_isp *isp, const struct rwa_isp_frame *f, bool *zero_copy, int *error, char *why, size_t why_size)
++isp_frame_texture(struct rwa_isp *isp, const struct rwa_isp_frame *f, struct rwa_texture **frame32, bool *zero_copy, int *error, char *why,
++                  size_t why_size)
+ {
+    struct rwa_device *device = isp->device;
+    const size_t bytes = (size_t)f->stride * f->height;
+@@ -1167,6 +1916,8 @@
+          if (isp->slot[slot].buffer != NULL && isp->slot[slot].frame_bytes < row * f->height) {
+             if (isp->slot[slot].texture != NULL)
+                rwa_texture_destroy(isp->slot[slot].texture);
++            if (isp->slot[slot].texture32 != NULL)
++               rwa_texture_destroy(isp->slot[slot].texture32);
+             rwa_buffer_destroy(isp->slot[slot].buffer);
+             memset(&isp->slot[slot], 0, sizeof(isp->slot[slot]));
+          }
+@@ -1181,47 +1932,93 @@
+             }
+             isp->slot[slot].frame_bytes = row * f->height;
+          }
++         /* (one copy into the context's buffer, kept from frame to frame and mapped once: the only processor work on the frame here) */
++         const uint64_t t_up = os_time_get_nano();
++
+          if (row == f->stride) {
+             memcpy(isp->slot[slot].buffer->map, f->raw, bytes);
+          } else {
+             for (uint32_t y = 0; y < f->height; y++)
+                memcpy((uint8_t *)isp->slot[slot].buffer->map + (size_t)y * row, f->raw + (size_t)y * f->stride, f->stride);
+          }
++         isp->count.upload_ns += os_time_get_nano() - t_up;
+       }
+       if (isp->slot[slot].texture != NULL && (isp->slot[slot].stride != row || isp->slot[slot].height != f->height)) {
+          rwa_texture_destroy(isp->slot[slot].texture);
+          isp->slot[slot].texture = NULL;
++         if (isp->slot[slot].texture32 != NULL)
++            rwa_texture_destroy(isp->slot[slot].texture32);
++         isp->slot[slot].texture32 = NULL;
+       }
+       if (isp->slot[slot].texture == NULL) {
+          const struct rwa_texture_shape shape = { .pixel_format = 13 /* R8Uint */, .type = RWA_TYPE_2D, .width = (unsigned)row,
+                                                   .height = f->height, .depth = 1, .array_length = 1, .mip_levels = 1,
+                                                   .sample_count = 1, .usage = RWA_USAGE_SHADER_READ };
++         struct rwa_texture_shape shape32 = shape;
+ 
++         shape32.pixel_format = 53 /* R32Uint */;
++         shape32.width = (unsigned)(row / 4);
+          isp->slot[slot].texture = rwa_texture_from_buffer(isp->slot[slot].buffer, &shape, offset, row, why, why_size);
++         isp->slot[slot].texture32 = isp->slot[slot].texture != NULL
++                                   ? rwa_texture_from_buffer(isp->slot[slot].buffer, &shape32, offset, row, why, why_size) : NULL;
++         if (isp->slot[slot].texture32 == NULL && isp->slot[slot].texture != NULL) {
++            rwa_texture_destroy(isp->slot[slot].texture);
++            isp->slot[slot].texture = NULL;
++         }
+          isp->slot[slot].stride = (uint32_t)row;
+          isp->slot[slot].height = f->height;
+       }
+-      if (isp->slot[slot].texture != NULL)
++      if (isp->slot[slot].texture != NULL) {
++         *frame32 = isp->slot[slot].texture32;
+          return isp->slot[slot].texture;
++      }
+       /* this GPU lays no texture over a buffer: an ordinary texture from here on (said once, by the caller's log of `why') */
+       isp->no_buffer_textures = true;
+       *zero_copy = false;
+    }
++   const uint32_t w32 = (f->stride + 3) / 4;
++
+    if (isp->raw_own != NULL && (isp->raw_own_w != f->stride || isp->raw_own_h != f->height)) {
+       rwa_texture_destroy(isp->raw_own);
+       isp->raw_own = NULL;
++      if (isp->raw_own32 != NULL)
++         rwa_texture_destroy(isp->raw_own32);
++      isp->raw_own32 = NULL;
+    }
+    if (isp->raw_own == NULL) {
+       isp->raw_own = isp_texture(device, 13 /* R8Uint */, f->stride, f->height, RWA_USAGE_SHADER_READ, why, why_size);
+-      if (isp->raw_own == NULL)
++      isp->raw_own32 = isp->raw_own != NULL ? isp_texture(device, 53 /* R32Uint */, w32, f->height, RWA_USAGE_SHADER_READ, why, why_size) : NULL;
++      if (isp->raw_own == NULL || isp->raw_own32 == NULL)
+          return NULL;
+       isp->raw_own_w = f->stride;
+       isp->raw_own_h = f->height;
+    }
+-   const unsigned size[3] = { f->stride, f->height, 1 };
++   const unsigned size[3] = { f->stride, f->height, 1 }, size32[3] = { w32, f->height, 1 };
++   const uint64_t t_up = os_time_get_nano();
+ 
+    if (rwa_texture_write(isp->raw_own, 0, 0, origin, size, f->raw, f->stride, why, why_size) != 0)
+       return NULL;
++   if (f->stride % 4 == 0) {
++      if (rwa_texture_write(isp->raw_own32, 0, 0, origin, size32, f->raw, f->stride, why, why_size) != 0)
++         return NULL;
++   } else {
++      /* (lines of a length that is no multiple of 4: each padded, so that no line's last word reads past the frame) */
++      uint8_t *padded = calloc((size_t)w32 * 4, f->height);
++
++      if (padded == NULL) {
++         *error = RWA_ISP_E_MEMORY;
++         return NULL;
++      }
++      for (uint32_t y = 0; y < f->height; y++)
++         memcpy(padded + (size_t)y * w32 * 4, f->raw + (size_t)y * f->stride, f->stride);
++      int e = rwa_texture_write(isp->raw_own32, 0, 0, origin, size32, padded, (size_t)w32 * 4, why, why_size);
++
++      free(padded);
++      if (e != 0)
++         return NULL;
++   }
++   isp->count.upload_ns += os_time_get_nano() - t_up;
++   *frame32 = isp->raw_own32;
+    return isp->raw_own;
+ }
+ 
+@@ -1306,12 +2103,11 @@
+    void *fs = *slot != NULL ? *slot
+             : isp_shader(device, slot, p->mode == RWA_ISP_MODE_FULL ? isp_full_shader(device->nir_options, f->format)
+                                                                      : isp_cells_shader(device->nir_options, f->format), why, why_size);
+-   void *fs_luma = device->isp.luma != NULL ? device->isp.luma
+-                 : isp_shader(device, &device->isp.luma, isp_luma_shader(device->nir_options), why, why_size);
++   /* (y2s75: no luma pass: the ISP shaders write the Y as well) */
+    void *fs_chroma = device->isp.chroma != NULL ? device->isp.chroma
+                    : isp_shader(device, &device->isp.chroma, isp_chroma_shader(device->nir_options), why, why_size);
+ 
+-   if (fs == NULL || fs_luma == NULL || fs_chroma == NULL)
++   if (fs == NULL || fs_chroma == NULL)
+       return RWA_ISP_E_GPU;
+ 
+    /* the tables: where each column and row of the picture reads the sensor, when anything that decides it has changed */
+@@ -1347,32 +2143,27 @@
+       memcpy(isp->gamma_now, p->gamma, sizeof(isp->gamma_now));
+       isp->gamma_valid = true;
+    }
+-   /* the intermediate picture */
+-   if (isp->rgb != NULL && (isp->rgb_w != width || isp->rgb_h != height)) {
+-      rwa_texture_destroy(isp->rgb);
+-      isp->rgb = NULL;
+-   }
+-   if (isp->rgb == NULL) {
+-      isp->rgb = isp_texture(device, 70 /* RGBA8Unorm */, width, height, RWA_USAGE_SHADER_READ | RWA_USAGE_RENDER_TARGET, why, why_size);
+-      if (isp->rgb == NULL)
+-         return RWA_ISP_E_MEMORY;
+-      isp->rgb_w = width;
+-      isp->rgb_h = height;
+-   }
+-   struct rwa_texture *frame = isp_frame_texture(isp, f, &zero_copy, &error, why, why_size);
++   const uint64_t passes0 = isp_passes, mid0 = isp->count.mid_waits;
++   struct rwa_texture *frame32 = NULL;
++   struct rwa_texture *frame = isp_frame_texture(isp, f, &frame32, &zero_copy, &error, why, why_size);
+ 
+    if (frame == NULL)
+       return error;
+    isp_block_fill(&block, f, p, width, height, isp->map_key.shade_off);
+    uint64_t t1 = os_time_get_nano();
+ 
+-   struct rwa_texture *const isp_textures[4] = { frame, isp->columns, isp->rows, isp->gamma };
+-   struct rwa_texture *const rgb_texture[1] = { isp->rgb };
++   struct rwa_texture *const isp_textures[5] = { frame, isp->columns, isp->rows, isp->gamma, frame32 };
+ 
+-   if (isp_pass(device, isp->rgb, fs, isp_textures, 4, &block, "ISP", why, why_size) != 0 ||
+-       isp_nr_planes(isp, p, luma, chroma, fs_luma, fs_chroma, rgb_texture, &block, width, height, why, why_size) != 0)
++   isp->renders++;
++   if (isp_planes(isp, p, luma, chroma, fs, isp_textures, fs_chroma, &block, width, height, why, why_size) != 0) {
++      isp_pool_release(isp);
+       return RWA_ISP_E_GPU;
+-   /* y2s65: the frame's statistics, one more pass over the frame alone, when the caller asked for them and has room */
++   }
++   /*
++    * y2s65: the frame's statistics, when the caller asked for them and has room. y2s75: two passes -- the cells the statistics look at, each
++    * read out of the frame once (isp_stats_cells_shader), then the 20 kinds of each block from them (isp_stats_shader) into a linear texture
++    * that isp_finish reads through its buffer.
++    */
+    isp->stats_w = isp->stats_h = isp->stats_step = 0;
+    if (isp->stats_out != NULL) {
+       uint32_t cw = f->width / 2, ch = f->height / 2, step = isp_stats_step(cw, ch);
+@@ -1383,19 +2174,15 @@
+       if ((uint64_t)tw * th * 4 <= isp->stats_floats && tw <= 8192 && th <= 8192) {
+          void *fs_stats = device->isp.stats[variant] != NULL ? device->isp.stats[variant]
+                         : isp_shader(device, &device->isp.stats[variant], isp_stats_shader(device->nir_options, f->format), why, why_size);
++         void *fs_cells = device->isp.cellstat[variant] != NULL ? device->isp.cellstat[variant]
++                        : isp_shader(device, &device->isp.cellstat[variant], isp_stats_cells_shader(device->nir_options, f->format), why, why_size);
++         struct rwa_texture *cells = fs_stats != NULL && fs_cells != NULL ? isp_pool_take(isp, 123 /* RGBA32Uint */, nw, nh, why, why_size) : NULL;
++         struct rwa_texture *target = cells != NULL ? isp_linear_get(isp, &isp->stats, 125 /* RGBA32Float */, tw, th,
++                                                                     RWA_USAGE_SHADER_READ | RWA_USAGE_RENDER_TARGET, why, why_size) : NULL;
+ 
+-         if (isp->stats != NULL && (isp->stats_tw != tw || isp->stats_th != th)) {
+-            rwa_texture_destroy(isp->stats);
+-            isp->stats = NULL;
+-         }
+-         if (fs_stats != NULL && isp->stats == NULL) {
+-            isp->stats = isp_texture(device, 125 /* RGBA32Float */, tw, th, RWA_USAGE_SHADER_READ | RWA_USAGE_RENDER_TARGET, why, why_size);
+-            isp->stats_tw = tw;
+-            isp->stats_th = th;
+-         }
+-         if (fs_stats != NULL && isp->stats != NULL) {
++         if (target != NULL) {
+             struct isp_block sb = block;
+-            struct rwa_texture *const stats_textures[1] = { frame };
++            struct rwa_texture *const cells_textures[1] = { isp_feat_r32 ? frame32 : frame }, *const stats_textures[1] = { cells };
+             int white = 1023 - (int)f->black;
+ 
+             white = white < 64 ? 64 : white;
+@@ -1404,25 +2191,53 @@
+             sb.q[2] = (int32_t)ch;
+             sb.q[3] = white * 85 / 100;
+             sb.q[4] = (int32_t)gw;
+-            sb.out_w = (int32_t)tw;
+-            sb.out_h = (int32_t)th;
+-            if (isp_pass(device, isp->stats, fs_stats, stats_textures, 1, &sb, "statistics", why, why_size) == 0) {
+-               isp->stats_w = gw;
+-               isp->stats_h = gh;
+-               isp->stats_step = step;
++            sb.q[5] = (int32_t)nw;
++            sb.q[6] = (int32_t)nh;
++            sb.out_w = (int32_t)nw;
++            sb.out_h = (int32_t)nh;
++            if (isp_pass(device, cells, fs_cells, cells_textures, 1, &sb, "statistics: cells", why, why_size) == 0) {
++               sb.out_w = (int32_t)tw;
++               sb.out_h = (int32_t)th;
++               if (isp_pass(device, target, fs_stats, stats_textures, 1, &sb, "statistics", why, why_size) == 0) {
++                  isp->stats_w = gw;
++                  isp->stats_h = gh;
++                  isp->stats_step = step;
++               }
+             }
+          }
+       }
+    }
+    device->pipe->flush(device->pipe, fence, 0);
+-   if (isp->rgb != NULL && (uint64_t)width * height * 4 > ISP_KEEP_BYTES) {
+-      rwa_texture_destroy(isp->rgb);          /* a still's: the queued passes hold what they use */
+-      isp->rgb = NULL;
++   isp_pool_release(isp);                     /* (the queued passes hold what they use) */
++   const uint64_t t2 = os_time_get_nano();
++   /* y2s75: what isp_say tells */
++   {
++      struct isp_counts *c = &isp->count;
++
++      c->renders++;
++      c->submits++;
++      c->passes += isp_passes - passes0;
++      if (zero_copy) {
++         c->zero_copy++;
++      } else {
++         c->uploaded++;
++         c->upload_bytes += (uint64_t)f->stride * f->height;
++      }
++      c->prepare_ns += t1 - t0;
++      c->queue_ns += t2 - t1;
++      c->fw = f->width;
++      c->fh = f->height;
++      c->w = width;
++      c->h = height;
++      c->mode = p->mode;
++      c->level = p->size >= sizeof(*p) ? p->denoise : 0;
++      c->before = p->size >= sizeof(*p) ? p->denoise_before : 0;
++      (void)mid0;
+    }
+    if (result != NULL && result->size >= RWA_ISP_RESULT_SIZE_1) {
+       result->flags = zero_copy ? RWA_ISP_DID_ZERO_COPY : 0;
+       result->prepare_ns = t1 - t0;
+-      result->queue_ns = os_time_get_nano() - t1;
++      result->queue_ns = t2 - t1;
+       result->wait_ns = 0;
+    }
+    return RWA_ISP_OK;
+@@ -1474,13 +2289,15 @@
+    /* y2s65: the statistics, read back now that the passes are done */
+    uint32_t sw = 0, sh = 0;
+ 
+-   if (error == RWA_ISP_OK && isp->stats_out != NULL && isp->stats_w != 0 && isp->stats != NULL) {
+-      const unsigned origin[3] = { 0, 0, 0 }, size[3] = { isp->stats_tw, isp->stats_th, 1 };
++   const uint64_t t_stats = os_time_get_nano();
+ 
+-      if (rwa_texture_read(isp->stats, 0, 0, origin, size, isp->stats_out, (size_t)isp->stats_tw * 16, why, why_size) == 0) {
++   isp->count.wait_ns += t_stats - t;
++   if (error == RWA_ISP_OK && isp->stats_out != NULL && isp->stats_w != 0 && isp->stats.texture != NULL) {
++      if (isp_linear_read(isp, &isp->stats, isp->stats_out, (size_t)isp->stats.width * 16, why, why_size) == 0) {
+          sw = isp->stats_w;
+          sh = isp->stats_h;
+       }
++      isp->count.stats_ns += os_time_get_nano() - t_stats;
+    }
+    if (result != NULL && result->size >= sizeof(*result)) {
+       result->stats_w = sw;
+@@ -1506,7 +2323,9 @@
+    }
+    int error = isp_render_locked(isp, frame, params, luma, chroma, width, height, &fence, result, why, why_size);
+ 
+-   return error != RWA_ISP_OK ? error : isp_finish(isp, fence, flags & RWA_ISP_OUT_ASYNC, result, why, why_size);
++   error = error != RWA_ISP_OK ? error : isp_finish(isp, fence, flags & RWA_ISP_OUT_ASYNC, result, why, why_size);
++   isp_say(isp);
++   return error;
+ }
+ 
+ /* y2s65, for tests (not in rwa_isp_api.h): the next rwa_isp_render_textures also makes the statistics into `stats' */
+@@ -1738,9 +2557,14 @@
+          if (device->isp.stats[variant] == NULL &&
+              isp_shader(device, &device->isp.stats[variant], isp_stats_shader(device->nir_options, job.format), why2, sizeof(why2)) == NULL)
+             isp_note("camera ISP: the statistics shader (format %u) was not made (%.160s): the processor measures the frames", job.format, why2);
++         if (device->isp.cellstat[variant] == NULL &&
++             isp_shader(device, &device->isp.cellstat[variant], isp_stats_cells_shader(device->nir_options, job.format), why2, sizeof(why2)) == NULL)
++            isp_note("camera ISP: the statistics' cells shader (format %u) was not made (%.160s): the processor measures the frames", job.format, why2);
+          t_stats = os_time_get_nano() - ts;
+          for (unsigned i = 0; i < 7; i++)
+             (void)isp_nr_fs(device, i, why2, sizeof(why2));
++         for (unsigned i = 0; i < ISP_NRG_COUNT; i++)
++            (void)isp_nrg_fs(device, i, why2, sizeof(why2));
+       }
+    }
+    double ms = (double)(os_time_get_nano() - t0) / 1e6;
+@@ -1845,6 +2669,41 @@
+       isp_note("camera ISP: the GPU path is OFF for this process: the processor makes every picture and its statistics from now on");
+ }
+ 
++/*
++ * y2s75: what a context's renders cost, said every ISP_SAY_NS (one line in the phone's log, "camera ISP: 5.0 s of ..."): the frame read in place
++ * (zero copy) or copied (and the copy's time), prepare / queue / wait as the caller's result has them, the noise's mid-render wait and readback,
++ * the statistics' readback after the wait (in nobody's numbers before), the pool's hits and misses (a miss is a texture made: none once warm),
++ * passes and submissions per render.
++ */
++static void
++isp_say(struct rwa_isp *isp)
++{
++   struct isp_counts *c = &isp->count;
++   const uint64_t now = os_time_get_nano();
++
++   if (c->since == 0) {
++      c->since = now;
++      return;
++   }
++   if (now - c->since < ISP_SAY_NS || c->renders == 0)
++      return;
++   const double n = (double)c->renders, ms = 1e6;
++
++   isp_note("camera ISP: %.1f s of %ux%u from %ux%u (%s, noise %u%s): %llu renders; frame zero copy %llu, uploaded %llu (%.1f MB, %.2f ms each); "
++            "prepare %.2f, queue %.2f (noise blocks' wait+readback %.2f in %llu), wait %.2f, statistics readback %.2f ms; pool hits %llu, misses %llu "
++            "(%.1f MB made), %.1f MB kept; %.1f passes, %.1f submissions a render; linear reads %llu, driver reads %llu; surfaces imported %llu",
++            (double)(now - c->since) / 1e9, c->w, c->h, c->fw, c->fh, c->mode == RWA_ISP_MODE_FULL ? "full" : "cells", c->level,
++            c->before ? " with the picture before" : "", (unsigned long long)c->renders, (unsigned long long)c->zero_copy,
++            (unsigned long long)c->uploaded, c->uploaded ? (double)c->upload_bytes / (double)c->uploaded / 1e6 : 0.0,
++            c->uploaded ? (double)c->upload_ns / (double)c->uploaded / ms : 0.0, (double)c->prepare_ns / n / ms, (double)c->queue_ns / n / ms,
++            (double)c->readback_ns / n / ms, (unsigned long long)c->mid_waits, (double)c->wait_ns / n / ms, (double)c->stats_ns / n / ms,
++            (unsigned long long)c->pool_hits, (unsigned long long)c->pool_misses, (double)c->pool_made_bytes / 1e6, (double)isp_pool_kept(isp) / 1e6,
++            (double)c->passes / n, (double)c->submits / n, (unsigned long long)c->linear_reads, (unsigned long long)c->driver_reads,
++            (unsigned long long)c->imports);
++   memset(c, 0, sizeof(*c));
++   c->since = now;
++}
++
+ /* ---- the calls of rwa_isp_api.h --------------------------------------------------------------------------------------------------- */
+ 
+ unsigned
+@@ -1869,6 +2728,19 @@
+       return NULL;
+    }
+    isp->device = isp_device;
++   pthread_once(&isp_feat_once, isp_features_load);
++   {
++      static bool said;
++
++      if (!said) {
++         said = true;
++         isp_no_linear = access("/private/var/db/nord2-isp-nolinear", F_OK) == 0;
++         isp_nr_cpu = access("/private/var/db/nord2-isp-nrcpu", F_OK) == 0 || getenv("RWA_ISP_NRCPU") != NULL;
++         isp_note("camera ISP: libmerge5 (y2s75/lm5): intermediates pooled, statistics from a cells pass, the noise's stillness one texel a pixel; "
++                  "features (nord2-isp-features) %s; the noise's numbers %s; readbacks %s", isp_feat_text, isp_nr_cpu ? "by the processor (nord2-isp-nrcpu)" : "on the GPU, one submission",
++                  isp_no_linear ? "through the driver (nord2-isp-nolinear)" : "out of linear buffers where the GPU lays textures over them");
++      }
++   }
+    return isp;
+ }
+ 
+@@ -1915,15 +2787,22 @@
+    for (int i = 0; i <= ISP_SLOTS; i++) {
+       if (isp->slot[i].texture != NULL)
+          rwa_texture_destroy(isp->slot[i].texture);
++      if (isp->slot[i].texture32 != NULL)
++         rwa_texture_destroy(isp->slot[i].texture32);
+       if (isp->slot[i].buffer != NULL)
+          rwa_buffer_destroy(isp->slot[i].buffer);
+    }
+-   struct rwa_texture *own[17] = { isp->raw_own, isp->columns, isp->rows, isp->gamma, isp->rgb, isp->stats, isp->nr_y0, isp->nr_y1, isp->nr_c0,
+-                                   isp->nr_c1, isp->nr_c2, isp->nr_by, isp->nr_bc, isp->nr_by2, isp->nr_bc2, isp->nr_diff, isp->nr_moves };
++   struct rwa_texture *own[9] = { isp->raw_own, isp->raw_own32, isp->columns, isp->rows, isp->gamma, isp->nr_by, isp->nr_bc, isp->nr_by2,
++                                  isp->nr_bc2 };
+ 
+-   for (int i = 0; i < 17; i++)
++   for (int i = 0; i < 9; i++)
+       if (own[i] != NULL)
+          rwa_texture_destroy(own[i]);
++   for (int i = 0; i < ISP_POOL; i++)
++      isp_pool_drop(&isp->pool[i]);
++   isp_linear_drop(&isp->stats);
++   isp_linear_drop(&isp->nr_diff);
++   isp_linear_drop(&isp->nr_still);
+    free(isp);
+ }
+ 
+@@ -1947,6 +2826,8 @@
+       return (uint8_t *)isp->slot[slot].buffer->map + pad;
+    if (isp->slot[slot].texture != NULL)
+       rwa_texture_destroy(isp->slot[slot].texture);
++   if (isp->slot[slot].texture32 != NULL)
++      rwa_texture_destroy(isp->slot[slot].texture32);
+    if (isp->slot[slot].buffer != NULL)
+       rwa_buffer_destroy(isp->slot[slot].buffer);
+    memset(&isp->slot[slot], 0, sizeof(isp->slot[slot]));
+@@ -2001,6 +2882,10 @@
+          result->prepare_ns += t;
+          result->flags |= imported ? RWA_ISP_DID_IMPORT : 0;
+       }
++      if (error == RWA_ISP_OK) {
++         isp->count.prepare_ns += t;
++         isp->count.imports += imported;
++      }
+    }
+    if (error != RWA_ISP_OK) {
+       isp_account(error, os_time_get_nano() - t_call);
+@@ -2008,5 +2893,6 @@
+    }
+    error = isp_finish(isp, fence, output->flags & RWA_ISP_OUT_ASYNC, result, why, why_size);
+    isp_account(error, os_time_get_nano() - t_call);
++   isp_say(isp);
+    return error;
+ }
+diff -ruN y2s72-libmerge3/src/air_metal.c y2s75-libmerge4/lm5/src/air_metal.c
+--- y2s72-libmerge3/src/air_metal.c	2026-11-12 13:47:02.586886185 +0100
++++ y2s75-libmerge4/lm5/src/air_metal.c	2026-11-12 16:00:27.538577703 +0100
+@@ -199,6 +199,8 @@
+       void *cells[2], *full[2], *luma, *chroma, *nearest;
+       void *stats[2];           /* y2s65: the frame's statistics, per frame format (air_isp.c isp_stats_shader) */
+       void *nr[7];              /* y2s70 NR2: smooth luma, smooth chroma, block difference, apply luma, apply chroma, copy luma, copy chroma */
++      void *cellstat[2];        /* y2s75 libmerge4: the statistics' cells, made once per frame for the 20 kinds (air_isp.c isp_stats_cells_shader) */
++      void *nrg[5];             /* y2s75 libmerge4: with_before()'s numbers on the GPU (air_isp.c isp_nrg_shader): rows, calm, moving, params, still */
+    } isp;
+ };
+ 
+diff -ruN y2s72-libmerge3/src/bench-host-test.sh y2s75-libmerge4/lm5/src/bench-host-test.sh
+--- y2s72-libmerge3/src/bench-host-test.sh	1970-01-01 01:00:00.000000000 +0100
++++ y2s75-libmerge4/lm5/src/bench-host-test.sh	2026-11-12 16:16:39.753346952 +0100
+@@ -0,0 +1,30 @@
++#!/bin/bash
++# y2s75 libmerge4: isp_bench_host_test (this directory's) built against the air_metal.c of SRC (default: this directory) and an EXISTING host
++# Mesa build (softpipe), READ ONLY, in the scratch directory T. Before/after:
++#   T=<scratch>/b3 bash bench-host-test.sh ../../y2s72-libmerge3/src libmerge3
++#   T=<scratch>/b4 bash bench-host-test.sh . libmerge4
++# BENCH_ITERS=n timed renders a case (default 3); BENCH_CASES=mask of the four cases (default all).
++set -euo pipefail
++G=$NORD2_WORK/gpu
++M=$G/build/y2s-stage0/mesa-25.0.7; HERE=$(cd "$(dirname "$0")" && pwd); T=${T:?set T to an empty scratch directory}
++SRC=$(cd "${1:-$HERE}" && pwd); LABEL=${2:-$(basename "$(dirname "$SRC")")}
++H=${H:-$G/video/build/WP08/hostmesa}
++mkdir -p $T; cd $T
++printf '#ifndef __ASSEMBLER__\n#include <pthread.h>\n#define __once_flag_defined 1\n#define once_flag pthread_once_t\n#endif\n' > hostfix.h
++printf '#include <stdint.h>\n#include <stdbool.h>\n#include "frontend/winsys_handle.h"\n#include "drm-uapi/drm_fourcc.h"\n' > hostfix2.h
++LIBS="src/gallium/auxiliary/libgallium.a src/compiler/nir/libnir.a src/compiler/libcompiler.a src/util/libmesa_util.a src/util/libmesa_util_sse41.a src/util/blake3/libblake3.a src/c11/impl/libmesa_util_c11.a src/gallium/auxiliary/libgalliumvl_stub.a src/gallium/winsys/sw/null/libws_null.a src/compiler/air/libair.a src/util/libxmlconfig.a src/gallium/drivers/softpipe/libsoftpipe.a"
++for l in $LIBS; do [ -f $H/$l ] || { echo "missing $H/$l"; exit 1; }; done
++INC=$(for d in src/gallium/drivers/panfrost include src src/mapi src/mesa src/gallium/include src/gallium/auxiliary src/gallium/winsys/sw src/gallium/winsys src/gallium/drivers src/compiler/air src/compiler/nir src/compiler src/panfrost src/panfrost/lib src/panfrost/util src/panfrost/compiler; do printf -- "-I$H/$d -I$M/$d "; done)
++DEF=$(grep -o '^DEF="[^"]*"' $G/build/y2s63-vt23/src/host-tests.sh | sed 's/^DEF="//; s/"$//')
++CC="cc -std=gnu11 -O1 -g -include $T/hostfix.h -include $T/hostfix2.h $DEF $INC"
++A=$(for l in $LIBS; do printf "$H/$l "; done)
++for f in air_to_nir air_intrinsics; do
++  C=$(python3 -I -c "import json,sys
++for e in json.load(open('$H/compile_commands.json')):
++    if e['file'].endswith('compiler/air/$f.c'): print(e['command']); break")
++  (cd $H && eval "$(echo "$C" | sed "s| -MD -MQ [^ ]* -MF [^ ]*||; s| -o [^ ]*| -o $T/$f.c.o|; s| -c [^ ]*| -c $SRC/$f.c|; s|^cc |cc -I$M/src/compiler/air |")")
++done
++$CC -c $SRC/air_metal.c -o air_metal_host.o
++cc -std=gnu11 -O1 -g -Wall -I$SRC -c $HERE/isp_bench_host_test.c -o bench.o
++c++ -o isp_bench_host_test bench.o air_metal_host.o air_to_nir.c.o air_intrinsics.c.o -Wl,--start-group $A -Wl,--end-group -lm -lz -lpthread -ldl -ldrm
++./isp_bench_host_test "$LABEL"
+diff -ruN y2s72-libmerge3/src/isp_bench_host_test.c y2s75-libmerge4/lm5/src/isp_bench_host_test.c
+--- y2s72-libmerge3/src/isp_bench_host_test.c	1970-01-01 01:00:00.000000000 +0100
++++ y2s75-libmerge4/lm5/src/isp_bench_host_test.c	2026-11-12 16:26:17.695180396 +0100
+@@ -0,0 +1,114 @@
++/*
++ * y2s75 libmerge4: isp_bench_host_test -- per-stage timings of the camera's GPU render (rwa_isp_render_textures, the statistics asked as the
++ * bundle asks them) on softpipe, for the picture sizes of the phone's streams, from a 4096x3072 RAW10 frame as the wide camera gives it:
++ *   1504x1128 cells, noise 2 with the picture before   (photo preview)
++ *   1920x1080 cells, noise 2 with the picture before   (1080p video)
++ *   3840x2160 cells, noise 2                           (4K video: the bundle asks the picture before only up to 4 MP)
++ *   4096x3072 full,  noise 2                           (the still)
++ * Built against the air_metal.c of the library given (bench-host-test.sh SRC), so that libmerge3 and libmerge4 are timed by the same program.
++ * softpipe is the processor drawing every pass: its time is the passes' work (fragments, texel reads) and the library's own processor time,
++ * not the Mali's; what it shows is how much work each render queues, and prepare / readback times of the processor's side.
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <stdbool.h>
++#include "air_metal.h"
++#include "rwa_isp_api.h"
++
++int rwa_isp_render_textures(struct rwa_isp *isp, const struct rwa_isp_frame *frame, const struct rwa_isp_params *params,
++			    struct rwa_texture *luma, struct rwa_texture *chroma, uint32_t width, uint32_t height, uint32_t flags,
++			    struct rwa_isp_result *result, char *why, size_t why_size);
++struct rwa_device *rwa_isp_device(struct rwa_isp *isp);
++void rwa_isp_want_stats(struct rwa_isp *isp, float *stats, uint32_t floats);
++struct rwa_isp *rwa_isp_create(char *why, size_t why_size);
++void rwa_isp_destroy(struct rwa_isp *isp);
++
++static double
++now_ms(void)
++{
++	struct timespec t;
++	clock_gettime(CLOCK_MONOTONIC, &t);
++	return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
++}
++
++/* the process's processor time: what softpipe spent, without the time the process was stopped (the build machine's thermal guard
++ * freezes it at 85 C) */
++static double
++cpu_ms(void)
++{
++	struct timespec t;
++	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t);
++	return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
++}
++
++static unsigned long long rng = 88172645463325252ull;
++static unsigned rnd(void) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return (unsigned)(rng >> 16); }
++
++int
++main(int argc, char **argv)
++{
++	const char *label = argc > 1 ? argv[1] : "?";
++	int iters = getenv("BENCH_ITERS") ? atoi(getenv("BENCH_ITERS")) : 3;
++	unsigned only = getenv("BENCH_CASES") ? (unsigned)strtoul(getenv("BENCH_CASES"), NULL, 0) : ~0u;     /* a mask of the cases below */
++	char why[512] = "";
++	static const struct { uint32_t w, h, mode, level, before; const char *name; } cases[] = {
++		{ 1504, 1128, RWA_ISP_MODE_CELLS, 2, 1, "1504x1128 preview" },
++		{ 1920, 1080, RWA_ISP_MODE_CELLS, 2, 1, "1920x1080 video  " },
++		{ 3840, 2160, RWA_ISP_MODE_CELLS, 2, 0, "3840x2160 video  " },
++		{ 4096, 3072, RWA_ISP_MODE_FULL,  2, 0, "4096x3072 still  " },
++	};
++	const uint32_t fw = 4096, fh = 3072, stride = fw / 4 * 5;
++	uint8_t *raw = malloc((size_t)stride * fh), gamma[4096];
++	static float stats[1 << 20];
++
++	setenv("RWA_SOFTWARE", "1", 1);
++	for (size_t i = 0; i < (size_t)stride * fh; i++)
++		raw[i] = (uint8_t)(rnd() & 0xff);
++	for (int i = 0; i < 4096; i++)
++		gamma[i] = (uint8_t)(i * 255 / 4095);
++	printf("isp_bench_host_test (%s), softpipe, frame %ux%u RAW10 (%zu bytes), %d timed renders a case after one untimed\n", label, fw, fh,
++	       (size_t)stride * fh, iters);
++	printf("%-18s %9s %9s %9s %9s %9s %9s\n", "case", "prepare", "queue", "wait", "after", "total ms", "cpu ms");
++	for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
++		if (!(only >> c & 1))
++			continue;
++		struct rwa_isp *isp = rwa_isp_create(why, sizeof(why));
++		if (isp == NULL) { fprintf(stderr, "no context: %s\n", why); return 1; }
++		struct rwa_device *device = rwa_isp_device(isp);
++		uint32_t pw = cases[c].w, ph = cases[c].h;
++		struct rwa_texture_shape s = { .pixel_format = 10, .type = 2, .width = pw, .height = ph, .depth = 1, .array_length = 1, .mip_levels = 1,
++					       .sample_count = 1, .usage = 1 | 4 };
++		struct rwa_texture *luma = rwa_texture_create(device, &s, why, sizeof(why));
++		s.pixel_format = 30; s.width = (pw + 1) / 2; s.height = (ph + 1) / 2;
++		struct rwa_texture *chroma = rwa_texture_create(device, &s, why, sizeof(why));
++		struct rwa_isp_frame frame = { .size = sizeof(frame), .width = fw, .height = fh, .stride = stride, .format = 1, .bayer = 0, .black = 64,
++					       .raw = raw };
++		struct rwa_isp_params params = { .size = sizeof(params), .mode = cases[c].mode, .wb = { 1.6f, 1.0f, 2.1f }, .digital = 1.2f,
++						 .ccm = { 1.5f, -0.3f, -0.2f, -0.2f, 1.4f, -0.2f, -0.1f, -0.4f, 1.5f }, .falloff = 0.3f, .zoom = 1.0f,
++						 .video_range = 1, .gamma = gamma, .denoise = cases[c].level, .denoise_before = cases[c].before };
++		double sp = 0, sq = 0, sw = 0, sa = 0, st = 0, sc = 0;
++		int ok = 0;
++		for (int k = 0; k <= iters; k++) {
++			struct rwa_isp_result r = { .size = sizeof(r) };
++			raw[(size_t)k * 977] ^= 0x55;            /* (another frame, as far as anything could tell) */
++			rwa_isp_want_stats(isp, stats, sizeof(stats) / sizeof(stats[0]));
++			double t0 = now_ms(), c0 = cpu_ms();
++			int e = rwa_isp_render_textures(isp, &frame, &params, luma, chroma, pw, ph, 0, &r, why, sizeof(why));
++			double t = now_ms() - t0, cpu = cpu_ms() - c0;
++			if (e != RWA_ISP_OK) { fprintf(stderr, "%s: render %d: %s\n", cases[c].name, e, why); return 1; }
++			if (k == 0)
++				continue;
++			double p = r.prepare_ns / 1e6, q = r.queue_ns / 1e6, w = r.wait_ns / 1e6;
++			sp += p; sq += q; sw += w; sa += t - p - q - w; st += t; sc += cpu; ok++;
++		}
++		printf("%-18s %9.2f %9.2f %9.2f %9.2f %9.2f %9.2f\n", cases[c].name, sp / ok, sq / ok, sw / ok, sa / ok, st / ok, sc / ok);
++		fflush(stdout);
++		rwa_texture_destroy(luma);
++		rwa_texture_destroy(chroma);
++		rwa_isp_destroy(isp);
++	}
++	free(raw);
++	return 0;
++}
+diff -ruN y2s72-libmerge3/src/isp_nrg_host_test.c y2s75-libmerge4/lm5/src/isp_nrg_host_test.c
+--- y2s72-libmerge3/src/isp_nrg_host_test.c	1970-01-01 01:00:00.000000000 +0100
++++ y2s75-libmerge4/lm5/src/isp_nrg_host_test.c	2026-11-12 16:01:55.171121432 +0100
+@@ -0,0 +1,176 @@
++/*
++ * y2s75 libmerge4: isp_nrg_host_test -- with_before()'s numbers on the GPU (air_isp.c isp_nrg_shader: rows, calm, moving, params, still) on
++ * softpipe, against the processor's own arithmetic (rwcam_render.c with_before(), as air_isp.c's processor path has it), for blocks' differences
++ * made to hit every case: random ones, uniform ones (mean v exactly: the ties of 1.7 v + 0.5 and 3 v / 4 + 0.5, v = 5, 15, 25, ...; 2, 6, 10, ...),
++ * two-valued ones (means (10 L - 5) / 17 and (4 N - 2) / 3 from unequal counts), all moving and none. Every block's stillness and both nears
++ * must be the processor's.
++ */
++#include "air_metal.c"
++
++static unsigned long long rng = 88172645463325252ull;
++static unsigned rnd(void) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return (unsigned)(rng >> 16); }
++
++/* the processor's numbers (air_isp.c's processor path) */
++static void
++cpu_still(const uint8_t *diff, uint32_t bw, uint32_t bh, int level, uint8_t *out)
++{
++   uint32_t n = bw * bh, moving = 0;
++   uint64_t all = 0, calm = 0, calm_n = 0;
++   int near_y = level == 2 ? 18 : 10, near_c = level == 2 ? 14 : 8, limit;
++
++   for (uint32_t b = 0; b < n; b++)
++      all += diff[b];
++   for (uint32_t b = 0; b < n; b++)
++      if ((uint64_t)diff[b] * n <= 2 * all) {
++         calm += diff[b];
++         calm_n++;
++      }
++   limit = (int)(1.7 * (calm_n ? (double)calm / (double)calm_n : 0) + 0.5);
++   limit = limit < 10 ? 10 : limit > 48 ? 48 : limit;
++   int noise3 = (int)(3.0 * (calm_n ? (double)calm / (double)calm_n : 0) / 4 + 0.5);
++   noise3 = noise3 > 40 ? 40 : noise3;
++   near_y = noise3 > near_y ? noise3 : near_y;
++   near_c = noise3 * 3 / 4 > near_c ? noise3 * 3 / 4 : near_c;
++   for (uint32_t b = 0; b < n; b++)
++      moving += diff[b] > limit;
++   int all_moving = (double)moving > 0.35 * n;
++   for (uint32_t by = 0; by < bh; by++)
++      for (uint32_t bx = 0; bx < bw; bx++) {
++         bool s = !all_moving;
++         for (int dy = -1; dy <= 1; dy++)
++            for (int dx = -1; dx <= 1; dx++) {
++               int64_t nx = (int64_t)bx + dx, ny = (int64_t)by + dy;
++               if (nx >= 0 && nx < bw && ny >= 0 && ny < bh && diff[ny * bw + nx] > limit)
++                  s = false;
++            }
++         uint8_t *t = out + 4 * ((size_t)by * bw + bx);
++         t[0] = s; t[1] = (uint8_t)near_y; t[2] = (uint8_t)near_c; t[3] = 0;
++      }
++}
++
++static int failures, cases;
++
++static void
++check(struct rwa_isp *isp, const uint8_t *diff, uint32_t bw, uint32_t bh, int level, const char *what)
++{
++   struct rwa_device *device = isp->device;
++   char why[512] = "";
++   uint32_t n = bw * bh;
++   uint8_t *want = malloc(4 * (size_t)n), *got = malloc(4 * (size_t)n);
++   struct rwa_texture *dt = isp_texture(device, 10, bw, bh, RWA_USAGE_SHADER_READ | RWA_USAGE_RENDER_TARGET, why, sizeof(why));
++   struct rwa_texture *rows = isp_texture(device, 123, 1, bh, RWA_USAGE_SHADER_READ | RWA_USAGE_RENDER_TARGET, why, sizeof(why));
++   struct rwa_texture *calm = isp_texture(device, 123, 1, bh, RWA_USAGE_SHADER_READ | RWA_USAGE_RENDER_TARGET, why, sizeof(why));
++   struct rwa_texture *moving = isp_texture(device, 123, 1, bh, RWA_USAGE_SHADER_READ | RWA_USAGE_RENDER_TARGET, why, sizeof(why));
++   struct rwa_texture *params = isp_texture(device, 123, 1, 1, RWA_USAGE_SHADER_READ | RWA_USAGE_RENDER_TARGET, why, sizeof(why));
++   struct rwa_texture *st = isp_texture(device, 73, bw, bh, RWA_USAGE_SHADER_READ | RWA_USAGE_RENDER_TARGET, why, sizeof(why));
++   const unsigned origin[3] = { 0, 0, 0 }, size[3] = { bw, bh, 1 };
++   struct isp_block gb;
++   uint64_t lm, nm;
++   void *f[ISP_NRG_COUNT];
++
++   cases++;
++   cpu_still(diff, bw, bh, level, want);
++   rwa_texture_write(dt, 0, 0, origin, size, diff, bw, why, sizeof(why));
++   for (unsigned i = 0; i < ISP_NRG_COUNT; i++)
++      f[i] = isp_nrg_fs(device, i, why, sizeof(why));
++   memset(&gb, 0, sizeof(gb));
++   isp_nr_tie_masks(&lm, &nm);
++   gb.q[0] = (int32_t)bw; gb.q[1] = (int32_t)bh; gb.q[2] = (int32_t)n; gb.q[3] = (int32_t)((uint32_t)(0.35 * (double)n) + 1);
++   gb.q[4] = level == 2 ? 18 : 10; gb.q[5] = level == 2 ? 14 : 8;
++   gb.q[6] = (int32_t)(uint32_t)lm; gb.q[7] = (int32_t)(uint32_t)(lm >> 32); gb.q[8] = (int32_t)(uint32_t)nm; gb.gq[0] = (int32_t)(uint32_t)(nm >> 32);
++   struct rwa_texture *const t_rows[1] = { dt }, *const t_calm[2] = { dt, rows }, *const t_moving[2] = { dt, calm };
++   struct rwa_texture *const t_params[1] = { moving }, *const t_still[2] = { dt, params };
++   int e = 0;
++   {
++      RWA_GUARD();
++      if (!ycbcr_state(device, why, sizeof(why)))
++         e = -1;
++      if (device->isp.nearest == NULL)
++         device->isp.nearest = device->pipe->create_sampler_state(device->pipe, &(struct pipe_sampler_state){
++            .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE, .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE, .wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
++            .min_img_filter = PIPE_TEX_FILTER_NEAREST, .mag_img_filter = PIPE_TEX_FILTER_NEAREST, .min_mip_filter = PIPE_TEX_MIPFILTER_NONE });
++#define P(dst, w, tex, c) (gb.out_w = (int32_t)(dst)->res->width0, gb.out_h = (int32_t)(dst)->res->height0, \
++                           e = e ? e : isp_pass(device, dst, f[w], tex, c, &gb, #w, why, sizeof(why)))
++      P(rows, ISP_NRG_ROWS, t_rows, 1); P(calm, ISP_NRG_CALM, t_calm, 2); P(moving, ISP_NRG_MOVING, t_moving, 2);
++      P(params, ISP_NRG_PARAMS, t_params, 1); P(st, ISP_NRG_STILL, t_still, 2);
++#undef P
++   }
++   if (e != 0 || rwa_texture_read(st, 0, 0, origin, size, got, 4 * (size_t)bw, why, sizeof(why)) != 0) {
++      fprintf(stderr, "FAILED %s: passes %d: %s\n", what, e, why);
++      failures++;
++   } else if (memcmp(want, got, 4 * (size_t)n) != 0) {
++      size_t bad = 0, first = 0;
++      for (size_t i = 0; i < 4 * (size_t)n; i++)
++         if (want[i] != got[i] && bad++ == 0)
++            first = i;
++      fprintf(stderr, "FAILED %s (%ux%u, level %d): %zu bytes differ, first at block %zu byte %zu: processor %u, GPU %u\n", what, bw, bh, level,
++              bad, first / 4, first % 4, want[first], got[first]);
++      failures++;
++   }
++   rwa_texture_destroy(dt); rwa_texture_destroy(rows); rwa_texture_destroy(calm); rwa_texture_destroy(moving);
++   rwa_texture_destroy(params); rwa_texture_destroy(st);
++   free(want); free(got);
++}
++
++int
++main(void)
++{
++   char why[512] = "", what[96];
++   static const uint32_t sizes[][2] = { { 17, 9 }, { 40, 30 }, { 81, 61 }, { 240, 135 } };
++
++   setenv("RWA_SOFTWARE", "1", 1);
++   struct rwa_isp *isp = rwa_isp_create(why, sizeof(why));
++   if (isp == NULL) {
++      fprintf(stderr, "FAILED: no context: %s\n", why);
++      return 1;
++   }
++   uint64_t lm, nm;
++   isp_nr_tie_masks(&lm, &nm);
++   printf("tie tables: limit %016llx, noise3 %016llx\n", (unsigned long long)lm, (unsigned long long)nm);
++   for (size_t z = 0; z < sizeof(sizes) / sizeof(sizes[0]); z++) {
++      uint32_t bw = sizes[z][0], bh = sizes[z][1], n = bw * bh;
++      uint8_t *d = malloc(n);
++      for (int level = 1; level <= 2; level++) {
++         /* uniform: mean v exactly (ties of both roundings at v = 5, 15, 25, ...; 2, 6, 10, ...), all moving above the limit */
++         for (unsigned v = 0; v <= 64; v++) {
++            memset(d, (int)v, n);
++            snprintf(what, sizeof(what), "uniform %u", v);
++            check(isp, d, bw, bh, level, what);
++         }
++         /* two values: a mean (10 L - 5) / 17 (limit tie) from 17 k blocks with sum 17 k * that ... built as a blocks of p and b of q */
++         for (unsigned L = 6; L <= 52 && n >= 17; L++) {
++            /* mean m = (10 L - 5) / 17: 17 blocks summing to 10 L - 5, repeated; the rest copies of that pattern */
++            for (uint32_t i = 0; i < n; i++) {
++               uint32_t k = i % 17, total = 10 * L - 5, base = total / 17, extra = total % 17;
++               d[i] = (uint8_t)(base + (k < extra ? 1 : 0));
++            }
++            snprintf(what, sizeof(what), "limit tie L=%u", L);
++            check(isp, d, bw, bh, level, what);
++         }
++         for (unsigned N = 1; N <= 44 && n >= 3; N++) {
++            for (uint32_t i = 0; i < n; i++) {
++               uint32_t k = i % 3, total = 4 * N - 2, base = total / 3, extra = total % 3;
++               d[i] = (uint8_t)(base + (k < extra ? 1 : 0));
++            }
++            snprintf(what, sizeof(what), "noise3 tie N=%u", N);
++            check(isp, d, bw, bh, level, what);
++         }
++         /* random: calm backgrounds with moving patches and outliers */
++         for (int r = 0; r < 24; r++) {
++            unsigned bg = rnd() % 40, spread = 1 + rnd() % 20;
++            for (uint32_t i = 0; i < n; i++) {
++               unsigned v = bg + rnd() % spread;
++               if (rnd() % 100 < (unsigned)r * 2)
++                  v = 40 + rnd() % 216;
++               d[i] = (uint8_t)(v > 255 ? 255 : v);
++            }
++            snprintf(what, sizeof(what), "random %d", r);
++            check(isp, d, bw, bh, level, what);
++         }
++      }
++      free(d);
++   }
++   rwa_isp_destroy(isp);
++   printf("isp_nrg_host_test: %d cases, %s\n", cases, failures ? "FAILED" : "every block's stillness and nears the processor's");
++   return failures != 0;
++}
+diff -ruN y2s72-libmerge3/src/pan-new-host-test.sh y2s75-libmerge4/lm5/src/pan-new-host-test.sh
+--- y2s72-libmerge3/src/pan-new-host-test.sh	2026-11-12 15:26:15.450670182 +0100
++++ y2s75-libmerge4/lm5/src/pan-new-host-test.sh	2026-11-12 16:02:01.623080845 +0100
+@@ -2,6 +2,7 @@
+ # y2s72: (1) the statistics (y2s65) and noise (y2s70) shaders through Panfrost's Valhall compiler for the Mali-G77, on the host, against an
+ # EXISTING host Mesa build (softpipe + panfrost), READ ONLY: this directory's translator objects and air_metal.c are built in $T.
+ # (2) isp_warm_host_test: the bounded wait for the shaders and the failure limit (air_isp.c isp_warm, isp_account) on softpipe.
++# (3) y2s75: isp_nrg_host_test: the noise's numbers on the GPU (air_isp.c isp_nrg_shader) against the processor's, on softpipe.
+ #   T=<empty scratch dir> [H=<host mesa build dir>] [TIMEOUT=s] bash pan-new-host-test.sh [shader index]
+ set -euo pipefail
+ G=$NORD2_WORK/gpu
+@@ -29,3 +30,7 @@
+ $CC -I$HERE -c $HERE/isp_warm_host_test.c -o warm.o
+ c++ -o isp_warm_host_test warm.o air_to_nir.c.o air_intrinsics.c.o -Wl,--start-group $A -Wl,--end-group -lm -lz -lpthread -ldl -ldrm
+ timeout 120 ./isp_warm_host_test
++# y2s75 libmerge4: with_before()'s numbers on the GPU against the processor's, every block (ties included)
++$CC -I$HERE -c $HERE/isp_nrg_host_test.c -o nrg.o
++c++ -o isp_nrg_host_test nrg.o air_to_nir.c.o air_intrinsics.c.o -Wl,--start-group $A -Wl,--end-group -lm -lz -lpthread -ldl -ldrm
++timeout 1200 ./isp_nrg_host_test
+diff -ruN y2s72-libmerge3/src/pan_compile_new_host_test.c y2s75-libmerge4/lm5/src/pan_compile_new_host_test.c
+--- y2s72-libmerge3/src/pan_compile_new_host_test.c	2026-11-12 15:18:47.382951852 +0100
++++ y2s75-libmerge4/lm5/src/pan_compile_new_host_test.c	2026-11-12 16:02:01.622672450 +0100
+@@ -56,6 +56,17 @@
+    if (only < 0 || only == 7) ok &= compile(isp_nr_copy_shader(options, 2), &screen, "nr copy c");
+    if (only < 0 || only == 8) ok &= compile(isp_stats_shader(options, 1), &screen, "isp stats, MIPI RAW10");
+    if (only < 0 || only == 9) ok &= compile(isp_stats_shader(options, 4), &screen, "isp stats, 40-bit words");
++   /* y2s75 libmerge4: the ISP shaders with the luma folded in (two outputs), the statistics' cells pass, the apply passes (two outputs, one
++    * stillness texel) */
++   if (only < 0 || only == 10) ok &= compile(isp_cells_shader(options, 1), &screen, "isp cells + Y, MIPI RAW10");
++   if (only < 0 || only == 11) ok &= compile(isp_cells_shader(options, 4), &screen, "isp cells + Y, 40-bit words");
++   if (only < 0 || only == 12) ok &= compile(isp_full_shader(options, 1), &screen, "isp full + Y, MIPI RAW10");
++   if (only < 0 || only == 13) ok &= compile(isp_full_shader(options, 4), &screen, "isp full + Y, 40-bit words");
++   if (only < 0 || only == 14) ok &= compile(isp_stats_cells_shader(options, 1), &screen, "isp stats cells, MIPI RAW10");
++   if (only < 0 || only == 15) ok &= compile(isp_stats_cells_shader(options, 4), &screen, "isp stats cells, 40-bit");
++   if (only < 0 || only == 16) ok &= compile(isp_chroma_shader(options), &screen, "isp chroma");
++   for (unsigned i = 0; i < ISP_NRG_COUNT; i++)
++      if (only < 0 || only == 17 + (int)i) ok &= compile(isp_nrg_shader(options, i), &screen, i == 0 ? "nrg rows" : i == 1 ? "nrg calm" : i == 2 ? "nrg moving" : i == 3 ? "nrg params" : "nrg still");
+    printf(ok ? "pan_compile_new_host_test: all compiled\n" : "pan_compile_new_host_test: FAILED\n");
+    return !ok;
+ }

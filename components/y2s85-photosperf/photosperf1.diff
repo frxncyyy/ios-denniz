@@ -1,0 +1,357 @@
+--- y2s85-photosperf/redwoodmetal.m.base	2026-11-12 22:36:37.798683898 +0100
++++ y2s85-photosperf/src/redwoodmetal.m	2026-11-12 22:39:11.808869941 +0100
+@@ -1445,6 +1445,105 @@
+ 	}
+ }
+ 
++/*
++ * y2s85 (photosperf): THE PHOTOS SCROLL'S COUNTERS, one compact record of three lines every 5 s in MobileSlideShow and backboardd,
++ * so that the same scenario (fbhw_scenario.py --scenarios photos) can be compared build against build:
++ *   NORD2 PERF PHOTOS A <proc> opt=<0|1> fps= fr= cb= lat=<avg>/<max>ms commit=<ms a buffer> drvcpu=<ms a second>
++ *   NORD2 PERF PHOTOS B <proc> conv= odd= cpu= same= frz= c/fr= rel=
++ *   NORD2 PERF PHOTOS C <proc> iostex=<n>/<ms>(max) buf=<n>/<ms> tex=<n>/<ms> comp=<n>/<ms> disp=<ms> skip=
++ * fr = command buffers that drew to a full-screen colour target (>= 1000x2000: the app's drawable, the window server's frame);
++ * lat = submit -> GPU fence of those (queue + GPU, the kernel's PRFCNT gives the GPU's busy time); commit = CPU in -commit;
++ * drvcpu = CPU of this driver a second (commits + iosurface textures + buffer/texture allocations); conv/odd/cpu = YCbCr
++ * conversions (GPU direct, GPU through the even padding + copy, CPU); same = uses that found the surface unchanged; frz = uses
++ * served frozen (thumbfix5); rel = frozen thumbnails whose planes import and padding picture were given back; iostex =
++ * -newTextureWithDescriptor:iosurface:plane:; comp = compute-only command buffers and their commit time, disp = time inside
++ * the library's dispatch call; skip = Photos diagnostic read-backs not made. Short lines: the kernel takes 256 KiB of driver
++ * text per connection (Nord2GPU SEL_LOG), which the thumbnail diagnostics used up in the first minute of run fbhwlive.
++ * Not while /var/db/nord2-metal/no-photosperf-log exists; the behaviour changes (opt=1) not while .../no-photosperf exists.
++ */
++static struct {
++	uint64_t frames, frame_ns, frame_max, compute_cb, compute_ns, dispatch_ns;
++	uint64_t conv_gpu, conv_odd, conv_cpu, conv_same, frozen_hits, released;
++	uint64_t iostex, iostex_ns, iostex_max, probe_skips;
++} rw_pp;
++
++#define RW_PP_ADD(field, v) ((void)__atomic_fetch_add(&rw_pp.field, (uint64_t)(v), __ATOMIC_RELAXED))
++
++static void
++rw_pp_max(uint64_t *field, uint64_t v)
++{
++	uint64_t cur = __atomic_load_n(field, __ATOMIC_RELAXED);
++
++	while (v > cur && !__atomic_compare_exchange_n(field, &cur, v, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
++	}
++}
++
++/* the behaviour changes of y2s85: MobileSlideShow only (where thumbfix5's freeze and the Photos probes run) */
++static bool
++rw_pp_opt(void)
++{
++	static int on = -1;
++
++	if (on < 0) {
++		on = strcmp(getprogname(), "MobileSlideShow") == 0 && access("/var/db/nord2-metal/no-photosperf", F_OK) != 0;
++	}
++	return on == 1;
++}
++
++static bool
++rw_pp_logs(void)
++{
++	static int on = -1;
++
++	if (on < 0) {
++		const char *n = getprogname();
++
++		on = (strcmp(n, "MobileSlideShow") == 0 || strcmp(n, "backboardd") == 0) &&
++		    access("/var/db/nord2-metal/no-photosperf-log", F_OK) != 0;
++	}
++	return on == 1;
++}
++
++/* the window's allocation and commit numbers come from rw_perf_tick's own copy of rw_perf (zeroed there) */
++static void
++rw_pp_tick(uint64_t commits, uint64_t commit_ns, uint64_t buf_made, uint64_t buf_ns, uint64_t tex_made, uint64_t tex_ns)
++{
++	uint64_t frames = __atomic_exchange_n(&rw_pp.frames, 0, __ATOMIC_RELAXED);
++	uint64_t frame_ns = __atomic_exchange_n(&rw_pp.frame_ns, 0, __ATOMIC_RELAXED);
++	uint64_t frame_max = __atomic_exchange_n(&rw_pp.frame_max, 0, __ATOMIC_RELAXED);
++	uint64_t compute_cb = __atomic_exchange_n(&rw_pp.compute_cb, 0, __ATOMIC_RELAXED);
++	uint64_t compute_ns = __atomic_exchange_n(&rw_pp.compute_ns, 0, __ATOMIC_RELAXED);
++	uint64_t dispatch_ns = __atomic_exchange_n(&rw_pp.dispatch_ns, 0, __ATOMIC_RELAXED);
++	uint64_t conv_gpu = __atomic_exchange_n(&rw_pp.conv_gpu, 0, __ATOMIC_RELAXED);
++	uint64_t conv_odd = __atomic_exchange_n(&rw_pp.conv_odd, 0, __ATOMIC_RELAXED);
++	uint64_t conv_cpu = __atomic_exchange_n(&rw_pp.conv_cpu, 0, __ATOMIC_RELAXED);
++	uint64_t conv_same = __atomic_exchange_n(&rw_pp.conv_same, 0, __ATOMIC_RELAXED);
++	uint64_t frozen_hits = __atomic_exchange_n(&rw_pp.frozen_hits, 0, __ATOMIC_RELAXED);
++	uint64_t released = __atomic_exchange_n(&rw_pp.released, 0, __ATOMIC_RELAXED);
++	uint64_t iostex = __atomic_exchange_n(&rw_pp.iostex, 0, __ATOMIC_RELAXED);
++	uint64_t iostex_ns = __atomic_exchange_n(&rw_pp.iostex_ns, 0, __ATOMIC_RELAXED);
++	uint64_t iostex_max = __atomic_exchange_n(&rw_pp.iostex_max, 0, __ATOMIC_RELAXED);
++	uint64_t probe_skips = __atomic_exchange_n(&rw_pp.probe_skips, 0, __ATOMIC_RELAXED);
++	uint64_t conv = conv_gpu + conv_odd + conv_cpu;
++
++	if (!rw_pp_logs() || (commits == 0 && frames == 0 && conv == 0 && iostex == 0)) {
++		return;
++	}
++	const char *n = getprogname();
++	int opt = rw_pp_opt() ? 1 : 0;
++
++	m2m_log('I', "PERF", "NORD2 PERF PHOTOS A %.12s opt=%d fps=%.1f fr=%llu cb=%llu lat=%.2f/%.1fms commit=%.2fms drvcpu=%.1fms/s\n", n, opt,
++	    frames / 5.0, (unsigned long long)frames, (unsigned long long)commits, frames ? frame_ns / 1e6 / frames : 0.0, frame_max / 1e6,
++	    commits ? commit_ns / 1e6 / commits : 0.0, (commit_ns + iostex_ns + buf_ns + tex_ns) / 5e6);
++	m2m_log('I', "PERF", "NORD2 PERF PHOTOS B %.12s conv=%llu odd=%llu cpu=%llu same=%llu frz=%llu c/fr=%.2f rel=%llu\n", n,
++	    (unsigned long long)conv_gpu, (unsigned long long)conv_odd, (unsigned long long)conv_cpu, (unsigned long long)conv_same,
++	    (unsigned long long)frozen_hits, frames ? (double)conv / frames : 0.0, (unsigned long long)released);
++	m2m_log('I', "PERF", "NORD2 PERF PHOTOS C %.12s iostex=%llu/%.1fms(max %.1f) buf=%llu/%.1fms tex=%llu/%.1fms comp=%llu/%.1fms disp=%.1fms "
++	    "skip=%llu\n", n, (unsigned long long)iostex, iostex_ns / 1e6, iostex_max / 1e6, (unsigned long long)buf_made, buf_ns / 1e6,
++	    (unsigned long long)tex_made, tex_ns / 1e6, (unsigned long long)compute_cb, compute_ns / 1e6, dispatch_ns / 1e6,
++	    (unsigned long long)probe_skips);
++}
++
+ /* every 5 s (rw_stats_install's timer): what the last 5 s cost, if anything was drawn */
+ static void
+ rw_perf_tick(void)
+@@ -1453,6 +1552,9 @@
+ 	typeof(rw_perf) p = rw_perf;
+ 
+ 	memset(&rw_perf, 0, sizeof(rw_perf));
++	pthread_mutex_unlock(&rw_stats_lock);
++	rw_pp_tick(p.commits, p.commit_ns, p.buf_made, p.buf_ns, p.tex_made, p.tex_ns);   /* y2s85 */
++	pthread_mutex_lock(&rw_stats_lock);
+ 	if (p.commits == 0 && p.compiles == 0) {
+ 		rw_tex_shapes_used = 0;   /* (a window that drew nothing says nothing, shapes included) */
+ 		rw_tex_shapes_other = 0;
+@@ -3190,6 +3292,7 @@
+ 	uint64_t _convertedAt;     /* y2s60: when the conversion was set up (the young-texture rule of -redwoodRefreshConverted) */
+ 	BOOL _frozen;              /* y2s83: (MobileSlideShow) converted from a finished picture: not converted again */
+ 	unsigned _freezeTries;     /* y2s83: conversions made while the picture was not finished */
++	BOOL _ppReady;             /* y2s85: the frozen conversion has been queued: its planes import and padding picture may go */
+ 	BOOL _raw540;
+ 	struct rwa_texture *_padTmp;   /* y2s63: the even-sized RGB picture an odd-sized surface is converted into (then copied) */
+ 	BOOL _padded;              /* y2s59: ... NOT converted: _texture is RGBA8 holding Cr, Y, Cb raw (format 540's channels, metal_view_swizzle) */
+@@ -4987,7 +5090,8 @@
+  * CoreAnimation does not test what it gets back, so a bare nil becomes a CAMetalDrawable
+  * whose -texture is nil, and the application finds out later and somewhere else.
+  */
+-- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(void *)s plane:(NSUInteger)p
++/* y2s85: the body of -newTextureWithDescriptor:iosurface:plane: (below, which times it for NORD2 PERF PHOTOS) */
++- (id)redwoodNewTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(void *)s plane:(NSUInteger)p
+ {
+ 	char why[512] = { 0 };
+ 	struct rwd_surface took;
+@@ -5204,6 +5308,17 @@
+ 	[made redwoodSetIOSurface:s plane:p];
+ 	return made;
+ }
++- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(void *)s plane:(NSUInteger)p
++{
++	uint64_t t0 = rw_now_ns();
++	id made = [self redwoodNewTextureWithDescriptor:d iosurface:s plane:p];
++	uint64_t ns = rw_now_ns() - t0;
++
++	RW_PP_ADD(iostex, 1);
++	RW_PP_ADD(iostex_ns, ns);
++	rw_pp_max(&rw_pp.iostex_max, ns);
++	return made;
++}
+ - (id)newBufferWithIOSurface:(void *)surface        { (void)surface; return nil; }
+ - (id)newBufferWithBytesNoCopy:(void *)bytes
+ 			length:(NSUInteger)length
+@@ -5980,6 +6095,47 @@
+ 	return [self redwoodConvertSurface];
+ }
+ 
++/*
++ * y2s85 (photosperf): A FROZEN THUMBNAIL GIVES ITS SOURCES BACK. Once thumbfix5 has frozen a converted texture (its picture was
++ * finished, or 3 s old) it is never converted again, so the in-place import of its two planes (a GPU mapping of the other process's
++ * surface: a handle, its page-table entries) and, for an odd-sized surface, the even-sized padding picture (376x668 BGRA, 1 MiB)
++ * are dead weight for the texture's whole life -- the grid keeps hundreds of them. They are destroyed at the first use after the
++ * frozen conversion was queued (_ppReady); the GPU work already queued keeps its own references (Gallium/Panfrost batches hold the
++ * resources and BOs, the kernel keeps a busy BO's backing). MobileSlideShow only; not while /var/db/nord2-metal/no-photosperf exists.
++ */
++static pthread_mutex_t rw_pp_release_lock = PTHREAD_MUTEX_INITIALIZER;
++
++- (void)redwoodPPReleaseSources
++{
++	if (!rw_pp_opt()) {
++		return;
++	}
++	pthread_mutex_lock(&rw_pp_release_lock);
++	if (_ppReady && _frozen && (_ycbcrSource != NULL || _padTmp != NULL)) {
++		if (_ycbcrSource != NULL) {
++			mesa.texture_destroy(_ycbcrSource);
++			_ycbcrSource = NULL;
++		}
++		if (_padTmp != NULL) {
++			mesa.texture_destroy(_padTmp);
++			_padTmp = NULL;
++		}
++		_padded = NO;
++		RW_PP_ADD(released, 1);
++	}
++	_ppReady = NO;
++	pthread_mutex_unlock(&rw_pp_release_lock);
++}
++
++- (void)redwoodPPConverted
++{
++	if (_frozen && rw_pp_opt()) {
++		pthread_mutex_lock(&rw_pp_release_lock);
++		_ppReady = YES;
++		pthread_mutex_unlock(&rw_pp_release_lock);
++	}
++}
++
+ /* The surface's two planes into _texture as BGRA, when the surface's seed or a few of its bytes say it changed. One scratch picture for
+  * the process, under a lock (the conversions of a frame come one after the other anyway); a large one is given back at once. */
+ - (BOOL)redwoodRefreshConverted
+@@ -6017,6 +6173,10 @@
+ 	 * every use converts again (the young rule's GPU pass); after 3 s the picture is taken as it is (a photo that is black indeed).
+ 	 */
+ 	if (freeze_rule == 1 && _frozen && _ycbcr) {
++		RW_PP_ADD(frozen_hits, 1);              /* y2s85 */
++		if (_ppReady) {
++			[self redwoodPPReleaseSources];
++		}
+ 		return YES;
+ 	}
+ 	BOOL freeze_now = NO, unfinished = NO;
+@@ -6072,6 +6232,7 @@
+ 	BOOL young = young_rule == 1 && _ycbcrSource != NULL && _convertedAt != 0 && rw_now_ns() - _convertedAt < 3000000000ULL;
+ 
+ 	if (_copiedOnce && seed == _copySeed && probe_now == _ycbcrProbe && !young && !unfinished && !freeze_now) {
++		RW_PP_ADD(conv_same, 1);                /* y2s85 */
+ 		return YES;
+ 	}
+ 	if (freeze_now) {
+@@ -6102,13 +6263,19 @@
+ 		_ycbcrSource = NULL;
+ 		_padded = NO;
+ 	}
+-	if (_ycbcrSource != NULL && (flush_rule == 1 || rw_is_photos()) && rw_ios.lock(_iosurface, 1, NULL) == 0) {
++	/* y2s85: the cpu-view diagnostic (a lock and unlock of the surface at every conversion, logged or not) not in photosperf */
++	BOOL pp_view = rw_is_photos() && !rw_pp_opt();
++
++	if (rw_is_photos() && rw_pp_opt() && _ycbcrSource != NULL && flush_rule != 1) {
++		RW_PP_ADD(probe_skips, 1);
++	}
++	if (_ycbcrSource != NULL && (flush_rule == 1 || pp_view) && rw_ios.lock(_iosurface, 1, NULL) == 0) {
+ 		struct rw_ycbcr_planes cv;
+ 
+ 		if (flush_rule == 1 && rw_ios.base(_iosurface) != NULL) {
+ 			dcache_flush((void *)rw_ios.base(_iosurface), rw_ios.alloc(_iosurface));
+ 		}
+-		if (rw_is_photos() && rw_ycbcr_planes_of(_iosurface, &cv) && cv.width == planes.width && cv.height == planes.height) {
++		if (pp_view && rw_ycbcr_planes_of(_iosurface, &cv) && cv.width == planes.width && cv.height == planes.height) {
+ 			static unsigned long views;
+ 			unsigned long k = __sync_add_and_fetch(&views, 1);
+ 
+@@ -6165,6 +6332,12 @@
+ 			_copySeed = seed;
+ 			_ycbcrProbe = probe_now;
+ 			_copiedOnce = YES;
++			if (_padded) {                  /* y2s85 */
++				RW_PP_ADD(conv_odd, 1);
++			} else {
++				RW_PP_ADD(conv_gpu, 1);
++			}
++			[self redwoodPPConverted];
+ 			if (__sync_fetch_and_add(&said_gpu, 1) < 8) {
+ 				m2m_log('I', "SURF", "YCbCr surface %u (%ux%u '%c%c%c%c') is served as RGB: converted on the GPU from its two "
+ 				    "planes in place, %s matrix, %s range; the pass took %.3f ms to queue (no pixel touched by the CPU)\n",
+@@ -6230,6 +6403,8 @@
+ 				_copySeed = seed;
+ 				_ycbcrProbe = probe;
+ 				_copiedOnce = YES;
++				RW_PP_ADD(conv_cpu, 1);         /* y2s85 */
++				[self redwoodPPConverted];
+ 			}
+ 			if (ok && __sync_fetch_and_add(&said, 1) < 8) {
+ 				uint64_t t_end = rw_now_ns();
+@@ -7568,6 +7743,7 @@
+ 	dispatch_group_t _inflight;     /* entered at an asynchronous -commit, left once its fence is paid */
+ 	NSMutableArray *_writeBack;     /* y2s58: copied planes a dispatch of this buffer may write (-redwoodWriteBack at completion) */
+ 	id _photosTarget;               /* y2s59: (MobileSlideShow) the full-screen colour target this buffer drew to, probed at completion */
++	BOOL _ppFrame;                  /* y2s85: drew to a full-screen colour target (a frame, for NORD2 PERF PHOTOS) */
+ 	unsigned _photosDraws;
+ 	NSMutableArray *_photosTex;     /* y2s60: the distinct textures those draws sampled (up to 12) */
+ }
+@@ -7722,6 +7898,14 @@
+ 		}
+ 		/* "GPU wait" is the fence alone: from when this completion's turn came to the fence */
+ 		signalled = rw_now_ns();
++		if (_ppFrame) {                 /* y2s85: submit -> fence of a frame (queue + GPU) */
++			RW_PP_ADD(frames, 1);
++			RW_PP_ADD(frame_ns, signalled - submitted);
++			rw_pp_max(&rw_pp.frame_max, signalled - submitted);
++			if (rw_is_photos() && rw_pp_opt()) {
++				RW_PP_ADD(probe_skips, 1);
++			}
++		}
+ 		pthread_mutex_lock(&rw_stats_lock);
+ 		rw_perf.wait_ns += signalled - started;
+ 		rw_perf.wait_max = MAX(rw_perf.wait_max, signalled - started);
+@@ -7973,6 +8157,7 @@
+ 
+ 	BOOL queued = NO, trace = NO;
+ 	uint64_t t_start = rw_now_ns(), t_wait = 0, draws = 0;
++	uint64_t pp_dispatches = 0;     /* y2s85: dispatches of this buffer (a compute-only buffer for NORD2 PERF PHOTOS) */
+ 	/* (rw_commit_report) what this commit is made of, in CoreAnimation's labels */
+ 	const char *top[RW_TOP] = { NULL };
+ 	unsigned topn[RW_TOP] = { 0 }, ntop = 0;
+@@ -8049,8 +8234,15 @@
+ 		}
+ 		if (work->render != nil) {
+ 			draws++;
+-			/* y2s59: the Photos grid's frames, probed after completion (rw_photos_probe) */
+-			if (rw_is_photos() && work->colorCount > 0 && work->color[0] != nil && [work->color[0] width] >= 1000 &&
++			/* y2s85: a frame for NORD2 PERF PHOTOS = a buffer that draws to a full-screen colour target */
++			if (!_ppFrame && work->colorCount > 0 && work->color[0] != nil && [work->color[0] width] >= 1000 &&
++			    [work->color[0] height] >= 2000) {
++				_ppFrame = YES;
++			}
++			/* y2s59: the Photos grid's frames, probed after completion (rw_photos_probe); y2s85: not in photosperf (the probe's
++			 * read-backs -- up to 12 textures, each a conversion and a GPU wait -- ran on the fence queue ahead of the frame's
++			 * completed handlers, which give CoreAnimation its drawable back) */
++			if (rw_is_photos() && !rw_pp_opt() && work->colorCount > 0 && work->color[0] != nil && [work->color[0] width] >= 1000 &&
+ 			    [work->color[0] height] >= 2000) {
+ 				if (_photosTarget != work->color[0]) {
+ 					[_photosTarget release];
+@@ -8135,12 +8327,15 @@
+ 		 * through rwa_dispatch, and then a kernel with a set is refused by name
+ 		 * there and every offset is read as zero -- which is what an older library
+ 		 * did with one in any case, out loud. */
++		uint64_t t_disp = rw_now_ns();   /* y2s85 */
+ 		int rc = mesa.dispatch_buffers != NULL
+ 			    ? mesa.dispatch_buffers([work->pipeline compute], &bindings,
+ 						    table, work->count, work->groups,
+ 						    work->size, why, sizeof(why))
+ 			    : mesa.dispatch([work->pipeline compute], &bindings, work->groups,
+ 					    work->size, why, sizeof(why));
++		RW_PP_ADD(dispatch_ns, rw_now_ns() - t_disp);
++		pp_dispatches++;
+ 		if (rc != 0) {
+ 			m2m_log('E', "CMD", "the dispatch failed: %s\n", why);
+ 			_error = [[NSError errorWithDomain:@"RedwoodMetal" code:2
+@@ -8162,6 +8357,10 @@
+ 		uint64_t t_end = rw_now_ns();
+ 
+ 		rw_commit_report(draws, t_end - t_start, 0, top, topn, ntop);
++		if (draws == 0 && pp_dispatches != 0) {          /* y2s85 */
++			RW_PP_ADD(compute_cb, 1);
++			RW_PP_ADD(compute_ns, t_end - t_start);
++		}
+ 		_status = RW_CB_SCHEDULED;
+ 		[self redwoodMaybeSnap];
+ 		[self redwoodReturnSlot];
+@@ -8180,6 +8379,15 @@
+ 		uint64_t t_end = rw_now_ns();
+ 
+ 		rw_commit_report(draws, t_end - t_start, t_end - t_wait, top, topn, ntop);
++		if (draws == 0 && pp_dispatches != 0) {          /* y2s85 */
++			RW_PP_ADD(compute_cb, 1);
++			RW_PP_ADD(compute_ns, t_end - t_start);
++		}
++		if (_ppFrame) {                                  /* y2s85: synchronous: the wait is the frame's GPU time */
++			RW_PP_ADD(frames, 1);
++			RW_PP_ADD(frame_ns, t_end - t_wait);
++			rw_pp_max(&rw_pp.frame_max, t_end - t_wait);
++		}
+ 	}
+ 	if (_status != RW_CB_ERROR) {
+ 		_status = RW_CB_SCHEDULED;   /* submitted; the fence below is what makes it completed */

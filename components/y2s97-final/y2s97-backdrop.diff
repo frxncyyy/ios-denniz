@@ -1,0 +1,1375 @@
+diff -ruN base-src-y2s96/air_metal.c src/air_metal.c
+--- base-src-y2s96/air_metal.c	2026-11-13 13:47:00.492544678 +0100
++++ src/air_metal.c	2026-11-13 16:33:28.832339502 +0100
+@@ -100,6 +100,8 @@
+ void rwa_fb_forget(struct pipe_resource *res, bool table);
+ void rwa_fb_counters(uint64_t out[16]);
+ void rwa_fb_count(unsigned which, unsigned n);
++bool rwa_fb_discard_level(struct pipe_context *pipe, struct pipe_resource *res, unsigned level);   /* y2s97 */
++void rwa_fb_discard_undo(struct pipe_resource *res, unsigned level);
+ #define RWA_FB_READ(res)   rwa_fb_note_read(res)
+ #define RWA_FB_SHARED(res) rwa_fb_note_shared(res)
+ #define RWA_FB_FORGET(res, table) rwa_fb_forget((res), (table))
+@@ -6788,6 +6790,43 @@
+    return 0;
+ }
+ 
++/*
++ * y2s97 (backdrop rename, redwoodmetal.m rw_bdr_*): the copy that puts the renamed capture back into the screen. It overwrites
++ * every texel of dst's level 0, so -- when it is a GPU blit (the same test as rwa_texture_copy's) -- dst is not preloaded:
++ * rwa_fb_discard_level flushes whatever batch still uses dst and clears its valid bit; the blit's own submit sets it again
++ * (emit_fragment_job), and rwa_fb_flushed / rwa_fb_note_read count a bit found still clear as a violation and set it back.
++ */
++int
++rwa_texture_copy_whole(struct rwa_texture *dst, struct rwa_texture *src, char *why, size_t why_size)
++{
++   RWA_GUARD();
++   static const unsigned zero[3] = { 0, 0, 0 };
++
++   if (!dst || !src) {
++      say(why, why_size, "a whole copy with no %s texture", dst ? "source" : "destination");
++      return -1;
++   }
++   struct pipe_resource *d = dst->res, *s = src->res;
++   const unsigned size[3] = { d->width0, d->height0, 1 };
++   bool discarded = false;
++#ifdef GALLIUM_PANFROST
++   struct pipe_screen *screen = dst->device->screen;
++   enum pipe_format f = src->format;
++   if (!dst->is_view && !src->is_view && f == dst->format && d->width0 == s->width0 && d->height0 == s->height0 &&
++       d->depth0 == 1 && d->array_size == 1 && d->nr_samples <= 1 && d->target == PIPE_TEXTURE_2D &&
++       util_format_get_num_planes(f) == 1 && !util_format_is_depth_or_stencil(f) &&
++       screen->is_format_supported(screen, f, d->target, d->nr_samples, d->nr_storage_samples, PIPE_BIND_RENDER_TARGET) &&
++       screen->is_format_supported(screen, f, s->target, s->nr_samples, s->nr_storage_samples, PIPE_BIND_SAMPLER_VIEW))
++      discarded = rwa_fb_discard_level(dst->device->pipe, d, 0);
++#endif
++   int rc = rwa_texture_copy(dst, 0, 0, zero, src, 0, 0, zero, size, why, why_size);
++#ifdef GALLIUM_PANFROST
++   if (rc != 0 && discarded)
++      rwa_fb_discard_undo(d, 0);
++#endif
++   return rc;
++}
++
+ int
+ rwa_buffer_copy(struct rwa_buffer *dst, size_t dst_offset, struct rwa_buffer *src,
+                 size_t src_offset, size_t size, char *why, size_t why_size)
+diff -ruN base-src-y2s96/air_metal.h src/air_metal.h
+--- base-src-y2s96/air_metal.h	2026-11-13 13:41:40.458739695 +0100
++++ src/air_metal.h	2026-11-13 16:33:28.812339911 +0100
+@@ -1432,7 +1432,7 @@
+ 
+ /* y2s96: the rt1 counters since load (rwa_pan_fb.c): 0 rt1 drawn, 1 preload avoided, 2 store discarded, 3 restored,
+  * 4 violations, 5 ext discarded, 6 ext violations, 7 single-target draws, 8 single-target refused, 9 batches not seen from
+- * the start, 10 ext table full, 11 single-target clears. */
++ * the start, 10 ext table full, 11 single-target clears; y2s97: 12 backdrop discards, 13 discards undone, 14 backdrop violations. */
+ void rwa_fb_stats(uint64_t out[16]);
+ 
+ /* A pass that clears and draws nothing: the attachments, clear values and `deferred` of
+@@ -1446,6 +1446,11 @@
+ 		     const unsigned dst_origin[3], struct rwa_texture *src, unsigned src_level,
+ 		     unsigned src_slice, const unsigned src_origin[3], const unsigned size[3],
+ 		     char *why, size_t why_size);
++/* y2s97 (backdrop rename): `src` copied over the WHOLE of `dst` (level 0, slice 0; same format and size). When the copy is a
++ * GPU blit, dst's valid bit is cleared first (nothing of dst is preloaded: every texel is written); the bit is set again by
++ * the copy's own submit, and rwa_pan_fb.c counts any bit found still clear (rwa_fb_stats 12 discards, 13 undone, 14 violations).
++ * Anything else: a plain rwa_texture_copy. 0, or -1 and a sentence. */
++int rwa_texture_copy_whole(struct rwa_texture *dst, struct rwa_texture *src, char *why, size_t why_size);
+ int rwa_buffer_copy(struct rwa_buffer *dst, size_t dst_offset, struct rwa_buffer *src,
+ 		    size_t src_offset, size_t size, char *why, size_t why_size);
+ int rwa_buffer_fill(struct rwa_buffer *dst, size_t offset, size_t size, unsigned value,
+diff -ruN base-src-y2s96/redwoodmetal.m src/redwoodmetal.m
+--- base-src-y2s96/redwoodmetal.m	2026-11-13 13:58:55.464510118 +0100
++++ src/redwoodmetal.m	2026-11-13 16:43:50.090005757 +0100
+@@ -2455,6 +2455,7 @@
+ 	BOOL _kept;        /* (y2s55) _compute is one of rw_compute_kept's: not this object's to destroy */
+ }
+ - (void)redwoodDoesNotOwnCompute;
++- (BOOL)redwoodHasArgbuf;               /* (y2s97) the kernel declares argument buffers */
+ @end
+ 
+ /* y2s55: the compute kernels made once and used by every pipeline that asks for the same (see -pipelineForFunction:...) */
+@@ -2542,6 +2543,7 @@
+ - (unsigned)vertexStreamMask;
+ - (unsigned)vertexStreamCount;
+ - (unsigned)colorWriteMasks;            /* (y2s96) the library's write mask, four bits per attachment */
++- (BOOL)redwoodHasArgbuf;               /* (y2s97) a stage declares argument buffers */
+ - (unsigned)fragmentTextureCount;       /* (y2s54) how many texture slots the fragment function reads: the highest index + 1 */
+ - (unsigned)fragmentBufferCount;        /* (y2s55) and buffer slots */
+ /* And the element array the compiler library built out of the descriptor and the module's
+@@ -3188,6 +3190,10 @@
+ 	unsigned loads[8], stores[8];
+ 	BOOL lastOfPass;
+ 	unsigned dropMask;
++	/* y2s97 (backdrop rename): a texture-to-texture copy's two textures (held by its block, not retained here) and whether it
++	 * copies the whole of level 0 / slice 0 of both */
++	BOOL texCopy, copyFull;
++	id copySrc, copyDst;
+ }
+ - (void)redwoodRetainReferences;
+ @end
+@@ -3899,6 +3905,9 @@
+ - (void)redwoodTGRunCheck:(unsigned long)k gen:(uint64_t)gen seed:(uint32_t)seed probe:(uint32_t)probe;
+ - (BOOL)redwoodTGPark;
+ - (RedwoodMetalTexture *)redwoodTGTargetRoot;
++/* (y2s97) a plain single-sample 2D texture of one level and one slice that is its own memory: not a view, not over a buffer, not a
++ * copy or conversion of a surface; with `surface` NO, not over an IOSurface either */
++- (BOOL)redwoodBackdropPlain:(BOOL)surface;
+ /* Not part of MTLTexture: the depth or stencil aspect of this texture, one float and one
+  * byte per texel. Metal's own -getBytes: has no aspect to name and the compiler library
+  * refuses a depth texture through it by name, so a caller that wants to know what a depth
+@@ -4724,6 +4733,325 @@
+ }
+ 
+ /*
++ * y2s97 (backdrop capture rename). Switches in /var/db/nord2-metal/, read once per process:
++ *   (none)            DRY RUN: every command buffer is matched (rw_backdrop_pure.h) and counted, nothing is changed
++ *   backdrop-rename   the matches are rewritten: the screen's passes before the capture draw into the capture B instead, the
++ *                     whole-surface copy S -> B is dropped, and one whole copy B -> S (S not preloaded) goes right before the
++ *                     pass that Loads S again
++ *   no-backdrop       nothing at all (not even matched)
++ * Lines: once per process 'NORD2 GPU BACKDROP: pid= name= config ...'; the first match and the first 6 rejections of a process
++ * with their step numbers; every 5 s while anything moved 'NORD2 GPU BACKDROP: pid= name= renamed=N would rename=M cbs=..
++ * candidates=.. | rejected partial=.. ... | discards=.. undone=.. violations=..' (discards/undone/violations: the library's
++ * valid-bit guard of the B -> S copy, rwa_pan_fb.c; violations must stay 0).
++ */
++#include "rw_backdrop_pure.h"
++
++static void rw_tex_desc(id t, char *out, size_t n);
++
++static const char *const rw_bdr_reason[RWB_R_N] = {
++	"partial", "shape", "b-shared", "first-not-clear", "s-used", "b-used", "opaque", "later-not-load", "no-later-use",
++	"b-written", "argbuf", "table", "lib"
++};
++static struct {
++	int mode;   /* 1 rename, 0 dry run, -1 off */
++	int (*copy_whole)(struct rwa_texture *dst, struct rwa_texture *src, char *why, size_t why_size);
++	uint64_t cbs, candidates, would, renamed, rej[RWB_R_N];
++	unsigned said;
++} rw_bdr;
++
++static void
++rw_bdr_init(void)
++{
++	static dispatch_once_t once;
++
++	dispatch_once(&once, ^{
++		BOOL off = access("/var/db/nord2-metal/no-backdrop", F_OK) == 0;
++		BOOL on = access("/var/db/nord2-metal/backdrop-rename", F_OK) == 0;
++
++		rw_bdr.mode = off ? -1 : on ? 1 : 0;
++		if (mesa.handle != NULL) {
++			*(void **)&rw_bdr.copy_whole = dlsym(mesa.handle, "rwa_texture_copy_whole");
++		}
++		m2m_log('I', "FB", "NORD2 GPU BACKDROP: pid=%d name=%s config %s (backdrop-rename %d, no-backdrop %d) library %s\n", getpid(),
++		    getprogname(), off ? "OFF" : on ? "rename ON" : "DRY-RUN (count only)", on, off,
++		    rw_bdr.copy_whole != NULL ? "y2s97 (whole copy without preload)" : "older (no rwa_texture_copy_whole: no rename)");
++	});
++}
++
++/* one identity per memory: a view counts as its root, a texture over a surface or buffer as that surface or buffer */
++static void *
++rw_bdr_key(id t)
++{
++	if (t == nil) {
++		return NULL;
++	}
++	if (![t isKindOfClass:[RedwoodMetalTexture class]]) {
++		return (void *)t;
++	}
++	id root = t;
++
++	while ([root parentTexture] != nil) {
++		root = [root parentTexture];
++	}
++	if ([root iosurface] != nil) {
++		return (void *)[root iosurface];
++	}
++	if ([root buffer] != nil) {
++		return (void *)[root buffer];
++	}
++	return (void *)root;
++}
++
++#define RWB_IDS 256
++#define RWB_STEPS 768
++struct rw_bdr_ids {
++	void *key[RWB_IDS];
++	unsigned n;
++	BOOL full;
++};
++
++static int
++rw_bdr_id(struct rw_bdr_ids *ids, id t)
++{
++	void *k = rw_bdr_key(t);
++
++	if (k == NULL) {
++		return -1;
++	}
++	for (unsigned i = 0; i < ids->n; i++) {
++		if (ids->key[i] == k) {
++			return (int)i;
++		}
++	}
++	if (ids->n == RWB_IDS) {
++		ids->full = YES;
++		return -1;
++	}
++	ids->key[ids->n] = k;
++	return (int)ids->n++;
++}
++
++static BOOL
++rw_bdr_plain(id t, BOOL surface)
++{
++	return [t isKindOfClass:[RedwoodMetalTexture class]] && [(RedwoodMetalTexture *)t redwoodBackdropPlain:surface];
++}
++
++static void
++rw_bdr_say(const char *what, NSArray *works, unsigned f, unsigned k, unsigned l, unsigned n)
++{
++	char a[64] = "?", b[64] = "?";
++
++	if (k < [works count]) {
++		RedwoodMetalWork *c = works[k];
++
++		rw_tex_desc(c->copySrc, a, sizeof(a));
++		rw_tex_desc(c->copyDst, b, sizeof(b));
++	}
++	m2m_log('I', "FB", "NORD2 GPU BACKDROP: pid=%d name=%s %s: steps first %u copy %u load %u of %u, S %s -> B %s\n", getpid(),
++	    getprogname(), what, f, k, l, n, a, b);
++}
++
++static void
++rw_bdr_report_maybe(void)
++{
++	static uint64_t last, prev_sum;
++	static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
++	uint64_t now = rw_now_ns(), c[16] = { 0 }, sum = 0;
++
++	if (now - last < 5000000000ULL || pthread_mutex_trylock(&lk) != 0) {
++		return;
++	}
++	if (now - last < 5000000000ULL) {
++		pthread_mutex_unlock(&lk);
++		return;
++	}
++	last = now;
++	if (rw_fb.stats != NULL) {
++		rw_fb.stats(c);
++	}
++	sum = rw_bdr.cbs + rw_bdr.candidates + c[12] + c[13] + c[14];
++	if (sum != prev_sum) {
++		char r[400];
++		size_t at = 0;
++
++		r[0] = 0;
++		for (unsigned i = 0; i < RWB_R_N; i++) {
++			at += (size_t)snprintf(r + at, at < sizeof(r) ? sizeof(r) - at : 0, " %s=%llu", rw_bdr_reason[i],
++			    (unsigned long long)rw_bdr.rej[i]);
++		}
++		m2m_log('I', "FB", "NORD2 GPU BACKDROP: pid=%d name=%s renamed=%llu would rename=%llu cbs=%llu candidates=%llu | rejected%s | "
++		    "discards=%llu undone=%llu violations=%llu (%s)\n", getpid(), getprogname(), (unsigned long long)rw_bdr.renamed,
++		    (unsigned long long)rw_bdr.would, (unsigned long long)rw_bdr.cbs, (unsigned long long)rw_bdr.candidates, r,
++		    (unsigned long long)c[12], (unsigned long long)c[13], (unsigned long long)c[14],
++		    rw_bdr.mode > 0 ? "rename ON" : "DRY-RUN");
++		prev_sum = sum;
++	}
++	pthread_mutex_unlock(&lk);
++}
++
++static void
++rw_bdr_commit(NSMutableArray *works)
++{
++	rw_bdr_init();
++	rw_fb_init();   /* (rw_fb.stats for the report) */
++	if (rw_bdr.mode < 0) {
++		return;
++	}
++	rw_bdr_report_maybe();
++	unsigned n = (unsigned)[works count], i;
++	BOOL any = NO;
++
++	for (RedwoodMetalWork *w in works) {
++		if (w->blit != nil && w->texCopy) {
++			any = YES;
++			break;
++		}
++	}
++	if (!any) {
++		return;
++	}
++	__sync_add_and_fetch(&rw_bdr.cbs, 1);
++	if (n > RWB_STEPS) {
++		__sync_add_and_fetch(&rw_bdr.rej[RWB_R_TABLE], 1);
++		return;
++	}
++	struct rwb_step *st = calloc(n, sizeof(*st));
++	struct rw_bdr_ids *ids = calloc(1, sizeof(*ids));
++	BOOL table = NO;
++
++	if (st == NULL || ids == NULL) {
++		free(st);
++		free(ids);
++		return;
++	}
++	for (i = 0; i < n; i++) {
++		RedwoodMetalWork *w = works[i];
++		struct rwb_step *s = &st[i];
++
++		s->depth = s->src = s->dst = -1;
++		for (unsigned j = 0; j < 8; j++) {
++			s->color[j] = -1;
++		}
++		for (unsigned j = 0; j < RWB_TEX; j++) {
++			s->tex[j] = -1;
++		}
++		if (w->blit != nil) {
++			if (!w->texCopy) {
++				s->kind = RWB_OPAQUE;
++				continue;
++			}
++			s->kind = RWB_COPY;
++			s->src = rw_bdr_id(ids, w->copySrc);
++			s->dst = rw_bdr_id(ids, w->copyDst);
++			s->copy_full = w->copyFull;
++			s->copy_shape = rw_bdr_plain(w->copySrc, YES) && rw_bdr_plain(w->copyDst, YES) &&
++			    [w->copySrc pixelFormat] == [w->copyDst pixelFormat] && [w->copySrc width] == [w->copyDst width] &&
++			    [w->copySrc height] == [w->copyDst height];
++			s->copy_bok = rw_bdr_plain(w->copyDst, NO);
++			continue;
++		}
++		if (w->render != nil || w->clearOnly) {
++			s->kind = w->render != nil ? RWB_DRAW : RWB_CLEAR;
++			s->load0 = (uint8_t)MIN(w->loadAction, 255u);
++			s->ncolor = (uint8_t)MIN(w->colorCount, 8u);
++			for (unsigned j = 0; j < s->ncolor; j++) {
++				s->color[j] = rw_bdr_id(ids, w->color[j]);
++			}
++			s->c0_base = w->colorCount > 0 && w->color[0] != nil && w->colorLevel[0] == 0 && w->colorSlice[0] == 0 &&
++			    w->level == 0 && w->slice == 0 && [w->color[0] isKindOfClass:[RedwoodMetalTexture class]] &&
++			    [w->color[0] parentTexture] == nil;
++			s->depth = rw_bdr_id(ids, w->depth);
++			s->argbuf = w->render != nil && [w->render redwoodHasArgbuf];
++		} else if (w->pipeline != nil) {
++			s->kind = RWB_COMPUTE;
++			s->argbuf = [w->pipeline redwoodHasArgbuf];
++		} else {
++			continue;
++		}
++		if (w->textureCount > RWB_TEX) {
++			table = YES;
++		}
++		s->ntex = (uint8_t)MIN(w->textureCount, (unsigned)RWB_TEX);
++		for (unsigned j = 0; j < s->ntex; j++) {
++			s->tex[j] = rw_bdr_id(ids, w->textures[j]);
++		}
++	}
++	if (table || ids->full) {
++		__sync_add_and_fetch(&rw_bdr.rej[RWB_R_TABLE], 1);
++		free(st);
++		free(ids);
++		return;
++	}
++	unsigned rej[RWB_R_N] = { 0 }, cand = 0;
++	struct rwb_match m;
++	int found = rwb_find(st, n, &m, rej, &cand);
++
++	free(st);
++	free(ids);
++	__sync_add_and_fetch(&rw_bdr.candidates, cand);
++	for (i = 0; i < RWB_R_N; i++) {
++		if (rej[i]) {
++			__sync_add_and_fetch(&rw_bdr.rej[i], rej[i]);
++			if (rw_bdr.said < 6 && __sync_add_and_fetch(&rw_bdr.said, 1) <= 6) {
++				char what[64];
++
++				snprintf(what, sizeof(what), "rejected (%s)", rw_bdr_reason[i]);
++				rw_bdr_say(what, works, 0, n, 0, n);
++			}
++		}
++	}
++	if (!found) {
++		return;
++	}
++	if (rw_bdr.mode == 0) {
++		if (__sync_add_and_fetch(&rw_bdr.would, 1) == 1) {
++			rw_bdr_say("WOULD RENAME (dry run; first match)", works, m.f, m.k, m.l, n);
++		}
++		return;
++	}
++	if (rw_bdr.copy_whole == NULL) {
++		__sync_add_and_fetch(&rw_bdr.rej[RWB_R_LIB], 1);
++		return;
++	}
++	/* ---- the rewrite (rw_backdrop_host_test.c rewrite() is its mirror) ---- */
++	RedwoodMetalWork *cap = works[m.k], *ld = works[m.l];
++	id B = cap->copyDst, S = ld->color[0];
++	void *ks = rw_bdr_key(cap->copySrc);
++
++	if (__sync_add_and_fetch(&rw_bdr.renamed, 1) == 1) {
++		rw_bdr_say("RENAMED (first)", works, m.f, m.k, m.l, n);
++	}
++	for (i = m.f; i < m.k; i++) {
++		RedwoodMetalWork *w = works[i];
++
++		if ((w->render != nil || w->clearOnly) && w->colorCount > 0 && rw_bdr_key(w->color[0]) == ks) {
++			if (w->retained) {
++				[B retain];
++				[w->color[0] release];
++			}
++			w->color[0] = B;
++		}
++	}
++	RedwoodMetalWork *cw = [[RedwoodMetalWork alloc] init];
++	int (*whole)(struct rwa_texture *, struct rwa_texture *, char *, size_t) = rw_bdr.copy_whole;
++
++	cw->blit = Block_copy(^BOOL(char *why, size_t size) {
++		return whole([S mesaTexture], [B mesaTexture], why, size) == 0;
++	});
++	cw->note = strdup("backdrop rename (y2s97): whole copy B -> S, S not preloaded");
++	cw->pass = ld->pass;
++	cw->texCopy = YES;
++	cw->copyFull = YES;
++	cw->copySrc = B;
++	cw->copyDst = S;
++	[cw redwoodRetainReferences];
++	[works removeObjectAtIndex:m.k];         /* (k < l) */
++	[works insertObject:cw atIndex:m.l - 1];
++	[cw release];
++}
++
++/*
+  * y2s96 (A, investigation only): with /var/db/nord2-metal/trace-cc present, backboardd does what com.redwood.metal.trace does
+  * (the next 3 command buffers written out draw by draw: 'TRACE trace: a command buffer of N steps (asked for)' + one
+  * 'TRACE trace:   pass ...' line per step) by itself: first 60 s after its first commit, then every 15 s, 20 times (5 minutes),
+@@ -8080,6 +8408,13 @@
+ 
+ /* y2s91 rttouch: a render-pass attachment that writes a plane of a two-plane (YCbCr) surface IN PLACE: the texture to touch at
+  * completion (its seed then moves, and every conversion of the surface, in this process or another, follows), or nil */
++- (BOOL)redwoodBackdropPlain:(BOOL)surface
++{
++	return _parent == nil && _buffer == nil && !_copied && !_copiedPlane && !_ycbcr && !_padded && _texture != NULL &&
++	    _shape.sample_count <= 1 && _shape.type == MTLTextureType2D && [self mipmapLevelCount] == 1 && [self arrayLength] == 1 &&
++	    [self depth] == 1 && (surface || _iosurface == NULL) && [self redwoodTGTargetRoot] == nil;
++}
++
+ - (RedwoodMetalTexture *)redwoodTGTargetRoot
+ {
+ 	RedwoodMetalTexture *t = self;
+@@ -9184,6 +9519,8 @@
+ 
+ - (void)redwoodDoesNotOwnCompute { _kept = YES; }
+ 
++- (BOOL)redwoodHasArgbuf { return _info.argbuf_mask != 0; }
++
+ - (struct rwa_compute *)compute
+ {
+ 	return _compute;
+@@ -9244,6 +9581,7 @@
+ }
+ 
+ - (struct rwa_render *)render { return _render; }
++- (BOOL)redwoodHasArgbuf { return _info.vertex_argbuf_mask != 0 || _info.fragment_argbuf_mask != 0; }
+ - (BOOL)writesDepth           { return _info.fragment_writes_depth != 0; }
+ - (unsigned)vertexStreamMask  { return _info.vertex_stream_mask; }
+ - (unsigned)colorWriteMasks   { return _info.color_write_masks; }
+@@ -10445,6 +10783,7 @@
+ 		}
+ 	}
+ 	_status = RW_CB_COMMITTED;
++	rw_bdr_commit(_work);           /* y2s97: backdrop capture rename (dry run unless backdrop-rename) */
+ 	rw_fb_single_target(_work);     /* y2s96 (C) */
+ 	rw_fb_report_maybe();           /* y2s96: 'NORD2 GPU FB:' every 5 s */
+ 	for (RedwoodMetalWork *work in _work) {
+@@ -13089,7 +13428,7 @@
+ 	[self record:step note:NULL];
+ }
+ 
+-- (void)record:(BOOL (^)(char *why, size_t size))step note:(const char *)note
++- (RedwoodMetalWork *)record:(BOOL (^)(char *why, size_t size))step note:(const char *)note
+ {
+ 	RedwoodMetalWork *work = [[RedwoodMetalWork alloc] init];
+ 
+@@ -13097,6 +13436,7 @@
+ 	work->blit = Block_copy(step);
+ 	[_commandBuffer recordWork:work];
+ 	[work release];
++	return work;    /* (y2s97) still alive: the command buffer holds it */
+ }
+ 
+ - (void)copyFromTexture:(id)source sourceSlice:(NSUInteger)sourceSlice
+@@ -13118,7 +13458,7 @@
+ 	    (unsigned long)sourceSize.height, b, (unsigned long)destinationLevel,
+ 	    (unsigned long)destinationSlice, (unsigned long)destinationOrigin.x,
+ 	    (unsigned long)destinationOrigin.y);
+-	[self record:^BOOL(char *why, size_t size) {
++	RedwoodMetalWork *work = [self record:^BOOL(char *why, size_t size) {
+ 		const unsigned from[3] = { (unsigned)sourceOrigin.x, (unsigned)sourceOrigin.y,
+ 					   (unsigned)sourceOrigin.z };
+ 		const unsigned to[3] = { (unsigned)destinationOrigin.x, (unsigned)destinationOrigin.y,
+@@ -13130,6 +13470,14 @@
+ 		    (unsigned)destinationSlice, to, [source mesaTexture], (unsigned)sourceLevel,
+ 		    (unsigned)sourceSlice, from, extent, why, size) == 0;
+ 	} note:note];
++	/* y2s97 (backdrop rename): what -commit's matcher needs to know of this copy */
++	work->texCopy = source != nil && destination != nil;
++	work->copySrc = source;
++	work->copyDst = destination;
++	work->copyFull = sourceLevel == 0 && sourceSlice == 0 && destinationLevel == 0 && destinationSlice == 0 &&
++	    sourceOrigin.x == 0 && sourceOrigin.y == 0 && sourceOrigin.z == 0 && destinationOrigin.x == 0 && destinationOrigin.y == 0 &&
++	    destinationOrigin.z == 0 && sourceSize.depth == 1 && sourceSize.width == [source width] &&
++	    sourceSize.height == [source height] && sourceSize.width == [destination width] && sourceSize.height == [destination height];
+ }
+ 
+ - (void)copyFromTexture:(id)source sourceSlice:(NSUInteger)sourceSlice
+diff -ruN base-src-y2s96/rw-backdrop-host-test.sh src/rw-backdrop-host-test.sh
+--- base-src-y2s96/rw-backdrop-host-test.sh	1970-01-01 01:00:00.000000000 +0100
++++ src/rw-backdrop-host-test.sh	2026-11-13 16:36:32.435735760 +0100
+@@ -0,0 +1,6 @@
++#!/bin/bash
++# y2s97: rw_backdrop_pure.h (the backdrop-rename matcher) on the build machine, ASan/UBSan, -Werror. Prints 'rw_backdrop: ok ...'.
++set -euo pipefail
++D=$(cd "$(dirname "$0")" && pwd); T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
++cc -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all -o "$T/t" "$D/rw_backdrop_host_test.c"
++"$T/t"
+diff -ruN base-src-y2s96/rw_backdrop_host_test.c src/rw_backdrop_host_test.c
+--- base-src-y2s96/rw_backdrop_host_test.c	1970-01-01 01:00:00.000000000 +0100
++++ src/rw_backdrop_host_test.c	2026-11-13 16:36:40.269588106 +0100
+@@ -0,0 +1,389 @@
++/*
++ * y2s97: rw_backdrop_pure.h on the build machine. (1) hand-made cases, one per rule; (2) a fuzz: random command buffers over a
++ * few textures (biased towards the capture pattern) are run through an abstract executor -- every texture's content is a hash
++ * of what made it, every read is logged -- before and after the rewrite redwoodmetal.m applies (rw_bdr_rewrite's mirror,
++ * below); wherever rwb_find matches, final contents and every read must be identical. Prints 'rw_backdrop: ok ...'.
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "rw_backdrop_pure.h"
++
++#define CHECK(c, what) do { if (!(c)) { printf("FAIL %s (line %d)\n", what, __LINE__); exit(1); } } while (0)
++#define NT 6
++#define MAXS 40
++
++static struct rwb_step
++mk(int kind)
++{
++	struct rwb_step s;
++
++	memset(&s, 0, sizeof(s));
++	s.kind = (uint8_t)kind;
++	s.depth = s.src = s.dst = -1;
++	for (int i = 0; i < 8; i++) {
++		s.color[i] = -1;
++	}
++	for (int i = 0; i < RWB_TEX; i++) {
++		s.tex[i] = -1;
++	}
++	s.c0_base = 1;
++	return s;
++}
++static struct rwb_step
++pass(int t, int load, int sampled)
++{
++	struct rwb_step s = mk(RWB_DRAW);
++
++	s.color[0] = t;
++	s.ncolor = 1;
++	s.load0 = (uint8_t)load;
++	if (sampled >= 0) {
++		s.tex[0] = sampled;
++		s.ntex = 1;
++	}
++	return s;
++}
++static struct rwb_step
++copy(int src, int dst, int full)
++{
++	struct rwb_step s = mk(RWB_COPY);
++
++	s.src = src;
++	s.dst = dst;
++	s.copy_full = (uint8_t)full;
++	s.copy_shape = 1;
++	s.copy_bok = 1;
++	return s;
++}
++
++static int
++run_find(const struct rwb_step *st, unsigned n, struct rwb_match *m, int *reason)
++{
++	unsigned rej[RWB_R_N] = { 0 }, cand = 0;
++	int r = rwb_find(st, n, m, rej, &cand);
++
++	*reason = -1;
++	for (int i = 0; i < RWB_R_N; i++) {
++		if (rej[i]) {
++			*reason = i;
++		}
++	}
++	return r;
++}
++
++/* ---- the abstract executor ---- */
++static uint64_t
++mix(uint64_t h, uint64_t v)
++{
++	h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
++	return h * 0xff51afd7ed558ccdULL;
++}
++struct exec {
++	uint64_t content[NT];
++	uint64_t reads[MAXS * 2];   /* by original step id */
++	int nreads;
++};
++static void
++execute(const struct rwb_step *st, const int *ids, unsigned n, struct exec *e)
++{
++	for (int t = 0; t < NT; t++) {
++		e->content[t] = mix(1000, (uint64_t)t);
++	}
++	memset(e->reads, 0, sizeof(e->reads));
++	for (unsigned i = 0; i < n; i++) {
++		const struct rwb_step *s = &st[i];
++		int id = ids[i];
++		uint64_t in = mix(77, (uint64_t)(id < 0 ? 999 : id));
++
++		if (s->kind == RWB_DRAW || s->kind == RWB_COMPUTE) {
++			for (unsigned j = 0; j < s->ntex; j++) {
++				if (s->tex[j] >= 0) {
++					in = mix(in, e->content[s->tex[j]]);
++				}
++			}
++		}
++		if (s->kind == RWB_COPY) {
++			in = mix(in, e->content[s->src]);
++		}
++		if (id >= 0) {
++			e->reads[id] = in;
++		}
++		if (s->kind == RWB_DRAW || s->kind == RWB_CLEAR) {
++			for (unsigned j = 0; j < s->ncolor; j++) {
++				int t = s->color[j];
++				uint64_t prev = j == 0 ? (s->load0 == RWB_LOAD_LOAD ? e->content[t] : s->load0 == RWB_LOAD_CLEAR ? 5 : 6) : e->content[t];
++
++				/* the pass's result in attachment j: what it started from + what it read + (the draw itself: its id) */
++				e->content[t] = mix(mix(prev, s->kind == RWB_DRAW ? in : 3), (uint64_t)j);
++			}
++			if (s->depth >= 0) {
++				e->content[s->depth] = mix(e->content[s->depth], in);
++			}
++		} else if (s->kind == RWB_COPY) {
++			e->content[s->dst] = s->copy_full ? e->content[s->src] : mix(e->content[s->dst], e->content[s->src]);
++		} else if (s->kind == RWB_COMPUTE) {
++			for (unsigned j = 0; j < s->ntex; j++) {
++				if (s->tex[j] >= 0) {
++					e->content[s->tex[j]] = mix(e->content[s->tex[j]], in);
++				}
++			}
++		}
++	}
++}
++
++/* the mirror of redwoodmetal.m's rewrite: attachment 0 of the S passes in [f, k) -> B, drop k, whole copy B -> S before l */
++static unsigned
++rewrite(const struct rwb_step *st, const int *ids, unsigned n, const struct rwb_match *m, struct rwb_step *out, int *oids)
++{
++	unsigned o = 0;
++
++	for (unsigned i = 0; i < n; i++) {
++		if (i == m->k) {
++			continue;
++		}
++		if (i == m->l) {
++			out[o] = copy(m->b, m->s, 1);
++			oids[o++] = -1;
++		}
++		out[o] = st[i];
++		if (i >= m->f && i < m->k && (st[i].kind == RWB_DRAW || st[i].kind == RWB_CLEAR) && st[i].color[0] == m->s) {
++			out[o].color[0] = m->b;
++		}
++		oids[o++] = ids[i];
++	}
++	return o;
++}
++
++static int
++equivalent(const struct rwb_step *st, unsigned n, const struct rwb_match *m)
++{
++	int ids[MAXS] = { 0 }, oids[MAXS + 1] = { 0 };
++	struct rwb_step out[MAXS + 1];
++	struct exec a, b;
++
++	for (unsigned i = 0; i < n; i++) {
++		ids[i] = (int)i;
++	}
++	unsigned on = rewrite(st, ids, n, m, out, oids);
++
++	execute(st, ids, n, &a);
++	execute(out, oids, on, &b);
++	if (memcmp(a.content, b.content, sizeof(a.content)) != 0) {
++		return 0;
++	}
++	for (unsigned i = 0; i < n; i++) {
++		if (i != m->k && a.reads[i] != b.reads[i]) {
++			return 0;
++		}
++	}
++	return 1;
++}
++
++static unsigned rng = 12345;
++static unsigned
++rnd(unsigned n)
++{
++	rng = rng * 1103515245u + 12345u;
++	return (rng >> 8) % n;
++}
++
++static struct rwb_step
++random_step(void)
++{
++	unsigned k = rnd(20);
++	struct rwb_step s;
++
++	if (k < 9) {
++		s = pass((int)rnd(NT), (int)rnd(3), rnd(2) ? (int)rnd(NT) : -1);
++		if (rnd(6) == 0) {
++			s.color[1] = (int)rnd(NT);
++			s.ncolor = 2;
++			if (s.color[1] == s.color[0]) {
++				s.ncolor = 1;
++				s.color[1] = -1;
++			}
++		}
++		if (rnd(10) == 0) {
++			s.depth = (int)rnd(NT);
++		}
++		if (rnd(25) == 0) {
++			s.argbuf = 1;
++		}
++		if (rnd(25) == 0) {
++			s.c0_base = 0;
++		}
++	} else if (k < 15) {
++		int a = (int)rnd(NT), b = (int)rnd(NT);
++
++		s = copy(a, b == a ? (a + 1) % NT : b, rnd(5) != 0);
++		if (rnd(20) == 0) {
++			s.copy_shape = 0;
++		}
++		if (rnd(20) == 0) {
++			s.copy_bok = 0;
++		}
++	} else if (k < 17) {
++		s = mk(RWB_COMPUTE);
++		s.tex[0] = (int)rnd(NT);
++		s.ntex = 1;
++	} else if (k < 18) {
++		s = mk(RWB_OPAQUE);
++	} else {
++		s = mk(RWB_CLEAR);
++		s.color[0] = (int)rnd(NT);
++		s.ncolor = 1;
++		s.load0 = RWB_LOAD_CLEAR;
++	}
++	return s;
++}
++
++int
++main(void)
++{
++	struct rwb_step st[MAXS];
++	struct rwb_match m;
++	int why;
++	unsigned n;
++
++	/* T1 the pattern: S=0 cleared and drawn, copy 0->1 whole, blur 1->2, 2->3, S loaded and drawn sampling 3 */
++	n = 0;
++	st[n++] = pass(0, RWB_LOAD_CLEAR, 4);
++	st[n++] = pass(0, RWB_LOAD_LOAD, 5);
++	st[n++] = copy(0, 1, 1);
++	st[n++] = pass(2, RWB_LOAD_DONTCARE, 1);
++	st[n++] = pass(3, RWB_LOAD_DONTCARE, 2);
++	st[n++] = pass(0, RWB_LOAD_LOAD, 3);
++	CHECK(run_find(st, n, &m, &why) && m.f == 0 && m.k == 2 && m.l == 5 && m.s == 0 && m.b == 1, "T1 match");
++	CHECK(equivalent(st, n, &m), "T1 equivalent");
++	/* T2 partial copy: untouched */
++	st[2].copy_full = 0;
++	CHECK(!run_find(st, n, &m, &why) && why == RWB_R_PARTIAL, "T2 partial");
++	st[2].copy_full = 1;
++	/* T3 S first loaded (not cleared) */
++	st[0].load0 = RWB_LOAD_LOAD;
++	CHECK(!run_find(st, n, &m, &why) && why == RWB_R_FIRST, "T3 first not clear");
++	st[0].load0 = RWB_LOAD_CLEAR;
++	/* T4 S sampled before the copy */
++	st[1].tex[0] = 0;
++	CHECK(!run_find(st, n, &m, &why) && why == RWB_R_SUSED, "T4 S sampled in [f,k)");
++	st[1].tex[0] = 5;
++	/* T5 B sampled before the copy */
++	st[1].tex[0] = 1;
++	CHECK(!run_find(st, n, &m, &why) && why == RWB_R_BUSED, "T5 B used in [f,k)");
++	st[1].tex[0] = 5;
++	/* T6 B written between copy and Load pass */
++	st[3].color[0] = 1;
++	st[3].tex[0] = 4;
++	CHECK(!run_find(st, n, &m, &why) && why == RWB_R_BWRITTEN, "T6 B written in (k,l)");
++	st[3].color[0] = 2;
++	st[3].tex[0] = 1;
++	/* T7 S sampled between copy and Load pass -> the next S use is not a Load pass */
++	st[4].tex[0] = 0;
++	CHECK(!run_find(st, n, &m, &why) && why == RWB_R_LATER, "T7 S sampled in (k,l)");
++	st[4].tex[0] = 2;
++	/* T8 the later S pass clears */
++	st[5].load0 = RWB_LOAD_CLEAR;
++	CHECK(!run_find(st, n, &m, &why) && why == RWB_R_LATER, "T8 later pass clears");
++	st[5].load0 = RWB_LOAD_LOAD;
++	/* T9 nothing after */
++	CHECK(!run_find(st, 5, &m, &why) && why == RWB_R_NOLATER, "T9 no later use");
++	/* T10 opaque blit inside */
++	{
++		struct rwb_step sv = st[3];
++
++		st[3] = mk(RWB_OPAQUE);
++		CHECK(!run_find(st, n, &m, &why) && why == RWB_R_OPAQUE, "T10 opaque");
++		st[3] = sv;
++	}
++	/* T11 argument buffers */
++	st[4].argbuf = 1;
++	CHECK(!run_find(st, n, &m, &why) && why == RWB_R_ARGBUF, "T11 argbuf");
++	st[4].argbuf = 0;
++	/* T12 shape / B shared */
++	st[2].copy_shape = 0;
++	CHECK(!run_find(st, n, &m, &why) && why == RWB_R_SHAPE, "T12 shape");
++	st[2].copy_shape = 1;
++	st[2].copy_bok = 0;
++	CHECK(!run_find(st, n, &m, &why) && why == RWB_R_BSHARED, "T12 b shared");
++	st[2].copy_bok = 1;
++	/* T13 S as attachment 1 of a pass in [f,k) */
++	st[1].color[1] = 0;
++	st[1].ncolor = 2;
++	CHECK(!run_find(st, n, &m, &why) && why == RWB_R_SUSED, "T13 S attachment 1");
++	st[1].color[1] = -1;
++	st[1].ncolor = 1;
++	/* T14 S at another level */
++	st[1].c0_base = 0;
++	CHECK(!run_find(st, n, &m, &why) && why == RWB_R_SUSED, "T14 S level");
++	st[1].c0_base = 1;
++	/* T15 B the attachment 1 of the Load pass */
++	st[5].color[1] = 1;
++	st[5].ncolor = 2;
++	CHECK(!run_find(st, n, &m, &why) && why == RWB_R_LATER, "T15 B attachment of l");
++	st[5].color[1] = -1;
++	st[5].ncolor = 1;
++	/* T16 compute on B between: refused (may write) */
++	{
++		struct rwb_step sv = st[3];
++
++		st[3] = mk(RWB_COMPUTE);
++		st[3].tex[0] = 1;
++		st[3].ntex = 1;
++		CHECK(!run_find(st, n, &m, &why) && why == RWB_R_BWRITTEN, "T16 compute on B");
++		st[3] = sv;
++	}
++	/* T17 a copy of a texture not drawn in this buffer: not a candidate at all */
++	{
++		struct rwb_step t[2] = { copy(4, 1, 1), pass(4, RWB_LOAD_LOAD, -1) };
++		unsigned rej[RWB_R_N] = { 0 }, cand = 0;
++
++		CHECK(!rwb_find(t, 2, &m, rej, &cand) && cand == 0, "T17 not a capture");
++	}
++	CHECK(run_find(st, n, &m, &why) && equivalent(st, n, &m), "T* restored");
++
++	/* fuzz */
++	unsigned tried = 0, matched = 0, rejected = 0, rej_by[RWB_R_N] = { 0 };
++
++	for (int iter = 0; iter < 400000; iter++) {
++		n = 3 + rnd(MAXS - 8);
++		for (unsigned i = 0; i < n; i++) {
++			st[i] = random_step();
++		}
++		if (rnd(2)) {   /* plant the pattern's skeleton at random places */
++			unsigned a = rnd(n), b = rnd(n), c = rnd(n);
++			int S = (int)rnd(NT), Bt = (S + 1 + (int)rnd(NT - 1)) % NT;
++
++			if (a < b && b < c) {
++				st[a] = pass(S, RWB_LOAD_CLEAR, rnd(2) ? (int)rnd(NT) : -1);
++				st[b] = copy(S, Bt, 1);
++				st[c] = pass(S, RWB_LOAD_LOAD, rnd(2) ? (int)rnd(NT) : -1);
++			}
++		}
++		unsigned rej[RWB_R_N] = { 0 }, cand = 0;
++
++		tried++;
++		if (rwb_find(st, n, &m, rej, &cand)) {
++			matched++;
++			if (!equivalent(st, n, &m)) {
++				printf("FAIL fuzz iteration %d: a match whose rewrite is not equivalent (f %u k %u l %u S %d B %d)\n", iter, m.f, m.k,
++				    m.l, m.s, m.b);
++				for (unsigned i = 0; i < n; i++) {
++					printf("  %u kind %d load %d c0 %d c1 %d d %d tex %d src %d dst %d full %d\n", i, st[i].kind, st[i].load0,
++					    st[i].color[0], st[i].color[1], st[i].depth, st[i].tex[0], st[i].src, st[i].dst, st[i].copy_full);
++				}
++				return 1;
++			}
++		}
++		for (int i = 0; i < RWB_R_N; i++) {
++			rejected += rej[i];
++			rej_by[i] += rej[i];
++		}
++	}
++	CHECK(matched > 1000, "fuzz found too few matches to mean anything");
++	printf("rw_backdrop: ok (17 cases; fuzz %u buffers, %u matches all equivalent, %u candidates rejected: partial %u shape %u "
++	    "b-shared %u first %u s-used %u b-used %u opaque %u later %u no-later %u b-written %u argbuf %u)\n", tried, matched,
++	    rejected, rej_by[0], rej_by[1], rej_by[2], rej_by[3], rej_by[4], rej_by[5], rej_by[6], rej_by[7], rej_by[8], rej_by[9],
++	    rej_by[10]);
++	return 0;
++}
+diff -ruN base-src-y2s96/rw_backdrop_pure.h src/rw_backdrop_pure.h
+--- base-src-y2s96/rw_backdrop_pure.h	1970-01-01 01:00:00.000000000 +0100
++++ src/rw_backdrop_pure.h	2026-11-13 16:35:19.529132153 +0100
+@@ -0,0 +1,235 @@
++/*
++ * y2s97 (backdrop capture rename): the MATCHER, pure C over an abstract list of a command buffer's steps, so that it can be
++ * tested on the build machine (rw_backdrop_host_test.c, rw-backdrop-host-test.sh). redwoodmetal.m (rw_bdr_commit) turns the
++ * command buffer's RedwoodMetalWork list into this list, asks rwb_find, and rewrites (or, by default, only counts).
++ *
++ * Pattern (inferred from CoreAnimation's backdrop comment at air_metal.c rwa_texture_copy, NOT yet seen in a trace):
++ *   f: the first step of the command buffer that touches S is a pass into S (attachment 0, level 0, slice 0) whose load is Clear;
++ *   k: a later texture copy S -> B of the WHOLE surface (level 0, slice 0, origin 0, full size; same format and size, one sample,
++ *      2D, one level, one slice; B private: no IOSurface, no buffer, not a view, not a YCbCr plane);
++ *   l: the next step after k that touches S is a pass into S (attachment 0, level 0, slice 0) whose load is Load.
++ * Conditions, every one of them required:
++ *   in [f, k): S only ever as attachment 0 at level 0 / slice 0 (never sampled, never another attachment / depth / copied);
++ *              B not touched at all; no opaque step (a blit whose textures are not known); no argument-buffer pipeline;
++ *   in (k, l): S not touched (by the definition of l); B never WRITTEN (attachment, depth, copy destination, compute texture);
++ *              no opaque step; no argument-buffer pipeline;
++ *   at l:      S only as attachment 0; B not an attachment of it; no argument-buffer pipeline.
++ * Rewrite (redwoodmetal.m): attachment 0 of the S passes in [f, k) becomes B, the copy k is dropped, one whole copy B -> S is
++ * inserted right before l (rwa_texture_copy_whole: S not preloaded). What S and B hold after l is what they held before.
++ * Copyright (c) 2026 ios-sweet contributors.  SPDX-License-Identifier: MIT.
++ */
++#ifndef RW_BACKDROP_PURE_H
++#define RW_BACKDROP_PURE_H
++#include <stdint.h>
++
++enum { RWB_NONE = 0, RWB_DRAW, RWB_CLEAR, RWB_COPY, RWB_OPAQUE, RWB_COMPUTE };
++enum { RWB_LOAD_DONTCARE = 0, RWB_LOAD_LOAD = 1, RWB_LOAD_CLEAR = 2 };
++
++/* rejection reasons, in the order they are checked for a candidate copy */
++enum {
++	RWB_R_PARTIAL = 0,  /* the copy is not of the whole level-0 / slice-0 surface (left untouched, by design) */
++	RWB_R_SHAPE,        /* S and B differ in format / size / samples / type / levels / slices, or S is not plain */
++	RWB_R_BSHARED,      /* B has an IOSurface / buffer / is a view / a YCbCr plane, or B == S */
++	RWB_R_FIRST,        /* the first step touching S is not a Clear pass into S's level 0 / slice 0 */
++	RWB_R_SUSED,        /* S touched in [f, k) other than as attachment 0 at level 0 / slice 0 */
++	RWB_R_BUSED,        /* B touched in [f, k) */
++	RWB_R_OPAQUE,       /* a blit with unknown textures in [f, l) */
++	RWB_R_LATER,        /* the next step touching S after k is not a Load pass into S (or B is an attachment of it) */
++	RWB_R_NOLATER,      /* nothing touches S after k */
++	RWB_R_BWRITTEN,     /* B written in (k, l) */
++	RWB_R_ARGBUF,       /* an argument-buffer pipeline in [f, l] (its textures are not visible here) */
++	RWB_R_TABLE,        /* (redwoodmetal.m) too many steps / textures in the command buffer */
++	RWB_R_LIB,          /* (redwoodmetal.m, rename on) the library has no rwa_texture_copy_whole */
++	RWB_R_N
++};
++
++#define RWB_TEX 32
++struct rwb_step {
++	uint8_t kind;        /* RWB_* */
++	uint8_t load0;       /* draw / clear: attachment 0's load action */
++	uint8_t c0_base;     /* draw / clear: attachment 0 is at level 0, slice 0 */
++	uint8_t argbuf;      /* draw / compute: the pipeline declares argument buffers */
++	uint8_t copy_full;   /* copy: whole level-0 / slice-0 surface, origins 0 */
++	uint8_t copy_shape;  /* copy: same format/size, 1 sample, 2D, 1 level, 1 slice, and the source is plain */
++	uint8_t copy_bok;    /* copy: the destination is private (no IOSurface / buffer / parent / YCbCr) */
++	uint8_t ncolor, ntex;
++	int color[8];        /* texture identities (-1: none) */
++	int depth;
++	int tex[RWB_TEX];
++	int src, dst;        /* copy */
++};
++
++struct rwb_match {
++	unsigned f, k, l;
++	int s, b;
++};
++
++#define RWB_REF_C0    1u   /* attachment 0 */
++#define RWB_REF_OTHER 2u   /* anything else: another attachment, depth, sampled / compute texture, copy source or destination */
++
++static inline unsigned
++rwb_refs(const struct rwb_step *st, int id)
++{
++	unsigned r = 0;
++
++	if (id < 0) {
++		return 0;
++	}
++	if (st->kind == RWB_DRAW || st->kind == RWB_CLEAR) {
++		for (unsigned i = 0; i < st->ncolor && i < 8; i++) {
++			if (st->color[i] == id) {
++				r |= i == 0 ? RWB_REF_C0 : RWB_REF_OTHER;
++			}
++		}
++		if (st->depth == id) {
++			r |= RWB_REF_OTHER;
++		}
++	}
++	if (st->kind == RWB_DRAW || st->kind == RWB_COMPUTE) {
++		for (unsigned i = 0; i < st->ntex && i < RWB_TEX; i++) {
++			if (st->tex[i] == id) {
++				r |= RWB_REF_OTHER;
++			}
++		}
++	}
++	if (st->kind == RWB_COPY && (st->src == id || st->dst == id)) {
++		r |= RWB_REF_OTHER;
++	}
++	return r;
++}
++
++/* does this (known) step write `id`? */
++static inline int
++rwb_writes(const struct rwb_step *st, int id)
++{
++	if (id < 0) {
++		return 0;
++	}
++	if (st->kind == RWB_DRAW || st->kind == RWB_CLEAR) {
++		for (unsigned i = 0; i < st->ncolor && i < 8; i++) {
++			if (st->color[i] == id) {
++				return 1;
++			}
++		}
++		return st->depth == id;
++	}
++	if (st->kind == RWB_COMPUTE) {   /* a compute texture may be written: no way to tell from here */
++		for (unsigned i = 0; i < st->ntex && i < RWB_TEX; i++) {
++			if (st->tex[i] == id) {
++				return 1;
++			}
++		}
++		return 0;
++	}
++	return st->kind == RWB_COPY && st->dst == id;
++}
++
++/* the candidate copy k checked; 0 = it matches (m filled), else 1 + the reason */
++static inline int
++rwb_check(const struct rwb_step *st, unsigned n, unsigned k, struct rwb_match *m)
++{
++	const struct rwb_step *c = &st[k];
++	int s = c->src, b = c->dst;
++	unsigned f, l, j;
++
++	if (!c->copy_full) {
++		return 1 + RWB_R_PARTIAL;
++	}
++	if (!c->copy_shape) {
++		return 1 + RWB_R_SHAPE;
++	}
++	if (!c->copy_bok || s == b || s < 0 || b < 0) {
++		return 1 + RWB_R_BSHARED;
++	}
++	for (f = 0; f < k && rwb_refs(&st[f], s) == 0; f++) {
++	}
++	if (f == k || (st[f].kind != RWB_DRAW && st[f].kind != RWB_CLEAR) || rwb_refs(&st[f], s) != RWB_REF_C0 ||
++	    !st[f].c0_base || st[f].load0 != RWB_LOAD_CLEAR) {
++		return 1 + RWB_R_FIRST;
++	}
++	for (j = f; j < k; j++) {
++		unsigned r = rwb_refs(&st[j], s);
++
++		if (st[j].kind == RWB_OPAQUE) {
++			return 1 + RWB_R_OPAQUE;
++		}
++		if (st[j].argbuf) {
++			return 1 + RWB_R_ARGBUF;
++		}
++		if ((r & RWB_REF_OTHER) || ((r & RWB_REF_C0) && !st[j].c0_base)) {
++			return 1 + RWB_R_SUSED;
++		}
++		if (rwb_refs(&st[j], b) != 0) {
++			return 1 + RWB_R_BUSED;
++		}
++	}
++	for (l = k + 1; l < n && rwb_refs(&st[l], s) == 0 && st[l].kind != RWB_OPAQUE; l++) {
++		if (st[l].argbuf) {
++			return 1 + RWB_R_ARGBUF;
++		}
++		if (rwb_writes(&st[l], b)) {
++			return 1 + RWB_R_BWRITTEN;
++		}
++	}
++	if (l == n) {
++		return 1 + RWB_R_NOLATER;
++	}
++	if (st[l].kind == RWB_OPAQUE) {
++		return 1 + RWB_R_OPAQUE;
++	}
++	if (st[l].argbuf) {
++		return 1 + RWB_R_ARGBUF;
++	}
++	if ((st[l].kind != RWB_DRAW && st[l].kind != RWB_CLEAR) || rwb_refs(&st[l], s) != RWB_REF_C0 || !st[l].c0_base ||
++	    st[l].load0 != RWB_LOAD_LOAD) {
++		return 1 + RWB_R_LATER;
++	}
++	for (unsigned i = 0; i < st[l].ncolor && i < 8; i++) {
++		if (st[l].color[i] == b) {
++			return 1 + RWB_R_LATER;
++		}
++	}
++	if (st[l].depth == b) {
++		return 1 + RWB_R_LATER;
++	}
++	m->f = f;
++	m->k = k;
++	m->l = l;
++	m->s = s;
++	m->b = b;
++	return 0;
++}
++
++/*
++ * The first candidate (a copy whose source was drawn into earlier in the buffer) that matches: 1 and *m; 0 if none does.
++ * Every candidate before it that does not match is counted in rejects[reason]; *candidates counts all that were looked at.
++ */
++static inline int
++rwb_find(const struct rwb_step *st, unsigned n, struct rwb_match *m, unsigned rejects[RWB_R_N], unsigned *candidates)
++{
++	for (unsigned k = 0; k < n; k++) {
++		if (st[k].kind != RWB_COPY || st[k].src < 0) {
++			continue;
++		}
++		unsigned j;
++
++		for (j = 0; j < k; j++) {
++			if ((st[j].kind == RWB_DRAW || st[j].kind == RWB_CLEAR) && st[j].ncolor > 0 && st[j].color[0] == st[k].src) {
++				break;
++			}
++		}
++		if (j == k) {
++			continue;   /* not a capture of something this buffer drew */
++		}
++		(*candidates)++;
++		int r = rwb_check(st, n, k, m);
++
++		if (r == 0) {
++			return 1;
++		}
++		rejects[r - 1]++;
++	}
++	return 0;
++}
++
++#endif
+diff -ruN base-src-y2s96/rwa_pan_fb.c src/rwa_pan_fb.c
+--- base-src-y2s96/rwa_pan_fb.c	2026-11-13 13:47:47.782004716 +0100
++++ src/rwa_pan_fb.c	2026-11-13 16:34:04.220319693 +0100
+@@ -21,6 +21,12 @@
+  * B+. (opt-in, deadstore) a Store of attachment >= 1 treated as DontCare for a resource that has never been sampled, blitted
+  *    from, read back or Loaded in this process and is not an IOSurface/buffer-backed one; a later read of such a resource is
+  *    counted (ext violations) -- the content it reads is the one before the discarded store.
++ * y2s97 (backdrop rename). rwa_fb_discard_level: a level about to be overwritten whole by a GPU blit (the renamed capture copied
++ *    back into the screen) is not preloaded. Every batch that uses the resource is flushed first, then its valid bit is cleared
++ *    and remembered (up to DISC_N at a time); the blit's own submit sets it again. Guard: after every flush (rwa_fb_flushed) a
++ *    remembered bit still clear is set back and counted as a backdrop VIOLATION (counter 14), and so is a read of the resource
++ *    (rwa_fb_note_read) while its bit is clear and no batch is writing it -- the read would otherwise see 'nothing valid'.
++ *    rwa_fb_discard_undo (the copy failed) and rwa_fb_forget (destroyed) put the bit back without counting it.
+  * Copyright (c) 2026 ios-sweet contributors.  SPDX-License-Identifier: MIT.
+  */
+ #include <string.h>
+@@ -47,12 +53,72 @@
+ void rwa_fb_forget(struct pipe_resource *res, bool table);
+ void rwa_fb_counters(uint64_t out[16]);
+ void rwa_fb_count(unsigned which, unsigned n);
++bool rwa_fb_discard_level(struct pipe_context *pipe, struct pipe_resource *res, unsigned level);
++void rwa_fb_discard_undo(struct pipe_resource *res, unsigned level);
+ 
+ /* counters: 0 rt1 drawn (batch slots >= 1 drawn), 1 preload avoided, 2 store discarded, 3 restored by a later Load / no fragment
+  * job, 4 VIOLATIONS (valid bit still clear after a flush), 5 ext store discarded, 6 ext violations, 7 single-target draws,
+- * 8 single-target refused, 9 batches not seen from the start, 10 ext table full (ext off), 11 single-target clears */
++ * 8 single-target refused, 9 batches not seen from the start, 10 ext table full (ext off), 11 single-target clears,
++ * y2s97: 12 backdrop discards (valid bit cleared before a whole copy), 13 discards undone (copy failed / destroyed / table full),
++ * 14 backdrop VIOLATIONS (bit still clear after the flush, or read while clear with no writer) */
+ static uint64_t fbc[16];
+ 
++/* ---- y2s97: levels cleared by rwa_fb_discard_level and not yet seen set again ---- */
++#define DISC_N 8
++static struct { struct panfrost_context *ctx; struct panfrost_resource *rsrc; unsigned level; } disc[DISC_N];
++
++static void
++disc_drop(unsigned i, bool set_back, unsigned counter)
++{
++   if (set_back && !BITSET_TEST(disc[i].rsrc->valid.data, disc[i].level)) {
++      BITSET_SET(disc[i].rsrc->valid.data, disc[i].level);
++      fbc[counter]++;
++   }
++   memset(&disc[i], 0, sizeof(disc[i]));
++}
++
++bool
++rwa_fb_discard_level(struct pipe_context *pipe, struct pipe_resource *res, unsigned level)
++{
++   if (!pipe || !res || level >= PAN_MAX_MIP_LEVELS || (res->target != PIPE_TEXTURE_2D && res->target != PIPE_TEXTURE_RECT) ||
++       res->array_size > 1 || res->depth0 > 1 || res->nr_samples > 1)
++      return false;
++   struct panfrost_context *ctx = pan_context(pipe);
++   struct panfrost_resource *rsrc = pan_resource(res);
++   if (rsrc->separate_stencil || rsrc->shadow_image)
++      return false;
++   unsigned i;
++   for (i = 0; i < DISC_N; i++) {
++      if (disc[i].rsrc == rsrc && disc[i].level == level)
++         return false;   /* already cleared and not seen set again: leave it to the guard */
++   }
++   for (i = 0; i < DISC_N && disc[i].rsrc; i++)
++      ;
++   if (i == DISC_N) {
++      fbc[13]++;
++      return false;
++   }
++   /* whatever is queued that reads or writes it goes first: its preload/store decisions are made at ITS submit */
++   panfrost_flush_batches_accessing_rsrc(ctx, rsrc, "rwa backdrop rename");
++   if (!BITSET_TEST(rsrc->valid.data, level))
++      return false;   /* nothing valid to preload anyway */
++   BITSET_CLEAR(rsrc->valid.data, level);
++   disc[i].ctx = ctx;
++   disc[i].rsrc = rsrc;
++   disc[i].level = level;
++   fbc[12]++;
++   return true;
++}
++
++void
++rwa_fb_discard_undo(struct pipe_resource *res, unsigned level)
++{
++   for (unsigned i = 0; i < DISC_N; i++) {
++      if (res && disc[i].rsrc == pan_resource(res) && disc[i].level == level)
++         disc_drop(i, true, 13);
++   }
++}
++
+ void
+ rwa_fb_count(unsigned which, unsigned n)
+ {
+@@ -144,6 +210,11 @@
+ {
+    if (!res)
+       return;
++   for (unsigned d = 0; d < DISC_N; d++) {   /* y2s97: a read of a discarded level that no queued batch will write */
++      if (disc[d].rsrc == pan_resource(res) && !BITSET_TEST(disc[d].rsrc->valid.data, disc[d].level) &&
++          !panfrost_any_batch_writes_rsrc(disc[d].ctx, disc[d].rsrc))
++         disc_drop(d, true, 14);
++   }
+    int i = fbr_get(res);
+    if (i < 0)
+       return;
+@@ -355,6 +426,10 @@
+ void
+ rwa_fb_flushed(void)
+ {
++   for (unsigned d = 0; d < DISC_N; d++) {   /* y2s97: every discarded level must have been set again by its blit's submit */
++      if (disc[d].rsrc)
++         disc_drop(d, true, 14);
++   }
+    for (unsigned b = 0; b < PAN_MAX_BATCHES; b++) {
+       struct fb_batch *e = &fbb[b];
+       if (!e->live)
+@@ -375,6 +450,10 @@
+ void
+ rwa_fb_forget(struct pipe_resource *res, bool table)
+ {
++   for (unsigned d = 0; d < DISC_N; d++) {   /* y2s97 */
++      if (disc[d].rsrc == pan_resource(res))
++         disc_drop(d, true, 13);
++   }
+    for (unsigned b = 0; b < PAN_MAX_BATCHES; b++) {
+       struct fb_batch *e = &fbb[b];
+       if (!e->live)
+diff -ruN base-src-y2s96/rwa_pan_fb_host_test.c src/rwa_pan_fb_host_test.c
+--- base-src-y2s96/rwa_pan_fb_host_test.c	2026-11-13 13:49:04.396845189 +0100
++++ src/rwa_pan_fb_host_test.c	2026-11-13 16:34:38.975927692 +0100
+@@ -22,6 +22,24 @@
+ void rwa_fb_note_shared(struct pipe_resource *res);
+ void rwa_fb_forget(struct pipe_resource *res, bool table);
+ void rwa_fb_counters(uint64_t out[16]);
++bool rwa_fb_discard_level(struct pipe_context *pipe, struct pipe_resource *res, unsigned level);
++void rwa_fb_discard_undo(struct pipe_resource *res, unsigned level);
++
++/* y2s97 stubs: Panfrost's flush of a resource's users and its writer table */
++static unsigned flushes_accessing;
++static bool writer_present;
++void
++panfrost_flush_batches_accessing_rsrc(struct panfrost_context *ctx, struct panfrost_resource *rsrc, const char *reason)
++{
++   (void)ctx; (void)rsrc; (void)reason;
++   flushes_accessing++;
++}
++bool
++panfrost_any_batch_writes_rsrc(struct panfrost_context *ctx, struct panfrost_resource *rsrc)
++{
++   (void)ctx; (void)rsrc;
++   return writer_present;
++}
+ 
+ static struct panfrost_context *C;
+ static struct pipe_framebuffer_state cur;
+@@ -175,6 +193,54 @@
+    setfb(0, 0); draw(0, 0, true, B | LAST, true); flush();
+    CHECK(preloaded && stored, "S10 shared level");
+    CHECK(ctr(4) == 0, "violations 0");
++   /* ---- y2s97 backdrop discard ---- */
++   /* D1: discard, then the whole copy's batch (draws into R2) is submitted: bit set by the submit, no violation */
++   CHECK(rwa_fb_discard_level(&C->base, &R[2].base, 0) && !BITSET_TEST(R[2].valid.data, 0) && ctr(12) == 1 && flushes_accessing == 1,
++         "D1 discard clears");
++   setfb(2, 1); draw(1, 1, true, 0, true); flush();
++   CHECK(BITSET_TEST(R[2].valid.data, 0) && ctr(14) == 0, "D1 submit sets it again, no violation");
++   /* D2: discard and NO copy follows: the flush finds it clear -> set back, violation counted */
++   CHECK(rwa_fb_discard_level(&C->base, &R[2].base, 0), "D2 discard");
++   flush();
++   CHECK(BITSET_TEST(R[2].valid.data, 0) && ctr(14) == 1, "D2 guard after flush");
++   /* D3: a read while clear with a writer queued: fine; with no writer: violation, set back */
++   CHECK(rwa_fb_discard_level(&C->base, &R[2].base, 0), "D3 discard");
++   writer_present = true; rwa_fb_note_read(&R[2].base);
++   CHECK(!BITSET_TEST(R[2].valid.data, 0) && ctr(14) == 1, "D3 read with writer");
++   writer_present = false; rwa_fb_note_read(&R[2].base);
++   CHECK(BITSET_TEST(R[2].valid.data, 0) && ctr(14) == 2, "D3 read without writer counted");
++   flush();
++   CHECK(ctr(14) == 2, "D3 nothing left");
++   /* D4: the copy failed: undo puts it back, not a violation */
++   CHECK(rwa_fb_discard_level(&C->base, &R[2].base, 0), "D4 discard");
++   rwa_fb_discard_undo(&R[2].base, 0);
++   CHECK(BITSET_TEST(R[2].valid.data, 0) && ctr(13) == 1 && ctr(14) == 2, "D4 undo");
++   flush();
++   /* D5: twice on the same level: the second refused; destroyed while clear: put back */
++   CHECK(rwa_fb_discard_level(&C->base, &R[2].base, 0) && !rwa_fb_discard_level(&C->base, &R[2].base, 0), "D5 twice");
++   rwa_fb_forget(&R[2].base, false);
++   CHECK(BITSET_TEST(R[2].valid.data, 0) && ctr(13) == 2, "D5 forget");
++   flush();
++   /* D6: not valid -> nothing to avoid; array / multisample -> refused */
++   BITSET_CLEAR(R[3].valid.data, 0);
++   CHECK(!rwa_fb_discard_level(&C->base, &R[3].base, 0), "D6 not valid");
++   BITSET_SET(R[3].valid.data, 0);
++   R[3].base.array_size = 2; CHECK(!rwa_fb_discard_level(&C->base, &R[3].base, 0), "D6 array"); R[3].base.array_size = 1;
++   R[3].base.nr_samples = 4; CHECK(!rwa_fb_discard_level(&C->base, &R[3].base, 0), "D6 msaa"); R[3].base.nr_samples = 1;
++   /* D7: table of 8: the 9th is refused (counted as undone) */
++   static struct panfrost_resource X[9];
++   for (int i = 0; i < 9; i++) {
++      X[i].base.target = PIPE_TEXTURE_2D; X[i].base.array_size = 1; X[i].base.depth0 = 1; X[i].base.nr_samples = 1;
++      BITSET_SET(X[i].valid.data, 0);
++   }
++   for (int i = 0; i < 8; i++) CHECK(rwa_fb_discard_level(&C->base, &X[i].base, 0), "D7 fill");
++   uint64_t u = ctr(13);
++   CHECK(!rwa_fb_discard_level(&C->base, &X[8].base, 0) && ctr(13) == u + 1 && BITSET_TEST(X[8].valid.data, 0), "D7 full");
++   for (int i = 0; i < 8; i++) BITSET_SET(X[i].valid.data, 0);   /* (their copies' submits) */
++   flush();
++   CHECK(ctr(14) == 2 && ctr(4) == 0, "D7 no new violation");
++   printf("rwa_pan_fb: backdrop discards %llu undone %llu violations %llu (2 provoked by D2/D3)\n", (unsigned long long)ctr(12),
++          (unsigned long long)ctr(13), (unsigned long long)ctr(14));
+    printf("rwa_pan_fb: ok (preload avoided %llu, store discarded %llu, restored %llu, violations %llu)\n",
+           (unsigned long long)ctr(1), (unsigned long long)ctr(2), (unsigned long long)ctr(3), (unsigned long long)ctr(4));
+    return 0;

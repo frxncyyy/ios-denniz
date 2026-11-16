@@ -1,0 +1,1447 @@
+--- a/redwoodmetal.m
++++ b/redwoodmetal.m
+@@ -3749,6 +3749,9 @@
+ 	uint64_t _countedAt;            /* made by -newTextureWithDescriptor: and counted (rw_perf) */
+ 	id _buffer;                     /* a texture over a buffer's memory: that buffer (retained) */
+ 	NSUInteger _bufferOffset, _bufferBytesPerRow;
++	BOOL _tgExact;                  /* y2s91: odd-sized, converted in ONE exact pass from the even-padded planes import (no _padTmp) */
++	BOOL _tgHeld;                   /* y2s91: holds _iosurface's use count (rw_tg_use_take; standalone, without y2s84) */
++	volatile uint64_t _tgGen;       /* y2s91: conversions made into _texture (the CHECK's generation) */
+ }
+ @property (readonly) struct rwa_texture *mesaTexture;
+ /* counted in rw_perf's allocations, made at `t` (its free is counted with its lifetime) */
+@@ -3782,6 +3785,20 @@
+ - (BOOL)redwoodRaw540Surface;
+ /* y2s63: _ycbcrSource is an even-padded import; conversions go through _padTmp */
+ - (void)redwoodSetPadded:(struct rwa_texture *)tmp;
++/* y2s91 (thumbgrid): see the rw_tg_* block below this interface */
++- (instancetype)initWithRedwoodDevice:(RedwoodMetalDevice *)device
++			      texture:(struct rwa_texture *)texture
++				shape:(const struct rwa_texture_shape *)shape;
++- (void)redwoodTGSetExact:(BOOL)exact;
++- (void)redwoodTGHold;
++- (void)redwoodTGGiveBack;
++- (void)redwoodTGAdoptSeed:(uint32_t)seed probe:(uint32_t)probe once:(BOOL)once;
++- (int)redwoodTGLiveDecision;
++- (int)redwoodTGConvertExact:(int)matrix full:(int)full why:(char *)why size:(size_t)size;
++- (void)redwoodTGConverted:(uint32_t)seed probe:(uint32_t)probe gpu:(BOOL)gpu;
++- (void)redwoodTGRunCheck:(unsigned long)k gen:(uint64_t)gen seed:(uint32_t)seed probe:(uint32_t)probe;
++- (BOOL)redwoodTGPark;
++- (RedwoodMetalTexture *)redwoodTGTargetRoot;
+ /* Not part of MTLTexture: the depth or stencil aspect of this texture, one float and one
+  * byte per texel. Metal's own -getBytes: has no aspect to name and the compiler library
+  * refuses a depth texture through it by name, so a caller that wants to know what a depth
+@@ -3791,6 +3808,851 @@
+ 	      fromRegion:(MTLRegion)region;
+ @end
+ 
++/*
++ * ==== y2s91 (thumbgrid): THE PHOTOS GRID, DETERMINISTIC AND VERIFIED, AND ITS PER-FRAME COSTS ====
++ * Everything here is rw_tg_*; the existing code calls it at a handful of marked places ("y2s91"). Switches, read once per process
++ * from /var/db/nord2-metal/ (a file that exists turns the feature OFF):
++ *   no-thumbgrid             all of this off: thumbfix5 (y2s83) behaviour, the library's old paths
++ *   no-thumbgrid-exact       odd sizes through the 376x668 picture + copy again (y2s63/y2s73) instead of one exact pass
++ *   no-thumbgrid-live        MobileSlideShow keeps the y2s83 freeze rule even with a real kernel use count
++ *   no-thumbgrid-pending     no "write in flight" deferral (keep the last good conversion while this process's GPU writes the surface)
++ *   no-thumbgrid-rttouch     a render pass that writes a YCbCr surface's plane in place does not move the seed at completion
++ *   no-thumbgrid-check       no CPU-reference check of converted thumbnails
++ *   no-thumbgrid-bufpool / -texpool / -thumbcache / -async   the pools / the converted-thumbnail cache / deferred dispatches
++ *   no-thumbgrid-ubo         (read by the library) every padded constant-buffer copy zeroes its whole tail again
++ *   no-thumbgrid-log         no 'NORD2 PERF PHOTOS TG' lines (the CHECK line stays)
++ * and, to widen the scope beyond MobileSlideShow (off by default): thumbgrid-pools-all, thumbgrid-async-all, thumbgrid-check-all;
++ * rttouch is on everywhere except mediaserverd, cameracaptured and Camera (thumbgrid-rttouch-all: there too).
++ * Merge note (y2s90-final): with y2s84 (usecount) in the same file, define RW_TG_HAVE_USECOUNT before this block: the texture holds
++ * are then y2s84's (every IOSurface texture) and rw_tg_use_* only reads its kernel state.
++ */
++#define RW_TG_HAVE_USECOUNT 1          /* y2s90-final: y2s84 (usecount) is in this file: its holds, its kernel probe */
++#include "rw_thumbgrid_pure.h"
++
++static struct {
++	pthread_once_t once;
++	int master, exact, live, pending, rttouch, check, bufpool, texpool, thumbcache, async, log;
++	int photos, pools_all, async_all, check_all;
++	int (*convert_exact)(struct rwa_texture *, struct rwa_texture *, int, int, char *, size_t);
++	int (*dispatch_deferred)(struct rwa_compute *, const struct rwa_bindings *, const struct rwa_buffer_bind *, unsigned,
++				 const unsigned[3], const unsigned[3], char *, size_t);
++	size_t (*buffer_recycle)(struct rwa_buffer *);
++	int (*texture_recycle)(struct rwa_texture *);
++	void (*ubo_stats)(uint64_t *, uint64_t *);
++} rw_tg = { .once = PTHREAD_ONCE_INIT };
++
++static struct {
++	volatile long conv_live, conv_skip, conv_deferred, conv_exact, conv_padded, conv_gpu, conv_cpu;
++	volatile long thumb_hit, thumb_miss, thumb_park, thumb_evict;
++	volatile long buf_hit, buf_miss, buf_park, buf_bgzero, buf_drop, buf_nozero;
++	volatile long tex_hit, tex_miss, tex_park, tex_drop;
++	volatile long async_n, async_flush, rt_touch, pending_defer, pending_max;
++	volatile long check_n, check_mismatch, check_gross, check_stale, check_raced, check_edge, check_cpu, check_fail;
++	volatile long check_maxdiff;
++} rw_tg_n;
++
++static int
++rw_tg_off(const char *name)
++{
++	char path[128];
++
++	snprintf(path, sizeof(path), "/var/db/nord2-metal/no-thumbgrid-%s", name);
++	return access(path, F_OK) == 0;
++}
++
++static void
++rw_tg_load(void)
++{
++	rw_tg.master = access("/var/db/nord2-metal/no-thumbgrid", F_OK) != 0;
++	rw_tg.photos = rw_is_photos_proc();
++	rw_tg.pools_all = access("/var/db/nord2-metal/thumbgrid-pools-all", F_OK) == 0;
++	rw_tg.async_all = access("/var/db/nord2-metal/thumbgrid-async-all", F_OK) == 0;
++	rw_tg.check_all = access("/var/db/nord2-metal/thumbgrid-check-all", F_OK) == 0;
++	if (mesa.handle != NULL) {
++		*(void **)&rw_tg.convert_exact = dlsym(mesa.handle, "rwa_texture_convert_ycbcr_exact");
++		*(void **)&rw_tg.dispatch_deferred = dlsym(mesa.handle, "rwa_dispatch_buffers_deferred");
++		*(void **)&rw_tg.buffer_recycle = dlsym(mesa.handle, "rwa_buffer_recycle");
++		*(void **)&rw_tg.texture_recycle = dlsym(mesa.handle, "rwa_texture_recycle");
++		*(void **)&rw_tg.ubo_stats = dlsym(mesa.handle, "rwa_tg_ubo_stats");
++	}
++	int m = rw_tg.master;
++	int scope_pools = rw_tg.photos || rw_tg.pools_all;
++
++	rw_tg.exact = m && !rw_tg_off("exact") && rw_tg.convert_exact != NULL;
++	rw_tg.live = m && !rw_tg_off("live") && rw_tg.photos;
++	rw_tg.pending = m && !rw_tg_off("pending");
++	/* not where the camera bring-up renders into YCbCr planes every frame (unless thumbgrid-rttouch-all) */
++	rw_tg.rttouch = m && !rw_tg_off("rttouch") && (access("/var/db/nord2-metal/thumbgrid-rttouch-all", F_OK) == 0 ||
++	    (strcmp(getprogname(), "mediaserverd") != 0 && strcmp(getprogname(), "cameracaptured") != 0 && strcmp(getprogname(), "Camera") != 0));
++	rw_tg.check = m && !rw_tg_off("check") && (rw_tg.photos || rw_tg.check_all) && mesa.texture_read != NULL;
++	rw_tg.bufpool = m && !rw_tg_off("bufpool") && scope_pools && rw_tg.buffer_recycle != NULL;
++	rw_tg.texpool = m && !rw_tg_off("texpool") && scope_pools && rw_tg.texture_recycle != NULL;
++	rw_tg.thumbcache = m && !rw_tg_off("thumbcache") && rw_tg.photos;
++	rw_tg.async = m && !rw_tg_off("async") && (rw_tg.photos || rw_tg.async_all) && rw_tg.dispatch_deferred != NULL;
++	rw_tg.log = m && !rw_tg_off("log");
++	if (rw_tg.photos || rw_tg.pools_all || rw_tg.async_all || rw_tg.check_all) {
++		m2m_log('I', "TG", "NORD2 PERF PHOTOS TG %s: thumbgrid %s: exact %d (library call %s), live %d, pending %d, rttouch %d, check %d, "
++		    "bufpool %d, texpool %d, thumbcache %d, async %d (library call %s), log %d\n", getprogname(), m ? "on" : "OFF (no-thumbgrid)",
++		    rw_tg.exact, rw_tg.convert_exact != NULL ? "found" : "missing", rw_tg.live, rw_tg.pending, rw_tg.rttouch, rw_tg.check,
++		    rw_tg.bufpool, rw_tg.texpool, rw_tg.thumbcache, rw_tg.async, rw_tg.dispatch_deferred != NULL ? "found" : "missing", rw_tg.log);
++	}
++}
++
++static inline void
++rw_tg_init(void)
++{
++	pthread_once(&rw_tg.once, rw_tg_load);
++}
++
++/* ---- the IOSurface use count of converted textures ---- */
++#ifndef RW_TG_HAVE_USECOUNT
++/* (standalone, over thumbfix5) a converted YCbCr texture in MobileSlideShow holds its surface's use count while it exists, as y2s84
++ * does for every IOSurface texture; the first hold probes whether the kernel counts (0398) */
++static struct {
++	pthread_once_t once;
++	void (*inc)(void *), (*dec)(void *);
++	unsigned char (*in_use)(void *);
++	volatile int kernel;
++	volatile long live, taken;
++} rw_tg_use = { .once = PTHREAD_ONCE_INIT, .kernel = -1 };
++
++static void
++rw_tg_use_load(void)
++{
++	*(void **)&rw_tg_use.inc = dlsym(RTLD_DEFAULT, "IOSurfaceIncrementUseCount");
++	*(void **)&rw_tg_use.dec = dlsym(RTLD_DEFAULT, "IOSurfaceDecrementUseCount");
++	*(void **)&rw_tg_use.in_use = dlsym(RTLD_DEFAULT, "IOSurfaceIsInUse");
++}
++
++static int
++rw_tg_use_kernel(void)
++{
++	return rw_tg_use.kernel;
++}
++
++static BOOL
++rw_tg_use_take(void *surface)
++{
++	pthread_once(&rw_tg_use.once, rw_tg_use_load);
++	if (surface == NULL || rw_tg_use.inc == NULL || rw_tg_use.dec == NULL) {
++		return NO;
++	}
++	rw_tg_use.inc(surface);
++	if (rw_tg_use.kernel < 0 && rw_tg_use.in_use != NULL) {
++		int k = rw_tg_use.in_use(surface) ? 1 : 0;
++
++		if (__sync_bool_compare_and_swap(&rw_tg_use.kernel, -1, k)) {
++			m2m_log('I', "TG", "NORD2 PERF PHOTOS TG %s: kernel use count %s (surface %u): follow-live %s\n", getprogname(),
++			    k ? "REAL (0398)" : "a no-op (no 0398)", rwd_surface_id(surface), k ? "possible" : "off, the freeze rule stays");
++		}
++	}
++	__sync_add_and_fetch(&rw_tg_use.live, 1);
++	__sync_add_and_fetch(&rw_tg_use.taken, 1);
++	return YES;
++}
++
++static void
++rw_tg_use_give(void *surface)
++{
++	if (surface != NULL && rw_tg_use.dec != NULL) {
++		rw_tg_use.dec(surface);
++		__sync_sub_and_fetch(&rw_tg_use.live, 1);
++	}
++}
++#else
++/* (merged with y2s84) every IOSurface texture already holds the count: only its probe is read */
++static int rw_tg_use_kernel(void) { return rw_use_kernel_state(); }
++static BOOL rw_tg_use_take(void *surface) { (void)surface; return NO; }
++static void rw_tg_use_give(void *surface) { (void)surface; }
++#endif
++
++/* follow-live (instead of the y2s83 freeze): MobileSlideShow, switch on, and the kernel count real with the texture holding it */
++static BOOL
++rw_tg_live_active(void)
++{
++	rw_tg_init();
++	return rw_tg.live && rw_tg_use_kernel() == 1;
++}
++
++/* ---- surfaces this process's GPU is writing (committed, not completed) ---- */
++#define RW_TG_PENDING 64
++static struct { uint32_t sid; int n; } rw_tg_pend[RW_TG_PENDING];
++static pthread_mutex_t rw_tg_pend_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static void
++rw_tg_pending_add(void *surface)
++{
++	uint32_t sid = rwd_surface_id(surface);
++	long used = 0;
++
++	rw_tg_init();
++	if (!rw_tg.pending || sid == 0) {
++		return;
++	}
++	pthread_mutex_lock(&rw_tg_pend_lock);
++	int free_slot = -1, i;
++
++	for (i = 0; i < RW_TG_PENDING; i++) {
++		if (rw_tg_pend[i].n > 0 && rw_tg_pend[i].sid == sid) {
++			rw_tg_pend[i].n++;
++			break;
++		}
++		if (rw_tg_pend[i].n == 0 && free_slot < 0) {
++			free_slot = i;
++		}
++	}
++	if (i == RW_TG_PENDING && free_slot >= 0) {
++		rw_tg_pend[free_slot].sid = sid;
++		rw_tg_pend[free_slot].n = 1;
++	}
++	for (i = 0; i < RW_TG_PENDING; i++) {
++		used += rw_tg_pend[i].n > 0;
++	}
++	pthread_mutex_unlock(&rw_tg_pend_lock);
++	if (used > rw_tg_n.pending_max) {
++		rw_tg_n.pending_max = used;
++	}
++}
++
++static void
++rw_tg_pending_del(void *surface)
++{
++	uint32_t sid = rwd_surface_id(surface);
++
++	if (!rw_tg.pending || sid == 0) {
++		return;
++	}
++	pthread_mutex_lock(&rw_tg_pend_lock);
++	for (int i = 0; i < RW_TG_PENDING; i++) {
++		if (rw_tg_pend[i].n > 0 && rw_tg_pend[i].sid == sid) {
++			rw_tg_pend[i].n--;
++			break;
++		}
++	}
++	pthread_mutex_unlock(&rw_tg_pend_lock);
++}
++
++static BOOL
++rw_tg_pending_has(void *surface)
++{
++	uint32_t sid = rwd_surface_id(surface);
++	BOOL has = NO;
++
++	if (!rw_tg.pending || sid == 0) {
++		return NO;
++	}
++	pthread_mutex_lock(&rw_tg_pend_lock);
++	for (int i = 0; i < RW_TG_PENDING && !has; i++) {
++		has = rw_tg_pend[i].n > 0 && rw_tg_pend[i].sid == sid;
++	}
++	pthread_mutex_unlock(&rw_tg_pend_lock);
++	return has;
++}
++
++/* the textures of a command buffer's write-back/touch list: each was rw_tg_pending_add'ed when it was put on the list */
++static void
++rw_tg_pending_release(NSArray *list)
++{
++	for (id t in list) {
++		rw_tg_pending_del((void *)[t iosurface]);
++	}
++}
++
++/* ---- which command buffers are still on the GPU (pool quarantine) ---- */
++static struct rw_tg_seq rw_tg_q;
++static pthread_once_t rw_tg_q_once = PTHREAD_ONCE_INIT;
++static pthread_mutex_t rw_tg_q_lock = PTHREAD_MUTEX_INITIALIZER;
++#define RW_TG_FENCES 512
++static struct { void *fence; uint64_t seq; } rw_tg_fences[RW_TG_FENCES];
++
++static void
++rw_tg_q_init(void)
++{
++	rw_tg_seq_init(&rw_tg_q);
++}
++
++/* at the submit of `fence` (NULL: nothing was queued, nothing to wait for) */
++static void
++rw_tg_seq_bind(void *fence)
++{
++	pthread_once(&rw_tg_q_once, rw_tg_q_init);
++	rw_tg_init();
++	if (fence == NULL || !(rw_tg.bufpool || rw_tg.texpool || rw_tg.thumbcache)) {
++		return;                 /* (nothing pooled in this process: nobody asks) */
++	}
++	pthread_mutex_lock(&rw_tg_q_lock);
++	uint64_t s = rw_tg_seq_submit(&rw_tg_q);
++	int i;
++
++	for (i = 0; i < RW_TG_FENCES && rw_tg_fences[i].fence != NULL; i++) {
++	}
++	if (i < RW_TG_FENCES) {
++		rw_tg_fences[i].fence = fence;
++		rw_tg_fences[i].seq = s;
++	} else {
++		/* no slot to find the number again at completion: it is counted as back now and the pools stop for good (512 command
++		 * buffers on the GPU at once does not happen; this only keeps the quarantine honest if it ever does) */
++		rw_tg_seq_done(&rw_tg_q, s);
++		rw_tg.bufpool = rw_tg.texpool = rw_tg.thumbcache = 0;
++	}
++	pthread_mutex_unlock(&rw_tg_q_lock);
++}
++
++/* on the fence queue, BEFORE the fence is waited for and let go (its address is unique until then) */
++static uint64_t
++rw_tg_seq_take(void *fence)
++{
++	uint64_t s = UINT64_MAX;
++
++	if (fence == NULL) {
++		return s;
++	}
++	pthread_once(&rw_tg_q_once, rw_tg_q_init);
++	pthread_mutex_lock(&rw_tg_q_lock);
++	for (int i = 0; i < RW_TG_FENCES; i++) {
++		if (rw_tg_fences[i].fence == fence) {
++			s = rw_tg_fences[i].seq;
++			rw_tg_fences[i].fence = NULL;
++			break;
++		}
++	}
++	pthread_mutex_unlock(&rw_tg_q_lock);
++	return s;
++}
++
++/* after the fence came back (or failed: the GPU is not running it any more either way) */
++static void
++rw_tg_seq_back(uint64_t s)
++{
++	if (s == UINT64_MAX) {
++		return;
++	}
++	pthread_mutex_lock(&rw_tg_q_lock);
++	rw_tg_seq_done(&rw_tg_q, s);
++	pthread_mutex_unlock(&rw_tg_q_lock);
++}
++
++static uint64_t
++rw_tg_mark(void)
++{
++	pthread_once(&rw_tg_q_once, rw_tg_q_init);
++	pthread_mutex_lock(&rw_tg_q_lock);
++	uint64_t m = rw_tg_seq_mark(&rw_tg_q);
++	pthread_mutex_unlock(&rw_tg_q_lock);
++	return m;
++}
++
++static BOOL
++rw_tg_safe(uint64_t mark)
++{
++	pthread_mutex_lock(&rw_tg_q_lock);
++	BOOL ok = rw_tg_seq_safe(&rw_tg_q, mark);
++	pthread_mutex_unlock(&rw_tg_q_lock);
++	return ok;
++}
++
++/* ---- the buffer pool ---- */
++#define RW_TG_BUF_MAX_BYTES (48u << 20)
++#define RW_TG_BUF_MAX_COUNT 384
++#define RW_TG_BUF_BIG (256u << 10)            /* from here zeroed on a background queue after the quarantine, before reuse */
++#define RW_TG_AGE_NS 3000000000ULL
++struct rw_tg_pbuf {
++	struct rwa_buffer *b;
++	size_t cap;
++	uint64_t mark, parked;
++	int clean, busy;
++	struct rw_tg_pbuf *next;
++};
++static struct rw_tg_pbuf *rw_tg_bufs;
++static size_t rw_tg_buf_bytes;
++static unsigned rw_tg_buf_count;
++static pthread_mutex_t rw_tg_buf_lock = PTHREAD_MUTEX_INITIALIZER;
++static __thread int rw_tg_nozero_next;         /* -newBufferWithBytes: overwrites what it asks for */
++
++/* the capacity a new buffer of `length` is made with while the pool is on (so it can be handed to the next request of its class) */
++static size_t
++rw_tg_buf_capacity(size_t length)
++{
++	rw_tg_init();
++	return rw_tg.bufpool ? rw_tg_class(length) : length;
++}
++
++static struct rwa_buffer *
++rw_tg_buf_take(size_t length, size_t *cap_out)
++{
++	int nozero = rw_tg_nozero_next;
++
++	rw_tg_nozero_next = 0;
++	rw_tg_init();
++	if (!rw_tg.bufpool || length == 0) {
++		return NULL;
++	}
++	size_t cls = rw_tg_class(length);
++	struct rw_tg_pbuf *e = NULL, **pp;
++
++	pthread_once(&rw_tg_q_once, rw_tg_q_init);
++	pthread_mutex_lock(&rw_tg_buf_lock);
++	for (pp = &rw_tg_bufs; *pp != NULL; pp = &(*pp)->next) {
++		struct rw_tg_pbuf *c = *pp;
++
++		if (!c->busy && c->cap >= cls && c->cap <= cls + cls / 8 && (c->cap < RW_TG_BUF_BIG ? rw_tg_safe(c->mark) : c->clean)) {
++			*pp = c->next;
++			e = c;
++			rw_tg_buf_bytes -= c->cap;
++			rw_tg_buf_count--;
++			break;
++		}
++	}
++	pthread_mutex_unlock(&rw_tg_buf_lock);
++	if (e == NULL) {
++		__sync_add_and_fetch(&rw_tg_n.buf_miss, 1);
++		return NULL;
++	}
++	struct rwa_buffer *b = e->b;
++	uint8_t *map = mesa.buffer_map(b);
++
++	if (!e->clean && map != NULL) {
++		/* Metal's new buffers read zero; -newBufferWithBytes: writes [0, length) itself, the rest (read by padded constant
++		 * buffers, see air_metal.c) is zeroed all the same */
++		size_t from = nozero ? length : 0;
++
++		memset(map + from, 0, e->cap - from);
++		if (nozero) {
++			__sync_add_and_fetch(&rw_tg_n.buf_nozero, 1);
++		}
++	}
++	rw_tg.buffer_recycle(b);
++	*cap_out = e->cap;
++	free(e);
++	__sync_add_and_fetch(&rw_tg_n.buf_hit, 1);
++	return b;
++}
++
++static void
++rw_tg_buf_sweep(void)
++{
++	struct rw_tg_pbuf *drop = NULL, **pp;
++	uint64_t now = rw_now_ns();
++
++	pthread_mutex_lock(&rw_tg_buf_lock);
++	/* the list is newest first: past the budget or too old, from the back */
++	unsigned k = 0;
++	size_t bytes = 0;
++
++	for (pp = &rw_tg_bufs; *pp != NULL;) {
++		struct rw_tg_pbuf *c = *pp;
++
++		k++;
++		bytes += c->cap;
++		if (!c->busy && (now - c->parked > RW_TG_AGE_NS || bytes > RW_TG_BUF_MAX_BYTES || k > RW_TG_BUF_MAX_COUNT) &&
++		    rw_tg_safe(c->mark)) {
++			*pp = c->next;
++			rw_tg_buf_bytes -= c->cap;
++			rw_tg_buf_count--;
++			bytes -= c->cap;
++			k--;
++			c->next = drop;
++			drop = c;
++			continue;
++		}
++		pp = &c->next;
++	}
++	pthread_mutex_unlock(&rw_tg_buf_lock);
++	while (drop != NULL) {
++		struct rw_tg_pbuf *n = drop->next;
++
++		mesa.buffer_destroy(drop->b);
++		free(drop);
++		drop = n;
++		__sync_add_and_fetch(&rw_tg_n.buf_drop, 1);
++	}
++}
++
++static dispatch_queue_t
++rw_tg_janitor(void)
++{
++	static dispatch_once_t once;
++	static dispatch_queue_t q;
++
++	dispatch_once(&once, ^{
++		q = dispatch_queue_create("com.redwood.metal.thumbgrid", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
++		    QOS_CLASS_UTILITY, 0));
++	});
++	return q;
++}
++
++/* the buffer's owner let it go: kept for the next request of its class instead of destroyed. NO: not taken (destroy it). */
++static BOOL
++rw_tg_buf_park(struct rwa_buffer *b)
++{
++	rw_tg_init();
++	if (!rw_tg.bufpool || b == NULL || mesa.buffer_map(b) == NULL) {
++		return NO;
++	}
++	size_t cap = rw_tg.buffer_recycle(b);   /* (also forgets its argument-buffer records now) */
++
++	if (cap == 0 || cap > RW_TG_BUF_MAX_BYTES / 2 || cap != rw_tg_class(cap)) {
++		return NO;              /* not one of ours (made before the pool, or with an odd size) */
++	}
++	struct rw_tg_pbuf *e = calloc(1, sizeof(*e));
++
++	if (e == NULL) {
++		return NO;
++	}
++	e->b = b;
++	e->cap = cap;
++	e->mark = rw_tg_mark();
++	e->parked = rw_now_ns();
++	e->busy = cap >= RW_TG_BUF_BIG;
++	pthread_mutex_lock(&rw_tg_buf_lock);
++	e->next = rw_tg_bufs;
++	rw_tg_bufs = e;
++	rw_tg_buf_bytes += cap;
++	rw_tg_buf_count++;
++	pthread_mutex_unlock(&rw_tg_buf_lock);
++	__sync_add_and_fetch(&rw_tg_n.buf_park, 1);
++	if (e->busy) {
++		/* zeroed off the caller's thread once the GPU is done with it (kernel zeroing of 3-16 MB was 2-9 ms on the allocating thread) */
++		dispatch_async(rw_tg_janitor(), ^{
++			uint64_t t0 = rw_now_ns();
++
++			while (!rw_tg_safe(e->mark) && rw_now_ns() - t0 < 1000000000ULL) {
++				usleep(2000);
++			}
++			if (rw_tg_safe(e->mark)) {
++				memset(mesa.buffer_map(e->b), 0, e->cap);
++				e->clean = 1;
++				__sync_add_and_fetch(&rw_tg_n.buf_bgzero, 1);
++			}
++			pthread_mutex_lock(&rw_tg_buf_lock);
++			e->busy = 0;
++			pthread_mutex_unlock(&rw_tg_buf_lock);
++		});
++	}
++	rw_tg_buf_sweep();
++	return YES;
++}
++
++/* ---- the texture pool (textures of -newTextureWithDescriptor:, not over a surface or a buffer, not views) ---- */
++#define RW_TG_TEX_MAX 64
++#define RW_TG_TEX_MAX_BYTES (40u << 20)
++struct rw_tg_ptex {
++	struct rwa_texture *t;
++	struct rwa_texture_shape shape;
++	size_t bytes;
++	uint64_t mark, parked;
++	struct rw_tg_ptex *next;
++};
++static struct rw_tg_ptex *rw_tg_texs;
++static unsigned rw_tg_tex_count;
++static size_t rw_tg_tex_bytes;
++static pthread_mutex_t rw_tg_tex_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static BOOL
++rw_tg_same_shape(const struct rwa_texture_shape *a, const struct rwa_texture_shape *b)
++{
++	return a->pixel_format == b->pixel_format && a->type == b->type && a->width == b->width && a->height == b->height &&
++	       a->depth == b->depth && a->array_length == b->array_length && a->mip_levels == b->mip_levels &&
++	       a->sample_count == b->sample_count && a->usage == b->usage;
++}
++
++static size_t
++rw_tg_shape_bytes(const struct rwa_texture_shape *s)
++{
++	size_t px = (size_t)s->width * (s->height ? s->height : 1) * (s->depth ? s->depth : 1) * (s->array_length ? s->array_length : 1) *
++		    (s->sample_count ? s->sample_count : 1);
++
++	return px * 8 * (s->mip_levels > 1 ? 4 : 3) / 3 / 2;   /* ~4 bytes a texel (8 for the wide formats, averaged), mips +1/3 */
++}
++
++static struct rwa_texture *
++rw_tg_tex_take(const struct rwa_texture_shape *shape)
++{
++	rw_tg_init();
++	if (!rw_tg.texpool) {
++		return NULL;
++	}
++	struct rw_tg_ptex *e = NULL, **pp;
++
++	pthread_once(&rw_tg_q_once, rw_tg_q_init);
++	pthread_mutex_lock(&rw_tg_tex_lock);
++	for (pp = &rw_tg_texs; *pp != NULL; pp = &(*pp)->next) {
++		if (rw_tg_same_shape(&(*pp)->shape, shape) && rw_tg_safe((*pp)->mark)) {
++			e = *pp;
++			*pp = e->next;
++			rw_tg_tex_count--;
++			rw_tg_tex_bytes -= e->bytes;
++			break;
++		}
++	}
++	pthread_mutex_unlock(&rw_tg_tex_lock);
++	if (e == NULL) {
++		__sync_add_and_fetch(&rw_tg_n.tex_miss, 1);
++		return NULL;
++	}
++	struct rwa_texture *t = e->t;
++
++	free(e);
++	if (rw_tg.texture_recycle(t) != 0) {
++		mesa.texture_destroy(t);
++		return NULL;
++	}
++	__sync_add_and_fetch(&rw_tg_n.tex_hit, 1);
++	return t;
++}
++
++static BOOL
++rw_tg_tex_park(struct rwa_texture *t, const struct rwa_texture_shape *shape)
++{
++	rw_tg_init();
++	size_t bytes = rw_tg_shape_bytes(shape);
++
++	if (!rw_tg.texpool || t == NULL || bytes > RW_TG_TEX_MAX_BYTES / 4 || shape->sample_count > 1) {
++		return NO;
++	}
++	struct rw_tg_ptex *e = calloc(1, sizeof(*e)), *drop = NULL;
++
++	if (e == NULL) {
++		return NO;
++	}
++	e->t = t;
++	e->shape = *shape;
++	e->bytes = bytes;
++	e->mark = rw_tg_mark();
++	e->parked = rw_now_ns();
++	pthread_mutex_lock(&rw_tg_tex_lock);
++	e->next = rw_tg_texs;
++	rw_tg_texs = e;
++	rw_tg_tex_count++;
++	rw_tg_tex_bytes += bytes;
++	/* past the budget or too old (newest first: cut from the back) */
++	{
++		struct rw_tg_ptex **pp = &rw_tg_texs;
++		unsigned k = 0;
++		size_t sum = 0;
++		uint64_t now = rw_now_ns();
++
++		while (*pp != NULL) {
++			struct rw_tg_ptex *c = *pp;
++
++			k++;
++			sum += c->bytes;
++			if ((k > RW_TG_TEX_MAX || sum > RW_TG_TEX_MAX_BYTES || now - c->parked > RW_TG_AGE_NS) && rw_tg_safe(c->mark)) {
++				*pp = c->next;
++				rw_tg_tex_count--;
++				rw_tg_tex_bytes -= c->bytes;
++				sum -= c->bytes;
++				k--;
++				c->next = drop;
++				drop = c;
++				continue;
++			}
++			pp = &c->next;
++		}
++	}
++	pthread_mutex_unlock(&rw_tg_tex_lock);
++	__sync_add_and_fetch(&rw_tg_n.tex_park, 1);
++	while (drop != NULL) {
++		struct rw_tg_ptex *n = drop->next;
++
++		mesa.texture_destroy(drop->t);
++		free(drop);
++		drop = n;
++		__sync_add_and_fetch(&rw_tg_n.tex_drop, 1);
++	}
++	return YES;
++}
++
++/* ---- the converted-thumbnail cache: (surface, shape) -> its RGB texture and planes import, with the seed/probe they hold ---- */
++#define RW_TG_THUMBS 24
++#define RW_TG_THUMB_MAX_BYTES (32u << 20)
++struct rw_tg_thumb {
++	void *surface;                  /* retained by the cache */
++	unsigned plane;
++	struct rwa_texture_shape shape; /* as asked (format 500) */
++	struct rwa_texture *own, *src, *pad;
++	BOOL padded, exact, copiedOnce;
++	uint32_t seed, probe;
++	size_t bytes;
++	uint64_t mark, parked;
++	struct rw_tg_thumb *next;
++};
++static struct rw_tg_thumb *rw_tg_thumbs;
++static pthread_mutex_t rw_tg_thumb_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static void
++rw_tg_thumb_free(struct rw_tg_thumb *e)
++{
++	if (e->src != NULL) {
++		mesa.texture_destroy(e->src);
++	}
++	if (e->pad != NULL) {
++		mesa.texture_destroy(e->pad);
++	}
++	if (e->own != NULL) {
++		mesa.texture_destroy(e->own);
++	}
++	if (e->surface != NULL) {
++		CFRelease(e->surface);
++	}
++	free(e);
++}
++
++/* the CHECK: one block of a converted thumbnail against the CPU's conversion of the surface's bytes, on the background queue */
++static void
++rw_tg_report_maybe(void)
++{
++	static uint64_t last;
++	static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
++	uint64_t now = rw_now_ns();
++
++	rw_tg_init();
++	if (!(rw_tg.photos || rw_tg.pools_all || rw_tg.async_all || rw_tg.check_all) || now - last < 5000000000ULL) {
++		return;
++	}
++	if (pthread_mutex_trylock(&lk) != 0) {
++		return;
++	}
++	if (now - last < 5000000000ULL) {
++		pthread_mutex_unlock(&lk);
++		return;
++	}
++	last = now;
++	pthread_mutex_unlock(&lk);
++	uint64_t zeroed = 0, saved = 0;
++
++	if (rw_tg.ubo_stats != NULL) {
++		rw_tg.ubo_stats(&zeroed, &saved);
++	}
++	if (rw_tg.log) {
++		m2m_log('I', "TG", "NORD2 PERF PHOTOS TG %s: live %d | conv gpu %ld (exact %ld padded %ld) cpu %ld, reconverted-live %ld skipped %ld "
++		    "deferred-pending %ld | thumbcache hit %ld miss %ld park %ld evict %ld | buf hit %ld miss %ld park %ld bgzero %ld nozero %ld drop %ld "
++		    "(%u parked, %zu KiB) | tex hit %ld miss %ld park %ld drop %ld (%u parked) | async dispatch %ld (flush before CPU blit %ld) | "
++		    "rttouch %ld | pending max %ld | ubo tail zeroed %llu KiB saved %llu KiB (since load)\n", getprogname(), rw_tg_live_active(),
++		    rw_tg_n.conv_gpu, rw_tg_n.conv_exact, rw_tg_n.conv_padded, rw_tg_n.conv_cpu, rw_tg_n.conv_live, rw_tg_n.conv_skip,
++		    rw_tg_n.conv_deferred, rw_tg_n.thumb_hit, rw_tg_n.thumb_miss, rw_tg_n.thumb_park, rw_tg_n.thumb_evict, rw_tg_n.buf_hit,
++		    rw_tg_n.buf_miss, rw_tg_n.buf_park, rw_tg_n.buf_bgzero, rw_tg_n.buf_nozero, rw_tg_n.buf_drop, rw_tg_buf_count,
++		    rw_tg_buf_bytes >> 10, rw_tg_n.tex_hit, rw_tg_n.tex_miss, rw_tg_n.tex_park, rw_tg_n.tex_drop, rw_tg_tex_count,
++		    rw_tg_n.async_n, rw_tg_n.async_flush, rw_tg_n.rt_touch, rw_tg_n.pending_max, (unsigned long long)(zeroed >> 10),
++		    (unsigned long long)(saved >> 10));
++	}
++	if (rw_tg.check) {
++		m2m_log('I', "TG", "NORD2 PERF PHOTOS CHECK: mismatches=%ld checks=%ld gross=%ld edge=%ld stale=%ld raced=%ld failed=%ld cpu-unchecked=%ld "
++		    "maxdiff=%ld proc=%s\n", rw_tg_n.check_mismatch, rw_tg_n.check_n, rw_tg_n.check_gross, rw_tg_n.check_edge, rw_tg_n.check_stale,
++		    rw_tg_n.check_raced, rw_tg_n.check_fail, rw_tg_n.check_cpu, rw_tg_n.check_maxdiff, getprogname());
++	}
++}
++
++/* the async dispatch: usable for this commit? */
++static BOOL
++rw_tg_async_usable(BOOL tracing)
++{
++	rw_tg_init();
++	return rw_tg.async && !tracing && !rw_sync_commits() && mesa.submit != NULL && mesa.fence_wait != NULL;
++}
++
++/* a converted texture for `surface` from the cache (its RGB texture, planes import and state), or nil */
++static RedwoodMetalTexture *
++rw_tg_thumb_take(RedwoodMetalDevice *device, void *surface, NSUInteger plane, const struct rwa_texture_shape *shape)
++{
++	rw_tg_init();
++	if (!rw_tg.thumbcache || !rw_tg_live_active() || surface == NULL) {
++		return nil;
++	}
++	struct rw_tg_thumb *e = NULL, **pp;
++
++	pthread_mutex_lock(&rw_tg_thumb_lock);
++	for (pp = &rw_tg_thumbs; *pp != NULL; pp = &(*pp)->next) {
++		struct rw_tg_thumb *c = *pp;
++
++		if (c->surface == surface && c->plane == plane && rw_tg_same_shape(&c->shape, shape) && rw_tg_safe(c->mark)) {
++			*pp = c->next;
++			e = c;
++			break;
++		}
++	}
++	pthread_mutex_unlock(&rw_tg_thumb_lock);
++	if (e == NULL) {
++		__sync_add_and_fetch(&rw_tg_n.thumb_miss, 1);
++		return nil;
++	}
++	RedwoodMetalTexture *t = [[RedwoodMetalTexture alloc] initWithRedwoodDevice:device texture:e->own shape:shape];
++
++	e->own = NULL;
++	if (t == nil) {
++		rw_tg_thumb_free(e);
++		return nil;
++	}
++	[t redwoodSetIOSurface:surface plane:plane];
++	[t redwoodSetYCbCrSource:e->src];
++	[t redwoodSetPadded:e->pad];
++	e->src = NULL;
++	e->pad = NULL;
++	[t redwoodTGSetExact:e->exact];
++	[t redwoodTGHold];
++	[t redwoodTGAdoptSeed:e->seed probe:e->probe once:e->copiedOnce];
++	rw_tg_thumb_free(e);            /* (only the cache's surface reference is left in it) */
++	__sync_add_and_fetch(&rw_tg_n.thumb_hit, 1);
++	/* converted again here only if the surface moved since (live rule) */
++	if (![t redwoodRefreshConverted]) {
++		[t release];
++		return nil;
++	}
++	return t;
++}
++
++static void
++rw_tg_thumb_put(struct rw_tg_thumb *e)
++{
++	struct rw_tg_thumb *drop = NULL;
++
++	pthread_mutex_lock(&rw_tg_thumb_lock);
++	e->next = rw_tg_thumbs;
++	rw_tg_thumbs = e;
++	{
++		struct rw_tg_thumb **pp = &rw_tg_thumbs;
++		unsigned k = 0;
++		size_t sum = 0;
++		uint64_t now = rw_now_ns();
++
++		while (*pp != NULL) {
++			struct rw_tg_thumb *c = *pp;
++
++			k++;
++			sum += c->bytes;
++			if ((k > RW_TG_THUMBS || sum > RW_TG_THUMB_MAX_BYTES || now - c->parked > RW_TG_AGE_NS) && rw_tg_safe(c->mark)) {
++				*pp = c->next;
++				sum -= c->bytes;
++				k--;
++				c->next = drop;
++				drop = c;
++				continue;
++			}
++			pp = &c->next;
++		}
++	}
++	pthread_mutex_unlock(&rw_tg_thumb_lock);
++	__sync_add_and_fetch(&rw_tg_n.thumb_park, 1);
++	while (drop != NULL) {
++		struct rw_tg_thumb *n = drop->next;
++
++		rw_tg_thumb_free(drop);
++		drop = n;
++		__sync_add_and_fetch(&rw_tg_n.thumb_evict, 1);
++	}
++}
++
++/* which conversions are checked: the first 16 of the process, then 1 in 64 */
++static BOOL
++rw_tg_check_due(unsigned long *k_out)
++{
++	static volatile unsigned long n;
++	unsigned long k = __sync_add_and_fetch(&n, 1);
++
++	*k_out = k;
++	return k <= 16 || k % 64 == 0;
++}
++
+ @interface RedwoodMetalSampler : _MTLSamplerState {
+ 	struct rwa_sampler *_sampler;
+ }
+@@ -4834,9 +5696,12 @@
+ 		.usage = (unsigned)[descriptor usage],
+ 	};
+ 	uint64_t t_made = rw_now_ns();
+-	struct rwa_texture *texture = mesa.texture_create(_mesa, &shape, why, sizeof(why));
++	struct rwa_texture *texture = rw_tg_tex_take(&shape);     /* y2s91: one of the same shape, let go a moment ago */
+ 
+ 	if (texture == NULL) {
++		texture = mesa.texture_create(_mesa, &shape, why, sizeof(why));
++	}
++	if (texture == NULL) {
+ 		m2m_log('E', "RES", "%s\n", why);
+ 		return nil;
+ 	}
+@@ -5654,6 +6519,13 @@
+ 		 * way of that -- a library without the call, planes the GPU cannot address in place -- leaves the conversion to the CPU. */
+ 		struct rwa_texture *planes = NULL;
+ 
++		/* y2s91 (thumbgrid): the converted thumbnail this surface had a moment ago, from the cache (follow-live only) */
++		RedwoodMetalTexture *tg_hit = rw_tg_thumb_take(self, s, p, &shape);
++
++		if (tg_hit != nil) {
++			return tg_hit;
++		}
++		BOOL tg_exact = NO;
+ 		const char *cpu_why = NULL;
+ 		bool cpu_only = rw_ycbcr_cpu_only(shape.width, shape.height, &cpu_why);
+ 
+@@ -5666,7 +6538,13 @@
+ 		if (mesa.texture_convert_ycbcr != NULL && !cpu_only && ((shape.width & 1u) || (shape.height & 1u)) &&
+ 		    mesa.texture_copy != NULL) {
+ 			planes = rw_ycbcr_import_padded(_mesa, s, &shape, why3, sizeof(why3));
+-			if (planes != NULL) {
++			rw_tg_init();
++			if (planes != NULL && rw_tg.exact) {
++				/* y2s91: converted in one exact pass from this import (rwa_texture_convert_ycbcr_exact): no padded picture */
++				tg_exact = YES;
++				RW_AGAIN('I', "SURF", "ycbcr-odd: a YCbCr surface (%ux%u) is read by the GPU through a %ux%u import and converted at its own "
++				    "size in one pass (thumbgrid exact)\n", shape.width, shape.height, (shape.width + 1u) & ~1u, (shape.height + 1u) & ~1u);
++			} else if (planes != NULL) {
+ 				struct rwa_texture_shape tmp_shape = shape;
+ 				char why4[256] = { 0 };
+ 
+@@ -5711,6 +6589,8 @@
+ 			[converted redwoodSetIOSurface:s plane:p];
+ 			[converted redwoodSetYCbCrSource:planes];
+ 			[converted redwoodSetPadded:pad_tmp];
++			[converted redwoodTGSetExact:tg_exact && planes != NULL];   /* y2s91 */
++			[converted redwoodTGHold];
+ 			if ([converted redwoodConvertSurface]) {
+ 				return converted;
+ 			}
+@@ -6014,6 +6894,7 @@
+ 
+ - (id)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(NSUInteger)options
+ {
++	rw_tg_nozero_next = bytes != NULL;      /* y2s91: written over just below: a pooled buffer is not zeroed first */
+ 	RedwoodMetalBuffer *buffer = [self newBufferWithLength:length options:options];
+ 
+ 	if (buffer != nil && bytes != NULL && [buffer contents] != NULL) {
+@@ -6053,8 +6934,13 @@
+ 		char why[256] = { 0 };
+ 
+ 		uint64_t t_made = rw_now_ns();
++		size_t tg_cap = 0;
+ 
+-		_mesa = mesa.buffer_create([device mesaDevice], length, why, sizeof(why));
++		/* y2s91: a buffer of the pool (its class, zeroed), else a new one made at the class's capacity so it can be pooled later */
++		_mesa = rw_tg_buf_take(length, &tg_cap);
++		if (_mesa == NULL) {
++			_mesa = mesa.buffer_create([device mesaDevice], rw_tg_buf_capacity(length), why, sizeof(why));
++		}
+ 		if (_mesa != NULL) {
+ 			rw_note_alloc(NULL, length, rw_now_ns() - t_made);
+ 		}
+@@ -6148,7 +7034,9 @@
+ - (void)dealloc
+ {
+ 	if (_mesa != NULL) {
+-		mesa.buffer_destroy(_mesa);
++		if (!rw_tg_buf_park(_mesa)) {   /* y2s91: kept for the next request of its class */
++			mesa.buffer_destroy(_mesa);
++		}
+ 		rw_note_free(false, 0);
+ 		[super dealloc];
+ 		return;
+@@ -6393,6 +7281,7 @@
+ 
+ - (void)dealloc
+ {
++	(void)[self redwoodTGPark];     /* y2s91: to a pool / the thumbnail cache (what went is NULL below) */
+ 	if (_ycbcrSource != NULL) {
+ 		mesa.texture_destroy(_ycbcrSource);
+ 	}
+@@ -6409,6 +7298,7 @@
+ 		if (_useHeld) {
+ 			rw_use_give(_iosurface);        /* y2s84: before the surface reference goes */
+ 		}
++		[self redwoodTGGiveBack];       /* y2s91 */
+ 		CFRelease(_iosurface);
+ 	}
+ 	[_parent release];
+@@ -6416,6 +7306,261 @@
+ 	[super dealloc];
+ }
+ 
++/* ==== y2s91 (thumbgrid): the texture's part (see the rw_tg_* block above RedwoodMetalTexture's implementation) ==== */
++- (void)redwoodTGSetExact:(BOOL)exact { _tgExact = exact; }
++
++/* a converted YCbCr texture holds its surface's use count while it exists (standalone over thumbfix5; y2s84 does it when merged) */
++- (void)redwoodTGHold
++{
++	rw_tg_init();
++	if (!_tgHeld && _iosurface != NULL && rw_tg.photos && rw_tg.master) {
++		_tgHeld = rw_tg_use_take(_iosurface);
++	}
++}
++
++- (void)redwoodTGGiveBack
++{
++	if (_tgHeld) {
++		rw_tg_use_give(_iosurface);
++		_tgHeld = NO;
++	}
++}
++
++/* (a texture of the thumbnail cache) its texture already holds what was converted from the surface at `seed` / `probe` */
++- (void)redwoodTGAdoptSeed:(uint32_t)seed probe:(uint32_t)probe once:(BOOL)once
++{
++	_copied = YES;
++	_ycbcr = YES;
++	_frozen = NO;
++	_freezeTries = 0;
++	_convertedAt = rw_now_ns();
++	_copySeed = seed;
++	_ycbcrProbe = probe;
++	_copiedOnce = once;
++}
++
++/*
++ * FOLLOW-LIVE, the rule that replaces y2s83's freeze in MobileSlideShow once the kernel's use count is real and this texture holds it
++ * (the pool can then not hand the buffer to the next picture while the texture exists, which is all the freeze stood in for):
++ *   -1  not this rule (another process, a switch, no real use count): the y2s60..y2s83 rules decide as before;
++ *    0  keep what the texture holds: the surface's seed and probe bytes are what they were at the last conversion, OR this process's
++ *       GPU has a write of the surface in flight (committed, not completed) -- the last good conversion stays until the write's
++ *       completion moves the seed (-redwoodTouchSurface), and the next use converts the finished picture;
++ *    1  convert now: never converted, or the seed / the probe bytes moved (a decoder's write-unlock moves the seed: SweetSurface
++ *       trapUnlock without kIOSurfaceLockReadOnly; this process's GPU writes move it at completion: compute (y2s60) and, y2s91,
++ *       render passes into a YCbCr plane).
++ * No timing rule (no "young" 3 s, no "finished" luma row, no 3 s give-up).
++ */
++- (int)redwoodTGLiveDecision
++{
++	struct rw_ycbcr_planes pl;
++
++	if (!_ycbcr || _raw540 || _iosurface == NULL || !rw_tg_live_active()) {
++		return -1;
++	}
++	if (!rw_ycbcr_planes_of(_iosurface, &pl)) {
++		return -1;
++	}
++	uint32_t seed = rw_ios.seed != NULL ? rw_ios.seed(_iosurface) : 0, probe = rw_ycbcr_probe(&pl);
++
++	if (_copiedOnce && seed == _copySeed && probe == _ycbcrProbe) {
++		__sync_add_and_fetch(&rw_tg_n.conv_skip, 1);
++		return 0;
++	}
++	if (_copiedOnce && rw_tg_pending_has(_iosurface)) {
++		__sync_add_and_fetch(&rw_tg_n.conv_deferred, 1);
++		return 0;
++	}
++	__sync_add_and_fetch(&rw_tg_n.conv_live, 1);
++	return 1;
++}
++
++/* y2s91: the GPU pass of an odd-sized surface straight from its even-padded planes import (rwa_texture_convert_ycbcr_exact) */
++- (int)redwoodTGConvertExact:(int)matrix full:(int)full why:(char *)why size:(size_t)size
++{
++	__sync_add_and_fetch(&rw_tg_n.conv_exact, 1);
++	return rw_tg.convert_exact(_texture, _ycbcrSource, matrix, full, why, size);
++}
++
++/* a conversion was queued (gpu) or written (cpu): a new generation of the picture; some are checked against the CPU */
++- (void)redwoodTGConverted:(uint32_t)seed probe:(uint32_t)probe gpu:(BOOL)gpu
++{
++	uint64_t gen = __sync_add_and_fetch(&_tgGen, 1);
++	unsigned long k;
++
++	rw_tg_init();
++	__sync_add_and_fetch(gpu ? &rw_tg_n.conv_gpu : &rw_tg_n.conv_cpu, 1);
++	if (gpu && !_tgExact && _padded) {
++		__sync_add_and_fetch(&rw_tg_n.conv_padded, 1);
++	}
++	if (!rw_tg.check || _raw540 || !rw_tg_check_due(&k)) {
++		return;
++	}
++	if (!gpu) {
++		__sync_add_and_fetch(&rw_tg_n.check_cpu, 1);   /* the CPU converter is not the pass: its chroma is not checked here */
++		return;
++	}
++	[self retain];
++	dispatch_async(rw_tg_janitor(), ^{
++		[self redwoodTGRunCheck:k gen:gen seed:seed probe:probe];
++		[self release];
++		rw_tg_report_maybe();
++	});
++}
++
++/*
++ * THE CHECK ('NORD2 PERF PHOTOS CHECK'): a 16x16 block of what the GPU converted (read back: this waits for the conversion's job)
++ * against rw_tg_ref_bgra over the surface's own bytes (read-only lock). Classified:
++ *   raced     the texture was converted again meanwhile (another generation): nothing to compare;
++ *   stale     the surface's seed/probe moved since this conversion: its next use converts again (follow-live), not an error;
++ *   mismatch  same surface bytes, different picture: a conversion error (gross = a pixel off by more than 48: black, stripes, garbage).
++ */
++- (void)redwoodTGRunCheck:(unsigned long)k gen:(uint64_t)gen seed:(uint32_t)seed probe:(uint32_t)probe
++{
++	unsigned bx, by, bw, bh;
++	int edge;
++	uint8_t gpu[16 * 16 * 4], ref[16 * 16 * 4];
++	char why[256] = { 0 };
++
++	if (_tgGen != gen || _texture == NULL || _iosurface == NULL) {
++		__sync_add_and_fetch(&rw_tg_n.check_raced, 1);
++		return;
++	}
++	rw_tg_check_block(k, _shape.width, _shape.height, &bx, &by, &bw, &bh, &edge);
++	const unsigned origin[3] = { bx, by, 0 }, size[3] = { bw, bh, 1 };
++
++	if (mesa.texture_read(_texture, 0, 0, origin, size, gpu, (size_t)bw * 4, why, sizeof(why)) != 0) {
++		__sync_add_and_fetch(&rw_tg_n.check_fail, 1);
++		RW_AGAIN('W', "TG", "NORD2 PERF PHOTOS CHECK: read-back failed: %s\n", why);
++		return;
++	}
++	if (_tgGen != gen) {
++		__sync_add_and_fetch(&rw_tg_n.check_raced, 1);
++		return;
++	}
++	struct rw_ycbcr_planes pl;
++	BOOL stale = NO, have = NO;
++	int matrix = rw_ycbcr_matrix_of(_iosurface);
++
++	if (rw_ios.lock(_iosurface, 1, NULL) == 0) {
++		if (rw_ycbcr_planes_of(_iosurface, &pl) && pl.width == _shape.width && pl.height == _shape.height) {
++			uint32_t s_now = rw_ios.seed != NULL ? rw_ios.seed(_iosurface) : 0;
++
++			stale = s_now != seed || rw_ycbcr_probe(&pl) != probe;
++			rw_tg_ref_bgra(pl.luma, pl.luma_row, pl.chroma, pl.chroma_row, pl.width, pl.height, matrix, pl.fourcc == '420f', bx, by, bw,
++				       bh, ref);
++			have = YES;
++		}
++		rw_ios.unlock(_iosurface, 1, NULL);
++	}
++	if (!have) {
++		__sync_add_and_fetch(&rw_tg_n.check_fail, 1);
++		return;
++	}
++	struct rw_tg_cmp c;
++
++	rw_tg_compare(gpu, (size_t)bw * 4, ref, (size_t)bw * 4, bw, bh, 10, 48, &c);
++	__sync_add_and_fetch(&rw_tg_n.check_n, 1);
++	if (edge) {
++		__sync_add_and_fetch(&rw_tg_n.check_edge, 1);
++	}
++	if (stale) {
++		__sync_add_and_fetch(&rw_tg_n.check_stale, 1);
++		return;
++	}
++	if ((long)c.maxdiff > rw_tg_n.check_maxdiff) {
++		rw_tg_n.check_maxdiff = (long)c.maxdiff;
++	}
++	if (rw_tg_is_mismatch(&c)) {
++		long m = __sync_add_and_fetch(&rw_tg_n.check_mismatch, 1);
++
++		if (c.gross) {
++			__sync_add_and_fetch(&rw_tg_n.check_gross, 1);
++		}
++		if (m <= 32 || m % 16 == 0) {
++			m2m_log('W', "TG", "NORD2 PERF PHOTOS CHECK MISMATCH n=%ld: surface %u (%ux%u '%c%c%c%c' %s) block %u,%u %ux%u%s: %u px over 10, "
++			    "%u gross, max %u, mean %.2f; gpu %02x%02x%02x ref %02x%02x%02x at its first pixel; %s conversion gen %llu\n", m,
++			    rwd_surface_id(_iosurface), pl.width, pl.height, (char)(pl.fourcc >> 24), (char)(pl.fourcc >> 16), (char)(pl.fourcc >> 8),
++			    (char)pl.fourcc, matrix == 1 ? "709" : matrix == 2 ? "2020" : "601", bx, by, bw, bh, edge ? " (edge)" : "", c.over, c.gross,
++			    c.maxdiff, c.sumdiff / (3.0 * bw * bh), gpu[2], gpu[1], gpu[0], ref[2], ref[1], ref[0],
++			    _tgExact ? "exact" : _padded ? "padded+copy" : "direct", (unsigned long long)gen);
++		}
++	} else if (k <= 4) {
++		m2m_log('I', "TG", "NORD2 PERF PHOTOS CHECK ok n=%lu: surface %u (%ux%u) block %u,%u%s max %u (%s)\n", k, rwd_surface_id(_iosurface),
++		    pl.width, pl.height, bx, by, edge ? " (edge)" : "", c.maxdiff, _tgExact ? "exact" : _padded ? "padded+copy" : "direct");
++	}
++}
++
++/*
++ * At -dealloc: NO, or YES when this texture's GPU objects went to a pool or the thumbnail cache instead of being destroyed (the
++ * ivars that held them are then NULL, so the rest of -dealloc lets go only of what is left).
++ */
++- (BOOL)redwoodTGPark
++{
++	rw_tg_init();
++	if (!rw_tg.master || _parent != nil) {
++		return NO;
++	}
++	/* a converted thumbnail: to the cache (with its surface reference) */
++	if (_ycbcr && !_raw540 && _iosurface != NULL && _texture != NULL && _copiedOnce && rw_tg.thumbcache && rw_tg_live_active()) {
++		struct rw_tg_thumb *e = calloc(1, sizeof(*e));
++
++		if (e != NULL) {
++			[self redwoodTGGiveBack];
++#ifdef RW_TG_HAVE_USECOUNT
++			if (_useHeld) {                 /* y2s84's hold: -dealloc gives it back only while _iosurface is set */
++				rw_use_give(_iosurface);
++				_useHeld = NO;
++			}
++#endif
++			e->surface = _iosurface;        /* the reference this texture held */
++			e->plane = (unsigned)_iosurfacePlane;
++			e->shape = _shape;
++			e->own = _texture;
++			e->src = _ycbcrSource;
++			e->pad = _padTmp;
++			e->padded = _padded;
++			e->exact = _tgExact;
++			e->copiedOnce = _copiedOnce;
++			e->seed = _copySeed;
++			e->probe = _ycbcrProbe;
++			e->bytes = (size_t)_shape.width * _shape.height * 4 * (_padTmp != NULL ? 2 : 1);
++			e->mark = rw_tg_mark();
++			e->parked = rw_now_ns();
++			_iosurface = NULL;
++			_texture = NULL;
++			_ycbcrSource = NULL;
++			_padTmp = NULL;
++			rw_tg_thumb_put(e);
++			return YES;
++		}
++	}
++	/* a plain texture of -newTextureWithDescriptor: to the texture pool */
++	if (_countedAt != 0 && _texture != NULL && _iosurface == NULL && _buffer == nil && !_copied && !_ycbcr &&
++	    rw_tg_tex_park(_texture, &_shape)) {
++		rw_note_free(true, rw_now_ns() - _countedAt);
++		_texture = NULL;
++		return YES;
++	}
++	return NO;
++}
++
++/* y2s91 rttouch: a render-pass attachment that writes a plane of a two-plane (YCbCr) surface IN PLACE: the texture to touch at
++ * completion (its seed then moves, and every conversion of the surface, in this process or another, follows), or nil */
++- (RedwoodMetalTexture *)redwoodTGTargetRoot
++{
++	RedwoodMetalTexture *t = self;
++
++	rw_tg_init();
++	if (!rw_tg.rttouch) {
++		return nil;
++	}
++	while (t->_parent != nil) {
++		t = t->_parent;
++	}
++	return !t->_copied && !t->_ycbcr && t->_iosurface != NULL && rw_ios_load() && rw_ios.planes(t->_iosurface) == 2 ? t : nil;
++}
++
+ - (void)redwoodCountedAt:(uint64_t)t { _countedAt = t; }
+ 
+ - (void)redwoodSetBuffer:(id)buffer offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bytesPerRow
+@@ -6695,6 +7840,12 @@
+ 			rule = base;            /* probe not answered yet: freeze this time, decide again at the next call */
+ 		}
+ 	}
++	/* y2s91 (thumbgrid): follow-live in place of the freeze, the young and the finished-row rules (-redwoodTGLiveDecision) */
++	int tg = [self redwoodTGLiveDecision];
++
++	if (tg == 0) {
++		return YES;
++	}
+ 	/*
+ 	 * y2s83 (thumbfix5): ... but only once the picture IS finished. Run v (q10jfe): the grid stays, but some cells are black or show a
+ 	 * strip of the photo and black elsewhere, always the same cells. The thumbnails are decoded into their pool buffers in place
+@@ -6704,7 +7855,7 @@
+ 	 * the last luma row of the surface holds data (a cleared buffer is luma 0 there; the decoder writes the rows in order). Until then
+ 	 * every use converts again (the young rule's GPU pass); after 3 s the picture is taken as it is (a photo that is black indeed).
+ 	 */
+-	if (rule == 1 && _frozen && _ycbcr) {
++	if (tg < 0 && rule == 1 && _frozen && _ycbcr) {
+ 		RW_PP_ADD(frozen_hits, 1);              /* y2s85 */
+ 		/*
+ 		 * y2s90 (final: usecount x photosperf): a frozen thumbnail gives its sources back only once the freeze rule is FINAL
+@@ -6719,7 +7870,7 @@
+ 	}
+ 	BOOL freeze_now = NO, unfinished = NO;
+ 
+-	if (rule == 1 && _ycbcr && _iosurface != NULL && rw_ios.lock(_iosurface, 1 /* read-only */, NULL) == 0) {
++	if (tg < 0 && rule == 1 && _ycbcr && _iosurface != NULL && rw_ios.lock(_iosurface, 1 /* read-only */, NULL) == 0) {
+ 		struct rw_ycbcr_planes fv;
+ 		BOOL finished = NO;
+ 
+@@ -6767,9 +7918,9 @@
+ 	if (young_rule < 0) {
+ 		young_rule = rw_is_photos() && access("/var/db/nord2-metal/no-young-reconvert", F_OK) != 0;
+ 	}
+-	BOOL young = young_rule == 1 && _ycbcrSource != NULL && _convertedAt != 0 && rw_now_ns() - _convertedAt < 3000000000ULL;
++	BOOL young = tg < 0 && young_rule == 1 && _ycbcrSource != NULL && _convertedAt != 0 && rw_now_ns() - _convertedAt < 3000000000ULL;
+ 
+-	if (_copiedOnce && seed == _copySeed && probe_now == _ycbcrProbe && !young && !unfinished && !freeze_now) {
++	if (tg != 1 && _copiedOnce && seed == _copySeed && probe_now == _ycbcrProbe && !young && !unfinished && !freeze_now) {
+ 		RW_PP_ADD(conv_same, 1);                /* y2s85 */
+ 		return YES;
+ 	}
+@@ -6800,6 +7951,7 @@
+ 		mesa.texture_destroy(_ycbcrSource);
+ 		_ycbcrSource = NULL;
+ 		_padded = NO;
++		_tgExact = NO;                  /* y2s91 */
+ 	}
+ 	/* y2s85: the cpu-view diagnostic (a lock and unlock of the surface at every conversion, logged or not) not in photosperf */
+ 	BOOL pp_view = rw_is_photos() && !rw_pp_opt();
+@@ -6850,7 +8002,11 @@
+ 
+ 		int conv_rc;
+ 
+-		if (_padded) {
++		if (_tgExact) {
++			/* y2s91: one pass, exact size, straight from the even-padded planes import: no _padTmp, no copy */
++			conv_rc = [self redwoodTGConvertExact:matrix full:full why:why size:sizeof(why)];
++			rw_ycbcr_odd_note(_iosurface, _texture, &planes, matrix, full, rw_now_ns() - t_gpu, conv_rc);
++		} else if (_padded) {
+ 			/* y2s63: into the even-sized picture, then its odd-sized part into the texture: two GPU passes, no pixel on the CPU */
+ 			const unsigned zero[3] = { 0, 0, 0 }, part[3] = { _shape.width, _shape.height, 1 };
+ 
+@@ -6870,6 +8026,7 @@
+ 			_copySeed = seed;
+ 			_ycbcrProbe = probe_now;
+ 			_copiedOnce = YES;
++			[self redwoodTGConverted:seed probe:probe_now gpu:YES];   /* y2s91 */
+ 			if (_padded) {                  /* y2s85 */
+ 				RW_PP_ADD(conv_odd, 1);
+ 			} else {
+@@ -6891,6 +8048,7 @@
+ 		mesa.texture_destroy(_ycbcrSource);
+ 		_ycbcrSource = NULL;
+ 		_padded = NO;
++		_tgExact = NO;                  /* y2s91 */
+ 		why[0] = 0;
+ 	}
+ 	if (rw_ios.lock(_iosurface, 1 /* kIOSurfaceLockReadOnly */, NULL) != 0) {
+@@ -6941,6 +8099,7 @@
+ 				_copySeed = seed;
+ 				_ycbcrProbe = probe;
+ 				_copiedOnce = YES;
++				[self redwoodTGConverted:seed probe:probe gpu:NO];   /* y2s91 */
+ 				RW_PP_ADD(conv_cpu, 1);         /* y2s85 */
+ 				[self redwoodPPConverted];
+ 			}
+@@ -8393,6 +9552,7 @@
+ 			[t redwoodTouchSurface];
+ 		}
+ 	}
++	rw_tg_pending_release(list);    /* y2s91: the writes are done and the seeds moved */
+ 	[list release];
+ }
+ 
+@@ -8432,8 +9592,13 @@
+ 		bool have_cpu_started = have_cpu && rw_cpu_ticks(&cpu_started);
+ 		NSUInteger handlers = [completed count], steps = [_work count];
+ 
+-		if (mesa.fence_wait([[_queue device] mesaDevice], fence, why, sizeof(why)) != 0) {
++		uint64_t tg_seq = rw_tg_seq_take(fence);       /* y2s91: (before the fence is let go) */
++		int tg_rc = mesa.fence_wait([[_queue device] mesaDevice], fence, why, sizeof(why));
++
++		rw_tg_seq_back(tg_seq);
++		if (tg_rc != 0) {
+ 			m2m_log('E', "CMD", "THE GPU DID NOT FINISH: %s\n", why);
++			rw_tg_pending_release(_writeBack);     /* y2s91: no touch follows; not in flight any more */
+ 			_error = [[NSError errorWithDomain:@"RedwoodMetal" code:3
+ 						  userInfo:@{ NSLocalizedDescriptionKey:
+ 							      [NSString stringWithUTF8String:why] }] retain];
+@@ -8702,6 +9867,8 @@
+ {
+ 	char why[512] = { 0 };
+ 
++	rw_tg_report_maybe();           /* y2s91: 'NORD2 PERF PHOTOS TG/CHECK' every 5 s */
++	BOOL tg_dispatch_out = NO;      /* y2s91: a deferred dispatch of this buffer is queued and not waited for yet */
+ 	BOOL queued = NO, trace = NO;
+ 	uint64_t t_start = rw_now_ns(), t_wait = 0, draws = 0;
+ 	uint64_t pp_dispatches = 0;     /* y2s85: dispatches of this buffer (a compute-only buffer for NORD2 PERF PHOTOS) */
+@@ -8757,6 +9924,12 @@
+ 			}
+ 		}
+ 		if (work->blit != nil) {
++			/* y2s91: some blits read or write a buffer's memory with the processor: deferred dispatches before them finish first */
++			if (tg_dispatch_out && mesa.finish != NULL) {
++				(void)mesa.finish([[_queue device] mesaDevice], why, sizeof(why));
++				tg_dispatch_out = NO;
++				__sync_add_and_fetch(&rw_tg_n.async_flush, 1);
++			}
+ 			uint64_t t_blit = rw_now_ns();
+ 			BOOL blit_ok = work->blit(why, sizeof(why));
+ 			uint64_t blit_ns = rw_now_ns() - t_blit;
+@@ -8783,6 +9956,23 @@
+ 		}
+ 		if (work->render != nil) {
+ 			draws++;
++			/* y2s91 rttouch: a plane of a YCbCr surface rendered into in place: touched (seed moved) at completion, and a write in
++			 * flight for the conversions of this process until then */
++			for (unsigned ci = 0; ci < work->colorCount && ci < 8; ci++) {
++				id ct = work->color[ci];
++				RedwoodMetalTexture *root = [ct isKindOfClass:[RedwoodMetalTexture class]] ? [(RedwoodMetalTexture *)ct redwoodTGTargetRoot] : nil;
++
++				if (root != nil) {
++					if (_writeBack == nil) {
++						_writeBack = [[NSMutableArray alloc] init];
++					}
++					if (![_writeBack containsObject:root]) {
++						[_writeBack addObject:root];
++						rw_tg_pending_add((void *)[root iosurface]);
++						__sync_add_and_fetch(&rw_tg_n.rt_touch, 1);
++					}
++				}
++			}
+ 			/* y2s85: a frame for NORD2 PERF PHOTOS = a buffer that draws to a full-screen colour target */
+ 			if (!_ppFrame && work->colorCount > 0 && work->color[0] != nil && [work->color[0] width] >= 1000 &&
+ 			    [work->color[0] height] >= 2000) {
+@@ -8858,6 +10048,7 @@
+ 					}
+ 					if (![_writeBack containsObject:root]) {
+ 						[_writeBack addObject:root];
++						rw_tg_pending_add((void *)[root iosurface]);   /* y2s91 */
+ 					}
+ 				}
+ 			}
+@@ -8877,12 +10068,22 @@
+ 		 * there and every offset is read as zero -- which is what an older library
+ 		 * did with one in any case, out loud. */
+ 		uint64_t t_disp = rw_now_ns();   /* y2s85 */
+-		int rc = mesa.dispatch_buffers != NULL
++		/* y2s91 async: queued like a draw and paid by this buffer's fence, instead of a flush and a wait per dispatch */
++		BOOL tg_deferred = rw_tg_async_usable(_tracing);
++		int rc = tg_deferred
++			    ? rw_tg.dispatch_deferred([work->pipeline compute], &bindings, table, work->count, work->groups, work->size, why,
++						      sizeof(why))
++			    : mesa.dispatch_buffers != NULL
+ 			    ? mesa.dispatch_buffers([work->pipeline compute], &bindings,
+ 						    table, work->count, work->groups,
+ 						    work->size, why, sizeof(why))
+ 			    : mesa.dispatch([work->pipeline compute], &bindings, work->groups,
+ 					    work->size, why, sizeof(why));
++		if (rc == 0 && tg_deferred) {
++			queued = YES;
++			tg_dispatch_out = YES;
++			__sync_add_and_fetch(&rw_tg_n.async_n, 1);
++		}
+ 		RW_PP_ADD(dispatch_ns, rw_now_ns() - t_disp);
+ 		pp_dispatches++;
+ 		if (rc != 0) {
+@@ -8905,6 +10106,8 @@
+ 		void *fence = mesa.submit([[_queue device] mesaDevice]);
+ 		uint64_t t_end = rw_now_ns();
+ 
++		rw_tg_seq_bind(fence);          /* y2s91: on the GPU until its fence (pool quarantine) */
++
+ 		rw_commit_report(draws, t_end - t_start, 0, top, topn, ntop);
+ 		if (draws == 0 && pp_dispatches != 0) {          /* y2s85 */
+ 			RW_PP_ADD(compute_cb, 1);

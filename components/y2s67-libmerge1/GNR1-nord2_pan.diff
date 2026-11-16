@@ -1,0 +1,151 @@
+--- orig/nord2_pan.c	2026-11-12 10:56:58.372248747 +0100
++++ src/nord2_pan.c	2026-11-12 10:59:12.937344179 +0100
+@@ -351,6 +351,132 @@
+ 		D.completed = seq;
+ }
+ 
++/* GNR1 (y2s63-gnr1, diagnostic): the kernel has always returned what a failed job died of (JS status, the
++ * context's MMU FAULTSTATUS and FAULTADDRESS) in WAIT_SEQ's structure output, and nothing here read it: every
++ * failure became "EIO" and, one level up, "did not finish within two seconds".  Now: the job's kind and chain
++ * head (from a ring of the last submits), the JS status and the MMU fault decoded, and which buffer object the
++ * address is in or nearest to (va, size, imported surface).  First 24 faults of a process. */
++#define GNR1_RING 128u
++static struct { uint64_t seq, jc; uint32_t kind, nbos, dropped; } gnr1_ring[GNR1_RING];
++static unsigned gnr1_faults_said;
++
++static void gnr1_note_submit(uint64_t seq, uint64_t jc, uint32_t kind, uint32_t nbos, uint32_t dropped)
++{
++	unsigned i = (unsigned)(seq % GNR1_RING);
++
++	gnr1_ring[i].seq = seq; gnr1_ring[i].jc = jc; gnr1_ring[i].kind = kind;
++	gnr1_ring[i].nbos = nbos; gnr1_ring[i].dropped = dropped;
++}
++
++static const char *gnr1_js_name(uint32_t s)
++{
++	switch (s & 0xff) {
++	case 0x00: return "no exception"; case 0x02: return "interrupted"; case 0x03: return "stopped";
++	case 0x04: return "terminated"; case 0x08: return "active"; case 0x40: return "job configuration fault";
++	case 0x41: return "job power fault"; case 0x42: return "job read fault"; case 0x43: return "job write fault";
++	case 0x44: return "job affinity fault"; case 0x48: return "job bus fault";
++	case 0x50: return "instruction invalid PC"; case 0x51: return "instruction invalid encoding";
++	case 0x52: return "instruction type mismatch"; case 0x53: return "instruction operand fault";
++	case 0x54: return "instruction TLS fault"; case 0x55: return "instruction barrier fault";
++	case 0x56: return "instruction alignment fault"; case 0x58: return "data invalid fault";
++	case 0x59: return "tile range fault"; case 0x5a: return "address range fault"; case 0x60: return "out of memory";
++	default:
++		if ((s & 0xf8) == 0xc0) return "MMU translation fault";
++		if ((s & 0xf8) == 0xc8) return "MMU permission fault";
++		if ((s & 0xf8) == 0xd8) return "MMU access flag fault";
++		return "other";
++	}
++}
++
++static const char *gnr1_mmu_kind(uint32_t fs)
++{
++	static const char *k[8] = { "translation", "permission", "translation table bus", "access flag",
++				    "address size", "memory attributes", "?6", "?7" };
++	return fs ? k[(fs >> 3) & 7] : "none";
++}
++
++static const char *gnr1_mmu_access(uint32_t fs)
++{
++	static const char *a[4] = { "atomic", "execute", "read", "write" };
++	return a[(fs >> 8) & 3];
++}
++
++/* the buffer object an address is in, else the nearest one below it (an overrun) and above it */
++static void gnr1_where(uint64_t addr, char *out, size_t size)
++{
++	uint32_t in = 0, below = 0, above = 0;
++
++	for (uint32_t h = 1; h <= NP_BOS; h++) {
++		const struct bo *x = &D.bos[h];
++
++		if (!x->kernel || !x->size)
++			continue;
++		if (addr >= x->va && addr < x->va + x->size) { in = h; break; }
++		if (x->va + x->size <= addr && (!below || x->va + x->size > D.bos[below].va + D.bos[below].size))
++			below = h;
++		if (x->va > addr && (!above || x->va < D.bos[above].va))
++			above = h;
++	}
++	if (in) {
++		const struct bo *x = &D.bos[in];
++		snprintf(out, size, "INSIDE bo %u (va 0x%llx size %llu, +%llu%s%s, surface %u)", in,
++			 (unsigned long long)x->va, (unsigned long long)x->size, (unsigned long long)(addr - x->va),
++			 x->imported ? ", imported" : "", x->noexec ? "" : ", executable", x->surface);
++		return;
++	}
++	int n = snprintf(out, size, "in NO buffer object");
++	if (below && n > 0 && (size_t)n < size) {
++		const struct bo *x = &D.bos[below];
++		n += snprintf(out + n, size - n, "; %llu bytes past the end of bo %u (va 0x%llx size %llu%s)",
++			      (unsigned long long)(addr - (x->va + x->size)), below, (unsigned long long)x->va,
++			      (unsigned long long)x->size, x->imported ? ", imported" : "");
++	}
++	if (above && n > 0 && (size_t)n < size) {
++		const struct bo *x = &D.bos[above];
++		snprintf(out + n, size - n, "; %llu bytes before bo %u (va 0x%llx size %llu)",
++			 (unsigned long long)(x->va - addr), above, (unsigned long long)x->va, (unsigned long long)x->size);
++	}
++}
++
++static void gnr1_say_fault(uint64_t waited, const uint64_t *out, unsigned n, const struct nord2_gpu_fault_info *fi)
++{
++	char b[512], where[224] = "";
++	uint64_t id = ((uint64_t)fi->job_id_hi << 32) | fi->job_id_lo;
++	uint64_t failed = id ? id : (n >= 3 ? out[2] : waited);
++	unsigned r = (unsigned)(failed % GNR1_RING);
++	int known = gnr1_ring[r].seq == failed;
++
++	if (gnr1_faults_said >= 24)
++		return;
++	gnr1_faults_said++;
++	if (fi->fault_address)
++		gnr1_where(fi->fault_address, where, sizeof(where));
++	int m = snprintf(b, sizeof(b),
++			 "np GNR1 FAULT pid=%d waited seq %llu: job %llu (%s, chain 0x%llx, %u bos%s) state %u out0 %llu; "
++			 "JS status 0x%x (%s); MMU faultstatus 0x%x (%s, %s access, source id 0x%x) address 0x%llx %s; "
++			 "first incomplete task %u",
++			 getpid(), (unsigned long long)waited, (unsigned long long)failed,
++			 known ? (gnr1_ring[r].kind == 3 ? "fragment" : "vertex/tiler/compute") : "not in the ring",
++			 known ? (unsigned long long)gnr1_ring[r].jc : 0ull, known ? gnr1_ring[r].nbos : 0,
++			 known && gnr1_ring[r].dropped ? ", list FULL" : "", fi->state,
++			 n >= 1 ? (unsigned long long)out[0] : 0ull, fi->status, gnr1_js_name(fi->status),
++			 fi->fault_status, gnr1_mmu_kind(fi->fault_status), gnr1_mmu_access(fi->fault_status),
++			 fi->fault_status >> 16, (unsigned long long)fi->fault_address, where, fi->first_incomplete_task);
++	if (m > 0)
++		np_log(b, (size_t)(m < (int)sizeof(b) ? m : (int)sizeof(b) - 1));
++}
++
++/* for air_metal.c's dispatch report: a Panfrost (KMS) handle's GPU range */
++int nord2_gnr1_bo_info(uint32_t h, uint64_t *va, uint64_t *size);
++__attribute__((visibility("default"))) int nord2_gnr1_bo_info(uint32_t h, uint64_t *va, uint64_t *size)
++{
++	if (!h || h > NP_BOS || !D.bos || !D.bos[h].kernel)
++		return -1;
++	*va = D.bos[h].va;
++	*size = D.bos[h].size;
++	return 0;
++}
++
+ /* Wait until every job <= seq is terminal.  lock held.  0 done, ETIMEDOUT, EIO (failed job, reaped). */
+ static int wait_seq(uint64_t seq, uint64_t ms)
+ {
+@@ -382,6 +508,7 @@
+ 			return 0;
+ 		}
+ 		if (n >= 1 && out[0] != 2) {
++			gnr1_say_fault(seq, out, n, &fi);       /* GNR1 */
+ 			note_done(seq);                 /* terminal: faulted, cancelled or reset, and reaped */
+ 			D.stats.faults++;
+ 			D.last_fault_seq = n >= 3 ? out[2] : seq;
+@@ -602,6 +729,7 @@
+ 			return np_fail(EIO);
+ 		*seqno = job;
+ 		D.submitted = job > D.submitted ? job : D.submitted;
++		gnr1_note_submit(job, r->jc, q.kind, np, np == NP_KERNEL_BOS);   /* GNR1 */
+ 		break;
+ 	}
+ 	for (unsigned i = 0; i < count; i++) {

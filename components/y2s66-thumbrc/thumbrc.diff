@@ -1,0 +1,98 @@
+--- a/src/redwood-drm/nord2_pan.c
++++ b/src/redwood-drm/nord2_pan.c
+@@ -91,6 +91,7 @@
+ 	uint64_t last_seq;              /* newest job that listed it */
+ 	uint8_t noexec, heap, imported, mapped;
+ 	uint32_t surface;               /* IOSurface ID of an imported buffer */
++	int import_fd;                  /* thumbrc: the DRM descriptor (one per Mesa screen) the import was made for */
+ 	uint8_t pooled, cls;            /* closed by the client but kept (kernel buffer and CPU mapping alive) for the next CREATE_BO of its size class */
+ 	uint32_t pool_next;
+ };
+@@ -823,6 +824,35 @@
+ 	return new_bo_ex(size, flags, 0, handle, va);
+ }
+ 
++/*
++ * thumbrc (12 Nov 2026): ONE IMPORT PER SURFACE AND SCREEN. Mesa shares an imported buffer within one pipe_screen (pan_lookup_bo by
++ * GEM handle, one GEM_CLOSE when its last user goes), and expects a second screen to get its own handle, as a DRM file
++ * descriptor does. On iOS os_same_file_description() cannot tell two dup()s of the connection apart, so every rwa_device gets a
++ * screen of its own, while this layer handed all of them the SAME handle for a surface: the first screen to let the surface go
++ * closed the kernel buffer under the others, whose GPU addresses then fell on whatever buffer took that range next (run ph11: the
++ * Photos grid's surfaces read back as vertex floats, BGRA texels, zeros). The descriptor of the import (drmPrimeFDToHandle, through
++ * np_set_import_fd) is now part of the key: a screen gets its own handle and kernel buffer, and its GEM_CLOSE closes only that.
++ * Logged: the first 48 imports and closes of imported buffers ('np import ...', 'np close ...').
++ */
++static __thread int np_import_fd = -1;
++void np_set_import_fd(int fd);
++void np_set_import_fd(int fd) { np_import_fd = fd; }
++
++static void import_note(const char *what, uint32_t surface, int fd, uint32_t h, uint64_t va, uint64_t size)
++{
++	static unsigned said;
++	char b[200];
++	int m;
++
++	if (said >= 48)
++		return;
++	said++;
++	m = snprintf(b, sizeof(b), "np %s: IOSurface %u fd %d -> handle %u va 0x%llx size %llu", what, surface, fd, h,
++		     (unsigned long long)va, (unsigned long long)size);
++	if (m > 0)
++		np_log(b, (size_t)m);
++}
++
+ static int do_close(uint32_t h)
+ {
+ 	struct bo *b;
+@@ -840,6 +870,8 @@
+ 	}
+ 	if (b->mapped && !b->imported && D.ops.unmap)
+ 		D.ops.unmap(D.ops.opaque, b->kernel, b->cpu);
++	if (b->imported)
++		import_note("close", b->surface, b->import_fd, h, b->va, b->size);
+ 	uint64_t in[1] = { b->kernel };
+ 	unsigned n = 0;
+ 	int e = kcall(NORD2_GPU_SEL_RELEASE, in, 1, NULL, 0, NULL, &n, NULL, NULL);
+@@ -898,7 +930,7 @@
+ 	return 0;               /* a mapping lives until the buffer is closed */
+ }
+ 
+-/* An IOSurface's pixels as a buffer: the same surface is the same buffer. */
++/* An IOSurface's pixels as a buffer: the same surface is the same buffer (for one screen: thumbrc). */
+ /* the first 40 failed imports of a process, with the reason: a failed import is a missing texture */
+ static void surf_note(uint32_t surface, const char *why, int err)
+ {
+@@ -944,7 +976,7 @@
+ 		return 0;
+ 	}
+ 	for (uint32_t h = 1; h <= NP_BOS; h++)
+-		if (D.bos[h].kernel && D.bos[h].imported && D.bos[h].surface == q->surface) {
++		if (D.bos[h].kernel && D.bos[h].imported && D.bos[h].surface == q->surface && D.bos[h].import_fd == np_import_fd) {
+ 			q->handle = h;
+ 			return 0;
+ 		}
+@@ -975,9 +1007,10 @@
+ 		return np_fail(EIO);
+ 	}
+ 	D.bos[h] = (struct bo){ .kernel = (uint32_t)reply[0], .va = reply[1], .size = in.size, .cpu = in.cpu,
+-				.noexec = 1, .imported = 1, .mapped = 1, .surface = q->surface };
++				.noexec = 1, .imported = 1, .mapped = 1, .surface = q->surface, .import_fd = np_import_fd };
+ 	D.next_bo = h;
+ 	q->handle = h;
++	import_note("import", q->surface, np_import_fd, h, reply[1], in.size);
+ 	return 0;
+ }
+ 
+--- a/src/redwood-drm/redwood_drm.c
++++ b/src/redwood-drm/redwood_drm.c
+@@ -213,8 +213,9 @@
+ 		*handle = (uint32_t)surface & ~REDWOOD_PRIME_LOCAL;
+ 		return 0;
+ 	}
++	np_set_import_fd(fd);           /* thumbrc: the import is this descriptor's (one per Mesa screen) */
+ 	error = call(REDWOOD_GPU_SURFACE, &request, sizeof(request));
+-	(void)fd;
++	np_set_import_fd(-1);
+ 	if (error != 0) {
+ 		errno = error;
+ 		return -1;
