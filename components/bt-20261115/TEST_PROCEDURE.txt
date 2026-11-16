@@ -1,0 +1,451 @@
+Bluetooth on the Nord 2 port -- phone test procedure (bt-20261115, pieces 0720-0723, revision bt2). NOT run by the author (host-only agent).
+
+bt2 (after bt18b: q10jfinal18 + bt1 hard-reset ~seconds after n2btd started, no BT0 line): kernel q10jfinal18bt2 + payload bt1/bt1probe
+rebuilt. Strict order now: (1) VARIANT=bt1probe (kernel stops after S1 = AP-side register reads only, nothing on conn_infra, nothing
+powered); only if it reports "stopped-at-S1" and the phone survives 3 minutes: (2) a stage file 2,3,... by hand or (3) bt1 (full).
+After ANY reset/hang: before flashing anything else, from the rescue:
+   adb shell 'grep -l N2BT /sys/fs/pstore/dmesg-ramoops-* | xargs cat'     (breadcrumbs, last line = the step that hung)
+   (also ENTER=1 gnss-20261114/sweetlog_tail.sh OUT for pmsg/console)
+The next boot refuses BT by itself (kernel: "S0 the previous boot reset during the bring-up: REFUSED"; n2btd: "GUARD: ... disabled");
+reinstalling payload bt1/bt1probe re-arms it.
+bt3 (after the bt2 runs: S1..S7 PASS, then a hard reset 3-6 min after the maxstep 6/7 stops): kernel q10jfinal18bt3, payload n2btd 75d39100.
+A stop after S6+ now KEEPS BT powered and hands BGF ownership back to the firmware (kern.n2bt_stop_mode=0; 1 = graceful Linux-order
+off: WMT FUNC_CTRL off, fw own, bgfsys_power_off, FW_BT A-die vote bit only); failures after S6 use the graceful off. Then
+'quiesce <tag>:' lines (BGF/GPS power + sleep protection, GNSS-polled registers only if GPS up) and 'mon <tag> t=..' host-CSR lines
+for kern.n2bt_monitor_s (600 s); state becomes '<state>:settled', and only then N2BT END (kernel guard) / guard file cleared (n2btd).
+Ladder to repeat: stage 5, 6, 7 again (each >= 12 min up, read dmesg-ramoops N2BT lines + bt_check), then 8, 9, full.
+
+What has to be on the phone
+  kernel   q10jfinal17bt (= q10jfinal15 + 0720 0721 0722)   device-mmu-q10jfinal17bt-candidate/ui-sched/*.img
+  userland payload bt1 (n2btd + the two BT firmware files + com.apple.BlueTool job program swap), via
+           READS=600 bt-20261115/pl/txn_bt1.sh <q10jfinal17bt img> <TAG>      (phone in fastboot: phone.py reset fastboot first)
+  Without bt1 the kernel pieces do nothing at all (no MMIO, no nodes): q10jfinal17bt alone == q10jfinal15 in behaviour.
+
+Run 1 -- controller only ("probe" stage, nothing shown to iOS)            [optional but recommended first]
+  VARIANT=bt1probe READS=600 bt-20261115/pl/txn_bt1.sh <q10jfinal17bt img> <TAG>   (writes /private/var/db/nord2-bt/stage = probe;
+  the plain bt1 transaction of Run 2 removes it). Wait 120 s after boot, USB log:
+     python3 -I bt-20261115/bt_check.py <run>/ui-usb/xnu-live.log
+  Expect: S1 ok ... S5 MCU ROM idle ... S7 WMT func on status 0 ... S8 6 of 6 HCI commands ... S9 set ... status 0,
+  then "controller up, kern.n2bt_publish=0". Note the "S8 HCI ver/manufacturer" line (expected manufacturer 0x46 MediaTek).
+  If S1 never passes: Wi-Fi (conninfra) is off -> join Wi-Fi first; if S5 fails: send the S5 lines (acks / ids / pc).
+
+Run 2 -- full stage (default; stage file absent)
+  Boot, wait for Wi-Fi auto-join (~35 s) and ~60 s more. bt_check.py must say VERDICT UP and PASS up to "Skywalk channel
+  connected". Markers in order:
+     NORD2 BT U: n2btd starts / first run ... address .. generated (first boot only) / bring-up requested
+     NORD2 BT0: S1..S9 lines, NORD2 BT2: service "bluetooth" in the registry: local-mac-address <addr> transport-encoding 3
+     NORD2 BT1: /dev/btwake ... made, Skywalk kernel pipe <UUID> up, kernel control ... registered, bridge runs
+     NORD2 BT U: BlueTool RunBuiltinScript 'boot' ... -> result 0
+     NORD2 BT1: control connected by bluetoothd, getsockopt 0x40105412 ... channel UUID, channel connected, then out/in HCI lines
+  bluetoothd must stop respawning every 10 s (the old "No bluetooth on this device" loop).
+  Settings -> Bluetooth: switch ON (green, not grey), "Now discoverable as <name>".
+
+Run 3 -- discovery / pairing / profiles (hands-on, user present; screenshot before every tap)
+  a) Discovery: Settings -> Bluetooth, put a known device (headphones / another phone / keyboard) in pairing mode; it must appear
+     under OTHER DEVICES within ~15 s.  Also: the other phone must see "<this iPhone's name>".
+  b) Pairing (SSP): tap the device. Headphones: "Just Works", connects. Phone/keyboard: confirm the 6-digit number on BOTH sides
+     (keyboard: type the shown PIN + Enter). Expect "Connected"; reboot the Nord 2 -> the device reconnects without re-pairing
+     (bonding storage = bluetoothd's own keychain/plist; address stable because n2btd reuses /private/var/db/nord2-bt/bdaddr).
+  c) A2DP + AVRCP: with headphones connected, play music (Music/YouTube in Safari). Expect audio in the headphones, play/pause from
+     the headphone buttons, volume sync. Capture 60 s of USB log while playing: bt_check stats (kern.n2bt_stats via the log or
+     `sysctl kern.n2bt_stats` in a shell) -- tx bytes should grow ~40-45 KB/s (SBC) or ~32 KB/s (AAC); look for "BTIF TX timeout".
+  d) HFP: place a call with the headset connected (or Siri / voice memo with BT mic). EXPECTED TO FAIL for audio (see risks):
+     signalling may connect, no voice path. Report what Control Center / call UI shows.
+  e) BLE: any app scanning for BLE (e.g. a BLE scanner app, Find My is not expected to work) -> devices with RSSI.
+     BLE peripheral pairing (e.g. a BLE watch/tag/keyboard) -> GATT read.
+  f) Keyboard (HID): pairs (b), but typing is EXPECTED NOT to reach iOS (the kernel has no IOHIDResource/IOHIDUserDevice).
+
+Switches (in a root shell / payload; all run time, the kernel command line is full)
+  rm /private/var/db/nord2-bt/enable + reboot     whole feature off (n2btd exits, kernel never touched)
+  sysctl kern.n2bt=0                              refuse bring-up (before n2btd runs: e.g. from a boot task)
+  echo probe > /private/var/db/nord2-bt/stage     controller only, not shown to iOS; kern.n2bt_publish=1 later publishes live
+  sysctl kern.n2bt_quirks=0                       raw controller answers (diagnosis; bluetoothd will likely stall on VSCs)
+  sysctl kern.n2bt_trace=500                      log more HCI packets (default first 160)
+  sysctl kern.n2bt_adie=0                         stop the A-die top-clock keeper
+  sysctl kern.n2bt_force=1                        skip the S1 AP-side checks (only if S1 is wrongly refusing)
+  read: kern.n2bt_state, kern.n2bt_stats; logs also in /private/var/db/nord2-bt/n2btd.log
+
+Undo
+  UNDO=1 txn_bt1.sh <q10jfinal15 img> <TAG>   (restores Apple's BlueTool job, removes n2btd + firmware; keeps the address file)
+  kernel: flash q10jfinal15 (sha256 70f31e50...).
+
+=== bt4 (2026-11-15): kernel q10jfinal22bt (= q10jfinal20 recipe + bt4 pieces), payload n2btd 339f32a2 ===
+Fixed: kern.n2bt_addr write (EINVAL: 18-byte sysctl buffer vs 18-byte write) -> the per-phone address now reaches S9; the kernel generates one if
+the daemon gives none (n2btd then stores it); the generic 00:00:46:xx:xx:xx (MediaTek default) is never published (S9 fails instead).
+New: the address is set again after each HCI_Reset from bluetoothd (S10k), breadcrumbs S10a..S10k.
+
+Stage 9 again (quick check of the fix; stage file 9 on the phone, payload bt1 reinstalled = re-arm + new n2btd):
+  VARIANT=bt1 READS=600 bt-20261115/pl/txn_bt1.sh <q10jfinal22bt img> TAG   then set the stage file to 9 (or keep your stage handling).
+  Expect: 'NORD2 BT U: kern.n2bt_addr accepted', 'address from the daemon: <addr>', 'S9 controller reports <addr>: the per-phone address'.
+
+Stage 10 (publish to iOS) -- remove /private/var/db/nord2-bt/stage (or write 10), reboot, keep the phone awake on the home screen:
+  t+45..120 s : n2btd starts the bring-up after Wi-Fi is running; S1..S9 as in stage 9.
+  then        : S10a registry "bluetooth" (address, transport-encoding 3) / S10b nodes / S10c Skywalk / S10d kernel control / S10e waiting
+  within ~10 s: bluetoothd (respawned by launchd every 10 s) finds the service: 'NORD2 BT U: BlueTool RunBuiltinScript ...' (boot script answered),
+                S10f control connected by bluetoothd, S10g channel UUID given, S10h Skywalk channel connected, S10i bluetoothd command 0x0c03
+                (HCI_Reset) ..., S10k address set again after HCI_Reset: status 0, S10j vendor commands answered in the kernel.
+  bt_check.py must show PASS up to S10k; bluetoothd must no longer respawn every 10 s ('exec bluetoothd' stops repeating).
+  Settings -> Bluetooth: switch ON (green), "Now discoverable as <name>". 'running 120 s without reset' + guard cleared.
+  If bluetoothd restarts again and again after S10i: the last 'S10j vendor command 0x....' / NORD2 BT1 out/in lines show the command it
+  stalled on (send the log; one more kernel answer may be needed). kern.n2bt_trace=500 (root shell) logs more HCI.
+Pairing (user present, real devices you own; screenshot before every tap):
+  1) Discovery: headphones/speaker in pairing mode -> appears under OTHER DEVICES within ~15 s. Another phone sees the Nord 2's name.
+  2) Headphones (Just Works): tap -> Connected. Play music (Music app / Safari) -> A2DP audio; play/pause buttons (AVRCP).
+  3) Phone-to-phone (numeric comparison): start from the other phone, confirm the same 6 digits on both -> Paired.
+  4) Reboot the Nord 2 -> the paired device reconnects without pairing again (bonding + stable address check).
+  5) BLE: a BLE scanner app shows devices / a BLE accessory pairs.
+  Expected not to work yet: HFP/SCO voice, BT keyboard/mouse input (no IOHIDUserDevice in the kernel).
+  Logs to keep: ui-usb/xnu-live.log, /private/var/db/nord2-bt/n2btd.log, and after any reset the rescue pstore (dmesg-ramoops N2BT lines).
+
+=== bt5 (2026-11-15): kernel q10jfinal23bt (= q10jfinal21 recipe + bt5 pieces), payload n2btd 8bc189a5 (+ bluetoothd log diagnostics) ===
+Cause of the bt22a respawn loop [V phone unified log via the mirror, bt_ulog.sh]: every bluetoothd run (88 of them) ends with
+"OI_HCICMD_WriteDefaultErroneousDataReporting (status=628)" -> "HCI initialization failed" -> "Bluetooth error - restarting {reason=108}".
+The command never reached the controller (its Read_Local_Supported_Commands bit was clear). Fix: bit advertised + 0x0c5b/0x0c5a answered
+in the kernel. Also: getsockopt 0x40487413 = TIOCGETA (bluetoothd's UART-style setup; return value ignored) now answered with a termios;
+TIOCSETA stored; every option + the last 12 HCI packets at each bluetoothd disconnect are breadcrumbs (S10g/S10o/S10x).
+Payload bt1 now also sets bluetoothd's job OS_ACTIVITY_DT_MODE=YES + StandardErrorPath /private/var/db/nord2-bt/bluetoothd.log; n2btd
+forwards the interesting lines as "NORD2 BT U: btd: ..." (<= 350/boot) and logs MobileGestalt "gestalt: bluetooth = ..." after the bring-up.
+
+Phone steps (stage 10, user present for pairing):
+  1. phone.py reset fastboot; READS=600 bt-20261115/pl/txn_bt1.sh <q10jfinal23bt img> bt23a   (reinstall = new n2btd + bluetoothd log + re-arm;
+     the payload removes the stage file = full stage 10).
+  2. python3 -I bt-20261115/bt_check.py autocycle/runs/bt23a/ui-usb/xnu-live.log : expect S10a..S10k PASS, "bluetoothd HCI init passed
+     0x0c5b" PASS, no repeating "S10x bluetoothd disconnected", 'exec bluetoothd' no longer every ~10 s, "NORD2 BT U: btd:" lines without
+     "HCI initialization failed", "gestalt: bluetooth = true".
+  3. Settings: a Bluetooth row between Wi-Fi and Cellular, switch ON, "Now discoverable as ...". If the row is missing while bluetoothd stays
+     up: send the "gestalt:" lines (MobileGestalt capability answer) -- next fix would be there, not in the kernel.
+  4. If bluetoothd still restarts: bt-20261115/bt_ulog.sh after the next transaction (any txn snapshot refreshes the mirror) prints the
+     exact bluetoothd reason; the S10x breadcrumb lists its last HCI packets.
+  5. Pairing as in the bt4 section (headphones A2DP/AVRCP, phone numeric comparison, reboot -> reconnect, BLE scan).
+
+=== bt6 (2026-11-15): kernel q10jfinal24bt (= q10jfinal23bt recipe + bt6 pieces), payload n2btd b9132530 + MobileGestalt cache rebuild ===
+(1) ~20.7 s bluetoothd disconnect: last packets were Write Local Name 0x0c13 (252 B) and Write EIR 0x0c52 (245 B), with no Command Complete.
+    Now, with quirk 0x40 LONGLOCAL (default quirks 0x7f), both are answered in the kernel (CC status 0) and NOT sent to the controller
+    (breadcrumb "S10l Write Local Name/Write EIR (N bytes) answered in the kernel, not sent"). Long TX (>64 B) is paced by kern.n2bt_tx_gap_us.
+    3 s watchdog for every forwarded command: "S10w no answer in 3 s to 0x.... (N bytes); BTIF LSR .., rx bytes waiting .." (<=12/boot).
+    Cost: the controller keeps its default name/EIR, so other devices may see a default/empty name until a real fix (inquiry/pairing work).
+    Undo the quirk live (root): sysctl kern.n2bt_quirks=0x3f -> both are forwarded again (to test the controller).
+(2) Settings Bluetooth row: MobileGestalt "bluetooth" = an address exists in IODeviceTree:/chosen mac-address-bluetooth0 (or IOService
+    "bluetooth" local-mac-address / syscfg BMac). The kernel now sets /chosen mac-address-bluetooth0 at boot (thread, from
+    /private/var/db/nord2-bt/bdaddr) and again whenever n2btd sets kern.n2bt_addr. The answer was cached false, so the bt1 payload moves
+    the MobileGestalt cache aside (backup /private/var/db/nord2-bt/MobileGestalt.plist.pre-bt; undo restores it byte-exact, rehearsed).
+    If n2btd still reads false after the bring-up it moves the (rebuilt) cache aside again, at most twice (counter mg-rebuilds).
+
+Phone steps:
+  1. phone.py reset fastboot; READS=600 bt-20261115/pl/txn_bt1.sh <q10jfinal24bt img> bt24a   (reinstall: new n2btd + MG cache moved aside).
+  2. python3 -I bt-20261115/bt_check.py autocycle/runs/bt24a/ui-usb/xnu-live.log : expect PASS for "/chosen mac-address-bluetooth0 (bt6)"
+     (also "NORD2 BT2: early: address file read N ms after the root volume"), "Write Local Name answered locally (bt6)", no repeating
+     "S10x bluetoothd disconnected", no "S10w no answer" (if present: the opcode named there is the next one the controller drops).
+  3. "gestalt: bluetooth = true" in n2btd.log / "gestalt bluetooth true (bt6)" PASS. If it says "cache moved aside (rebuild 1 of 2)":
+     reboot once more (normal reboot) and check again -- the MG cache was rebuilt before the kernel thread published the address.
+  4. Settings: Bluetooth row between Wi-Fi and Cellular -> switch ON -> "Now discoverable". Then pairing steps of the bt4 section.
+  5. Undo: UNDO=1 bt-20261115/pl/txn_bt1.sh ... restores both launchd jobs and the original MobileGestalt cache.
+
+=== bt7 (2026-11-15): kernel q10jfinal26bt (= q10jfinal25 recipe + bt7 pieces, private combiner fin26), payload unchanged (n2btd b9132530) ===
+img device-mmu-q10jfinal26bt-candidate/ui-sched/nord2-ios-metal-q10jfinal26bt-ui654fb60dvfs-cap3500-ram5088-sched.img sha256 b54f3da28499c9d199a6561f1abd2e47419bfb9e5992f2036b196004a9cbabf7
+bt25a [V phone]: BT On in iOS, first bluetoothd connection 202 s, then every connection ends right after LE Set Scan Parameters
+(0x200b passive, interval 0x1e0, window 0x30) answered by the controller with 0x0C Command Disallowed (connections 2..6: 0.8-2.7 s).
+bluetoothd [V disassembly 0x10019ad30..]: a failed scan start logs "Could not start LE scan (leScanParams*Cb): %!" and calls the
+requester back with the error (no abort in that function); why bluetoothd then exits is NOT known (its os_log lines do not reach
+bluetoothd.log; the next mirror refresh + bt_ulog.sh will show the reason).
+Fix (quirk 0x80 SCANFIX, default quirks 0xff):
+  - before every 0x200b the kernel sends LE Set Scan Enable(0) (0x200c 00 00), swallows its answer, then sends 0x200b;
+  - 0x0c on 0x200b -> Scan Enable(0) again + 0x200b once more; still 0x0c -> Command Complete status 0 to bluetoothd (S10m);
+  - 0x0c on bluetoothd's own LE Set Scan Enable -> status 0 to bluetoothd (S10m; then there is simply no LE scan).
+  LE Set Advertising Enable(0) is NOT sent (it would silently stop bluetoothd's advertising and does not affect scan parameters).
+Diagnostics: S10y = every Command Complete/Status with status != 0 handed to bluetoothd (<= 40/boot); S10z = all commands since
+bluetoothd's last HCI_Reset as "opcode+how=status" (how c = sent, k = answered in the kernel, i = injected by the kernel; '-' = no answer),
+12 per line, at each of the first 6 disconnects. Live off switch: sysctl kern.n2bt_quirks=0x7f (root).
+
+Phone steps:
+  1. phone.py reset fastboot; READS=600 bt-20261115/pl/txn_bt1.sh <q10jfinal26bt img> bt26a   (payload already installed: VARIANT bt1 again
+     is fine, idempotent; or flash the kernel only if the coordinator's flow allows).
+  2. bt_check.py on the new xnu-live.log: "LE Set Scan Parameters handled (bt7)" shows which branch ran:
+       "status 0 after Scan Enable(0)"   -> the controller simply had a scan running: real fix;
+       "still 0x0c after the retry"      -> faked; LE scan does not work yet (send the S10z lines);
+     and the connection durations in S10x (expect no more restarts, or a different last packet).
+  3. Settings > Bluetooth: ON, a nearby device in pairing mode shows under OTHER DEVICES (classic inquiry does not need the LE scan).
+  4. Send S10m/S10y/S10z lines and, after any transaction, bt-20261115/bt_ulog.sh output (bluetoothd's own exit reason).
+
+=== bt8 (2026-11-15): kernel q10jfinal28bt (= q10jfinal27 recipe + bt8 pieces, private combiner fin28), payload unchanged (n2btd b9132530) ===
+img device-mmu-q10jfinal28bt-candidate/ui-sched/nord2-ios-metal-q10jfinal28bt-ui654fb60dvfs-cap3500-ram5088-sched.img
+sha256 27e5706b3c608c4f9bec9d6e3dfe492079564b99c6e9faa0368f9ba3ba033d8c
+What changed:
+  - Breadcrumb zone (dmesg-ramoops-142): first 900 B linear, NOW slot (what the BT thread did last: tx/rx/idle/hk-*/restart with
+    opcode/len), GUARD slot (INFLIGHT -> END), then a ring of the LAST 41 lines. Decode: python3 -I bt-20261115/crumbs.py <file>.
+    The guard no longer refuses BT because a full zone hid "END" (the bt26a false positive): END is in its own slot.
+  - Runtime lines: S11e (connection/pairing/encryption/disconnect/hardware-error/vendor events, first occurrence of every event code),
+    S11c (link control/policy commands), S11a (first ACL/SCO each way after a connection), S11s (counters every 15 s of traffic),
+    S11x (BTIF send/receive errors). Peer addresses only as ..:xx:yy.
+  - RX FIFO drained while a long TX waits (ACL bursts), at most 16 bluetoothd packets before the controller side is read again.
+  - 0x204a (LE Read Periodic Advertiser List Size) answered in the kernel: the controller should accept legacy LE scan again (S10n).
+    kern.n2bt_quirks: 0x100 = this, 0x200 = LE scan commands never sent (answered 0 in the kernel), default 0x1ff.
+  - S10w (no answer in 3 s) now also logs S10q (BGF MCU PC x3 "STUCK", LPCTL, IRQ, sleep protection; always-on host CSR only) and,
+    with kern.n2bt_recover=1 (default), restarts the controller (S10r: WMT off, fw own, bgfsys off Linux order, firmware again, S5..S9)
+    and hands bluetoothd a Hardware Error event (0x10, code 0x7e) so it resets and re-inits; at most 3 restarts in 5 minutes.
+Phone steps (user present, FreeBuds bonded from bt26a):
+  1. phone.py reset fastboot; READS=600 bt-20261115/pl/txn_bt1.sh <q10jfinal28bt img> bt28a (idempotent bt1) -- or the coordinator's
+     kernel-only flow. Start tools/nord2-usb-console.py (600 s) right after boot.
+  2. Wait for "S10e bridge runs" and the Bluetooth row; turn the FreeBuds on (case open): expect S11e conn complete / encryption change,
+     S11a first ACL, then play audio (Music) for >= 2 minutes. Then pair/connect again from Settings if it dropped.
+  3. bt_check.py on the capture; look for: S10n line; S10m lines gone or "status 0 after Scan Enable(0)" (LE scan accepted);
+     S11e VENDOR event lines just before any S10w (the 0xff bytes we never saw); S10q (PC STUCK = firmware dead) and S10r restart
+     done/FAILED; S11s counters (overrun/resync must stay 0).
+  4. If the phone resets: rescue pstore -> python3 -I bt-20261115/crumbs.py dmesg-ramoops-142: NOW = last BT action, ring = last 41 lines.
+  5. If restarts misbehave: sysctl kern.n2bt_recover=0 (root) and repeat; if LE scan still refused: sysctl kern.n2bt_quirks=0x3ff.
+
+=== bt9 (2026-11-15): kernel q10jfinal29bt (= q10jfinal28bt recipe + bt9 pieces), payload unchanged (n2btd b9132530) ===
+img device-mmu-q10jfinal29bt-candidate/ui-sched/nord2-ios-metal-q10jfinal29bt-ui654fb60dvfs-cap3500-ram5088-sched.img
+sha256 853e5d66b64a4db7c43fae15e5b70057ee3f9a4f070f931819152cfc4cb028d5
+Facts behind it [V livecap3 + Linux connac2 driver btmtk_mt66xx.c/btmtk_irq.c/btmtk_btif_main.c, EndCredits/android_kernel_oppo_mt6893]:
+  the controller dies ~1 ms .. 4 s after an ACL link comes up (inquiry refuted); first S10q PC 0x1005f2 = the ROM idle loop seen at
+  S5 -> the BGF MCU was reset under the running firmware (assert + watchdog [I]); Linux learns about such asserts from BGF2AP_SW_IRQ
+  (BGF_SW_IRQ_STATUS 0x18800150 bit25 subsys-reset request) and then power-cycles BT, restoring the RF calibration first.
+  Linux steps we skipped: MD coex CCIF (0x10003318 bit0 before BGF power-on), calibration backup after the first func-on and
+  restore (+0x5AD02EA5 ready word) before every later one, WMT blank status after func-on. Linux sends NO coexistence vendor
+  command on a new connection (kern.n2bt_coex not added: nothing real to send). Vendor event 0xff "04 xx" is passed to the
+  Android stack unhandled by the Linux driver (no host answer required).
+Changes:
+  - guard: the GUARD slot alone decides (END written when the bridge starts; restart = INFLIGHT restart ... END restart);
+    run-time hangs never refuse the next boot; a q10jfinal28bt zone that reached "S10e bridge runs" is accepted too.
+  - kern.n2bt_keepvote=1: BT wake vote 0x180601a8 held while BT runs, re-asserted every 100 ms (S11w if someone cleared it).
+  - kern.n2bt_ccif=1: CCIF BGF_PWR_ON before every BGF power-on (S5c).
+  - S7b blank status, S7c calibration saved; S10r restores it before func-on.
+  - S11v after every connection/disconnection complete: votes, LPCTL, MCU PC, sleep prot, IRQ.
+  - S10q on a hang: BGF sw irq status (SUBSYS/WHOLE-CHIP reset request, DEADFEED) and the firmware assert text (EMI+0x3b000);
+    kern.n2bt_diag_bgf=0 skips these BGF/EMI reads (they touch the BGF bus of a dead firmware: NOW slot says "diag-bgf" if that hangs).
+  - not done: whole-chip (conninfra) reset - it would take Wi-Fi down and we have no conninfra driver to bring it back.
+Phone steps:
+  1. phone.py reset fastboot; READS=600 bt-20261115/pl/txn_bt1.sh <q10jfinal29bt img> bt29a; live USB capture 600 s.
+  2. Expect at bring-up: S5c, S7b, S7c (calibration bytes), "S10 BT wake vote held". Turn the FreeBuds on (Settings page closed).
+  3. After the connection: S11v line (votes 0x1 expected), link key / encryption, A2DP audio for >= 2 min.
+  4. If it dies again, send: S10q lines (PC, "ROM idle" note, BGF sw irq status, firmware assert text), S10r result, S11w lines.
+  5. A/B tests (root, before connecting): kern.n2bt_keepvote=0 (vote released as Linux) / kern.n2bt_ccif=0 need a reboot to matter
+     for CCIF (it is set at power-on: re-arm with kern.n2bt_rearm=1 + kern.n2bt_up=1 after the change is NOT enough while BT is up).
+  6. After a hang + reboot: BT must come up again without kern.n2bt_rearm (guard fix); crumbs.py on dmesg-ramoops-142 shows NOW/GUARD.
+
+=== bt10 (2026-11-16): kernel q10jfinal30bt (= sensors q10jfinal30 recipe [29bt + 0762] + bt10 pieces, combiner fin28), payload unchanged ===
+img device-mmu-q10jfinal30bt-candidate/ui-sched/nord2-ios-metal-q10jfinal30bt-ui654fb60dvfs-cap3500-ram5088-sched.img
+sha256 d9c6bf5b4a53be7bb93b0bc717fafb16d579a8559fd12a880b1e2003df6a4472
+bt29a [V]: firmware assert "<ASSERT> system/transport/hcit_mtk_uart.c #500 ... id=0x4 idle, isr=" (sw irq status 0x2000800 = bit25
+subsys-reset request + bit11) on the first command after ~7 s idle. Linux connac2 [V OnePlus/Oppo MT6893 trees]: BTIF PIO send writes
+bytes while LSR THRE/TEMT allows (ours: same), never toggles BTIF_WAK (btif_raise_wak_signal has no caller; its pulse, when used,
+is >= 128 us > 1/32k s); BT wake-up is the BGF_LPCTL own handshake. We pulsed BTIF_WAK low for 2 us before every write -> prime
+suspect [I]: a sub-32k-period glitch on "AP wakes consys" while the firmware idles. Assert line #500 itself: no source found.
+Changes:
+  - kern.n2bt_wak=0 (default): BTIF_WAK never touched; 1 = old 2 us pulse (to reproduce), 2 = 150 us pulse.
+  - kern.n2bt_swirq=1: every 100 ms (vote held + driver own) BGF_SW_IRQ_STATUS is read: S11q on change, FW-log bit24 acknowledged,
+    bit25/26 (reset requests) acknowledged + immediate S10r restart (no 3 s wait). Restart acknowledges pending bits first.
+  - guard: pre-bt8 (linear) zones are never judged any more (bt29a was refused after a q10jfinal27 boot).
+Not done: a "firmware sleep disable" vendor command (none exists in the connac2 driver; firmware sleep = host FW own, which we never give).
+Phone steps:
+  1. phone.py reset fastboot; READS=600 bt-20261115/pl/txn_bt1.sh <q10jfinal30bt img> bt30a; live capture 600 s. BT must come up
+     without rearm (previous zone = 29bt format or older: accepted unless a bring-up step was interrupted).
+  2. FreeBuds on, connect, audio >= 2 min, then leave the phone idle 30 s and play again (the bt29a trigger was "first command after idle").
+  3. Send S11q/S11r lines, any S10w/S10q (assert text), S10r result. A/B: sysctl kern.n2bt_wak=1 reproduces the old behaviour.
+
+=== bt11 (2026-11-16): kernel q10jfinal31bt (= q10jfinal30bt recipe [sensors final30 + bt] + bt11 pieces), payload unchanged ===
+img device-mmu-q10jfinal31bt-candidate/ui-sched/nord2-ios-metal-q10jfinal31bt-ui654fb60dvfs-cap3500-ram5088-sched.img
+sha256 eafee24fcf49567179ddc51427ee1558a6e656583a94444a55d12cd0483ef862
+bt30a [V]: same assert with kern.n2bt_wak=0 (WAK glitch refuted); not idle-triggered; it hits when the controller's event burst
+(link key request + completed packets) meets our TX. sw irq bit 11 (0x800) is set from 84.8 s on (steady, not the trigger).
+Linux [V btif_priv.h]: AP BTIF RX FIFO = 8 bytes, TX FIFO 16; Linux empties RX by IRQ/DMA, we polled every 1-4 ms when idle ->
+[I] the firmware's transport waits too long with data for the host and asserts.
+Changes:
+  - RX drained before every TX and between 16-byte chunks (S11h for the first 6 TX that found controller bytes pending; S11s rx@tx).
+  - bridge polls the BTIF every kern.n2bt_poll_us (100 us, a timer wait) while a link is up (S11s "links N") or traffic is < 3 s
+    old; otherwise 1 ms / 4 ms as before. kern.n2bt_poll_us=0 = old behaviour.
+  - restart: up to 3 attempts (settle 0.2 / 2 / 5 s after power-off), no WMT func off / fw-own with the dead firmware (Linux reset
+    flow), sw irq bits acknowledged before each power-on, ROM idle needs pc 0x1xxxxx (bt30a restart 2 saw a stale 0x1D1E at pc
+    0xf0006f30), 0xdeadfeed BGF bus = not ready -> next attempt. Lines "S10r #N ...".
+  - guard: refuses only for an AP reset inside S2..S9 (NOW slot "starting:S2".."S9") or inside a restart power-on (rs-bgf/rs-own/
+    rs-func); END on every restart return; "N2BT END alive <s>" every 15 s.
+Phone steps:
+  1. phone.py reset fastboot; READS=600 bt-20261115/pl/txn_bt1.sh <q10jfinal31bt img> bt31a; live capture. BT must come up
+     without rearm (previous 30bt zone: INFLIGHT restart with NOW = idle/tx -> accepted).
+  2. FreeBuds: connect (link key / encryption), audio >= 2 min, pause 30 s, play again, disconnect/reconnect twice.
+  3. Send S11h/S11s (rx@tx, links), any S10w/S10q/S11r, all "S10r #N" lines.
+  4. A/B: kern.n2bt_poll_us=0 (old polling) should bring the assert back if polling latency is the cause.
+
+=== bt12 (2026-11-16): kernel q10jfinal32bt (= q10jfinal31bt recipe + bt12 pieces), payload unchanged ===
+img device-mmu-q10jfinal32bt-candidate/ui-sched/nord2-ios-metal-q10jfinal32bt-ui654fb60dvfs-cap3500-ram5088-sched.img
+sha256 ea42c6a98b7bc78d360d048af0c7d8208922a34adae1dea5407835c388fe2b33
+bluetoothd crash [V bt31a .ips (UUID aa9424e8 = our 20H392 binary) + disassembly]: frames +0xc0d90 = AssertFail helper ("AssertFail
+%s:%d : %s"), +0x123c40 in _BCM_ProfilingStatsEventParser (bcm_vsc.c:138, "ByteStream_NumReadBytesAvail(*pBs) >= 2", reads 4 x u16),
+called back for VSC 0xfce2 sub 0x0d (sender bluetoothd +0x1282b4) sent during a headset connection; we answered with no data.
+BCM Command Complete parsers only check ">= n" (the "== 0" checks are in _BCM_EventHandler for 0xff events, which we drop, and in
+aci_vsc.c for Apple's own chip) -> quirk 0x400 (default on, quirks 0x5ff): every kernel-answered vendor command carries >= 16 zero bytes.
+Read Buffer Size / features / LE buffer / NOCP accounting were not involved (no data path to this assert).
+Phone steps: txn_bt1.sh <q10jfinal32bt img> bt32a; FreeBuds connect, audio >= 3 min, reconnect x2; expect no bluetoothd crash
+(no new /private/var/mobile/Library/Logs/CrashReporter/bluetoothd-*.ips), connections not restarting (S10f count stays low).
+If another abort appears: send the new .ips; the first bluetoothd frame after abort gives the next parser.
+
+=== bt13 (2026-11-16): kernel q10jfinal33bt (= q10jfinal32bt recipe + bt13 pieces), payload unchanged ===
+img device-mmu-q10jfinal33bt-candidate/ui-sched/nord2-ios-metal-q10jfinal33bt-ui654fb60dvfs-cap3500-ram5088-sched.img
+sha256 ba1901625d6ce9bba95e75b235e755165807b222ddc5ff15537fe26705c7e8c9
+bt32a [V]: blanket pad stalled the init at 0xfce9 (15.6 s timeouts). Now quirks default 0x9ff: 0x800 targeted (fce2 sub 0x0d -> 8,
+0x2d -> 4, 0x05/0x0a -> 1 zero bytes), 0x400 blanket OFF. Host test replays all 25 kernel-answered commands seen in bt31a (fce9,
+fce2 0b/15/1c/1e/26, fd47, fd48, fd4e, fd7f, 0c5b, 204a): replies byte-identical to bt31a. Toggle live: sysctl kern.n2bt_quirks=0x1ff
+(no pad at all = bt31a) / 0xdff (blanket = bt32a).
+[V disassembly, not yet seen on the phone]: fce9 has senders whose parsers read data (sub 0x1c -> +0x12359c >=1 byte, sub 0x0c ->
++0x126638, 0x39 -> +0x1236a8, 0x4b -> +0x1277a4 >=4, others at +0x13bd5c/+0x148b84/+0x149170/+0x1496fc); if bluetoothd aborts later
+with a frame in one of those, that sub needs targeted data next.
+Phone steps: txn_bt1.sh <q10jfinal33bt img> bt33a; expect the bt31a init (LE scan parameters accepted) and no 15.6 s cycles;
+FreeBuds connect, audio >= 3 min (past the ~20 s abort point of bt31a), reconnect x2; no new bluetoothd .ips.
+
+=== bt14 (2026-11-16): kernel q10jfinal34bt (= q10jfinal33bt recipe + bt14 pieces), payload unchanged ===
+img device-mmu-q10jfinal34bt-candidate/ui-sched/nord2-ios-metal-q10jfinal34bt-ui654fb60dvfs-cap3500-ram5088-sched.img
+sha256 0de547310775ae893265d769cd7833ae6bf9ca818609f5f70edaf344b2372346
+bluetoothd SIGSEGV [V bt33a .ips + disassembly + kernel log]: os_channel_get_fd(NULL) at +0x3effb4 in the AudioSkywalkPipe read-loop setup;
+the pipe's channel (+0xa8) is NULL because its constructor bails out: os_nexus_controller_register_provider("com.apple.bluetooth.AudioPipe",
+NEXUS_TYPE_USER_PIPE) at +0x3efc2c fails (result unchecked) -> alloc_provider_instance fails. The kernel log shows why:
+"SWEET Sandbox: bluetoothd privilege 12000 denied" (PRIV_SKYWALK_REGISTER_USER_PIPE): the port's AMFI stand-in grants no privilege but
+PRIV_WORK_INTERVAL; bluetoothd holds com.apple.private.skywalk.register-user-pipe. Not our kernel pipe (0721): its channel stays up.
+Fix: MAC policy "Nord2BT" (registered by 0720 once the root volume is mounted) grants exactly privilege 12000 to a process named bluetoothd holding that
+entitlement ("NORD2 BT0: S12p ... granted"). kern.n2bt_skywalk_grant=0 = off. Other processes (rapportd/identityservicesd also denied
+12000) are unchanged. Breadcrumbs: S10h channel pre_connect/disconnect/disconnected with pid.
+Phone steps: txn_bt1.sh <q10jfinal34bt img> bt34a; expect "S12p MAC policy Nord2BT ... registered: 0" at boot, "S12p ... granted to
+bluetoothd" when the FreeBuds connect, no "SWEET Sandbox: bluetoothd privilege 12000 denied", no new bluetoothd .ips; play audio >= 3 min
+(A2DP now has its audio pipe). If a crash remains, send the .ips.
+
+=== bt15 (2026-11-16): kernel q10jfinal35bt (= q10jfinal34bt recipe + bt15 pieces) + payload bt1 (n2btd acd25226, plan 73637027c465ca04aaddc86f8c15755c24e9ecb3709a343b56468e5d69bdcfe2) ===
+img device-mmu-q10jfinal35bt-candidate/ui-sched/nord2-ios-metal-q10jfinal35bt-ui654fb60dvfs-cap3500-ram5088-sched.img
+sha256 8d736dce746d02e87847324bd5d93e635f7c4c000007f9de2bcf842bf3a6863b
+Finding [V rootfs mirror 09:23]: /System/Library/Audio/Plug-Ins/HAL holds only RedwoodAudio.driver; Apple's HAL drivers (incl.
+BTAudioHALPlugin.driver, the Bluetooth audio route of coreaudiod/mediaserverd) are parked in HAL.nord2-original by the audio package
+(VirtualAudio crashed mediaserverd). Without BTAudioHALPlugin iOS has no Bluetooth output route -> audio stays on the speaker and
+bluetoothd never starts an A2DP stream (bt34a: ACL r106/t118 packets only, sco 0).
+Changes:
+  - payload bt1: copies BTAudioHALPlugin.driver back into HAL (identical tree, owners kept; receipt bt_hal_added; undo removes it;
+    owned list = its 47 paths). Rehearsed: host fake root + VM (offline + catalog EXIT 0 for bt1/bt1probe/bt1-undo).
+  - n2btd: forwards up to 3000 bluetoothd lines (was 350) and also matches a2dp/avdtp/avrcp/hfp/audio/route/skywalk/profile/connect/
+    sdp/sbc/aac/codec/stream.
+  - kernel S11l: L2CAP signalling on CID 1 both ways (conn req psm/scid, conn rsp result, config, disconnect, info), AVDTP signals
+    (discover / get-caps / set-config / open / start ... cmd/accept/reject), first data per channel ("AVDTP-MEDIA" = the stream
+    channel); S11s per-channel rx/tx bytes ("psm 0x19 MEDIA ... tx N" grows by tens of KB/s while streaming). First 200 lines.
+Risk [I]: mediaserverd/audiomxd now loads BTAudioHALPlugin; if it crashes the audio daemon (as VirtualAudio did), undo bt1 (UNDO=1)
+removes it again.
+Phone steps:
+  1. phone.py reset fastboot; READS=600 bt-20261115/pl/txn_bt1.sh <q10jfinal35bt img> bt35a (installs the new payload: n2btd + BT HAL).
+  2. FreeBuds connect; play music. Expect S11l lines: conn req psm 0x19 (x2), AVDTP discover/get-caps/set-config/open/start accepts,
+     "first data on psm 0x19 AVDTP-MEDIA", S11s "psm 0x19 MEDIA ... tx" growing; audio in the earbuds; "btd:" lines about a2dp/route.
+  3. If no AVDTP at all: send the S11l lines (which PSMs connect) + btd: lines. If mediaserverd/audiomxd crash: their .ips + UNDO=1.
+
+=== bt16 (2026-11-16): payload fix only (kernel stays q10jfinal35bt 8d736dce); guest-bt1.sh 03d6af382423a6ab287a5776a1253efb33c3c69b58da9e055893186a20980131, guest-bt1-undo.sh 3d3a436ab6e5989f2d3b76754ee47eb0e45c7095bbf78d6a1d9fa8b25ca53ec5 ===
+bt35b [V kernel log + bsd/dev/audio_install.c]: "NORD2 AUDIO INSTALL: mode=0 phase=2 error=22" = committed-install check custom():
+entries_many() is an exact allowlist: /System/Library/Audio/Plug-Ins/HAL must hold ONLY RedwoodAudio.driver (and that only
+RedwoodAudio + Info.plist with the journal's hashes); any other entry -> EINVAL -> launchd refused ("HAL recovery required").
+The same boot check only verifies the identity of HAL.nord2-original and /Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin and the
+absence of HAL.disabled/VirtualAudio.plugin; /Library/Audio/Plug-Ins/HAL itself has no allowlist, and mediaserverd loads HAL
+plug-ins from it (VirtualAudio.plugin there crashed it, NOTES). No manifest can declare extra files (fixed names in the kernel).
+Fix: BTAudioHALPlugin.driver goes to /Library/Audio/Plug-Ins/HAL (copied from HAL.nord2-original, which is only read). If the
+phone still has the bt35b copy in /System/.../HAL (receipt bt_hal_added) the install removes it first. Undo removes both.
+Host model of the kernel check: test/t_audio_check.py (custom() allowlists, B/V unchanged, D absent) runs in rehearse.sh on the
+mirror's real audio layout: before / after install / after a simulated bt35b layout (detected, then repaired) / after undo: all OK.
+VM rehearsal: bt1, bt1probe, bt1-undo offline + catalog EXIT 0.
+Why the plug-in [V bluetoothd strings]: bluetoothd sends its AudioSkywalkPipe to the BT audio HAL plug-in (kBTAudioMsgPropertyNexusUuid,
+kBTAudioMsgPropertySkywalkKey); no other A2DP route exists in the parked layout.
+Phone steps: (phone restored by bt35u first) READS=600 bt-20261115/pl/txn_bt1.sh <q10jfinal35bt img> bt36a. Expect the boot to reach
+launchd ("NORD2 AUDIO INSTALL: ... error=0", exec lines), then FreeBuds + music: S11l AVDTP ... start, "psm 0x19 MEDIA" bytes growing,
+btd: a2dp/route lines, audio in the earbuds. If mediaserverd crashes in BTAudioHALPlugin: send its .ips, UNDO=1 txn.
+
+=== bt17 (2026-11-16): kernel q10jfinal36bt (= q10jfinal35bt recipe + bt17 pieces), payload unchanged (bt16 guest scripts) ===
+img device-mmu-q10jfinal36bt-candidate/ui-sched/nord2-ios-metal-q10jfinal36bt-ui654fb60dvfs-cap3500-ram5088-sched.img
+sha256 4f13091e092b340df69587cf7959b71d5adbdcdfeb96e27a618fc5e7e36592a6
+bt36a [V]: A2DP audio worked (MEDIA channel, 837 ACL out, up to 700 B), then the firmware asserted again (hcit_mtk_uart.c #500);
+restart 2 asserted 100 ms after it came back (bluetoothd's queued media packets for the old link [I]); then "3 restarts in 5 minutes:
+not again" left BT dead. Controller limits [V S8]: Read Buffer Size = ACL 1021 bytes x 8 buffers (bluetoothd's 700 B are within).
+Changes (kernel bridge, 0721):
+  - ACL gate: holds ACL while the controller has no free buffer (from the Read Buffer Size / LE Read Buffer Size answers bluetoothd
+    gets, S10b), frees on Number Of Completed Packets; drops (faking the completion to bluetoothd) ACL for an unconnected handle or
+    longer than the controller's maximum (S11z); 2 s without completions = counts reset (S11p).
+  - pacing: ACL limited to kern.n2bt_tx_bps (1 Mbit/s; 0 = off); a held/paced packet does not busy-spin (100 us polling continues,
+    RX drained before/during every TX as before).
+  - restart: queued bytes for the old controller are dropped, handle/credit tables cleared; back-off 1, 2, 4, 8, 16, 30 s, at most 10
+    restarts per 10 minutes, never a permanent stop ("S10r restart scheduled in N ms").
+  - S11p every 15 s with traffic: sent, in-flight/buffers, max in flight, holds, paced, stalls, drops.
+Phone steps: txn_bt1.sh <q10jfinal36bt img> bt37a (payload as bt36a); FreeBuds + music 5 min. Look at S10b (controller buffers),
+S11p (max in flight <= buffers, holds/paced counts), S11z (should be 0 or only around disconnects), no S10w/S11r. If the firmware still
+asserts: S11p/S11s just before it + the assert text; A/B with sysctl kern.n2bt_tx_bps=500000 (half rate).
+
+=== bt18 (2026-11-16): kernel q10jfinal37bt (= q10jfinal36bt recipe + bt18 pieces) + payload bt1 (n2btd afea341f, plan d92406a0, guest bt16) ===
+img device-mmu-q10jfinal37bt-candidate/ui-sched/nord2-ios-metal-q10jfinal37bt-ui654fb60dvfs-cap3500-ram5088-sched.img
+sha256 011c5a709d36a1361f622d339c15821b9a3549b7340dd4714c04292e45be1937
+AAC in bt36a [V S11l lengths, inferred codec]: the FreeBuds were the AVDTP initiator (discover / get-caps of the phone's 6 endpoints),
+then SET_CONFIGURATION of 16 bytes = media transport (2) + Media Codec category with 6 codec-information bytes = AAC (SBC has 4,
+vendor codecs >= 7); start accepted at 170.05 s; the media channel carried up to ~700-byte packets (AAC-sized). So AAC was negotiated
+and the user heard it. The firmware assert came 11.6 s into the stream (181.7 s) -> the problem is the transport, not AAC.
+Encoder [V BTAudioHALPlugin strings]: AACEncoder / SBCEncoder classes on AudioConverter, loading
+/System/Library/Components/AudioCodecs.component (in the dyld shared cache on iOS, which this rootfs has; no IOKit/hardware encoder
+reference) -> software AAC in mediaserverd; nothing needed from the port beyond the HAL plug-in (bt16). No sandbox denial for
+mediaserverd/bluetoothd around streaming except mediaserverd privilege 10001 (unrelated, seen on every boot).
+New in 37bt: S11d lines (own cap 100): AVDTP signals with decoded endpoints (discover), codec capabilities (get-caps/get-all-caps:
+SBC freq/ch-mode/blocks/subbands/alloc/bitpool, AAC object/freq/channels/VBR/bitrate, vendor id/codec: LDAC/aptX names), set-config
+(acp/int SEID + codec), rejects with error code; first 3 media packets' first 16 bytes (RTP 0x80/PT, then SBC 0x9c or AAC LATM);
+S11s MEDIA "(N B/s)" per 15 s; L2CAP config lines only the first 40. Diagnostic only: kern.n2bt_a2dp_filter (default 0 = AAC on;
+1 hides AAC, 2 leaves only SBC, in either side's capabilities). n2btd also forwards selected/configur/encoder/converter/bitpool/bitrate.
+Phone steps: txn_bt1.sh <q10jfinal37bt img> bt38a (reinstalls payload: new n2btd); FreeBuds + music 5 min. Read S11d set-config
+("AAC obj ... bitrate ..."), media packet dumps, S11s MEDIA B/s (AAC ~32-40 KB/s at 256-320 kbit/s), S11p, and whether the
+firmware assert still happens (credit gate/pacing from bt17 are in this image).
+bt19 (folded into q10jfinal37bt, sha256 above updated): bt37a [V]: "send of 666 bytes (type 2) failed (60)" then the assert. The BTIF write
+waited for TEMT (TX FIFO completely empty) before each 16-byte chunk with IODelay(1) (a timer wait on arm64, not a spin), slept
+30 us (timer) between chunks of long packets and gave up after 20000 waits -> a truncated ACL packet left in the firmware [I].
+Now: one HCI packet = one tight burst, spin on LSR (TEMT 16 / THRE 8 free, as Linux), pure byte drain of the RX FIFO only, no sleep or
+logging inside a packet; deadline kern.n2bt_tx_timeout_ms = 200; on failure: S11x "<written>/<len> written, LSR, us", BTIF TX FIFO
+cleared, and if part of the packet went out an immediate controller restart. Pacing (kern.n2bt_tx_bps) acts only between packets.
+
+=== bt20 (2026-11-16): kernel q10jfinal38bt (= q10jfinal37bt recipe + bt20 pieces), payload as bt18 (n2btd afea341f) ===
+img device-mmu-q10jfinal38bt-candidate/ui-sched/nord2-ios-metal-q10jfinal38bt-ui654fb60dvfs-cap3500-ram5088-sched.img
+sha256 1fc698b9d2a6b4a71f18f1f62a4814d5f1bec4170bedd7e6c124476c981061e8
+Transport auto-bisect (kern.n2bt_mode = -1 default; 0..5 = fixed; kern.n2bt_tx_mode = in effect): the boot starts in mode 0 and each
+controller restart (firmware assert -> reset request, or no answer) logs "S12m mode N survived X ms (acl tx/rx) before the restart",
+moves to the next untried mode, and after all six keeps the longest survivor ("S12m all modes tried: keeping mode M").
+  0 = bt36a exactly: TEMT wait per 16-byte chunk (IODelay(1) + RX drain), 30 us gap inside long packets, no credit gate, no rate cap, 100 us poll
+  1 = 0 + ACL credit/handle/length gate
+  2 = 8-byte chunks on THRE (spin), RX drain after every chunk, no gap, gate, 50 us poll
+  3 = bt19 tight burst (TEMT 16 / THRE 8), gate + 1 Mbit/s rate cap, 100 us poll
+  4 = byte by byte, RX drain before every byte, gate, 20 us poll
+  5 = 4-byte chunks on THRE, RX drain after each, gate, 20 us poll
+  (a separate high-priority RX thread / BTIF RX interrupt is not implemented: no IRQ wiring for BTIF here.)
+S6b at bring-up: BTIF IER/FAKELCR/LSR/SLEEP_EN/DMA_EN/TRI_LVL/WAK/HANDSHAKE. BTIF is the AP<->BGF FIFO bridge: it has no baud or
+sample-count register (Linux btif_priv.h register map), so the termios 3000000 from bluetoothd has nothing to program.
+Phone steps: txn_bt1.sh <q10jfinal38bt img> bt39a; connect the FreeBuds / play music repeatedly for ~10 minutes (each assert
+advances the mode; restarts back off 1-30 s, max 10 per 10 min). Send all S12m lines (+ S11p/S11s MEDIA B/s); the mode with the longest
+survival is the answer (set it fixed with sysctl kern.n2bt_mode=N for confirmation runs).
+
+=== bt21 (2026-11-16): kernel q10jfinal39bt (= q10jfinal38bt recipe + bt21 pieces), payload as bt18 (n2btd afea341f) ===
+img device-mmu-q10jfinal39bt-candidate/ui-sched/nord2-ios-metal-q10jfinal39bt-ui654fb60dvfs-cap3500-ram5088-sched.img
+sha256 7a8c5a3a58eb5c3b7ec19b9cd7bfd5c5d71fb243a006164ae78193a57588461d
+bt39a [V]: mode 0 353 s, mode 1 8.9 s, mode 2 stable AAC (MPEG2-LC 44.1k stereo VBR 230 kbit/s, ~29 KB/s) from 438 s; S6b BTIF IER 0
+FAKELCR 0 LSR 0x60 SLEEP_EN 0 DMA_EN 0x4 (= AUTORST_EN, the bit Linux hal_btif_hw_init sets too) TRI_LVL 0x18 WAK 0x1 HANDSHAKE 0x3.
+CPU [V NORD2 SYS]: average cpu_busy 23.8 % with BT up before mode 2 vs 29.6 % while streaming AAC in mode 2 (encoder + 50 us poll).
+Why modes 0/1 fail and 2 works [I]: the AP's BTIF RX FIFO holds 8 bytes; in modes 0/1 each 16-byte TX chunk waits for TEMT with
+IODelay(1) (a timer wait) and a 30 us sleep follows inside long packets, so RX can go unserved for long stretches while the controller
+has events/ACL to send; mode 2 never sleeps inside a packet and empties the RX FIFO after every 8-byte chunk and whenever LSR shows data.
+Mode 1 died faster than 0 (gate only) -> not the gate itself; one sample each, so treat the ordering 0 vs 1 as noise.
+Changes: kern.n2bt_mode default 2 (fixed; -1 = auto-bisect in the order 2, 4, 5, 0, 1, 3, keeping the longest survivor; a fixed value set by
+sysctl applies immediately); adaptive poll: the mode's period (50 us in mode 2) while traffic is < 500 ms old, kern.n2bt_poll_idle_us
+(100 us) with a quiet link, 1-4 ms without a link; S11p/S11s every 15 s for the first 5 minutes, then every 60 s, S11p shows the mode and
+its uptime; S11c capped at 60 lines, S11e at 200.
+Phone steps: txn_bt1.sh <q10jfinal39bt img> bt40a; play AAC for 30+ minutes with pauses; expect S11p "mode 2 up N s" growing, no S12m
+(no restart), MEDIA ~29 KB/s. The console now gets ~4 lines/min in steady state from BT.
+
+=== bt22 (2026-11-16): kernel q10jfinal40bt (= q10jfinal39bt recipe + bt22 pieces) + payload bt1 (n2btd 7beef97b, plan 50312e59) ===
+img device-mmu-q10jfinal40bt-candidate/ui-sched/nord2-ios-metal-q10jfinal40bt-ui654fb60dvfs-cap3500-ram5088-sched.img
+sha256 866531b0e8452fa4977c8b54c4f78719b6420fff76a48ed9dd66b214a50bf390
+What the bring-up needs [V]: conn_infra powered + the Wi-Fi bring-up finished with it. Our Wi-Fi bring-up is kernel-side and runs at
+every boot after launchd starts (ROM -> DMA -> MAIN -> ... -> "WIFI IOS OWNER: ready=1" -> en0 attached), independent of a network;
+iOS Wi-Fi off / airplane mode only flips nss_native.powered (nord2_wifi_power_set: scans cancelled, link notice) - no conn_infra
+power-down, so BT keeps its power source. If the Wi-Fi bring-up itself fails, conn_infra may stay off: S1 then waits kern.n2bt_wait_s
+(120 s) and fails cleanly (BT powering conn_infra by itself like Linux conninfra_pwr_on(BT) is not implemented).
+Change: the kernel's early thread (root volume + /private/var/db/nord2-bt/enable) reads the address, stage and rearm files and starts the
+bring-up as soon as en0 is ATTACHED (Wi-Fi bring-up done; not "running") or after 90 s, logging
+"NORD2 BT0: S0e BT start at uptime N s: en0 attached (Wi-Fi bring-up done) after M ms"; S1's three conn_infra checks follow as before.
+n2btd (new) sees the running bring-up and follows it instead of waiting 45-120 s. kern.n2bt_early=0 restores the n2btd start (needs a boot
+with the sysctl set early, e.g. via the stage of a later build; normally leave it).
+Rehearsal: host fake root REHEARSAL_BT1_OK; the VM rehearsal could not run (the rootfs mirror manifest is marked clean=False right now:
+generic_update_offline refuses a mirror being refreshed) - rerun pl/rehearse_vm.sh after the next clean snapshot or rely on the txn's
+own offline step (it is the same tool).
+Phone steps: txn_bt1.sh <q10jfinal40bt img> bt41a (new n2btd). Boot 1: normal; boot 2: airplane mode on before reboot; boot 3: Wi-Fi on
+but no known network. Each: expect S0e within ~30 s of launchd (the Wi-Fi bring-up finishes around 20-30 s), "S1 ok x3", S10e bridge
+runs, bluetoothd connecting once (no respawn loop), FreeBuds connect + AAC.
