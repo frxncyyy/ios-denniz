@@ -1,0 +1,11 @@
+- [Nord2 CPU limits lifted for builds](nord2-cpu-limits-lifted-for-builds.md) — user allowed dropping the CLAUDE.md CPU quota for compilations (2026-11-10)
+- [Nord2: delegate analysis to Fable](nord2-delegate-analysis-to-fable.md) — new problems in the camera bring-up go to a Fable 5.2 subagent (medium effort)
+- [Nord2 phone test procedure](nord2-phone-test-procedure.md) — txn/log-reader/auto-lock/battery-guard pitfalls (2026-11-13)
+- [Nord2 night mandate 2026-11-14](nord2-night-mandate-20261114.md) — full autonomy, Opus-only agents (never Fable), report due 08:00
+- [Nord2 haptic final = q10hapd6a](nord2-haptic-final-6a.md) — tick 11.8ms fixed gain 0x57 confirmed perfect; sbshift2 OK; restore after GNSS tests
+- [Nord2 GNSS working](nord2-gnss-working.md) — first valid fix 2026-11-14 with q10jfin + gnssfix22; root causes unaligned Device loads + 0 Hz clock
+- [Nord2 night mandate 2026-11-15](nord2-night-mandate-20261115.md) — second autonomous night, phone in fastboot, report due 08:00, drive scenarios via phone.py
+- [Nord2: no blind taps](nord2-phone-tap-scenarios-need-screenshot-check.md) — screenshot first; fixed-coordinate scenarios opened Clock (2026-11-15)
+- [Nord2 night 2026-11-15 results](nord2-night-20261115-results.md) — final q10jfinal8a + gfxall11-seeded; what works/open
+- [Nord2 jbts1 Sileo/SSH/TrollStore](nord2-jbts1-sileo-ssh-trollstore.md) — payload ready + VM-rehearsed 2026-11-15, not on phone; no kernel change
+- [Nord2 Files 'On My iPhone' fixed](nord2-files-on-my-iphone-fixed.md) — q10jfinal44ts: 0732 lsd memfloor + 0734 apfs type name; TrollStore + picker OK (2026-11-16)

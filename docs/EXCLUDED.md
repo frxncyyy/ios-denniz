@@ -29,7 +29,9 @@ extra scans (private keys, tokens, e-mail addresses, MAC/IMEI/ICCID patterns, ow
 - Upstream Mesa source trees (`mesa-25.0.7/`, `mesa-src/` ...): only the port's Mesa patches (e.g.
   `components/y2s-stage0/tools-mesa/*.patch`) and the port's own sources are included.
 - The engineering log is included as `notes/ENGINEERING-LOG.md` with identity values redacted in place (one SSID occurrence
-  replaced by `<redacted-ssid>`).
+  replaced by `<redacted-ssid>`; on 2026-11-17 the position of the first GNSS fix was redacted too).
+- The wider "resume" scope (2026-11-17) and what is still out by design: [COMPLETENESS.md](COMPLETENESS.md),
+  [LARGE-ARTIFACTS.md](LARGE-ARTIFACTS.md).
 - Owner host paths were rewritten (`$NORD2_WORK`, `$NORD2_REPO`, `$HOME`, `user`).
 
 ## 2. Apple and vendor content (never published; get it yourself)
