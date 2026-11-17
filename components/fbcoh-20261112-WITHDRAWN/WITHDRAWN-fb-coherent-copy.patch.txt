@@ -1,0 +1,274 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -41,6 +41,10 @@
+ #include "sweet_fb_swapwait.h"
+ #include "sweet_fb_blend.h"           /* 0390 */
+ #include "sweet_fb_scene.h"           /* 0392 */
++#include "sweet_fb_coherent.h"        /* 0394 */
++
++/* 0394 (fbcoh-20261112): n2fbcoh=0 copies as 0393 (default 1: coherent copy, see sweet_fb_coherent.h). */
++static uint32_t sweet_fb_coh_mode = 1;
+ 
+ /* 0390: n2fbblend=0 copies the SwapEnd layers over each other as before 0390 (default 1: composite them). */
+ static uint32_t sweet_fb_blend_mode = 1;
+@@ -242,6 +246,8 @@
+ 		uint64_t copy_gt4, copy_gt8, total_gt16, long_logged, tear_logged, race_logged;
+ 		uint64_t copy_max_us, total_max_us;
+ 	} fSync;
++	struct sweet_fb_coh_stats fCoh;               /* 0394: present thread only */
++	uint32_t            fCohSkipRun;              /* 0394: presents skipped in a row (unstable source, old frame kept) */
+ 	uint64_t            fPresentT0Us;             /* when the presenter took the frame (state 5/1 entry) */
+ 	uint32_t            fLastCopyLayers;
+ 	uint8_t             fFront, fNextState;      /* fFront: panel buffer the overlay reads (0 = fPixels, 1 = fPixelsB); fNextState 0 none, 1 taken / waiting for the GPU, 2 copied */
+@@ -397,6 +403,9 @@
+ 	{ uint32_t bl = 1; if (PE_parse_boot_argn("n2fbblend", &bl, sizeof(bl))) { sweet_fb_blend_mode = bl ? 1 : 0; } }   /* 0390 */
+ 	{ uint32_t iv = 1; if (PE_parse_boot_argn("n2fbinval", &iv, sizeof(iv))) { sweet_fb_inval_mode = iv ? 1 : 0; } }   /* 0391 */
+ 	{ uint32_t rt = 1; if (PE_parse_boot_argn("n2fbretain", &rt, sizeof(rt))) { sweet_fb_retain_mode = rt ? 1 : 0; } }   /* 0392 */
++	{ uint32_t ch = 1; if (PE_parse_boot_argn("n2fbcoh", &ch, sizeof(ch))) { sweet_fb_coh_mode = ch ? 1 : 0; } }      /* 0394 */
++	bzero(&fCoh, sizeof(fCoh)); fCohSkipRun = 0;
++	IOLog("SWEET FB: coherent layer copy %s (0394)\n", sweet_fb_coh_mode ? "on" : "off (n2fbcoh=0)");
+ 	IOLog("SWEET FB: layers outside a swap's mask kept %s (0392)\n", sweet_fb_retain_mode ? "on" : "off (n2fbretain=0)");
+ 	IOLog("SWEET FB: multi-layer source cache clean+invalidate %s (0391)\n", sweet_fb_inval_mode ? "on" : "off (n2fbinval=0)");
+ 	IOLog("SWEET FB: layer composition %s (0390)\n", sweet_fb_blend_mode ? "on" : "off (n2fbblend=0)");
+@@ -1449,6 +1458,10 @@
+ 			    fSync.te_margin_n ? fSync.te_margin_sum_us / fSync.te_margin_n : 0ULL, fSync.src_race, fSync.busy_after, fSync.copy_mismatch,
+ 			    fSync.checked_layers, fSync.empty_frames, fSync.black_fill_rows, fSync.copy_gt4, fSync.copy_gt8, fSync.copy_max_us, fSync.total_gt16,
+ 			    fSync.total_max_us, fSwapWaitLevel, fRetire.not_ready, fRetire.valve, fRetire.dropped);
++			/* 0394: cumulative since boot */
++			IOLog("NORD2 FB COH: mode=%u presents=%llu prewait=%llu aborts=%llu raced=%llu busy_after=%llu retries=%llu recovered=%llu gave_up=%llu skipped=%llu wait_us_avg=%llu wait_us_max=%llu\n",
++			    sweet_fb_coh_mode, fCoh.presents, fCoh.prewait, fCoh.aborts, fCoh.raced, fCoh.busy_after, fCoh.retries, fCoh.recovered, fCoh.gave_up, fCoh.skipped,
++			    fCoh.presents ? fCoh.wait_us_sum / fCoh.presents : 0ULL, fCoh.wait_us_max);
+ 			fOvlFrames = 0; fDsiUnd = 0; memset(fOvlBits, 0, sizeof(fOvlBits));
+ 		}
+ 		fSafeStarts = 0; fDzWaits = 0; fTickCorrSumUs = 0; fPhBin[0] = fPhBin[1] = fPhBin[2] = 0;
+@@ -1840,6 +1853,29 @@
+ 	return rows;
+ }
+ 
++/* 0394: any of the frame's surfaces has a GPU write queued, running or promised (Nord2GPU surfaceBusy). */
++static bool
++sweet_fb_layers_busy(SweetSurface *const *ls, unsigned nl)
++{
++	for (unsigned i = 0; i < nl; i++) {
++		if (ls[i] != NULL && nord2_gpu_surface_busy(ls[i])) { return true; }
++	}
++	return false;
++}
++
++/* 0394: wait (present thread) until none of the surfaces is busy or the per-present budget is spent; *waited accumulates. */
++static void
++sweet_fb_coh_wait_idle(SweetSurface *const *ls, unsigned nl, uint64_t *waited)
++{
++	uint64_t base = *waited, t0 = mach_absolute_time();
++	while (sweet_fb_layers_busy(ls, nl)) {
++		uint32_t p = sweet_fb_coh_poll_us(*waited);
++		if (p == 0) { break; }
++		if (p >= 1000) { IOSleep(1); } else { IODelay(p); }
++		*waited = base + sweet_fb_abs_to_us(mach_absolute_time() - t0);
++	}
++}
++
+ /* Copies the layers into the panel memory. Returns false only when the display could not be taken over
+  * (nothing shown); the panel transfer is started by the caller. */
+ bool
+@@ -1991,8 +2027,29 @@
+ 	fLastCopyLayers = nl;
+ 	if (nl == 0) { fCopyEmpty = true; }
+ 	uint64_t syncHash[SWEET_FB_LAYERS];
+-	for (unsigned i = 0; i < nl; i++) { syncHash[i] = sweet_fb_rows_hash(lsrc[i], lbpr[i], &lg[i]); }
+ 	uint64_t syncT0 = mach_absolute_time();
++	uint32_t *rowBuf = NULL;
++	if (nl > 1 && sweet_fb_blend_mode != 0) {
++		rowBuf = (uint32_t *)IOMallocData((vm_size_t)fWidth * 4);
++	}
++	/* 0394 (sweet_fb_coherent.h): no GPU write to the frame's surfaces may overlap the copy; else wait for idle and copy again */
++	bool coh = sweet_fb_coh_mode != 0 && nl > 0;
++	uint64_t cohWaitUs = 0;
++	bool cohSkip = false;
++	/* the copy goes to the panel buffer the overlay does not show: an unstable result can be dropped (the panel keeps the last frame) */
++	bool cohSkipOk = coh && sweet_fb_coh_skip_ok(fDbl, dstBase != (fFront ? fPixelsB : fPixels), fCohSkipRun);
++	if (coh) {
++		fCoh.presents++;
++		if (sweet_fb_layers_busy(ls, nl)) { fCoh.prewait++; sweet_fb_coh_wait_idle(ls, nl, &cohWaitUs); }
++	}
++	for (unsigned cohAttempt = 0;; cohAttempt++) {
++	bool cohAbort = false;
++	/* chunk checks only while another copy is still possible: the last copy always runs to the end (never a half-written frame) */
++	bool cohChk = sweet_fb_coh_chunk_checks(coh, cohAttempt, cohWaitUs, cohSkipOk);
++	if (cohAttempt > 0) {
++		for (unsigned i = 0; i < nl; i++) { nord2_gpu_surface_cpu_acquire(ls[i]); }     /* the GPU rewrote them: cache maintenance again */
++	}
++	for (unsigned i = 0; i < nl; i++) { syncHash[i] = sweet_fb_rows_hash(lsrc[i], lbpr[i], &lg[i]); }
+ 	/* 0391: no stale CPU line of a GPU-written layer may satisfy the copy (CIVAC = what the GPU driver's own maintenance does). */
+ 	uint64_t inval_us = 0;
+ 	if (nl > 1 && sweet_fb_inval_mode != 0) {
+@@ -2002,11 +2059,7 @@
+ 		}
+ 		inval_us = sweet_fb_abs_to_us(mach_absolute_time() - t0);
+ 	}
+-	uint32_t *rowBuf = NULL;
+-	if (nl > 1 && sweet_fb_blend_mode != 0) {
+-		rowBuf = (uint32_t *)IOMallocData((vm_size_t)fWidth * 4);
+-	}
+-	if (nl > 1) {
++	if (nl > 1 && cohAttempt == 0) {
+ 		uint64_t multi = __atomic_add_fetch(&sweet_fb_multi_presents, 1, __ATOMIC_RELAXED);
+ 		if (multi <= 24 || (multi % 600) == 0) {
+ 			IOLog("NORD2 FB LAYERS: multi=%llu swap=%u mask=%#x n=%u blend=%u inval=%u inval_us=%llu%s\n", multi, get32(rec, 0x50), mask, nl,
+@@ -2037,6 +2090,7 @@
+ 			fSync.black_fill_rows += sweet_fb_black_outside(dstBase, fRowBytes, fWidth, fHeight, 0, y0 < 0 ? 0 : y0, (int32_t)fWidth, y1);
+ 		}
+ 		for (int32_t y = y0; y < y1; y++) {
++			if (cohChk && sweet_fb_coh_check_due((uint32_t)(y - y0)) && sweet_fb_layers_busy(ls, nl)) { cohAbort = true; break; }
+ 			const uint32_t *rows[SWEET_FB_LAYERS];
+ 			for (unsigned i = 0; i < nl; i++) {
+ 				rows[i] = (y >= lg[i].dy && y < lg[i].dy + lg[i].h) ?
+@@ -2061,7 +2115,6 @@
+ 			IOLog("NORD2 FB BLEND: multi=%llu rows=%d..%d upper-layer px opaque=%llu clear=%llu mixed=%llu\n", multi, y0, y1,
+ 			    st.opaque, st.clear, st.mixed);
+ 		}
+-		IOFreeData(rowBuf, (vm_size_t)fWidth * 4);
+ 	} else {
+ 		if (nl > 0) {       /* 0393: black outside the layers' bounding box */
+ 			int32_t bx0 = lg[0].dx, by0 = lg[0].dy, bx1 = lg[0].dx + lg[0].w, by1 = lg[0].dy + lg[0].h;
+@@ -2073,15 +2126,52 @@
+ 			}
+ 			fSync.black_fill_rows += sweet_fb_black_outside(dstBase, fRowBytes, fWidth, fHeight, bx0, by0, bx1, by1);
+ 		}
+-		for (unsigned i = 0; i < nl; i++) {
++		for (unsigned i = 0; i < nl && !cohAbort; i++) {
+ 			if (fDiag.enabled) { __atomic_fetch_add(&fDiag.copied_layers, 1, __ATOMIC_RELAXED); }
+ 			for (int32_t y = 0; y < lg[i].h; y++) {
++				if (cohChk && sweet_fb_coh_check_due((uint32_t)y) && sweet_fb_layers_busy(ls, nl)) { cohAbort = true; break; }
+ 				memcpy((void *)(dstBase + (uint64_t)(lg[i].dy + y) * fRowBytes + (uint64_t)lg[i].dx * 4),
+ 				    (const void *)(lsrc[i] + (uint64_t)(lg[i].sy + y) * lbpr[i] + (uint64_t)lg[i].sx * 4),
+ 				    (size_t)lg[i].w * 4);
+ 			}
+ 		}
+ 	}
++	if (!coh) { break; }
++	{   /* 0394: verdict on this copy */
++		bool raced = false;
++		for (unsigned i = 0; i < nl && !raced; i++) { raced = sweet_fb_rows_hash(lsrc[i], lbpr[i], &lg[i]) != syncHash[i]; }
++		bool busyAfter = !cohAbort && sweet_fb_layers_busy(ls, nl);
++		if (cohAbort) { fCoh.aborts++; }
++		if (raced) { fCoh.raced++; }
++		if (busyAfter) { fCoh.busy_after++; }
++		int v = sweet_fb_coh_verdict(true, cohAttempt, cohAbort, raced, busyAfter, cohWaitUs, cohSkipOk);
++		if (v == SWEET_FB_COH_SHOW) { if (cohAttempt > 0) { fCoh.recovered++; } fCohSkipRun = 0; break; }
++		if (v == SWEET_FB_COH_SKIP) {
++			fCoh.skipped++; fCohSkipRun++; cohSkip = true;
++			if (fCoh.skipped <= 16) {
++				IOLog("NORD2 FB COH: swap=%u skipped after %u copies, waited %llu us (abort=%u raced=%u busy=%u, %u layers): panel keeps the last frame\n",
++				    get32(rec, 0x50), cohAttempt + 1, cohWaitUs, cohAbort ? 1u : 0u, raced ? 1u : 0u, busyAfter ? 1u : 0u, nl);
++			}
++			break;
++		}
++		if (v == SWEET_FB_COH_GIVE_UP) {
++			fCoh.gave_up++; fCohSkipRun = 0;
++			if (fCoh.gave_up <= 16) {
++				IOLog("NORD2 FB COH: swap=%u gave up after %u copies, waited %llu us (abort=%u raced=%u busy=%u, %u layers)\n", get32(rec, 0x50),
++				    cohAttempt + 1, cohWaitUs, cohAbort ? 1u : 0u, raced ? 1u : 0u, busyAfter ? 1u : 0u, nl);
++			}
++			break;
++		}
++		fCoh.retries++;
++		sweet_fb_coh_wait_idle(ls, nl, &cohWaitUs);
++	}
++	}       /* 0394: copy attempts */
++	if (coh) {
++		fCoh.wait_us_sum += cohWaitUs;
++		if (cohWaitUs > fCoh.wait_us_max) { fCoh.wait_us_max = cohWaitUs; }
++	}
++	if (rowBuf != NULL) { IOFreeData(rowBuf, (vm_size_t)fWidth * 4); }
++	if (cohSkip) { fCopyEmpty = true; }      /* 0394: as an empty frame (0393): no flip, the shown buffer is pushed again */
+ 	{   /* 0393: copy duration, source rewritten during the copy, GPU writing a layer right after it, copy verification (one layer) */
+ 		uint64_t cus = sweet_fb_abs_to_us(mach_absolute_time() - syncT0);
+ 		if (cus > 4000) { fSync.copy_gt4++; }
+--- a/iokit/Kernel/arm/sweet_fb_coherent.h
++++ b/iokit/Kernel/arm/sweet_fb_coherent.h
+@@ -0,0 +1,84 @@
++#ifndef SWEET_FB_COHERENT_H
++#define SWEET_FB_COHERENT_H
++/*
++ * 0394 (fbcoh-20261112): coherent CPU copy of the swap layers, pure and host-testable (no IOKit, no registers).
++ *
++ * Why (live capture q10jfh, Photos grid scroll): src_race +91, busy_after +39 in ~600 pushes, only while scrolling.  The detached
++ * layer 0 is the APP's own drawable; SwapWait only paces backboardd, so the app's GPU starts rendering its next frame into a
++ * surface the kernel is still copying (mixed frames, tile blocks).
++ *
++ * Rule: a layer copy is good when no GPU write to any of the frame's surfaces was queued, running or promised (Nord2GPU
++ * surfaceBusy: write jobs + 0112 reservations) from before the copy started until after it ended, and the sampled rows did not
++ * change.  The copy checks busy every SWEET_FB_COH_CHUNK_ROWS rows; on a hit (or a hash change, or busy right after) it waits
++ * until the surfaces are idle and copies the frame again (the newer, complete frame).  Waiting is bounded by
++ * SWEET_FB_COH_BUDGET_US per present and SWEET_FB_COH_MAX_ATTEMPTS copies.  Then, if the copy went into the hidden panel
++ * buffer (double buffering) and fewer than SWEET_FB_COH_MAX_SKIPS presents in a row were skipped, the present is skipped (the
++ * panel keeps the last good frame; the next swap is copied normally); otherwise the last copy is shown as before 0394 (and the
++ * last copy then runs to its end without chunk checks, so it is never half written).
++ */
++#include <stdbool.h>
++#include <stdint.h>
++
++#define SWEET_FB_COH_CHUNK_ROWS     128u       /* busy check granularity: ~0.15 ms of copy */
++#define SWEET_FB_COH_BUDGET_US      8000u      /* total wait for idle surfaces per present */
++#define SWEET_FB_COH_MAX_ATTEMPTS   3u         /* copies per present */
++#define SWEET_FB_COH_MAX_SKIPS      2u         /* consecutive presents skipped (old frame kept) before an unstable copy is shown */
++
++enum sweet_fb_coh_verdict {
++	SWEET_FB_COH_SHOW = 0,          /* the copy is coherent: show it */
++	SWEET_FB_COH_RETRY,             /* wait for idle surfaces, copy again */
++	SWEET_FB_COH_GIVE_UP,           /* budget or attempts exhausted: show the last copy (counted) */
++	SWEET_FB_COH_SKIP,              /* exhausted and the copy went to the hidden buffer: keep the shown frame, present nothing new */
++};
++
++/* After copy number `attempt` (0-based).  aborted: busy seen between chunks; raced: sampled rows changed; busy_after: a write is
++ * pending right after the copy; waited_us: wait spent so far in this present. */
++static inline int
++sweet_fb_coh_verdict(bool enabled, unsigned attempt, bool aborted, bool raced, bool busy_after, uint64_t waited_us, bool skip_ok)
++{
++	if (!enabled || (!aborted && !raced && !busy_after)) {
++		return SWEET_FB_COH_SHOW;
++	}
++	if (attempt + 1 >= SWEET_FB_COH_MAX_ATTEMPTS || waited_us >= SWEET_FB_COH_BUDGET_US) {
++		return skip_ok ? SWEET_FB_COH_SKIP : SWEET_FB_COH_GIVE_UP;
++	}
++	return SWEET_FB_COH_RETRY;
++}
++
++/* A skip is allowed when the copy target is not the buffer the overlay shows and the skip run is short. */
++static inline bool
++sweet_fb_coh_skip_ok(bool double_buffered, bool target_hidden, uint32_t skip_run)
++{
++	return double_buffered && target_hidden && skip_run < SWEET_FB_COH_MAX_SKIPS;
++}
++
++/* Chunk checks are useful while another copy can follow, or when an unstable copy would be skipped anyway. */
++static inline bool
++sweet_fb_coh_chunk_checks(bool enabled, unsigned attempt, uint64_t waited_us, bool skip_ok)
++{
++	return enabled && ((attempt + 1 < SWEET_FB_COH_MAX_ATTEMPTS && waited_us < SWEET_FB_COH_BUDGET_US) || skip_ok);
++}
++
++/* Busy check due before copying row index r (0-based within the copy loop): every chunk boundary except the first row (the
++ * caller checks once before the copy starts). */
++static inline bool
++sweet_fb_coh_check_due(uint32_t r)
++{
++	return r != 0 && (r % SWEET_FB_COH_CHUNK_ROWS) == 0;
++}
++
++/* How long the next idle poll may sleep: 1 ms sleeps while more than 1.2 ms of budget remain, else 100 us spins. 0 = budget over. */
++static inline uint32_t
++sweet_fb_coh_poll_us(uint64_t waited_us)
++{
++	if (waited_us >= SWEET_FB_COH_BUDGET_US) {
++		return 0;
++	}
++	return (SWEET_FB_COH_BUDGET_US - waited_us > 1200u) ? 1000u : 100u;
++}
++
++struct sweet_fb_coh_stats {
++	uint64_t presents, prewait, aborts, raced, busy_after, retries, recovered, gave_up, skipped, wait_us_sum, wait_us_max;
++};
++
++#endif

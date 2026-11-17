@@ -1,0 +1,96 @@
+--- a/gpu/metal/tegu/render_encoder.inc
++++ b/gpu/metal/tegu/render_encoder.inc
+@@ -155,8 +155,15 @@
+    [d resourceOptions]==0x30&&[d mipmapLevelCount]==1&&[d usage]==4&&
+    [d textureType]==4&&[d sampleCount]==4&&[d arrayLength]==1;
+ }
++/* NSRange-compatible by value; kept local so this freestanding file does not
++ * require Foundation. */
++typedef struct {NSUInteger location,length;} TeguTextureViewRange;
+ @interface TeguTexture : NSObject {
+ @public TeguBuffer *buffer;id debugLabel,heapOwner;NSUInteger heapCharge; TeguComputeDevice *transientOwner,*importedOwner; id importedSurface; U64 importedHandle; signed char surfaceImported;uint32_t surfaceTargetVersion;
++ /* Views retain the source object so an imported kernel handle or heap charge
++  * cannot be released before every view. importedHandleShared suppresses the
++  * per-view kernel release; the source owns that handle. */
++ TeguTexture *viewSource;signed char importedHandleShared;
+  /* IOSurface the kernel refused to import: the texture owns a GPU-reachable
+   * copy, synchronised around each command buffer that uses it. */
+  id shadowSurface;
+@@ -176,6 +183,9 @@
+ - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)stride fromRegion:(TeguRegion)region mipmapLevel:(NSUInteger)level;
+ - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)stride bytesPerImage:(NSUInteger)imageStride
+  fromRegion:(TeguRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice;
++- (id)newTextureViewWithPixelFormat:(NSUInteger)viewFormat;
++- (id)newTextureViewWithPixelFormat:(NSUInteger)viewFormat textureType:(NSUInteger)viewType
++ levels:(TeguTextureViewRange)levels slices:(TeguTextureViewRange)slices;
+ @end
+ /* Resolve the CPU layer base for a Metal slice. Arrays/cube/MS arrays are
+  * layer-major: the level's offset is layer-relative and levelLayerStride is
+@@ -199,6 +209,58 @@
+ }
+ @implementation TeguTexture
+ - (id)device{return surfaceImported?importedOwner:(buffer?buffer->owner:transientOwner);}
++/* Zero-copy view creation.  The format alias policy is the shared audited
++ * n2t_view_format_check; no descriptor or backing allocation is performed. */
++static TeguTexture *tegu_texture_view_alloc(TeguTexture *src,NSUInteger viewFormat) {
++ if(!src||!viewFormat)return 0;
++ const struct TeguIOSurfaceAPI *api=tegu_iosurface_api();
++ TeguTexture *v=[[TeguTexture alloc] init];if(!v)return 0;
++ v->viewSource=[src retain];
++ v->textureWidth=src->textureWidth;v->textureHeight=src->textureHeight;v->textureDepth=src->textureDepth;
++ v->textureKind=src->textureKind;v->textureSamples=src->textureSamples;v->format=viewFormat;
++ v->textureUsage=src->textureUsage;v->textureResourceOptions=src->textureResourceOptions;
++ v->rowBytes=src->rowBytes;v->levelCount=src->levelCount;v->arrayLength=src->arrayLength;v->layers=src->layers;
++ v->surfaceAllocSize=src->surfaceAllocSize;v->surfaceRowBytes=src->surfaceRowBytes;
++ memcpy(v->mip,src->mip,sizeof(v->mip));
++ memcpy(v->levelDepth,src->levelDepth,sizeof(v->levelDepth));
++ memcpy(v->levelSliceStride,src->levelSliceStride,sizeof(v->levelSliceStride));
++ memcpy(v->levelLayerStride,src->levelLayerStride,sizeof(v->levelLayerStride));
++ v->buffer=[src->buffer retain];
++ v->transientOwner=[src->transientOwner retain];
++ if(src->heapOwner){v->heapOwner=[src->heapOwner retain];v->heapCharge=0;}
++ v->debugLabel=[src->debugLabel copy];
++ if(src->surfaceImported) {
++  v->surfaceImported=1;v->surfaceTargetVersion=src->surfaceTargetVersion;
++  v->importedOwner=[src->importedOwner retain];v->importedHandle=src->importedHandle;
++  v->importedHandleShared=1;v->releaseImportedSurface=src->releaseImportedSurface;
++  if(src->importedSurface) {
++   if(!api||!api->cfRetain)goto fail;
++   v->importedSurface=api->cfRetain((void *)src->importedSurface);
++   if(!v->importedSurface)goto fail;
++  }
++ }
++ if(src->shadowSurface) {
++  if(!api||!api->cfRetain)goto fail;
++  v->shadowSurface=api->cfRetain((void *)src->shadowSurface);
++  if(!v->shadowSurface)goto fail;
++  v->releaseImportedSurface=src->releaseImportedSurface;
++ }
++ return v;
++fail:
++ [v release];return 0;
++}
++- (id)newTextureViewWithPixelFormat:(NSUInteger)viewFormat {
++ struct n2t_format_info allocation,view;
++ if(!viewFormat||n2t_view_format_check((uint32_t)format,(uint32_t)viewFormat,&allocation,&view)!=N2T_OK)return 0;
++ return tegu_texture_view_alloc(self,viewFormat);
++}
++- (id)newTextureViewWithPixelFormat:(NSUInteger)viewFormat textureType:(NSUInteger)viewType
++ levels:(TeguTextureViewRange)levels slices:(TeguTextureViewRange)slices {
++ NSUInteger fullSlices=textureKind==7?textureDepth:(layers?layers:1);
++ if(!viewFormat||viewType!=textureKind||!levels.length||!slices.length||
++    levels.location||slices.location||levels.length!=levelCount||slices.length!=fullSlices)return 0;
++ return [self newTextureViewWithPixelFormat:viewFormat];
++}
+ - (id)heap{return heapOwner?heapOwner:(buffer?buffer->heapOwner:0);}
+ - (id)iosurface{return surfaceImported?importedSurface:shadowSurface;}
+ - (NSUInteger)iosurfacePlane{return 0;}
+@@ -357,7 +419,7 @@
+    (r.origin.y+y)*m.stride+r.origin.x*bytesPerPixel,
+   (const unsigned char *)bytes+z*effectiveImageStride+y*effectiveRowStride,rowByteCount);
+ }
+-- (void)dealloc{if(heapOwner&&heapCharge)[heapOwner teguReleaseHeapCharge:heapCharge];[heapOwner release];[debugLabel release];[buffer release];[transientOwner release];if(surfaceImported){if(importedHandle&&importedOwner&&importedOwner->scalar){unsigned n=0;importedOwner->scalar(importedOwner->connection,14,&importedHandle,1,0,&n);}
++- (void)dealloc{if(heapOwner&&heapCharge)[heapOwner teguReleaseHeapCharge:heapCharge];[heapOwner release];[viewSource release];[debugLabel release];[buffer release];[transientOwner release];if(surfaceImported){if(importedHandle&&!importedHandleShared&&importedOwner&&importedOwner->scalar){unsigned n=0;importedOwner->scalar(importedOwner->connection,14,&importedHandle,1,0,&n);}
+  if(importedSurface&&releaseImportedSurface)releaseImportedSurface((void *)importedSurface);[importedOwner release];}
+  if(shadowSurface&&releaseImportedSurface)releaseImportedSurface((void *)shadowSurface);[super dealloc];}
+ @end

@@ -1,0 +1,48 @@
+GPU CONTEXT FREEZE -- design note only (memwod-20261113, with 0481).  Nothing of this is implemented.
+
+Problem
+  0481 only returns buffers the driver itself marked DONTNEED (Mesa's BO cache, and the shim's pool once it forwards MADVISE).  The live
+  buffers of an application that is alive but not drawing stay wired for ever: autocycle/runs/lag1 ended with 1353 MiB of GPU private
+  memory in 2381 buffers while the shim reported only "pooled 41/16 MiB", so most of it was live.  A frozen context would give all of it
+  to the VM (compressor) until the application draws again.
+
+Preconditions (none is met today)
+  1. Every private buffer pageable.  Only ALLOC flag 4 (CPU write-combine) is pageable (Nord2GPU::mapBuffer, 0137); flags 0/1 are wired
+     kIOMemoryKernelUserShared buffers whose kernel address the core keeps for cache maintenance (n2c_page.cpu), flag 2 (GPU-only) is
+     wired or, with 0441, a heap range.  Pageable versions need the per-page CPU address taken from the physical aperture after each
+     prepare(), as nord2_gpu_wod.inc (0480) does for imports; heap buffers (0441) are outside XNU and are left alone.
+  2. A page-table primitive that rewrites the leaf entries of an existing mapping (nord2_gpu_mmu.c has map / unmap / detach only):
+     physical addresses change across complete() / prepare().
+  3. A trigger that knows the application is not visible: the memorystatus band (runningboardd sets it; the 0420 governor reads it) or
+     "no job, no ALLOC, no import for N s".  The band is the better one: an idle but visible application must not pay a thaw.
+
+State per context (core, host-testable like the 0480 state machine): ACTIVE -> FREEZING -> FROZEN -> THAWING -> ACTIVE
+  Freeze (thread call, GPU lock; refuse unless jobs == 0, retained == 0, no reservation, no fence pending, not quarantined):
+    a. disable the address space in the hardware (AS_TRANSTAB unmapped + AS_COMMAND UPDATE + flush, wait for the acknowledge);
+       as_live = false.  From here the GPU cannot reach any page of the context, whatever the tables say.
+    b. state = FROZEN; every entry point of the context (SUBMIT, ALLOC, IMPORT, SYNC, RESERVE, MADVISE, WAIT) sees it.
+    c. GPU lock dropped: complete() on every private pageable buffer; the import holds of 0480 surfaces are given back (they unwire by
+       their own idle rule).  CPU mappings stay valid: the application's own threads may still read and write the buffers.
+  Thaw (first call that needs the GPU, on the caller's thread, GPU lock dropped, connection lock held as in mapBuffer):
+    a. state = THAWING (other callers of the context sleep);
+    b. prepare() every buffer (pages come back from the compressor: this is the cost, ~1 ms per MiB if compressed), re-take the import
+       holds; for each page read the new physical address, rewrite the leaf entry, refresh n2c_page.pa / .cpu;
+    c. flush the tables' cache lines, enable the address space, flush it, state = ACTIVE.
+    A failed prepare() (no memory) fails the thaw: the context is closed as if the client had died (kIOReturnNoMemory to the caller).
+  Partial thaw is not possible: a raw job chain may address any buffer of its address space (the 0185 rule), so the whole context comes
+  back at once.  Thaw at "application becomes visible" (band change) rather than at its first submit keeps the cost out of its first frame.
+
+What must be proven before it runs on the phone (host model first, as wod_host_test.c)
+  - no job is ever started on a context that is not ACTIVE; no table entry is live while its buffer is unprepared;
+  - the cache-tracking flags (cpu_dirty / gpu_dirty / explicit_track) survive: the VM moves the data, the CPU caches stay coherent,
+    but the first job after a thaw must clean every CPU-visible buffer (the pages are new);
+  - accounting: ctxs[].wired keeps the charge (budgets must not admit new buffers into memory that a thaw will need), a separate
+    "frozen bytes" figure goes to the NORD2 MEM GPU line; privateTotal() for the 0417/0418 budget excludes frozen contexts.
+
+Risks
+  - a stale translation after step a of the freeze = GPU fault or, worse, a write into pages the VM gave to somebody else: the address
+    space must be verified disabled (read back, and one deliberate fault test on a probe context) before step c;
+  - thaw latency on resume (hundreds of ms for 200 MiB);
+  - with the governor in act mode (0420 mode 2) background applications are killed and their contexts disappear anyway: freeze only
+    helps applications the governor keeps.  That is why it ranks last (study item 1.5 b); estimate 1 to 1.5 weeks.
+  Switch: a sysctl of its own, default off; a refused or failed freeze must leave the context exactly as it was.

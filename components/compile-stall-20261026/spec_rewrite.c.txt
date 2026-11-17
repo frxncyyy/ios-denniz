@@ -1,0 +1,183 @@
+/* RUNTIME_SPEC: rewrite a module so that its specialization constants are
+ * read from push words (layout: tegu_spec_push_scan in the header). Each
+ * specialization constant and OpSpecConstantOp keeps its result id but becomes
+ * an ordinary instruction at the top of the entry function (a push load per
+ * constant, the operations in module order), so no use is rewritten; their
+ * SpecId decorations go. Refused (reason returned, *outp NULL): such a value
+ * used outside the entry function other than by another such operation, an
+ * operation kind outside the integer/logical/compare/select set, a push block
+ * reaching past the base, or a push block member whose size is not plain. */
+static bool spec_push_op_ok(uint32_t op) {
+ switch(op) {
+ case 126: case 128: case 130: case 132: case 134: case 135: case 137: case 138: case 139:
+ case 113: case 114:
+ case 164: case 165: case 166: case 167: case 168: case 169:
+ case 170: case 171: case 172: case 173: case 174: case 175: case 176: case 177: case 178: case 179:
+ case 194: case 195: case 196: case 197: case 198: case 199: case 200:
+  return true;
+ default: return false;
+ }
+}
+static bool spec_push_type_size(const uint32_t *w,size_t words,uint32_t type,uint64_t *size,unsigned depth) {
+ if(depth>8)return false;
+ for(size_t at=5;at<words;) {
+  uint32_t op=w[at]&0xffffu,len=w[at]>>16;if(!len||at+len>words)return false;
+  if(len>=2&&w[at+1]==type&&op>=19&&op<=30) {
+   if((op==21||op==22)&&len>=3){*size=w[at+2]/8;return w[at+2]%8==0;}
+   if(op==23&&len==4){uint64_t el;if(!spec_push_type_size(w,words,w[at+2],&el,depth+1))return false;*size=el*w[at+3];return true;}
+   if(op==28&&len==4) {
+    uint64_t stride=0,count=0;
+    for(size_t d=5;d<words;){uint32_t o=w[d]&0xffffu,l=w[d]>>16;if(!l||d+l>words)return false;
+     if(o==71&&l==4&&w[d+1]==type&&w[d+2]==6)stride=w[d+3];
+     if(o==43&&l==4&&w[d+2]==w[at+3])count=w[d+3];d+=l;}
+    *size=stride*count;return stride&&count;
+   }
+   if(op==30) {
+    uint64_t end=0;
+    for(uint32_t mbr=0;mbr+2<len;mbr++) {
+     uint64_t off=UINT64_MAX,ms=0;
+     for(size_t d=5;d<words;){uint32_t o=w[d]&0xffffu,l=w[d]>>16;if(!l||d+l>words)return false;
+      if(o==72&&l==5&&w[d+1]==type&&w[d+2]==mbr&&w[d+3]==35)off=w[d+4];d+=l;}
+     if(off==UINT64_MAX||!spec_push_type_size(w,words,w[at+2+mbr],&ms,depth+1))return false;
+     if(off+ms>end)end=off+ms;
+    }
+    *size=end;return true;
+   }
+   return false;
+  }
+  at+=len;
+ }
+ return false;
+}
+static const char *spec_push_rewrite(const uint32_t *w,size_t words,uint32_t **outp,size_t *out_words) {
+ *outp=NULL;*out_words=0;
+ struct tegu_spec_push_entry e[TEGU_SPEC_PUSH_MAX];
+ int n=tegu_spec_push_scan(w,words,e);
+ if(n<0)return "specialization constants are not 32-bit integers or booleans with SpecIds";
+ if(n==0){uint32_t *c=malloc(words*4);if(!c)return "allocation failed";memcpy(c,w,words*4);*outp=c;*out_words=words;return NULL;}
+ const uint32_t bound=w[3];
+ uint8_t *derived=calloc(bound,1);
+ if(!derived)return "allocation failed";
+ uint32_t spec_type[TEGU_SPEC_PUSH_MAX]={0};
+ size_t first_fn=0,last_annotation=0;uint32_t entry_fn=0,uint_type=0,bool_type=0,push_var=0,push_ptr=0,push_struct=0;
+ size_t entry_ep=0;const char *why=NULL;
+ for(int k=0;k<n;k++)derived[e[k].result_id]=1;
+ for(size_t at=5;at<words&&!why;) {
+  uint32_t op=w[at]&0xffffu,len=w[at]>>16;
+  if(op==54){first_fn=at;break;}
+  if(op==15&&len>=3&&!entry_fn){entry_fn=w[at+2];entry_ep=at;}
+  if(op>=71&&op<=75)last_annotation=at;
+  if(op==21&&len==4&&w[at+2]==32&&w[at+3]==0&&!uint_type)uint_type=w[at+1];
+  if(op==20&&len==2&&!bool_type)bool_type=w[at+1];
+  if(op==59&&len>=4&&w[at+3]==9){if(push_var)why="two push-constant variables";push_var=w[at+2];push_ptr=w[at+1];}
+  if((op==48||op==49||op==50)&&len>=3)for(int k=0;k<n;k++)if(e[k].result_id==w[at+2])spec_type[k]=w[at+1];
+  if(op==52) {
+   if(len<5||w[at+2]>=bound||!spec_push_op_ok(w[at+3]))why="specialization operation kind unsupported";
+   else derived[w[at+2]]=1;
+  }
+  at+=len;
+ }
+ if(!why&&(!first_fn||!entry_fn||!uint_type||!last_annotation))why="module lacks an entry function, annotations or a 32-bit unsigned type";
+ for(int k=0;!why&&k<n;k++)if(!spec_type[k]||(e[k].is_bool&&spec_type[k]!=bool_type))why="malformed specialization constant";
+ if(!why&&push_var) {
+  for(size_t at=5;at<first_fn;){uint32_t op=w[at]&0xffffu,len=w[at]>>16;if(op==32&&len==4&&w[at+1]==push_ptr)push_struct=w[at+3];at+=len;}
+  uint64_t size=0;
+  if(!push_struct||!spec_push_type_size(w,words,push_struct,&size,0))why="push block layout not plain";
+  else if(size>TEGU_SPEC_PUSH_BASE)why="push block reaches past the runtime specialization base";
+  for(size_t at=5;!why&&at<first_fn;){uint32_t op=w[at]&0xffffu,len=w[at]>>16;
+   if(op!=30&&op!=5&&op!=6&&op!=71&&op!=72&&!(op==32&&w[at+1]==push_ptr))
+    for(uint32_t i=1;i<len;i++)if(w[at+i]==push_struct){why="push block type shared";break;}
+   at+=len;}
+ }
+ if(!why) {
+  int in_fn=0;uint32_t cur=0;
+  for(size_t at=5;at<words&&!why;) {
+   uint32_t op=w[at]&0xffffu,len=w[at]>>16;
+   if(!len||at+len>words){why="malformed";break;}
+   if(op==54){in_fn=1;cur=len>=3?w[at+2]:0;}
+   int spec_def=op==48||op==49||op==50||op==52;
+   int names=op==5||op==6||op==71||op==72||op==3||op==7||op==8||op==15||op==16||op==11||op==10||op==17||op==14||op==330||op==331||op==332;
+   if(!spec_def&&!names&&(!in_fn||cur!=entry_fn))
+    for(uint32_t i=1;i<len;i++)if(w[at+i]<bound&&derived[w[at+i]]){why=in_fn?"specialization value used outside the entry function":"specialization value used at module scope";break;}
+   if(in_fn&&cur==entry_fn&&op==59&&len==5&&w[at+4]<bound&&derived[w[at+4]])why="specialization value initializes a variable";
+   if(op==56)in_fn=0;
+   at+=len;
+  }
+ }
+ if(why){free(derived);return why;}
+ uint32_t next=bound,ptr_pc_uint=0;
+ for(size_t at=5;at<first_fn;){uint32_t op=w[at]&0xffffu,len=w[at]>>16;
+  if(op==32&&len==4&&w[at+2]==9&&w[at+3]==uint_type)ptr_pc_uint=w[at+1];at+=len;}
+ const int make_ptr=!ptr_pc_uint;if(make_ptr)ptr_pc_uint=next++;
+ const uint32_t zero=next++;
+ uint32_t member0=0,block=push_struct,block_ptr=0,block_var=push_var;
+ if(push_struct){for(size_t at=5;at<first_fn;){uint32_t op=w[at]&0xffffu,len=w[at]>>16;if(op==30&&w[at+1]==push_struct)member0=len-2;at+=len;}}
+ else {block=next++;block_ptr=next++;block_var=next++;}
+ uint32_t idx[TEGU_SPEC_PUSH_MAX],ac[TEGU_SPEC_PUSH_MAX],ld[TEGU_SPEC_PUSH_MAX];
+ for(int k=0;k<n;k++){idx[k]=next++;ac[k]=next++;ld[k]=next++;}
+ size_t cap=words+32+(size_t)n*24;
+ for(size_t at=5;at<first_fn;){uint32_t op=w[at]&0xffffu,len=w[at]>>16;if(op==52)cap+=len;at+=len;}
+ uint32_t *o=malloc(cap*4);size_t m=0;
+ if(!o){free(derived);return "allocation failed";}
+#define SPV_PUT(x) do{if(m<cap)o[m++]=(uint32_t)(x);}while(0)
+ for(unsigned i=0;i<5;i++)SPV_PUT(w[i]);
+ int in_entry=0,entry_open=0;
+ for(size_t at=5;at<words;) {
+  uint32_t op=w[at]&0xffffu,len=w[at]>>16;
+  if(at==first_fn) {                                        /* new globals before the first function */
+   if(make_ptr){SPV_PUT(32u|4u<<16);SPV_PUT(ptr_pc_uint);SPV_PUT(9);SPV_PUT(uint_type);}
+   SPV_PUT(43u|4u<<16);SPV_PUT(uint_type);SPV_PUT(zero);SPV_PUT(0);
+   for(int k=0;k<n;k++){SPV_PUT(43u|4u<<16);SPV_PUT(uint_type);SPV_PUT(idx[k]);SPV_PUT(member0+(uint32_t)k);}
+   if(!push_struct) {
+    SPV_PUT(30u|(uint32_t)(2+n)<<16);SPV_PUT(block);for(int k=0;k<n;k++)SPV_PUT(uint_type);
+    SPV_PUT(32u|4u<<16);SPV_PUT(block_ptr);SPV_PUT(9);SPV_PUT(block);
+    SPV_PUT(59u|4u<<16);SPV_PUT(block_ptr);SPV_PUT(block_var);SPV_PUT(9);
+   }
+  }
+  if(at<first_fn) {
+   const int last=at==last_annotation;
+   int skip=((op==48||op==49||op==50||op==52)&&len>=3&&derived[w[at+2]])||
+    (op==71&&len==4&&w[at+2]==1&&w[at+1]<bound&&derived[w[at+1]]);
+   if(!skip) {
+    if(op==15&&at==entry_ep&&!push_struct&&w[1]>=0x00010400u) {
+     SPV_PUT(op|((len+1)<<16));for(uint32_t i=1;i<len;i++)SPV_PUT(w[at+i]);SPV_PUT(block_var);
+    } else if(op==30&&push_struct&&w[at+1]==push_struct) {
+     SPV_PUT(30u|((len+(uint32_t)n)<<16));for(uint32_t i=1;i<len;i++)SPV_PUT(w[at+i]);for(int k=0;k<n;k++)SPV_PUT(uint_type);
+    } else for(uint32_t i=0;i<len;i++)SPV_PUT(w[at+i]);
+   }
+   at+=len;
+   if(last) {
+    if(!push_struct){SPV_PUT(71u|3u<<16);SPV_PUT(block);SPV_PUT(2);}
+    for(int k=0;k<n;k++){SPV_PUT(72u|5u<<16);SPV_PUT(block);SPV_PUT(member0+(uint32_t)k);SPV_PUT(35);SPV_PUT(TEGU_SPEC_PUSH_BASE+4u*(uint32_t)k);}
+   }
+   continue;
+  }
+  if(op==54&&len>=3)in_entry=w[at+2]==entry_fn;
+  for(uint32_t i=0;i<len;i++)SPV_PUT(w[at+i]);
+  at+=len;
+  if(in_entry&&op==248)entry_open=1;                         /* first OpLabel of the entry */
+  if(entry_open) {
+   uint32_t nop=at<words?(w[at]&0xffffu):0;
+   if(nop==59||nop==8||nop==317)continue;                     /* OpVariable, OpLine, OpNoLine stay first */
+   entry_open=0;in_entry=0;
+   for(int k=0;k<n;k++) {
+    SPV_PUT(65u|5u<<16);SPV_PUT(ptr_pc_uint);SPV_PUT(ac[k]);SPV_PUT(block_var);SPV_PUT(idx[k]);
+    if(spec_type[k]==uint_type){SPV_PUT(61u|4u<<16);SPV_PUT(uint_type);SPV_PUT(e[k].result_id);SPV_PUT(ac[k]);}
+    else {
+     SPV_PUT(61u|4u<<16);SPV_PUT(uint_type);SPV_PUT(ld[k]);SPV_PUT(ac[k]);
+     if(e[k].is_bool){SPV_PUT(171u|5u<<16);SPV_PUT(bool_type);SPV_PUT(e[k].result_id);SPV_PUT(ld[k]);SPV_PUT(zero);}
+     else {SPV_PUT(124u|4u<<16);SPV_PUT(spec_type[k]);SPV_PUT(e[k].result_id);SPV_PUT(ld[k]);}
+    }
+   }
+   for(size_t s=5;s<first_fn;) {
+    uint32_t so=w[s]&0xffffu,sl=w[s]>>16;
+    if(so==52&&derived[w[s+2]]){SPV_PUT(w[s+3]|((sl-1)<<16));SPV_PUT(w[s+1]);SPV_PUT(w[s+2]);for(uint32_t i=4;i<sl;i++)SPV_PUT(w[s+i]);}
+    s+=sl;
+   }
+  }
+ }
+#undef SPV_PUT
+ free(derived);
+ if(m>=cap){free(o);return "rewrite overflow";}
+ o[3]=next;*outp=o;*out_words=m;return NULL;
+}

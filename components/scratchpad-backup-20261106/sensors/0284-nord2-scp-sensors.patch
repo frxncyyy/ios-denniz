@@ -1,0 +1,723 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -378,6 +378,9 @@
+ 	case 0x1c1c: case 0x1c20: case 0x1c22: case 0x1c28:
+ 	case 0x1c2e: case 0x1c32: case 0x1c34: case 0x1c3a:
+ 	case 0x1f98: case 0x1f9c: case 0x2010: case 0x202e:
++	/* 0284: VCORE (BUCK_VGPU11) and its SCP ("SSHUB") controls, read only: CON0, OP_EN, DBG0 (output VOSEL),
++	 * SSHUB_CON0 (SCP enable/VOSEL), ELR0 (AP VOSEL), PMRC_CON1 (VR_SSHUB_MODE bit 2), VSRAM_OTHERS_SSHUB */
++	case 0x1588: case 0x1594: case 0x15a6: case 0x15aa: case 0x15b4: case 0x01ac: case 0x1f28:
+ 		break;
+ 	default:
+ 		return false;
+@@ -403,6 +406,8 @@
+ 	return false;
+ }
+ 
++static void n2scp_pmic_snapshot(void);   /* 0284, nord2_scp.inc */
++
+ static bool
+ ni_keys_read(uint16_t *out)
+ {
+@@ -876,6 +881,7 @@
+ 	/* Publish retained maps only after this owner finishes initial GPIO writes. */
+ 	nah_native_publish_ready();
+ 	ns_probe(); /* alert slider: publishes the boot ring/silent state */
++	n2scp_pmic_snapshot(); /* 0284: VCORE/SSHUB state for the SCP thread, on the PMIF's owner thread */
+ 	ni_bus(false);
+ 	unsigned errors = 0, ticks = 0, key_errors = 0, slider_ticks = 0;
+ 	int state[3] = {0}, previous[3] = {-1, -1, -1};
+@@ -921,6 +927,8 @@
+ 	}
+ }
+ 
++#include "nord2_scp.inc"   /* 0284: SCP sensor hub */
++
+ void
+ nord2_input_init(void)
+ {
+@@ -933,6 +941,7 @@
+ 	kern_return_t kr = kernel_thread_start(ni_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) { thread_deallocate(thread); }
+ 	else { printf("NORD2 INPUT: thread start failed %d\n", kr); }
++	nord2_scp_start();   /* 0284 */
+ }
+ #else /* original Sweet hardware */
+ /*
+--- a/bsd/dev/nord2_scp.inc
++++ b/bsd/dev/nord2_scp.inc
+@@ -0,0 +1,438 @@
++/*
++ * 0284 NORD2 SCP: the MT6893 sensor hub (MediaTek "tinysys" SCP, two RISC-V cores) and the sensors behind it.
++ *
++ * On the Nord 2 every sensor sits on the SCP's own buses, not the AP's (OnePlus dtbo sensor_devinfo: light/proximity
++ * TCS3701 0x39 or STK32600 0x48 on SCP I2C0 with EINT 4, magnetometer AK09918 0x0c or MMC5603 0x30 on SCP I2C0,
++ * accelerometer/gyroscope on SCP SPI2). Android's kernel never drives the chips: LK loads the SCP image into its TCM,
++ * the kernel lets core 0 run and talks to the firmware's sensor hub. This file does the same, from scratch, after the
++ * public descriptions of the interfaces (MediaTek scp v02 / mtk-mbox / sensorHub v1 headers in the OnePlus mt6893 OSS
++ * kernel; the bring-up order follows HakiOS' MT6768 driver, MIT, github.com/oosexgang/hakios-mt6768
++ * kernel/bsd/dev/redwood_scp.c):
++ *
++ *   SCP regions (device tree scp@10700000): TCM 0x10500000 (1.5 MB; region info at +4, written by LK), cfg
++ *   0x10724000, core0 0x10730000 (+0 SW_RSTN_CLR = run, +4 SW_RSTN_SET = hold, +0x40.. GPR0..7, GPR1/2 = the AP DRAM
++ *   the firmware may use, +0x70 status, +0x80 PC), core1 0x10740000. Clock: topckgen CLK_CFG_0 scp_sel bits 16-18
++ *   (0 = clk26m), gate bit 23, CLK_CFG_UPDATE bit 2.
++ *   Mailboxes 0..4 at 0x107fb000 + 0x1000*n: 64 32-bit slots, +0x100 "set" (AP -> SCP pin bits, a bit stays set until
++ *   the SCP has taken that pin), +0x10c "clr" (SCP -> AP pending pin bits; writing them back takes them). Pins (scp
++ *   v02 mt6885 tables, offsets as mbox_setup_pin_table() lays them out with 64-bit slots): mbox1 recv SCP_READY_0 slot
++ *   20 bit 10; mbox2 send MPOOL_0 slot 0 bit 0 (34 slots), recv MPOOL_0 slot 34 bit 17 (30 slots). The "legacy" IPIs
++ *   ride on MPOOL: words {id, length in bytes, payload}; ids IPI_CHRE 1, IPI_CHREX 2, IPI_SENSOR 3.
++ *   Waking it for a send: infracfg 0x10001b14 INFRA_IRQ_SET = 0xA0 | 1, until it takes it, then INFRA_IRQ_CLEAR.
++ *   Sensor hub: SCP_SENSOR_HUB_REQ {type, action, 0, 0, data[]} on IPI_SENSOR; SET_CONFIG (4) gives the DRAM FIFO
++ *   (struct sensorFIFO {rp, wp, FIFOSize, 0} then 44-byte data_unit_t records); sensors are enabled with nanohub
++ *   ConfigCmd packets on IPI_CHRE (sync 0x31, seq, CMD_COMMS_WRITE 0x1091, length, data, CRC32), each IPI_CHRE from
++ *   the SCP acknowledged with IPI_CHREX carrying its length. Android sensor types: accelerometer 1, magnetic 2,
++ *   gyroscope 4, light 5, proximity 8 (data_unit_t: x/y/z at +12/+16/+20; light at +12; proximity steps +12,
++ *   oneshot +16: 0 near, 1 far).
++ *
++ * The SCP's DRAM (its MPU window and the sensor FIFO) is N2SCP_DRAM_PHYS: below XNU's window, outside every fixed
++ * carve-out of the live device tree, where Android's kernel itself places reserve-memory-scp_share (0x320000, 16 MB
++ * aligned, 0x50000000-0x90000000): see the scp-probe-20261108 notes.
++ *
++ * Everything is in one kernel thread started with the input thread; it never blocks the boot. Every step is logged
++ * ("NORD2 SCP: ..."). No storage is written. Default on; boot-arg nord2scp=0 turns it off (the command line is full,
++ * so the default is compiled in), nord2scp=1 only reads (step 1).
++ */
++#ifndef N2SCP_DRAM_PHYS
++#define N2SCP_DRAM_PHYS     0x89000000u         /* Android (rescue, 8 Nov): scp_reserve_memory_ioremap 0x89000000+0x320000 */
++#endif
++#define N2SCP_DRAM_SIZE     0x320000u
++#ifndef N2SCP_START_DELAY_S
++#define N2SCP_START_DELAY_S 60u
++#endif
++#define N2SCP_FIFO_OFF      0x4c000u            /* page-aligned, inside SENS_MEM_ID (0x4a700..0x14a700) */
++#define N2SCP_FIFO_SIZE     0x4000u             /* 16 KB (372 records): XNU's I/O map is small, bigger maps exhausted it and the next driver to map panicked (q10ee/q10el/q10em) */
++
++#define N2SCP_TCM           0x10500000u
++#define N2SCP_CFG           0x10724000u
++#define N2SCP_CORE0         0x10730000u
++#define N2SCP_CORE1         0x10740000u
++#define N2SCP_MBOX(n)       (0x107fb000u + 0x1000u * (n))
++#define N2SCP_INFRA         0x10001000u
++#define N2SCP_TOPCK         0x10000000u
++
++#define N2SCP_IPI_CHRE      1u
++#define N2SCP_IPI_CHREX     2u
++#define N2SCP_IPI_SENSOR    3u
++
++#define N2SCP_REC           44u
++enum { N2S_ACCEL = 1, N2S_MAG = 2, N2S_GYRO = 4, N2S_LIGHT = 5, N2S_PROX = 8 };
++
++static vm_offset_t n2scp_tcm, n2scp_cfg, n2scp_c0, n2scp_c1, n2scp_infra, n2scp_topck, n2scp_dram;
++static vm_offset_t n2scp_mb[5];
++static uint32_t n2scp_seq = 1;
++static volatile int n2scp_prox = -1;            /* last proximity: 0 near, 1 far, -1 none */
++static volatile int32_t n2scp_lux = -1;
++static volatile int32_t n2scp_acc[3], n2scp_gyr[3], n2scp_magv[3];
++static volatile uint32_t n2scp_state, n2scp_records, n2scp_msgs;
++
++/* VCORE/SSHUB PMIC registers, read once by the input thread (the PMIF's only user) before its polling loop */
++static const uint16_t n2scp_pmic_addr[7] = { 0x1588, 0x1594, 0x15a6, 0x15aa, 0x15b4, 0x01ac, 0x1f28 };
++static uint16_t n2scp_pmic_val[7];
++static volatile int n2scp_pmic_done;      /* 0 not yet, 1 read, -1 failed */
++static void
++n2scp_pmic_snapshot(void)
++{
++	int ok = 1;
++	for (int i = 0; i < 7; i++) { if (!ni_pmic_read(n2scp_pmic_addr[i], &n2scp_pmic_val[i])) { ok = 0; } }
++	n2scp_pmic_done = ok ? 1 : -1;
++}
++
++extern void sweet_hid_proximity(int near);
++extern void sweet_hid_ambient(int lux);
++extern void sweet_hid_motion(int kind, int x, int y, int z);
++
++static int n2scp_chan;
++static void
++n2scp_sleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&n2scp_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static inline uint32_t n2scp_rd(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline void n2scp_wr(vm_offset_t b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; __asm__ volatile("dsb sy" ::: "memory"); }
++
++/* -------- step 1: what LK left (read only) -------- */
++static bool
++n2scp_map(void)
++{
++	n2scp_tcm = ml_io_map(N2SCP_TCM, 0x1000);
++	n2scp_cfg = ml_io_map(N2SCP_CFG, 0x1000);
++	n2scp_c0 = ml_io_map(N2SCP_CORE0, 0x1000);
++	n2scp_c1 = ml_io_map(N2SCP_CORE1, 0x1000);
++	n2scp_infra = ml_io_map(N2SCP_INFRA, 0x1000);
++	n2scp_topck = ml_io_map(N2SCP_TOPCK, 0x1000);
++	for (int i = 0; i < 5; i++) { n2scp_mb[i] = ml_io_map(N2SCP_MBOX(i), 0x1000); }
++	return n2scp_tcm && n2scp_cfg && n2scp_c0 && n2scp_c1 && n2scp_infra && n2scp_topck && n2scp_mb[1] && n2scp_mb[2];
++}
++
++static bool
++n2scp_step1(void)
++{
++	uint32_t ri[17], pc0, pc1;
++
++	for (int i = 0; i < 17; i++) { ri[i] = n2scp_rd(n2scp_tcm, 4 + 4 * i); }
++	pc0 = n2scp_rd(n2scp_c0, 0x80);
++	n2scp_sleep(20);
++	pc1 = n2scp_rd(n2scp_c0, 0x80);
++	printf("NORD2 SCP: step 1: core0 status %#x PC %#x/%#x LR %#x rstn %#x | core1 status %#x PC %#x | clk_cfg_0 %#x\n",
++	    n2scp_rd(n2scp_c0, 0x70), pc0, pc1, n2scp_rd(n2scp_c0, 0x84), n2scp_rd(n2scp_c0, 0x4),
++	    n2scp_rd(n2scp_c1, 0x70), n2scp_rd(n2scp_c1, 0x80), n2scp_rd(n2scp_topck, 0x10));
++	printf("NORD2 SCP: step 1: GPR %#x %#x %#x %#x %#x %#x %#x %#x | TCM[0] %#x %#x\n",
++	    n2scp_rd(n2scp_c0, 0x40), n2scp_rd(n2scp_c0, 0x44), n2scp_rd(n2scp_c0, 0x48), n2scp_rd(n2scp_c0, 0x4c),
++	    n2scp_rd(n2scp_c0, 0x50), n2scp_rd(n2scp_c0, 0x54), n2scp_rd(n2scp_c0, 0x58), n2scp_rd(n2scp_c0, 0x5c),
++	    n2scp_rd(n2scp_tcm, 0), n2scp_rd(n2scp_tcm, 0x800));
++	printf("NORD2 SCP: step 1: region info loader %#x+%#x fw %#x+%#x dram %#x+%#x backup %#x size %u uart %u ctx %#x "
++	    "scpctl %#x regdump %#x+%#x op %u pcb %u proj %u sensor_data %#x\n", ri[0], ri[1], ri[2], ri[3], ri[4], ri[5],
++	    ri[6], ri[7], ri[8], ri[9], ri[10], ri[11], ri[12], ri[13], ri[14], ri[15], ri[16]);
++	printf("NORD2 SCP: step 1: mbox set/clr %#x/%#x %#x/%#x %#x/%#x %#x/%#x %#x/%#x\n",
++	    n2scp_rd(n2scp_mb[0], 0x100), n2scp_rd(n2scp_mb[0], 0x10c), n2scp_rd(n2scp_mb[1], 0x100), n2scp_rd(n2scp_mb[1], 0x10c),
++	    n2scp_rd(n2scp_mb[2], 0x100), n2scp_rd(n2scp_mb[2], 0x10c), n2scp_rd(n2scp_mb[3], 0x100), n2scp_rd(n2scp_mb[3], 0x10c),
++	    n2scp_rd(n2scp_mb[4], 0x100), n2scp_rd(n2scp_mb[4], 0x10c));
++	/* a loaded image: the region info says where LK put it */
++	return ri[2] != 0 && ri[3] != 0 && ri[3] < 0x10000000u;
++}
++
++/* -------- IPI -------- */
++static bool
++n2scp_awake(int unlock)
++{
++	bool ok = false;
++	n2scp_wr(n2scp_infra, 0xb14, 0xA0u | (1u << (unlock ? 1 : 0)));
++	for (int n = 0; n < 20000; n++) {
++		uint32_t v = n2scp_rd(n2scp_infra, 0xb14);
++		if ((v & 0xE0) != 0xA0) { break; }
++		if (!(v & (1u << (unlock ? 1 : 0)))) { ok = true; break; }
++		delay(10);
++	}
++	n2scp_wr(n2scp_infra, 0xb18, 0xA0u | (1u << (unlock ? 1 : 0)));
++	return ok;
++}
++
++/* one legacy IPI: {id, length, payload} into mbox2 MPOOL_0 (slot 0, pin 0); whether the SCP took it */
++static bool
++n2scp_send(uint32_t id, const void *payload, uint32_t len)
++{
++	const uint8_t *p = payload;
++	bool taken = false;
++
++	if (len > (34 - 2) * 4) { return false; }
++	(void)n2scp_awake(0);
++	for (int n = 0; n < 10000 && (n2scp_rd(n2scp_mb[2], 0x100) & 1); n++) { delay(10); }
++	if (!(n2scp_rd(n2scp_mb[2], 0x100) & 1)) {
++		n2scp_wr(n2scp_mb[2], 0, id);
++		n2scp_wr(n2scp_mb[2], 4, len);
++		for (uint32_t i = 0; i < len; i += 4) {
++			uint32_t w = 0;
++			for (uint32_t k = 0; k < 4 && i + k < len; k++) { w |= (uint32_t)p[i + k] << (8 * k); }
++			n2scp_wr(n2scp_mb[2], 8 + i, w);
++		}
++		n2scp_wr(n2scp_mb[2], 0x100, 1);
++		for (int n = 0; n < 100000; n++) {
++			if (!(n2scp_rd(n2scp_mb[2], 0x100) & 1)) { taken = true; break; }
++			delay(10);
++		}
++	}
++	(void)n2scp_awake(1);
++	return taken;
++}
++
++static const uint32_t n2scp_crc_tab[16] = {
++	0x00000000, 0x04C11DB7, 0x09823B6E, 0x0D4326D9, 0x130476DC, 0x17C56B6B, 0x1A864DB2, 0x1E475005,
++	0x2608EDB8, 0x22C9F00F, 0x2F8AD6D6, 0x2B4BCB61, 0x350C9B64, 0x31CD86D3, 0x3C8EA00A, 0x384FBDBD,
++};
++static uint32_t
++n2scp_crc(const uint8_t *b, uint32_t len)
++{
++	uint32_t crc = ~0u;
++	for (uint32_t i = 0; i < len; i += 4) {
++		uint32_t w = 0;
++		for (uint32_t k = 0; k < 4 && i + k < len; k++) { w |= (uint32_t)b[i + k] << (8 * k); }
++		crc ^= w;
++		for (int n = 0; n < 8; n++) { crc = (crc << 4) ^ n2scp_crc_tab[crc >> 28]; }
++	}
++	return crc;
++}
++
++/* nanohub ConfigCmd: enable/disable `type` at `hz` (rate = Hz * 1024; 0xFFFFFF01 on-change) */
++static bool
++n2scp_config(uint8_t type, int enable, uint32_t rate)
++{
++	uint8_t pkt[10 + 20 + 4];
++	uint32_t seq = n2scp_seq++, crc;
++
++	memset(pkt, 0, sizeof(pkt));
++	pkt[0] = 0x31;
++	memcpy(pkt + 1, &seq, 4);
++	pkt[5] = 0x91; pkt[6] = 0x10;
++	pkt[9] = 20;
++	pkt[10] = 0x00; pkt[11] = 0x03;            /* EVT_NO_SENSOR_CONFIG_EVENT 0x300 */
++	memcpy(pkt + 10 + 12, &rate, 4);
++	pkt[10 + 16] = type;
++	pkt[10 + 17] = enable ? 1 : 0;
++	crc = n2scp_crc(pkt, 30);
++	memcpy(pkt + 30, &crc, 4);
++	bool ok = n2scp_send(N2SCP_IPI_CHRE, pkt, sizeof(pkt));
++	printf("NORD2 SCP: config sensor %u %s rate %u: %s\n", type, enable ? "on" : "off", rate, ok ? "taken" : "NOT TAKEN");
++	return ok;
++}
++
++/* the SCP's messages: mbox1 (ready, errors) and mbox2 MPOOL (sensor hub, nanohub); `say` logs them */
++static int
++n2scp_take(bool say)
++{
++	int got = 0;
++	uint32_t p1 = n2scp_rd(n2scp_mb[1], 0x10c), p2 = n2scp_rd(n2scp_mb[2], 0x10c);
++
++	if (p1) {
++		if (say) {
++			printf("NORD2 SCP: mbox1 pins %#x: ready slot %#x | error info %#x %#x %#x %#x\n", p1, n2scp_rd(n2scp_mb[1], 20 * 4),
++			    n2scp_rd(n2scp_mb[1], 10 * 4), n2scp_rd(n2scp_mb[1], 11 * 4), n2scp_rd(n2scp_mb[1], 12 * 4), n2scp_rd(n2scp_mb[1], 13 * 4));
++		}
++		if (p1 & (1u << 10)) { n2scp_state |= 1; }
++		n2scp_wr(n2scp_mb[1], 0x10c, p1);
++		got++;
++	}
++	if (p2 & (1u << 17)) {
++		uint32_t id = n2scp_rd(n2scp_mb[2], 34 * 4), len = n2scp_rd(n2scp_mb[2], 35 * 4), d0 = n2scp_rd(n2scp_mb[2], 36 * 4);
++		n2scp_msgs++;
++		if (say || n2scp_msgs <= 40) {
++			printf("NORD2 SCP: msg %u id %u len %u: %08x %08x %08x %08x %08x %08x\n", n2scp_msgs, id, len, d0,
++			    n2scp_rd(n2scp_mb[2], 37 * 4), n2scp_rd(n2scp_mb[2], 38 * 4), n2scp_rd(n2scp_mb[2], 39 * 4),
++			    n2scp_rd(n2scp_mb[2], 40 * 4), n2scp_rd(n2scp_mb[2], 41 * 4));
++		}
++		/* sensor hub: byte 1 the action, byte 2 the notify event (SCP_INIT_DONE 0) */
++		if (id == N2SCP_IPI_SENSOR && ((d0 >> 8) & 0xff) == 6 && ((d0 >> 16) & 0xff) == 0) { n2scp_state |= 2; }
++		n2scp_wr(n2scp_mb[2], 0x10c, 1u << 17);
++		if (id == N2SCP_IPI_CHRE) { (void)n2scp_send(N2SCP_IPI_CHREX, &len, 4); }
++		got++;
++	} else if (p2) {
++		if (say) { printf("NORD2 SCP: mbox2 unexpected pins %#x\n", p2); }
++		n2scp_wr(n2scp_mb[2], 0x10c, p2);
++	}
++	return got;
++}
++
++static void
++n2scp_wait(uint32_t ms, uint32_t want)
++{
++	for (uint32_t t = 0; t < ms && (n2scp_state & want) != want; t += 10) {
++		if (!n2scp_take(true)) { n2scp_sleep(10); }
++	}
++}
++
++/* -------- the FIFO -------- */
++static void
++n2scp_record(const volatile uint8_t *r)
++{
++	uint8_t type = r[0];
++	int32_t a = *(const volatile int32_t *)(r + 12), b = *(const volatile int32_t *)(r + 16), c = *(const volatile int32_t *)(r + 20);
++
++	n2scp_records++;
++	switch (type) {
++	case N2S_PROX: {
++		/* "near" reaches iOS only once the sensor has shown it can say "far": without OPLUS' calibration a sensor stuck at
++		 * "near" would leave the touch screen ignored for every call (the q10eb..q10ed freeze) */
++		static int seen_far;
++		int far = b != 0;
++		if (far) { seen_far = 1; }
++		if (far != n2scp_prox) {
++			printf("NORD2 SCP: proximity %s (steps %d)%s\n", far ? "far" : "NEAR", a, (!far && !seen_far) ? " - not passed on (never far yet)" : "");
++			n2scp_prox = far;
++			if (far || seen_far) { sweet_hid_proximity(!far); }
++		}
++		break;
++	}
++	case N2S_LIGHT:
++		if (n2scp_lux < 0 || a > n2scp_lux * 2 || a < n2scp_lux / 2) { printf("NORD2 SCP: light %d lux\n", a); }
++		n2scp_lux = a;
++		sweet_hid_ambient(a);
++		break;
++	case N2S_ACCEL: n2scp_acc[0] = a; n2scp_acc[1] = b; n2scp_acc[2] = c; sweet_hid_motion(0, a, b, c); break;
++	case N2S_GYRO: n2scp_gyr[0] = a; n2scp_gyr[1] = b; n2scp_gyr[2] = c; sweet_hid_motion(1, a, b, c); break;
++	case N2S_MAG: n2scp_magv[0] = a; n2scp_magv[1] = b; n2scp_magv[2] = c; sweet_hid_motion(2, a, b, c); break;
++	default: break;
++	}
++	if (n2scp_records <= 16 || (n2scp_records % 2000) == 0) {
++		printf("NORD2 SCP: record %u type %u: %d %d %d\n", n2scp_records, type, a, b, c);
++	}
++}
++
++static void
++n2scp_drain(void)
++{
++	volatile uint32_t *h = (volatile uint32_t *)n2scp_dram + N2SCP_FIFO_OFF / 4;
++	uint32_t size = h[2], rp = h[0], wp = h[1];
++	const volatile uint8_t *data = (const volatile uint8_t *)(h + 4);
++
++	if (size == 0 || size > N2SCP_FIFO_SIZE - 16 || rp >= size || wp >= size) { return; }
++	while (rp != wp) {
++		n2scp_record(data + rp);
++		rp += N2SCP_REC;
++		if (rp + N2SCP_REC > size) { rp = 0; }
++	}
++	h[0] = rp;
++}
++
++/* -------- the thread -------- */
++#ifndef N2SCP_DEFAULT_MODE
++#define N2SCP_DEFAULT_MODE  1
++#endif
++static int n2scp_mode = N2SCP_DEFAULT_MODE;     /* 0 off, 1 read only (default since q10ee: the started SCP stalled the AP at boot), 2 all */
++
++static void
++n2scp_thread(void *arg __unused, wait_result_t res __unused)
++{
++	if (!n2scp_map()) { printf("NORD2 SCP: map failed\n"); goto out; }
++	/* the FIFO window now, while the I/O map has room; n2scp_dram points N2SCP_FIFO_OFF before it so offsets stay those of the region */
++	{
++		vm_offset_t fifo = ml_io_map(N2SCP_DRAM_PHYS + N2SCP_FIFO_OFF, N2SCP_FIFO_SIZE);
++		n2scp_dram = fifo ? fifo - N2SCP_FIFO_OFF : 0;
++		printf("NORD2 SCP: FIFO %#x+%#x mapped %s\n", N2SCP_DRAM_PHYS + N2SCP_FIFO_OFF, N2SCP_FIFO_SIZE, fifo ? "ok" : "FAILED");
++	}
++	bool loaded = n2scp_step1();
++	for (int i = 0; i < 9000 && !n2scp_pmic_done; i++) { n2scp_sleep(10); }
++	printf("NORD2 SCP: step 1: PMIC %s: VGPU11 CON0 %#x OP_EN %#x DBG0(vosel out) %#x SSHUB_CON0 %#x (en %u vosel %#x) ELR0(AP vosel) %#x "
++	    "PMRC_CON1 %#x (sshub mode %u) VSRAM_OTHERS_SSHUB %#x\n", n2scp_pmic_done > 0 ? "read" : "NOT read", n2scp_pmic_val[0],
++	    n2scp_pmic_val[1], n2scp_pmic_val[2], n2scp_pmic_val[3], n2scp_pmic_val[3] & 1, (n2scp_pmic_val[3] >> 4) & 0x7f, n2scp_pmic_val[4],
++	    n2scp_pmic_val[5], (n2scp_pmic_val[5] >> 2) & 1, n2scp_pmic_val[6]);
++	if (n2scp_mode < 2 || !loaded || N2SCP_DRAM_PHYS == 0) {
++		printf("NORD2 SCP: stop after step 1 (mode %d, image %s, DRAM %#x)\n", n2scp_mode, loaded ? "loaded" : "NOT loaded",
++		    N2SCP_DRAM_PHYS);
++		goto out;
++	}
++	if (n2scp_rd(n2scp_c0, 0x80) != 0 && (n2scp_rd(n2scp_c0, 0x70) & 1) == 0) {
++		printf("NORD2 SCP: core0 already runs: not restarted\n");
++	} else {
++		/* after userland is up (the q10ee stall came seconds after the release, during the boot) */
++		printf("NORD2 SCP: step 2 in %u s\n", N2SCP_START_DELAY_S);
++		for (unsigned t = 0; t < N2SCP_START_DELAY_S; t += 10) {
++			n2scp_sleep(10000);
++			printf("NORD2 SCP: waiting, %u s to go\n", N2SCP_START_DELAY_S - t - 10);
++		}
++		printf("NORD2 SCP: 2-: mapping the DRAM %#x+%#x next\n", N2SCP_DRAM_PHYS, N2SCP_DRAM_SIZE); n2scp_sleep(3000);
++		if (!n2scp_dram) { printf("NORD2 SCP: FIFO map failed\n"); goto out; }
++		/* the FIFO header first (the hub writes records after it) */
++		volatile uint32_t *h = (volatile uint32_t *)n2scp_dram + N2SCP_FIFO_OFF / 4;
++		printf("NORD2 SCP: 2a: DRAM mapped, writing the FIFO header\n"); n2scp_sleep(3000);
++		h[0] = 0; h[1] = 0; h[2] = (N2SCP_FIFO_SIZE - 16) / N2SCP_REC * N2SCP_REC; h[3] = 0;
++		__asm__ volatile("dsb sy" ::: "memory");
++		printf("NORD2 SCP: 2b: FIFO header written (%#x), the clock next\n", h[2]); n2scp_sleep(3000);
++		/* clock: scp_sel on clk26m, ungated */
++		uint32_t before = n2scp_rd(n2scp_topck, 0x10);
++		n2scp_wr(n2scp_topck, 0x18, (7u << 16) | (1u << 23));
++		n2scp_wr(n2scp_topck, 0x04, 1u << 2);
++		delay(100);
++		printf("NORD2 SCP: 2c: clock %#x -> %#x, GPR1/2 next\n", before, n2scp_rd(n2scp_topck, 0x10)); n2scp_sleep(3000);
++		/* the AP DRAM it may use (MPU window), then core 0 runs */
++		n2scp_wr(n2scp_c0, 0x44, N2SCP_DRAM_PHYS);
++		n2scp_wr(n2scp_c0, 0x48, N2SCP_DRAM_SIZE);
++		printf("NORD2 SCP: 2d: GPR1/2 %#x %#x, releasing core 0 now\n", n2scp_rd(n2scp_c0, 0x44), n2scp_rd(n2scp_c0, 0x48)); n2scp_sleep(3000);
++		n2scp_wr(n2scp_c0, 0x0, 1);
++		{       /* the first 50 ms, sampled each ms, said in one line */
++			uint32_t pcs[10];
++			for (int k = 0; k < 10; k++) { pcs[k] = n2scp_rd(n2scp_c0, 0x80); delay(5000); }
++			printf("NORD2 SCP: 2e: released; PC %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x\n", pcs[0], pcs[1], pcs[2], pcs[3], pcs[4], pcs[5],
++			    pcs[6], pcs[7], pcs[8], pcs[9]);
++		}
++		printf("NORD2 SCP: step 2: clk_cfg_0 %#x -> %#x, DRAM %#x+%#x, core0 released (rstn %#x)\n", before,
++		    n2scp_rd(n2scp_topck, 0x10), N2SCP_DRAM_PHYS, N2SCP_DRAM_SIZE, n2scp_rd(n2scp_c0, 0x0));
++	}
++	/* heartbeat: what the SCP does, every 200 ms for 6 s (the AP's last line says when it stopped) */
++	for (int hb = 0; hb < 30; hb++) {
++		(void)n2scp_take(true);
++		printf("NORD2 SCP: hb %d: c0 st %#x pc %#x lr %#x | c1 st %#x pc %#x | gpr %#x %#x %#x %#x %#x %#x | to_spm %#x | mbox1 %#x mbox2 %#x mbox3 %#x\n",
++		    hb, n2scp_rd(n2scp_c0, 0x70), n2scp_rd(n2scp_c0, 0x80), n2scp_rd(n2scp_c0, 0x84), n2scp_rd(n2scp_c1, 0x70), n2scp_rd(n2scp_c1, 0x80),
++		    n2scp_rd(n2scp_c0, 0x40), n2scp_rd(n2scp_c0, 0x4c), n2scp_rd(n2scp_c0, 0x50), n2scp_rd(n2scp_c0, 0x54), n2scp_rd(n2scp_c0, 0x58),
++		    n2scp_rd(n2scp_c0, 0x5c), n2scp_rd(n2scp_cfg, 0x94), n2scp_rd(n2scp_mb[1], 0x10c), n2scp_rd(n2scp_mb[2], 0x10c),
++		    n2scp_rd(n2scp_mb[3], 0x10c));
++		n2scp_sleep(hb < 10 ? 50 : 200);
++	}
++	n2scp_wait(20000, 1);
++	printf("NORD2 SCP: step 3: %s (core0 status %#x PC %#x, GPR4 freq %u)\n", (n2scp_state & 1) ? "READY" : "no ready message",
++	    n2scp_rd(n2scp_c0, 0x70), n2scp_rd(n2scp_c0, 0x80), n2scp_rd(n2scp_c0, 0x50));
++	if (!(n2scp_state & 1)) { goto out; }
++	n2scp_wait(5000, 2);
++	printf("NORD2 SCP: step 4: sensor hub %s\n", (n2scp_state & 2) ? "SCP_INIT_DONE" : "silent (continuing)");
++	{
++		uint32_t req[8] = { 4u << 8, N2SCP_DRAM_PHYS + N2SCP_FIFO_OFF, N2SCP_FIFO_SIZE, 0, 0, 0, 0, 0 };   /* SET_CONFIG */
++		printf("NORD2 SCP: SET_CONFIG FIFO %#x: %s\n", req[1], n2scp_send(N2SCP_IPI_SENSOR, req, sizeof(req)) ? "taken" : "NOT TAKEN");
++		n2scp_wait(500, 0);
++		for (int i = 0; i < 50; i++) { (void)n2scp_take(true); n2scp_sleep(10); }
++	}
++	(void)n2scp_config(N2S_PROX, 1, 0xFFFFFF01u);
++	(void)n2scp_config(N2S_LIGHT, 1, 0xFFFFFF01u);
++	(void)n2scp_config(N2S_ACCEL, 1, 50u * 1024u);
++	(void)n2scp_config(N2S_GYRO, 1, 50u * 1024u);
++	(void)n2scp_config(N2S_MAG, 1, 25u * 1024u);
++	n2scp_state |= 4;
++	printf("NORD2 SCP: step 5: sensors enabled; polling every 20 ms\n");
++	for (uint32_t tick = 0;; tick++) {
++		while (n2scp_take(false)) { }
++		n2scp_drain();
++		if ((tick % 500) == 0) {
++			volatile uint32_t *h = (volatile uint32_t *)n2scp_dram + N2SCP_FIFO_OFF / 4;
++			printf("NORD2 SCP: t=%us records %u msgs %u fifo rp %u wp %u | prox %d lux %d acc %d %d %d gyr %d %d %d mag %d %d %d | core0 %#x PC %#x\n",
++			    tick / 50, n2scp_records, n2scp_msgs, h[0], h[1], n2scp_prox, n2scp_lux, n2scp_acc[0], n2scp_acc[1], n2scp_acc[2],
++			    n2scp_gyr[0], n2scp_gyr[1], n2scp_gyr[2], n2scp_magv[0], n2scp_magv[1], n2scp_magv[2],
++			    n2scp_rd(n2scp_c0, 0x70), n2scp_rd(n2scp_c0, 0x80));
++		}
++		n2scp_sleep(20);
++	}
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++nord2_scp_start(void)
++{
++	thread_t thread;
++	(void)PE_parse_boot_argn("nord2scp", &n2scp_mode, sizeof(n2scp_mode));
++	if (n2scp_mode <= 0) { printf("NORD2 SCP: off (nord2scp=0)\n"); return; }
++	if (kernel_thread_start(n2scp_thread, NULL, &thread) == KERN_SUCCESS) { thread_deallocate(thread); }
++}
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -382,8 +382,181 @@
+ };
+ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+ 
++/*
++ * 0284: the SCP's sensors (nord2_scp.inc) as Apple-vendor sensor services, the usage pairs iOS matches its built-in
++ * sensors by (AppleHIDUsageTables.h: page 0xFF00, usage 0x08 proximity, 0x04 ambient light). Proximity: backboardd's
++ * proximity processor (BKHIDProximityEventProcessor) takes kIOHIDEventTypeProximity events from it; near = the
++ * receiver covered (kIOHIDProximityDetectionReceiver | LargeBodyContact), far = mask 0. Until the SCP reports, the
++ * state is "far", so a call on the receiver never leaves the touch screen ignored (q10eb..q10ed: callservicesd asked
++ * for proximity mode "active", backboardd put the digitizer in faceExpected mode and nothing ever said "far").
++ * The state is answered on copyEvent and dispatched again whenever backboardd sets the service's properties
++ * (its proximity detection mode).
++ */
++#ifndef N2_SENSOR_MASK
++#define N2_SENSOR_MASK          0       /* bit 0 proximity, 1 light, 2 accelerometer, 3 gyro, 4 compass (q10ef: all five -> backboardd crash loop) */
++#endif
++#ifndef N2_PROX_DISPATCH_ON_SET
++#define N2_PROX_DISPATCH_ON_SET 0
++#endif
++class SweetHIDSensor : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDSensor);
++public:
++	bool initSensor(UInt32 usage, const char *name);
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching, IOOptionBits options) APPLE_KEXT_OVERRIDE;
++	void report(SInt32 value);
++	void motion(SInt32 x, SInt32 y, SInt32 z);      /* accelerometer / gyro / compass, hub units */
++	IOHIDEvent *current(void);
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return 0xFF00; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return fUsage; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 0x10 + fUsage; }
++	virtual OSString *getProduct() APPLE_KEXT_OVERRIDE { return OSString::withCString(fName); }
++private:
++	UInt32 fUsage;
++	const char *fName;
++	volatile SInt32 fValue;         /* proximity: 1 near, 0 far; light: lux */
++	volatile SInt32 fXYZ[3];        /* motion: last sample in the hub's units (1/1000 m/s^2, mrad/s, 1/1000 uT) */
++	bool fHaveXYZ;
++	UInt32 fSaid;
++};
++OSDefineMetaClassAndStructors(SweetHIDSensor, IOHIDEventService);
++
+ static SweetHIDButtons *gSweetButtons;
+ static SweetHIDTouch *gSweetTouch;
++static SweetHIDSensor *gSweetProx, *gSweetALS, *gSweetAccel, *gSweetGyro, *gSweetCompass;
++
++bool
++SweetHIDSensor::initSensor(UInt32 usage, const char *name)
++{
++	fUsage = usage;
++	fName = name;
++	fValue = usage == 0x08 ? 0 : -1;
++	return init(NULL);
++}
++
++bool
++SweetHIDSensor::start(IOService *provider)
++{
++	if (!IOHIDEventService::start(provider)) {
++		return false;
++	}
++	registerService();
++	IOLog("SWEET HID: %s sensor registered (0xFF00/0x%02x)\n", fName, (unsigned)fUsage);
++	return true;
++}
++
++IOHIDEvent *
++SweetHIDSensor::current(void)
++{
++	SInt32 v = fValue;
++	if (fUsage == 0x08) {
++		return IOHIDEvent::proximityEvent(mach_absolute_time(),
++		    v > 0 ? (IOHIDProximityDetectionMask)(kIOHIDProximityDetectionReceiver | kIOHIDProximityDetectionLargeBodyContact) :
++		    (IOHIDProximityDetectionMask)0, v > 0 ? 1000 : 0);
++	}
++	if (fUsage == 0x03 || fUsage == 0x09 || fUsage == 0x0A) {
++		if (!fHaveXYZ) {
++			return NULL;
++		}
++		/* IOFixed: g for the accelerometer (9806.65 hub units = 1 g), rad/s for the gyro, microtesla for the compass */
++		SInt64 x = fXYZ[0], y = fXYZ[1], z = fXYZ[2];
++		if (fUsage == 0x03) {
++			return IOHIDEvent::accelerometerEvent(mach_absolute_time(), (IOFixed)(x * 65536 / 9807), (IOFixed)(y * 65536 / 9807),
++			           (IOFixed)(z * 65536 / 9807));
++		}
++		if (fUsage == 0x09) {
++			return IOHIDEvent::gyroEvent(mach_absolute_time(), (IOFixed)(x * 65536 / 1000), (IOFixed)(y * 65536 / 1000),
++			           (IOFixed)(z * 65536 / 1000));
++		}
++		return IOHIDEvent::compassEvent(mach_absolute_time(), (IOFixed)(x * 65536 / 1000), (IOFixed)(y * 65536 / 1000),
++		           (IOFixed)(z * 65536 / 1000));
++	}
++	if (v < 0) {
++		return NULL;
++	}
++	return IOHIDEvent::ambientLightSensorEvent(mach_absolute_time(), (UInt32)v);
++}
++
++void
++SweetHIDSensor::motion(SInt32 x, SInt32 y, SInt32 z)
++{
++	fXYZ[0] = x; fXYZ[1] = y; fXYZ[2] = z;
++	fHaveXYZ = true;
++	if (!_clients || _clients->getCount() == 0) {
++		return;
++	}
++	IOHIDEvent *event = current();
++	if (event) {
++		if (fSaid < 3) {
++			fSaid++;
++			IOLog("SWEET HID: %s %d %d %d (%u clients)\n", fName, (int)x, (int)y, (int)z, _clients->getCount());
++		}
++		dispatchEvent(event);
++		event->release();
++	}
++}
++
++void
++SweetHIDSensor::report(SInt32 value)
++{
++	fValue = value;
++	IOHIDEvent *event = current();
++	if (event) {
++		if (fSaid < 20 || fUsage == 0x08) {
++			fSaid++;
++			IOLog("SWEET HID: %s %d (%u clients)\n", fName, (int)value, _clients ? _clients->getCount() : 0);
++		}
++		dispatchEvent(event);
++		event->release();
++	}
++}
++
++IOReturn
++SweetHIDSensor::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	if (!dict) {
++		return kIOReturnBadArgument;
++	}
++	if (fUsage == 0x08 && N2_PROX_DISPATCH_ON_SET) {
++		IOLog("SWEET HID: proximity properties set (%u keys): state %s again\n", dict->getCount(), fValue > 0 ? "near" : "far");
++		IOHIDEvent *event = current();
++		if (event) {
++			dispatchEvent(event);
++			event->release();
++		}
++	}
++	return kIOReturnSuccess;
++}
++
++IOHIDEvent *
++SweetHIDSensor::copyEvent(IOHIDEventType type, IOHIDEvent *matching __unused, IOOptionBits options __unused)
++{
++	if ((fUsage == 0x08 && type != kIOHIDEventTypeProximity) || (fUsage == 0x04 && type != kIOHIDEventTypeAmbientLightSensor) ||
++	    (fUsage == 0x03 && type != kIOHIDEventTypeAccelerometer) || (fUsage == 0x09 && type != kIOHIDEventTypeGyro) ||
++	    (fUsage == 0x0A && type != kIOHIDEventTypeCompass)) {
++		return NULL;
++	}
++	return current();
++}
++
++static SweetHIDSensor *
++sweet_hid_new_sensor(IOService *provider, UInt32 usage, const char *name)
++{
++	SweetHIDSensor *s = OSTypeAlloc(SweetHIDSensor);
++	if (!s || !s->initSensor(usage, name) || !s->attach(provider)) {
++		OSSafeReleaseNULL(s);
++		return NULL;
++	}
++	if (!s->start(provider)) {
++		s->detach(provider);
++		s->release();
++		return NULL;
++	}
++	return s;       /* the registry holds it from here; our reference is the global */
++}
+ 
+ /*
+  * Ring/silent switch. iOS 16.7 backboardd (ringer processor,
+@@ -411,6 +584,17 @@
+ 	gSweetButtons = this;
+ #if defined(NORD2)
+ 	publishRingerSwitch();
++	{
++		int sensors = 1;
++		(void)PE_parse_boot_argn("nord2sensors", &sensors, sizeof(sensors));
++		if (sensors) {
++			if (N2_SENSOR_MASK & 1) { gSweetProx = sweet_hid_new_sensor(provider, 0x08, "proximity"); }
++			if (N2_SENSOR_MASK & 2) { gSweetALS = sweet_hid_new_sensor(provider, 0x04, "ambient-light"); }
++			if (N2_SENSOR_MASK & 4) { gSweetAccel = sweet_hid_new_sensor(provider, 0x03, "accelerometer"); }
++			if (N2_SENSOR_MASK & 8) { gSweetGyro = sweet_hid_new_sensor(provider, 0x09, "gyro"); }
++			if (N2_SENSOR_MASK & 16) { gSweetCompass = sweet_hid_new_sensor(provider, 0x0A, "compass"); }
++		}
++	}
+ #endif
+ 	registerService();
+ 	IOLog("SWEET HID: buttons registered (test every %u s)\n", fTestSecs);
+@@ -659,3 +843,33 @@
+ 		gSweetTouch->touch(finger, down != 0, x, y);
+ 	}
+ }
++
++/* 0284: near 1 = something in front of the receiver, 0 = clear (nord2_scp.inc) */
++extern "C" void sweet_hid_proximity(int near);
++extern "C" void
++sweet_hid_proximity(int near)
++{
++	if (gSweetProx) {
++		gSweetProx->report(near ? 1 : 0);
++	}
++}
++
++extern "C" void sweet_hid_ambient(int lux);
++extern "C" void
++sweet_hid_ambient(int lux)
++{
++	if (gSweetALS && lux >= 0) {
++		gSweetALS->report(lux);
++	}
++}
++
++/* 0284: kind 0 accelerometer, 1 gyro, 2 compass; values in the SCP hub's units */
++extern "C" void sweet_hid_motion(int kind, int x, int y, int z);
++extern "C" void
++sweet_hid_motion(int kind, int x, int y, int z)
++{
++	SweetHIDSensor *s = kind == 0 ? gSweetAccel : kind == 1 ? gSweetGyro : gSweetCompass;
++	if (s) {
++		s->motion(x, y, z);
++	}
++}

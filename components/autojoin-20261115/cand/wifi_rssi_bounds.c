@@ -1,0 +1,108 @@
+/* 0790: APPLE80211_IOC_RSSI_BOUNDS (GET 106) for wifid, so that auto-join can
+ * pick a known network.
+ *
+ * Why (verified on the host, 2026-11-15, unified log of the phone + wifid /
+ * IO80211 disassembly of 20H392):
+ *  - WiFiDeviceOpen asks Apple80211CopyValue(106) once when wifid starts; the
+ *    reply is {u32 version 1, s32 RSSI_MIN, s32 RSSI_MAX, s32 RSSI_THRESHOLD}
+ *    (16 bytes, IO80211 _Apple80211GetWithIOCTL). The CI user client answers
+ *    0xe00002c7 (unsupported), so wifid keeps its built-in defaults
+ *    RSSI_MIN -19, RSSI_MAX 65, RSSI_THRESHOLD 7 (WiFiDeviceCreate) and never
+ *    logs "Device RSSI bounds (...)".
+ *  - The device-manager auto-join filter compares [candidate RSSI] < threshold
+ *    (base value = RSSI_THRESHOLD = 7) and rejects every known network with
+ *    "Join candidate ... is not allowed (error=(1 'Below minimum RSSI
+ *    threshold'))" (3476 such lines in the phone's log, no other reason), so
+ *    auto-join never issues an association; a tap joins at once because the
+ *    user join path does not apply this filter.
+ *
+ * How (no prebuilt member is recompiled, binders untouched): two symbol NAME
+ * edits in the archive copy (same length, code bytes unchanged, like 0450/0451):
+ *    wifi_ios_control.o      _niw_decode       -> _niv_decode
+ *    wifi_ios_station_view.o _niwj_state_reply -> _niwk_state_reply
+ * The unchanged callers land in the wrappers below:
+ *  - niw_decode: CI decode, then a GET 106 with a 16-byte payload is handed on
+ *    as request 16 with a 16-byte payload. Request 16 (RSSI) is otherwise
+ *    always 52 bytes, so the pair (16, 16) only ever means "bounds"; the CI
+ *    client's request-16 branch calls niwj_state_reply().
+ *  - niwj_state_reply: (16, 16) -> the bounds reply; everything else goes to
+ *    the CI function unchanged.
+ * RSSI_MIN/RSSI_MAX are returned equal to wifid's current defaults (-19, 65)
+ * so nothing that already works changes; only the threshold is new.
+ * kern.n2wifi_rssithr (signed dBm): auto-join minimum RSSI, default -80;
+ * 0 = kill switch (GET 106 stays unsupported exactly as before).
+ * The value is read by wifid once at start (WiFiDeviceOpen): a change needs a
+ * wifid restart or a reboot. One log line per reply (at most 8 per boot):
+ *   "NORD2 WIFI IOS RSSIBOUNDS: min=-19 max=65 threshold=-80 status=0" */
+#include "wifi_ios_control.h"
+#include "wifi_ios_station_view.h"
+#if defined(KERNEL) || defined(_KERNEL)
+#include <sys/systm.h>
+#include <sys/sysctl.h>
+#define N2RB_KERNEL 1
+#else
+#include <stdio.h>
+#endif
+
+#define N2RB_REQUEST   106u   /* APPLE80211_IOC_RSSI_BOUNDS */
+#define N2RB_CARRIER   16u    /* request id the CI client routes to niwj_state_reply */
+#define N2RB_BYTES     16u
+#define N2RB_MIN       (-19)  /* = wifid default, unchanged behaviour */
+#define N2RB_MAX       65     /* = wifid default, unchanged behaviour */
+
+/* CI functions, renamed in the archive copy (symbol names only). */
+int niv_decode(unsigned, const void *, size_t, struct niw_request *);
+int niwk_state_reply(const struct njs_snapshot *, unsigned, size_t, unsigned, uint64_t, void *, size_t, size_t *);
+
+int n2rb_threshold = -80;
+static unsigned n2rb_logs;
+#ifdef N2RB_KERNEL
+SYSCTL_INT(_kern, OID_AUTO, n2wifi_rssithr, CTLFLAG_RW | CTLFLAG_LOCKED, &n2rb_threshold, 0,
+    "0790: RSSI_THRESHOLD (dBm) answered to APPLE80211_IOC_RSSI_BOUNDS = wifid auto-join minimum RSSI; read by wifid at start; 0 = unsupported as before");
+#endif
+
+static int n2rb_enabled(void)
+{
+	int t = n2rb_threshold;
+	return t < 0 && t >= -127;
+}
+
+int niw_decode(unsigned selector, const void *input, size_t bytes, struct niw_request *out)
+{
+	int r = niv_decode(selector, input, bytes, out);
+	if (r == 0 && out && out->operation == NIW_GET && out->request == N2RB_REQUEST &&
+	    out->payload_bytes == N2RB_BYTES && out->value == 0 && n2rb_enabled()) {
+		out->request = N2RB_CARRIER;
+	}
+	return r;
+}
+
+static void n2rb_p32(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+int niwj_state_reply(const struct njs_snapshot *s, unsigned request, size_t payload, unsigned scanning,
+    uint64_t now, void *v, size_t cap, size_t *used)
+{
+	if (request == N2RB_CARRIER && payload == N2RB_BYTES) {
+		int t = n2rb_threshold, status = 0;
+		uint8_t *p = v;
+		if (!used || !p || cap < N2RB_BYTES || !n2rb_enabled()) {
+			status = -1;            /* client answers kIOReturnBadArgument, wifid keeps its defaults */
+			if (used) *used = 0;
+		} else {
+			n2rb_p32(p, 1);
+			n2rb_p32(p + 4, (uint32_t)N2RB_MIN);
+			n2rb_p32(p + 8, (uint32_t)N2RB_MAX);
+			n2rb_p32(p + 12, (uint32_t)t);
+			*used = N2RB_BYTES;
+		}
+		if (n2rb_logs < 8) {
+			n2rb_logs++;
+			printf("NORD2 WIFI IOS RSSIBOUNDS: min=%d max=%d threshold=%d status=%d\n", N2RB_MIN, N2RB_MAX, t, status);
+		}
+		return status;
+	}
+	return niwk_state_reply(s, request, payload, scanning, now, v, cap, used);
+}

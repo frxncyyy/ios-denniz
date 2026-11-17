@@ -1,0 +1,190 @@
+--- a/bsd/dev/audio_call.c
++++ b/bsd/dev/audio_call.c
+@@ -39,6 +39,11 @@
+  *   MT6359 read-back after power-up and periodic codec MTKAIF monitors.  Call volume: hardware gains start at a fixed
+  *   ceiling and the per-route level is a Q15 prescale of the modem PCM, stepped 3 dB by the volume keys during a call
+  *   (iOS's call volume never reaches this kernel path); NSA ioctl 'r' 2 selects the route (for the HAL / speakerphone).
++ * v4 (patch 0320, recording): the same MT6359 uplink and ADDA UL -> VUL12 capture without a call, for /dev/redwood-mic
++ *   (audio_mic.inc, 0321): nac_mic_afe_up() is nac_afe_up() without PCM2/AWB/CONN17/18/CONN5 (VUL12_ON only), the MT6359
++ *   tables run through the async slot (nac_mic_pmic_submit/poll) so the worker never waits on the input thread while the
++ *   speaker path runs, and nac_mic_take() drains VUL12.  The VUL12 path is the call's probe, seen on the phone with speech
++ *   peaks (runs q10ct..q10f3n: ~48000 frames/s, peaks 300..27244); the call path's register writes are unchanged.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -89,6 +94,11 @@
+ static uint32_t nac_afe_rb[16];          /* AP AFE words after nac_afe_up */
+ static unsigned nac_afe_rb_valid, nac_afe_rb_printed;
+ static void nac_print_diag(void);
++/* 0320: what the AFE runs for: a call (PCM2/AWB + the VUL12 probe) or the microphone alone (VUL12 -> /dev/redwood-mic) */
++enum { NAC_MODE_CALL = 0, NAC_MODE_MIC = 1 };
++static unsigned nac_mode;
++struct nau_hw;
++static unsigned nac_ring_take(struct nau_hw *, uint32_t, uint32_t, uint32_t, uint32_t *, int16_t *, unsigned, uint32_t *);
+ 
+ static int
+ nac_sysctl_gain(__unused struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+@@ -751,6 +761,16 @@
+ 	__atomic_store_n(&nac_as.state, AS_QUEUED, __ATOMIC_RELEASE);
+ 	return 0;
+ }
++/* 0320: a whole static table (nac_up/nac_down) through the same slot, not copied: the worker never blocks on the input
++ * thread while the AFE runs (a >= 20 ms worker stall stops the speaker path with NAH_E_DEADLINE). */
++static int
++nac_async_submit_static(const struct nac_pop *ops, unsigned n)
++{
++	if (__atomic_load_n(&nac_as.state, __ATOMIC_ACQUIRE) != AS_IDLE || !n2owner_ready(&nac_owner)) return -1;
++	nac_as.j = (struct nac_job){ ops, n, 0, 0, 0, 0 };
++	__atomic_store_n(&nac_as.state, AS_QUEUED, __ATOMIC_RELEASE);
++	return 0;
++}
+ /* 1 = finished (slot idle again, result in *error), 0 = still pending */
+ static int
+ nac_async_poll(int *error)
+@@ -933,11 +953,13 @@
+ 	return e;
+ }
+ 
+-int
+-nac_afe_up(struct nau_hw *h)
++/* 0320: call = 1 is the call's AFE (PCM2/AWB/VUL12 probe, unchanged); call = 0 the microphone alone: ADDA UL -> VUL12 */
++static int
++nac_afe_up_mode(struct nau_hw *h, unsigned call)
+ {
+ 	int e = 0;
+ 	if (!h || !h->status.running) return -1;
++	nac_mode = call ? NAC_MODE_CALL : NAC_MODE_MIC;
+ 	for (unsigned i = 0; i < NAC_AFE_N; i++) if (nac_rd(h, nac_afe_words[i], &nac_afe_saved[i])) return -2;
+ 	nac_afe_saved_ok = 1;
+ 	nac_afe_live = 1;
+@@ -960,27 +982,31 @@
+ 	nac_cal_state = (nac_aif == 0 && !nac_cal_done) ? 1 : 0;           /* first CLK_P2 call: calibrate (nac_tick) */
+ 	e |= nac_afe_mtkaif(h, nac_cal_state != 0);
+ 	e |= nac_rmw(h, AFE_ADDA_UL_SRC_CON0, 1u, 1u);
+-	/* modem PCM 2: AFIFO, 32 BCK, 48 kHz (mode 3), PCM mode B, then enable */
+-	e |= nac_rmw(h, PCM2_INTF_CON, 0xfffffffeu, 0x5eu);
+-	e |= nac_rmw(h, PCM2_INTF_CON, 1u, 1u);
+-	/* mic -> modem: ADDA_UL_CH1 into PCM_2_PB_CH1/CH2 */
+-	e |= nac_rmw(h, AFE_CONN17, 1u << 3, 1u << 3);
+-	e |= nac_rmw(h, AFE_CONN18, 1u << 3, 1u << 3);
+-	/* modem -> AWB: PCM_2_CAP_CH1 into UL2_CH1, AWB mono 16-bit 48 kHz */
+-	e |= nac_wr(h, AFE_AWB_BASE_MSB, 0);
+-	e |= nac_wr(h, AFE_AWB_END_MSB, 0);
+-	e |= nac_wr(h, AFE_AWB_BASE, NAC_AWB_SRAM);
+-	e |= nac_wr(h, AFE_AWB_END, NAC_AWB_SRAM + NAC_AWB_BYTES - 1u);
+-	e |= nac_rmw(h, AFE_AWB_CON0, (0xfu << 24) | (1u << 8) | 1u, (10u << 24) | (1u << 8));
+-	e |= nac_rmw(h, AFE_CONN5, 1u << 14, 1u << 14);
+-	/* mic probe: ADDA_UL_CH1 into UL1_CH1, VUL12 mono 16-bit 48 kHz */
++	if (call) {
++		/* modem PCM 2: AFIFO, 32 BCK, 48 kHz (mode 3), PCM mode B, then enable */
++		e |= nac_rmw(h, PCM2_INTF_CON, 0xfffffffeu, 0x5eu);
++		e |= nac_rmw(h, PCM2_INTF_CON, 1u, 1u);
++		/* mic -> modem: ADDA_UL_CH1 into PCM_2_PB_CH1/CH2 */
++		e |= nac_rmw(h, AFE_CONN17, 1u << 3, 1u << 3);
++		e |= nac_rmw(h, AFE_CONN18, 1u << 3, 1u << 3);
++		/* modem -> AWB: PCM_2_CAP_CH1 into UL2_CH1, AWB mono 16-bit 48 kHz */
++		e |= nac_wr(h, AFE_AWB_BASE_MSB, 0);
++		e |= nac_wr(h, AFE_AWB_END_MSB, 0);
++		e |= nac_wr(h, AFE_AWB_BASE, NAC_AWB_SRAM);
++		e |= nac_wr(h, AFE_AWB_END, NAC_AWB_SRAM + NAC_AWB_BYTES - 1u);
++		e |= nac_rmw(h, AFE_AWB_CON0, (0xfu << 24) | (1u << 8) | 1u, (10u << 24) | (1u << 8));
++		e |= nac_rmw(h, AFE_CONN5, 1u << 14, 1u << 14);
++	}
++	/* mic probe (call) / the microphone (0320): ADDA_UL_CH1 into UL1_CH1, VUL12 mono 16-bit 48 kHz */
+ 	e |= nac_wr(h, AFE_VUL12_BASE_MSB, 0);
+ 	e |= nac_wr(h, AFE_VUL12_END_MSB, 0);
+ 	e |= nac_wr(h, AFE_VUL12_BASE, NAC_VUL_SRAM);
+ 	e |= nac_wr(h, AFE_VUL12_END, NAC_VUL_SRAM + NAC_VUL_BYTES - 1u);
+ 	e |= nac_rmw(h, AFE_VUL12_CON0, (0xfu << 24) | (1u << 11) | (1u << 8) | 1u, (10u << 24) | (1u << 8));
+ 	e |= nac_rmw(h, AFE_CONN21, 1u << 3, 1u << 3);
+-	e |= nac_rmw(h, AFE_DAC_CON0, (1u << 16) | (1u << 31), (1u << 16) | (1u << 31));
++	/* AFE_DAC_CON0: bit 31 VUL12_ON, bit 16 AWB_ON (mt6885-reg.h VUL12_ON_SFT / AWB_ON_SFT) */
++	if (call) e |= nac_rmw(h, AFE_DAC_CON0, (1u << 16) | (1u << 31), (1u << 16) | (1u << 31));
++	else e |= nac_rmw(h, AFE_DAC_CON0, 1u << 31, 1u << 31);
+ 	{
+ 		uint32_t cur = 0;
+ 		(void)nac_rd(h, AFE_AWB_CUR, &cur);
+@@ -1002,6 +1028,60 @@
+ }
+ 
+ int
++nac_afe_up(struct nau_hw *h)
++{
++	return nac_afe_up_mode(h, 1);
++}
++
++/* 0320: the microphone alone (recording: /dev/redwood-mic), on an AFE that is running (speaker path or silent DMA). */
++int
++nac_mic_afe_up(struct nau_hw *h)
++{
++	return nac_afe_up_mode(h, 0);
++}
++
++/* 0320: drain VUL12 (mono 16-bit 48 kHz) for the recording; statistics as the call's probe keeps them. 0 if none. */
++unsigned
++nac_mic_take(struct nau_hw *h, int16_t *mono, unsigned max)
++{
++	unsigned n, i;
++	if (!nac_afe_live || nac_mode != NAC_MODE_MIC || !h || !mono) return 0;
++	nac_dl_calls++;
++	if ((nac_dl_calls & 255u) == 1u) {
++		(void)nac_rd(h, AFE_ADDA_UL_SRC_MON0, &nac_ul_mon);
++		(void)nac_rd(h, AFE_ADDA_UL_SRC_MON1, &nac_ul_mon1);
++		(void)nac_rd(h, AFE_ADDA_MTKAIF_MON0, &nac_aif_mon);
++		(void)nac_rd(h, AFE_ADDA_MTKAIF_MON1, &nac_aif_mon1);
++	}
++	n = nac_ring_take(h, AFE_VUL12_CUR, NAC_VUL_SRAM, NAC_VUL_BYTES, &nac_vul_rd, mono, max, &nac_vul_cur);
++	for (i = 0; i < n; i++) {
++		unsigned a = (unsigned)(mono[i] < 0 ? -mono[i] : mono[i]);
++		if (a > nac_mic_peak) nac_mic_peak = a;
++		if (a > 4) nac_mic_nz++;
++	}
++	nac_mic_frames += n;
++	return n;
++}
++
++/* 0320: MT6359 uplink on/off without blocking the worker: nac_up / nac_down run whole on the input thread through the
++ * async slot (waiting for a pending monitor read first). submit: 0 queued, -1 slot busy (try again next pass). */
++int
++nac_mic_pmic_submit(unsigned up)
++{
++	int err = 0;
++	if (__atomic_load_n(&nac_as.state, __ATOMIC_ACQUIRE) == AS_DONE) (void)nac_async_poll(&err);   /* a finished monitor read */
++	return up ? nac_async_submit_static(nac_up, sizeof nac_up / sizeof nac_up[0]) :
++	       nac_async_submit_static(nac_down, sizeof nac_down / sizeof nac_down[0]);
++}
++
++/* 1 = the submitted table finished (its result in *error), 0 = still running on the input thread */
++int
++nac_mic_pmic_poll(int *error)
++{
++	return nac_async_poll(error);
++}
++
++int
+ nac_afe_down(struct nau_hw *h)
+ {
+ 	int e = 0;
+@@ -1047,7 +1127,7 @@
+ 	if (!nac_afe_live || !h) return;
+ 	{
+ 		unsigned m = __atomic_load_n(&nac_ul_mute, __ATOMIC_ACQUIRE);
+-		if (m != nac_ul_mute_applied) {
++		if (nac_mode == NAC_MODE_CALL && m != nac_ul_mute_applied) {   /* 0320: no PCM2 route to (un)mute while recording */
+ 			int e = nac_rmw(h, AFE_CONN17, 1u << 3, m ? 0 : 1u << 3) | nac_rmw(h, AFE_CONN18, 1u << 3, m ? 0 : 1u << 3);
+ 			if (!e) nac_ul_mute_applied = m;
+ 			printf("NORD2 CALL: uplink %s applied (conn17/18 bit 3 %s, rc %d)\n", m ? "mute" : "unmute", m ? "off" : "on", e);
+--- a/bsd/dev/audio_call.h
++++ b/bsd/dev/audio_call.h
+@@ -24,6 +24,11 @@
+ int nac_pmic_down(void);
+ int nac_afe_up(struct nau_hw *);              /* AFE: PCM2 <-> ADDA UL / AWB, MTKAIF RX; hardware must be running */
+ int nac_afe_down(struct nau_hw *);            /* restores every AFE/GPIO word nac_afe_up changed */
++/* 0320: the microphone without a call (recording, /dev/redwood-mic); worker side, never blocking */
++int nac_mic_pmic_submit(unsigned up);         /* queue nac_up (1) / nac_down (0) for the input thread: 0 queued, -1 busy */
++int nac_mic_pmic_poll(int *error);            /* 1 = that table finished (*error its result), 0 = pending */
++int nac_mic_afe_up(struct nau_hw *);          /* AFE: ADDA UL -> VUL12 only; hardware must be running; nac_afe_down undoes */
++unsigned nac_mic_take(struct nau_hw *, int16_t *mono, unsigned max);   /* VUL12 samples (mono 16-bit 48 kHz); 0 if none */
+ void nac_sph_on(void);                        /* queues MSG_A2M_SPH_ON (0x2F20) for the modem thread */
+ void nac_sph_off(void);                       /* queues MSG_A2M_SPH_OFF (0x2F21) */
+ /* Modem downlink captured by AWB (mono 16-bit, 48 kHz) as stereo frames for nau_hw_feed; 0 if none. */

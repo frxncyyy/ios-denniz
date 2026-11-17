@@ -1,0 +1,169 @@
+/* ---- Draw-time variant fallback --------------------------------------
+ * A draw whose exact specialized variant is not compiled yet draws with the
+ * pipeline's runtime-specialization variant (the same modules compiled with
+ * TEGU_MALI_GENERIC_OPTION_RUNTIME_SPEC: every specialization constant read
+ * from push words the encoder fills from the draw's plan), while the exact
+ * variant compiles on a low-priority worker and is published for later
+ * draws. Same Metal function and values; the driver folds less in the
+ * fallback, so a non-exact float operation may contract differently (Metal
+ * fast-math permits either). The runtime variant is compiled in the
+ * background at pipeline creation; until it is ready a miss compiles the
+ * exact variant on the encoding thread as before. Translator variants
+ * (spec->reserved[0]) never fall back. NORD2_METAL_VARIANT_FALLBACK=0 turns
+ * it off. */
+#define TEGU_VF_RING 64u
+#define TEGU_VF_VARIANTS 64u
+struct tegu_vf_job {
+ TeguRenderPipeline *p;unsigned kind,rt,tile;uint8_t key[32],digest[32];
+ TeguAIRGraphicsSpecializationPlan spec;double enq;uint8_t *vs,*fs;NSUInteger vn,fn;
+};
+static struct tegu_vf_job tegu_vf_ring[TEGU_VF_RING];
+static unsigned tegu_vf_head,tegu_vf_tail,tegu_vf_lock,tegu_vf_draining;
+static U64 tegu_vf_fallback_draws,tegu_vf_standins,tegu_vf_enqueued,tegu_vf_done,tegu_vf_failed,tegu_vf_dropped,
+ tegu_vf_prewarmed,tegu_vf_swap_us,tegu_vf_swap_max_us,tegu_vf_stale;
+static int tegu_vf_enabled(void) {
+ static int state=-1;
+ if(state<0){const char *env=getenv("NORD2_METAL_VARIANT_FALLBACK");state=!(env&&env[0]=='0'&&!env[1]);}
+ return state;
+}
+static void tegu_vf_runtime_key(TeguRenderPipeline *p,unsigned rt,unsigned tile,uint8_t key[32]) {
+ struct tegu_pc_sha256 s;tegu_pc_sha256_init(&s);tegu_pc_key_str(&s,"TGRGRT1");
+ tegu_pc_key_bytes(&s,p->genericModuleDigest,sizeof(p->genericModuleDigest));
+ tegu_pc_key_u32(&s,rt);tegu_pc_key_u32(&s,tile);tegu_pc_sha256_final(&s,key);
+}
+static void tegu_vf_drain(void *unused);
+#ifdef TEGU_FRONTEND_HOST
+#include <pthread.h>
+static void *tegu_vf_thread(void *a){tegu_vf_drain(a);return 0;}
+static void tegu_vf_schedule(void) {
+ pthread_t t;pthread_attr_t at;pthread_attr_init(&at);pthread_attr_setdetachstate(&at,PTHREAD_CREATE_DETACHED);
+ if(pthread_create(&t,&at,tegu_vf_thread,0))tegu_vf_drain(0);
+ pthread_attr_destroy(&at);
+}
+#else
+static void tegu_vf_schedule(void) {
+ static void *(*getq)(long,unsigned long);static void (*async)(void *,void *,void (*)(void *));
+ if(!getq){void *system=dlopen("/usr/lib/libSystem.B.dylib",2);
+  if(system){async=dlsym(system,"dispatch_async_f");getq=dlsym(system,"dispatch_get_global_queue");}}
+ void *q=getq?getq(0x11 /* QOS_CLASS_UTILITY */,0):0;
+ if(q&&async)async(q,0,tegu_vf_drain);else tegu_vf_drain(0);
+}
+#endif
+/* Called with p->genericVariantLock held. Returns 0 queued (or already
+ * queued), -1 dropped (queue full or no memory). */
+static int tegu_vf_enqueue(TeguRenderPipeline *p,unsigned kind,unsigned rt,unsigned tile,const uint8_t key[32],
+ const TeguAIRGraphicsSpecializationPlan *spec) {
+ tegu_lock(&tegu_vf_lock);
+ for(unsigned i=tegu_vf_head;i!=tegu_vf_tail;i++) {
+  const struct tegu_vf_job *j=&tegu_vf_ring[i%TEGU_VF_RING];
+  if(j->p==p&&j->kind==kind&&j->rt==rt&&j->tile==tile&&(!key||!memcmp(j->key,key,32))){tegu_unlock(&tegu_vf_lock);return 0;}
+ }
+ if(tegu_vf_tail-tegu_vf_head>=TEGU_VF_RING){tegu_unlock(&tegu_vf_lock);__atomic_fetch_add(&tegu_vf_dropped,1,__ATOMIC_RELAXED);return -1;}
+ uint8_t *vs=malloc(p->genericVsLength),*fs=malloc(p->genericFsLength);
+ if(!vs||!fs){tegu_unlock(&tegu_vf_lock);free(vs);free(fs);__atomic_fetch_add(&tegu_vf_dropped,1,__ATOMIC_RELAXED);return -1;}
+ memcpy(vs,p->genericVsBytes,p->genericVsLength);memcpy(fs,p->genericFsBytes,p->genericFsLength);
+ struct tegu_vf_job *j=&tegu_vf_ring[tegu_vf_tail%TEGU_VF_RING];
+ memset(j,0,sizeof(*j));
+ j->p=[p retain];j->kind=kind;j->rt=rt;j->tile=tile;if(key)memcpy(j->key,key,32);
+ memcpy(j->digest,p->genericModuleDigest,32);if(spec)j->spec=*spec;j->enq=tegu_host_seconds();
+ j->vs=vs;j->fs=fs;j->vn=p->genericVsLength;j->fn=p->genericFsLength;
+ tegu_vf_tail++;
+ int start=!tegu_vf_draining;tegu_vf_draining=1;
+ tegu_unlock(&tegu_vf_lock);
+ __atomic_fetch_add(&tegu_vf_enqueued,1,__ATOMIC_RELAXED);
+ if(start)tegu_vf_schedule();
+ return 0;
+}
+static void tegu_vf_publish(TeguRenderPipeline *p,struct tegu_render_generic_variant *v,const struct tegu_vf_job *j) {
+ int kept=0;
+ tegu_lock(&p->genericVariantLock);
+ if(!memcmp(p->genericModuleDigest,j->digest,32)&&p->genericVariants&&p->genericVariantCount<p->genericVariantCapacity) {
+  unsigned dup=0;
+  if(j->kind==2)for(unsigned i=0;i<p->genericVariantCount;i++)
+   if(!p->genericVariants[i].runtime_spec&&!memcmp(p->genericVariants[i].key,j->key,32)){dup=1;break;}
+  if(!dup) {
+   p->genericVariants[p->genericVariantCount]=*v;
+   if(j->kind==1){p->rtsBase[j->rt][j->tile]=p->genericVariantCount+1;p->rtsState[j->rt][j->tile]=2;}
+   __atomic_store_n(&p->genericVariantCount,p->genericVariantCount+1,__ATOMIC_RELEASE);
+   kept=1;
+  }
+ } else __atomic_fetch_add(&tegu_vf_stale,1,__ATOMIC_RELAXED);
+ if(!kept&&j->kind==1&&!memcmp(p->genericModuleDigest,j->digest,32))p->rtsState[j->rt][j->tile]=3;
+ tegu_unlock(&p->genericVariantLock);
+ if(!kept){tegu_mali_graphics_free(&v->vertex);tegu_mali_graphics_free(&v->fragment);}
+ else if(j->kind==2) {
+  U64 us=(U64)((tegu_host_seconds()-j->enq)*1e6);
+  __atomic_fetch_add(&tegu_vf_swap_us,us,__ATOMIC_RELAXED);
+  U64 old=__atomic_load_n(&tegu_vf_swap_max_us,__ATOMIC_RELAXED);
+  while(us>old&&!__atomic_compare_exchange_n(&tegu_vf_swap_max_us,&old,us,0,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}
+ }
+}
+static void tegu_vf_run(struct tegu_vf_job *j) {
+ TeguRenderPipeline *p=j->p;
+ struct tegu_render_generic_variant v;char message[256]={0};
+ TeguAIRGraphicsSpecializationPlan zero;memset(&zero,0,sizeof(zero));zero.version=1;
+ const TeguAIRGraphicsSpecializationPlan *spec=j->kind==1?&zero:&j->spec;
+ int rc=tegu_render_generic_variant_compile_modules(p,j->rt,spec,&v,message,sizeof(message),j->vs,j->vn,j->fs,j->fn,
+  j->kind==1?TEGU_MALI_GENERIC_OPTION_RUNTIME_SPEC:0);
+ if(!rc&&j->kind==1) {
+  v.rs_n[0]=tegu_spec_push_scan((const uint32_t *)(const void *)j->vs,j->vn/4,v.rs[0]);
+  v.rs_n[1]=tegu_spec_push_scan((const uint32_t *)(const void *)j->fs,j->fn/4,v.rs[1]);
+  if(v.rs_n[0]<0||v.rs_n[1]<0){tegu_mali_graphics_free(&v.vertex);tegu_mali_graphics_free(&v.fragment);rc=-1;}
+  else {v.runtime_spec=1;tegu_vf_runtime_key(p,j->rt,j->tile,v.key);}
+ } else if(!rc)memcpy(v.key,j->key,32);
+ if(rc) {
+  __atomic_fetch_add(&tegu_vf_failed,1,__ATOMIC_RELAXED);
+  if(j->kind==1){tegu_lock(&p->genericVariantLock);
+   if(!memcmp(p->genericModuleDigest,j->digest,32))p->rtsState[j->rt][j->tile]=3;tegu_unlock(&p->genericVariantLock);}
+ } else {
+  tegu_vf_publish(p,&v,j);
+  __atomic_fetch_add(j->kind==1?&tegu_vf_prewarmed:&tegu_vf_done,1,__ATOMIC_RELAXED);
+ }
+ free(j->vs);free(j->fs);[p release];
+}
+static void tegu_vf_drain(void *unused) {
+ (void)unused;
+ for(;;) {
+  tegu_lock(&tegu_vf_lock);
+  if(tegu_vf_head==tegu_vf_tail){tegu_vf_draining=0;tegu_unlock(&tegu_vf_lock);return;}
+  struct tegu_vf_job *j=malloc(sizeof(*j));
+  if(!j){tegu_vf_draining=0;tegu_unlock(&tegu_vf_lock);return;}
+  *j=tegu_vf_ring[tegu_vf_head%TEGU_VF_RING];tegu_vf_head++;
+  tegu_unlock(&tegu_vf_lock);
+  tegu_vf_run(j);free(j);
+ }
+}
+/* Prewarm at pipeline creation (generic modules ready). */
+static void tegu_vf_prewarm(TeguRenderPipeline *p,unsigned rt) {
+ if(!p||!tegu_vf_enabled()||rt>=4||p->genericTrueMrt||!p->genericVsBytes||!p->genericFsBytes)return;
+ const unsigned tile=tegu_render_variant_tile_mode()?1u:0u;
+ tegu_lock(&p->genericVariantLock);
+ if(!p->rtsState[rt][tile]){
+  struct tegu_spec_push_entry probe[TEGU_SPEC_PUSH_MAX];
+  int nv=tegu_spec_push_scan((const uint32_t *)(const void *)p->genericVsBytes,p->genericVsLength/4,probe);
+  int nf=tegu_spec_push_scan((const uint32_t *)(const void *)p->genericFsBytes,p->genericFsLength/4,probe);
+  if(nv<0||nf<0||(!nv&&!nf))p->rtsState[rt][tile]=3; /* nothing to specialize, or not representable */
+  else if(!tegu_vf_enqueue(p,1,rt,tile,0,0))p->rtsState[rt][tile]=1;
+ }
+ tegu_unlock(&p->genericVariantLock);
+}
+/* Write the draw's specialization values into the runtime variant's push words. */
+static void tegu_vf_push(const struct tegu_render_generic_variant *v,const TeguAIRGraphicsSpecializationPlan *spec,
+ uint8_t *vpush,uint32_t *vbytes,uint8_t *fpush,uint32_t *fbytes) {
+ for(unsigned s=0;s<2;s++) {
+  const TeguAIRGraphicsSpecConstant *c=s?spec->fragment_constants:spec->vertex_constants;
+  uint32_t cn=s?spec->fragment_count:spec->vertex_count;
+  uint8_t *out=s?fpush:vpush;uint32_t *bytes=s?fbytes:vbytes;
+  for(int k=0;k<v->rs_n[s];k++) {
+   const struct tegu_spec_push_entry *e=&v->rs[s][k];
+   uint32_t value=e->default_value;
+   for(uint32_t i=0;i<cn&&i<TEGU_AIR_GRAPHICS_SPEC_MAX;i++)if(c[i].id==e->spec_id) {
+    uint32_t x=0;for(uint32_t b=0;b<c[i].size&&b<4;b++)x|=(uint32_t)c[i].data[b]<<(8*b);
+    if(e->is_bool){x=0;for(uint32_t b=0;b<c[i].size&&b<8;b++)x|=c[i].data[b];x=x!=0;}
+    value=x;break;
+   }
+   uint32_t at=TEGU_SPEC_PUSH_BASE+4u*(uint32_t)k;
+   memcpy(out+at,&value,4);if(at+4>*bytes)*bytes=at+4;
+  }
+ }
+}

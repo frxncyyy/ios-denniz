@@ -1,0 +1,103 @@
+/* lowering-air-opus -> render owner / root integrator. NOT APPLIED (render_pipeline.inc is
+ * render-owned and carries root's uncommitted bisect defines). Needs: compiler entry
+ * tegu_mali_compile_air_pair_options (mali_graphics_compiler.h, landed in the candidate) and
+ * the bridge export in air_bridge_air_source.rs. Behaviour with TEGU_AIR_DIRECT unset: identical.
+ *
+ * 1. TeguRenderPipeline ivars (render_pipeline.inc @interface):
+ *      struct tegu_render_air_source *airSource;   // NULL: AIR-direct never tried
+ *      uint8_t *genericMetaBytes;NSUInteger genericMetaLength; // meta of genericVs/FsBytes
+ *    dealloc: tegu_render_air_source_free(airSource);free(genericMetaBytes);
+ *
+ * 2. tegu_render_generic_set_modules(p,vs,fs) gains `const TeguAIRBlob *meta` and copies it next to
+ *    the modules (same generation: the adapter reads bindings/push/spec ids of THIS translation).
+ *    tegu_render_generic_prepare/_prepare_rt/_retranslate pass the meta blob they already hold.
+ *
+ * 3. Pipeline creation, where `vertex`, `fragment` (TeguFunction) and the MTLVertexDescriptor
+ *    attributes are known (the generic path, before tegu_render_generic_prepare): */
+struct tegu_render_air_source {
+ TeguLibrary *vlib,*flib;                       /* retained: their AIR bytes are borrowed */
+ char ventry[128],fentry[128];
+ struct tegu_mali_air_constant vc[64],fc[64];uint32_t vcn,fcn;
+ char names[4096];size_t names_used;            /* NUL-terminated constant names */
+ struct tegu_mali_air_vertex_attribute attrs[31];uint32_t attr_count;
+};
+static int tegu_air_direct_enabled(void) {
+#ifndef TEGU_AIR_DIRECT_DEFAULT
+#define TEGU_AIR_DIRECT_DEFAULT 0
+#endif
+ static int state=-1;
+ if(state<0){const char *e=getenv("TEGU_AIR_DIRECT");state=e&&e[0]?e[0]!='0':TEGU_AIR_DIRECT_DEFAULT;}
+ return state;
+}
+static U64 tegu_air_direct_ok,tegu_air_direct_refused,tegu_air_direct_m2v;
+static int tegu_render_air_constants(TeguLibrary *lib,const char *entry,struct tegu_mali_air_constant *out,uint32_t *n,
+ struct tegu_render_air_source *s) {
+ TeguAIRSourceConstant raw[64];size_t count=0;const uint8_t *bytes;size_t length;
+ if(tegu_air_library_air_source(lib->library,(const uint8_t *)entry,strlen(entry),&bytes,&length,raw,64,&count))return -1;
+ for(size_t i=0;i<count;i++) {
+  const char *name=NULL;
+  if(raw[i].name) {
+   if(s->names_used+raw[i].name_len+1>sizeof(s->names))return -1;
+   memcpy(s->names+s->names_used,raw[i].name,raw[i].name_len);s->names[s->names_used+raw[i].name_len]=0;
+   name=s->names+s->names_used;s->names_used+=raw[i].name_len+1;
+  }
+  out[i]=(struct tegu_mali_air_constant){name,raw[i].index,raw[i].size,raw[i].bits};
+ }
+ *n=(uint32_t)count;return 0;
+}
+static struct tegu_render_air_source *tegu_render_air_source_make(TeguFunction *vertex,TeguFunction *fragment,
+ const TeguAIRVertexAttribute *attributes,NSUInteger count) {
+ if(!tegu_air_direct_enabled()||!vertex||!fragment||count>31)return NULL;
+ struct tegu_render_air_source *s=calloc(1,sizeof(*s));if(!s)return NULL;
+ snprintf(s->ventry,sizeof(s->ventry),"%s",[vertex->functionName UTF8String]);
+ snprintf(s->fentry,sizeof(s->fentry),"%s",[fragment->functionName UTF8String]);
+ s->vlib=[vertex->library retain];s->flib=[fragment->library retain];
+ if(tegu_render_air_constants(s->vlib,s->ventry,s->vc,&s->vcn,s)||tegu_render_air_constants(s->flib,s->fentry,s->fc,&s->fcn,s)) {
+  [s->vlib release];[s->flib release];free(s);return NULL;
+ }
+ for(NSUInteger i=0;i<count;i++)
+  s->attrs[i]=(struct tegu_mali_air_vertex_attribute){attributes[i].index,attributes[i].format,attributes[i].offset,attributes[i].buffer_index};
+ s->attr_count=(uint32_t)count;return s;
+}
+static void tegu_render_air_source_free(struct tegu_render_air_source *s){if(!s)return;[s->vlib release];[s->flib release];free(s);}
+/* 4. tegu_render_compile_generic_options gains a leading `TeguRenderPipeline *p` (NULL at call sites
+ *    that compile anything but p's retained modules) and tries AIR first: */
+static int tegu_render_compile_air_first(TeguRenderPipeline *p,const void *vs,size_t vn,const void *fs,size_t fn,
+ const struct tegu_mali_specialization *vc,size_t vcn,const struct tegu_mali_specialization *fc,size_t fcn,
+ const struct tegu_mali_generic_options *options,struct tegu_mali_graphics *vo,struct tegu_mali_graphics *fo,
+ struct tegu_mali_graphics_pair2 *pair,struct tegu_mali_generic_plan *plan,struct tegu_mali_varying_info *varying,
+ char *message,size_t size) {
+ if(!p||!p->airSource||!tegu_air_direct_enabled()||!p->genericMetaBytes||vs!=p->genericVsBytes||fs!=p->genericFsBytes||
+    (options->flags&TEGU_MALI_GENERIC_OPTION_RUNTIME_SPEC)){__atomic_fetch_add(&tegu_air_direct_m2v,1,__ATOMIC_RELAXED);return -1;}
+ const struct tegu_render_air_source *s=p->airSource;const uint8_t *vb,*fb;size_t vl,fl,unused;
+ if(tegu_air_library_air_source(s->vlib->library,(const uint8_t *)s->ventry,strlen(s->ventry),&vb,&vl,NULL,0,&unused)==1||
+    tegu_air_library_air_source(s->flib->library,(const uint8_t *)s->fentry,strlen(s->fentry),&fb,&fl,NULL,0,&unused)==1)return -1; /* 3 = constants not requested */
+ struct tegu_mali_air_pair air={TEGU_MALI_AIR_PAIR_VERSION,s->attr_count,
+  {vb,vl,s->ventry,s->vc,s->vcn,0},{fb,fl,s->fentry,s->fc,s->fcn,0},s->attrs,
+  (const char *)p->genericMetaBytes,p->genericMetaLength};
+ /* Pipeline cache: a separate entry kind with an "AIR1" salt over the same key as
+  * tegu_pc_mali_generic_options PLUS both library cacheIdentity values, entries and constants
+  * (pipeline_cache_frontend.inc owner); until then call the compiler directly: */
+ char why[192]={0};
+ int rc=tegu_mali_compile_air_pair_options(&air,vs,vn,fs,fn,vc,vcn,fc,fcn,options,vo,fo,pair,plan,varying,why,sizeof(why));
+ if(!rc){__atomic_fetch_add(&tegu_air_direct_ok,1,__ATOMIC_RELAXED);return 0;}
+ /* refusal: outputs are zero (compiler contract); the caller compiles the m2v SPIR-V */
+ memset(plan,0,sizeof(*plan));memset(varying,0,sizeof(*varying));
+ __atomic_fetch_add(&tegu_air_direct_refused,1,__ATOMIC_RELAXED);
+ static unsigned traces;
+ if(__atomic_fetch_add(&traces,1,__ATOMIC_RELAXED)<24) {
+  char line[256];int n=snprintf(line,sizeof(line),"TEGU_AIR_DIRECT refused %s+%s: %.180s\n",s->ventry,s->fentry,why);
+  if(n>0)write(2,line,(size_t)n<sizeof(line)?(size_t)n:sizeof(line)-1);
+ }
+ (void)message;(void)size;return -1;
+}
+/*    In tegu_render_compile_generic_options, after building `options`/`options2` and before
+ *    tegu_pc_mali_generic_options:
+ *      if(!tegu_render_compile_air_first(p,vs,vn,fs,fn,vc,vc_count,fc,fc_count,
+ *         (const struct tegu_mali_generic_options *)&options,vo,fo,pair,plan,varying,message,size))return 0;
+ * 5. TEGU_PERF: append " air=%llu air_refused=%llu air_m2v=%llu" (the three counters) to the
+ *    existing per-interval render/pipeline perf line.
+ * 6. Build: add mali_graphics_air.inc, air/*.c, air/*.h, air/NOTICE.md, air/LICENSE.hackios-userland to
+ *    gpu/tools/build_native_compilers.py's copy list and air/*.c to its meson sources list with
+ *    -DTEGU_MALI_AIR and include_directories('air'); same for the host mesa-src clc meson target
+ *    (or gpu/build/air-nir-20261028/tools/build_air_so.sh for a private host lib). */

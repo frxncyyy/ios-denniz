@@ -1,0 +1,68 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * PROPOSAL (opus-dec1, 2026-11-11) for include/n2vcd_proto.h rev 2: the decoder half.  Owner of the header: hw-lead.
+ * Additive: N2VCD_VERSION 2; every v1 message keeps its number and layout; a v1 client never sends the new types.
+ * The text below is meant to be pasted after `struct n2vcd_simple` (types) and into enum n2vcd_type (ids).
+ *
+ * Why v1 DEC_HEADER/DEC_FRAME are not enough (facts from dec1/vdec_ref.c on the fake, host only):
+ *  - the vendor decoder keeps each output buffer as a reference picture for several frames and returns pictures in
+ *    DISPLAY order through vsi.list_disp, buffers in vsi.list_free: one output buffer per DEC_FRAME request with
+ *    "picture in this buffer" semantics does not exist (a B-frame stream displays 1000,1002,1003,1001,...);
+ *  - one input can yield 0, 1 or several pictures (flush yields up to dpb_sz);
+ *  - the output is MM21 (16x32 tiles) at buf_w x buf_h, not linear NV12: the client must know the layout + buf_h.
+ * So: the client registers a POOL of output buffers once (after the header), feeds inputs, pops pictures, and
+ * releases each picture after copying it into its CVPixelBuffer.  No pixel copy happens in the daemon.
+ *
+ * Flow:
+ *   OPEN(encoder=0, codec)                     -> OPEN_OK(in_buf_bytes = suggested bitstream buffer size)
+ *   DEC_HEADER(in_handle, in_bytes)            -> DEC_HEADER_OK (v1 struct, rev-2 meaning of the fields below)
+ *   DEC_ADD_BUFFER(handle, bytes) x N          -> DEC_ADD_BUFFER_OK(index)       N = DEC_HEADER_OK.dpb_frames
+ *   loop: DEC_INPUT(in_handle, in_bytes, pts)  -> DEC_INPUT_OK(pictures_ready, changed)   input buffer reusable on reply
+ *         while pictures_ready: DEC_PICTURE    -> DEC_PICTURE_OK(have, index, pts, ...)
+ *         after copying: DEC_RELEASE(index)    -> simple
+ *   end:  FLUSH                                -> FLUSH_OK (detail = pictures_ready); drain with DEC_PICTURE
+ *   CLOSE                                      -> CLOSE_OK (all buffers forgotten; the client frees them)
+ *   Resolution change: DEC_INPUT_OK.changed = 1 -> the input was NOT consumed: drain DEC_PICTURE, DEC_RELEASE all,
+ *   DEC_FREE_BUFFERS, read the new geometry with DEC_HEADER(same input), register a new pool, resend the input.
+ *
+ * Daemon rules: output buffers are client RWVC DMA buffers with the share flag (phone: RWVC_DMA_INFO gives the pa;
+ * host: the transport's shared file).  Y plane at offset 0, C plane at offset stride * buf_h.  A buffer is handed to
+ * the vendor only when it is released by the client AND not held by the vendor (vsi.list_free).  Cache: the daemon
+ * syncs from_device before answering DEC_PICTURE_OK.  Errors: N2VCD_ERROR with the v1 codes; a vendor/guest stop is
+ * fatal for the daemon exactly as on the encoder path (N2VCD_E_GUEST, exit 70).
+ */
+
+/* enum n2vcd_type additions (rev 2) */
+	N2VCD_DEC_ADD_BUFFER = 20, N2VCD_DEC_ADD_BUFFER_OK,
+	N2VCD_DEC_FREE_BUFFERS, N2VCD_DEC_FREE_BUFFERS_OK,      /* reply: n2vcd_simple */
+	N2VCD_DEC_INPUT, N2VCD_DEC_INPUT_OK,
+	N2VCD_DEC_PICTURE, N2VCD_DEC_PICTURE_OK,
+	N2VCD_DEC_RELEASE, N2VCD_DEC_RELEASE_OK,                /* reply: n2vcd_simple */
+
+/* output layouts (DEC_HEADER_OK.reserved[0], DEC_PICTURE_OK.fourcc) */
+enum { N2VCD_FMT_MM21 = 0x31324d4d /* 'MM21': 8-bit 4:2:0, Y 16x32 tiles, CbCr 16x16 tiles (2 planes) */,
+	N2VCD_FMT_NV12 = 0x3231564e /* 'NV12' linear, only if the vendor ever accepts the layout */ };
+
+/* rev-2 meaning of struct n2vcd_dec_header_ok (layout unchanged):
+ *   width, height   = display size (vsi.crop.width/height), e.g. 1920x1080
+ *   stride          = buf_w (vsi.pic.buf_w), e.g. 1920; also the MM21 row pitch in bytes of the Y plane
+ *   out_buf_bytes   = bytes of ONE output buffer = fb_sz[0] + fb_sz[1] (1080p MM21: 2088960 + 1044480)
+ *   dpb_frames      = buffers the client must register: vsi.dec.dpb_sz + 1 (V4L2 GET_PARAM_DPB_SIZE) + 2
+ *                     (one decoding, one held by the client)
+ *   reserved[0]     = N2VCD_FMT_* of the output,  reserved[1] = buf_h (vsi.pic.buf_h, e.g. 1088)          */
+
+struct n2vcd_dec_add_buffer { struct n2vcd_hdr h; uint32_t handle, bytes; };
+struct n2vcd_dec_add_buffer_ok { struct n2vcd_hdr h; uint32_t status, index; };      /* index 0..31 */
+struct n2vcd_dec_input { struct n2vcd_hdr h; uint32_t in_handle, in_bytes; uint64_t pts;
+	uint32_t flags, reserved; };                       /* flags bit 0: discontinuity (seek) -> RESET first */
+struct n2vcd_dec_input_ok { struct n2vcd_hdr h; uint32_t status, pictures_ready;
+	uint32_t changed;                                  /* 1: geometry change, input not consumed (see flow) */
+	uint32_t error_map;                                /* vsi.dec.error_map of this input, 0 = clean */
+	uint32_t hw_us, reserved; };
+struct n2vcd_dec_picture { struct n2vcd_hdr h; };
+struct n2vcd_dec_picture_ok { struct n2vcd_hdr h; uint32_t status, have; uint64_t pts;
+	uint32_t index;                                    /* registered buffer holding the picture; client owns it */
+	uint32_t width, height, stride, buf_h, fourcc;     /* display size, Y pitch, aligned height, N2VCD_FMT_* */
+	uint32_t pictures_ready, reserved; };              /* still queued after this one */
+struct n2vcd_dec_release { struct n2vcd_hdr h; uint32_t index, reserved; };
+/* sizes: add_buffer 24, add_buffer_ok 24, input 40, input_ok 40, picture 16, picture_ok 64, release 24 (<= 1024) */

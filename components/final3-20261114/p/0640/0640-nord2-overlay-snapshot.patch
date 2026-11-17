@@ -1,0 +1,603 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -43,6 +43,7 @@
+ #include "sweet_fb_scene.h"           /* 0392 */
+ #include "sweet_fb_hw.h"              /* 0396 */
+ #include "sweet_fb_cutout.h"          /* 0550: punch-hole status bar band rotation (overlay pieces + touch) */
++#include "sweet_fb_snapc.h"           /* 0640: debug snapshot = the shown overlay plan composed in software (on USB request only) */
+ #include "sweet_fb_pace.h"            /* 0397 */
+ #include "sweet_fb_iommu.h"           /* 0401 IOMMU */
+ #include "sweet_fb_fpsmeter.h"         /* 0407: HW-frame content clock (measurement only) */
+@@ -420,6 +421,11 @@
+ 	struct sweet_fb_hw_plan fHwPlan, fHwShownPlan;
+ 	uint32_t            fHwLastCon[SWEET_FB_HW_SLOTS];      /* 0399: CON of layer 0 / layer 1 last written */
+ 	sweet_fb_pending_surfaces fHwHeld;       /* surfaces of the shown HW frame: held until the overlay stops reading them */
++	/* 0640: debug snapshot.  fHwPlanIn/N: present thread (with fHwPlan); fHwShownIn/S/N: fLock (with fHwShownPlan; S are in fHwHeld) */
++	struct sweet_fb_hw_in fHwPlanIn[SWEET_FB_HW_MAX_IN], fHwShownIn[SWEET_FB_HW_MAX_IN];
++	SweetSurface       *fHwShownS[SWEET_FB_HW_MAX_IN];
++	unsigned            fHwPlanN, fHwShownN;
++	uint32_t            fSnapMs, fSnapFlags;
+ 	SweetSurface       *fHwLayerS[SWEET_FB_HW_MAX_IN];
+ 	uint32_t            fHwLayerId[SWEET_FB_HW_MAX_IN];
+ 	uint64_t            fHwSeq[SWEET_FB_HW_MAX_IN], fHwSnap[SWEET_FB_HW_MAX_IN];      /* 0402: write_seq at plan / at SwapEnd */
+@@ -485,6 +491,8 @@
+ 	void        blService(bool owned);
+ 	void        blThermTick(void);
+ 	int         blStat(char *buf, size_t len);
++	uint8_t    *snapHw(const uint32_t want[6], uint32_t info[8]);      /* 0640 */
++	void        statusWords(uint32_t w[4]);                          /* 0640 */
+ 	void        blConfigChanged(void);
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 
+@@ -1055,6 +1063,7 @@
+ 	IOLog("SWEET FB: layers outside a swap's mask kept %s (0392)\n", sweet_fb_retain_mode ? "on" : "off (n2fbretain=0)");
+ 	sweet_fb_pending_surfaces_init(&fHwHeld);       /* 0396 */
+ 	bzero(&fHwSt, sizeof(fHwSt)); fHwInitDone = fHwInitOk = fHwOn = fWorkHw = false; fHwN = 0; fHwTestMem = NULL; fHwTestMap = NULL;
++	fHwPlanN = fHwShownN = 0; fSnapMs = fSnapFlags = 0;      /* 0640 */
+ 	fPanelBlank = false; fBlankFails = 0; fHwInitRetryN = 0; fHwInitRetryUs = 0; fHeldN = 0; bzero(fHeld, sizeof(fHeld));      /* 0413 */
+ 	fOvl4[0] = fOvl4[1] = NULL; fHw4Ok = fHw4On = fHwUses4 = fHwForced = fHw4Tried = false; fHw4OffN = fWorkResv = fPendResv = 0; fHw4OffUntilUs = 0; fCfT0Us = 0; fCfLastCpm = 0;      /* 0402 */
+ 	bzero(fPendSeq, sizeof(fPendSeq)); bzero(fWorkSeq, sizeof(fWorkSeq));
+@@ -1273,13 +1282,113 @@
+ 	return true;
+ }
+ 
+-/* 0416: no CPU read of the panel: screenshots are gone (bsd/dev/nord2_autotest.inc gets NULL = "no picture") */
++/*
++ * 0640: debug screenshot in the overlay modes (0416 removed the CPU read of the panel buffer).  On a USB autotest request only
++ * (bsd/dev/nord2_autotest.inc command 3, its own thread): the plan on the panel (fHwShownPlan, its layer ranges and surfaces) is
++ * copied under fLock, the surfaces are retained, the lock is dropped at once, and the picture is composed from that copy in software
++ * (sweet_fb_snapc.h; slots it cannot read or model are painted magenta).  Nothing runs per frame: display operation stays CPU-free.
++ * kern.n2snap = 0 refuses (kill switch).  NULL with info[3] = reason: 20 off, 21 no overlay frame shown yet, 22 no memory.
++ * info: [0] w [1] h [2] bytes [3] scale | packed << 4 [4] slots composed [5] SWEET_FB_SNAPC_F_* [6] presents during [7] panel
++ * (bit 0 iOS asked display off, bit 1 DCS display off sent = dark).
++ */
++static uint32_t sweet_fb_snap_mode = 1;      /* kern.n2snap */
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wreserved-identifier"
++#pragma clang diagnostic ignored "-Wmissing-designated-field-initializers"
++#pragma clang diagnostic ignored "-Wcast-function-type-strict"
++SYSCTL_UINT(_kern, OID_AUTO, n2snap, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_snap_mode, 0, "0640 debug screenshot of the overlay plan (USB autotest) 1 on / 0 off");
++#pragma clang diagnostic pop
++extern "C" int sweet_surface_snap_read(void *surface, uint64_t off, void *dst, uint32_t n);      /* SweetSurface.cpp (0640) */
++struct sweet_fb_snap_ctx { SweetSurface *s[SWEET_FB_HW_MAX_IN]; };
++static int
++sweet_fb_snap_read(void *ctx, int src, uint64_t off, void *dst, uint32_t n)
++{
++	struct sweet_fb_snap_ctx *c = (struct sweet_fb_snap_ctx *)ctx;
++	if (src < 0 || src >= (int)SWEET_FB_HW_MAX_IN || c->s[src] == NULL) { return 1; }
++	return sweet_surface_snap_read(c->s[src], off, dst, n);
++}
++
++uint8_t *
++AppleCLCD::snapHw(const uint32_t want[6], uint32_t info[8])
++{
++	static uint8_t *buf, *tmp;
++	static uint32_t *line;
++	if (__atomic_load_n(&sweet_fb_snap_mode, __ATOMIC_RELAXED) == 0) { info[3] = 20; return NULL; }
++	if (buf == NULL) {
++		buf = (uint8_t *)IOMallocData((vm_size_t)sweet_fb_snapc_bound(fWidth, fHeight));
++		line = (uint32_t *)IOMallocData((vm_size_t)fWidth * 4u + 64u);
++		tmp = (uint8_t *)IOMallocData(SWEET_FB_SNAPC_TMP_BYTES);
++	}
++	if (buf == NULL || line == NULL || tmp == NULL || fWidth > 1080u * 2u) { info[3] = 22; return NULL; }
++	struct sweet_fb_hw_plan plan;
++	struct sweet_fb_snapc_src src[SWEET_FB_HW_MAX_IN];
++	struct sweet_fb_snap_ctx ctx;
++	bzero(&ctx, sizeof(ctx));
++	bzero(src, sizeof(src));
++	IOLockLock(fLock);      /* only the copy is done under the lock (a few hundred bytes) */
++	unsigned n = (fHwOn && fHwShownN <= SWEET_FB_HW_MAX_IN) ? fHwShownN : 0;
++	plan = fHwShownPlan;
++	for (unsigned i = 0; i < n; i++) {
++		src[i].dev = fHwShownIn[i].pa; src[i].len = fHwShownIn[i].len;
++		ctx.s[i] = fHwShownS[i];
++		if (ctx.s[i] != NULL) { ctx.s[i]->retain(); }
++	}
++	uint32_t panel = (fPowerOff ? 1u : 0u) | (fPanelBlank ? 2u : 0u), presents = fPresents;
++	IOLockUnlock(fLock);
++	if (n == 0) { info[3] = 21; info[7] = panel; return NULL; }
++	uint64_t t0 = mach_absolute_time();
++	struct sweet_fb_snapc c;
++	(void)sweet_fb_snapc_prepare(&c, &plan, src, n, fWidth, fHeight);
++	uint32_t pinfo[4];
++	sweet_fb_snapc_picture(&c, want, fWidth, fHeight, buf, line, tmp, sweet_fb_snap_read, &ctx, pinfo);
++	for (unsigned i = 0; i < n; i++) { if (ctx.s[i] != NULL) { ctx.s[i]->release(); } }
++	uint32_t slots = 0;
++	for (unsigned k = 0; k < SWEET_FB_HW_PIPES; k++) { slots += (uint32_t)__builtin_popcount(plan.src_con[k] & 0x3fu); }
++	uint32_t flags = c.flags | (__atomic_load_n(&sweet_fb_cut_live, __ATOMIC_RELAXED) ? SWEET_FB_SNAPC_F_CUT : 0u) |
++	    ((panel & 1u) ? SWEET_FB_SNAPC_F_PANEL_OFF : 0u) | ((panel & 2u) ? SWEET_FB_SNAPC_F_BLANK : 0u);
++	info[0] = pinfo[0]; info[1] = pinfo[1]; info[2] = pinfo[2]; info[3] = pinfo[3];
++	info[4] = slots; info[5] = flags & 0xffu; info[6] = fPresents - presents; info[7] = panel;
++	uint64_t snap_ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &snap_ns);
++	fSnapMs = (uint32_t)(snap_ns / 1000000u); fSnapFlags = flags;
++	static unsigned said;
++	if (said < 20 || (flags & SWEET_FB_SNAPC_F_MARKED)) {
++		said++;
++		IOLog("NORD2 SNAP: %ux%u scale %u from %u layers / %u slots in %u ms, flags %#x (%u marked magenta), panel %s%s\n", pinfo[0], pinfo[1],
++		    pinfo[3] & 15u, n, slots, fSnapMs, flags, c.marked, (panel & 2u) ? "dark (DCS off)" : "on", (panel & 1u) ? ", iOS asked display off" : "");
++	}
++	return buf;
++}
++
++/* 0640: cheap state words for the autotest status (racy relaxed reads, no lock): [0] panel/flags, [1] DBV sent | target << 16,
++ * [2] brightness request nits 16.16 (-1 none), [3] presents */
++void
++AppleCLCD::statusWords(uint32_t w[4])
++{
++	struct sweet_bl_cfg cfg = sweet_bl_cfg_g;
++	uint32_t sent = __atomic_load_n(&fBl.sent_dbv, __ATOMIC_RELAXED);
++	struct sweet_bl b = fBl;      /* racy copy: only the fields below are used */
++	w[0] = (fPowerOff ? 1u : 0u) | (fPanelBlank ? 2u : 0u) | (fHwOn ? 4u : 0u) | (__atomic_load_n(&sweet_fb_cut_live, __ATOMIC_RELAXED) ? 8u : 0u) |
++	    16u | ((fSnapFlags & 0xffu) << 8) | ((fSnapMs > 0xffffu ? 0xffffu : fSnapMs) << 16);
++	w[1] = (sent & 0xffffu) | ((sweet_bl_target(&b, &cfg) & 0xffffu) << 16);
++	w[2] = (uint32_t)b.req_q16;
++	w[3] = fPresents;
++}
++
+ extern "C" void *sweet_fb_snap(const uint32_t want[6], uint32_t info[8]);
+ extern "C" void *
+ sweet_fb_snap(const uint32_t want[6], uint32_t info[8])
+ {
+-	(void)want; (void)info;
+-	return NULL;
++	if (gSweetFBSnapOwner == NULL) { info[3] = 21; return NULL; }
++	return gSweetFBSnapOwner->snapHw(want, info);
++}
++
++extern "C" void sweet_fb_status_words(uint32_t w[4]);
++extern "C" void
++sweet_fb_status_words(uint32_t w[4])
++{
++	w[0] = w[1] = w[2] = w[3] = 0;
++	if (gSweetFBSnapOwner != NULL) { gSweetFBSnapOwner->statusWords(w); }
+ }
+ 
+ /* All counters are relaxed observations; report only after releasing fLock.
+@@ -2124,6 +2233,13 @@
+ 		fHwHeld = surfaces;
+ 		sweet_fb_pending_surfaces_init(&surfaces);
+ 		fHwShownPlan = fHwPlan;
++		/* 0640: the layer ranges / surfaces of the shown plan for the debug snapshot; a surface not in fHwHeld is never named */
++		fHwShownN = 0;
++		for (unsigned i = 0; i < fHwPlanN && i < SWEET_FB_HW_MAX_IN; i++) {
++			bool held = false;
++			for (unsigned j = 0; j < SWEET_FB_PENDING_SURFACE_COUNT; j++) { held |= fHwHeld.object[j] != NULL && fHwHeld.object[j] == (void *)fHwLayerS[i]; }
++			fHwShownIn[fHwShownN] = fHwPlanIn[i]; fHwShownS[fHwShownN] = held ? fHwLayerS[i] : NULL; fHwShownN++;
++		}
+ 	}
+ 	fPState = 0;
+ 	IOLockUnlock(fLock);
+@@ -2672,6 +2788,8 @@
+ 	if (!hwApply(&p, ids, lpid, n)) { fHwN = 0; fHwSt.cpu_frames++; fHwSt.why[SWEET_FB_HW_W_STATE]++; return 0; }      /* faulted / 4L lost */
+ 	__atomic_store_n(&sweet_fb_cut_live, cw == SWEET_FB_CUT_OK ? 1u : 0u, __ATOMIC_RELAXED);      /* 0550: touch follows the programmed frame */
+ 	fHwPlan = p;
++	fHwPlanN = n;      /* 0640: the planned layers' device ranges, copied with the plan when it is shown */
++	for (unsigned i = 0; i < n; i++) { fHwPlanIn[i] = in[i]; }
+ 	fHwSt.planned++;
+ 	sweet_fb_yuv_note(in, n, ids, ss);      /* 0490 */
+ 	if (fHwUses4) { fHwSt.l4_frames++; }
+@@ -3084,6 +3202,7 @@
+ 		fPresentTimer->disable();
+ 	}
+ #if defined(NORD2)
++	IOLockLock(fLock); fHwShownN = 0; IOLockUnlock(fLock);      /* 0640: the snapshot no longer names the held surfaces */
+ 	sweet_fb_pending_surfaces_release(&fHwHeld, sweet_fb_release_surface);
+ 	OSSafeReleaseNULL(fHwTestMap);
+ 	OSSafeReleaseNULL(fHwTestMem);
+--- /dev/null
++++ b/iokit/Kernel/arm/sweet_fb_snapc.h
+@@ -0,0 +1,243 @@
++#ifndef SWEET_FB_SNAPC_H
++#define SWEET_FB_SNAPC_H
++/*
++ * 0640 (snap-20261114): a debugging picture of what the overlay shows, composed in software from the plan that is programmed now.
++ * Pure and host-testable (snap-20261114/test/t_snapc.c): no IOKit, no registers, the pixels are read through a callback.
++ *
++ * Used ONLY when the USB autotest asks for a screenshot (bsd/dev/nord2_autotest.inc command 3, thread context).  Normal display
++ * operation stays CPU-free: nothing here runs per frame.  The driver (SweetFramebuffer.cpp AppleCLCD::snapHw) copies the shown plan
++ * (fHwShownPlan, = the registers of the frame on the panel) and the device address range of every layer surface under fLock,
++ * retains the surfaces, drops the lock and composes from that copy.
++ *
++ * Model = the register plan, slot by slot, exactly as the OVLs run it (sweet_fb_hw.h): per pipe k (panel columns k*540 ..), a black
++ * background, then slots 0..5 in order (2L L0, 2L L1, then the cascaded 4L L0..L3 over the 2L output), each slot reading
++ * size.h rows of size.w pixels from addr with pitch and placing them at offset (pipe-local x, y).  The 0550 band rotation pieces are
++ * ordinary slots of that plan, so the rotated status bar comes out as the panel shows it with no special case.
++ * Per slot, from its final CON (sweet_fb_hw_con_final, incl. the 0399 swap bits):
++ *   CFMT 2/3 (32 bit): the word decoded by sweet_fb_hw_con_decode (the colour-order model);  AEN 0: copied (alpha ignored);
++ *     AEN 1 without MAN (straight, pm 0 default): out = (s*ea + d*(255-ea)) / 255, ea = sa*pa/255;
++ *     AEN 1 with MAN (premultiplied): out = s*pa/255 + d*(255 - ea)/255.  Rounding: +127 then /255 per step (model, not bit-exact HW).
++ *   CFMT 4/5 (packed 4:2:2, 0490): UYVY / YUYV, matrix L_CON[19:16] by sweet_fb_yuv_ref_rgb, BYTE_SWAP = Cb/Cr exchanged, Ln_CLIP
++ *     trims [7:0] left / [15:8] right columns of the read span; plane alpha as straight.
++ *   anything else, an address that lies in no layer's range, a read leaving the range, a failed read: the slot's rectangle is
++ *     painted MAGENTA (255,0,255) instead of guessed, and counted (flags SWEET_FB_SNAPC_F_MARKED).
++ * Output: R,G,B bytes per pixel or the 0296 run-length packing (a byte c, then c < 128: c + 1 pixels as they are; c >= 128: one
++ * pixel shown c - 126 times; runs go on over row ends), every scale-th pixel of every scale-th row of a crop.
++ */
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#ifndef SWEET_FB_HW_H
++#error "sweet_fb_snapc.h needs sweet_fb_hw.h first"
++#endif
++
++#define SWEET_FB_SNAPC_MAGENTA      0xffff00ffu     /* 0xAARRGGBB */
++#define SWEET_FB_SNAPC_MAX_SRC      8u
++#define SWEET_FB_SNAPC_TMP_BYTES    (540u * 4u + 64u)
++
++/* flags of a composition (info word, also in the status) */
++#define SWEET_FB_SNAPC_F_HW         0x01u           /* composed from the overlay plan */
++#define SWEET_FB_SNAPC_F_MARKED     0x02u           /* at least one slot painted magenta (not readable / format not modelled) */
++#define SWEET_FB_SNAPC_F_CUT        0x04u           /* the 0550 band rotation is in the plan (live) */
++#define SWEET_FB_SNAPC_F_YUV        0x08u           /* a 4:2:2 slot was composed */
++#define SWEET_FB_SNAPC_F_PANEL_OFF  0x10u           /* iOS asked display off (RequestPowerChange 0) */
++#define SWEET_FB_SNAPC_F_BLANK      0x20u           /* DCS 0x28 display off was sent: the panel is dark */
++
++/* one layer surface: the device address range the plan's slots point into (pool PA, IOVA or carve-out) */
++struct sweet_fb_snapc_src { uint64_t dev, len; };
++
++enum { SWEET_FB_SNAPC_K_OFF = 0, SWEET_FB_SNAPC_K_RGB32, SWEET_FB_SNAPC_K_YUV, SWEET_FB_SNAPC_K_BAD };
++
++struct sweet_fb_snapc_slot {
++	uint32_t kind;              /* SWEET_FB_SNAPC_K_* */
++	int32_t src;                /* source index (-1: none) */
++	uint64_t off;               /* byte offset in the source of the first read pixel of row 0 */
++	uint32_t pitch, w, h, ox, oy, con, clip, bpp;
++};
++
++struct sweet_fb_snapc {
++	uint32_t pw, fh;            /* pipe width (540), panel height */
++	struct sweet_fb_snapc_slot s[SWEET_FB_HW_PIPES][SWEET_FB_HW_NSLOT];
++	uint32_t marked;            /* slots that cannot be composed (painted magenta) */
++	uint32_t flags;
++};
++
++/* reads n bytes at byte offset off of source src into dst; 0 = done */
++typedef int (*sweet_fb_snapc_read_fn)(void *ctx, int src, uint64_t off, void *dst, uint32_t n);
++
++/* Turns a plan into composition slots (addresses -> source, offset).  Returns the number of slots that will be painted magenta. */
++static inline uint32_t
++sweet_fb_snapc_prepare(struct sweet_fb_snapc *c, const struct sweet_fb_hw_plan *p, const struct sweet_fb_snapc_src *src, unsigned nsrc,
++    uint32_t fw, uint32_t fh)
++{
++	__builtin_memset(c, 0, sizeof(*c));
++	c->pw = fw / SWEET_FB_HW_PIPES; c->fh = fh; c->flags = SWEET_FB_SNAPC_F_HW;
++	for (unsigned k = 0; k < SWEET_FB_HW_PIPES; k++) {
++		for (unsigned i = 0; i < SWEET_FB_HW_NSLOT; i++) {
++			const struct sweet_fb_hw_slot *sl = &p->slot[k][i];
++			struct sweet_fb_snapc_slot *o = &c->s[k][i];
++			o->src = -1;
++			if (!sl->en || !(p->src_con[k] & (1u << i))) { o->kind = SWEET_FB_SNAPC_K_OFF; continue; }
++			o->con = sweet_fb_hw_con_final(p, k, i);
++			o->pitch = sl->pitch; o->w = sl->size & 0xffffu; o->h = sl->size >> 16; o->ox = sl->offset & 0xffffu; o->oy = sl->offset >> 16;
++			o->clip = sl->clip;
++			uint32_t cf = SWEET_FB_HW_CON_CFMT(o->con);
++			o->kind = (cf == 2u || cf == 3u) ? SWEET_FB_SNAPC_K_RGB32 : ((cf == 4u || cf == 5u) ? SWEET_FB_SNAPC_K_YUV : SWEET_FB_SNAPC_K_BAD);
++			o->bpp = o->kind == SWEET_FB_SNAPC_K_YUV ? 2u : 4u;
++			if (o->kind == SWEET_FB_SNAPC_K_YUV) { c->flags |= SWEET_FB_SNAPC_F_YUV; }
++			if (o->w == 0u || o->h == 0u) { o->kind = SWEET_FB_SNAPC_K_OFF; continue; }
++			/* geometry clamped to the pipe / panel (the planner never exceeds them; a corrupt plan must not overrun the row buffer) */
++			if (o->ox >= c->pw || o->oy >= fh) { o->kind = SWEET_FB_SNAPC_K_OFF; continue; }
++			if (o->w > c->pw - o->ox + ((o->kind == SWEET_FB_SNAPC_K_YUV) ? 2u : 0u)) { o->kind = SWEET_FB_SNAPC_K_BAD; o->w = c->pw - o->ox; }
++			if (o->h > fh - o->oy) { o->h = fh - o->oy; }
++			if (o->kind == SWEET_FB_SNAPC_K_BAD) { c->marked++; continue; }
++			uint64_t need = (uint64_t)(o->h - 1u) * o->pitch + (uint64_t)o->w * o->bpp;
++			for (unsigned j = 0; j < nsrc; j++) {
++				if ((uint64_t)sl->addr >= src[j].dev && (uint64_t)sl->addr - src[j].dev < src[j].len &&
++				    (uint64_t)sl->addr - src[j].dev + need <= src[j].len) {
++					o->src = (int32_t)j; o->off = (uint64_t)sl->addr - src[j].dev; break;
++				}
++			}
++			if (o->src < 0 || o->pitch == 0u) { o->kind = SWEET_FB_SNAPC_K_BAD; c->marked++; }
++		}
++	}
++	if (c->marked) { c->flags |= SWEET_FB_SNAPC_F_MARKED; }
++	return c->marked;
++}
++
++static inline uint32_t
++sweet_fb_snapc_div255(uint32_t v)
++{
++	return (v + 127u) / 255u;
++}
++
++/* one 0xAARRGGBB source pixel s of a slot with CON con over the destination d (0x..RRGGBB) */
++static inline uint32_t
++sweet_fb_snapc_blend(uint32_t con, uint32_t s, uint32_t d, bool yuv)
++{
++	uint32_t pa = con & 0xffu, sa = yuv ? 255u : (s >> 24);
++	if (!(con & SWEET_FB_HW_CON_AEN)) { return s & 0xffffffu; }
++	uint32_t ea = sweet_fb_snapc_div255(sa * pa), out = 0;
++	bool man = !yuv && (con & SWEET_FB_HW_CON_MAN) != 0u;
++	for (unsigned sh = 0; sh < 24; sh += 8) {
++		uint32_t sc = (s >> sh) & 0xffu, dc = (d >> sh) & 0xffu, v;
++		if (man) { v = sweet_fb_snapc_div255(sc * pa) + sweet_fb_snapc_div255(dc * (255u - ea)); }
++		else { v = sweet_fb_snapc_div255(sc * ea + dc * (255u - ea)); }
++		out |= (v > 255u ? 255u : v) << sh;
++	}
++	return out;
++}
++
++/*
++ * Composes panel row y of pipe k into row[0..pw) (0x00RRGGBB; row starts black).  tmp: SWEET_FB_SNAPC_TMP_BYTES bytes.
++ * Returns the slots of this row whose read failed (painted magenta, counted into c->marked once per slot).
++ */
++static inline uint32_t
++sweet_fb_snapc_row(struct sweet_fb_snapc *c, unsigned k, uint32_t y, uint32_t *row, uint8_t *tmp, sweet_fb_snapc_read_fn rd, void *ctx)
++{
++	uint32_t failed = 0;
++	for (uint32_t x = 0; x < c->pw; x++) { row[x] = 0u; }
++	for (unsigned i = 0; i < SWEET_FB_HW_NSLOT; i++) {
++		struct sweet_fb_snapc_slot *o = &c->s[k][i];
++		if (o->kind == SWEET_FB_SNAPC_K_OFF || y < o->oy || y >= o->oy + o->h) { continue; }
++		uint32_t x0 = o->ox, n = o->w;
++		bool bad = o->kind == SWEET_FB_SNAPC_K_BAD;
++		uint32_t bytes = n * o->bpp;
++		if (!bad && (bytes > SWEET_FB_SNAPC_TMP_BYTES || rd(ctx, o->src, o->off + (uint64_t)(y - o->oy) * o->pitch, tmp, bytes) != 0)) {
++			bad = true; o->kind = SWEET_FB_SNAPC_K_BAD; c->marked++; c->flags |= SWEET_FB_SNAPC_F_MARKED; failed++;
++		}
++		if (bad) {
++			for (uint32_t x = 0; x < n && x0 + x < c->pw; x++) { row[x0 + x] = SWEET_FB_SNAPC_MAGENTA & 0xffffffu; }
++			continue;
++		}
++		if (o->kind == SWEET_FB_SNAPC_K_RGB32) {
++			for (uint32_t x = 0; x < n && x0 + x < c->pw; x++) {
++				uint32_t w = (uint32_t)tmp[4 * x] | (uint32_t)tmp[4 * x + 1] << 8 | (uint32_t)tmp[4 * x + 2] << 16 | (uint32_t)tmp[4 * x + 3] << 24;
++				row[x0 + x] = sweet_fb_snapc_blend(o->con, sweet_fb_hw_con_decode(o->con, w), row[x0 + x], false);
++			}
++		} else {      /* packed 4:2:2: pairs of pixels share Cb/Cr; the CLIP columns of the read span are not shown */
++			uint32_t left = o->clip & 0xffu, right = (o->clip >> 8) & 0xffu, mtx = (o->con >> 16) & 0xfu;
++			bool uyvy = SWEET_FB_HW_CON_CFMT(o->con) == 4u, swap = (o->con & SWEET_FB_YUV_CON_BYTE_SWAP) != 0u;
++			for (uint32_t x = left; x + right < n; x++) {
++				uint32_t px = x0 + x - left;
++				if (px >= c->pw) { break; }
++				const uint8_t *q = tmp + 4u * (x / 2u);
++				uint32_t yy = uyvy ? q[1 + 2 * (x & 1u)] : q[2 * (x & 1u)];
++				uint32_t cb = uyvy ? q[0] : q[1], cr = uyvy ? q[2] : q[3];
++				if (swap) { uint32_t t = cb; cb = cr; cr = t; }
++				uint32_t rgb = sweet_fb_yuv_ref_rgb(mtx, yy, cb, cr);
++				if (rgb == 0xff000000u) { rgb = SWEET_FB_SNAPC_MAGENTA & 0xffffffu; c->flags |= SWEET_FB_SNAPC_F_MARKED; }
++				row[px] = sweet_fb_snapc_blend(o->con, rgb, row[px], true);
++			}
++		}
++	}
++	return failed;
++}
++
++/* ---- 0296 picture packing (same bytes as the old AppleCLCD::snap) ---- */
++struct sweet_fb_snapc_pack { uint8_t *d, *lit; uint32_t prev, run, packed; };
++
++static inline void
++sweet_fb_snapc_pack_init(struct sweet_fb_snapc_pack *pk, uint8_t *buf, bool packed)
++{
++	pk->d = buf; pk->lit = NULL; pk->prev = 0; pk->run = 0; pk->packed = packed ? 1u : 0u;
++}
++
++static inline void
++sweet_fb_snapc_pack_flush(struct sweet_fb_snapc_pack *pk)
++{
++	if (pk->run >= 2u) { *pk->d++ = (uint8_t)(126u + pk->run); pk->lit = NULL; }
++	else if (pk->run == 1u) { if (pk->lit == NULL || *pk->lit == 127u) { pk->lit = pk->d++; *pk->lit = 0; } else { (*pk->lit)++; } }
++	if (pk->run != 0u) { *pk->d++ = (uint8_t)(pk->prev >> 16); *pk->d++ = (uint8_t)(pk->prev >> 8); *pk->d++ = (uint8_t)pk->prev; }
++	pk->run = 0;
++}
++
++static inline void
++sweet_fb_snapc_pack_put(struct sweet_fb_snapc_pack *pk, uint32_t p)
++{
++	p &= 0xffffffu;
++	if (!pk->packed) { *pk->d++ = (uint8_t)(p >> 16); *pk->d++ = (uint8_t)(p >> 8); *pk->d++ = (uint8_t)p; return; }
++	if (pk->run != 0u && p == pk->prev && pk->run < 129u) { pk->run++; return; }
++	sweet_fb_snapc_pack_flush(pk);
++	pk->prev = p; pk->run = 1;
++}
++
++/* worst-case output bytes for w x h pixels */
++static inline uint64_t
++sweet_fb_snapc_bound(uint32_t w, uint32_t h)
++{
++	return (uint64_t)w * h * 3u + (uint64_t)w * h / 64u + 64u;
++}
++
++/*
++ * The whole picture: crop (x0, y0, pw, ph) of the fw x fh panel, every scale-th pixel / row, into out (sweet_fb_snapc_bound bytes).
++ * line: fw words, tmp: SWEET_FB_SNAPC_TMP_BYTES.  info: [0] width, [1] height, [2] bytes, [3] scale | packed << 4 (the 0296 words).
++ */
++static inline void
++sweet_fb_snapc_picture(struct sweet_fb_snapc *c, const uint32_t want[6], uint32_t fw, uint32_t fh, uint8_t *out, uint32_t *line, uint8_t *tmp,
++    sweet_fb_snapc_read_fn rd, void *ctx, uint32_t info[4])
++{
++	uint32_t scale = want[0], packed = want[1] ? 1u : 0u;
++	uint32_t x0 = want[2], y0 = want[3], pw = want[4], ph = want[5];
++	if (scale < 1u || scale > 8u) { scale = 2u; }
++	if (pw == 0u || ph == 0u || x0 >= fw || y0 >= fh) { x0 = y0 = 0u; pw = fw; ph = fh; }
++	if (pw > fw - x0) { pw = fw - x0; }
++	if (ph > fh - y0) { ph = fh - y0; }
++	uint32_t w = pw / scale, h = ph / scale;
++	struct sweet_fb_snapc_pack pk;
++	sweet_fb_snapc_pack_init(&pk, out, packed != 0u);
++	for (uint32_t j = 0; j < h; j++) {
++		uint32_t y = y0 + j * scale;
++		uint32_t xa = x0, xb = x0 + (w ? (w - 1u) * scale : 0u);
++		for (unsigned k = 0; k < SWEET_FB_HW_PIPES; k++) {
++			uint32_t c0 = k * c->pw;
++			if (w == 0u || xb < c0 || xa >= c0 + c->pw) { continue; }      /* this pipe has no sampled column in the crop */
++			(void)sweet_fb_snapc_row(c, k, y, line + c0, tmp, rd, ctx);
++		}
++		for (uint32_t i = 0; i < w; i++) { sweet_fb_snapc_pack_put(&pk, line[x0 + i * scale]); }
++	}
++	if (packed) { sweet_fb_snapc_pack_flush(&pk); }
++	info[0] = w; info[1] = h; info[2] = (uint32_t)(pk.d - out); info[3] = scale | packed << 4;
++}
++
++#endif /* SWEET_FB_SNAPC_H */
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -2931,4 +2931,49 @@
+ 	*targetP = this;
+ 	return &sweet_surface_traps[index];
+ }
++
++/*
++ * 0640: debug snapshot (SweetFramebuffer.cpp snapHw, autotest thread only, never the display path).  Copies n bytes at byte offset
++ * off of the surface's memory into dst, through a kernel mapping the driver ALREADY has (buffer, pool, heap region, purge sink, an
++ * existing kernelMap) -- never a new mapping (a new write-combined alias of cacheable user pages would be a mismatched alias) --
++ * else through IOMemoryDescriptor::readBytes under a non-blocking wire hold.  A cacheable buffer range is cleaned+invalidated to
++ * PoC first, so the bytes are the ones in DRAM, i.e. what the overlay reads.  0 = done; 1 no memory, 2 out of range, 3 not wired now,
++ * 4 read failed.  The caller holds a retain on the surface.
++ */
++extern "C" int sweet_surface_snap_read(void *surface, uint64_t off, void *dst, uint32_t n);
++extern "C" int
++sweet_surface_snap_read(void *surface, uint64_t off, void *dst, uint32_t n)
++{
++	SweetSurface *s = (SweetSurface *)surface;
++	if (s == NULL || s->memory == NULL || dst == NULL) { return 1; }
++	uint64_t len = s->memory->getLength();
++	if (off > len || n > len - off) { return 2; }
++	if (n == 0) { return 0; }
++	if (!sweet_surface_wod_hold_try(s)) { return 3; }
++	int r = 0;
++	IOBufferMemoryDescriptor *buffer = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
++	uintptr_t va = 0;
++	bool cacheable = false;
++	if (buffer != NULL) {
++		va = (uintptr_t)buffer->getBytesNoCopy(); cacheable = true;
++	} else if (s->purged) {
++		va = sweet_purge_sink_kva(); cacheable = true;
++	} else if (sweet_pool_surface_pa(s) != 0) {
++		va = (uintptr_t)(sweet_pool_kva + (sweet_pool_surface_pa(s) - SWEET_FB_HW_POOL_BASE)); cacheable = sweet_pool_copyback != 0;
++	} else if (sweet_heap_surface_pa(s) != 0) {
++		va = (uintptr_t)sweet_heap_va(sweet_heap_surface_pa(s), len);
++	} else {
++		IOLockLock(sweet_surface_lock);
++		if (s->kernelMap != NULL) { va = (uintptr_t)s->kernelMap->getVirtualAddress(); }
++		IOLockUnlock(sweet_surface_lock);
++	}
++	if (va != 0) {
++		if (cacheable) { FlushPoC_DcacheRegion((vm_offset_t)(va + off), (unsigned)n); }
++		memcpy(dst, (const void *)(va + off), n);
++	} else if (s->memory->readBytes((IOByteCount)off, dst, (IOByteCount)n) != n) {
++		r = 4;
++	}
++	sweet_surface_wod_unhold(s);
++	return r;
++}
+ #endif /* SWEET */
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -651,6 +651,34 @@
+ }
+ #endif
+ 
++/*
++ * 0640: delivery counters for the USB autotest status (nord2_autotest.inc words 24..29): every dispatched HID report is counted
++ * here, so injected gestures / keys can be confirmed without the log.  [0] injected touch reports (fingers >= 8), [1] injected
++ * down transitions | key reports << 16, [2] all touch reports, [5] injected reports dispatched while the touch service had no
++ * client (not delivered to anyone).  Relaxed atomics, no lock.
++ */
++#define SWEET_HID_INJECTED_FINGER 8
++static uint32_t sweet_hid_cnt[6], sweet_hid_touch_clients, sweet_hid_btn_clients;
++static void
++sweet_hid_note_touch(int finger, bool went_down, int x, int y, unsigned clients)
++{
++	__atomic_fetch_add(&sweet_hid_cnt[2], 1u, __ATOMIC_RELAXED);
++	__atomic_store_n(&sweet_hid_touch_clients, clients, __ATOMIC_RELAXED);
++	if (finger < SWEET_HID_INJECTED_FINGER) { return; }
++	__atomic_fetch_add(&sweet_hid_cnt[0], 1u, __ATOMIC_RELAXED);
++	if (went_down) { __atomic_fetch_add(&sweet_hid_cnt[1], 1u, __ATOMIC_RELAXED); }
++	if (clients == 0) { __atomic_fetch_add(&sweet_hid_cnt[5], 1u, __ATOMIC_RELAXED); }
++	__atomic_store_n(&sweet_hid_cnt[4], ((uint32_t)x & 0xffffu) | ((uint32_t)y << 16), __ATOMIC_RELAXED);
++}
++
++extern "C" void sweet_hid_counts(uint32_t c[6]);
++extern "C" void
++sweet_hid_counts(uint32_t c[6])
++{
++	for (unsigned i = 0; i < 6; i++) { c[i] = __atomic_load_n(&sweet_hid_cnt[i], __ATOMIC_RELAXED); }
++	c[3] = (__atomic_load_n(&sweet_hid_touch_clients, __ATOMIC_RELAXED) & 0xffffu) | (__atomic_load_n(&sweet_hid_btn_clients, __ATOMIC_RELAXED) << 16);
++}
++
+ void
+ SweetHIDButtons::key(UInt32 usage, bool down)
+ {
+@@ -661,6 +689,8 @@
+ 		    _clients ? _clients->getCount() : 0);
+ 		dispatchEvent(event);
+ 		event->release();
++		__atomic_fetch_add(&sweet_hid_cnt[1], 1u << 16, __ATOMIC_RELAXED);      /* 0640: key events dispatched */
++		__atomic_store_n(&sweet_hid_btn_clients, _clients ? _clients->getCount() : 0u, __ATOMIC_RELAXED);
+ 	}
+ }
+ 
+@@ -822,12 +852,16 @@
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerButtonMask, any ? 1 : 0);
+ 	IOLockUnlock(fLock);
+ 
+-	if (was != down) {
++	unsigned clients = _clients ? _clients->getCount() : 0;
++	if (was != down && finger >= SWEET_HID_INJECTED_FINGER) {      /* 0640: the USB autotest's fingers 8/9 (nord2_autotest.inc) */
++		IOLog("SWEET HID: injected touch %d %s at %d,%d%s (%u clients)\n", finger, down ? "down" : "up", x, y, fEdge[finger] ? " edge" : "", clients);
++	} else if (was != down) {
+ 		IOLog("SWEET HID: touch %d %s at %d,%d%s\n", finger, down ? "down" : "up", x, y,
+ 		    fEdge[finger] ? " edge" : "");
+ 	}
+ 	dispatchEvent(collection);
+ 	collection->release();
++	sweet_hid_note_touch(finger, down && !was, x, y, clients);      /* 0640 */
+ }
+ 
+ /*
+--- a/bsd/dev/nord2_autotest.inc
++++ b/bsd/dev/nord2_autotest.inc
+@@ -30,10 +30,18 @@
+  *   8 vcodec   (0312, nord2_vcodec.inc n2vc_at_command) arg bits 0-7 = step: 0 status (read only), 1 VENC power + clocks + larb,
+  *              2 larb read-back + interrupt status, 3 VENC registers (r0 offset, r1 = 1 write r2 + read back + restore),
+  *              4 off; arg bit 8 = VENC core 1 too. Result 1 = done, 16.. = what stopped it (host tool gpu/hwcodec/tools/hwv.py).
++ * 0640 (snap-20261114): the picture is the overlay plan on the panel composed in software (SweetFramebuffer.cpp snapHw); refusals
++ *   20 = kern.n2snap 0, 21 = no overlay frame shown yet, 22 = no memory (4 = other).  Status: asked with wLength >= 128 it has 32
++ *   words; 20..31 = 0640 state (fb flags: bit 0 iOS display off, 1 DCS display off sent = panel dark, 2 overlay plan on, 3 band
++ *   rotation live, 4 framebuffer present, 8..15 last snapshot flags, 16..31 last snapshot ms; DBV sent | target << 16; brightness
++ *   request nits 16.16; presents; HID: injected touch reports, injected downs | key reports << 16, all touch reports, touch clients |
++ *   button clients << 16, last injected x | y << 16, injected reports with no client; 30 = 0; 31 = 0x534e0001).  wLength 80: as before.
+  * Packed pictures: a byte c, then c < 128: c + 1 pixels as they are; c >= 128: one pixel shown c - 126 times.
+  * The USB side only stores words and copies bytes; everything else runs on the thread.
+  */
+ extern void *sweet_fb_snap(const uint32_t want[6], uint32_t info[8]);
++extern void sweet_fb_status_words(uint32_t w[4]);      /* 0640 SweetFramebuffer.cpp: panel state, brightness, presents */
++extern void sweet_hid_counts(uint32_t c[6]);           /* 0640 hid/SweetHID.cpp: dispatched HID reports */
+ extern void nord2_log_stream_info(uint32_t info[2]);
+ extern int nal_usb(const uint8_t setup[8], uint8_t *, size_t, uint32_t *length);
+ int nat_usb(const uint8_t setup[8], uint8_t *out, size_t capacity, uint32_t *length);
+@@ -170,7 +178,7 @@
+ 	nat_put(&nat.snap_ready, 0);
+ 	const uint32_t want[6] = {arg & 15, (arg >> 4) & 1, nat.job[11], nat.job[12], nat.job[13], nat.job[14]};
+ 	const uint8_t *p = (const uint8_t *)sweet_fb_snap(want, info);
+-	if (p == NULL) { return 4; }
++	if (p == NULL) { nat_put(&nat.snap_info[7], info[7]); return info[3] >= 20 && info[3] <= 22 ? info[3] : 4; }      /* 0640 reasons */
+ 	for (unsigned i = 0; i < 8; i++) { nat_put(&nat.snap_info[i], info[i]); }
+ 	nat.snap = p;
+ 	nat_put(&nat.snap_seq, nat_get(&nat.snap_seq) + 1);
+@@ -302,7 +310,7 @@
+ 	unsigned value = setup[2] | (unsigned)setup[3] << 8, index = setup[4] | (unsigned)setup[5] << 8;
+ 	unsigned wanted = setup[6] | (unsigned)setup[7] << 8;
+ 	*length = 0;
+-	if (setup[0] != 0xc0 || !wanted || capacity < 80 || !nat_get(&nat.started)) { return 0; }
++	if (setup[0] != 0xc0 || !wanted || capacity < 128 || !nat_get(&nat.started)) { return 0; }
+ 	uint32_t n = 0;
+ 	if (code == NAT_USB_STATUS) {
+ 		if (value || index) { return 0; }
+@@ -315,6 +323,14 @@
+ 			            nat.boot, nat.rewinds, nat.log_known, 0};
+ 		for (unsigned i = 0; i < 20; i++) { nat_le32(out + i * 4, v[i]); }
+ 		n = 80;
++		if (wanted >= 128) {      /* 0640: panel / brightness / HID delivery words (cheap, lock-free reads) */
++			uint32_t fw[4], hc[6];
++			sweet_fb_status_words(fw);
++			sweet_hid_counts(hc);
++			const uint32_t x[12] = {fw[0], fw[1], fw[2], fw[3], hc[0], hc[1], hc[2], hc[3], hc[4], hc[5], 0, 0x534e0001u};
++			for (unsigned i = 0; i < 12; i++) { nat_le32(out + 80 + i * 4, x[i]); }
++			n = 128;
++		}
+ 	} else if (code == NAT_USB_REG) {
+ 		if (index >= NAT_REGS) { return 0; }
+ 		nat_put(&nat.reg[index], value);

@@ -1,0 +1,290 @@
+--- a/audio_plugin.c
++++ b/audio_plugin.c
+@@ -17,7 +17,8 @@
+  * Control Center that go with it. So this presents four devices under those names:
+  *
+  *   "Speaker"   a stereo output whose samples are written to /dev/redwood-audio, where the
+- *               kernel takes them to whatever can play them (see sys/redwood_audio.h), and a
++ *               kernel takes them to whatever can play them (see sys/redwood_audio.h), a second,
++ *               one-channel output: the receiver, the earpiece (see "The receiver" below), and a
+  *               stereo input that is always silent (on an iPhone: what the amplifiers measure)
+  *   "Hawking"   one silent input and nothing else. The virtual audio device will not build the
+  *               speaker route without a second virtual device of its own (its type 'vhaw', a
+@@ -173,6 +174,10 @@
+ 	kAudioStreamPropertyPhysicalFormat = 'pft ', kAudioStreamPropertyAvailablePhysicalFormats = 'pfta',
+ 
+ 	kAudioStreamTerminalTypeSpeaker = 'spkr', kAudioStreamTerminalTypeMicrophone = 'micr',
++	kAudioStreamTerminalTypeReceiverSpeaker = 'rspk',
++	/* asked by the virtual audio device of a built-in device's last output stream: nonzero = it is the receiver's
++	 * (VirtualAudio 0x295bbc, the predicate before "creating a receiver port", iOS 16.7.16 20H392) */
++	kNord2StreamPropertyReceiver = 'taps',
+ 
+ 	kAudioServerPlugInIOOperationReadInput = 'read', kAudioServerPlugInIOOperationWriteMix = 'rite',
+ 
+@@ -197,7 +202,9 @@
+ 	OBJECT_CODEC, OBJECT_CODEC_INPUT,
+ 	OBJECT_SPEAKER_VOLUME,          /* the speaker output's volume control */
+ 	OBJECT_CODEC_SOURCE,            /* the codec input's data source control: its microphones */
+-	OBJECT_LAST = OBJECT_CODEC_SOURCE
++	OBJECT_SPEAKER_RECEIVER,        /* the speaker device's second output: the receiver (earpiece) */
++	OBJECT_RECEIVER_VOLUME,         /* its volume control: iOS's call volume on the receiver */
++	OBJECT_LAST = OBJECT_RECEIVER_VOLUME
+ };
+ 
+ #define VOLUME_RANGE_DB         48.0    /* from the loudest the kernel allows down to the quietest step above 0 */
+@@ -206,6 +213,7 @@
+ 	AudioObjectID object;
+ 	CFStringRef uid;                /* the name the virtual audio device knows it by */
+ 	AudioObjectID output, input;    /* its streams; 0 = none */
++	AudioObjectID receiver;         /* a second output stream (the speaker device's receiver); 0 = none */
+ 	UInt32 output_channels, input_channels;
+ 	/* its clock, running while anybody does I/O */
+ 	unsigned running;               /* how many clients have started I/O */
+@@ -215,7 +223,7 @@
+ 
+ static struct device devices[] = {
+ 	{ .object = OBJECT_SPEAKER, .uid = CFSTR("Speaker"), .output = OBJECT_SPEAKER_OUTPUT, .input = OBJECT_SPEAKER_INPUT,
+-	  .output_channels = REDWOOD_AUDIO_CHANNELS, .input_channels = 2 },
++	  .receiver = OBJECT_SPEAKER_RECEIVER, .output_channels = REDWOOD_AUDIO_CHANNELS, .input_channels = 2 },
+ 	{ .object = OBJECT_HAWKING, .uid = CFSTR("Hawking"), .input = OBJECT_HAWKING_INPUT, .input_channels = 1 },
+ 	{ .object = OBJECT_ACTUATOR, .uid = CFSTR("Actuator"), .output = OBJECT_ACTUATOR_OUTPUT, .output_channels = 1 },
+ 	{ .object = OBJECT_CODEC, .uid = CFSTR("Codec"), .input = OBJECT_CODEC_INPUT, .input_channels = 1 },
+@@ -242,6 +250,8 @@
+ static UInt64 written, refused;         /* frames since the speaker's I/O started */
+ static Boolean inactive[OBJECT_LAST + 1];       /* streams the HAL has switched off */
+ static Float32 volume = 1.0f;           /* the speaker's volume control, 0 to 1 (iOS sets it once it routes there) */
++static Float32 receiver_volume = 0.5f;  /* the receiver's volume control (iOS's call volume on the earpiece) */
++static int call_route = -1;             /* last route told to the kernel: 0 receiver, 1 speaker, -1 none yet */
+ 
+ static void
+ say(const char *format, ...)
+@@ -289,12 +299,54 @@
+ 	    v.below / 8.0);
+ }
+ 
++/*
++ * The receiver. On the iPhone X the virtual audio device makes a receiver port (beside the speaker port)
++ * of a built-in device whose last output stream answers kNord2StreamPropertyReceiver, and switches a call
++ * between the two by which of the device's output streams it keeps active (kAudioStreamPropertyIsActive).
++ * The call's audio itself is the kernel's (modem -> AFE -> amplifiers); what the plug-in passes on is
++ * where iOS puts the call and the call volume iOS sets on each port's volume control. With the lock held.
++ */
++static void
++route_to_kernel(void)
++{
++	int route;
++	uint32_t r;
++
++	if (inactive[OBJECT_SPEAKER_RECEIVER] == inactive[OBJECT_SPEAKER_OUTPUT]) {
++		return;                 /* both or neither: not a choice between them */
++	}
++	route = inactive[OBJECT_SPEAKER_RECEIVER] ? 1 : 0;
++	if (route == call_route) {
++		return;
++	}
++	r = (uint32_t)route;
++	if (sink < 0 || ioctl(sink, REDWOOD_AUDIO_SET_CALL_ROUTE, &r) < 0) {
++		say("redwood: audio: the call route (%s) could not be given to the kernel (%s)\n", route ? "speaker" : "receiver",
++		    strerror(errno));
++		return;
++	}
++	call_route = route;
++	say("redwood: audio: calls are heard on the %s\n", route ? "speaker" : "receiver");
++}
++
++static void
++call_volume_to_kernel(uint32_t port, Float32 scalar)
++{
++	struct redwood_audio_call_volume v = { port, (uint32_t)lround(-scalar_to_db(scalar) * 8), scalar <= 0 };
++
++	if (sink < 0 || ioctl(sink, REDWOOD_AUDIO_SET_CALL_VOLUME, &v) < 0) {
++		say("redwood: audio: the %s's call volume %.3f could not be given to the kernel (%s)\n", port ? "speaker" : "receiver",
++		    scalar, strerror(errno));
++	}
++}
++
+ /* The device with this object number, or the one this stream belongs to; NULL = neither. */
+ static struct device *
+ device_of(AudioObjectID object)
+ {
+ 	for (unsigned i = 0; i < DEVICES; i++) {
+-		if (object == devices[i].object || (object != 0 && (object == devices[i].output || object == devices[i].input))) {
++		if (object == devices[i].object || (object != 0 && (object == devices[i].output || object == devices[i].input ||
++		    object == devices[i].receiver))) {
+ 			return &devices[i];
+ 		}
+ 	}
+@@ -306,7 +358,7 @@
+ format_of(AudioObjectID stream)
+ {
+ 	const struct device *d = device_of(stream);
+-	UInt32 channels = stream == d->output ? d->output_channels : d->input_channels;
++	UInt32 channels = stream == d->receiver ? 1 : stream == d->output ? d->output_channels : d->input_channels;
+ 
+ 	return (AudioStreamBasicDescription) {
+ 		       .mSampleRate = REDWOOD_AUDIO_RATE, .mFormatID = kAudioFormatLinearPCM,
+@@ -410,7 +462,8 @@
+ #define LIST(x)         (v.u.words[v.size / sizeof(UInt32)] = (x), v.size += sizeof(UInt32))
+ #define STRING(x)       (v.u.string = (x), v.string = true, v.size = sizeof(CFStringRef))
+ #define FLOAT(x)        (v.u.decimal = (x), v.size = sizeof(Float32))
+-	if (object == OBJECT_SPEAKER_VOLUME) {
++	if (object == OBJECT_SPEAKER_VOLUME || object == OBJECT_RECEIVER_VOLUME) {
++		Float32 level = object == OBJECT_SPEAKER_VOLUME ? volume : receiver_volume;
+ 		switch (selector) {
+ 		case kAudioObjectPropertyBaseClass:
+ 			WORD(kAudioLevelControlClassID);
+@@ -428,13 +481,13 @@
+ 			WORD(kAudioObjectPropertyScopeOutput);
+ 			break;
+ 		case kAudioControlPropertyElement:
+-			WORD(0);
++			WORD(object == OBJECT_SPEAKER_VOLUME ? 0 : 3);  /* the receiver's channel follows the speaker's two */
+ 			break;
+ 		case kAudioLevelControlPropertyScalarValue:
+-			FLOAT(volume);
++			FLOAT(level);
+ 			break;
+ 		case kAudioLevelControlPropertyDecibelValue:
+-			FLOAT(scalar_to_db(volume));
++			FLOAT(scalar_to_db(level));
+ 			break;
+ 		case kAudioLevelControlPropertyDecibelRange:
+ 			v.u.range.mMinimum = -VOLUME_RANGE_DB;
+@@ -564,11 +617,15 @@
+ 			if (scope != kAudioObjectPropertyScopeInput && d->output != 0) {
+ 				LIST(d->output);
+ 			}
++			if (scope != kAudioObjectPropertyScopeInput && d->receiver != 0) {
++				LIST(d->receiver);      /* last of the outputs: see route_to_kernel() */
++			}
+ 			if (scope != kAudioObjectPropertyScopeOutput && d->input != 0) {
+ 				LIST(d->input);
+ 			}
+ 			if (selector == kAudioObjectPropertyOwnedObjects && d->object == OBJECT_SPEAKER) {
+ 				LIST(OBJECT_SPEAKER_VOLUME);
++				LIST(OBJECT_RECEIVER_VOLUME);
+ 			}
+ 			if (selector == kAudioObjectPropertyOwnedObjects && d->object == OBJECT_CODEC && scope != kAudioObjectPropertyScopeOutput) {
+ 				LIST(OBJECT_CODEC_SOURCE);
+@@ -578,6 +635,7 @@
+ 		case kAudioObjectPropertyControlList:
+ 			if (d->object == OBJECT_SPEAKER) {
+ 				LIST(OBJECT_SPEAKER_VOLUME);
++				LIST(OBJECT_RECEIVER_VOLUME);
+ 			}
+ 			if (d->object == OBJECT_CODEC) {
+ 				LIST(OBJECT_CODEC_SOURCE);
+@@ -610,10 +668,16 @@
+ 			WORD(object == d->input);
+ 			break;
+ 		case kAudioStreamPropertyTerminalType:
+-			WORD(object == d->input ? kAudioStreamTerminalTypeMicrophone : kAudioStreamTerminalTypeSpeaker);
++			WORD(object == d->input ? kAudioStreamTerminalTypeMicrophone : object == d->receiver ?
++			    kAudioStreamTerminalTypeReceiverSpeaker : kAudioStreamTerminalTypeSpeaker);
+ 			break;
+ 		case kAudioStreamPropertyStartingChannel:
+-			WORD(1);
++			WORD(object == d->receiver ? d->output_channels + 1 : 1);
++			break;
++		case kNord2StreamPropertyReceiver:
++			if (object == d->receiver) {
++				WORD(1);
++			}
+ 			break;
+ 		case kAudioStreamPropertyLatency:
+ 			WORD(0);
+@@ -695,7 +759,7 @@
+ 		return kAudioHardwareUnknownPropertyError;
+ 	}
+ 	/* the rate and the formats can be "set", to the ones there are; the volume can be set */
+-	if (object == OBJECT_SPEAKER_VOLUME) {
++	if (object == OBJECT_SPEAKER_VOLUME || object == OBJECT_RECEIVER_VOLUME) {
+ 		*settable = address->mSelector == kAudioLevelControlPropertyScalarValue ||
+ 		    address->mSelector == kAudioLevelControlPropertyDecibelValue;
+ 	} else if (object == OBJECT_CODEC_SOURCE) {
+@@ -732,7 +796,8 @@
+ 	if (address == NULL || size == NULL || data == NULL || !has_property(driver, object, client, address)) {
+ 		return object < OBJECT_PLUGIN || object > OBJECT_LAST ? kAudioHardwareBadObjectError : kAudioHardwareUnknownPropertyError;
+ 	}
+-	if (object == OBJECT_SPEAKER_VOLUME && (address->mSelector == kAudioLevelControlPropertyConvertScalarToDecibels ||
++	if ((object == OBJECT_SPEAKER_VOLUME || object == OBJECT_RECEIVER_VOLUME) &&
++	    (address->mSelector == kAudioLevelControlPropertyConvertScalarToDecibels ||
+ 	    address->mSelector == kAudioLevelControlPropertyConvertDecibelsToScalar)) {
+ 		/* what is in the buffer, converted where it is */
+ 		if (room < sizeof(Float32)) {
+@@ -775,7 +840,7 @@
+ 	if (!settable) {
+ 		return kAudioHardwareIllegalOperationError;
+ 	}
+-	if (object == OBJECT_SPEAKER_VOLUME) {
++	if (object == OBJECT_SPEAKER_VOLUME || object == OBJECT_RECEIVER_VOLUME) {
+ 		AudioObjectPropertyAddress changed[2] = {
+ 			{ kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal, 0 },
+ 			{ kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, 0 },
+@@ -789,11 +854,18 @@
+ 		wanted = address->mSelector == kAudioLevelControlPropertyDecibelValue ? db_to_scalar(wanted) :
+ 		    wanted < 0 ? 0 : wanted > 1 ? 1 : wanted;
+ 		pthread_mutex_lock(&lock);
+-		volume = wanted;
+-		volume_to_kernel();
++		if (object == OBJECT_SPEAKER_VOLUME) {
++			volume = wanted;
++			volume_to_kernel();
++			call_volume_to_kernel(1, wanted);       /* the kernel takes it only while a call plays */
++		} else {
++			receiver_volume = wanted;
++			call_volume_to_kernel(0, wanted);
++			say("redwood: audio: the receiver's volume is %.3f (%.1f dB under its top)\n", wanted, -scalar_to_db(wanted));
++		}
+ 		pthread_mutex_unlock(&lock);
+ 		if (host != NULL) {
+-			host->PropertiesChanged(host, OBJECT_SPEAKER_VOLUME, 2, changed);
++			host->PropertiesChanged(host, object, 2, changed);
+ 		}
+ 		return 0;
+ 	}
+@@ -808,6 +880,11 @@
+ 		}
+ 		pthread_mutex_lock(&lock);
+ 		inactive[object] = *(const UInt32 *)data == 0;
++		if (object == OBJECT_SPEAKER_OUTPUT || object == OBJECT_SPEAKER_RECEIVER) {
++			say("redwood: audio: the %s output is %s\n", object == OBJECT_SPEAKER_RECEIVER ? "receiver" : "speaker",
++			    inactive[object] ? "inactive" : "active");
++			route_to_kernel();
++		}
+ 		pthread_mutex_unlock(&lock);
+ 		return 0;
+ 	}
+@@ -1015,6 +1092,8 @@
+ 		memset(buffer, 0, (size_t)frames * 2 * d->input_channels);
+ 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_ACTUATOR_OUTPUT) {
+ 		actuator_write(buffer, frames);
++	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->receiver) {
++		/* what iOS plays on the receiver itself (the call is the kernel's): not heard */
+ 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->output) {
+ 		/* the kernel takes it all or leaves it: this thread must not wait */
+ 		if (sink < 0 || write(sink, buffer, (size_t)frames * REDWOOD_AUDIO_FRAME) < 0) {
+--- a/redwood_audio.h
++++ b/redwood_audio.h
+@@ -37,6 +37,21 @@
+ };
+ #define REDWOOD_AUDIO_SET_VOLUME _IOW('r', 1, struct redwood_audio_volume)
+ 
++/*
++ * Nord2 call audio (kernel patch 0280; a call's audio never passes through the plug-in):
++ * ioctl(REDWOOD_AUDIO_SET_CALL_ROUTE): where the call is heard, as iOS routes it (the Phone app's speaker
++ * button): 0 the receiver (earpiece), 1 the speaker.
++ * ioctl(REDWOOD_AUDIO_SET_CALL_VOLUME): iOS's call volume, the volume control of the port the call is on
++ * (port 0 receiver, port 1 speaker), in eighths of a dB under its top as for REDWOOD_AUDIO_SET_VOLUME.
++ */
++#define REDWOOD_AUDIO_SET_CALL_ROUTE _IOW('r', 2, uint32_t)
++struct redwood_audio_call_volume {
++	uint32_t port;                  /* 0 receiver, 1 speaker */
++	uint32_t below;                 /* eighths of a dB */
++	uint32_t muted;
++};
++#define REDWOOD_AUDIO_SET_CALL_VOLUME _IOW('r', 3, struct redwood_audio_call_volume)
++
+ #ifdef KERNEL
+ #include <stdbool.h>
+ 

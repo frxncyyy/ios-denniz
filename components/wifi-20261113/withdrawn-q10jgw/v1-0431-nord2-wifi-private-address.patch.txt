@@ -1,0 +1,298 @@
+--- a/bsd/dev/wifi_normal_rx.c	2026-10-23 16:27:33.000000000 +0200
++++ b/bsd/dev/wifi_normal_rx.c	2026-11-13 14:23:53.379536656 +0100
+@@ -32,14 +32,14 @@
+ int ncr_prepare(struct ncr_state*s,struct nwi_state*i,struct nct_session*t,unsigned command,uint8_t sequence,uint64_t timeout){return prepare(s,i,t,command,sequence,timeout,5);}
+ int ncr_continue_prepare(struct ncr_state*s,struct nwi_state*i,struct nct_session*t,const struct ncr_state*p,uint8_t sequence,uint64_t timeout){
+  if(!p||p==s||!source(p)||!p->entered||p->active||p->halt||p->error||p->scan.active||!t||t->continuation!=1||t->previous!=p->session||p->init!=i)return -1;
+- if(prepare(s,i,t,0,sequence,timeout,t->base_completed))return -1;
++ if(prepare(s,i,t,t->count?t->count-1:0,sequence,timeout,t->base_completed))return -1;
+  for(unsigned k=0;k<NCR_QUEUES;k++){s->queue[k].next=p->queue[k].next;s->queue[k].didx=p->queue[k].didx;s->queue[k].segmented=p->queue[k].segmented;}
+  return source(s)?0:-1;
+ }
+ int ncr_scan_return_prepare(struct ncr_state*s,struct nwi_state*i,struct nct_session*t,const struct ncr_queue*q,uint8_t sequence,uint64_t timeout){
+  if(!q||!i||!t||t->continuation!=2||!t->scan_return||!t->scan_return->sealed||t->init!=i)return -1;
+  for(unsigned k=0;k<NCR_QUEUES;k++)if(!same_ring(&q[k].ring,&i->rings[k+4])||q[k].next>=q[k].ring.count||q[k].segmented>1)return -1;
+- if(q[1].next!=i->transport.rx_index||prepare(s,i,t,0,sequence,timeout,t->base_completed))return -1;
++ if(q[1].next!=i->transport.rx_index||prepare(s,i,t,t->count?t->count-1:0,sequence,timeout,t->base_completed))return -1;
+  for(unsigned k=0;k<NCR_QUEUES;k++){s->queue[k]=q[k];/* Refresh DIDX/raw only through next checked pump. */s->queue[k].didx=0;for(unsigned j=0;j<4;j++)s->queue[k].raw[j]=0;}
+  return source(s)?0:-1;
+ }
+--- a/bsd/dev/wifi_normal_transport.c	2026-10-23 16:27:33.000000000 +0200
++++ b/bsd/dev/wifi_normal_transport.c	2026-11-13 14:23:53.379442983 +0100
+@@ -23,6 +23,14 @@
+     b->budget.pse_remaining!=b->plan.pse_cmd-1)return -1;
+  return 0;
+ }
++/* 0431: a continuation is one scan (CID 0x03, 1252 bytes), optionally preceded
++ * by at most two 76-byte BSS activate-control commands (CID 0x11) that give
++ * the firmware a new station address, exactly as the boot recipe sends them. */
++static int scan_shape(const struct nct_entry*e,unsigned count){
++ if(!e||!count||count>3)return 0;
++ for(unsigned k=0;k+1<count;k++)if(e[k].cid!=0x11||e[k].bytes!=76||e[k].set_query!=1)return 0;
++ return e[count-1].cid==3&&e[count-1].bytes==1252&&e[count-1].set_query==1;
++}
+ static int build(struct nct_session*s,unsigned k){size_t used=0;
+  if(k>=s->count||s->build(s->build_context,k,s->wire,sizeof(s->wire),&used))return -1;
+  const struct nct_entry*e=&s->entry[k];
+@@ -71,11 +79,11 @@
+  if(!s->continuation)return !s->previous&&!s->scan_return&&s->base_completed==5;
+  if(s->continuation==2){const struct nct_scan_return*p=s->scan_return;
+   return !s->previous&&p&&p->sealed==1&&p->generation&&p->basic==s->basic&&p->cap==s->cap&&p->init==s->init&&p->firmware==s->firmware&&
+-   s->count==1&&s->entry[0].cid==3&&s->entry[0].bytes==1252&&s->entry[0].set_query==1&&
++   scan_shape(s->entry,s->count)&&
+    s->base_completed==p->completed&&s->first_tx==p->tx_index&&s->first_sequence==p->next_sequence&&s->pse_total==p->pse_total&&s->capacity==p->capacity;
+  }
+  const struct nct_session*p=s->previous;
+- return s->continuation==1&&p!=s&&terminal(p)&&s->scan_return==p->scan_return&&s->count==1&&s->entry[0].cid==3&&s->entry[0].bytes==1252&&s->entry[0].set_query==1&&
++ return s->continuation==1&&p!=s&&terminal(p)&&s->scan_return==p->scan_return&&scan_shape(s->entry,s->count)&&
+  p->basic==s->basic&&p->cap==s->cap&&p->init==s->init&&p->firmware==s->firmware&&
+  s->base_completed==p->base_completed+p->count&&s->first_tx==(p->first_tx+p->count)%1024&&s->first_sequence==(uint8_t)(p->first_sequence+p->count)&&s->pse_total==p->pse_total;
+ }
+@@ -85,7 +93,7 @@
+  s->cap=b->cap;s->init=b->init;s->firmware=b->firmware;
+  struct nwt_state*t=&s->init->transport;
+  if(p->base_completed+p->count==UINT32_MAX||t->completed!=p->base_completed+p->count||t->tx_index!=(p->first_tx+p->count)%1024||t->next_sequence!=(uint8_t)(p->first_sequence+p->count)||t->submit_attempted||t->tx_done||t->rx_done||t->rx_index>=16)return refuse(s,111);
+- if(!r||!r->entry||!r->build||r->count!=1||r->entry[0].cid!=3||r->entry[0].bytes!=1252||r->entry[0].set_query!=1||!r->batch_us||r->batch_us>NCT_BATCH_MAX_US||!r->service_us||r->service_us>NCT_SERVICE_MAX_US||r->service_us>=r->batch_us||p->pse_total!=b->plan.pse_cmd||p->capacity!=p->pse_total-1)return refuse(s,112);
++ if(!r||!r->entry||!r->build||!scan_shape(r->entry,r->count)||!r->batch_us||r->batch_us>NCT_BATCH_MAX_US||!r->service_us||r->service_us>NCT_SERVICE_MAX_US||r->service_us>=r->batch_us||p->pse_total!=b->plan.pse_cmd||p->capacity!=p->pse_total-1)return refuse(s,112);
+  s->continuation=1;s->previous=p;s->scan_return=p->scan_return;return seal(s,r,p->pse_total);
+ }
+ int nct_scan_return_prepare(const struct nbc_state*b,const struct nct_scan_return*p,const struct nct_recipe*r,struct nct_session*s){
+@@ -93,7 +101,7 @@
+  if(basic_receipt(b)||!p||p->sealed!=1||!p->generation||p->basic!=b||p->cap!=b->cap||p->init!=b->init||p->firmware!=b->firmware||p->completed<5||p->completed==UINT32_MAX||p->tx_index>=1024||p->pse_total!=b->plan.pse_cmd||p->capacity!=p->pse_total-1)return refuse(s,113);
+  s->cap=b->cap;s->init=b->init;s->firmware=b->firmware;const struct nwt_state*t=&s->init->transport;
+  if(t->completed!=p->completed||t->tx_index!=p->tx_index||t->next_sequence!=p->next_sequence||t->submit_attempted||t->tx_done||t->rx_done||t->rx_index>=16)return refuse(s,114);
+- if(!r||!r->entry||!r->build||r->count!=1||r->entry[0].cid!=3||r->entry[0].bytes!=1252||r->entry[0].set_query!=1||!r->batch_us||r->batch_us>NCT_BATCH_MAX_US||!r->service_us||r->service_us>NCT_SERVICE_MAX_US||r->service_us>=r->batch_us)return refuse(s,115);
++ if(!r||!r->entry||!r->build||!scan_shape(r->entry,r->count)||!r->batch_us||r->batch_us>NCT_BATCH_MAX_US||!r->service_us||r->service_us>NCT_SERVICE_MAX_US||r->service_us>=r->batch_us)return refuse(s,115);
+  s->continuation=2;s->scan_return=p;return seal(s,r,p->pse_total);
+ }
+ int nct_lease_window(const struct nct_session*s,const struct nbc_state*b,const struct ncd_state*c,const struct nwi_state*i,const struct nfp_native*f){
+--- a/bsd/dev/wifi_scan_service_bind.inc	2026-10-23 16:27:33.000000000 +0200
++++ b/bsd/dev/wifi_scan_service_bind.inc	2026-11-13 14:26:19.688770804 +0100
+@@ -9,7 +9,10 @@
+ #include "wifi_ios_join.h"
+ enum {NSS_FREE,NSS_QUEUED,NSS_RUNNING,NSS_DONE};
+ struct nss_slot {unsigned state,canceled,callback_busy,retire;uint64_t ticket,generation,captured;void*cookie;nss_completion completion;enum nss_status status;struct nss_request request;struct nsb_scan scan;};
+-static struct {IOLock*lock;unsigned ready,failed,powered;uint64_t serial,power_epoch;uint8_t scan_sequence;struct nss_info info;struct nss_slot slot[NSS_SLOTS];struct nct_session previous;struct ncr_state previous_rx;struct ncs_frames frames;}nss_native;
++static struct {IOLock*lock;unsigned ready,failed,powered;uint64_t serial,power_epoch;uint8_t scan_sequence;struct nss_info info;struct nss_slot slot[NSS_SLOTS];struct nct_session previous;struct ncr_state previous_rx;struct ncs_frames frames;
++ /* 0431: station address. info.mac is the address in use (scan activation, peer, ifnet); factory_mac the board address;
++  * fw_mac what the firmware was last activated with. mac_switch = BSS activate-control commands the next scan sends first. */
++ uint8_t factory_mac[6],fw_mac[6],lladdr_old[6],deactivate[NCS_ACTIVATE_BYTES];unsigned mac_switch,build_pre,lladdr_pending,mac_attempts;}nss_native;
+ #if defined(NSS_HOST_TEST) && !defined(NJS_HOST_TEST)
+ #define NSS_STATION_TEST_DISABLED 1
+ static int njs_scan_blocked_locked(void){return 0;}
+@@ -43,7 +46,11 @@
+ int nord2_wifi_scan_cancel(uint64_t ticket){if(!ticket||!nss_available())return 1;IOLockLock(nss_native.lock);struct nss_slot*s=nss_find(ticket);int r=s?0:1;if(s)s->canceled=1;IOLockUnlock(nss_native.lock);if(!r)thread_wakeup((event_t)&nss_native);return r;}
+ int nord2_wifi_scan_view(uint64_t ticket,struct nss_view*out){if(!out)return -1;if(!nss_available())return 1;IOLockLock(nss_native.lock);struct nss_slot*s=nss_find(ticket);int r=1;if(s&&s->state==NSS_DONE&&!s->canceled&&(s->status==NSS_COMPLETE||s->status==NSS_PARTIAL)){*out=(struct nss_view){&s->scan,s->captured,s->generation,s->status};r=0;}IOLockUnlock(nss_native.lock);return r;}
+ int nord2_wifi_scan_release(uint64_t ticket){if(!ticket||!nss_available())return 1;IOLockLock(nss_native.lock);struct nss_slot*s=nss_find(ticket);int r=1;if(s&&s->state==NSS_DONE){if(s->callback_busy)s->retire=1;else memset(s,0,sizeof(*s));r=0;}IOLockUnlock(nss_native.lock);return r;}
+-static int nss_build(void*c,unsigned index,uint8_t*out,size_t capacity,size_t*used){if(c!=&nss_native.frames||index||!out||!used||capacity<NCS_SCAN_BYTES)return -1;memcpy(out,nss_native.frames.scan,NCS_SCAN_BYTES);*used=NCS_SCAN_BYTES;return 0;}
++static int nss_build(void*c,unsigned index,uint8_t*out,size_t capacity,size_t*used){
++ unsigned pre=nss_native.build_pre;
++ if(c!=&nss_native.frames||index>pre||pre>2||!out||!used)return -1;
++ if(index<pre){if(capacity<NCS_ACTIVATE_BYTES)return -1;memcpy(out,pre==2&&!index?nss_native.deactivate:nss_native.frames.activate,NCS_ACTIVATE_BYTES);*used=NCS_ACTIVATE_BYTES;return 0;}
++ if(capacity<NCS_SCAN_BYTES)return -1;memcpy(out,nss_native.frames.scan,NCS_SCAN_BYTES);*used=NCS_SCAN_BYTES;return 0;}
+ static int nss_start(void){
+  unsigned opt=0;PE_parse_boot_argn("nord2wifiios",&opt,sizeof(opt));if(opt!=1)return 1;
+  const struct nct_session*s=&nct_native.session;struct nni_address address;struct ncfg_channel channels[39];size_t count=0;
+@@ -57,7 +64,7 @@
+  nwfn_native.init.transport.completed!=5u+NCB_COMMANDS||
+  ncfg_address(&ncb_native.plan.input,&ncb_native.plan.config,&address)||address.source!=NNI_ADDRESS_BOARD||
+  ncfg_channels(&ncb_native.plan.input,&ncb_native.plan.config,channels,39,&count))return 1;
+- for(unsigned k=0;k<6;k++)nss_native.info.mac[k]=address.mac[k];
++ for(unsigned k=0;k<6;k++)nss_native.info.mac[k]=nss_native.factory_mac[k]=nss_native.fw_mac[k]=address.mac[k];
+  const struct nrp_caps*c=&ncb_native.plan.input.caps;nss_native.info.band5=c->band5;nss_native.info.nss=c->nss;nss_native.info.max_bw=c->max_bw;nss_native.info.path=c->path;
+  /* Android fgSkipDFS defaults0; DFS exclusion is not a station passive-scan rule.
+   * Keep the authenticated regulatory intersection; no probe/DFS AP operation. */
+@@ -69,6 +76,9 @@
+  if(!nss_native.info.count||nss_native.info.count!=ncb_native.plan.channel_count)return 1;
+  nss_native.scan_sequence=ncb_native.rx.scan.sequence;
+  nss_native.lock=IOLockAlloc();if(!nss_native.lock)return 1;
++#ifndef NSS_HOST_TEST
++ {unsigned mode=0;if(PE_parse_boot_argn("n2wpm",&mode,sizeof(mode))&&mode<=3)niwj_privmac_mode=mode;}
++#endif
+  nss_native.powered=1;nss_native.power_epoch=1;njs_initialize_locked();
+  __atomic_store_n(&nss_native.ready,1,__ATOMIC_RELEASE);
+  printf("NORD2 WIFI IOS OWNER: active=1 retained=1 boot_complete=1 ready=1\n");
+@@ -81,23 +91,31 @@
+  const struct ncs_channel*channels=slot->request.count?slot->request.channels:nss_native.info.channels;
+  size_t count=slot->request.count?slot->request.count:nss_native.info.count;
+  uint8_t sequence=(uint8_t)(nss_native.scan_sequence+1u);
+- if(ncs_build(ncd_native.diag.frame,ncd_native.diag.frame_bytes,ncd_native.diag.history[ncd_native.diag.events-1].sequence,nss_native.info.mac,channels,count,1,2,sequence,1,slot->request.dwell_tu,0,&nss_native.frames))return 1;
++ uint8_t mac[6];IOLockLock(nss_native.lock);unsigned pre=nss_native.mac_switch>2?0:nss_native.mac_switch;memcpy(mac,nss_native.info.mac,6);IOLockUnlock(nss_native.lock);
++ if(ncs_build(ncd_native.diag.frame,ncd_native.diag.frame_bytes,ncd_native.diag.history[ncd_native.diag.events-1].sequence,mac,channels,count,1,2,sequence,1,slot->request.dwell_tu,0,&nss_native.frames))return 1;
++ /* Deactivate = the same command with ucActive 0 and the address the firmware has now. */
++ if(pre==2){memcpy(nss_native.deactivate,nss_native.frames.activate,NCS_ACTIVATE_BYTES);nss_native.deactivate[65]=0;memcpy(nss_native.deactivate+68,nss_native.fw_mac,6);}
++ nss_native.build_pre=pre;
+  nss_native.previous=*s;nss_native.previous_rx=*r;nss_native.previous_rx.session=&nss_native.previous;
+  memset(s,0,sizeof(*s));memset(r,0,sizeof(*r));
+- const struct nct_entry entry={NCS_SCAN_BYTES,3,1};const struct nct_recipe recipe={&entry,1,nss_build,&nss_native.frames,UINT64_C(30000000),UINT64_C(15000000)};
++ static const struct nct_entry entry[3]={{NCS_ACTIVATE_BYTES,0x11,1},{NCS_ACTIVATE_BYTES,0x11,1},{NCS_SCAN_BYTES,3,1}};const struct nct_recipe recipe={entry+(2-pre),1+pre,nss_build,&nss_native.frames,UINT64_C(30000000),UINT64_C(15000000)};
+  unsigned returning=nss_return.ready&&!nss_return.consumed;
+  int preparation=returning?nct_scan_return_prepare(&nbc_native.state,&nss_return.origin,&recipe,s):nct_continue_prepare(&nbc_native.state,&nss_native.previous,&recipe,s);
+  if(!preparation)preparation=returning?ncr_scan_return_prepare(r,&nwfn_native.init,s,nss_return.queue,sequence,UINT64_C(14000000)):ncr_continue_prepare(r,&nwfn_native.init,s,&nss_native.previous_rx,sequence,UINT64_C(14000000));
+- if(preparation){*s=nss_native.previous;*r=nss_native.previous_rx;r->session=s;return 1;}
++ if(preparation){nss_native.build_pre=0;*s=nss_native.previous;*r=nss_native.previous_rx;r->session=s;return 1;}
+  nct_native.active=1;NVC_PHASE(5);
+  const struct nct_hooks hooks={ncr_pump,r,ncb_sleep,&ncb_native};
+- int result=nct_run(&ncd_io,&ncd_native,&hooks,s);nct_native.active=0;
++ int result=nct_run(&ncd_io,&ncd_native,&hooks,s);nct_native.active=0;nss_native.build_pre=0;
+  if(result==1&&s->drain_refused){/* RX may already have rearmed stale frames: preserve its current cursors. */
+   if(returning)for(unsigned k=0;k<5;k++)nss_return.queue[k]=r->queue[k];
+   *s=nss_native.previous;r->session=s;r->phase=NCR_IDLE;r->active=0;return 1;
+  }
+  if(returning)nss_return.consumed=1;
+  nss_native.scan_sequence=sequence;
++ if(pre&&result>=0){
++  IOLockLock(nss_native.lock);memcpy(nss_native.fw_mac,mac,6);if(!memcmp(mac,nss_native.info.mac,6))nss_native.mac_switch=0;IOLockUnlock(nss_native.lock);
++  printf("NORD2 WIFI IOS MAC: activated=1 commands=%u private=%u result=%d\n",pre,(unsigned)((mac[0]&2u)!=0),result);
++ }
+  if(result<0){slot->scan=r->scan;slot->captured=r->scan.last;ncd_native.halt=nwfn_native.halt=nwfn_native.init.halt=nwfn_native.init.transport.halt=nfp_native.halt=1;return -1;}
+  if(!r->scan.done&&r->scan_requested){r->scan.active=0;r->scan.partial=1;if(s->service_timed_out)r->scan.timed_out=1;}
+  uint64_t now;if(ncd_native_now(&ncd_native,&now)||now<r->scan.last)return -1;
+--- a/bsd/dev/wifi_station_service_bind.inc	2026-10-23 16:27:33.000000000 +0200
++++ b/bsd/dev/wifi_station_service_bind.inc	2026-11-13 14:23:53.382781260 +0100
+@@ -4,9 +4,15 @@
+ #include "wifi_ios_card.h"
+ #include "wifi_wpa_nst.h"
+ #include "wifi_ifnet_link.h"
++#include "wifi_wpa2.h"
+ #ifndef NJS_HOST_TEST
+ #include <sys/random.h>
+ #include <kern/clock.h>
++#include <sys/sysctl.h>
++#include <net/kpi_interface.h>
++extern unsigned niwi_scan_relax;
++SYSCTL_UINT(_kern, OID_AUTO, n2wifi_privmac, CTLFLAG_RW | CTLFLAG_LOCKED, &niwj_privmac_mode, 0, "0431: private Wi-Fi address: 0 legacy refuse, 1 use it, 2 use it with a deactivate first, 3 accept and ignore");
++SYSCTL_UINT(_kern, OID_AUTO, n2wifi_scanrelax, CTLFLAG_RW | CTLFLAG_LOCKED, &niwi_scan_relax, 0, "0430: serve directed scan requests with the passive scan (0 = refuse them)");
+ #endif
+ /* Same clock_get_uptime conversion as ncd_native_now, usable from IOUC:
+  * reading monotonic time does not borrow worker authority or access MMIO. */
+@@ -37,6 +43,7 @@
+  uint64_t serial,ticket,epoch,native_generation,rx_generation[NJS_RX_SLOTS];
+  void*cookie;njs_completion completion;
+  struct niwj_request request;
++ uint8_t want_self[6];unsigned has_self; /* 0431: requested private station address of this attempt */
+  struct niwj_target target,candidate;
+  struct njs_snapshot snapshot;
+  struct nsb_scan cache[NJS_CACHE_SLOTS];
+@@ -49,7 +56,7 @@
+ /* One copied next attempt; old callback/firmware ownership stays intact until
+  * retirement plus the existing real all-queue/fresh-scan barrier. */
+ static struct {unsigned state,canceled;uint64_t admitted,deadline,ticket,epoch;
+- void*cookie;njs_completion completion;struct niwj_request request;struct njs_snapshot snapshot;}njs_handover;
++ void*cookie;njs_completion completion;struct niwj_request request;struct njs_snapshot snapshot;uint8_t want_self[6];unsigned has_self;}njs_handover;
+ 
+ /* At most112 samples (five short state parts each), never packet/secret
+  * bytes. State rows only on phase/action/outcome/error/readiness transitions. */
+@@ -82,13 +89,72 @@
+   nct_done_receipt(&nct_native.session)&&!ncb_native.rx.active&&!ncb_native.rx.halt&&!ncb_native.rx.error)
+   nsr_native.scan_ready=1;
+ }
+-static void njs_initialize_locked(void){njs_native.notice_lock=IOLockAlloc();njs_cache_scan_locked(&ncb_native.rx.scan);njs_native.snapshot.phase=NJS_IDLE;}
++static void njs_initialize_locked(void){niwj_pmk_hook=nwp_pmk;njs_native.notice_lock=IOLockAlloc();njs_cache_scan_locked(&ncb_native.rx.scan);njs_native.snapshot.phase=NJS_IDLE;}
+ static int njs_request_ok(const struct niwj_request*q){
+  static const uint8_t rsn[22]={48,20,1,0,0,15,172,4,1,0,0,15,172,4,1,0,0,15,172,2,0,0};
+  return q&&q->ssid_length&&q->ssid_length<=32&&q->has_target<=1&&q->association_reason<=2&&((q->security==NIWJ_WPA2_PSK_CCMP&&(q->native_flags==0||q->native_flags==4)&&!memcmp(q->station_rsn,rsn,22))||
+  (q->security==NIWJ_OPEN&&!q->native_flags&&!memcmp(q->station_rsn,(const uint8_t[22]){0},22)&&!memcmp(q->pmk,(const uint8_t[32]){0},32)))&&(!q->has_target||(!(q->target[0]&1)&&(q->target[0]|q->target[1]|q->target[2]|q->target[3]|q->target[4]|q->target[5])));
+ }
++/* 0431: private Wi-Fi address. The address of the next attempt is chosen at
++ * admission (requested LAA in modes 1/2, otherwise the board address). A
++ * change is published in three places before authentication: info.mac (scan
++ * activation, 802.11 peer, PTK, output source check), the BSD interface
++ * link-layer address, and the firmware through one internal passive scan
++ * whose command recipe starts with BSS activate-control (nss_execute).
++ * Until that scan ran the join stays queued; three refused scans give up and
++ * the join then fails by its ordinary timeout. No address is ever logged. */
++static int njs_ifnet_set_mac(const uint8_t old[6],const uint8_t mac[6]){
++#ifdef NJS_HOST_TEST
++ (void)old;(void)mac;return 0;
++#else
++ int error=ENXIO;
++ for(unsigned unit=0;unit<8&&error==ENXIO;unit++){
++  char name[8];ifnet_t net=NULL;uint8_t current[6];snprintf(name,sizeof name,"en%u",unit);
++  if(ifnet_find_by_name(name,&net)||!net)continue;
++  if(ifnet_subfamily(net)==IFNET_SUBFAMILY_WIFI&&ifnet_addrlen(net)==6&&!ifnet_lladdr_copy_bytes(net,current,6)&&
++     (!memcmp(current,old,6)||!memcmp(current,nss_native.factory_mac,6)||!memcmp(current,mac,6)))
++   error=memcmp(current,mac,6)?(int)ifnet_set_lladdr(net,mac,6):0;
++  ifnet_release(net);
++ }
++ return error;
++#endif
++}
++static void njs_mac_select_locked(void){
++ unsigned mode=niwj_privmac_mode;
++ const uint8_t*want=(mode==1||mode==2)&&njs_native.has_self?njs_native.want_self:nss_native.factory_mac;
++ if(!(want[0]|want[1]|want[2]|want[3]|want[4]|want[5])||(want[0]&1)||!memcmp(want,nss_native.info.mac,6))return;
++ memcpy(nss_native.lladdr_old,nss_native.info.mac,6);memcpy(nss_native.info.mac,want,6);
++ nss_native.mac_switch=mode==2?2:1;nss_native.lladdr_pending=1;nss_native.mac_attempts=0;
++}
++static void njs_mac_scan_done(void*cookie,uint64_t generation,uint64_t ticket,enum nss_status status){(void)cookie;(void)generation;(void)status;(void)nord2_wifi_scan_release(ticket);}
++/* Owner thread, no lock held. 0 nothing pending, 1 activation scan queued for
++ * the owner loop, -1 no free scan slot yet (slept 10 ms). */
++static int njs_mac_work(void){
++ uint8_t old[6],mac[6];int r=0;
++ IOLockLock(nss_native.lock);unsigned ll=nss_native.lladdr_pending,sw=nss_native.mac_switch;nss_native.lladdr_pending=0;memcpy(old,nss_native.lladdr_old,6);memcpy(mac,nss_native.info.mac,6);IOLockUnlock(nss_native.lock);
++ if(ll){int error=njs_ifnet_set_mac(old,mac);printf("NORD2 WIFI IOS MAC: lladdr private=%u error=%d\n",(unsigned)((mac[0]&2u)!=0),error);}
++ if(!sw)return 0;
++ IOLockLock(nss_native.lock);
++ if(nss_native.mac_attempts>=3||nss_native.serial==UINT64_MAX){IOLockUnlock(nss_native.lock);return 0;}
++ struct nss_slot*s=0;for(unsigned k=0;k<NSS_SLOTS;k++)if(!nss_native.slot[k].state){s=&nss_native.slot[k];break;}
++ if(s){
++  memset(s,0,sizeof(*s));
++  /* Channels on which retained scans heard the requested SSID; none = the full allowed list. */
++  for(unsigned c=0;c<NJS_CACHE_SLOTS;c++){const struct nsb_scan*scan=&njs_native.cache[c];
++   for(unsigned i=0;i<scan->count&&i<NSB_RESULTS&&s->request.count<8;i++){const struct nsb_record*rec=&scan->records[i];
++    if(!rec->ssid_present||rec->ssid_len!=njs_native.request.ssid_length||memcmp(rec->ssid,njs_native.request.ssid,rec->ssid_len)||!rec->channel||rec->channel!=rec->hw_channel)continue;
++    struct ncs_channel ch={(uint8_t)(rec->hw_channel<=14?1:2),(uint8_t)rec->channel};unsigned allowed=0,dup=0;
++    for(unsigned j=0;j<nss_native.info.count;j++)if(nss_native.info.channels[j].band==ch.band&&nss_native.info.channels[j].channel==ch.channel)allowed=1;
++    for(unsigned j=0;j<s->request.count;j++)if(s->request.channels[j].band==ch.band&&s->request.channels[j].channel==ch.channel)dup=1;
++    if(allowed&&!dup)s->request.channels[s->request.count++]=ch;}}
++  s->cookie=&nss_native.mac_switch;s->generation=njs_native.native_generation?njs_native.native_generation:1;s->completion=njs_mac_scan_done;s->ticket=++nss_native.serial;s->state=NSS_QUEUED;nss_native.mac_attempts++;r=1;
++ }else r=-1;
++ IOLockUnlock(nss_native.lock);
++ if(r<0){uint64_t deadline;clock_interval_to_deadline(10000,NSEC_PER_USEC,&deadline);IOLockLock(nss_native.lock);assert_wait_deadline((event_t)&nss_native,THREAD_UNINT,deadline);IOLockUnlock(nss_native.lock);thread_block(THREAD_CONTINUE_NULL);}
++ return r;
++}
+ static void njs_accept_locked(const struct niwj_request*q,void*cookie,uint64_t epoch,njs_completion completion,uint64_t next_ticket,uint64_t now_us){
++ njs_mac_select_locked();
+  njs_native.admitted_us=now_us;njs_native.deadline_us=(now_us/1000+8000)*1000;
+  njs_native.cookie_retired=0;njs_native.request=*q;njs_native.ticket=next_ticket;njs_native.native_generation=njs_native.ticket;
+  if(njs_native.used)nsr_native.admitted_generation=njs_native.native_generation;
+@@ -98,6 +164,7 @@
+ }
+ int nord2_wifi_join_enqueue(const struct niwj_request*q,void*cookie,uint64_t epoch,njs_completion completion,uint64_t*ticket){
+  if(!njs_request_ok(q)||!cookie||!epoch||!completion||!ticket)return -1;
++ uint8_t self[6]={0};unsigned has_self=(unsigned)niwj_take_self(q,self);
+  if(!nss_available())return 1;uint64_t now_us=njs_uptime_us();if(now_us>UINT64_MAX-NJS_JOIN_BUDGET_US)return 1;IOLockLock(nss_native.lock);
+  if(!nss_native.powered||!njs_native.notice_lock||nss_native.failed||nst_native.state.halt||nst_native.state.error||nsr_native.bad||njs_native.serial>=255){IOLockUnlock(nss_native.lock);return 1;}
+  if(njs_handover.state){IOLockUnlock(nss_native.lock);return 2;}
+@@ -107,12 +174,13 @@
+   if(!njs_native.leave&&!(njs_native.scan_returned&&!njs_native.active&&!njs_native.queued)){IOLockUnlock(nss_native.lock);return 1;}
+   if(now_us>UINT64_MAX-NJS_HANDOVER_BUDGET_US){IOLockUnlock(nss_native.lock);return 1;}
+   njs_handover.state=1;njs_handover.admitted=now_us;njs_handover.deadline=now_us+NJS_HANDOVER_BUDGET_US;
+-  njs_handover.ticket=++njs_native.serial;njs_handover.epoch=epoch;njs_handover.cookie=cookie;njs_handover.completion=completion;njs_handover.request=*q;
++  njs_handover.ticket=++njs_native.serial;njs_handover.epoch=epoch;njs_handover.cookie=cookie;njs_handover.completion=completion;njs_handover.request=*q;njs_handover.has_self=has_self;memcpy(njs_handover.want_self,self,6);
+   njs_handover.snapshot=(struct njs_snapshot){.native_generation=njs_handover.ticket,.client_epoch=epoch,.ticket=njs_handover.ticket,.phase=NJS_QUEUED,.security=q->security};
+   *ticket=njs_handover.ticket;IOLockUnlock(nss_native.lock);thread_wakeup((event_t)&nss_native);return 0;
+  }
+  unsigned busy=njs_native.active||njs_native.queued||njs_native.retiring||njs_native.completion;
+  if(busy){IOLockUnlock(nss_native.lock);return 2;}
++ njs_native.has_self=has_self;memcpy(njs_native.want_self,self,6);
+  njs_accept_locked(q,cookie,epoch,completion,++njs_native.serial,now_us);
+  *ticket=njs_native.ticket;IOLockUnlock(nss_native.lock);thread_wakeup((event_t)&nss_native);return 0;
+ }
+@@ -304,6 +372,7 @@
+   IOLockLock(nss_native.lock);niwj_clear(&njs_handover,sizeof njs_handover);IOLockUnlock(nss_native.lock);return 1;
+  }
+  if(!njs_native.active&&!njs_native.queued&&!njs_native.retiring&&!njs_native.completion&&njs_rejoin_ready_locked()){
++  njs_native.has_self=njs_handover.has_self;memcpy(njs_native.want_self,njs_handover.want_self,6);
+   njs_accept_locked(&njs_handover.request,njs_handover.cookie,njs_handover.epoch,njs_handover.completion,njs_handover.ticket,now);
+   niwj_clear(&njs_handover,sizeof njs_handover);
+  }
+@@ -317,6 +386,7 @@
+  if(!queued&&!active){njs_rejoin_refresh();if(njs_handover.state){uint64_t pause;clock_interval_to_deadline(1000,NSEC_PER_USEC,&pause);IOLockLock(nss_native.lock);assert_wait_deadline((event_t)&nss_native,THREAD_UNINT,pause);IOLockUnlock(nss_native.lock);thread_block(THREAD_CONTINUE_NULL);}return 0;}
+  if(queued){uint64_t observed=njs_uptime_us();if(canceled||observed<admitted||observed>=deadline){njs_early_finish(!canceled&&observed>=deadline?9:2);return 1;}
+   if(scans)return 0; /* Drain only scans admitted before this first join. */
++  {int m=njs_mac_work();if(m)return m>0?0:1;} /* 0431: activation scan for a changed station address */
+  }
+  uint64_t now_us;if(ncd_native_now(&ncd_native,&now_us))return njs_fatal_owner(1);
+  if(queued){int r=njs_start_owner(now_us);if(r<0)return -1;IOLockLock(nss_native.lock);active=njs_native.active;IOLockUnlock(nss_native.lock);if(!active)return 1;

@@ -1,0 +1,211 @@
+{
+  "package": "WP01",
+  "title": "Platform: SDK stubs, host/iOS builds, the VideoToolbox plug-in shim, logging",
+  "state": "host-tested (Linux x86-64, ASan+UBSan and TSan) and compiled+linked for arm64-apple-ios16.0; nothing was installed or run on the phone",
+  "done": [
+    "sdk/sysinc: 20 hand-written freestanding headers (sys/types, stdio, stdlib, string, pthread, unistd, fcntl, dlfcn, time, sys/time, mach/mach_time, errno, sys/wait, signal, math, assert, dirent, sys/stat, sys/utsname, poll). Darwin ABI sizes: pthread_mutex_t 64, pthread_cond_t 48, pthread_once_t 16, struct dirent 1048, mode_t 16-bit, dev_t 32-bit; Darwin flag values: O_NONBLOCK 4, O_NOCTTY 0x20000, RTLD_NOW 2, RTLD_LOCAL 4. Every header is self-contained and compiles on its own with -ffreestanding -nostdinc (20/20 in the suite).",
+    "sdk/make_tbds.py: reads gpu/video/*/symbols.txt, gpu/video/*/*/symbols.txt and sdk/symbols.txt; folds /usr/lib/system/libsystem_* and /usr/lib/libsystem_* owners into /usr/lib/libSystem.B.dylib; writes one tbd v4 (targets [arm64-ios]) per install name into sdk/lib; fails on a symbol listed twice with different owners and on an owner with no INFO entry, and writes nothing in either error case; idempotent (a second run reports '0 file(s) changed'); removes stale TBDs.",
+    "sdk/symbols.txt: the platform package's own imports (libSystem incl. ___error, CoreFoundation incl. ___CFConstantStringClassReference and _kCFAllocatorDefault, VideoToolbox), plus make_tbds.py's BASELINE of compiler-emitted libSystem symbols (memcpy/memset/.../__stack_chk_*) so a plain C package cannot forget them.",
+    "vt/n2vt_log.h/.c: n2vt_say() writes 'N2VIDEO <progname>[pid]: <text>\\n' to /dev/console, opening and closing it per line with Darwin O_WRONLY|O_NONBLOCK|O_NOCTTY (values checked against <fcntl.h> at compile time on the phone build); 40 lines per process then exactly one '(further lines suppressed)' line; silent when N2VT_SWITCH_QUIET exists; mutex-protected; write errors and a missing console are ignored; 480-byte line buffer, truncation safe.",
+    "vt/n2vt_shim.c: the plug-in; exports exactly SLIMEncoderRegister and n2vt_version (the latter returns 1). Body once per process via pthread_once: N2VT_SWITCH_OFF -> one 'off' line and return; VTRegisterVideoEncoderWithInfo NULL -> one line and return; HEVC (Apple's HEVCVideoEncoder_CreateInstance out of VCPHEVC.videocodec via dlopen(RTLD_NOW|RTLD_LOCAL)+dlsym) registered for hvc1 and hev1 with CMClassImplementationID = N2VT_ID_HEVC; avc1 via the weak n2avc_vt_create with N2VT_ID_AVC; jpeg via the weak n2jpeg_vt_create with N2VT_ID_JPEG; each unless its N2VT_SWITCH_NO_* file exists; N2VT_SWITCH_CLAIM_HW adds kVTVideoEncoder_IsHardwareAccelerated = kCFBooleanTrue; one summary line with ok/failed/off/absent per codec type. Every CoreFoundation/VideoToolbox symbol is a weak import and is checked before use; the two encoder factories are weak imports (linker -U while their package is absent). No threads, no retained allocation, no dlclose (the factory must stay valid).",
+    "build_ios.sh [outdir]: runs make_tbds.py, compiles vt/*.c (leaving out vt/n2avc_vt.c while avc/*.c is absent, the documented stage-0 v0 plug-in), avc/*.c, jpeg/*.c and -- only when avc/*.c exists, because they exist for the encoder -- kern/n2vk_ref.c and kern/n2vk_dispatch.c, with the flags of PLAN.md 4.3; links Slim.videoencoder (-dylib, -install_name /System/Library/VideoEncoders/Slim.videoencoder, -adhoc_codesign, -exported_symbol for exactly the two exports, libSystem+CoreFoundation normal and every other TBD weak); checks file(1), the dylib id, the exact export list and that every undefined symbol is covered by a TBD. Then links n2vt_probe from probe/*.c (+ probe/av/*.c, or -DPROBE_NO_AV automatically when probe/av/ has no sources, or on PROBE_NO_AV=1) as a main executable, with the same symbol-coverage check. Prints sha256 and size of each product.",
+    "build_host.sh [package] and run_all_tests.sh: every <pkg>/run_tests.sh and <pkg>/<sub>/run_tests.sh, each last line and a total, exit 1 if any failed; LC_ALL=C for stable order.",
+    "vt/test/t_shim.c + run_tests.sh + this STATUS.json: 11 shim/log checks in four binaries (full matrix ASan+UBSan; no-avc-factory; no-VT-register; 4 threads x 3 calls under TSan) plus the 20-header self-containment check. The CoreFoundation subset used by the shim is a local fake in the test file; access/dlopen/dlsym/open/write/close/getpid/getprogname/VTRegisterVideoEncoderWithInfo are test doubles, and the test asserts the literal Darwin arguments (paths, RTLD flags, open flags, codec types, implementation IDs, the IsHardwareAccelerated key, registration order).",
+    "build_ios.sh links every non-libSystem/CoreFoundation framework with -weak_library and passes -dead_strip_dylibs: the plug-in's load commands are exactly libSystem + CoreFoundation (normal) + VideoToolbox (weak), and llvm-objdump --macho --dyld-info shows _n2avc_vt_create and _n2jpeg_vt_create as 'flat-namespace ... (weak import)' while every CoreFoundation and VideoToolbox symbol is a '(weak import)' bound to its named image.",
+    "The ad-hoc code signatures were parsed: both products carry one CodeDirectory (version 0x20400, flags 0x20002 = CS_ADHOC|CS_LINKER_SIGNED, hashType 2 = SHA-256, hashSize 32, pageSize 4096) and every page hash matches (17/17 for the plug-in, 24/24 for the probe). That is a structurally valid ad-hoc signature; arm64 dyld accepts that class for non-platform binaries (the C1 answer will be whether the specific path/process policy does)."
+  ],
+  "not_done": [
+    "No phone work of any kind: nothing was installed, no cycle was run, no console line has ever been produced by the device. 'Compiled and linked for iOS' is the strongest claim this package makes.",
+    "The plug-in was never loaded by a real VideoToolbox: whether dyld in mediaserverd/CMPhoto's host accepts an ad-hoc-signed dylib at /System/Library/VideoEncoders/Slim.videoencoder, and whether VTLoadVideoEncoders reaches that path, is cycle C1's question.",
+    "In this tree the avc1 registration could not be link-tested with the real encoder: avc/*.c did not exist when this was written, so build_ios.sh leaves vt/n2avc_vt.c out and the plug-in registers HEVC only. vt/n2avc_vt.c did compile for iOS before that rule was added; when WP03 lands, build_ios.sh includes it automatically and the same export/undefined-symbol checks run. The 'avc1 registered' path itself is host-tested with a fake factory.",
+    "The jpeg path has never been built with n2jpeg_vt_create present (the reserve package R1); only the 'absent' branch is exercised.",
+    "sysinc has no struct stat, no termios, no netinet, no CoreFoundation/Objective-C headers: nothing in gpu/video needs them yet. Ask on the board and they are added.",
+    "make_tbds.py's current-version/compatibility-version numbers for frameworks are metadata only (the linker uses the install name); they were not read out of the phone's cache. The LEAD verifies every symbol name against the cache's export tries.",
+    "The probe link currently exercises the -DPROBE_NO_AV path because probe/av/ was empty at the time of writing; the full link (with WP06's sources) has not been run from this package.",
+    "kern/n2vk_dispatch.c (WP08) does not compile for iOS as it stands: it calls snprintf without <stdio.h>. Because of that (and because nothing in the stage-0 plug-in calls the kernels) build_ios.sh keeps kern/*.c out of the link until avc/*.c exists; it was reported to WP08. The 'avc present' link path itself was checked in a scratch copy with a stub avc/*.c: the plug-in linked (72880 B, 74 undefined symbols all covered, still exactly two exports), so the rule works and the only outstanding blocker for the avc1-capable plug-in is the real avc/*.c plus that include fix.",
+    "probe/av/probe_av.c (WP06) does not compile for iOS as it stands (missing <stdio.h> for snprintf/vsnprintf and 13 Class-vs-id pointer errors); reported to WP06. With probe/av/ present the default build_ios.sh therefore exits 1 at the probe compile, after the plug-in has been built and checked. 'PROBE_NO_AV=1 bash build_ios.sh' builds everything C1 needs (probe without the AV tests); a bug in that flag (probe/av/*.c was still compiled) was found and fixed."
+  ],
+  "imports": [
+    {
+      "symbol": "_CFDictionaryCreateMutable",
+      "image": "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    },
+    {
+      "symbol": "_CFDictionarySetValue",
+      "image": "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    },
+    {
+      "symbol": "_CFRelease",
+      "image": "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    },
+    {
+      "symbol": "_kCFAllocatorDefault",
+      "image": "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    },
+    {
+      "symbol": "_kCFBooleanTrue",
+      "image": "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    },
+    {
+      "symbol": "_kCFTypeDictionaryKeyCallBacks",
+      "image": "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    },
+    {
+      "symbol": "_kCFTypeDictionaryValueCallBacks",
+      "image": "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    },
+    {
+      "symbol": "___CFConstantStringClassReference",
+      "image": "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
+      "note": "N2STR() literals"
+    },
+    {
+      "symbol": "_VTRegisterVideoEncoderWithInfo",
+      "image": "/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox"
+    },
+    {
+      "symbol": "_kVTVideoEncoder_IsHardwareAccelerated",
+      "image": "/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox"
+    },
+    {
+      "symbol": "___error",
+      "image": "/usr/lib/libSystem.B.dylib"
+    },
+    {
+      "symbol": "___stack_chk_fail",
+      "image": "/usr/lib/libSystem.B.dylib"
+    },
+    {
+      "symbol": "___stack_chk_guard",
+      "image": "/usr/lib/libSystem.B.dylib"
+    },
+    {
+      "symbol": "_access",
+      "image": "/usr/lib/libSystem.B.dylib",
+      "note": "owner /usr/lib/system/libsystem_kernel.dylib, folded"
+    },
+    {
+      "symbol": "_close",
+      "image": "/usr/lib/libSystem.B.dylib",
+      "note": "owner /usr/lib/system/libsystem_kernel.dylib, folded"
+    },
+    {
+      "symbol": "_dlopen",
+      "image": "/usr/lib/libSystem.B.dylib",
+      "note": "owner /usr/lib/system/libdyld.dylib, folded"
+    },
+    {
+      "symbol": "_dlsym",
+      "image": "/usr/lib/libSystem.B.dylib",
+      "note": "owner /usr/lib/system/libdyld.dylib, folded"
+    },
+    {
+      "symbol": "_getpid",
+      "image": "/usr/lib/libSystem.B.dylib",
+      "note": "owner /usr/lib/system/libsystem_kernel.dylib, folded"
+    },
+    {
+      "symbol": "_getprogname",
+      "image": "/usr/lib/libSystem.B.dylib",
+      "note": "owner /usr/lib/system/libsystem_c.dylib, folded"
+    },
+    {
+      "symbol": "_open",
+      "image": "/usr/lib/libSystem.B.dylib",
+      "note": "owner /usr/lib/system/libsystem_kernel.dylib, folded"
+    },
+    {
+      "symbol": "_pthread_mutex_lock",
+      "image": "/usr/lib/libSystem.B.dylib",
+      "note": "owner /usr/lib/system/libsystem_pthread.dylib, folded"
+    },
+    {
+      "symbol": "_pthread_mutex_unlock",
+      "image": "/usr/lib/libSystem.B.dylib",
+      "note": "owner /usr/lib/system/libsystem_pthread.dylib, folded"
+    },
+    {
+      "symbol": "_pthread_once",
+      "image": "/usr/lib/libSystem.B.dylib",
+      "note": "owner /usr/lib/system/libsystem_pthread.dylib, folded"
+    },
+    {
+      "symbol": "_snprintf",
+      "image": "/usr/lib/libSystem.B.dylib",
+      "note": "owner /usr/lib/system/libsystem_c.dylib, folded"
+    },
+    {
+      "symbol": "_vsnprintf",
+      "image": "/usr/lib/libSystem.B.dylib",
+      "note": "owner /usr/lib/system/libsystem_c.dylib, folded"
+    },
+    {
+      "symbol": "_write",
+      "image": "/usr/lib/libSystem.B.dylib",
+      "note": "owner /usr/lib/system/libsystem_kernel.dylib, folded"
+    },
+    {
+      "symbol": "dyld_stub_binder",
+      "image": "/usr/lib/libSystem.B.dylib"
+    },
+    {
+      "symbol": "_n2avc_vt_create",
+      "image": "this dylib (vt/n2avc_vt.c, WP05)",
+      "note": "weak import; undefined in the current tree, build_ios.sh allows it with ld64 -U until avc/*.c exists"
+    },
+    {
+      "symbol": "_n2jpeg_vt_create",
+      "image": "this dylib (jpeg/, reserve R1)",
+      "note": "weak import; absent until R1 exists"
+    }
+  ],
+  "commands": [
+    {
+      "cmd": "bash gpu/video/vt/test/run_tests.sh",
+      "last_line": "N2TEST WP01 PASS 31/31"
+    },
+    {
+      "cmd": "bash gpu/video/build_ios.sh",
+      "last_line": "   size: 95072 bytes",
+      "note": "Slim.videoencoder 68416 bytes sha256 ee604d612c07932cc1baecbc72c6726763e91acbe1b75d3c9dd38bbf1238c3c2; n2vt_probe 95200 bytes sha256 f88d4c1fe9f54a026034e88a2dad1bf24c51ea0d7741c6da74cacc74e4942fc7 (tree of 11 Nov 2026 ~02:30 CET; the hashes change with every package that lands)"
+    },
+    {
+      "cmd": "llvm-objdump --macho --dylib-id gpu/video/build/ios/Slim.videoencoder | tail -1",
+      "last_line": "/System/Library/VideoEncoders/Slim.videoencoder"
+    },
+    {
+      "cmd": "llvm-nm -gU gpu/video/build/ios/Slim.videoencoder",
+      "last_line": "0000000000004560 T _n2vt_version",
+      "note": "two lines, _SLIMEncoderRegister and _n2vt_version, nothing else"
+    },
+    {
+      "cmd": "LLVM_OBJDUMP=llvm-objdump file gpu/video/build/ios/Slim.videoencoder",
+      "last_line": "gpu/video/build/ios/Slim.videoencoder: Mach-O 64-bit arm64 dynamically linked shared library, flags:<NOUNDEFS|DYLDLINK|TWOLEVEL|NO_REEXPORTED_DYLIBS>"
+    },
+    {
+      "cmd": "python3 gpu/video/sdk/make_tbds.py",
+      "last_line": "make_tbds: 0 file(s) changed, 161 symbol(s), 8 image(s)",
+      "note": "second and third runs; the first run of a changed tree reports the files it wrote"
+    },
+    {
+      "cmd": "bash gpu/video/build_host.sh vt",
+      "last_line": "make_tbds: 0 file(s) changed, 164 symbol(s), 8 image(s)"
+    },
+    {
+      "cmd": "bash gpu/video/run_all_tests.sh",
+      "last_line": "run_all_tests: PASS",
+      "note": "5/5 suites in the tree at the time (WP01, WP02, WP05, WP07, WP09)"
+    }
+  ],
+  "known_risks": [
+    "Info-dictionary ownership: the shim passes a freshly created CFDictionary to VTRegisterVideoEncoderWithInfo and releases it immediately after both HEVC registrations ('no allocation kept'). This assumes VideoToolbox copies or retains the dictionary, as CF's Create/Copy/Get naming rules imply for an API that keeps its argument. If it stored a bare pointer, the registry would later read freed memory. If the lead prefers belt-and-braces, keeping the dictionary alive (one small leak per process) is a one-line change.",
+    "kVTVideoEncoder_IsHardwareAccelerated is read as a value and only after VTRegisterVideoEncoderWithInfo was found: both come from VideoToolbox, so the read cannot happen with the image unloaded. The availability check for the data symbol would be '&symbol != NULL', which the current code does not use because the value is what is needed.",
+    "The weak-import link behaviour was verified with ld64.lld 23.1.4 (a dylib with -U for the two absent factories, and a dylib with the factory defined in a hidden-visibility object), not with Apple's ld64; the resulting Mach-O carries a weak undefined reference and no text relocation.",
+    "pthread_once semantics under fork: each forked test child inherits 'once not run', which is what the scenarios rely on. On the phone the plug-in is registered by VideoToolbox once per process; nothing in the shim forks.",
+    "The console budget is per process, not per encoding session: a long-lived mediaserverd that loads the plug-in once gets those 40 lines for its whole life (the design in n2vt_log.h).",
+    "sdk/sysinc/stdio.h declares FILE as struct __sFILE (opaque); the probe only passes FILE* around, never inspects it. A package that needs stdin/stdout buffering internals would need a different solution.",
+    "struct tm and struct utsname are hand-written from the Darwin ABI; the probe writes into their fields (gmtime_r, uname). A wrong field offset would be caught only on the phone (C1).",
+    "The probe executable is ad-hoc signed by ld64.lld; whether the phone's launchd/AMFI loads an ad-hoc-signed executable from /usr/libexec is a C1 question (the camera bundle's precedent says yes for dylibs).",
+    "The plug-in's object set follows the tree: vt/n2avc_vt.c is in the link only when avc/*.c exists, and kern/n2vk_{ref,dispatch}.c only then too. That keeps the stage-0 payload buildable, but it also means 'the plug-in built' must always be read together with the source list build_ios.sh prints."
+  ]
+}

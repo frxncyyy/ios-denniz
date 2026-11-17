@@ -1,0 +1,190 @@
+--- a/bsd/dev/wifi_ios_join.c	2026-10-23 16:27:33.000000000 +0200
++++ b/bsd/dev/wifi_ios_join.c	2026-11-13 14:20:34.266077276 +0100
+@@ -17,6 +17,71 @@
+  return n==24||(!p[24]&&p[25]==15&&p[26]==172&&(p[27]==6||p[27]==11||p[27]==12||p[27]==13));
+ }
+ static int refuse(struct niwj_diagnostic*d,int reason){if(d)d->reason=(uint32_t)-reason;return reason;}
++/* 0430: relaxed IOUC join decoder. Still WPA2-PSK/CCMP or OPEN only: SAE-only,
++ * 802.1X, WEP, WPA1/TKIP and a station RSN that demands MFP stay refused. */
++unsigned niwj_privmac_mode=1;
++int (*niwj_pmk_hook)(const uint8_t*,size_t,const uint8_t*,size_t,uint8_t out[32]);
++int printf(const char*,...) __attribute__((format(printf,1,2)));
++static struct {uint8_t valid,ssid_length,ssid[32],self[6];} pending_self;
++static unsigned join_logs;
++int niwj_take_self(const struct niwj_request*q,uint8_t out[6]){
++ int r=0;
++ if(q&&out&&pending_self.valid&&q->ssid_length&&q->ssid_length<=32&&pending_self.ssid_length==q->ssid_length&&same(pending_self.ssid,q->ssid,q->ssid_length)){copy(out,pending_self.self,6);r=1;}
++ niwj_clear(&pending_self,sizeof pending_self);return r;
++}
++static int suite0(const uint8_t*p,unsigned type){return !p[0]&&p[1]==15&&p[2]==172&&p[3]==type;}
++/* The framework's own RSN element only has to offer CCMP and PSK and must
++ * not require MFP; association and M2 always carry station_rsn22. */
++static int station_rsn_psk(const uint8_t*p,unsigned n){
++ unsigned at=8,count,ccmp=0,psk=0;
++ if(n<20||n>64||p[0]!=48||p[1]!=n-2||j16(p+2)!=1||!suite0(p+4,4))return 0;
++ count=j16(p+at);at+=2;if(!count||count>(n-at)/4)return 0;
++ while(count--){ccmp|=(unsigned)suite0(p+at,4);at+=4;}
++ if(!ccmp||n-at<2)return 0;
++ count=j16(p+at);at+=2;if(!count||count>(n-at)/4)return 0;
++ while(count--){psk|=(unsigned)suite0(p+at,2);at+=4;}
++ if(!psk)return 0;
++ return n-at<2||!(j16(p+at)&64u);
++}
++/* class: 1 open, 2 WPA2-PSK with PMK, 3 WPA2-PSK with passphrase, 4 802.1X
++ * style (no PSK bit, WPA/WPA2/802.1X bits), 5 anything else (SAE-only). */
++static int relaxed(const uint8_t*p,struct niwj_request*out,unsigned*klass,unsigned*ignored){
++ unsigned upper=j16(p+8),open=upper==0,pass=0,mode=niwj_privmac_mode;
++ *klass=open?1:(upper&8u)?2:(upper&0x125u)?4:5;*ignored=0;
++ if(j32(p)!=1||!j32(p+12)||j32(p+12)>32||(nz(p+48,6)&&(p[48]&1)))return NIWJ_SHAPE;
++ if(j16(p+4)!=2||j16(p+6)!=1||(!open&&!(upper&8u)))return NIWJ_PROFILE;
++ if(open){
++  if(j32(p+56)||j32(p+60)||j32(p+64)||j16(p+68)||j16(p+70)||j32(p+468))return NIWJ_CREDENTIAL;
++  if(j16(p+204))return NIWJ_SECURITY;
++ }else{
++  if(j32(p+56)!=1||j16(p+68)||j16(p+70)||j32(p+468))return NIWJ_CREDENTIAL;
++  if(j32(p+64)==6&&j32(p+60)==32)pass=0;
++  else if(j32(p+64)==10&&j32(p+60)>=8&&j32(p+60)<=63&&niwj_pmk_hook){pass=1;*klass=3;}
++  else return NIWJ_CREDENTIAL;
++  if(!station_rsn_ok(p+206,j16(p+204))&&!station_rsn_psk(p+206,j16(p+204)))return NIWJ_SECURITY;
++  if(j32(p+584)&1u)return NIWJ_SECURITY; /* WPA3 transition disabled: no PSK fallback */
++ }
++ /* Unknown association flag bits are reported, not refused; band preference
++  * is a hint. Blacklists and conditional options stay unimplemented. */
++ *ignored=(p[463]&~0x20u)|((unsigned)(p[464]&~0x48u)<<8);
++ if(p[465]>2||((p[463]&0x20u)&&!nz(p+48,6))||(j32(p+504)!=0&&(open||j32(p+504)!=4))||p[514]||j32(p+580))return NIWJ_OPTIONS;
++ if((p[464]&8u)&&(!nz(p+508,6)||(p[508]&3u)!=2u))return NIWJ_OPTIONS;
++ unsigned scope=j32(p+536);
++ if(p[464]&0x40u){
++  if(!scope||scope>36||p[540+scope])return NIWJ_OPTIONS;
++  for(unsigned i=0;i<scope;i++)if(!p[540+i])return NIWJ_OPTIONS;
++ }else if(scope)return NIWJ_OPTIONS;
++ out->ssid_length=(uint8_t)j32(p+12);copy(out->ssid,p+16,out->ssid_length);
++ out->has_target=(uint8_t)nz(p+48,6);copy(out->target,p+48,6);
++ if(!open){
++  if(pass){if(niwj_pmk_hook(p+72,j32(p+60),p+16,j32(p+12),out->pmk))return NIWJ_CREDENTIAL;}
++  else copy(out->pmk,p+72,32);
++  copy(out->station_rsn,station_rsn,22);
++ }
++ out->association_reason=p[465];out->security=open?NIWJ_OPEN:NIWJ_WPA2_PSK_CCMP;out->native_flags=j32(p+504);
++ if((p[464]&8u)&&(mode==1||mode==2)){pending_self.ssid_length=out->ssid_length;copy(pending_self.ssid,out->ssid,out->ssid_length);copy(pending_self.self,p+508,6);pending_self.valid=1;}
++ return 0;
++}
+ int niwj_decode_identity(const void*v,size_t n,const uint8_t owner_mac[6],struct niwj_request*out,struct niwj_diagnostic*d){
+  const uint8_t*p=v;if(d)niwj_clear(d,sizeof(*d));if(out)niwj_clear(out,sizeof(*out));
+  if(!out||!p||n!=NIWJ_ASSOC_BYTES)return refuse(d,NIWJ_SHAPE);
+@@ -25,6 +90,12 @@
+   d->private_address_present=(p[464]&8u)!=0;
+   d->owner_address_valid=owner_mac&&nz(owner_mac,6)&&!(owner_mac[0]&1u);
+   d->private_address_matches=d->private_address_present&&d->owner_address_valid&&same(p+508,owner_mac,6);}
++ if(niwj_privmac_mode&&owner_mac){
++  unsigned klass=0,ignored=0;niwj_clear(&pending_self,sizeof pending_self);
++  int r=relaxed(p,out,&klass,&ignored);if(r)niwj_clear(out,sizeof(*out));
++  if(join_logs<4096){join_logs++;printf("NORD2 WIFI IOS JOINSEC: class=%u upper=%#x key_kind=%u key_bytes=%u rsn_bytes=%u flags=%#x ignored=%#x private=%u mode=%u refusal=%d\n",klass,(unsigned)j16(p+8),(unsigned)j32(p+64),(unsigned)j32(p+60),(unsigned)j16(p+204),(unsigned)j16(p+463),ignored,(unsigned)((p[464]&8u)!=0),niwj_privmac_mode,-r);}
++  return r?refuse(d,r):0;
++ }
+  if(j32(p)!=1||!j32(p+12)||j32(p+12)>32||(nz(p+48,6)&&(p[48]&1)))return refuse(d,NIWJ_SHAPE);
+  unsigned open=j16(p+8)==0;
+  if(j16(p+4)!=2||j16(p+6)!=1||(!open&&j16(p+8)!=8))return refuse(d,NIWJ_PROFILE);
+--- a/bsd/dev/wifi_ios_join.h	2026-10-23 16:27:33.000000000 +0200
++++ b/bsd/dev/wifi_ios_join.h	2026-11-13 14:20:34.265825111 +0100
+@@ -38,6 +38,20 @@
+ int niwj_decode_identity(const void*,size_t,const uint8_t actual_owner_mac[6],
+  struct niwj_request*,struct niwj_diagnostic*);
+ void niwj_clear(void*,size_t);
++/* 0430 join policy, kern.n2wifi_privmac / boot-arg n2wpm (default 1):
++ * 0 legacy decoder: exact WPA2 profile, a private address must equal the
++ *   current station address;
++ * 1 relaxed decoder, the requested private address becomes the station
++ *   address (BSS re-activated with it before authentication);
++ * 2 as 1, with a deactivate command before the activate;
++ * 3 relaxed decoder, private address accepted but ignored (factory MAC).
++ * struct niwj_request/niwj_diagnostic keep the CI layout: the IOUC object
++ * (wifi_ios_client.cpo) is not rebuilt. The requested station address
++ * travels through niwj_take_self: recorded by a successful decode, taken
++ * once by the native enqueue for the same SSID, cleared by any decode. */
++extern unsigned niwj_privmac_mode;
++extern int (*niwj_pmk_hook)(const uint8_t*,size_t,const uint8_t*,size_t,uint8_t out[32]);
++int niwj_take_self(const struct niwj_request*,uint8_t out[6]);
+ struct niwj_target {
+  struct nsb_record record;
+  uint8_t band,channel,rate_count,rates[12]; /*500kbps; basic flags retained*/
+--- a/bsd/dev/wifi_ios_policy.c	2026-10-23 16:27:33.000000000 +0200
++++ b/bsd/dev/wifi_ios_policy.c	2026-11-13 14:20:34.266798128 +0100
+@@ -25,7 +25,10 @@
+  * DFS is admitted only from the authenticated owner list, always passively.
+  * info must be the authoritative native owner snapshot. Scheduling hints are
+  * best effort; no priority, preemption or completion latency is promised. */
+-int niwi_scan_admit(const uint8_t*p,size_t n,const struct nss_info*info,struct nss_request*out){
++unsigned niwi_scan_relax=1;
++int printf(const char*,...) __attribute__((format(printf,1,2)));
++static unsigned admit_logs;
++static int admit(const uint8_t*p,size_t n,const struct nss_info*info,struct nss_request*out,unsigned relax,unsigned*relaxed){
+  if(!p||n!=5456||!info||!out)return NIWI_ADMIT_ARGUMENT;
+  if(!info->count||info->count>NSS_CHANNELS||(info->dfs_mask>>info->count))return NIWI_ADMIT_OWNER;
+  uint32_t mode=u32(p+52),count=u32(p+68),options=u32(p+4872);
+@@ -41,18 +44,28 @@
+   * framework dictionary builder initializes RSSI threshold to INT32_MIN.
+   * Zero is retained for the existing null/default request profile. Explicit
+   * thresholds, other timing profiles, named/short SSIDs are not implemented. */
+- if(u32(p+16)||((p[60]|(unsigned)p[61]<<8)!=0&&(p[60]|(unsigned)p[61]<<8)!=110)||u32(p+64)||
+-    (u32(p+4880)!=0&&u32(p+4880)!=0x80000000u)||u32(p+4884)||u32(p+5448))return NIWI_ADMIT_OPTION;
++ unsigned dwell=p[60]|(unsigned)p[61]<<8,soft=0;
++ if(u32(p+16)){if(u32(p+16)>32)return NIWI_ADMIT_OPTION;soft|=1;}
++ if(dwell!=0&&dwell!=110)soft|=2;
++ if(u32(p+64))soft|=4;
++ if(u32(p+4880)!=0&&u32(p+4880)!=0x80000000u)soft|=8;
++ if(u32(p+4884))soft|=16;
++ if(u32(p+5448))soft|=32;
++ if(soft&&!relax)return NIWI_ADMIT_OPTION;
+  /* Exact builder0x1d3ebb970..9bc maps true LOW_PRIORITY to2 and LOW_LATENCY
+   * to0x20. Neither changes RF/filter semantics. The dedicated scan-only worker
+   * wakes on enqueue and serializes FIFO without artificial throttling. Admit
+   * either advisory hint in that scheduling policy; do not claim preemption,
+   * priority reordering or a latency bound. Future shared-radio work must review
+   * arbitration. Mixed priority/latency, filters, overrides and6GHz bits refuse. */
+- if(u32(p+4876)||(options&&options!=NIWI_SCAN_LOW_PRIORITY&&options!=NIWI_SCAN_LOW_LATENCY))return NIWI_ADMIT_FLAGS;
++ if(u32(p+4876))return NIWI_ADMIT_FLAGS;
++ if(options&&options!=NIWI_SCAN_LOW_PRIORITY&&options!=NIWI_SCAN_LOW_LATENCY){
++  if(!relax||(options&~(NIWI_SCAN_LOW_PRIORITY|NIWI_SCAN_LOW_LATENCY)))return NIWI_ADMIT_FLAGS;
++  soft|=64;
++ }
+  unsigned zero=1,broadcast=1;
+  for(unsigned i=8;i<14;i++){if(p[i])zero=0;if(p[i]!=255)broadcast=0;}
+- if(!zero&&!broadcast)return NIWI_ADMIT_PEER; /* Neither directed peer nor fabricated filter. */
++ if(!zero&&!broadcast){if(!relax)return NIWI_ADMIT_PEER;soft|=128;} /* legacy: neither directed peer nor fabricated filter */
+  struct nss_request result={0};
+  for(unsigned j=0;j<count;j++){
+   const uint8_t*c=p+72+12*j;uint32_t channel=u32(c+4),flags=u32(c+8);unsigned band=0;
+@@ -74,7 +87,17 @@
+       result.channels[k].channel==info->channels[found].channel)return NIWI_ADMIT_ALLOWLIST;
+   result.channels[j]=info->channels[found];
+  }
+- result.count=count;result.dwell_tu=p[60]?108:0;*out=result;return 0;
++ result.count=count;result.dwell_tu=dwell?108:0;*out=result;*relaxed=soft;return 0;
++}
++int niwi_scan_admit(const uint8_t*p,size_t n,const struct nss_info*info,struct nss_request*out){
++ unsigned soft=0,relax=niwi_scan_relax;int r=admit(p,n,info,out,relax,&soft);
++ /* Not capped per client like SCANREQ: every relaxed or refused request of
++  * the first 512, then one in 32. Numbers only, never names or addresses. */
++ if(relax&&(r||soft)&&p&&n==5456){
++  if(admit_logs<512||!(admit_logs&31u))printf("NORD2 WIFI IOS SCANADMIT: status=%d relaxed=%#x type=%u bss=%u channels=%u ssid_length=%u names=%u dwell=%u options=%#x seen=%u\n",r,soft,(unsigned)u32(p+52),(unsigned)u32(p+4),(unsigned)u32(p+68),(unsigned)u32(p+16),(unsigned)u32(p+4884),(unsigned)(p[60]|(unsigned)p[61]<<8),(unsigned)u32(p+4872),admit_logs);
++  admit_logs++;
++ }
++ return r;
+ }
+ const struct niwp_rate_map*niwi_rate_map(size_t*n){return niwr_production_map(n);}
+ 
+--- a/bsd/dev/wifi_ios_policy.h	2026-10-23 16:27:33.000000000 +0200
++++ b/bsd/dev/wifi_ios_policy.h	2026-11-13 14:20:34.266152139 +0100
+@@ -14,6 +14,11 @@
+ int niwi_set_shape(unsigned,const void*,size_t,const char[16],uint32_t*);
+ int niwi_scan_envelope(unsigned,const void*,size_t,const char[16]);
+ int niwi_scan_admit(const uint8_t*,size_t,const struct nss_info*,struct nss_request*);
++/* 0430, kern.n2wifi_scanrelax (default 1): directed SSID/BSSID, SSID lists,
++ * other dwell/rest/RSSI options and combined priority+latency hints are
++ * served by the same passive scan of the requested channels instead of being
++ * refused (0 = legacy refusal). Results are not filtered here. */
++extern unsigned niwi_scan_relax;
+ const struct niwp_rate_map*niwi_rate_map(size_t*);
+ 
+ /* Pure shape only: caller must independently require the real owner ready. */

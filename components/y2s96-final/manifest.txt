@@ -1,0 +1,54 @@
+# y2s96-final (2026-11-13): y2s95-final with the pressure handlers OFF by default + rt1 DontCare (B) + single-target framebuffer (C)
+# + trace-cc investigation switch (A). User space only. Host only: not run on the phone.
+# Tree: src = base-src-y2s95 (= y2s95-final/src, the shipped-library sources + pressure diff) + y2s96-rt1.diff.
+control bash base-src-y2s95/build.sh base-src-y2s95 control-y2s95 -> Nord2Metal 29abe952 + libredwoodair.dylib 55de13de (= gpufinal5 exactly)
+diff   4323867978069e1fa1f4a0fa49cdf447ac8f74fc54d8b3d24949b29586691921  y2s96-rt1.diff
+result 4f0ad2088811e5dc9a09fd79f827ffd1029658d78bb5eb91b5b78c1c381b03ca  src/rwa_pan_fb.c (new)
+       11e2c9b0e1a63a03c13b93e1691ff4d79d1bd3632e62385d805437b64e4a8ca3  src/air_metal.c
+       8cb091c29ff57da1249590fbd2f983f467d7427954d46fcde1a20d0075361fac  src/redwoodmetal.m
+build  bash src/build.sh src . -> Nord2Metal          fe406e9c91b42f063235cbac4035977e63bf59012f7c731a0aa4587139435bfe
+                                  libredwoodair.dylib d9dd236ef7e7073b7990e75064172d6b2658835ed40e129ce3e72b97d4cfc9eb
+       (built twice, identical (rebuild/); redwoodmetal.err: the same 15 pre-existing warnings as y2s95, none new; air_metal/rwa_pan_fb: none)
+       rwa_pan_fb.o is compiled with pan_screen.c's command (build.sh, as rwa_pressure_pan.c); offsets checked in the binary against
+       Panfrost's own code: ctx->batch +0xa9b8, batches.slots +0x5a8, batch clear/draws/read/resolve +0x70/74/78/7c, nr_cbufs +0xf, cbufs +0x18.
+Host test: src/rwa-pan-fb-host-test.sh -> 'rwa_pan_fb: ok' (rwa_pan_fb.c against a model of pan_job.c's preload/store/valid rules:
+  DontCare load/store, keep of an earlier merged pass's store, restore by a later Load, no-fragment-job restore, unknown batch, deadstore
+  discard + ext violation, shared texture, forget, B off, shared resource/level; violations 0).
+What changed:
+  pressure: rw_mp_install makes no source unless /var/db/nord2-metal/pressure-on exists (no-pressure still wins) -> gpufinal4 behaviour.
+  B (rwa_pan_fb.c, default ON, off with no-rt1): attachments >= 1 only. Preload: at a draw whose attachment i is DontCare-loaded and slot i
+     untouched in its Panfrost batch, the level's valid bit is cleared (Panfrost decides preload at submit and the submit sets the bit again);
+     a later draw of the same batch that Loads slot i puts it back; a batch left without a fragment job / a destroyed texture get it back
+     at once; after every flush any bit still clear is put back and counted as a VIOLATION. Store: at the pass's LAST draw, slot i's resolve
+     bit is cleared when its store is DontCare and no earlier pass of the same batch asked to store it (merged passes: Apple would have
+     stored that tile). Array/3D/MSAA targets, a slot sharing resource+level with another attachment, batches not seen from their start: untouched.
+     Why default ON: what it produces is exactly what Apple's tile GPU produces for these actions (DontCare-loaded pixels undefined there
+     too; a DontCare store leaves memory as it was, which is what clearing resolve does), the merge cases are handled (keep / restore),
+     and the code paths are checked by the host test; the counter catches the one residual (a valid bit not set back by a submit).
+  B+ (opt-in rt1-deadstore): Store of attachment >= 1 treated as DontCare for a texture never sampled/blitted/read back/Loaded in this
+     process and not IOSurface/buffer-backed; a later read counted as ext violation. NOT shipped on.
+  C (default ON, off with no-singletarget): -commit pre-pass, per command buffer and target (attachment 0 texture+level+slice): when no
+     pass into it has colorCount 2 with a pipeline writing attachment 1 (writeMask), a clear of attachment 1, or attachment 1 == attachment 0,
+     attachment 1 becomes a NULL cbuf (nr_cbufs unchanged) for all its passes (draws and clear-only), so batch keys stay equal. The library
+     re-checks per draw (write mask, [[color(1)]] framebuffer fetch, clear) and keeps the slot otherwise ('refused'). Exact: memory keeps what
+     it held (Load+Store of an unwritten attachment / DontCare). Gains: no tile-buffer space for rt1, forward pixel kill allowed again.
+  rwa_draw: +load_actions, store_actions, fb_flags, fb_drop_mask, fb_magic ('FB96'), pad (360 bytes; both sides asserted); the library
+     reads them only with the magic. Export rwa_fb_stats(uint64_t[16]).
+  A (investigation only, flag trace-cc): backboardd forces the existing com.redwood.metal.trace (3 command buffers draw by draw) 60 s after
+     its first commit and then every 15 s, 20 times; trace step lines now end with '| a1 <tex> ld st wm drop [LAST]'.
+Lines: 'NORD2 GPU FB: pid= name= config rt1 on single-target on deadstore off library y2s96' once per process;
+       'NORD2 GPU FB: pid= name= rt1 drawn= preload avoided= store discarded= violations= | restored= unseen= | single-target cbs= targets=
+        works= draws= clears= refused= | deadstore off ...' every 5 s while it moves; 'NORD2 MEM GPU CTX: ... pressure handler OFF (no pressure-on)'.
+ship   apps-20261104/payload-gpufinal6{,-off,-tracecc,-undo}; guest-gpufinal6{,-undo}.sh; owned-gpufinal6{,-undo}.json;
+       -off ships no-rt1 + no-singletarget (= gpufinal4 behaviour), -tracecc ships trace-cc (made-by-gpufinal6); -undo carries the
+       thumbfix5/libmerge6 fallbacks.
+rehearsal apps-20261104/rehearse-gpufinal6.sh -> REHEARSAL_OK (rehearse-gpufinal6.log): over gpufinal4 = mirror = phone since cc-txn-gf4
+  (plain and +no-final; chain 6-undo -> 4-undo -> 3-undo), gpufinal5 over gpufinal4 (plain and -off; chain 6->5->4->3), gpufinal3, base,
+  thumbfix4+libmerge5, usecount1+libmerge6, gpufinal2; flags; user switches kept; fallbacks; refusals; owned.
+txn (gpu/build; image of cc-txn-gf4 = device-mmu-q10jgp-candidate/ui-sched/nord2-ios-metal-q10jgp-ui654fb60dvfs-cap3500-ram3776-sched.img, 46cffe08,
+     or whatever image the phone boots now: user-space change only):
+  PAYLOAD=payload-gpufinal6 GUEST=guest-gpufinal6.sh OWNED=$PWD/apps-20261104/owned-gpufinal6.json READS=600 autocycle/txn_g.sh <img> gf6
+  off:     PAYLOAD=payload-gpufinal6-off     GUEST=guest-gpufinal6.sh      OWNED=$PWD/apps-20261104/owned-gpufinal6.json      READS=600 autocycle/txn_g.sh <img> gf6off
+  trace:   PAYLOAD=payload-gpufinal6-tracecc GUEST=guest-gpufinal6.sh      OWNED=$PWD/apps-20261104/owned-gpufinal6.json      READS=600 autocycle/txn_g.sh <img> gf6tr
+  undo:    PAYLOAD=payload-gpufinal6-undo    GUEST=guest-gpufinal6-undo.sh OWNED=$PWD/apps-20261104/owned-gpufinal6-undo.json READS=600 autocycle/txn_g.sh <img> gf6u
+  (then, if wanted, gpufinal4's own undo: PAYLOAD=payload-gpufinal4-undo GUEST=guest-gpufinal4-undo.sh OWNED=$PWD/apps-20261104/owned-gpufinal4-undo.json ...)

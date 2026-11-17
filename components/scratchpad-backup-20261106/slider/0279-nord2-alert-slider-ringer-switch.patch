@@ -1,0 +1,450 @@
+--- a/bsd/dev/nord2_slider.inc	1970-01-01 01:00:00.000000000 +0100
++++ b/bsd/dev/nord2_slider.inc	1970-01-01 01:00:00.000000000 +0100
+@@ -0,0 +1,182 @@
++/*
++ * Nord2 alert slider (OPLUS tri-state key, project 20827) as the iOS
++ * ring/silent switch. Included by sweet_touch.c; runs only on the NORD2
++ * INPUT thread, which owns every software-I2C pin (ni_scl/ni_sda).
++ *
++ * Hardware, from the Android denniz kernel:
++ *  - cust_mt6893_oplus_tri_state_key_20827.dtsi: two hall sensors on I2C9
++ *    (GPIO120 = SCL9, GPIO121 = SDA9), either IST8801 (up 0x18, down 0x19,
++ *    DID 0x81) or MagnaChip MXM1120 (up 0x0D, down 0x0C, DID 0x9C). The
++ *    driver probes both pairs; only the fitted pair answers. INT outputs
++ *    on GPIO12/GPIO13 are not used: we poll with interrupts disabled.
++ *    Supplies VIO28 (vdd) and VIO18 (vio) are not switched here; a NACK
++ *    from every address means absent or unpowered, and the slider stays off.
++ *  - hall_ist8801_up.c reset_device/set_operation_mode/set_sensitivity("40mT")
++ *    and hall_mxm1120_up.c reset_device: the init sequences below, with
++ *    INTSRS interrupt-off (polling mode, same sensitivity bits).
++ *  - oplus_tri_key.c reboot_get_position(): delta = up - down (both negated
++ *    when either is negative); delta > 30 top, delta < -30 bottom, else middle.
++ *    OnePlus: top silent, middle vibrate, bottom ring (UP_STATE reports 1).
++ * iOS: top and middle -> silent, bottom -> ringer on (sweet_hid_ringer).
++ * Boot-arg nord2slider=0 leaves GPIO120/121 and the sensors untouched.
++ */
++extern void sweet_hid_ringer(int);
++
++enum { NS_TOP = 0, NS_BOTTOM = 1, NS_MIDDLE = 2 };	/* oplus enum tri_key_position */
++static const char *const ns_names[] = {"top/silent", "bottom/ring", "middle/vibrate"};
++static int ns_enabled = 1;
++static unsigned ns_chip;		/* 0 none, 1 IST8801, 2 MXM1120 */
++static uint8_t ns_addr[2];		/* [0] up hall (DHALL_1), [1] down hall (DHALL_0) */
++static int16_t ns_value[2];
++static unsigned ns_valid;
++static int ns_pos = -1, ns_cand = -1, ns_ring = -1;
++static unsigned ns_errors;
++
++static void
++ns_bus(void)
++{
++	ni_scl = NS_SCL;
++	ni_sda = NS_SDA;
++}
++
++static bool
++ns_rd(uint8_t addr, uint8_t reg, uint8_t *data, unsigned len)
++{
++	ns_bus();
++	return ni_bus_read(addr, reg, data, len);
++}
++
++static bool
++ns_wr(uint8_t addr, uint8_t reg, uint8_t value)
++{
++	ns_bus();
++	bool ok = ni_start() && ni_send((uint8_t)(addr << 1)) && ni_send(reg) && ni_send(value);
++	bool stopped = ni_stop();
++	return ok && stopped;
++}
++
++static bool
++ns_ist_init(uint8_t a)
++{
++	uint8_t id = 0, ifc = 0, info = 0;
++	if (!ns_rd(a, 0x09, &id, 1) || id != 0x81) { return false; }
++	if (!ns_wr(a, 0x07, 0x01)) { return false; }	/* SRST */
++	ni_wait(20);
++	if (!ns_rd(a, 0x09, &id, 1) || id != 0x81) { return false; }
++	bool ok = ns_wr(a, 0x76, 0x04) &&		/* TSTCNTL */
++	    ns_wr(a, 0x6c, 0x05) &&			/* OSRCNTL */
++	    ns_rd(a, 0x87, &info, 1) &&			/* INFO, log only (40mT row is the same) */
++	    ns_wr(a, 0x00, 0x20) &&			/* PERSINT count 2 */
++	    ns_wr(a, 0x01, 0x00) &&			/* INTSRS: interrupt off, range 0 */
++	    ns_wr(a, 0x20, 0x00);			/* ACTION */
++	if (!ok) { return false; }
++	ni_wait(5);
++	ok = ns_wr(a, 0x08, 0x00) &&			/* OPF standby */
++	    ns_rd(a, 0x40, &ifc, 1) && ns_wr(a, 0x40, (uint8_t)(ifc | 0x04)) &&	/* IFCNTL */
++	    ns_wr(a, 0x0d, 0x2c) &&			/* CNTL2: 40mT = GAIN x2, 10-bit ADC */
++	    ns_wr(a, 0x08, 0x70);			/* OPF: 20 Hz continuous */
++	printf("NORD2 SLIDER: IST8801 %#x info=%#x ifcntl=%#x ok=%d\n", a, info, ifc, ok);
++	return ok;
++}
++
++static bool
++ns_mxm_init(uint8_t a)
++{
++	uint8_t id = 0;
++	if (!ns_rd(a, 0x09, &id, 1) || id != 0x9c) { return false; }
++	if (!ns_wr(a, 0x07, 0x01)) { return false; }	/* SRST */
++	ni_wait(20);
++	if (!ns_rd(a, 0x09, &id, 1) || id != 0x9c) { return false; }
++	bool ok = ns_wr(a, 0x00, 0xf0) &&		/* PERSINT 15 << 4 */
++	    ns_wr(a, 0x01, 0x00) &&			/* INTSRS: interrupt off, 10-bit 0.068 mT */
++	    ns_wr(a, 0x08, 0x40) &&			/* OPF: 80 Hz, 10-bit */
++	    ns_wr(a, 0x08, 0x41);			/* measurement (HSSON) */
++	printf("NORD2 SLIDER: MXM1120 %#x ok=%d\n", a, ok);
++	return ok;
++}
++
++static bool
++ns_read_hall(unsigned i)
++{
++	uint8_t b[3] = {0};
++	if (!ns_rd(ns_addr[i], 0x10, b, 3)) { return false; }
++	if (ns_chip == 1) {
++		if (b[0] & 0x05) {			/* ST1 DRDY or overrun: hall_ist8801_up.c get_data */
++			ns_value[i] = (int16_t)((b[2] << 8) | b[1]);
++			ns_valid |= 1u << i;
++		}
++	} else if (b[0] & 0x01) {			/* m1120_2byte_to_short, 10-bit */
++		int x = ((b[2] & 0x40) ? 0x100 : 0) | b[1];
++		if (b[2] & 0x80) { x -= 0x200; }
++		ns_value[i] = (int16_t)x;
++		ns_valid |= 1u << i;
++	}
++	return true;
++}
++
++static int
++ns_decode(int16_t up, int16_t down)
++{
++	int16_t delta = (up < 0 || down < 0) ? (int16_t)(-up - -down) : (int16_t)(up - down);
++	return delta > 30 ? NS_TOP : (-delta > 30 ? NS_BOTTOM : NS_MIDDLE);
++}
++
++/* One sample of both halls. A position counts after two equal decodes in a
++ * row; iOS gets an event for the first one and whenever ring/silent changes
++ * (top <-> middle is silent -> silent: logged, no event). */
++static void
++ns_poll(void)
++{
++	if (!ns_chip) { return; }
++	if (!ns_read_hall(0) || !ns_read_hall(1)) {
++		if ((ns_errors++ % 100) == 0) {
++			printf("NORD2 SLIDER: read error stage=%u scl=%d sda=%d\n",
++			    ni_stage, ni_level(NS_SCL), ni_level(NS_SDA));
++		}
++		return;
++	}
++	ns_errors = 0;
++	if (ns_valid != 3) { return; }
++	int pos = ns_decode(ns_value[0], ns_value[1]);
++	if (pos != ns_cand) { ns_cand = pos; return; }
++	if (pos == ns_pos) { return; }
++	bool initial = ns_pos < 0;
++	int ring = pos == NS_BOTTOM;
++	ns_pos = pos;
++	printf("NORD2 SLIDER: %s%s up=%d down=%d -> iOS ringer %s\n", initial ? "initial " : "",
++	    ns_names[pos], ns_value[0], ns_value[1], ring ? "on" : "silent");
++	if (ring != ns_ring) {
++		ns_ring = ring;
++		sweet_hid_ringer(ring);
++	}
++}
++
++/* After the pins are GPIO inputs with DOUT 0 and IES set. */
++static void
++ns_probe(void)
++{
++	if (!ns_enabled) {
++		printf("NORD2 SLIDER: disabled (nord2slider=0)\n");
++		return;
++	}
++	if (!ni_level(NS_SCL) || !ni_level(NS_SDA)) {
++		printf("NORD2 SLIDER: I2C9 not idle scl=%d sda=%d; slider off\n",
++		    ni_level(NS_SCL), ni_level(NS_SDA));
++		return;
++	}
++	if (ns_ist_init(0x18) && ns_ist_init(0x19)) {
++		ns_chip = 1; ns_addr[0] = 0x18; ns_addr[1] = 0x19;
++	} else if (ns_mxm_init(0x0d) && ns_mxm_init(0x0c)) {
++		ns_chip = 2; ns_addr[0] = 0x0d; ns_addr[1] = 0x0c;
++	} else {
++		printf("NORD2 SLIDER: no IST8801 (0x18/0x19) or MXM1120 (0x0d/0x0c) pair; stage=%u slider off\n",
++		    ni_stage);
++		return;
++	}
++	ni_wait(120);			/* first conversions (20 Hz / 80 Hz) */
++	ns_poll();
++	ni_wait(60);
++	ns_poll();			/* second equal decode publishes the boot state */
++	printf("NORD2 SLIDER: %s up=%#x down=%#x, polled every 100 ms, state=%d\n",
++	    ns_chip == 1 ? "IST8801" : "MXM1120", ns_addr[0], ns_addr[1], ns_pos);
++}
+--- a/bsd/dev/sweet_touch.c	2026-11-05 20:03:09.651316249 +0100
++++ b/bsd/dev/sweet_touch.c	2026-11-05 20:12:05.731812229 +0100
+@@ -27,8 +27,9 @@
+ extern void sweet_hid_touch(int, int, int, int);
+ 
+ enum { NI_SCL = 204, NI_SDA = 205, NI_RESET = 20, NI_IRQ = 21, NI_VOLDN = 155, NI_PSCL = 202, NI_PSDA = 203 };
++enum { NS_SCL = 120, NS_SDA = 121 }; /* I2C9: alert-slider hall sensors (nord2_slider.inc) */
+ static unsigned ni_scl = NI_SCL, ni_sda = NI_SDA;
+-static vm_offset_t ni_gpio, ni_lt, ni_tm, ni_rt, ni_pwrap;
++static vm_offset_t ni_gpio, ni_lt, ni_tm, ni_rt, ni_br, ni_pwrap;
+ static bool ni_started, ni_saved, ni_bus_owned, ni_pwrap_owned;
+ static int ni_chan;
+ static uint32_t ni_active;
+@@ -37,8 +38,10 @@
+ static struct {
+ 	unsigned pin, mux, dir, dout;
+ } ni_pins[] = {{NI_SCL,0,0,0}, {NI_SDA,0,0,0}, {NI_RESET,0,0,0},
+-              {NI_IRQ,0,0,0}, {NI_VOLDN,0,0,0}, {NI_PSCL,0,0,0}, {NI_PSDA,0,0,0}};
+-static uint32_t ni_ies_lt, ni_ies_tm, ni_ies_rt, ni_ies_pwr;
++              {NI_IRQ,0,0,0}, {NI_VOLDN,0,0,0}, {NI_PSCL,0,0,0}, {NI_PSDA,0,0,0},
++              {NS_SCL,0,0,0}, {NS_SDA,0,0,0}};
++static uint32_t ni_ies_lt, ni_ies_tm, ni_ies_rt, ni_ies_pwr, ni_ies_br;
++#define NI_BR_IES_I2C9 ((1u << 4) | (1u << 14)) /* iocfg_br+0x70: GPIO120/121 IES (pinctrl-mt6885.c) */
+ static bool ni_ldo_changed;
+ static uint8_t ni_ldo_en, ni_ldo_volt;
+ static unsigned ni_stage;
+@@ -760,6 +763,8 @@
+ 	if (!restored) { panic("NORD2 WIFI: restoration failed; refuse Linux return"); }
+ }
+ 
++#include "nord2_slider.inc"
++
+ int
+ nord2_input_prepare_return(void)
+ {
+@@ -782,6 +787,7 @@
+ 	if (ni_bus_owned) {
+ 		ni_bus(false); (void)ni_stop();
+ 		ni_bus(true); (void)ni_stop();
++		if (ns_enabled) { ns_bus(); (void)ni_stop(); }
+ 		power_ok = ni_power_restore();
+ 		ni_bus(false);
+ 	}
+@@ -796,6 +802,7 @@
+ 	ni_mask(ni_tm, 0x50, 3u << 12, ni_ies_tm);
+ 	ni_mask(ni_tm, 0x60, (1u << 3) | (1u << 6), ni_ies_pwr);
+ 	ni_mask(ni_rt, 0x30, 1u << 24, ni_ies_rt);
++	ni_mask(ni_br, 0x70, NI_BR_IES_I2C9, ni_ies_br);
+ 	ni_saved = false;
+ 	return idle && power_ok ? 1 : -1;
+ }
+@@ -809,8 +816,10 @@
+ 	ni_lt = ml_io_map(0x11f20000, 0x1000);
+ 	ni_tm = ml_io_map(0x11f30000, 0x1000);
+ 	ni_rt = ml_io_map(0x11ea0000, 0x1000);
++	ni_br = ml_io_map(0x11d10000, 0x1000);
+ 	ni_pwrap = ml_io_map(0x10026000, 0x1000);
+-	if (!ni_gpio || !ni_lt || !ni_tm || !ni_rt || !ni_pwrap) {
++	PE_parse_boot_argn("nord2slider", &ns_enabled, sizeof(ns_enabled));
++	if (!ni_gpio || !ni_lt || !ni_tm || !ni_rt || !ni_br || !ni_pwrap) {
+ 		panic("NORD2 INPUT: mapping failed");
+ 	}
+ 	for (unsigned i = 0; i < sizeof(ni_pins) / sizeof(ni_pins[0]); i++) {
+@@ -825,14 +834,17 @@
+ 	ni_ies_tm = ni_rd(ni_tm, 0x50);
+ 	ni_ies_pwr = ni_rd(ni_tm, 0x60);
+ 	ni_ies_rt = ni_rd(ni_rt, 0x30);
++	ni_ies_br = ni_rd(ni_br, 0x70);
+ 	ni_saved = true; /* snapshots complete before first mutation */
+ 	ni_wifi_snapshot(); /* PMIF cleanup is now armed, before any GPIO change. */
+ 	nrpa_prepare_before_power(); /* sleepable UFS before radio ownership */
+ 	ni_wifi_power_probe();
+ 	for (unsigned i = 0; i < sizeof(ni_pins) / sizeof(ni_pins[0]); i++) {
+ 		unsigned pin = ni_pins[i].pin;
++		if ((pin == NS_SCL || pin == NS_SDA) && !ns_enabled) { continue; }
+ 		ni_gpio_bit(pin, 0, false);
+-		if (pin == NI_SDA || pin == NI_SCL || pin == NI_PSCL || pin == NI_PSDA) {
++		if (pin == NI_SDA || pin == NI_SCL || pin == NI_PSCL || pin == NI_PSDA ||
++		    pin == NS_SCL || pin == NS_SDA) {
+ 			ni_gpio_bit(pin, 0x100, false);
+ 		}
+ 		ni_mask(ni_gpio, 0x300 + pin / 8 * 16, 15u << (pin % 8 * 4), 0);
+@@ -841,6 +853,7 @@
+ 	ni_mask(ni_tm, 0x50, 3u << 12, 3u << 12);
+ 	ni_mask(ni_tm, 0x60, (1u << 3) | (1u << 6), (1u << 3) | (1u << 6));
+ 	ni_mask(ni_rt, 0x30, 1u << 24, 1u << 24);
++	if (ns_enabled) { ni_mask(ni_br, 0x70, NI_BR_IES_I2C9, NI_BR_IES_I2C9); }
+ 	ni_bus_owned = true;
+ 	/* Keep reset asserted while checking/enabling only its dedicated rail. */
+ 	ni_gpio_bit(NI_RESET, 0x100, false);
+@@ -861,7 +874,9 @@
+ 	printf("NORD2 INPUT: software I2C0, x4 coordinates, PMIC power/up and GPIO155 down; poll=10ms\n");
+ 	/* Publish retained maps only after this owner finishes initial GPIO writes. */
+ 	nah_native_publish_ready();
+-	unsigned errors = 0, ticks = 0, key_errors = 0;
++	ns_probe(); /* alert slider: publishes the boot ring/silent state */
++	ni_bus(false);
++	unsigned errors = 0, ticks = 0, key_errors = 0, slider_ticks = 0;
+ 	int state[3] = {0}, previous[3] = {-1, -1, -1};
+ 	for (;;) {
+         extern void nord2_gpu_owner_poll(void);
+@@ -898,6 +913,7 @@
+ 				if (errors >= 3) { ni_report(0, ni_x, ni_y); }
+ 			} else { errors = 0; }
+ 		}
++		if ((++slider_ticks % 10) == 0) { ns_poll(); }
+ 		ni_wait(10);
+ 	}
+ }
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp	2026-10-23 16:27:33.000000000 +0200
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-05 21:27:53.509168011 +0100
+@@ -13,12 +13,14 @@
+  *   SweetHIDTouch    the built-in touch screen (digitizer collections)
+  *
+  * Hardware drivers feed them through the C entry points sweet_hid_key()
+- * and sweet_hid_touch(). Boot-arg sweethidtest=N (seconds) presses Home
++ * and sweet_hid_touch(). sweet_hid_ringer() reports the ring/silent switch
++ * (Nord2 alert slider) on the buttons service. Boot-arg sweethidtest=N (seconds) presses Home
+  * every N seconds, to test the event path without input hardware.
+  */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOTimerEventSource.h>
++#include <IOKit/IODeviceTreeSupport.h>
+ #include <libkern/c++/OSArray.h>
+ #include <pexpert/pexpert.h>
+ 
+@@ -330,6 +332,11 @@
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void key(UInt32 usage, bool down);
++	void ringer(bool ringOn);
++#if defined(NORD2)
++	void publishRingerSwitch(void);
++#endif
++	virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching, IOOptionBits options) APPLE_KEXT_OVERRIDE;
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Consumer; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Csmr_ConsumerControl; }
+@@ -378,6 +385,17 @@
+ static SweetHIDButtons *gSweetButtons;
+ static SweetHIDTouch *gSweetTouch;
+ 
++/*
++ * Ring/silent switch. iOS 16.7 backboardd (ringer processor,
++ * -processEvent:sender:dispatcher:) takes a keyboard event with usage page
++ * 0x0B (Telephony) and usage 0x2E (kHIDUsage_Tfon_Ring): ringer state =
++ * (KeyboardDown != 0), 1 = "tone1" (ringer on), 0 = "silent". At start it
++ * asks the services for the current state with a keyboard copyEvent
++ * matching 0x0B/0x2E; without an answer its state stays 0 (silent).
++ * -1 = no hardware reading yet, 0 = silent, 1 = ringer on.
++ */
++static volatile SInt32 gSweetRinger = -1;
++
+ bool
+ SweetHIDButtons::start(IOService *provider)
+ {
+@@ -391,11 +409,51 @@
+ 		}
+ 	}
+ 	gSweetButtons = this;
++#if defined(NORD2)
++	publishRingerSwitch();
++#endif
+ 	registerService();
+ 	IOLog("SWEET HID: buttons registered (test every %u s)\n", fTestSecs);
+ 	return true;
+ }
+ 
++#if defined(NORD2)
++/*
++ * MobileGestalt "ringer-switch" (libMobileGestalt: IODeviceTree:/buttons has a
++ * property named "function-button_ringerab", key hash Ah5yfSlY2yycIQb92HbmrA).
++ * SpringBoard's -_updateRingerState:withVisuals:updatePreferenceRegister:
++ * returns at once when that answer is false: no mute state, no HUD, no
++ * com.apple.springboard.ringerstate update. The ADT /buttons node lacks it,
++ * so add it here, before userland. Value as in the D22AP ADT (phandle
++ * 0x4e + 'RntbNIRb'); only its presence is read. nord2slider=0 skips it.
++ */
++void
++SweetHIDButtons::publishRingerSwitch(void)
++{
++	int slider = 1;
++	(void)PE_parse_boot_argn("nord2slider", &slider, sizeof(slider));
++	if (!slider) {
++		return;
++	}
++	IORegistryEntry *buttons = IORegistryEntry::fromPath("/buttons", gIODTPlane);
++	if (!buttons) {
++		IOLog("SWEET HID: no IODeviceTree:/buttons; ringer-switch not published\n");
++		return;
++	}
++	if (!buttons->getProperty("function-button_ringerab")) {
++		static const UInt8 value[12] = {0x4e, 0, 0, 0, 'R', 'n', 't', 'b', 'N', 'I', 'R', 'b'};
++		OSData *data = OSData::withBytes(value, sizeof(value));
++		if (data) {
++			buttons->setProperty("function-button_ringerab", data);
++			data->release();
++		}
++	}
++	IOLog("SWEET HID: IODeviceTree:/buttons function-button_ringerab %s\n",
++	    buttons->getProperty("function-button_ringerab") ? "present" : "missing");
++	buttons->release();
++}
++#endif
++
+ void
+ SweetHIDButtons::key(UInt32 usage, bool down)
+ {
+@@ -410,6 +468,37 @@
+ }
+ 
+ void
++SweetHIDButtons::ringer(bool ringOn)
++{
++	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_Telephony,
++	    kHIDUsage_Tfon_Ring, ringOn);
++
++	if (event) {
++		IOLog("SWEET HID: ringer %s (%u clients)\n", ringOn ? "on" : "silent",
++		    _clients ? _clients->getCount() : 0);
++		dispatchEvent(event);
++		event->release();
++	}
++}
++
++IOHIDEvent *
++SweetHIDButtons::copyEvent(IOHIDEventType type, IOHIDEvent *matching, IOOptionBits options __unused)
++{
++	SInt32 state = gSweetRinger;
++
++	if (type != kIOHIDEventTypeKeyboard || state < 0) {
++		return NULL;
++	}
++	if (matching && (matching->getType() != kIOHIDEventTypeKeyboard ||
++	    (UInt32)matching->getIntegerValue(kIOHIDEventFieldKeyboardUsagePage) != kHIDPage_Telephony ||
++	    (UInt32)matching->getIntegerValue(kIOHIDEventFieldKeyboardUsage) != kHIDUsage_Tfon_Ring)) {
++		return NULL;
++	}
++	return IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_Telephony, kHIDUsage_Tfon_Ring,
++	           state != 0);
++}
++
++void
+ SweetHIDButtons::testFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	SweetHIDButtons *self = (SweetHIDButtons *)owner;
+@@ -552,6 +641,17 @@
+ 	}
+ }
+ 
++/* ring_on: 1 ringer on, 0 silent. Every call dispatches one event. */
++extern "C" void sweet_hid_ringer(int ring_on);
++extern "C" void
++sweet_hid_ringer(int ring_on)
++{
++	gSweetRinger = ring_on ? 1 : 0;
++	if (gSweetButtons) {
++		gSweetButtons->ringer(ring_on != 0);
++	}
++}
++
+ extern "C" void
+ sweet_hid_touch(int finger, int down, int x, int y)
+ {

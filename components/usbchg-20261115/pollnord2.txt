@@ -1,0 +1,156 @@
+#if defined(NORD2)
+/*
+ * 0701 (usbchg-20261115): what iOS sees.
+ *  - external / charging follow the MP2650 status with the corrected VIN power-good polarity (nord2_battery.c);
+ *  - a failed sample no longer publishes 0 % / MaxCapacity 0: the last valid sample is held for kern.n2bat_hold_s (120 s), marked
+ *    Nord2BatterySOCStale, and only then the source is invalidated (that 0/0 blink was one cause of the "odd" percentage);
+ *  - displayed SOC: the gauge RSOC (0x2c), with a one-step direction filter (kern.n2bat_filter): a +-1 % flicker against the sign
+ *    of the measured current is not shown (raw SOC stays in Nord2BatteryRawSOC and the log);
+ *  - iPhone-style keys: CurrentCapacity/MaxCapacity in percent, AppleRawCurrentCapacity/AppleRawMaxCapacity/NominalChargeCapacity in
+ *    mAh from the gauge (RM/FCC), Amperage = AverageCurrent, InstantAmperage = Current, time to empty/full, AdapterDetails;
+ *  - poll every kern.n2bat_poll_ms (10 s, was 30 s); one "NORD2 BAT14:" line per change or every kern.n2bat_log_s.
+ *  kern.n2bat_legacy=1 = the pre-0701 publishing (kill switch; the polarity fix stays).
+ */
+extern "C" {
+extern unsigned nord2_bat_poll_ms, nord2_bat_hold_s, nord2_bat_filter, nord2_bat_log_s, nord2_bat_legacy;
+extern unsigned nord2_chg_policy_type(void);      /* 0702 (0 = no charger control in this kernel), nord2_battery.c */
+extern const char *nord2_chg_policy_name(void);
+}
+static struct nbg_sample n2b_last;
+static uint64_t n2b_last_ms, n2b_log_ms;
+static unsigned n2b_shown = 101, n2b_last_pg = 9, n2b_last_state = 9, n2b_last_logged = 101, n2b_fail;
+static uint64_t
+n2b_now_ms(void)
+{
+ uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns / 1000000ull;
+}
+void
+SweetBattery::pollNord2(void)
+{
+ struct nbg_sample s = {};
+ int rc = fReal ? nord2_battery_platform_sample(&s) : -1;
+ if(rc != 0){s = (struct nbg_sample){};}
+ bool valid = rc == 0 && s.soc_valid && s.percent <= 100;
+ if(nord2_bat_legacy){
+  setBatteryInstalled(true);
+  setCurrentCapacity(valid ? s.percent : 0);
+  setMaxCapacity(valid ? 100 : 0);
+  setTimeRemaining(-1);
+  setExternalConnected(s.charger_valid && s.external);
+  setExternalChargeCapable(s.charger_valid && s.external);
+  setIsCharging(s.charger_valid && s.charging);
+  setVoltage(s.voltage_valid ? s.pack_mv : 0);
+  setAmperage(s.current_valid ? s.current_ma : 0);
+  setAtWarnLevel(false); setAtCriticalLevel(false);
+  putBool("FullyCharged", s.charger_valid && s.full);
+  putBool("Nord2BatterySOCValid", valid);
+  putBool("Nord2BatteryTemperatureValid", s.temperature_valid);
+  putNumber("Temperature", s.temperature_valid ? (UInt32)s.temperature_centi_c : 0);
+  const OSSymbol *e0 = OSSymbol::withCString(valid ? "" : "Battery sample unavailable");
+  if(e0){setErrorCondition((OSSymbol *)e0);e0->release();}
+  updateStatus();
+  return;
+ }
+ uint64_t now = n2b_now_ms();
+ bool stale = false;
+ if(valid){
+  /* ancillary fields missing in this sample: keep the previous ones (never fabricate on a first sample) */
+  if(!s.temperature_valid && n2b_last.temperature_valid){s.temperature_valid = 1; s.temperature_centi_c = n2b_last.temperature_centi_c;}
+  if(!s.voltage_valid && n2b_last.voltage_valid){s.voltage_valid = 1; s.pack_mv = n2b_last.pack_mv;}
+  n2b_last = s; n2b_last_ms = now; n2b_fail = 0;
+ } else if(n2b_last.soc_valid && now - n2b_last_ms <= (uint64_t)nord2_bat_hold_s * 1000ull){
+  n2b_fail++; s = n2b_last; valid = true; stale = true;
+ } else {
+  n2b_fail++;
+ }
+ int amps = s.avg_valid ? s.avg_current_ma : (s.current_valid ? s.current_ma : 0);
+ bool ampsValid = s.avg_valid || s.current_valid;
+ unsigned shown = valid ? s.percent : 0;
+ if(valid && nord2_bat_filter && n2b_shown <= 100 && ampsValid){
+  /* one-step flicker against the current direction is not shown */
+  if(shown == n2b_shown + 1 && amps < -50) shown = n2b_shown;
+  else if(shown + 1 == n2b_shown && amps > 50) shown = n2b_shown;
+ }
+ if(valid) n2b_shown = shown;
+ bool ext = s.charger_valid && s.external;
+ bool full = ext && s.full;
+ bool chg = ext && s.charging && !full;
+ unsigned fcc = s.capacity_valid ? s.fcc_mah : 4500u;
+ unsigned rm = s.capacity_valid ? s.rm_mah : (4500u * shown + 50u) / 100u;
+ int minutes = -1;
+ if(valid && ampsValid && s.capacity_valid){
+  if(amps < -30) minutes = (int)((uint64_t)rm * 60u / (unsigned)(-amps));
+  else if(chg && amps > 30 && fcc > rm) minutes = (int)((uint64_t)(fcc - rm) * 60u / (unsigned)amps);
+ }
+ setBatteryInstalled(true);
+ setCurrentCapacity(valid ? shown : 0);
+ setMaxCapacity(valid ? 100 : 0);
+ setTimeRemaining(minutes);
+ setExternalConnected(ext);
+ setExternalChargeCapable(ext);
+ setIsCharging(chg);
+ setVoltage(s.voltage_valid ? s.pack_mv : 0);
+ setAmperage(ampsValid ? amps : 0);
+ setAtWarnLevel(valid && shown <= 10);
+ setAtCriticalLevel(false);
+ putBool("FullyCharged", full);
+ putBool("AppleRawExternalConnected", ext);
+ putNumber("AppleRawCurrentCapacity", valid ? rm : 0);
+ putNumber("AppleRawMaxCapacity", valid ? fcc : 0);
+ putNumber("NominalChargeCapacity", fcc);
+ putNumber("DesignCapacity", 4500);
+ putNumber("AppleRawBatteryVoltage", s.voltage_valid ? s.pack_mv : 0);
+ putNumber("InstantAmperage", (UInt32)(s.current_valid ? s.current_ma : amps));
+ putNumber("AvgTimeToEmpty", (!chg && minutes > 0) ? (UInt32)minutes : 65535u);
+ putNumber("AvgTimeToFull", (chg && minutes > 0) ? (UInt32)minutes : 65535u);
+ putNumber("Nord2BatteryRawSOC", valid ? s.percent : 0);
+ putBool("Nord2BatterySOCValid", valid);
+ putBool("Nord2BatteryGaugeComputedSOC", valid);
+ putBool("Nord2BatterySOCStale", !valid || stale);
+ putBool("Nord2BatteryChargerValid", s.charger_valid);
+ putBool("Nord2BatteryCurrentValid", ampsValid);
+ putBool("Nord2BatteryVoltageValid", s.voltage_valid);
+ putBool("Nord2BatteryTemperatureValid", s.temperature_valid && !stale);
+ putNumber("Temperature", s.temperature_valid ? (UInt32)s.temperature_centi_c : 0);
+ putBool("SweetBatterySOCEstimated", false);
+ putBool("SweetBatteryTemperatureEstimated", false);
+ putBool("SweetBatteryFallback", false);
+ if(ext){
+  OSDictionary *ad = OSDictionary::withCapacity(4);
+  if(ad){
+   unsigned vin = s.vin_mv ? s.vin_mv : 5000u, ilim = s.ilim_ma ? s.ilim_ma : 500u;
+   OSNumber *w = OSNumber::withNumber((unsigned long long)((vin * ilim + 500000u) / 1000000u), 32);
+   OSNumber *cu = OSNumber::withNumber((unsigned long long)ilim, 32);
+   OSNumber *vo = OSNumber::withNumber((unsigned long long)vin, 32);
+   OSString *de = OSString::withCString(nord2_chg_policy_type() ? nord2_chg_policy_name() : "usb");
+   if(w){ad->setObject("Watts", w); w->release();}
+   if(cu){ad->setObject("Current", cu); cu->release();}
+   if(vo){ad->setObject("Voltage", vo); vo->release();}
+   if(de){ad->setObject("Description", de); de->release();}
+   const OSSymbol *k = OSSymbol::withCString("AdapterDetails");
+   if(k){setPSProperty(k, ad); k->release();}
+   ad->release();
+  }
+ } else {
+  const OSSymbol *k = OSSymbol::withCString("AdapterDetails");
+  OSDictionary *none = OSDictionary::withCapacity(1);
+  if(k && none){setPSProperty(k, none);}
+  OSSafeReleaseNULL(none); OSSafeReleaseNULL(k);
+ }
+ const OSSymbol *error = OSSymbol::withCString(valid ? "" : "Battery sample unavailable");
+ if(error){setErrorCondition((OSSymbol *)error);error->release();}
+ updateStatus();
+ int mode = valid ? 2 : 3;
+ if(mode != fLastMode){IOLog("NORD2 BATTERY: soc_valid=%d percent=%u charger_valid=%u external=%u charging=%u\n",valid,valid?s.percent:0,s.charger_valid,s.external,s.charging);fLastMode=mode;}
+ bool change = shown != n2b_last_logged || s.power_good != n2b_last_pg || s.chg_state != n2b_last_state || stale;
+ if(change || now - n2b_log_ms >= (uint64_t)nord2_bat_log_s * 1000ull){
+  IOLog("NORD2 BAT14: t=%llus shown=%u raw=%u rm=%u fcc=%u mv=%u cur=%d avg=%d temp=%d.%02dC | chg valid=%u pg=%u state=%u ppm=%u aicl=%u"
+   " ntc=%u fault=%u vin=%umV iin=%umA ichg_adc=%umA ilim=%u ichg_set=%u en=%u hiz=%u | ios ext=%u charging=%u full=%u mins=%d stale=%u fails=%u policy=%s\n",
+   now / 1000ull, shown, valid ? s.percent : 0, s.rm_mah, s.fcc_mah, s.pack_mv, s.current_valid ? s.current_ma : 0, s.avg_valid ? s.avg_current_ma : 0,
+   s.temperature_centi_c / 100, (s.temperature_centi_c < 0 ? -s.temperature_centi_c : s.temperature_centi_c) % 100,
+   s.charger_valid, s.power_good, s.chg_state, s.ppm, s.aicl, s.ntc_fault, s.chg_fault, s.vin_mv, s.iin_ma, s.ichg_adc_ma, s.ilim_ma, s.ichg_set_ma,
+   s.chg_en, s.learn, ext, chg, full, minutes, stale, n2b_fail, nord2_chg_policy_type() ? nord2_chg_policy_name() : "off");
+  n2b_log_ms = now; n2b_last_logged = shown; n2b_last_pg = s.power_good; n2b_last_state = s.chg_state;
+ }
+}
+#endif

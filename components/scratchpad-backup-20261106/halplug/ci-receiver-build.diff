@@ -1,0 +1,562 @@
+diff -ruN a/.github/workflows/xnu.yml b/.github/workflows/xnu.yml
+--- a/.github/workflows/xnu.yml	2026-11-06 00:39:51.785733978 +0100
++++ b/.github/workflows/xnu.yml	2026-11-06 00:39:51.796573538 +0100
+@@ -68,7 +68,7 @@
+           xcrun --find iig
+ 
+       - name: Build pinned Nord2 iOS audio HAL
+-        run: python3 tools/nord2-build-audio-plugin.py nord2-audio-hal
++        run: python3 tools/nord2-build-audio-plugin.py nord2-audio-hal --patch tools/nord2-audio-plugin-receiver.patch
+ 
+       - uses: actions/upload-artifact@v4
+         with:
+diff -ruN a/tools/nord2-audio-plugin-receiver.patch b/tools/nord2-audio-plugin-receiver.patch
+--- a/tools/nord2-audio-plugin-receiver.patch	1970-01-01 01:00:00.000000000 +0100
++++ b/tools/nord2-audio-plugin-receiver.patch	2026-11-06 17:01:10.734558245 +0100
+@@ -0,0 +1,510 @@
++--- a/audio_plugin.c
+++++ b/audio_plugin.c
++@@ -29,7 +29,10 @@
++  *   "Codec"     one input of one channel: on an iPhone, the audio codec that the built-in
++  *               microphones are on, of which the virtual audio device makes the built-in microphone
++  *               port; its samples come from the kernel, /dev/redwood-mic (the phone's main
++- *               microphone, boot-arg mic=4), which listens only while this input runs (see codec_read())
+++ *               microphone, boot-arg mic=4), which listens only while this input runs (see codec_read());
+++ *               and a four-channel output whose third channel is the receiver, the earpiece (see "The
+++ *               receiver" below), with the mute and volume controls of that channel and a mute control
+++ *               on the input (the Phone app's mute button)
++  *
++  * CoreAudio's own null device ("Null_Device", described in the framework's Info.plist, playing
++  * into nowhere) stays as it is: it is the only device the virtual audio device takes while it
++@@ -63,6 +66,7 @@
++ #include <stdarg.h>
++ #include <stdio.h>
++ #include <string.h>
+++#include <syslog.h>
++ #include <unistd.h>
++ 
++ #include "redwood_audio.h"
++@@ -173,6 +177,8 @@
++ 	kAudioStreamPropertyPhysicalFormat = 'pft ', kAudioStreamPropertyAvailablePhysicalFormats = 'pfta',
++ 
++ 	kAudioStreamTerminalTypeSpeaker = 'spkr', kAudioStreamTerminalTypeMicrophone = 'micr',
+++	kAudioStreamTerminalTypeReceiverSpeaker = 'rspk',
+++	kAudioDevicePropertyMute = 'mute',
++ 
++ 	kAudioServerPlugInIOOperationReadInput = 'read', kAudioServerPlugInIOOperationWriteMix = 'rite',
++ 
++@@ -181,7 +187,13 @@
++ 	kAudioLevelControlPropertyScalarValue = 'lcsv', kAudioLevelControlPropertyDecibelValue = 'lcdv',
++ 	kAudioLevelControlPropertyDecibelRange = 'lcdr', kAudioLevelControlPropertyConvertScalarToDecibels = 'lcsd',
++ 	kAudioLevelControlPropertyConvertDecibelsToScalar = 'lcds',
+++	kAudioBooleanControlClassID = 'togl', kAudioMuteControlClassID = 'mute', kAudioBooleanControlPropertyValue = 'bcvl',
++ };
+++/* The codec's output channel of the receiver: the virtual audio device makes the iPhone codec's receiver port only when
+++ * the device has a mute property on this output element ('mute'/'outp'/3: Device_Codec_Aspen.cpp, VirtualAudio 0x240358;
+++ * element 4 would make a second speaker port there), and finds the port's volume and mute controls by it. */
+++#define RECEIVER_ELEMENT        3
+++#define CODEC_OUTPUT_CHANNELS   4
++ 
++ /* ---- the devices ---------------------------------------------------------------------------------- */
++ 
++@@ -197,7 +209,16 @@
++ 	OBJECT_CODEC, OBJECT_CODEC_INPUT,
++ 	OBJECT_SPEAKER_VOLUME,          /* the speaker output's volume control */
++ 	OBJECT_CODEC_SOURCE,            /* the codec input's data source control: its microphones */
++-	OBJECT_LAST = OBJECT_CODEC_SOURCE
+++	OBJECT_CODEC_OUTPUT,            /* the codec's output: channel RECEIVER_ELEMENT is the receiver (earpiece) */
+++	OBJECT_RECEIVER_VOLUME,         /* the receiver's volume control: iOS's call volume on the earpiece */
+++	OBJECT_RECEIVER_MUTE,           /* the receiver's mute control */
+++	OBJECT_MIC_MUTE,                /* the codec input's mute control: the Phone app's mute button */
+++	OBJECT_SPEAKER_IN_MUTE,         /* the speaker input's: the same button when a call's aggregate takes that input */
+++	OBJECT_MIC_VOLUME,              /* the codec input's volume controls (master, channel 1): the virtual audio device */
+++	OBJECT_MIC_VOLUME1,             /*   will not use the built-in microphone port without one ("No control present
+++	                                 *   for (Codec pmbi)"); kept, not applied */
+++	OBJECT_MIC_MUTE1,               /* the codec input's mute control of channel 1 */
+++	OBJECT_LAST = OBJECT_MIC_MUTE1
++ };
++ 
++ #define VOLUME_RANGE_DB         48.0    /* from the loudest the kernel allows down to the quietest step above 0 */
++@@ -218,7 +239,8 @@
++ 	  .output_channels = REDWOOD_AUDIO_CHANNELS, .input_channels = 2 },
++ 	{ .object = OBJECT_HAWKING, .uid = CFSTR("Hawking"), .input = OBJECT_HAWKING_INPUT, .input_channels = 1 },
++ 	{ .object = OBJECT_ACTUATOR, .uid = CFSTR("Actuator"), .output = OBJECT_ACTUATOR_OUTPUT, .output_channels = 1 },
++-	{ .object = OBJECT_CODEC, .uid = CFSTR("Codec"), .input = OBJECT_CODEC_INPUT, .input_channels = 1 },
+++	{ .object = OBJECT_CODEC, .uid = CFSTR("Codec"), .output = OBJECT_CODEC_OUTPUT, .input = OBJECT_CODEC_INPUT,
+++	  .output_channels = CODEC_OUTPUT_CHANNELS, .input_channels = 1 },
++ };
++ #define DEVICES                 (sizeof(devices) / sizeof(devices[0]))
++ 
++@@ -242,6 +264,18 @@
++ static UInt64 written, refused;         /* frames since the speaker's I/O started */
++ static Boolean inactive[OBJECT_LAST + 1];       /* streams the HAL has switched off */
++ static Float32 volume = 1.0f;           /* the speaker's volume control, 0 to 1 (iOS sets it once it routes there) */
+++static Float32 receiver_volume = 0.5f;  /* the receiver's volume control (iOS's call volume on the earpiece) */
+++static int call_route = -1;             /* last route told to the kernel: 0 receiver, 1 speaker, -1 none yet */
+++static UInt32 receiver_muted;           /* the receiver's mute control */
+++static UInt32 mic_muted1;               /* the codec input's channel-1 mute control */
+++static Float32 mic_volume[2] = { 1.0f, 1.0f };  /* the codec input's volume controls (master, channel 1) */
+++#define IS_VOLUME(o)    ((o) == OBJECT_SPEAKER_VOLUME || (o) == OBJECT_RECEIVER_VOLUME || (o) == OBJECT_MIC_VOLUME || \
+++	(o) == OBJECT_MIC_VOLUME1)
+++#define IS_MUTE(o)      ((o) == OBJECT_RECEIVER_MUTE || (o) == OBJECT_MIC_MUTE || (o) == OBJECT_SPEAKER_IN_MUTE || \
+++	(o) == OBJECT_MIC_MUTE1)
+++static UInt32 mic_muted;                /* the codec input's mute control */
+++static UInt32 speaker_in_muted;         /* the speaker input's mute control (iOS 16: vaemSetUplinkMuteOnDevice sets mute/inpt/0
+++                                         * on the virtual device, which reaches the input of whichever device it aggregates) */
++ 
++ static void
++ say(const char *format, ...)
++@@ -257,6 +291,7 @@
++ 		n = sizeof(line) - 1;
++ 	}
++ 	write(2, line, (size_t)n);
+++	syslog(LOG_NOTICE, "%s", line);         /* mediaserverd's unified log: the redwood: lines of a log archive */
++ }
++ 
++ /* The volume control's scale: a straight line of decibels over VOLUME_RANGE_DB. */
++@@ -289,6 +324,64 @@
++ 	    v.below / 8.0);
++ }
++ 
+++/*
+++ * The receiver. On the iPhone X the receiver is on the codec ("Codec", Device_Codec_Aspen in the virtual
+++ * audio device), the speaker on its own amplifier device ("Speaker"): the virtual audio device makes the
+++ * receiver port of the codec's output element RECEIVER_ELEMENT (it must have a mute control there), and a
+++ * call is switched between the two ports by which device's output stream it keeps active
+++ * (kAudioStreamPropertyIsActive) and by the receiver's mute. The call's audio itself is the kernel's
+++ * (modem -> AFE -> amplifiers); what the plug-in passes on is where iOS puts the call, the call volume iOS
+++ * sets on each port's volume control and the input's mute. With the lock held.
+++ */
+++static void
+++route_to_kernel(const char *why)
+++{
+++	int route, receiver_on = !inactive[OBJECT_CODEC_OUTPUT] && !receiver_muted, speaker_on = !inactive[OBJECT_SPEAKER_OUTPUT];
+++	uint32_t r;
+++
+++	say("redwood: audio: %s: codec output %s, receiver %s, speaker output %s\n", why,
+++	    inactive[OBJECT_CODEC_OUTPUT] ? "inactive" : "active", receiver_muted ? "muted" : "unmuted",
+++	    inactive[OBJECT_SPEAKER_OUTPUT] ? "inactive" : "active");
+++	if (receiver_on == speaker_on) {
+++		return;                 /* both or neither: not a choice between them */
+++	}
+++	route = receiver_on ? 0 : 1;
+++	if (route == call_route) {
+++		return;
+++	}
+++	r = (uint32_t)route;
+++	if (sink < 0 || ioctl(sink, REDWOOD_AUDIO_SET_CALL_ROUTE, &r) < 0) {
+++		say("redwood: audio: the call route (%s) could not be given to the kernel (%s)\n", route ? "speaker" : "receiver",
+++		    strerror(errno));
+++		return;
+++	}
+++	call_route = route;
+++	say("redwood: audio: calls are heard on the %s\n", route ? "speaker" : "receiver");
+++}
+++
+++static void
+++call_volume_to_kernel(uint32_t port, Float32 scalar)
+++{
+++	struct redwood_audio_call_volume v = { port, (uint32_t)lround(-scalar_to_db(scalar) * 8), scalar <= 0 };
+++
+++	if (sink < 0 || ioctl(sink, REDWOOD_AUDIO_SET_CALL_VOLUME, &v) < 0) {
+++		say("redwood: audio: the %s's call volume %.3f could not be given to the kernel (%s)\n", port ? "speaker" : "receiver",
+++		    scalar, strerror(errno));
+++	}
+++}
+++
+++static void
+++mic_mute_to_kernel(void)
+++{
+++	uint32_t m = mic_muted != 0 || mic_muted1 != 0 || speaker_in_muted != 0;
+++
+++	if (sink < 0 || ioctl(sink, REDWOOD_AUDIO_SET_CALL_MUTE, &m) < 0) {
+++		say("redwood: audio: the microphone's mute (%u) could not be given to the kernel (%s)\n", m, strerror(errno));
+++		return;
+++	}
+++	say("redwood: audio: the microphone is %s\n", m ? "muted" : "unmuted");
+++}
+++
++ /* The device with this object number, or the one this stream belongs to; NULL = neither. */
++ static struct device *
++ device_of(AudioObjectID object)
++@@ -410,7 +503,9 @@
++ #define LIST(x)         (v.u.words[v.size / sizeof(UInt32)] = (x), v.size += sizeof(UInt32))
++ #define STRING(x)       (v.u.string = (x), v.string = true, v.size = sizeof(CFStringRef))
++ #define FLOAT(x)        (v.u.decimal = (x), v.size = sizeof(Float32))
++-	if (object == OBJECT_SPEAKER_VOLUME) {
+++	if (IS_VOLUME(object)) {
+++		Float32 level = object == OBJECT_SPEAKER_VOLUME ? volume : object == OBJECT_RECEIVER_VOLUME ? receiver_volume :
+++		    mic_volume[object == OBJECT_MIC_VOLUME1];
++ 		switch (selector) {
++ 		case kAudioObjectPropertyBaseClass:
++ 			WORD(kAudioLevelControlClassID);
++@@ -419,22 +514,23 @@
++ 			WORD(kAudioVolumeControlClassID);
++ 			break;
++ 		case kAudioObjectPropertyOwner:
++-			WORD(OBJECT_SPEAKER);
+++			WORD(object == OBJECT_SPEAKER_VOLUME ? OBJECT_SPEAKER : OBJECT_CODEC);
++ 			break;
++ 		case kAudioObjectPropertyOwnedObjects:
++ 			v.empty = true;
++ 			break;
++ 		case kAudioControlPropertyScope:
++-			WORD(kAudioObjectPropertyScopeOutput);
+++			WORD(object == OBJECT_MIC_VOLUME || object == OBJECT_MIC_VOLUME1 ? kAudioObjectPropertyScopeInput :
+++			    kAudioObjectPropertyScopeOutput);
++ 			break;
++ 		case kAudioControlPropertyElement:
++-			WORD(0);
+++			WORD(object == OBJECT_RECEIVER_VOLUME ? RECEIVER_ELEMENT : object == OBJECT_MIC_VOLUME1 ? 1 : 0);
++ 			break;
++ 		case kAudioLevelControlPropertyScalarValue:
++-			FLOAT(volume);
+++			FLOAT(level);
++ 			break;
++ 		case kAudioLevelControlPropertyDecibelValue:
++-			FLOAT(scalar_to_db(volume));
+++			FLOAT(scalar_to_db(level));
++ 			break;
++ 		case kAudioLevelControlPropertyDecibelRange:
++ 			v.u.range.mMinimum = -VOLUME_RANGE_DB;
++@@ -448,6 +544,33 @@
++ 		}
++ 		return v;
++ 	}
+++	if (IS_MUTE(object)) {
+++		switch (selector) {
+++		case kAudioObjectPropertyBaseClass:
+++			WORD(kAudioBooleanControlClassID);
+++			break;
+++		case kAudioObjectPropertyClass:
+++			WORD(kAudioMuteControlClassID);
+++			break;
+++		case kAudioObjectPropertyOwner:
+++			WORD(object == OBJECT_SPEAKER_IN_MUTE ? OBJECT_SPEAKER : OBJECT_CODEC);
+++			break;
+++		case kAudioObjectPropertyOwnedObjects:
+++			v.empty = true;
+++			break;
+++		case kAudioControlPropertyScope:
+++			WORD(object == OBJECT_RECEIVER_MUTE ? kAudioObjectPropertyScopeOutput : kAudioObjectPropertyScopeInput);
+++			break;
+++		case kAudioControlPropertyElement:
+++			WORD(object == OBJECT_RECEIVER_MUTE ? RECEIVER_ELEMENT : object == OBJECT_MIC_MUTE1 ? 1 : 0);
+++			break;
+++		case kAudioBooleanControlPropertyValue:
+++			WORD(object == OBJECT_RECEIVER_MUTE ? receiver_muted : object == OBJECT_MIC_MUTE ? mic_muted :
+++			    object == OBJECT_MIC_MUTE1 ? mic_muted1 : speaker_in_muted);
+++			break;
+++		}
+++		return v;
+++	}
++ 	if (object == OBJECT_CODEC_SOURCE) {
++ 		switch (selector) {
++ 		case kAudioObjectPropertyBaseClass:
++@@ -553,7 +676,7 @@
++ 			break;
++ 		case kAudioDevicePropertyDeviceCanBeDefaultDevice:
++ 		case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
++-			WORD(d->output != 0);
+++			WORD(d->output != 0 && d->object != OBJECT_CODEC);   /* the codec's output is only the receiver */
++ 			break;
++ 		case kAudioDevicePropertyDeviceIsRunning:
++ 			WORD(d->running != 0);
++@@ -567,20 +690,38 @@
++ 			if (scope != kAudioObjectPropertyScopeOutput && d->input != 0) {
++ 				LIST(d->input);
++ 			}
++-			if (selector == kAudioObjectPropertyOwnedObjects && d->object == OBJECT_SPEAKER) {
+++			if (selector == kAudioObjectPropertyOwnedObjects && d->object == OBJECT_SPEAKER && scope != kAudioObjectPropertyScopeInput) {
++ 				LIST(OBJECT_SPEAKER_VOLUME);
++ 			}
+++			if (selector == kAudioObjectPropertyOwnedObjects && d->object == OBJECT_SPEAKER && scope != kAudioObjectPropertyScopeOutput) {
+++				LIST(OBJECT_SPEAKER_IN_MUTE);
+++			}
+++			if (selector == kAudioObjectPropertyOwnedObjects && d->object == OBJECT_CODEC && scope != kAudioObjectPropertyScopeInput) {
+++				LIST(OBJECT_RECEIVER_VOLUME);
+++				LIST(OBJECT_RECEIVER_MUTE);
+++			}
++ 			if (selector == kAudioObjectPropertyOwnedObjects && d->object == OBJECT_CODEC && scope != kAudioObjectPropertyScopeOutput) {
++ 				LIST(OBJECT_CODEC_SOURCE);
+++				LIST(OBJECT_MIC_MUTE);
+++				LIST(OBJECT_MIC_MUTE1);
+++				LIST(OBJECT_MIC_VOLUME);
+++				LIST(OBJECT_MIC_VOLUME1);
++ 			}
++ 			v.empty = v.size == 0;
++ 			break;
++ 		case kAudioObjectPropertyControlList:
++ 			if (d->object == OBJECT_SPEAKER) {
++ 				LIST(OBJECT_SPEAKER_VOLUME);
+++				LIST(OBJECT_SPEAKER_IN_MUTE);
++ 			}
++ 			if (d->object == OBJECT_CODEC) {
++ 				LIST(OBJECT_CODEC_SOURCE);
+++				LIST(OBJECT_RECEIVER_VOLUME);
+++				LIST(OBJECT_RECEIVER_MUTE);
+++				LIST(OBJECT_MIC_MUTE);
+++				LIST(OBJECT_MIC_MUTE1);
+++				LIST(OBJECT_MIC_VOLUME);
+++				LIST(OBJECT_MIC_VOLUME1);
++ 			}
++ 			v.empty = v.size == 0;
++ 			break;
++@@ -600,6 +741,16 @@
++ 		case kAudioDevicePropertyZeroTimeStampPeriod:
++ 			WORD(TIMESTAMP_PERIOD);
++ 			break;
+++		case kAudioDevicePropertyMute:
+++			/* the codec's mute controls as device properties too (should the HAL not make them of the controls) */
+++			if (d->object == OBJECT_CODEC && scope == kAudioObjectPropertyScopeOutput && address->mElement == RECEIVER_ELEMENT) {
+++				WORD(receiver_muted);
+++			} else if (d->object == OBJECT_CODEC && scope == kAudioObjectPropertyScopeInput && address->mElement <= 1) {
+++				WORD(address->mElement ? mic_muted1 : mic_muted);
+++			} else if (d->object == OBJECT_SPEAKER && scope == kAudioObjectPropertyScopeInput && address->mElement == 0) {
+++				WORD(speaker_in_muted);
+++			}
+++			break;
++ 		}
++ 	} else {
++ 		switch (selector) {
++@@ -610,7 +761,8 @@
++ 			WORD(object == d->input);
++ 			break;
++ 		case kAudioStreamPropertyTerminalType:
++-			WORD(object == d->input ? kAudioStreamTerminalTypeMicrophone : kAudioStreamTerminalTypeSpeaker);
+++			WORD(object == d->input ? kAudioStreamTerminalTypeMicrophone : object == OBJECT_CODEC_OUTPUT ?
+++			    kAudioStreamTerminalTypeReceiverSpeaker : kAudioStreamTerminalTypeSpeaker);
++ 			break;
++ 		case kAudioStreamPropertyStartingChannel:
++ 			WORD(1);
++@@ -695,15 +847,17 @@
++ 		return kAudioHardwareUnknownPropertyError;
++ 	}
++ 	/* the rate and the formats can be "set", to the ones there are; the volume can be set */
++-	if (object == OBJECT_SPEAKER_VOLUME) {
+++	if (IS_VOLUME(object)) {
++ 		*settable = address->mSelector == kAudioLevelControlPropertyScalarValue ||
++ 		    address->mSelector == kAudioLevelControlPropertyDecibelValue;
++ 	} else if (object == OBJECT_CODEC_SOURCE) {
++ 		*settable = address->mSelector == kAudioSelectorControlPropertyCurrentItem;
+++	} else if (IS_MUTE(object)) {
+++		*settable = address->mSelector == kAudioBooleanControlPropertyValue;
++ 	} else if (object == OBJECT_PLUGIN) {
++ 		*settable = false;
++ 	} else if (object == d->object) {
++-		*settable = address->mSelector == kAudioDevicePropertyNominalSampleRate;
+++		*settable = address->mSelector == kAudioDevicePropertyNominalSampleRate || address->mSelector == kAudioDevicePropertyMute;
++ 	} else {
++ 		*settable = address->mSelector == kAudioStreamPropertyIsActive ||
++ 		    address->mSelector == kAudioStreamPropertyVirtualFormat || address->mSelector == kAudioStreamPropertyPhysicalFormat;
++@@ -732,7 +886,8 @@
++ 	if (address == NULL || size == NULL || data == NULL || !has_property(driver, object, client, address)) {
++ 		return object < OBJECT_PLUGIN || object > OBJECT_LAST ? kAudioHardwareBadObjectError : kAudioHardwareUnknownPropertyError;
++ 	}
++-	if (object == OBJECT_SPEAKER_VOLUME && (address->mSelector == kAudioLevelControlPropertyConvertScalarToDecibels ||
+++	if (IS_VOLUME(object) &&
+++	    (address->mSelector == kAudioLevelControlPropertyConvertScalarToDecibels ||
++ 	    address->mSelector == kAudioLevelControlPropertyConvertDecibelsToScalar)) {
++ 		/* what is in the buffer, converted where it is */
++ 		if (room < sizeof(Float32)) {
++@@ -775,7 +930,7 @@
++ 	if (!settable) {
++ 		return kAudioHardwareIllegalOperationError;
++ 	}
++-	if (object == OBJECT_SPEAKER_VOLUME) {
+++	if (IS_VOLUME(object)) {
++ 		AudioObjectPropertyAddress changed[2] = {
++ 			{ kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal, 0 },
++ 			{ kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, 0 },
++@@ -789,18 +944,60 @@
++ 		wanted = address->mSelector == kAudioLevelControlPropertyDecibelValue ? db_to_scalar(wanted) :
++ 		    wanted < 0 ? 0 : wanted > 1 ? 1 : wanted;
++ 		pthread_mutex_lock(&lock);
++-		volume = wanted;
++-		volume_to_kernel();
+++		if (object == OBJECT_SPEAKER_VOLUME) {
+++			volume = wanted;
+++			volume_to_kernel();
+++			call_volume_to_kernel(1, wanted);       /* the kernel takes it only while a call plays */
+++		} else if (object == OBJECT_MIC_VOLUME || object == OBJECT_MIC_VOLUME1) {
+++			mic_volume[object == OBJECT_MIC_VOLUME1] = wanted;
+++			say("redwood: audio: the microphone's volume control %u is %.3f (not applied)\n", object == OBJECT_MIC_VOLUME1, wanted);
+++		} else {
+++			receiver_volume = wanted;
+++			call_volume_to_kernel(0, wanted);       /* any time: the earpiece is only ever a call's */
+++			say("redwood: audio: the receiver's volume is %.3f (%.1f dB under its top)\n", wanted, -scalar_to_db(wanted));
+++		}
++ 		pthread_mutex_unlock(&lock);
++ 		if (host != NULL) {
++-			host->PropertiesChanged(host, OBJECT_SPEAKER_VOLUME, 2, changed);
+++			host->PropertiesChanged(host, object, 2, changed);
+++		}
+++		return 0;
+++	}
+++	if (object == OBJECT_CODEC && address->mSelector == kAudioDevicePropertyMute) {
+++		object = address->mScope == kAudioObjectPropertyScopeOutput ? OBJECT_RECEIVER_MUTE : address->mElement ? OBJECT_MIC_MUTE1 :
+++		    OBJECT_MIC_MUTE;
+++	} else if (object == OBJECT_SPEAKER && address->mSelector == kAudioDevicePropertyMute) {
+++		object = OBJECT_SPEAKER_IN_MUTE;
+++	}
+++	if (IS_MUTE(object)) {
+++		AudioObjectPropertyAddress changed = { kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal, 0 };
+++
+++		if (size != sizeof(UInt32)) {
+++			return kAudioHardwareBadPropertySizeError;
+++		}
+++		pthread_mutex_lock(&lock);
+++		if (object == OBJECT_RECEIVER_MUTE) {
+++			receiver_muted = *(const UInt32 *)data != 0;
+++			route_to_kernel(receiver_muted ? "the receiver is muted" : "the receiver is unmuted");
+++		} else {
+++			*(object == OBJECT_MIC_MUTE ? &mic_muted : object == OBJECT_MIC_MUTE1 ? &mic_muted1 : &speaker_in_muted) =
+++			    *(const UInt32 *)data != 0;
+++			say("redwood: audio: the %s input's mute control is set to %u\n", object == OBJECT_MIC_MUTE ? "codec" :
+++			    object == OBJECT_MIC_MUTE1 ? "codec (channel 1)" : "speaker", *(const UInt32 *)data != 0);
+++			mic_mute_to_kernel();
+++		}
+++		pthread_mutex_unlock(&lock);
+++		if (host != NULL) {
+++			host->PropertiesChanged(host, object, 1, &changed);
++ 		}
++ 		return 0;
++ 	}
++ 	if (object == OBJECT_CODEC_SOURCE) {
++-		/* the one microphone there is */
++-		return size == sizeof(UInt32) ? (*(const UInt32 *)data == MIC_SOURCE ? 0 : kAudioHardwareIllegalOperationError) :
++-		       kAudioHardwareBadPropertySizeError;
+++		/* the one microphone there is: whatever is chosen (q10dx: VirtualAudio's [ssrc/inpt/0] failed with '!siz' when this
+++		 * insisted on one UInt32 of 'imic'), it stays the one */
+++		say("redwood: audio: the codec input's data source is set (%u bytes, '%c%c%c%c')\n", (unsigned)size,
+++		    size >= 4 ? (int)(*(const UInt32 *)data >> 24 & 0xff) : '-', size >= 4 ? (int)(*(const UInt32 *)data >> 16 & 0xff) : '-',
+++		    size >= 4 ? (int)(*(const UInt32 *)data >> 8 & 0xff) : '-', size >= 4 ? (int)(*(const UInt32 *)data & 0xff) : '-');
+++		return 0;
++ 	}
++ 	if (address->mSelector == kAudioStreamPropertyIsActive) {
++ 		if (size != sizeof(UInt32)) {
++@@ -808,6 +1005,10 @@
++ 		}
++ 		pthread_mutex_lock(&lock);
++ 		inactive[object] = *(const UInt32 *)data == 0;
+++		if (object == OBJECT_SPEAKER_OUTPUT || object == OBJECT_CODEC_OUTPUT) {
+++			route_to_kernel(object == OBJECT_CODEC_OUTPUT ? "the codec's output (the receiver) switched" :
+++			    "the speaker's output switched");
+++		}
++ 		pthread_mutex_unlock(&lock);
++ 		return 0;
++ 	}
++@@ -859,7 +1060,13 @@
++ static void
++ codec_read(int16_t *samples, UInt32 frames)
++ {
++-	ssize_t got = mic >= 0 ? read(mic, samples, (size_t)frames * 2) : -1;
+++	ssize_t got;
+++
+++	if (mic == -1) {
+++		codec_open();
+++		mic = mic < 0 ? -2 : mic;       /* -2: tried, not there (until the codec stops) */
+++	}
+++	got = mic >= 0 ? read(mic, samples, (size_t)frames * 2) : -1;
++ 	UInt32 have = got > 0 ? (UInt32)got / 2 : 0;
++ 
++ 	if (have > 0 && mic_heard == 0) {
++@@ -891,12 +1098,12 @@
++ 	if (d->running++ == 0) {
++ 		d->anchor = mach_absolute_time();
++ 		d->periods = 0;
++-		if (d->output != 0) {
+++		if (d->object == OBJECT_SPEAKER) {
++ 			written = refused = 0;
++ 			say("redwood: audio: playing\n");
++ 		}
++ 		if (d->object == OBJECT_CODEC) {
++-			codec_open();
+++			say("redwood: audio: the codec runs\n");     /* the microphone opens at its first read (codec_read) */
++ 		}
++ 	}
++ 	pthread_mutex_unlock(&lock);
++@@ -914,8 +1121,10 @@
++ 	pthread_mutex_lock(&lock);
++ 	if (d->running != 0 && --d->running == 0) {
++ 		if (d->object == OBJECT_CODEC) {
++-			codec_close();
++-		} else if (d->output != 0) {
+++			if (mic != -1) {
+++				codec_close();
+++			}
+++		} else if (d->object == OBJECT_SPEAKER) {
++ 			say("redwood: audio: stopped after %llu.%02llu s (%llu frames not taken by %s)\n", written / REDWOOD_AUDIO_RATE,
++ 			    written % REDWOOD_AUDIO_RATE * 100 / REDWOOD_AUDIO_RATE, refused, REDWOOD_AUDIO_DEVICE);
++ 		}
++@@ -1015,6 +1224,8 @@
++ 		memset(buffer, 0, (size_t)frames * 2 * d->input_channels);
++ 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_ACTUATOR_OUTPUT) {
++ 		actuator_write(buffer, frames);
+++	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_CODEC_OUTPUT) {
+++		/* what iOS plays on the receiver itself (the call is the kernel's): not heard */
++ 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->output) {
++ 		/* the kernel takes it all or leaves it: this thread must not wait */
++ 		if (sink < 0 || write(sink, buffer, (size_t)frames * REDWOOD_AUDIO_FRAME) < 0) {
++--- a/redwood_audio.h
+++++ b/redwood_audio.h
++@@ -37,6 +37,23 @@
++ };
++ #define REDWOOD_AUDIO_SET_VOLUME _IOW('r', 1, struct redwood_audio_volume)
++ 
+++/*
+++ * Nord2 call audio (kernel patch 0280; a call's audio never passes through the plug-in):
+++ * ioctl(REDWOOD_AUDIO_SET_CALL_ROUTE): where the call is heard, as iOS routes it (the Phone app's speaker
+++ * button): 0 the receiver (earpiece), 1 the speaker.
+++ * ioctl(REDWOOD_AUDIO_SET_CALL_VOLUME): iOS's call volume, the volume control of the port the call is on
+++ * (port 0 receiver, port 1 speaker), in eighths of a dB under its top as for REDWOOD_AUDIO_SET_VOLUME.
+++ */
+++#define REDWOOD_AUDIO_SET_CALL_ROUTE _IOW('r', 2, uint32_t)
+++struct redwood_audio_call_volume {
+++	uint32_t port;                  /* 0 receiver, 1 speaker */
+++	uint32_t below;                 /* eighths of a dB */
+++	uint32_t muted;
+++};
+++#define REDWOOD_AUDIO_SET_CALL_VOLUME _IOW('r', 3, struct redwood_audio_call_volume)
+++/* uplink mute of a call (the Phone app's mute button: the codec input's mute control): 1 muted, 0 not */
+++#define REDWOOD_AUDIO_SET_CALL_MUTE _IOW('r', 4, uint32_t)
+++
++ #ifdef KERNEL
++ #include <stdbool.h>
++ 
+diff -ruN a/tools/nord2-build-audio-plugin.py b/tools/nord2-build-audio-plugin.py
+--- a/tools/nord2-build-audio-plugin.py	2026-11-06 00:39:51.785053613 +0100
++++ b/tools/nord2-build-audio-plugin.py	2026-11-06 00:39:51.796521662 +0100
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-"""Build the unmodified pinned HackiOS/Topaz iOS HAL on macOS; no device access."""
++"""Build the pinned HackiOS/Topaz iOS HAL on macOS, optionally with a local patch; no device access."""
+ import argparse,hashlib,json,pathlib,subprocess,urllib.request
+ PIN='a79ff0772a3454fd1ef127e181e5b3bce6c9ce18'
+ FILES={
+@@ -9,7 +9,7 @@
+  'redwood_audio.h':'5ab3444730e47cb105a9ee14a924b0dca2df2b7588cf3eeba86e14a234d2dce4'}
+ def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+ def main():
+- ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('output',type=pathlib.Path);a=ap.parse_args()
++ ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('output',type=pathlib.Path);ap.add_argument('--patch',type=pathlib.Path,help='patch -p1 applied to the verified upstream sources');a=ap.parse_args()
+  a.output.mkdir();out=a.output.resolve();src=out/'source';src.mkdir()
+  for name,digest in FILES.items():
+   source_path=name if name=='LICENSE' else 'userland/src/'+name
+@@ -19,6 +19,7 @@
+   if len(blob)>131072 or hashlib.sha256(blob).hexdigest()!=digest:raise SystemExit('upstream hash mismatch: '+name)
+   (src/name).write_bytes(blob)
+  (out/'LICENSE').write_bytes((src/'LICENSE').read_bytes())
++ if a.patch:subprocess.run(['patch','-p1','--no-backup-if-mismatch','-d',str(src),'-i',str(a.patch.resolve())],check=True)
+  bundle=out/'RedwoodAudio.driver';bundle.mkdir()
+  subprocess.run(['xcrun','--sdk','iphoneos','clang','-arch','arm64','-miphoneos-version-min=16.0','-O1',
+   '-bundle','-framework','CoreFoundation','-Wl,-no_uuid','-o',str(bundle/'RedwoodAudio'),str(src/'audio_plugin.c')],check=True)
+@@ -33,7 +34,7 @@
+   r=subprocess.run(cmd,check=True,stdout=subprocess.PIPE,text=True);(out/(name+'.txt')).write_text(r.stdout)
+   if want and want not in r.stdout:raise SystemExit('HAL check failed: '+name)
+  subprocess.run(['python3',str(pathlib.Path(__file__).with_name('nord2-audio-package.py')),'build',str(bundle),str(out/'audio.pkg')],check=True)
+- record={'upstream':'oosexgang/hackios-xnu-userland','commit':PIN,'sources':FILES,
++ record={'upstream':'oosexgang/hackios-xnu-userland','commit':PIN,'sources':FILES,'patch':(a.patch.name,sha(a.patch)) if a.patch else None,
+   'outputs':{str(p.relative_to(out)):sha(p) for p in [bundle/'RedwoodAudio',bundle/'Info.plist',out/'audio.pkg']}}
+  (out/'provenance.json').write_text(json.dumps(record,indent=2)+'\n')
+  print(json.dumps(record,indent=2))

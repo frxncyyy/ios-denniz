@@ -1,0 +1,107 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * PROPOSAL for include/n2vcd_proto.h rev 2: the decoder half.  Owner of the header: hw-lead.
+ * Base: opus-dec1's text (gpu/hwcodec/dec1/n2vcd_proto_dec_rev2.h.txt, posted 18:00), which this
+ * file supersedes in two places only, marked AMENDED below.  Additive: N2VCD_VERSION becomes 2;
+ * every v1 message keeps its number and layout; a v1 client never sends the new types.
+ *
+ * AMENDED 1 (DEC_ADD_BUFFER): the original one-handle form needs a plane offset that did not
+ * exist in the AP path.  The kernel hands the decoder two plane addresses
+ * (vdec_common_if.c:200-223 fb_dma[0..1] from fb_base[i].dma_addr; vdec_vcu_if.c:321-328 fb_fd[i]
+ * per plane); on Android a single-dmabuf gralloc buffer still presents plane 1 as base +
+ * data_offset through vb2, so the vendor never computes stride*buf_h itself.  hw-dec01's
+ * ap/n2ap_vdec.c now has the matching branch (decode(): fb_c_handle == fb_handle -> c_pa =
+ * fb_pa + vsi.pic.fb_sz[0]), found and used by hw-dec05 at 18:40.  Therefore DEC_ADD_BUFFER gains
+ * two OPTIONAL fields: c_handle = 0 means "the C plane is at stride*buf_h inside handle"
+ * (the normal case, one client buffer of out_buf_bytes per pool entry); c_handle != 0 registers a
+ * separate second RWVC buffer.  Either way the client splits DEC_HEADER_OK.out_buf_bytes into
+ * y_bytes = stride*buf_h and c_bytes = out_buf_bytes - y_bytes.  hw-dec06 may use the one-buffer
+ * form (one shared mapping) or two; hw-dec05's client uses one by default.
+ *
+ * AMENDED 2 (OPEN.flags + PICTURE poc): OPEN.flags bits 8..15 select the requested output
+ * format (0 = no preference/MM21, 1 = MM21, 2 = NV12).  The vendor currently produces MM21 only
+ * (DECODE_PATH.md section 2.3), so 2 is refused with N2VCD_E_UNSUPPORTED at OPEN, before any
+ * buffer exists.  DEC_PICTURE_OK's last word is renamed reserved -> poc (layout unchanged); the
+ * task's FRAME_OUT(handle, pts, crop, poc) needs the vendor POC (vsi.list_disp[].poc).
+ *
+ * Everything else is exactly opus-dec1's text: ids 20..29, DEC_HEADER/DEC_HEADER_OK keep their
+ * v1 layouts with reserved[0] = N2VCD_FMT_*, reserved[1] = buf_h; output buffers are client
+ * RWVC_DMA_SHARED buffers (RWVC_DMA_INFO gives the daemon the pa); the daemon never copies
+ * pixels; a vendor/guest stop is fatal for the daemon exactly as on the encoder path (E_GUEST,
+ * exit 70).
+ *
+ * Flow:
+ *   OPEN(codec, encoder=0, width/height = optional maximum, flags bits 8..15 = format)
+ *                                              -> OPEN_OK(in_buf_bytes = suggested bitstream size,
+ *                                                           out_buf_bytes = 0: unknown before HEADER)
+ *   DEC_HEADER(in_handle, in_bytes)            -> DEC_HEADER_OK (v1 struct, rev-2 meaning below)
+ *   DEC_ADD_BUFFER(handle, bytes, c_handle, c_bytes) x N
+ *                                              -> DEC_ADD_BUFFER_OK(index)   N = DEC_HEADER_OK.dpb_frames
+ *   loop: DEC_INPUT(in_handle, in_bytes, pts)  -> DEC_INPUT_OK(pictures_ready, changed, error_map, hw_us)
+ *         while pictures_ready: DEC_PICTURE    -> DEC_PICTURE_OK(have, index, pts, poc, ...)
+ *         after copying: DEC_RELEASE(index)    -> DEC_RELEASE_OK (n2vcd_simple)
+ *   end:  FLUSH                                -> FLUSH_OK (detail = pictures_ready); drain DEC_PICTURE
+ *   CLOSE                                      -> CLOSE_OK (all buffers forgotten; the client frees them)
+ *   Resolution change: DEC_INPUT_OK.changed = 1 -> the input was NOT consumed: drain DEC_PICTURE,
+ *   DEC_RELEASE all, DEC_FREE_BUFFERS, read the new geometry with DEC_HEADER(same input),
+ *   DEC_ADD_BUFFER a new pool, resend the input.
+ *
+ * Daemon rules: one decoder session at a time (N2VCD_E_BUSY, detail = the active session id);
+ * input buffers are reusable as soon as DEC_INPUT_OK is sent (the vendor copies the AU into its
+ * own ring); a buffer is handed to the vendor only when it is not held by the vendor and has been
+ * released by the client; the daemon syncs the output from the device before answering
+ * DEC_PICTURE_OK; dpb_frames is capped at 16 (ap/n2ap_vdec.h N2AP_VDEC_FB_QUEUE); a stream that
+ * needs more is refused with N2VCD_E_UNSUPPORTED rather than silently dropping pictures.
+ *
+ * Sizes: add_buffer 32, add_buffer_ok 24, input 40, input_ok 40, picture 16, picture_ok 64,
+ * release 24, free_buffers/simple 24 (all <= 1024).
+ */
+
+/* --- enum n2vcd_type additions, after N2VCD_ERROR = 100 -------------------------------- */
+/* STAGE-BEGIN-ENUM */
+	N2VCD_DEC_ADD_BUFFER = 20, N2VCD_DEC_ADD_BUFFER_OK,
+	N2VCD_DEC_FREE_BUFFERS, N2VCD_DEC_FREE_BUFFERS_OK,      /* reply: n2vcd_simple */
+	N2VCD_DEC_INPUT, N2VCD_DEC_INPUT_OK,
+	N2VCD_DEC_PICTURE, N2VCD_DEC_PICTURE_OK,
+	N2VCD_DEC_RELEASE, N2VCD_DEC_RELEASE_OK,                /* reply: n2vcd_simple */
+/* STAGE-END-ENUM */
+
+/* --- output layouts: DEC_HEADER_OK.reserved[0] and DEC_PICTURE_OK.fourcc ------------- */
+/* STAGE-BEGIN-STRUCTS */
+#ifndef N2VCD_PROTO_REV2
+#define N2VCD_PROTO_REV2 2u     /* rev-2 decoder messages are present */
+#endif
+enum { N2VCD_FMT_MM21 = 0x31324d4d /* 'MM21': 8-bit 4:2:0, Y 16x32 tiles, CbCr 16x16 tiles (2 planes) */,
+	N2VCD_FMT_NV12 = 0x3231564e /* 'NV12' linear, only if the vendor ever accepts the layout */ };
+
+/* --- OPEN.flags bits 8..15 (decoder): requested output format ------------------------ */
+enum { N2VCD_OPEN_FMT_SHIFT = 8, N2VCD_OPEN_FMT_MASK = 0xffu,
+	N2VCD_OPEN_FMT_AUTO = 0, N2VCD_OPEN_FMT_MM21 = 1, N2VCD_OPEN_FMT_NV12 = 2 };
+
+/* --- structs, paste after struct n2vcd_simple --------------------------------------- */
+/* rev-2 meaning of struct n2vcd_dec_header_ok (layout unchanged):
+ *   width, height   = display size (vsi.crop[2..3]), e.g. 1920x1080
+ *   stride          = buf_w (vsi.pic.buf_w), e.g. 1920; also the MM21 row pitch in bytes of the Y plane
+ *   out_buf_bytes   = bytes of ONE output buffer = fb_sz[0] + fb_sz[1] (1080p MM21: 2088960 + 1044480)
+ *                     Y plane at offset 0 with y_bytes = stride * buf_h, C plane with c_bytes =
+ *                     out_buf_bytes - y_bytes (each plane is its own RWVC DMA buffer)
+ *   dpb_frames      = buffers the client must register: vsi.dec.dpb_sz + 1 (V4L2 GET_PARAM_DPB_SIZE)
+ *                     + 2 (one decoding, one held by the client), clamped to 16
+ *   reserved[0]     = N2VCD_FMT_* of the output,  reserved[1] = buf_h (vsi.pic.buf_h, e.g. 1088) */
+struct n2vcd_dec_add_buffer { struct n2vcd_hdr h; uint32_t handle, bytes;      /* Y plane / whole buffer */
+	uint32_t c_handle, c_bytes; };   /* 0,0: C at stride*buf_h inside handle; else a second buffer */
+struct n2vcd_dec_add_buffer_ok { struct n2vcd_hdr h; uint32_t status, index; };      /* index 0..15 */
+struct n2vcd_dec_input { struct n2vcd_hdr h; uint32_t in_handle, in_bytes; uint64_t pts;
+	uint32_t flags, reserved; };                       /* flags bit 0: discontinuity (seek) -> RESET first */
+struct n2vcd_dec_input_ok { struct n2vcd_hdr h; uint32_t status, pictures_ready;
+	uint32_t changed;                                  /* 1: geometry change, input not consumed (see flow) */
+	uint32_t error_map;                                /* vsi.dec.error_map of this input, 0 = clean */
+	uint32_t hw_us, reserved; };
+struct n2vcd_dec_picture { struct n2vcd_hdr h; };
+struct n2vcd_dec_picture_ok { struct n2vcd_hdr h; uint32_t status, have; uint64_t pts;
+	uint32_t index;                                    /* registered buffer holding the picture; client owns it */
+	uint32_t width, height, stride, buf_h, fourcc;     /* display size, Y pitch, aligned height, N2VCD_FMT_* */
+	uint32_t pictures_ready;                           /* still queued after this one */
+	int32_t poc; };                                    /* AMENDED 2: was reserved, same offset */
+struct n2vcd_dec_release { struct n2vcd_hdr h; uint32_t index, reserved; };
+/* STAGE-END-STRUCTS */

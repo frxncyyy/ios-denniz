@@ -1,0 +1,387 @@
+--- /dev/null
++++ b/bsd/dev/wifi_8021x_bind.inc
+@@ -0,0 +1,170 @@
++/* 0451: WPA2-Enterprise (802.1X) glue of the native station service. Included
++ * by wifi_station_service_bind.inc after njs_native / njs_handover; same
++ * retained owner thread, same admission lock (nss_native.lock).
++ *
++ * An 802.1X join associates like WPA2-PSK (station RSN with AKM 1 or 5) but
++ * without a PMK. When the station is configured (STC_EAPOL, STA active):
++ *  - the BSD link goes up ("prelink") so that eapolclient starts; the native
++ *    controlled port stays closed: only ethertype 0x888e passes, both ways;
++ *  - EAPOL frames from the AP that are not EAPOL-Key (EAP packets) go up to
++ *    the interface input (PF_NDRV / BPF of eapolclient); EAPOL-Key frames go
++ *    to the host WPA2 engine, which keeps the newest one until the PMK exists;
++ *  - EAPOL frames written by eapolclient are sent to the AP unencrypted
++ *    (encrypted with the PTK after the keys exist: reauthentication);
++ *  - APPLE80211_IOC_CIPHER_KEY (MSK 64 bytes, or PMK 32) from eapolclient
++ *    starts the engine: 4-way handshake, key install, port open as for PSK.
++ * The whole exchange has N8XB_BUDGET_MS from admission (the native transport
++ * refuses unauthorized periods over 60 s). No frame bytes, addresses or key
++ * bytes are logged. */
++#define N8XB_SLOTS 4u
++#define N8XB_BUDGET_MS 55000u
++#define N8XB_TICKET (UINT64_MAX-7)
++#define N8XB_FRAME_LOGS 96u
++static void njs_snapshot_locked(void);
++static struct {
++ unsigned prelinked,tried,key_pending,started,port_logged,rx_head,rx_count,tx_head,tx_count;
++ unsigned rx_seen,rx_up,rx_drop,tx_seen,tx_sent,tx_drop,tx_done,keys_set,keys_ignored,frame_logs;
++ uint64_t generation; /* attempt that owns the prelink */
++ uint8_t key[32];
++ uint8_t rx[N8XB_SLOTS][NWIL_ETHERNET_MAX],tx[N8XB_SLOTS][NWIL_ETHERNET_MAX],scratch[NWIL_ETHERNET_MAX];
++ unsigned rx_bytes[N8XB_SLOTS],tx_bytes[N8XB_SLOTS];
++} n8xb;
++#ifndef NJS_HOST_TEST
++SYSCTL_UINT(_kern, OID_AUTO, n2wifi_8021x, CTLFLAG_RW | CTLFLAG_LOCKED, &niwj_8021x, 0, "0450: WPA2-Enterprise (802.1X) joins: 0 refuse the profile, 1 associate, pass EAPOL to eapolclient, 4-way handshake with its PMK");
++#endif
++static unsigned n8xb_akm(void){return njs_native.target.security==NIWJ_WPA2_8021X?N8X_AKM_8021X:N8X_AKM_8021X_SHA256;}
++static int n8xb_active_locked(void){return njs_native.active&&niwj_eap(njs_native.target.security);}
++static int n8xb_request_ok(const struct niwj_request*q){
++ static const uint8_t zero[32]={0};
++ return niwj_8021x&&niwj_eap(q->security)&&(q->native_flags==0||q->native_flags==4)&&
++  n8x_rsn_akm(q->station_rsn)==(q->security==NIWJ_WPA2_8021X?N8X_AKM_8021X:N8X_AKM_8021X_SHA256)&&!memcmp(q->pmk,zero,32);
++}
++static uint64_t n8xb_budget_ms(const struct niwj_request*q){return niwj_eap(q->security)?N8XB_BUDGET_MS:8000u;}
++/* New admitted attempt: nothing of an older exchange survives. The prelink
++ * flag is kept; the owner loop revokes a stale one before anything else. */
++static void n8xb_reset_locked(void){
++ unsigned prelinked=n8xb.prelinked;uint64_t generation=n8xb.generation;
++ niwj_clear(&n8xb,sizeof n8xb);n8xb.prelinked=prelinked;n8xb.generation=generation;
++}
++/* nst_step callback, lock held. 1 = consumed (EAP packet for userland). */
++static int n8xb_rx_locked(const struct nst_event*e){
++ if(e->kind==NST_SECURITY_SUBMITTED&&e->ticket==N8XB_TICKET){n8xb.tx_done++;return 1;}
++ if(e->kind!=NST_EAPOL||!n8xb_active_locked()||!e->body||e->bytes<18||e->bytes>NWIL_ETHERNET_MAX||e->body[15]==3)return 0;
++ n8xb.rx_seen++;
++ if(njs_native.canceled||njs_native.leave||n8xb.rx_count==N8XB_SLOTS){n8xb.rx_drop++;return 1;}
++ unsigned k=(n8xb.rx_head+n8xb.rx_count++)%N8XB_SLOTS;memcpy(n8xb.rx[k],e->body,e->bytes);n8xb.rx_bytes[k]=(unsigned)e->bytes;return 1;
++}
++/* Interface output of an EAPOL frame (eapolclient). The kernel owns the
++ * 4-way handshake: EAPOL-Key from userland is refused. Destination becomes
++ * the AP (the PAE group address is not usable on an infrastructure BSS). */
++static int n8xb_send(const uint8_t*p,size_t n,uint64_t generation){
++ if(n<18||p[15]==3)return NWIL_SEND_INVALID;
++ if(!nss_available())return NWIL_SEND_NOT_READY;
++ IOLockLock(nss_native.lock);int r=NWIL_SEND_NOT_READY;const struct stc*t=&njs_native.driver.owner.transaction;
++ if(memcmp(p+6,nss_native.info.mac,6)||!niwj_8021x)r=NWIL_SEND_INVALID;
++ else if(nss_native.powered&&!nss_native.failed&&n8xb_active_locked()&&!njs_native.canceled&&!njs_native.leave&&njs_native.native_generation==generation&&
++  (n8xb.prelinked||njs_native.linked)&&t->phase>=STC_EAPOL&&t->phase<STC_DEAUTH){
++  if(n8xb.tx_count==N8XB_SLOTS)r=NWIL_SEND_BUSY;
++  else{unsigned k=(n8xb.tx_head+n8xb.tx_count++)%N8XB_SLOTS;memcpy(n8xb.tx[k],p,n);memcpy(n8xb.tx[k],nst_native.state.peer.ap,6);n8xb.tx_bytes[k]=(unsigned)n;n8xb.tx_seen++;r=NWIL_SEND_ACCEPTED;}
++ }
++ IOLockUnlock(nss_native.lock);if(!r)thread_wakeup((event_t)&nss_native);return r;
++}
++/* IOUC thread: key of APPLE80211_IOC_CIPHER_KEY. 64 bytes = MSK (PMK is its
++ * first half), 32 = PMK. 0 taken, 1 no 802.1X association waits for one,
++ * -1 invalid. The caller's copy is the caller's to wipe. */
++int nord2_wifi_8021x_key(const uint8_t*key,size_t bytes){
++ if(!key||(bytes!=32&&bytes!=64))return -1;
++ if(!nss_available())return 1;
++ IOLockLock(nss_native.lock);int r=1;
++ if(n8xb_active_locked()&&!njs_native.canceled&&!njs_native.leave&&stc_eap_waiting(&njs_native.driver.owner.transaction)){memcpy(n8xb.key,key,32);n8xb.key_pending=1;n8xb.keys_set++;r=0;}
++ else n8xb.keys_ignored++;
++ unsigned waiting=(unsigned)!r,eap=(unsigned)n8xb_active_locked();IOLockUnlock(nss_native.lock);
++ printf("NORD2 WIFI 8021X: key from supplicant bytes=%u taken=%u eap_join=%u\n",(unsigned)bytes,waiting,eap);
++ if(!r)thread_wakeup((event_t)&nss_native);return r;
++}
++/* Owner, lock held, before the transaction pump: hand the PMK to the engine. */
++static void n8xb_key_locked(uint64_t now_us){
++ struct stc*t=&njs_native.driver.owner.transaction;
++ if(!n8xb.key_pending)return;
++ if(!n8xb_active_locked()||njs_native.canceled||njs_native.leave||!stc_eap_waiting(t)){niwj_clear(n8xb.key,sizeof n8xb.key);n8xb.key_pending=0;return;}
++ if(njs_native.driver.owner.halted||njs_native.driver.owner.issuing||t->phase!=STC_EAPOL)return; /* association still completing */
++ unsigned waiting=t->eapol_pending;int r=stc_pmk(t,njs_native.native_generation,n8xb.key,now_us/1000);
++ if(!r)return;
++ niwj_clear(n8xb.key,sizeof n8xb.key);n8xb.key_pending=0;n8xb.started=r>0;
++ printf("NORD2 WIFI 8021X: pmk received generation=%llu t_ms=%llu\n",(unsigned long long)njs_native.native_generation,(unsigned long long)(now_us/1000));
++ printf("NORD2 WIFI 8021X: 4way start akm=%u version=%u message1_waiting=%u result=%d\n",n8xb_akm(),n8xb_akm()==N8X_AKM_8021X_SHA256?3u:2u,waiting,r);
++}
++/* Owner, lock held, after the pump: one userland EAPOL frame when the
++ * transport and the handshake engine are idle. */
++static void n8xb_tx_locked(void){
++ const struct stc*t=&njs_native.driver.owner.transaction;struct nst*n=&nst_native.state;
++ if(!n8xb.tx_count)return;
++ unsigned k=n8xb.tx_head,drop=!n8xb_active_locked()||njs_native.canceled||njs_native.leave||t->phase>=STC_DEAUTH;int sent=-1;
++ if(!drop){
++  if(n->wire_busy||n->air_pending||n->peer_kind||njs_native.driver.owner.in_ticket||t->action.kind||t->phase<STC_EAPOL)return;
++  sent=nst_eapol(n,N8XB_TICKET,n8xb.tx[k],n8xb.tx_bytes[k],n->ptk_ready&&n->ptk.installed&&n->controlled_port);
++  if(sent>0)return;
++ }
++ if(sent<0)n8xb.tx_drop++;else n8xb.tx_sent++;
++ if(n8xb.frame_logs<N8XB_FRAME_LOGS){n8xb.frame_logs++;printf("NORD2 WIFI 8021X: eapol tx type=%u len=%u protected=%u status=%d\n",(unsigned)n8xb.tx[k][15],n8xb.tx_bytes[k]-14,(unsigned)(n->ptk_ready&&n->ptk.installed&&n->controlled_port),sent);}
++ niwj_clear(n8xb.tx[k],sizeof n8xb.tx[k]);n8xb.tx_bytes[k]=0;n8xb.tx_head=(k+1)%N8XB_SLOTS;n8xb.tx_count--;
++}
++/* End of njs_snapshot_locked: the clients see an associated 802.1X link. */
++static void n8xb_snapshot_locked(struct njs_snapshot*v,const struct stc*s){
++ if(n8xb.prelinked&&n8xb.generation==njs_native.native_generation&&n8xb_active_locked()&&!njs_native.canceled&&!njs_native.leave&&s->phase>=STC_EAPOL&&s->phase<STC_DEAUTH&&s->associated&&nst_native.state.sta_active){v->phase=NJS_AUTHORIZED;v->result=1;}
++}
++static int n8xb_live_locked(void){return n8xb.prelinked&&n8xb.generation==njs_native.native_generation&&n8xb_active_locked();}
++/* Owner, no lock held, after the ordinary link transitions. */
++static void n8xb_link_work(unsigned*notify_join){
++ IOLockLock(nss_native.lock);
++ const struct stc*t=&njs_native.driver.owner.transaction;unsigned up=0,down=0,port=0,outcome=t->outcome,phase=t->phase;uint64_t generation=njs_native.native_generation,old=n8xb.generation;
++ if(n8xb.prelinked){
++  if(njs_native.linked&&old==generation)n8xb.prelinked=0; /* the authorized link owns the interface now */
++  else if(old!=generation||!njs_native.active||njs_native.canceled||njs_native.leave||phase>=STC_DEAUTH){n8xb.prelinked=0;down=1;}
++ }else if(n8xb_active_locked()&&!njs_native.canceled&&!njs_native.leave&&!njs_native.linked&&phase==STC_EAPOL&&t->associated&&nst_native.state.sta_active&&!n8xb.tried){n8xb.tried=1;up=1;} /* once per attempt */
++ if(n8xb_active_locked()&&njs_native.linked&&nst_native.state.controlled_port&&!n8xb.port_logged){n8xb.port_logged=1;port=1;}
++ unsigned key=n8xb.keys_set,rx=n8xb.rx_up,tx=n8xb.tx_sent;
++ IOLockUnlock(nss_native.lock);
++ if(port)printf("NORD2 WIFI 8021X: keys installed generation=%llu port=open eapol_rx=%u eapol_tx=%u\n",(unsigned long long)generation,rx,tx);
++ if(down){
++  IOLockLock(njs_native.notice_lock);int error=nord2_wifi_ifnet_link(old,0);IOLockUnlock(njs_native.notice_lock);
++  printf("NORD2 WIFI 8021X: link down generation=%llu outcome=%u phase=%u keys=%u eapol_rx=%u eapol_tx=%u error=%d\n",(unsigned long long)old,outcome,phase,key,rx,tx,error);
++ }
++ if(!up)return;
++ IOLockLock(njs_native.notice_lock);
++ /* The clients must see the association before the link event reaches them. */
++ IOLockLock(nss_native.lock);
++ unsigned eligible=n8xb_active_locked()&&!njs_native.canceled&&!njs_native.leave&&njs_native.native_generation==generation&&njs_native.driver.owner.transaction.phase==STC_EAPOL;
++ if(eligible){n8xb.prelinked=1;n8xb.generation=generation;njs_snapshot_locked();}
++ IOLockUnlock(nss_native.lock);
++ int error=eligible?nord2_wifi_ifnet_link(generation,1):0;
++ IOLockLock(nss_native.lock);
++ unsigned ok=eligible&&!error&&n8xb_live_locked()&&!njs_native.canceled&&!njs_native.leave;
++ if(!ok&&n8xb.prelinked&&n8xb.generation==generation){n8xb.prelinked=0;njs_snapshot_locked();}
++ if(ok&&!njs_native.joined){njs_native.joined=1;*notify_join=1;}
++ IOLockUnlock(nss_native.lock);
++ if(eligible&&!ok)(void)nord2_wifi_ifnet_link(generation,0);
++ IOLockUnlock(njs_native.notice_lock);
++ printf("NORD2 WIFI 8021X: assoc ok generation=%llu akm=%u link=%u error=%d (port closed, EAPOL only, waiting for pmk up to %u ms from admission)\n",(unsigned long long)generation,n8xb_akm(),ok,error,N8XB_BUDGET_MS);
++}
++/* Owner, no lock held: received EAP packets to the interface input. */
++static void n8xb_deliver(void){
++ for(unsigned round=0;round<N8XB_SLOTS;round++){
++  unsigned bytes=0,log=0;uint64_t generation=0;
++  IOLockLock(nss_native.lock);
++  if(n8xb.rx_count){
++   unsigned k=n8xb.rx_head,gone=!n8xb_active_locked()||njs_native.canceled||njs_native.leave;
++   if(gone||n8xb_live_locked()||njs_native.linked){
++    if(!gone){bytes=n8xb.rx_bytes[k];memcpy(n8xb.scratch,n8xb.rx[k],bytes);generation=njs_native.native_generation;}else n8xb.rx_drop++;
++    niwj_clear(n8xb.rx[k],sizeof n8xb.rx[k]);n8xb.rx_bytes[k]=0;n8xb.rx_head=(k+1)%N8XB_SLOTS;n8xb.rx_count--;
++    if(bytes&&n8xb.frame_logs<N8XB_FRAME_LOGS){n8xb.frame_logs++;log=1;}
++   }
++  }
++  IOLockUnlock(nss_native.lock);
++  if(!bytes)break;
++  int error=nord2_wifi_ifnet_receive(generation,n8xb.scratch,bytes);
++  IOLockLock(nss_native.lock);if(error)n8xb.rx_drop++;else n8xb.rx_up++;IOLockUnlock(nss_native.lock);
++  if(log)printf("NORD2 WIFI 8021X: eapol rx type=%u len=%u error=%d\n",(unsigned)n8xb.scratch[15],bytes-14,error);
++  niwj_clear(n8xb.scratch,sizeof n8xb.scratch);
++ }
++}
+--- a/bsd/dev/wifi_ifnet_link.inc
++++ b/bsd/dev/wifi_ifnet_link.inc
+@@ -108,9 +108,12 @@
+ static bool nwil_ethernet(const uint8_t *frame,size_t length) {
+  if (!frame || length<14 || length>NWIL_ETHERNET_MAX) return false;
+  unsigned type=(unsigned)frame[12]*256u+frame[13];
+- /* EAPOL belongs exclusively to the owner's authenticator. No VLAN or
+-  * 802.3-length/SNAP emulation is advertised by this first data path. */
+- return type>=0x600 && type!=0x888e && type!=0x8100 && type!=0x88a8;
++ /* No VLAN or 802.3-length/SNAP emulation is advertised by this data path.
++  * 0451: EAPOL (0x888e) is no longer refused here. The native owner decides:
++  * nord2_wifi_link_send accepts it only during an 802.1X join (EAP packets
++  * of eapolclient, never EAPOL-Key), and only the owner's 802.1X delivery
++  * calls nord2_wifi_ifnet_receive with it; for PSK both stay closed. */
++ return type>=0x600 && type!=0x8100 && type!=0x88a8;
+ }
+ 
+ static errno_t nwil_ioctl(ifnet_t net,u_long command,void *data) {
+--- a/bsd/dev/wifi_station_service.h
++++ b/bsd/dev/wifi_station_service.h
+@@ -51,6 +51,11 @@
+  * 0 copied,1 native service unavailable,-1 invalid; failure leaves out unchanged. */
+ struct niwc_manifest;
+ int nord2_wifi_join_card_inventory(struct niwc_manifest*);
++/* 0451: key of APPLE80211_IOC_CIPHER_KEY from eapolclient after EAP success:
++ * 64 bytes MSK (PMK = first 32) or 32 bytes PMK. Copied under the native
++ * lock; the 4-way handshake then runs in the native owner. 0 taken, 1 no
++ * 802.1X association is waiting for a key, -1 invalid. */
++int nord2_wifi_8021x_key(const uint8_t*,size_t);
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/bsd/dev/wifi_station_service_bind.inc
++++ b/bsd/dev/wifi_station_service_bind.inc
+@@ -5,6 +5,7 @@
+ #include "wifi_wpa_nst.h"
+ #include "wifi_ifnet_link.h"
+ #include "wifi_wpa2.h"
++#include "wifi_8021x.h"
+ #ifndef NJS_HOST_TEST
+ #include <sys/random.h>
+ #include <kern/clock.h>
+@@ -57,6 +58,7 @@
+  * retirement plus the existing real all-queue/fresh-scan barrier. */
+ static struct {unsigned state,canceled;uint64_t admitted,deadline,ticket,epoch;
+  void*cookie;njs_completion completion;struct niwj_request request;struct njs_snapshot snapshot;uint8_t want_self[6];unsigned has_self;}njs_handover;
++#include "wifi_8021x_bind.inc"
+ 
+ /* At most112 samples (five short state parts each), never packet/secret
+  * bytes. State rows only on phase/action/outcome/error/readiness transitions. */
+@@ -92,7 +94,7 @@
+ static void njs_initialize_locked(void){niwj_pmk_hook=nwp_pmk;njs_native.notice_lock=IOLockAlloc();njs_cache_scan_locked(&ncb_native.rx.scan);njs_native.snapshot.phase=NJS_IDLE;}
+ static int njs_request_ok(const struct niwj_request*q){
+  static const uint8_t rsn[22]={48,20,1,0,0,15,172,4,1,0,0,15,172,4,1,0,0,15,172,2,0,0};
+- return q&&q->ssid_length&&q->ssid_length<=32&&q->has_target<=1&&q->association_reason<=2&&((q->security==NIWJ_WPA2_PSK_CCMP&&(q->native_flags==0||q->native_flags==4)&&!memcmp(q->station_rsn,rsn,22))||
++ return q&&q->ssid_length&&q->ssid_length<=32&&q->has_target<=1&&q->association_reason<=2&&((q->security==NIWJ_WPA2_PSK_CCMP&&(q->native_flags==0||q->native_flags==4)&&!memcmp(q->station_rsn,rsn,22))||n8xb_request_ok(q)||
+  (q->security==NIWJ_OPEN&&!q->native_flags&&!memcmp(q->station_rsn,(const uint8_t[22]){0},22)&&!memcmp(q->pmk,(const uint8_t[32]){0},32)))&&(!q->has_target||(!(q->target[0]&1)&&(q->target[0]|q->target[1]|q->target[2]|q->target[3]|q->target[4]|q->target[5])));
+ }
+ /* 0431: private Wi-Fi address. The address of the next attempt is chosen at
+@@ -155,7 +157,8 @@
+ }
+ static void njs_accept_locked(const struct niwj_request*q,void*cookie,uint64_t epoch,njs_completion completion,uint64_t next_ticket,uint64_t now_us){
+  njs_mac_select_locked();
+- njs_native.admitted_us=now_us;njs_native.deadline_us=(now_us/1000+8000)*1000;
++ n8xb_reset_locked();
++ njs_native.admitted_us=now_us;njs_native.deadline_us=(now_us/1000+n8xb_budget_ms(q))*1000;
+  njs_native.cookie_retired=0;njs_native.request=*q;njs_native.ticket=next_ticket;njs_native.native_generation=njs_native.ticket;
+  if(njs_native.used)nsr_native.admitted_generation=njs_native.native_generation;
+  njs_native.epoch=epoch;njs_native.cookie=cookie;njs_native.completion=completion;njs_native.queued=1;njs_native.canceled=njs_native.leave=njs_native.detach=njs_native.terminal=njs_native.joined=njs_native.retiring=0;
+@@ -251,6 +254,7 @@
+ }
+ int nord2_wifi_join_copy_state(struct njs_snapshot*out){if(!out)return -1;if(!nss_available())return 1;IOLockLock(nss_native.lock);*out=njs_handover.state?njs_handover.snapshot:njs_native.snapshot;IOLockUnlock(nss_native.lock);return 0;}
+ int nord2_wifi_link_send(const uint8_t*p,size_t n,uint64_t generation){
++ if(p&&n>=14&&n<=NWIL_ETHERNET_MAX&&generation&&p[12]==0x88&&p[13]==0x8e)return n8xb_send(p,n,generation); /* 0451: EAPOL of eapolclient */
+  if(!p||n<14||n>NWIL_ETHERNET_MAX||!generation||(p[12]==0x88&&p[13]==0x8e))return NWIL_SEND_INVALID;
+  if(!nss_available())return NWIL_SEND_NOT_READY;IOLockLock(nss_native.lock);
+  if((((unsigned)p[12]<<8)|p[13])<1536||memcmp(p+6,nss_native.info.mac,6)){IOLockUnlock(nss_native.lock);return NWIL_SEND_INVALID;}
+@@ -284,12 +288,14 @@
+  else if(s->phase>=STC_ASSOC_TX)v->phase=NJS_ASSOCIATING;
+  else v->phase=NJS_AUTHENTICATING;
+  v->result=v->data_ready?1:(s->outcome==STC_PENDING||s->outcome==STC_AUTHORIZED)?0:s->outcome==STC_TIMEOUT?9:2;
++ n8xb_snapshot_locked(v,s);
+ }
+ /* Called by nst_step under admission lock: pure engine updates or bounded copy,
+  * never client callback/ifnet invocation/recursive transport publication. */
+ static int njs_event(void*ctx,const struct nst_event*e){
+  if(ctx!=&njs_native||e->generation!=njs_native.native_generation)return 0;
+  if(!nss_native.powered&&e->kind==NST_EAPOL)return 0;
++ if(n8xb_rx_locked(e))return 0; /* 0451: EAP packet for eapolclient, or the receipt of one of its frames */
+  if(e->kind==NST_COMMAND_DMA&&e->cid==7&&nsr_key_complete(&nsr_native,e))return -1;
+  njs_native.last_event=e->kind;njs_native.last_status=e->status;njs_native.event_count++;if(e->kind==NST_FRAME_RESULT&&e->ticket==UINT64_MAX){njs_native.tx_results++;if(e->status==0)njs_native.tx_ok++;else njs_native.tx_fail++;if(njs_native.data_logs<8){njs_native.data_logs++;njs_trace_locked(1);}}
+  if(e->kind==NST_DATA_SUBMITTED&&e->ticket==UINT64_MAX){if(e->status==0)njs_native.tx_local++;else njs_native.queued_drop++;if(njs_native.data_retire_logs<8){njs_native.data_retire_logs++;njs_trace_locked(1);}return 0;} /* local retirement, not tx_ok */
+@@ -310,7 +316,11 @@
+  if(njs_native.canceled||njs_native.leave||now_us<njs_native.admitted_us||now_us>=njs_native.deadline_us){
+   unsigned result=!njs_native.canceled&&!njs_native.leave&&now_us>=njs_native.deadline_us?9:2;
+   IOLockUnlock(nss_native.lock);njs_early_finish(result);return 0;}
+- for(unsigned k=0;k<NJS_CACHE_SLOTS;k++)if(!niwj_select(&njs_native.request,&njs_native.cache[k],&nss_native.info,now_us,&njs_native.candidate)&&(!found||njs_native.candidate.rssi_dbm>njs_native.target.rssi_dbm)){njs_native.target=njs_native.candidate;found=1;}
++ unsigned mfpr=0;
++ for(unsigned k=0;k<NJS_CACHE_SLOTS;k++){niwj_ap_mfpr=0;int miss=niwj_select(&njs_native.request,&njs_native.cache[k],&nss_native.info,now_us,&njs_native.candidate);mfpr+=niwj_ap_mfpr;if(miss)continue;
++  if(!found||njs_native.candidate.rssi_dbm>njs_native.target.rssi_dbm){njs_native.target=njs_native.candidate;found=1;}}
++ if(niwj_eap(njs_native.request.security))printf("NORD2 WIFI 8021X: join akm=%u ap_found=%u ap_requires_pmf=%u%s\n",njs_native.request.security==NIWJ_WPA2_8021X?1u:5u,(unsigned)found,mfpr,!found&&mfpr?" (PMF/MFPR is not supported)":"");
++
+  /* Holding admission lock across these pure constructors serializes cancel
+   * with first-attempt ownership. No native publish or callback occurs here. */
+  if(!found||nst_native_prepare(&njs_native.target,njs_native.native_generation,now_us,njs_native.deadline_us,&njs_native.profile)){
+@@ -327,6 +337,7 @@
+  struct stc_config config={0};config.generation=njs_native.native_generation;config.deadline_ms=njs_native.deadline_us/1000;config.cleanup_timeout_ms=30000;config.assoc=njs_native.profile.assoc;config.security=config.assoc.security;
+  config.channel=(struct sw_channel){.bss=nst_native.state.peer.bss,.token=(uint8_t)njs_native.native_generation,.band=njs_native.target.band,.channel=njs_native.target.channel,.dbdc_band=4,.interval_ms=4000};
+  memcpy(config.group_spare,nst_native.state.group_spare,sizeof config.group_spare);config.sta_wlan=nst_native.state.peer.wlan;config.group_wlan=nst_native.state.peer.group_wlan;if(config.security!=SW_SECURITY_OPEN){config.pmk=njs_native.request.pmk;config.station_rsn=njs_native.request.station_rsn;config.ap_rsn=njs_native.target.ap_rsn;config.ap_rsn_bytes=njs_native.target.ap_rsn_bytes;config.rng=njs_rng;}
++ if(niwj_eap(njs_native.target.security))config.pmk=0; /* 0451: 802.1X, the PMK arrives after EAP (stc_pmk) */
+  config.ap_ies=njs_native.target.record.ies;config.ap_ies_bytes=njs_native.target.record.ie_bytes;
+  int result=nwn_begin(&njs_native.driver,&nst_native.state,&njs_native.arbiter,&config,njs_peer,&njs_native,fresh_us/1000);
+  niwj_clear(&config,sizeof config);niwj_clear(&njs_native.request,sizeof njs_native.request);njs_native.queued=0;njs_native.active=result==1;
+@@ -400,8 +411,10 @@
+  if(nst_native.state.associated_scan&&(njs_native.canceled||njs_native.leave||nst_native.state.link_lost))(void)nst_associated_scan_cancel(&nst_native.state);
+  if((njs_native.canceled||njs_native.leave)&&!nst_native.state.associated_scan){(void)nwn_cancel(&njs_native.driver,njs_native.native_generation,now_us/1000);njs_drop_tx_locked();}
+  if(njs_associated_scan_start_locked()<0){IOLockUnlock(nss_native.lock);return njs_fatal_owner(3);}
++ n8xb_key_locked(now_us);
+  int result=(njs_native.canceled||njs_native.leave)&&nst_native.state.associated_scan?0:nwn_pump(&njs_native.driver,now_us/1000);
+  if(result<0){IOLockUnlock(nss_native.lock);return njs_fatal_owner(4);}
++ n8xb_tx_locked();
+  if(!njs_native.canceled&&!njs_native.leave&&nwo_authorized(&njs_native.driver.owner)&&!nst_native.state.wire_busy&&!nst_native.state.air_pending&&njs_native.tx_count){
+   unsigned k=njs_native.tx_head;int sent=nst_data(&nst_native.state,UINT64_MAX,njs_native.tx[k],njs_native.tx_bytes[k]);
+   if(sent<=0){if(sent<0)njs_native.queued_drop++;niwj_clear(njs_native.tx[k],sizeof njs_native.tx[k]);njs_native.tx_bytes[k]=0;njs_native.tx_head=(k+1)%NJS_TX_SLOTS;njs_native.tx_count--;}}
+@@ -434,9 +447,10 @@
+   IOLockUnlock(njs_native.notice_lock);
+   if(error)njs_link_error(1,error);
+  }
++ n8xb_link_work(&notify_join);n8xb_deliver();
+  for(unsigned k=0;k<njs_native.rx_count;k++){IOLockLock(nss_native.lock);unsigned deliver=njs_native.linked&&!njs_native.canceled&&!njs_native.leave&&njs_native.rx_generation[k]==njs_native.native_generation;IOLockUnlock(nss_native.lock);if(deliver&&!nord2_wifi_ifnet_receive(njs_native.rx_generation[k],njs_native.rx[k],njs_native.rx_bytes[k])){IOLockLock(nss_native.lock);njs_native.rx_delivered++;if(njs_native.data_logs<8){njs_native.data_logs++;njs_trace_locked(1);}IOLockUnlock(nss_native.lock);}niwj_clear(njs_native.rx[k],sizeof njs_native.rx[k]);njs_native.rx_bytes[k]=0;}njs_native.rx_count=0;
+  if(detach)njs_notice(NJS_RETIRED);
+- if(notify_join&&!detach){IOLockLock(nss_native.lock);unsigned live=njs_native.linked&&!njs_native.canceled&&!njs_native.leave;IOLockUnlock(nss_native.lock);if(live)njs_notice(NJS_JOINED);}
++ if(notify_join&&!detach){IOLockLock(nss_native.lock);unsigned live=(njs_native.linked||n8xb_live_locked())&&!njs_native.canceled&&!njs_native.leave;IOLockUnlock(nss_native.lock);if(live)njs_notice(NJS_JOINED);}
+  if(notify_terminal)njs_notice(njs_native.joined?NJS_LEFT:NJS_JOIN_FAILED);
+  if(retire)njs_notice(NJS_RETIRED);
+  if(terminal&&njs_native.driver.owner.transaction.phase==STC_DONE&&NJS_RETURN_SCANS()<0)return njs_fatal_owner(6);
+--- a/bsd/dev/wifi_station_transport_bind.inc
++++ b/bsd/dev/wifi_station_transport_bind.inc
+@@ -43,7 +43,7 @@
+ static int nst_native_rx_memory(const struct nwfn_native*n,uint64_t a,uint32_t bytes,unsigned write){return nst_native_owner_window(n)&&nst_memory_range(&nst_native.state,a,bytes,write);}
+ static int nst_native_rx_write(const struct nwfn_native*n,uint32_t a,uint32_t v){return nst_native_owner_window(n)&&nst_register_write(&nst_native.state,a,v);}
+ static int nst_native_prepare(const struct niwj_target*t,uint64_t generation,uint64_t now,uint64_t deadline,struct nst_profile*out){
+- if(nst_native.probe||nst_native.next_data_profile>NST_DATA_TODS||!t||!out||(t->security!=NIWJ_WPA2_PSK_CCMP&&t->security!=NIWJ_OPEN)||(t->security==NIWJ_OPEN&&nst_native.next_data_profile!=NST_DATA_ETHERNET)||!generation||generation>255||(nst_native.attempted&&(!nsr_native.scan_ready||nsr_native.admitted_generation!=generation||nsr_native.bad||nsr_native.ptk||nsr_native.gtk||nsr_native.pending||nst_native.active))||ncd_native.worker!=current_thread()||!ncd_native.active||ncd_native.parked||ncd_native.halt||nct_native.active||!nss_available()||nss_native.failed||!ncb_native.prepared||!nbc_native.state.plan.pse_data||ncb_native.rx.active||!nst_scan_admissible(&ncb_native.rx.scan)||!nct_done_receipt(&nct_native.session))return -1;
++ if(nst_native.probe||nst_native.next_data_profile>NST_DATA_TODS||!t||!out||(t->security!=NIWJ_WPA2_PSK_CCMP&&t->security!=NIWJ_OPEN&&!niwj_eap(t->security))||(t->security==NIWJ_OPEN&&nst_native.next_data_profile!=NST_DATA_ETHERNET)||!generation||generation>255||(nst_native.attempted&&(!nsr_native.scan_ready||nsr_native.admitted_generation!=generation||nsr_native.bad||nsr_native.ptk||nsr_native.gtk||nsr_native.pending||nst_native.active))||ncd_native.worker!=current_thread()||!ncd_native.active||ncd_native.parked||ncd_native.halt||nct_native.active||!nss_available()||nss_native.failed||!ncb_native.prepared||!nbc_native.state.plan.pse_data||ncb_native.rx.active||!nst_scan_admissible(&ncb_native.rx.scan)||!nct_done_receipt(&nct_native.session))return -1;
+  for(unsigned k=0;k<NSS_SLOTS;k++)if(nss_native.slot[k].state==NSS_QUEUED||nss_native.slot[k].state==NSS_RUNNING)return 1;
+  struct ncs_cap cap;if(!ncd_native.diag.events||ncd_native.diag.events>sizeof(ncd_native.diag.history)/sizeof(ncd_native.diag.history[0])||ncs_cap_mac(ncd_native.diag.frame,ncd_native.diag.frame_bytes,ncd_native.diag.history[ncd_native.diag.events-1].sequence,&cap)||cap.bmc!=4||cap.wtbl<7)return -1;
+  unsigned allowed=0;for(unsigned k=0;k<nss_native.info.count;k++)if(nss_native.info.channels[k].band==t->band&&nss_native.info.channels[k].channel==t->channel)allowed=1;
+--- a/iokit/Kernel/arm/wifi_ios_client.cpp
++++ b/iokit/Kernel/arm/wifi_ios_client.cpp
+@@ -102,7 +102,7 @@
+ static void niwj_free(void*p,size_t n){if(p){niwj_clear(p,n);IOFree(p,n);}}
+ class NiwlLifecycleClient : public IOUserClient {
+  OSDeclareDefaultStructors(NiwlLifecycleClient)
+- task_t owner;IOLock *gate;
++ task_t owner;IOLock *gate;bool supplicant;
+  uint64_t timingClient;uint32_t timingCalls,timingRequest,timingNormal,timingSlow;
+  enum Phase {Closed,Open,Allocated,Armed};Phase phase;
+  IOBufferMemoryDescriptor *data,*state;
+@@ -129,6 +129,7 @@
+  IOReturn outputLocked(uint32_t,IOExternalMethodArguments *,bool *);
+ public:
+  void bindInterface(const char*);
++ bool isSupplicant(void) const {return supplicant;}
+  bool initWithTask(task_t,void *,UInt32,OSDictionary *) override;
+  IOReturn externalMethod(uint32_t,IOExternalMethodArguments *,IOExternalMethodDispatch *,OSObject *,void *) override;
+  IOReturn clientMemoryForType(UInt32,IOOptionBits *,IOMemoryDescriptor **) override;
+@@ -146,6 +147,13 @@
+  OSObject *entitlement=IOUserClient::copyClientEntitlement(task,"com.apple.wifi.manager-access");
+  OSBoolean *allowed=OSDynamicCast(OSBoolean,entitlement);bool authorized=allowed&&allowed->isTrue();
+  if(entitlement)entitlement->release();
++ supplicant=false;
++ if(!authorized&&niwj_8021x){
++  /* 0451: the 802.1X supplicant (eapolclient) has com.apple.wlan.authentication, not manager access. It may query
++   * the association (SSID, BSSID, AUTH_TYPE), monitor events, scan and set the EAP key; no join, leave or power. */
++  entitlement=IOUserClient::copyClientEntitlement(task,"com.apple.wlan.authentication");allowed=OSDynamicCast(OSBoolean,entitlement);
++  supplicant=authorized=allowed&&allowed->isTrue();if(entitlement)entitlement->release();
++ }
+  if(!authorized||!IOUserClient::initWithTask(task,security,type,props))return false;
+  gate=IOLockAlloc();if(!gate)return false;
+  snapshot=(niwa_snapshot*)IOMalloc(sizeof(*snapshot));if(!snapshot)return false;bzero(snapshot,sizeof(*snapshot));
+@@ -198,6 +206,24 @@
+   uint32_t unsupportedSet=0;
+   if(!niwi_set_shape(selector,carrier,bytes,interfaceName,&unsupportedSet)){timingRequest=unsupportedSet;
+    const uint8_t*power=(const uint8_t*)carrier+8;size_t tail=selector==0?15368:245768;
++   if(unsupportedSet==3||unsupportedSet==89){
++    /* 0451: APPLE80211_IOC_CIPHER_KEY of eapolclient after EAP success. struct apple80211_key, 148 bytes: version 1 at 0,
++     * key length at 4, cipher type at 8, key at 16. Cipher 9 = MSK, 64 bytes (the PMK is its first half); 6 = PMK, 32.
++     * An empty MSK and request 89 clear a PMK cache this driver does not keep. Key bytes are never logged. */
++    uint32_t extent=niw_u32((const uint8_t*)carrier+4),value=niw_u32((const uint8_t*)carrier+tail+20),cipher=0,length=0;const uint8_t*key=power;
++    if(a->structureOutputSize||value)result=kIOReturnBadArgument;
++    else if(unsupportedSet==89)result=extent?kIOReturnUnsupported:kIOReturnSuccess;
++    else if(extent!=148||niw_u32(key)!=1)result=kIOReturnBadArgument;
++    else{
++     cipher=niw_u32(key+8);length=niw_u32(key+4);
++     if((cipher==9&&length==64)||(cipher==6&&length==32)){int x=nord2_wifi_8021x_key(key+16,length);result=!x?kIOReturnSuccess:x<0?kIOReturnBadArgument:kIOReturnNotReady;}
++     else if(cipher==9&&!length)result=kIOReturnSuccess;
++     else result=kIOReturnUnsupported;
++    }
++    if(traceControl(unsupportedSet,0x802869c8))printf("NORD2 WIFI 8021X: set request=%u bytes=%u cipher=%u key_bytes=%u status=%#x supplicant=%u t_ms=%llu\n",unsupportedSet,extent,cipher,length,(unsigned)result,(unsigned)supplicant,niw_ms());
++    if(copy)niwj_free(copy,bytes);return result;
++   }
++   if(supplicant&&(unsupportedSet==19||unsupportedSet==20||unsupportedSet==22)){if(copy)niwj_free(copy,bytes);return kIOReturnNotPrivileged;}
+    if(unsupportedSet==20||unsupportedSet==22){
+     uint32_t extent=niw_u32((const uint8_t*)carrier+4),value=niw_u32((const uint8_t*)carrier+tail+20);
+     if(a->structureOutputSize||value)result=kIOReturnBadArgument;
+@@ -366,7 +392,7 @@
+  c->bindInterface(name->getCStringNoCopy());
+  if(!c->attach(provider)){c->release();return kIOReturnNotReady;}
+  if(!c->start(provider)){c->detach(provider);c->release();return kIOReturnNotReady;}
+- *handler=c;printf("NORD2 WIFI IOS CLIENT: opened=1 type=0 root_busy=%d t_ms=%llu\n",niw_root_busy(),niw_ms());return kIOReturnSuccess;
++ *handler=c;printf("NORD2 WIFI IOS CLIENT: opened=1 type=0 root_busy=%d t_ms=%llu\n",niw_root_busy(),niw_ms());if(c->isSupplicant())printf("NORD2 WIFI 8021X: supplicant client opened t_ms=%llu\n",niw_ms());return kIOReturnSuccess;
+ }
+ bool NiwlLifecycleClient::powerEventLocked(){
+  if(phase!=Armed||!ownsReference||!data||!state)return false;
