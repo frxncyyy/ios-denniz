@@ -1,0 +1,477 @@
+diff -ruN a/bsd/dev/audio_afe.h b/bsd/dev/audio_afe.h
+--- a/bsd/dev/audio_afe.h	2026-11-05 19:42:06.576676245 +0100
++++ b/bsd/dev/audio_afe.h	2026-11-05 19:42:06.588350599 +0100
+@@ -5,8 +5,15 @@
+ 
+ /* MT6893 continuous speaker AFE backend, derived from reviewed revision5.
+  * Selected source Android04d00c2; register/order audit in SOURCE-AUDIT.md.
+- * Cold SPM AUDIO domain is powered up; APLL2 is actually programmed to
+- * 196.608MHz (PCW/postdivider/tuner), not assumed to inherit that rate.
++ * The AUDIO MTCMOS must be in the exact source power-down end state; we own
++ * its whole power transition. Everything AROUND it is classified from the
++ * real inherited boot state (naf_ownership): ADSP domain, AUDIO bus protect,
++ * infra audio gates, audio muxes and APLL2 are either acquired (gated/cold:
++ * we enable and later re-gate) or borrowed (already live: never gated,
++ * reparented back, powered down or retuned). Every borrowed field is
++ * restored bit-exact on stop and re-verified against the boot snapshot.
++ * Cold APLL2 is programmed to 196.608MHz (PCW/postdivider/tuner); a live
++ * APLL2 is accepted only at exactly that source rate and left untouched.
+  * DL1 uses one4KiB SRAM block, stereoS16; I2S3 uses32-bit serial slots as
+  * required by selected Android BE fixup. SRAM must reuse AFE16KiB mapping.
+  * naf_stream_open/close retain per-object plans; worker feeds SRAM while
+@@ -76,8 +83,10 @@
+ #define NAF_AFE_DL1_END      (NAF_AFE + 0x064u)
+ #define NAF_AFE_DAC_MON      (NAF_AFE + 0x2ecu)
+ #define NAF_AFE_APLL2_TCFG   (NAF_AFE + 0x3f4u)
+-#define NAF_AFE_CONN28       (NAF_AFE + 0x4bcu)
+-#define NAF_AFE_CONN29       (NAF_AFE + 0x4c0u)
++#define NAF_AFE_CONN0        (NAF_AFE + 0x020u)
++#define NAF_AFE_CONN1        (NAF_AFE + 0x024u)
++#define NAF_AFE_CONN28       (NAF_AFE + 0x4bcu) /* historical I2S1 sink; not writable */
++#define NAF_AFE_CONN29       (NAF_AFE + 0x4c0u) /* historical I2S1 sink; not writable */
+ #define NAF_AFE_MEMIF_CON0   (NAF_AFE + 0x8ccu)
+ #define NAF_AFE_CONN_24BIT_1 (NAF_AFE + 0x994u)
+ #define NAF_AFE_HD_ENGEN     (NAF_AFE + 0xdd0u)
+@@ -96,22 +105,49 @@
+ 	unsigned pwdn, ampe, manstate;
+ };
+ 
++/* Gate bits. A set bit is a refusal; nothing is written. Bits 4/5 are
++ * retired (kept for log stability): the selected AUDIO on-sequence has no
++ * protect precondition (pg.c:3314-3355) and an already-ungated infra gate is
++ * simply borrowed, so neither inherited state is a reason to refuse. */
+ enum {
+ 	NAF_G_SNAPSHOT = 1u << 0,   /* milestone-1a snapshot incomplete/failed */
+-	NAF_G_SPM_CFG = 1u << 1,    /* POWERON_CONFIG_EN != selected keyed write */
+-	NAF_G_AUDIO_ON = 1u << 2,   /* AUDIO MTCMOS not in the exact cold state */
+-	NAF_G_ADSP_ON = 1u << 3,    /* ADSP domain on or not in selected cold state */
+-	NAF_G_PROTECT = 1u << 4,    /* AUDIO bus protection not set while cold */
+-	NAF_G_INFRA = 1u << 5,      /* ifrao_audio/audio26m already ungated */
+-	NAF_G_MUX = 1u << 6,        /* an audio mux ungated or not on 26 MHz */
+-	NAF_G_APLL2_ON = 1u << 7,   /* APLL2 enabled/powered or its tuner enabled */
+-	NAF_G_APLL2_RATE = 1u << 8, /* measured postdiv/PCW != 196.608 MHz source calc */
+-	NAF_G_APLL2_TUNER = 1u << 9,/* tuner != PCW + 1 (clk-pll.c:271-272) */
+-	NAF_G_PINS = 1u << 10,      /* GPIO32/33/35 not GPIO-mode inputs */
++	NAF_G_SPM_CFG = 1u << 1,    /* retired: POWERON is rewritten per transition */
++	NAF_G_AUDIO_ON = 1u << 2,   /* AUDIO MTCMOS not in the exact power-down end state */
++	NAF_G_ADSP_ON = 1u << 3,    /* ADSP neither exact off nor exact on (transition/incoherent) */
++	NAF_G_PROTECT = 1u << 4,    /* retired: inherited protect bit4 accepted either way */
++	NAF_G_INFRA = 1u << 5,      /* retired: inherited ungated infra audio gates borrowed */
++	NAF_G_MUX = 1u << 6,        /* an audio mux on a parent we cannot adopt or restore */
++	NAF_G_APLL2_ON = 1u << 7,   /* APLL2 neither exact cold nor exact powered/enabled */
++	NAF_G_APLL2_RATE = 1u << 8, /* live APLL2 not at the 196.608 MHz source rate */
++	NAF_G_APLL2_TUNER = 1u << 9,/* live APLL2 tuner enabled with tuner != PCW + 1 */
++	NAF_G_PINS = 1u << 10,      /* GPIO32/33/35 not idleGPIOinputs or exactI2S3 */
+ 	NAF_G_AMPS = 1u << 11,      /* no measured power-down for both amplifiers */
+ 	NAF_G_AFE_SEEN = 1u << 12,  /* snapshot found the AFE readable (not cold) */
+ };
+ 
++/* Inherited ownership, decoded only from snapshot words (pure).
++ * *_gated: 1 = we must ungate and later re-gate; 0 = borrowed live gate.
++ * *_parent: inherited mux index restored exactly on stop. */
++struct naf_own {
++	uint8_t adsp_on, prot_clear, ifr1_gated, ifr3_gated, apll2_borrowed;
++	uint8_t audio_gated, audio_parent, intbus_gated, intbus_parent;
++	uint8_t aud2_gated, aud2_parent, engen2_gated, engen2_parent;
++};
++/* Log summary of struct naf_own (status.ownership); parents in
++ * audio_sel [13:12], intbus [15:14], engen2 [17:16], aud_2 [18]. */
++#define NAF_OWN_ADSP_ON        (1u << 0)
++#define NAF_OWN_PROT_CLEAR     (1u << 1)
++#define NAF_OWN_IFR_AUDIO_ON   (1u << 2)
++#define NAF_OWN_IFR_26M_ON     (1u << 3)
++#define NAF_OWN_APLL2_BORROWED (1u << 4)
++#define NAF_OWN_AUDIO_SEL_ON   (1u << 5)
++#define NAF_OWN_INTBUS_ON      (1u << 6)
++#define NAF_OWN_AUD2_ON        (1u << 7)
++#define NAF_OWN_ENGEN2_ON      (1u << 8)
++#define NAF_OWN_VALID          (1u << 31)
++unsigned naf_ownership(const uint32_t snap[NAU_SNAP_COUNT], struct naf_own *);
++uint32_t naf_own_mask(const struct naf_own *);
++
+ /* mtk_pll_calc_values() for the MT6893 PLL() parameters (fin 26 MHz,
+  * fmin 1500 MHz, fmax 3800 MHz, pcwbits 32, integer bits 8). Returns the
+  * PCW and writes the postdiv register code (log2 of the divider). */
+@@ -124,6 +160,7 @@
+ #define NAF_MAX_OPS 128
+ struct naf_plan {
+ 	unsigned n_up, n_down;
++	struct naf_own own;
+ 	struct naf_op up[NAF_MAX_OPS];
+ 	struct naf_op down[NAF_MAX_OPS];
+ };
+@@ -157,13 +194,13 @@
+  * One silent-stream cycle: live re-read of every gate register (reads only),
+  * gate, plan validation against the write allowlist, bring-up, bounded
+  * DL1_CUR observation, source teardown, final read-back verify.
+- *   0  streamed, observed, torn down and verified cold
++ *   0  streamed, observed, torn down and verified back to the snapshot
+  *  -1  refused before any write (arguments, authorization, gate, live drift, plan)
+  *  -2  uncertain: a callback failed or a bring-up/teardown poll timed out; no
+  *      cleanup is attempted, state->active/uncertain stay set (Linux return
+  *      must be refused, no further call)
+  *  -3  bring-up finished but DL1_CUR did not advance in range; teardown and
+- *      verify still ran cleanly (functional failure, hardware back to cold)
++ *      verify still ran cleanly (functional failure, hardware restored)
+  *  -4  teardown finished but read-back differs from the snapshot (uncertain)
+  * A second call on the same state makes no callback.
+  */
+diff -ruN a/bsd/dev/audio_hw.h b/bsd/dev/audio_hw.h
+--- a/bsd/dev/audio_hw.h	2026-11-05 19:42:06.573398976 +0100
++++ b/bsd/dev/audio_hw.h	2026-11-05 19:42:06.586972902 +0100
+@@ -8,7 +8,13 @@
+ #define NAH_RATE 48000u
+ #define NAH_RING_FRAMES (NAF_SRAM_BYTES / 4u)
+ #define NAH_QUEUE_FRAMES 8192u
+-#define NAH_MAX_GAIN_Q15 256u /* full-scale input <= -42dBFS at DMA */
++#define NAH_DEFAULT_GAIN_Q15 256u /* original tested bringup level */
++#define NAH_DEFAULT_BOTTOM_GAIN_Q15 5793u /* user-approved live level, 2026-10-24 */
++/* Digital calibration range, not a calibrated acoustic/protection limit.
++ * Unity is the upper bound: never amplify beyond the incoming signed PCM.
++ * Startup defaults remain the physically tested low levels above. */
++#define NAH_MAX_GAIN_Q15 32768u
++#define NAH_GAIN_RAMP_FRAMES 480u /* ten-ms PCM ramp; no busy wait */
+ #define NAH_MAX_TEST_US 2000000u
+ /* Failure values are stable public worker status, never a kernel panic. */
+ enum { NAH_OK=0, NAH_E_ARG=-1, NAH_E_WORKER=-2, NAH_E_IO=-3,
+@@ -29,11 +35,10 @@
+  uintptr_t (*worker)(void *);
+  int (*lease)(void *, unsigned acquire);
+ };
+-/* Board profile cannot be supplied by USB/userspace. Immutable compiled data,
+- * reviewed against exact Nord2 container and observed amp REV is required.
++/* Board profile cannot be supplied by USB/userspace. Immutable boot ADT data,
++ * verified against the pinned Nord2 container and observed amp REV is required.
+  * apply runs source-backed volatile init + exact board profile while PWDN=1,
+- * AMPE=0; it must not touch OTP/MTP or rail bucks. It is deliberately absent
+- * from this candidate until the matching container is recovered. The amp
++ * AMPE=0; it must not touch OTP/MTP or rail bucks. The amp
+  * control path still performs independent mute/clock/readback checks.
+  * This callback boundary avoids manufacturing unknown analog settings. */
+ struct nah_board {
+@@ -42,6 +47,22 @@
+  int (*apply)(void *, const struct na8_io *, struct na8_state *, unsigned amp);
+  int (*supports)(uint16_t revision, unsigned slave);
+ };
++/* Fixed startup observations, captured once after both AMPE enables.
++ * No generic register access or live ABI is exposed. */
++enum { NAH_O_SYS0,NAH_O_STATUS10,NAH_O_STATUS11,NAH_O_STATUS13,
++ NAH_O_STATUS14,NAH_O_MUTE58,NAH_O_TDM20,NAH_O_TDM23,NAH_O_TDM26,NAH_O_FIELDS };
++enum { NAH_AS_CONFIG=1,NAH_AS_PRE_WAIT,NAH_AS_ENABLE,NAH_AS_POST_CLEAR,
++ NAH_AS_POST_WAIT,NAH_AS_READY,NAH_AS_OBSERVE };
++/* Worker-owned startup evidence. Cleanup never changes this record.
++ * valid/first_bad_valid bit0=status10, bit1=family clock register.
++ * attempts counts complete/partial sample attempts across both waits. */
++struct nah_amp_start {
++ unsigned stage,attempts,valid,first_bad_valid,first_bad_stage,first_bad_attempt;
++ uint16_t status,clocks,first_bad_status,first_bad_clocks;
++ int error;
++ unsigned failure_reg;
++ uint32_t failure_pa,failure_value;
++};
+ struct nah_status {
+  unsigned initialized, running, silent_only, uncertain, gate, retained_shared_clock;
+  unsigned amp_reset_held; /* uncertain amp transport: local GPIO reset latched high */
+@@ -50,7 +71,14 @@
+  int error, stop_error, reset_error;
+  uint32_t current_pa, consumed_frames, queued_frames, fed_frames;
+  uint32_t pcm_frames, silence_frames, underruns, ticks, max_tick_gap_us;
++ uint32_t gain_ramp_frames, dma_peak[2];
+  uint16_t amp_revision[2], amp_status[2];
++ struct nah_amp_start amp_start[2];
++ uint16_t amp_observed[2][NAH_O_FIELDS];
++ unsigned amp_observed_valid[2], amp_observed_seq;
++ /* Saved-state diagnostics only: naf_own_mask of the boot snapshot and the
++  * last I2C8 register/value the transport touched (no extra MMIO). */
++ uint32_t ownership, i2c_last_pa, i2c_last_value;
+ };
+ struct nau_hw {
+  struct nah_io io; void *cookie; uintptr_t owner;
+@@ -64,22 +92,31 @@
+  struct nah_status status;
+  int16_t queue[NAH_QUEUE_FRAMES * 2u];
+  uint32_t qr, qw, qcount, last_frame, idle_ticks;
+- uint64_t last_us, deadline_us, last_feed_us;
+- unsigned gain_q15, leased, first_tick, new_input, reset_changed, bus_clock_prepared, bus_clock_changed;
++ uint64_t last_us, deadline_us, last_feed_us, last_progress_us;
++ unsigned gain_q15[2], leased, first_tick, new_input, reset_changed, bus_clock_prepared, bus_clock_changed, pointer_waiting;
+ };
+ /* h must be static/heap, zeroed once per boot; never place on kernel stack.
+- * init snapshots original reset GPIO111/148 fields, checks coldAFE and idlebus,
+- * then source reset pulse high5ms/low5ms when pinsareGPIO. Stop restores saved
+- * direction/latch fields; no controller reset or bitbang ever occurs. */
++ * init snapshots original reset GPIO111/148 fields and the inherited clock/
++ * power tree, classifies acquired vs borrowed shared state (naf_ownership),
++ * checks idle bus, then source reset pulse high5ms/low5ms when pins are GPIO.
++ * Stop restores saved direction/latch fields and every borrowed clock/power
++ * field; no controller reset or bitbang ever occurs. NAH_E_COLD means the
++ * snapshot itself is refused (status.gate), NAH_E_AMPS that only the post-
++ * reset amplifier evidence is (gate == NAF_G_AMPS). */
+ int nau_hw_init(struct nau_hw *, const struct nah_io *, void *, const struct nah_board *);
+ /* silent_only=1 proves AFE without amp enable; normal start returns
+  * NAH_E_BOARD_CONFIG with zero hardware writes if board is missing.
+  * Both modes run actual continuous DMA and tick. duration_us=0 is continuous
+  * HAL playback with 750ms input-idle watchdog; nonzero tests are capped2s.
+- * rate must be48000/channels2/bits16. gain0..256 scales queue PCM; no amp gain
++ * rate must be48000/channels2/bits16. gain0..32768 scales queue PCM; no amp gain
+  * guessed or modified. now_us is monotonic microseconds from worker clock. */
+ int nau_hw_start(struct nau_hw *, unsigned rate, unsigned channels, unsigned bits,
+  unsigned silent_only, unsigned gain_q15, unsigned duration_us, uint64_t now_us);
++/* Physical top=left/slot0/amp37; bottom=right/slot1/amp34. Absolute
++ * gains, never multipliers; each startup ramps only meaningful PCM. */
++int nau_hw_start_channels(struct nau_hw *, unsigned rate, unsigned channels, unsigned bits,
++ unsigned silent_only, unsigned top_q15, unsigned bottom_q15,
++ unsigned duration_us, uint64_t now_us);
+ /* feed returns accepted frames (0 if full), or negative error. Only worker;
+  * producer/devfs queues its data externally before this call. */
+ int nau_hw_feed(struct nau_hw *, const int16_t *, unsigned frames);
+diff -ruN a/bsd/dev/audio_hw_native.inc b/bsd/dev/audio_hw_native.inc
+--- a/bsd/dev/audio_hw_native.inc	2026-11-05 19:42:06.570148382 +0100
++++ b/bsd/dev/audio_hw_native.inc	2026-11-05 19:42:06.586188647 +0100
+@@ -6,6 +6,10 @@
+  * Audio worker calls nau_hw_* with &nah_native_io and &native as cookie.
+  * I2C8 lease callback must serialize AP users and must not touch PMIF. */
+ #include "audio_hw.h"
++#include "audio_native.h"
++#ifndef NAH_NATIVE_BARRIER
++#define NAH_NATIVE_BARRIER() __asm__ __volatile__("dsb sy" ::: "memory")
++#endif
+ #define NAH_NATIVE_WINDOWS 9u
+ struct nah_native_window { uint32_t base; vm_offset_t va; };
+ struct nah_native_context {
+@@ -45,18 +49,28 @@
+   if (c->windows[i].base==base) return c->windows[i].va+(pa-base);
+  return 0;
+ }
++/* Reuse the PE-owned distributor mapping; do not create a tenth alias. */
++extern int nord2_audio_gic_read(uint32_t *);
+ static int nah_native_read(void *cookie,uint32_t pa,unsigned w,uint32_t *v)
+ {
+  struct nah_native_context *c=cookie;
++ if (!v || !nah_native_worker(c)) return -1;
++ if (pa==0x0c000110) {
++  if (w!=4) return -1;
++  NAH_NATIVE_BARRIER();
++  int rc=nord2_audio_gic_read(v);
++  NAH_NATIVE_BARRIER();
++  return rc;
++ }
+  vm_offset_t va=nah_native_va(c,pa,w);
+- if (!v || !va) return -1;
++ if (!va) return -1;
+  /* FIFO_DATA is only popped by the polled transport; SRAM is write-only. */
+  if (pa>=NAF_SRAM && pa<NAF_SRAM+NAF_SRAM_BYTES) return -1;
+- __asm__ __volatile__("dsb sy" ::: "memory");
++ NAH_NATIVE_BARRIER();
+  if (w==1) *v=*(volatile uint8_t *)va;
+  else if (w==2) *v=*(volatile uint16_t *)va;
+  else *v=*(volatile uint32_t *)va;
+- __asm__ __volatile__("dsb sy" ::: "memory");
++ NAH_NATIVE_BARRIER();
+  return 0;
+ }
+ static int nah_native_bus_write(uint32_t pa,unsigned w)
+@@ -88,11 +102,11 @@
+  if (!((w==4 && naf_write_allowed(pa)) || nah_native_bus_write(pa,w) || reset || clock)) return -1;
+  vm_offset_t va=nah_native_va(c,pa,w);
+  if (!va) return -1;
+- __asm__ __volatile__("dsb sy" ::: "memory");
++ NAH_NATIVE_BARRIER();
+  if (w==1) *(volatile uint8_t *)va=(uint8_t)v;
+  else if (w==2) *(volatile uint16_t *)va=(uint16_t)v;
+  else *(volatile uint32_t *)va=v;
+- __asm__ __volatile__("dsb sy" ::: "memory");
++ NAH_NATIVE_BARRIER();
+  return 0;
+ }
+ static int nah_native_delay(void *cookie,unsigned us)
+@@ -115,6 +129,37 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ static struct nah_native_context nah_native;
+ static unsigned nah_native_attempted;
++/* The producer owns NI/NW globals. Audio never reads them while they are
++ * being initialized: immutable retained VAs publish via release/acquire. */
++static struct { vm_offset_t infra,gpio,lt; } nah_native_shared;
++static int nah_native_publication=NAH_NATIVE_WAIT;
++#define NAH_NATIVE_PUBLISHING 2
++int nah_native_dependency_state(void)
++{
++ int state=__atomic_load_n(&nah_native_publication,__ATOMIC_ACQUIRE);
++ return state==NAH_NATIVE_PUBLISHING ? NAH_NATIVE_WAIT:state;
++}
++int nah_native_publish_ready(void)
++{
++ int expected=NAH_NATIVE_WAIT;
++ if (!__atomic_compare_exchange_n(&nah_native_publication,&expected,
++     NAH_NATIVE_PUBLISHING,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))
++  return nah_native_dependency_state();
++ int result=NAH_NATIVE_READY;
++ /* Called only by NI after its initial writes. Capture once, never replace
++  * or unmap these windows, even if audio subsequently fails to initialize. */
++ if (PAGE_SIZE!=0x4000u) result=NAH_NATIVE_E_PAGE;
++ else if (!nw.infra || !ni_gpio || !ni_lt) result=NAH_NATIVE_E_DEPENDENCIES;
++ else if (((nw.infra-0x1000)&0x3fff) || ((ni_gpio-0x1000)&0x3fff) ||
++          (ni_lt&0x3fff)) result=NAH_NATIVE_E_WINDOW;
++ if (!result) {
++  nah_native_shared.infra=nw.infra;
++  nah_native_shared.gpio=ni_gpio;
++  nah_native_shared.lt=ni_lt;
++ }
++ __atomic_store_n(&nah_native_publication,result,__ATOMIC_RELEASE);
++ return result;
++}
+ static volatile unsigned nah_native_bus_owned;
+ static int nah_native_bus_lease(unsigned acquire)
+ {
+@@ -124,21 +169,25 @@
+ }
+ int nah_native_prepare(struct nah_io *out,void **cookie)
+ {
+- if (!out || !cookie || nah_native_attempted || PAGE_SIZE!=0x4000u ||
+-     !nw.infra || !ni_gpio || !ni_lt || !current_thread()) return -1;
++ if (!out || !cookie) return NAH_NATIVE_E_ARGS;
++ if (PAGE_SIZE!=0x4000u) return NAH_NATIVE_E_PAGE;
++ if (!current_thread()) return NAH_NATIVE_E_CONTEXT;
++ if (nah_native_attempted) return NAH_NATIVE_E_REENTRY;
++ int state=nah_native_dependency_state();
++ if (state!=NAH_NATIVE_READY) return state; /* WAIT has zero side effects. */
+  nah_native_attempted=1;
+  nah_native.worker=current_thread(); nah_native.i2c8_lease=nah_native_bus_lease;
+  for (unsigned i=0;i<NAH_NATIVE_WINDOWS;i++) {
+   uint32_t pa=nah_native_bases[i]; vm_offset_t va=0;
+   /* ni_gpio maps logical10005000, offset1000 within16KiB page. */
+-  if (pa==0x10000000) va=nw.infra-0x1000;
+-  else if (pa==0x10004000) va=ni_gpio-0x1000;
+-  else if (pa==0x11f20000) va=ni_lt;
++  if (pa==0x10000000) va=nah_native_shared.infra-0x1000;
++  else if (pa==0x10004000) va=nah_native_shared.gpio-0x1000;
++  else if (pa==0x11f20000) va=nah_native_shared.lt;
+   else va=ml_io_map(pa,0x4000);
+-  if (!va) return -1;
++  if (!va) return NAH_NATIVE_E_MAP;
+   nah_native.windows[i]=(struct nah_native_window){pa,va};
+  }
+- if (!nah_native_valid(&nah_native)) return -1;
++ if (!nah_native_valid(&nah_native)) return NAH_NATIVE_E_WINDOW;
+  *out=nah_native_io; *cookie=&nah_native; return 0;
+ }
+ #endif
+diff -ruN a/bsd/dev/audio_i2c8.h b/bsd/dev/audio_i2c8.h
+--- a/bsd/dev/audio_i2c8.h	2026-11-05 19:42:06.580398852 +0100
++++ b/bsd/dev/audio_i2c8.h	2026-11-05 19:42:06.590093798 +0100
+@@ -13,7 +13,8 @@
+  * after mutation is sticky uncertain, with no reset/retry/next-slave access.
+  * Shared clock enabling, amp reset and the AP lease belong to audio_hw.c.
+  * Every transfer rechecks clocks, pinmux, CAM/CCU/shadow/AP idle, DMA/FIFO,
+- * and V2 I3C_EN at0xec. Source references: SOURCE-AUDIT.md.
++ * and captures V2 I3C_EN at0xec as read-only evidence. Fixed100kHz uses
++ * the selected source legacy-I2C branch regardless of that bit.
+  */
+ struct na8_io {
+ 	int (*read)(void *, uint32_t, unsigned, uint32_t *);   /* width 1/2/4 */
+@@ -26,7 +27,12 @@
+  * 12 delay, 13 timeout, 14 completion error, 15 byte bounds,
+  * 16 CAM power (CCU may run), 17 CCU channel busy, 18 shadow START,
+  * 19 argument not allowed, 20 existing GPIO input-enable/pads not high,
+- * 21 AP-channel I3C mode enabled. */
++ * 21 reserved (former unsupported I3C_EN refusal), 22 GIC IRQ owned. */
++/* Read-only AP-channel preflight snapshot. Bit(index) means that read
++ * completed successfully during the latest transfer; missing fields are0. */
++enum na8_ap_field { NA8_AP_START, NA8_AP_CONTROL, NA8_AP_IRQ, NA8_AP_FIFO,
++ NA8_AP_I3C, NA8_AP_FIELDS };
++#define NA8_AP_VALID_ALL ((1u << NA8_AP_FIELDS) - 1u)
+ struct na8_state {
+ 	unsigned entered, inflight, offline, mutated, uncertain, polls, calls;
+  unsigned poll_limit; /* 0=2000, streaming monitor uses200 (2ms); maximum2000 */
+@@ -39,6 +45,8 @@
+ 	uint32_t ifr1, ifr2, dma_en, sh_start, ccu_start, ccu_ctrl, prior_irq, prior_ack;
+ 	uint32_t completion_irq;
+ 	unsigned dma_checked;
++ uint32_t ap_preflight[NA8_AP_FIELDS];
++ unsigned ap_valid;
+ };
+ 
+ /* One read of a 16-bit big-endian TFA register (tfa98xx.c:4705-4709).
+@@ -84,6 +92,8 @@
+  * amplifier is probed only after clean completions. */
+ int na8_probe(const struct na8_io *, void *, struct na8_state *, struct na8_amp amp[2]);
+ unsigned na8_classify(uint16_t rev);
++/* Cold-init only: fixed reg00=2, requires preceding same-amp PWDN1/AMPE0 read. */
++int na8_amp_i2cr(const struct na8_io *, void *, struct na8_state *, unsigned slave);
+ int na8_write16(const struct na8_io *, void *, struct na8_state *,
+     unsigned slave, unsigned reg, uint16_t value);
+ #endif
+diff -ruN a/bsd/dev/audio_id.h b/bsd/dev/audio_id.h
+--- a/bsd/dev/audio_id.h	2026-11-05 19:42:06.583398798 +0100
++++ b/bsd/dev/audio_id.h	2026-11-05 19:42:06.591341836 +0100
+@@ -21,7 +21,8 @@
+  * Revision 3 keeps that snapshot contract and changes only milestone 1b
+  * (audio_i2c8.c): a clean completed NACK is a bounded result rather than an
+  * uncertain fault, the source V2 HW timeout is programmed/restored, and an
+- * AP-channel I3C mode is refused. None of this is hardware-authorized.
++ * AP-channel I3C_EN is retained as read-only evidence; the fixed100kHz
++ * transport follows the source legacy-I2C branch without changing it.
+  */
+ 
+ enum nau_snap {
+@@ -57,6 +58,8 @@
+ 	/* Revision5: SPM POWERON_CONFIG_EN, read only, for the audio_afe.c gate
+ 	 * (clk-mt6885-pg.c:166, 263, 3267). */
+ 	NAU_S_SPM_POWERON,
++	/* Append-only: protection request, distinct from asynchronous STA1 ack. */
++	NAU_S_PROT2_EN,
+ 	NAU_SNAP_COUNT
+ };
+ 
+@@ -64,6 +67,8 @@
+ 	/* AFE 0x11210000 (mt6885-reg.h:2355-2377, 2564-2565) */
+ 	NAU_A_TOP_CON0, NAU_A_TOP_CON1, NAU_A_TOP_CON2, NAU_A_TOP_CON3,
+ 	NAU_A_DAC_CON0, NAU_A_I2S_CON3, NAU_A_DL1_CON0, NAU_A_CONN28, NAU_A_CONN29,
++	/* Append-only: I2S3 mixer; historical I2S1 observations above stay intact. */
++	NAU_A_CONN0, NAU_A_CONN1,
+ 	NAU_AFE_COUNT
+ };
+ 
+diff -ruN a/bsd/dev/audio_native.h b/bsd/dev/audio_native.h
+--- a/bsd/dev/audio_native.h	2026-11-05 19:42:06.569439076 +0100
++++ b/bsd/dev/audio_native.h	2026-11-05 19:42:06.585495871 +0100
+@@ -1,5 +1,19 @@
+ #ifndef NORD2_AUDIO_NATIVE_H
+ #define NORD2_AUDIO_NATIVE_H
+ struct nah_io;
++enum {
++ NAH_NATIVE_READY=0, NAH_NATIVE_WAIT=1,
++ NAH_NATIVE_E_ARGS=-32, NAH_NATIVE_E_PAGE=-33,
++ NAH_NATIVE_E_DEPENDENCIES=-34, NAH_NATIVE_E_REENTRY=-35,
++ NAH_NATIVE_E_CONTEXT=-36, NAH_NATIVE_E_MAP=-37,
++ NAH_NATIVE_E_WINDOW=-38, NAH_NATIVE_E_TIMEOUT=-39
++};
++/* Only NI calls publish, after all initial GPIO/WiFi/touch writes, before
++ * polling. No MMIO/map occurs here. Retained dependency VAs publish once. */
++int nah_native_publish_ready(void);
++/* Side-effect-free acquire observation: WAIT, READY, or permanent error. */
++int nah_native_dependency_state(void);
++/* Only WAIT may be retried. Once ready, mapping/validation is one attempt.
++ * No hardware MMIO is performed by prepare; nau_hw_init is called once later. */
+ int nah_native_prepare(struct nah_io *,void **);
+ #endif
+diff -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-05 19:42:06.568632715 +0100
++++ b/bsd/dev/sweet_touch.c	2026-11-05 19:42:06.632219359 +0100
+@@ -20,6 +20,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include "audio_native.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int, int);
+@@ -858,6 +859,8 @@
+ 	printf("NORD2 INPUT: FT3518 id=%02x:%02x ready=%d powered=%d idle=%d stage=%u irq=%d; TOPSTATUS=%#x ok=%d\n",
+ 	    a, b, touch_ok, powered, bus_idle, ni_stage, ni_level(NI_IRQ), top, key_ok);
+ 	printf("NORD2 INPUT: software I2C0, x4 coordinates, PMIC power/up and GPIO155 down; poll=10ms\n");
++	/* Publish retained maps only after this owner finishes initial GPIO writes. */
++	nah_native_publish_ready();
+ 	unsigned errors = 0, ticks = 0, key_errors = 0;
+ 	int state[3] = {0}, previous[3] = {-1, -1, -1};
+ 	for (;;) {
