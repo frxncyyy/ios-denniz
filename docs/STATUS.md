@@ -22,6 +22,10 @@ The README's [What works](../README.md#what-works) table lists every hardware bl
 | Files | "On My iPhone" fixed | 0734 (root statfs type "apfs" for fileproviderd); 0733 never fired, kept harmless |
 | Logs | fplog1 readable-log payload | optional |
 | Torch / camera flash | **works** (verified by the user, 2026-11-17) | 0496 torch, 0501/0502, 0560 strobe + camera bundle |
+| Calls / SMS / MMS | voice calls fully work; SMS and MMS work (verified by the user, 2026-11-17) | 0277-0282 telephony, 0710-0712 |
+| Cameras | front camera and 4K recording work (verified by the user, 2026-11-17) | camera pieces 0289-0294, 0340, hwcodec 0298-0317 |
+| Proximity | proximity sensor works (verified by the user, 2026-11-17) | 0283/0284 SCP hub |
+| Wi-Fi 5 GHz | works (verified by the user, 2026-11-17) | Wi-Fi line + 0790 auto-join |
 
 ## Kernel lines (most recent first; only hash prefixes)
 | Line | sha256 prefix | Adds |

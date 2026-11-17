@@ -19,5 +19,5 @@ removed; nothing else was changed. To use them, copy the files into the new host
 | [nord2-files-on-my-iphone-fixed.md](nord2-files-on-my-iphone-fixed.md) | result | q10jfinal44ts: 0732 + 0734, how to undo |
 
 Later facts (2026-11-16/17, not in these notes): Bluetooth pairing + AAC stable in transport mode 2; SIM and modem
-firmware restored (0715 + nvfile, simcache); Terraria landscape + touch (gfxall17 + flip); torch/flash verified by
-the user on 2026-11-17. See [../../docs/STATUS.md](../../docs/STATUS.md).
+firmware restored (0715 + nvfile, simcache); Terraria landscape + touch (gfxall17 + flip); torch/flash, voice calls,
+SMS/MMS, front camera, 4K recording, proximity sensor and 5 GHz Wi-Fi verified by the user on 2026-11-17. See [../../docs/STATUS.md](../../docs/STATUS.md).

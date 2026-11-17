@@ -8,7 +8,7 @@ SpringBoard and the stock apps. It grew out of [ios-sweet](https://github.com/di
 Redmi Note 10 Pro) and reuses its boot shim and loader.
 
 As of **2026-11-17** the phone boots to the **iOS home screen** with **GPU-accelerated graphics** (Metal on the Mali-G77),
-touch, sound, Wi-Fi, Bluetooth, a working SIM, camera with hardware video encoding, GPS and sensors. Games such as Terraria
+touch, sound, Wi-Fi, Bluetooth, phone calls, SMS/MMS, front and rear cameras with hardware video encoding, GPS and sensors. Games such as Terraria
 and Subway Surfers run, and IPA files can be installed with TrollStore.
 
 > **Experimental. Not a daily driver.** It has been run on **one** phone only (the author's). Apple's security model is
@@ -43,14 +43,14 @@ Kernel line on the phone: **`q10jfinal44ts`** (image sha256 prefix `f55a15ea`). 
 | Buttons | Power, volume up/down, alert slider | log (2026-10-20 onward; alert slider 2026-11-06) | `nord2input=1` |
 | Haptics | AW8697 motor, short "tick" taps (q10hapd6a, fixed gain) | log (2026-11-14, user: "perfect") | `kern.n2hap` |
 | Audio | Loudspeakers with calibrated volume; earpiece and microphone in calls; microphone in video recordings | log (speakers 2026-10-24; calls 2026-11-06; recordings 2026-11-12) | `nord2audio=1`, `kern.n2mic.enable` |
-| Camera | Rear camera: photos, **1080p30 and 1080p60 video**, Magnifier preview | log (2026-11-12) | `kern.n2vc.venc_fast` |
+| Camera | **Rear and front cameras**: photos, video up to **4K**, 1080p60, Magnifier preview | user, 2026-11-17 (front camera, 4K); log (1080p30/60 2026-11-12) | `kern.n2vc.venc_fast` |
 | Hardware codecs | **H.264 / HEVC encode** (camera recording up to 1080p60, HEVC recording) and decode through VideoToolbox; standalone decode of VP8/VP9/AV1/MPEG-2/4; **hardware JPEG** encode/decode | log (2026-11-11/12 codec report) | `/var/db/nord2-vcodec-run` |
 | Flash / torch | **Torch and camera flash work** (MT6360 flash LEDs, 0496/0501/0502/0560) | **user, 2026-11-17** | `kern.n2torch`, `kern.n2torch_strobe` |
-| Wi-Fi | WPA2 networks, DHCP, Safari; **auto-join at boot** (0790, ~32-37 s after boot); private address | log (2026-10-23 user IP/Safari test; 0790 2026-11-15) | `kern.n2wifi_rssithr` (-80), `kern.n2wifi_privmac` |
+| Wi-Fi | WPA2 networks on **2.4 and 5 GHz**, DHCP, Safari; **auto-join at boot** (0790, ~32-37 s after boot); private address | user, 2026-11-17 (5 GHz); log (2026-10-23 IP/Safari test; 0790 2026-11-15) | `kern.n2wifi_rssithr` (-80), `kern.n2wifi_privmac` |
 | Bluetooth | Pairing; **AAC audio streaming** stable (transport mode 2); starts ~24 s after boot together with Wi-Fi | user, this session | `kern.n2bt_mode` (2), `kern.n2bt_early` |
-| Cellular / SIM | SIM works; modem firmware restored, clean Carrier row (0715 + nvfile, simcache); 4G data, SMS, VoLTE calls in/out recorded earlier | user, this session (SIM, modem, Carrier); log (data/SMS/VoLTE 2026-11-06) | `kern.n2sim_fix`, `kern.n2sim_apn`, `kern.n2nr` |
+| Cellular / SIM | SIM works; modem firmware restored, clean Carrier row (0715 + nvfile, simcache); 4G data; **voice calls fully work** (VoLTE in/out, earpiece, microphone); **SMS and MMS** | user, this session and 2026-11-17 (calls, MMS); log (data/SMS 2026-11-06) | `kern.n2sim_fix`, `kern.n2sim_apn`, `kern.n2nr` |
 | GNSS / GPS | MediaTek GNSS engine with a real fix (7 satellites); location services work for apps | log (first valid fix 2026-11-14; Location Services 2026-11-12) | `kern.n2gnss` |
-| Sensors | Accelerometer, gyroscope and magnetometer data reach iOS; **auto-rotate** works; SCP sensor hub; proximity path (0284) | user, this session (acc/gyro/compass data, auto-rotate); proximity: not re-verified | `kern.n2scp_motion`, `kern.n2scp_orient`, `kern.n2scp_lightpoll` |
+| Sensors | Accelerometer, gyroscope and magnetometer data reach iOS; **auto-rotate** works; **proximity sensor** works; SCP sensor hub | user, this session (acc/gyro/compass data, auto-rotate); user, 2026-11-17 (proximity) | `kern.n2scp_motion`, `kern.n2scp_orient`, `kern.n2scp_lightpoll` |
 | USB | USB device mode for the live kernel log; boots without a cable (0700) | log (2026-11-15); user, this session (charging) | `kern.n2usb_late` |
 | Charging / battery | **Charging works** (MP2650 charger, 0700-0703); battery percentage from the fuel gauge (0701 adds current and time to full/empty) | user, this session (charging); 0701 gauge details: not separately verified | `kern.n2chg_ctl`, `kern.n2chg_ichg_ma` |
 | Thermal / power | CPU/GPU DVFS, SoC thermal ladder (0643), hardware RTC (no standby heat) | log (2026-11-14/15) | `kern.n2dvfs_mode`, `nord2_lvts` |
@@ -68,12 +68,9 @@ Details per piece: [docs/STATUS.md](docs/STATUS.md). Every knob: [docs/CONFIGURA
 - **Ambient light sensor** stays silent, so there is no Auto-Brightness.
 - **Bluetooth**: a long-running test and a boot in airplane mode are still open; no hands-free (HFP/SCO) calls, no Bluetooth
   keyboards/mice.
-- **Calls**: in-call mute, the speaker button and in-call volume did not work in the last recorded test (2026-11-06); MMS
-  never tested.
 - **NFC**: no driver; never worked on.
-- **Not verified**: the front camera, the proximity sensor on the current line, 5 GHz / WPA3 / Enterprise Wi-Fi
-  (built, never tested on a real network), MMS, hardware JPEG/HEIC inside the Camera app (photos are encoded in
-  software), 4K camera recording.
+- **Not verified**: WPA3 / Enterprise Wi-Fi (built, never tested on a real network); hardware JPEG/HEIC inside the
+  Camera app (photos are encoded in software).
 - **Memory**: the DRAM above the XNU window is not usable as normal RAM; under memory pressure iOS kills daemons (0732 keeps
   the install/Files daemons alive).
 - **Not part of this work and not supported**: SEP, Face ID/Touch ID, Apple Pay, App Store downloads (FairPlay), Apple ID
