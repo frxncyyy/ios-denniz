@@ -1,0 +1,320 @@
+--- /dev/null
++++ b/shim/nord2-xnu/wifi_async_event.h
+@@ -0,0 +1,17 @@
++#ifndef NORD2_WIFI_ASYNC_EVENT_H
++#define NORD2_WIFI_ASYNC_EVENT_H
++#include <stdint.h>
++#include <stddef.h>
++/* Selected EID7 is unsolicited EVENT_SLEEPY_INFO: uint8 state + reserved3.
++ * Capture the raw hint only. Nonzero is not an ownership handoff or FW ACK.
++ * Outer discriminator/actual copied extent govern access; inner type,
++ * sequence, declared lengths and reserved bytes are captured/opaque.
++ * Caller retains the owned copied frame and independently bounds total IO. */
++static inline int nwe_sleepy(const uint8_t*p,size_t n,uint8_t*state){
++ if(!p||!state||n<36)return -1;
++ uint16_t outer=(uint16_t)p[2]|(uint16_t)p[3]<<8;
++ if((outer&0x380fu)!=0x3800u||p[28]!=7)return 0;
++ if(n<40)return -1;
++ *state=p[36];return 1;
++}
++#endif
+--- a/shim/nord2-xnu/wifi_basic_config.c
++++ b/shim/nord2-xnu/wifi_basic_config.c
+@@ -1,4 +1,5 @@
+ #include "wifi_basic_config.h"
++#include "wifi_async_event.h"
+ static uint16_t u16(const uint8_t*p){return (uint16_t)p[0]|(uint16_t)p[1]<<8;}
+ static uint32_t u32(const uint8_t*p){return (uint32_t)u16(p)|(uint32_t)u16(p+2)<<16;}
+ static int cap_receipt(const struct ncd_state*c,const struct nwi_state*i,const struct nfp_native*f){
+@@ -49,13 +50,14 @@
+ static int sy(const struct ncd_io*o,void*c,struct nbc_state*s,uint64_t a,uint32_t n,unsigned w){if(before(o,c,s))return -1;s->callbacks++;return o->bus->sync(c,a,n,w)?fail(s,8):0;}
+ static int coherent(const struct ncd_io*o,void*c,struct nbc_state*s){s->irq_valid=0;for(unsigned d=0;d<2;d++){if(rr(o,c,s,0x18024200+0x1000*d,&s->irq[d]))return -1;s->irq_valid|=1u<<d;if(s->irq[d]&0x00300000)return fail(s,10);}return 0;}
+ /* Observe pending events without waiting for an invented command-result ACK.
+- * Only bounded existing ASCII debug metadata may be consumed/rearmed. */
++ * Only bounded recognized ASCII debug and unsolicited sleepy metadata may
++ * be consumed/rearmed. Neither is a firmware ACK or ownership transition. */
+ static int drain(const struct ncd_io*o,void*c,struct nbc_state*s){struct nwt_state*t=&s->init->transport;uint32_t v;
+  for(;;){
+   if(coherent(o,c,s)||rr(o,c,s,0x1802550c,&v))return -1;
+   if(v>=16)return fail(s,20);
+   if(v==t->rx_index)return 0;
+-  if(s->debug_events>=NBC_RX_BUDGET)return fail(s,21);
++  if(s->debug_events+s->sleepy_events>=NBC_RX_BUDGET)return fail(s,21);
+   uint64_t d=t->rx_ring+16u*t->rx_index,b=t->rx_buffers+4096u*t->rx_index;
+   if(sy(o,c,s,d,16,2)||mr(o,c,s,d,s->descriptor,16))return -1;
+   if(nwt_rx_complete(s->descriptor,b,3840,&s->rx_bytes))return fail(s,22);
+@@ -66,9 +68,15 @@
+   h->bytes=(uint32_t)n;h->rxd_bytes=u16(p);h->event_bytes=u16(p+24);h->rx_class=u16(p+2);
+   h->eid=p[28];h->sequence=p[29];h->inner_type=u16(p+26);h->header_valid=1;h->kind=4;
+   for(unsigned k=0;k<36;k++)h->header[k]=p[k];
+-  if(n>=48){h->debug_id=u16(p+36);h->debug_type=p[38];h->debug_bytes=u16(p+44);}
+-  if(n<48||p[28]!=0x27||p[38]!=3||u16(p+44)>1200||u16(p+44)>n-48)return fail(s,23);
+-  h->kind=2;s->debug_events++;if(coherent(o,c,s)||nwt_rx_desc(s->descriptor,b,3840)||mw(o,c,s,d,s->descriptor,16)||sy(o,c,s,d,16,1)||rw(o,c,s,0x18025508,t->rx_index))return -1;
++  if(n>=48&&p[28]==0x27){h->debug_id=u16(p+36);h->debug_type=p[38];h->debug_bytes=u16(p+44);}
++  if(p[28]==7){
++   uint8_t state;if(nwe_sleepy(p,n,&state)!=1)return fail(s,23);
++   h->kind=3;h->debug_type=state;s->sleepy_events++;s->last_sleepy=state;
++  }else{
++   if(n<48||p[28]!=0x27||p[38]!=3||u16(p+44)>1200||u16(p+44)>n-48)return fail(s,23);
++   h->kind=2;s->debug_events++;
++  }
++  if(coherent(o,c,s)||nwt_rx_desc(s->descriptor,b,3840)||mw(o,c,s,d,s->descriptor,16)||sy(o,c,s,d,16,1)||rw(o,c,s,0x18025508,t->rx_index))return -1;
+   s->rearmed++;t->rx_index=(t->rx_index+1)%16;
+  }
+ }
+--- a/shim/nord2-xnu/wifi_basic_config.h
++++ b/shim/nord2-xnu/wifi_basic_config.h
+@@ -12,6 +12,7 @@
+  struct ncd_state *cap;struct nwi_state *init;const struct nfp_native *firmware;
+  unsigned attempted,prepared,entered,phase,halt,error,mutated,submit_attempted,tx_done,completed;
+  unsigned skipped,skip_reason,polls,debug_events,rearmed,metadata_valid;
++ unsigned sleepy_events,last_sleepy;
+  unsigned tx_index,rx_index,callbacks,publications,tx_didx,tx_consumed;uint32_t tx_control,tx_raw[4];unsigned tx_observed;
+  uint64_t tx_descriptor_address,tx_expected_buffer;uint8_t sequence;
+  struct ncd_event last_debug;unsigned debug_index;
+--- a/shim/nord2-xnu/wifi_basic_config_bind.inc
++++ b/shim/nord2-xnu/wifi_basic_config_bind.inc
+@@ -21,6 +21,8 @@
+  const struct nbc_state*s=&nbc_native.state;const struct ncp_result*c=&s->verified_cap;
+  printf("NORD2 WIFI BASIC: status=%d phase=%u complete=%u skipped=%u reason=%u halt=%u error=%u submit=%u txdone=%u polls=%u debug=%u rearmed=%u callbacks=%u publications=%u\n",
+   result,s->phase,s->completed,s->skipped,s->skip_reason,s->halt,s->error,s->submit_attempted,s->tx_done,s->polls,s->debug_events,s->rearmed,s->callbacks,s->publications);
++ printf("NORD2 WIFI BASIC ASYNC: events=%u sleepy=%u state_valid=%u state=%u\n",
++  s->debug_events+s->sleepy_events,s->sleepy_events,!!s->sleepy_events,s->last_sleepy);
+  if(s->prepared)printf("NORD2 WIFI BASIC TX: cid=%#x seq=%u bytes=%u from=%u to=%u completed=%u didx=%u control=%#x consumed=%u ack_expected=0 firmware_ack=0\n",
+   2,s->sequence,NNI_BASIC_BYTES,s->tx_index,(s->tx_index+1)%1024,nwfn_native.init.transport.completed,s->tx_didx,s->tx_control,s->tx_consumed);
+  if(s->prepared)printf("NORD2 WIFI BASIC TXDESC: observed=%u address=%#llx expected=%#llx software_used=%u raw=%#x/%#x/%#x/%#x\n",
+--- a/shim/nord2-xnu/wifi_capability_bind.inc
++++ b/shim/nord2-xnu/wifi_capability_bind.inc
+@@ -86,6 +86,7 @@
+   printf("NORD2 WIFI CAP EVENT: n=%u kind=%u type=%#x eid=%#x seq=%u bytes=%u declared=%u/%u debug_type=%u debug_bytes=%u\n",
+    k,h->kind,h->rx_class,h->eid,h->sequence,h->bytes,h->rxd_bytes,h->event_bytes,
+    h->debug_type,h->debug_bytes);
++  if(h->kind==3)printf("NORD2 WIFI CAP SLEEPY: n=%u state=%u\n",k,(unsigned)h->debug_type);
+   printf("NORD2 WIFI CAP EVENTHEADER: n=%u valid=%u bytes=%u inner=%#x raw=%#x/%#x/%#x/%#x/%#x/%#x/%#x/%#x/%#x\n",
+    k,h->header_valid,h->header_valid?(unsigned)sizeof(h->header):0,h->inner_type,
+    ncd_header_word(h,0),ncd_header_word(h,1),ncd_header_word(h,2),
+--- a/shim/nord2-xnu/wifi_capability_dispatcher.c
++++ b/shim/nord2-xnu/wifi_capability_dispatcher.c
+@@ -1,4 +1,5 @@
+ #include "wifi_capability_dispatcher.h"
++#include "wifi_async_event.h"
+ #define TX_CIDX 0x18025418u
+ #define TX_DIDX 0x1802541cu
+ #define RX_CIDX 0x18025508u
+@@ -68,7 +69,7 @@
+  /* Capture only the already-owned, copied RXD24 + event12 header. Never
+   * include byte36 onward (capability/debug body and possible MAC TLV).
+   * The inner type is opaque for exact EIDec capability and bounded EID27
+-  * ASCII debug; unsupported EIDs retain strict inner-type fail-stop. */
++  * ASCII debug and unsolicited sleepy metadata; unsupported EIDs retain strict inner-type fail-stop. */
+  h->inner_type=u16(p+26);
+  for(unsigned k=0;k<sizeof(h->header);k++)h->header[k]=p[k];
+  h->header_valid=1;
+@@ -90,8 +91,13 @@
+   if(h->debug_bytes>1200||h->debug_bytes>n-48)return fail(s,22);
+   h->kind=2;s->debug_events++;return 0;
+  }
++ if(h->eid==7){
++  uint8_t state;
++  if(nwe_sleepy(p,n,&state)!=1)return fail(s,22);
++  h->kind=3;h->debug_type=state;return 0;
++ }
+  if(p[26]||p[27]!=0xe0)return fail(s,20);
+- /* Sleepy/TXdone/ownership/failure/unknown events need their actual handler.
++ /* TXdone/ownership/failure/unknown events need their actual handler.
+   * Capture metadata but never silently discard, acknowledge or rearm them. */
+  h->kind=4;return fail(s,23);
+ }
+--- a/shim/nord2-xnu/wifi_capability_dispatcher.h
++++ b/shim/nord2-xnu/wifi_capability_dispatcher.h
+@@ -12,7 +12,7 @@
+ };
+ struct ncd_event {
+  uint32_t bytes;uint16_t rxd_bytes,event_bytes,rx_class,debug_id,debug_bytes;
+- uint8_t eid,sequence,kind,debug_type; /*1capability,2debug,4unsupported*/
++ uint8_t eid,sequence,kind,debug_type; /*1capability,2debug,3sleepy(raw state in debug_type),4unsupported*/
+  uint16_t inner_type;unsigned header_valid;uint8_t header[36]; /* captured RXD24 + WIFI_EVENT12 only; body starts36 */
+ };
+ struct ncd_state {
+--- a/shim/nord2-xnu/wifi_normal_rx.c
++++ b/shim/nord2-xnu/wifi_normal_rx.c
+@@ -1,4 +1,5 @@
+ #include "wifi_normal_rx.h"
++#include "wifi_async_event.h"
+ static uint16_t u16(const uint8_t*p){return (uint16_t)p[0]|(uint16_t)p[1]<<8;}
+ static uint32_t u32(const uint8_t*p){return (uint32_t)u16(p)|(uint32_t)u16(p+2)<<16;}
+ static void copy(void*d,const void*s,size_t n){uint8_t*a=d;const uint8_t*b=s;while(n--)*a++=*b++;}
+@@ -66,7 +67,7 @@
+  }else if(h.eid==0x27){
+   h.kind=2;if(n<48||u16(p+44)>n-48){s->malformed++;}else s->debug++;
+  }else if(h.eid==7){
+-  h.kind=3;if(n<40)s->malformed++;else{s->sleepy++;h.status=p[36];}
++  h.kind=3;uint8_t state;if(nwe_sleepy(p,n,&state)!=1)s->malformed++;else{s->sleepy++;h.status=state;}
+   /* Record firmware sleep advice only. Never yield AP/WF ownership. */
+  }else if(h.eid==0xf0||(h.eid==0xed&&p[32]==0x23)){
+   h.kind=4;
+--- a/tools/fixtures/nord2-wifi-normal/owner-fixture.inc
++++ b/tools/fixtures/nord2-wifi-normal/owner-fixture.inc
+@@ -43,6 +43,14 @@
+ static uint32_t get32(const unsigned char *p){return p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
+ static void put32(unsigned char *p,uint32_t v){for(unsigned i=0;i<4;i++)p[i]=(unsigned char)(v>>(8*i));}
+ static void hardware_register(uint32_t a,uint32_t v){for(unsigned i=0;i<registers;i++)if(reg[i].address==a){reg[i].value=v;return;}assert(registers<2048);reg[registers].address=a;reg[registers++].value=v;}
++static unsigned sleep_cap,sleep_pre,sleep_post,sleep_state,sleep_eid=7,sleep_bytes=40,sleep_outer=0x3800,sleep_stream,sleep_pushed,sleep_mixed,sleep_normal,sleep_delay;
++static unsigned sleepy_didx(void){for(unsigned j=0;j<registers;j++)if(reg[j].address==0x1802550c)return reg[j].value;return nwfn_native.init.transport.rx_index;}
++static void sleepy_at(unsigned index){struct nwt_state*t=&nwfn_native.init.transport;uint8_t*d=pool_memory+(t->rx_ring-NDP_POOL_BASE)+16*index,*p=pool_memory+(t->rx_buffers-NDP_POOL_BASE)+4096*index;
++ memset(p,0,sleep_bytes);p[0]=p[1]=p[24]=p[25]=255;p[2]=(uint8_t)sleep_outer;p[3]=(uint8_t)(sleep_outer>>8);p[26]=0x34;p[27]=0x12;p[28]=(uint8_t)sleep_eid;p[29]=255;p[36]=(uint8_t)sleep_state;p[37]=p[38]=p[39]=255;if(sleep_bytes>40)memset(p+40,0xab,sleep_bytes-40);
++ if(sleep_mixed&&(sleep_pushed&1)){p[28]=0x27;p[38]=3;p[44]=p[45]=0;}
++ put32(d,(uint32_t)(t->rx_buffers+4096*index));put32(d+4,0xc0000000u|(sleep_bytes<<16));put32(d+8,0);put32(d+12,0);}
++static void sleepy_enqueue(unsigned count){unsigned index=sleepy_didx();while(count--){sleepy_at(index);index=(index+1)%16;sleep_pushed++;}hardware_register(0x1802550c,index);}
++static void sleepy_pre_basic(void){sleepy_enqueue(sleep_pre);}
+ static void simulated_completion(unsigned next){
+  struct nwt_state *t=&nwfn_native.init.transport;
+  unsigned char *tx=pool_memory+(t->tx_ring-NDP_POOL_BASE)+16*t->tx_index;
+@@ -58,6 +66,7 @@
+   for(unsigned k=64;k<76;k++)assert(!cmd[k]);
+   assert(get32(tx+4)==0x404c0000u);put32(tx+4,0x80000000u);if(completion_custom)for(unsigned k=0;k<4;k++)put32(tx+4*k,completion_raw[k]);hardware_register(0x1802541c,completion_didx_override==UINT32_MAX?next:completion_didx_override);basic_pubs++;
+   if(basic_pending)hardware_register(0x18025200,0x20000000u);
++  sleepy_enqueue(sleep_post);
+   return; /* no fabricated RX or firmware ACK for CID2 */
+  }
+  unsigned bytes=cmd[36]==0x8a?116:cmd[36]==8?60:36;
+@@ -74,12 +83,14 @@
+   put32(event+96,8);put32(event+100,12);event[106]=1;event[107]=2;event[108]=2;event[114]=15;
+  }
+  hardware_register(0x1802541c,next);hardware_register(0x1802550c,(t->rx_index+1)%16);
++ if(cmd[36]==0x8a&&sleep_cap){unsigned dst=(t->rx_index+sleep_cap)%16;uint8_t*dd=pool_memory+(t->rx_ring-NDP_POOL_BASE)+16*dst,*dp=pool_memory+(t->rx_buffers-NDP_POOL_BASE)+4096*dst;memcpy(dp,event,bytes);put32(dd,(uint32_t)(t->rx_buffers+4096*dst));put32(dd+4,0xc0000000u|(bytes<<16));put32(dd+8,0);put32(dd+12,0);for(unsigned k=0;k<sleep_cap;k++)sleepy_at((t->rx_index+k)%16);hardware_register(0x1802550c,(dst+1)%16);}
++
+ }
+-static void ni_wr(uintptr_t b,unsigned o,uint32_t v){uint32_t a=(uint32_t)b+o;mmio_writes++;
++static void ni_wr(uintptr_t b,unsigned o,uint32_t v){uint32_t a=(uint32_t)b+o;mmio_writes++;if(a==0x18025508&&basic_pubs&&sleep_pushed<sleep_stream)sleepy_enqueue(1);
+  assert(a!=0x18024228&&a!=0x18025228);if(a==0x18025418&&nwfn_native.stage==NWFN_RETAINED&&nwfn_native.init.transport.submit_attempted)simulated_completion(v);if(a==0x18060010){assert(v==2);v=0;}if(a==0x18060000&&!clock_fail)v|=6;
+  for(unsigned i=0;i<registers;i++)if(reg[i].address==a){reg[i].value=v;return;}
+  assert(registers<2048);reg[registers].address=a;reg[registers++].value=v;}
+-static void delay(unsigned us){assert(us==1||us==10||us==500||us==1000);delays++;}
++static void delay(unsigned us){if(us==1000&&basic_pubs&&sleep_delay){sleep_delay=0;sleepy_enqueue(1);struct nwt_state*t=&nwfn_native.init.transport;uint8_t*d=pool_memory+(t->tx_ring-NDP_POOL_BASE)+16*t->tx_index;put32(d+4,get32(d+4)|0x80000000u);}assert(us==1||us==10||us==500||us==1000);delays++;}
+ static void nwfn_test_barrier(void){barriers++;}
+ static void panic(const char *message){assert(strstr(message,"manual reset"));manual_halts++;longjmp(parked_exit,2);}
+ static int ncd_normal_owner_window(const struct nwfn_native *);
+--- a/tools/fixtures/nord2-wifi-normal/test-full.c
++++ b/tools/fixtures/nord2-wifi-normal/test-full.c
+@@ -72,7 +72,7 @@
+  beacon(0,'X',mode!=2&&mode!=4);if(mode==4){struct ncr_queue*q=&ncb_native.rx.queue[0];uint8_t*b=pool_memory+(q->ring.buffers-NDP_POOL_BASE)+4096*q->next;w16(b+2,6u<<11);}beacon(2,'Y',1);
+  uint8_t p[512]={0};w16(p,32);w16(p+2,6u<<11);deliver(3,p,32,1);w16(p+2,11u<<11);deliver(4,p,32,1);
+  if(mode==1)return; /* actual no completion => bounded truthful partial */
+- memset(p,0,sizeof(p));w16(p,512);w16(p+2,0x3800);w16(p+24,488);w16(p+26,0x1234);p[28]=mode==3?0xf0:0x0d;p[36]=1;p[40]=(uint8_t)ncb_native.plan.channel_count;p[41]=7;p[42]=2;p[37]=1;p[38]=1;p[39]=6;put32(p+44,13);p[48]=1;p[52]=2;p[56]=6;p[57]=36;w16(p+120,0x1234);w16(p+122,0xabcd);p[248]=2;p[249]=3;p[312]=4;p[313]=5;put32(p+376,8);put32(p+380,5);w16(p+384,0x55aa);w16(p+386,0xa55a);deliver(1,p,sizeof(p),1);
++ memset(p,0,sizeof(p));w16(p,512);w16(p+2,0x3800);w16(p+24,488);w16(p+26,0x1234);p[28]=mode==3?0xf0:0x0d;p[36]=1;p[40]=(uint8_t)ncb_native.plan.channel_count;p[41]=7;p[42]=2;p[37]=1;p[38]=1;p[39]=6;put32(p+44,13);p[48]=1;p[52]=2;p[56]=6;p[57]=36;w16(p+120,0x1234);w16(p+122,0xabcd);p[248]=2;p[249]=3;p[312]=4;p[313]=5;put32(p+376,8);put32(p+380,5);w16(p+384,0x55aa);w16(p+386,0xa55a);deliver(1,p,sizeof(p),1);if(sleep_normal)sleepy_enqueue(1);
+ }
+ static void setup(unsigned which){ready_fixture();memset(&ncb_native,0,sizeof(ncb_native));memset(&nct_native,0,sizeof(nct_native));mode=which;delivered=no_board=probe_memory=probe_write=delayed_trigger=0;normal_enabled=1;scan_flag=1;normal_pubs=normal_no_ddone=normal_wrong_didx=0;basic_flag=1;}
+ int main(int argc,char**argv){assert(argc==2);FILE*f=fopen(argv[1],"rb");assert(f&&fread(authenticated_board,1,sizeof(authenticated_board),f)==sizeof(authenticated_board));fclose(f);
+--- /dev/null
++++ b/tools/fixtures/nord2-wifi-normal/test-sleepy-decoder.c
+@@ -0,0 +1,9 @@
++#include "wifi_async_event.h"
++#include <assert.h>
++#include <string.h>
++#include <stdio.h>
++int main(void){uint8_t p[48]={0},s;unsigned checks=0;p[3]=0x38;p[28]=7;
++ for(unsigned state=0;state<256;state++)for(unsigned inner=0;inner<65536;inner+=257){p[36]=(uint8_t)state;p[26]=(uint8_t)inner;p[27]=(uint8_t)(inner>>8);p[29]=255;p[0]=p[1]=p[24]=p[25]=255;p[37]=p[38]=p[39]=255;s=0;assert(nwe_sleepy(p,40,&s)==1&&s==state);checks++;}
++ for(unsigned n=0;n<40;n++){s=0xaa;assert(nwe_sleepy(p,n,&s)<0&&s==0xaa);checks++;}
++ p[28]=0x28;s=0xaa;assert(!nwe_sleepy(p,40,&s)&&s==0xaa);p[28]=7;p[2]=1;assert(!nwe_sleepy(p,40,&s)&&s==0xaa);checks+=2;
++ printf("PASS %u shared sleepy decoder rawuint8/opaqueheaders/actualextent/outer/EID/atomic-refusal checks. Synthetic only.\n",checks);return 0;}
+--- /dev/null
++++ b/tools/fixtures/nord2-wifi-normal/test-sleepy-faults.c
+@@ -0,0 +1,20 @@
++#define FULL_FAULTS 1
++#define SLEEPY_FAULTS 1
++#include "test-sleepy.c"
++
++static unsigned fault_at,fault_calls,fault_seen,fault_after;
++static int full_test_fail(void){
++ if(fault_seen){fault_after++;return -1;}
++ if(!nbc_native.state.entered||nbc_native.state.completed)return 0;
++ if(++fault_calls==fault_at){fault_seen=1;return -1;}return 0;
++}
++int main(int argc,char**argv){assert(argc==2);FILE*f=fopen(argv[1],"rb");assert(f&&fread(authenticated_board,1,sizeof(authenticated_board),f)==sizeof(authenticated_board));fclose(f);
++ scenario(1,1,1,1);run_worker();assert(!manual_halts&&fault_calls>100);unsigned total=fault_calls;
++ for(unsigned k=1;k<=total;k++){
++  scenario(1,1,1,1);fault_at=k;fault_calls=fault_seen=fault_after=0;run_worker();struct nbc_state*b=&nbc_native.state;
++  assert(fault_seen&&!fault_after&&manual_halts==1&&nwm_drain_entered&&b->halt&&!b->completed&&!normal_pubs&&basic_pubs<=1&&nwfn_native.init.transport.completed==4);
++  if(b->budget.reserved)assert(b->budget.pse_remaining==2);else assert(b->budget.pse_remaining==3);
++  assert(b->rearmed<=2&&b->sleepy_events<=2);
++ }
++ printf("PASS %u real-owner BASIC callback faults with queued pre/postCID2 sleepy; no postfailureIO/retry/refund/fakeACK, exact incomplete4/drain. Synthetic only.\n",total);return 0;
++}
+--- /dev/null
++++ b/tools/fixtures/nord2-wifi-normal/test-sleepy.c
+@@ -0,0 +1,42 @@
++#define main full_reference_main
++#include "test-full.c"
++#undef main
++static void scenario(unsigned cap,unsigned pre,unsigned post,unsigned state){
++ setup(0);sleep_cap=cap;sleep_pre=pre;sleep_post=post;sleep_state=state;
++ sleep_eid=7;sleep_bytes=40;sleep_outer=0x3800;sleep_stream=0;sleep_pushed=0;sleep_mixed=0;sleep_normal=0;sleep_delay=0;
++}
++void success(unsigned cap,unsigned pre,unsigned post,unsigned state){
++ scenario(cap,pre,post,state);run_worker();struct nbc_state*b=&nbc_native.state;struct ncd_state*c=&ncd_native.diag;
++ assert(!manual_halts&&ncd_native.parked&&b->completed&&b->tx_done&&b->publications==1&&basic_pubs==1&&normal_pubs==22&&nwfn_native.init.transport.completed==27);
++ assert(c->events==cap+1&&c->rearmed==cap+1&&c->matched&&c->history[c->events-1].kind==1&&!c->debug_events&&c->sequence_echo==1&&!c->sequence_mismatches);
++ for(unsigned k=0;k<cap;k++)assert(c->history[k].kind==3&&c->history[k].eid==7&&c->history[k].debug_type==state&&c->history[k].sequence==255);
++ assert(b->sleepy_events==pre+post&&!b->debug_events&&b->rearmed==pre+post&&b->last_sleepy==(pre+post?state:0));
++ assert(b->budget.reserved&&b->budget.pse_remaining==2&&nct_native.session.acquired==22&&nct_native.session.released==22);
++ if(pre+post)assert(b->last_debug.kind==3&&b->last_debug.debug_type==state&&!b->last_debug.debug_id&&!b->last_debug.debug_bytes);
++}
++
++#ifndef SLEEPY_FAULTS
++int main(int argc,char**argv){assert(argc==2);FILE*f=fopen(argv[1],"rb");assert(f&&fread(authenticated_board,1,sizeof(authenticated_board),f)==sizeof(authenticated_board));fclose(f);
++ success(1,1,1,0);success(2,2,3,1);success(14,0,0,255);success(0,7,8,255);
++ /* Larger actual body/opaque header lengths never become address authority. */
++ scenario(1,1,1,2);sleep_bytes=48;run_worker();assert(!manual_halts&&nbc_native.state.sleepy_events==2&&!nbc_native.state.last_debug.debug_id&&!nbc_native.state.last_debug.debug_bytes);
++ /* Advice cannot manufacture TX completion. A later DDONE transition and
++  * another unsolicited notification are observed only through the real loop. */
++ scenario(1,1,0,1);completion_custom=1;completion_raw[0]=0x90005000;completion_raw[1]=0x404c0000;completion_raw[2]=completion_raw[3]=0;sleep_delay=1;run_worker();assert(!manual_halts&&nbc_native.state.completed&&nbc_native.state.polls==2&&nbc_native.state.sleepy_events==2&&nbc_native.state.rearmed==2);
++ scenario(0,1,1,1);completion_custom=1;completion_raw[0]=0x90005000;completion_raw[1]=0x404c0000;completion_raw[2]=completion_raw[3]=0;run_worker();assert(manual_halts==1&&nbc_native.state.error==18&&!nbc_native.state.tx_done&&!nbc_native.state.completed&&nbc_native.state.sleepy_events==2&&nbc_native.state.rearmed==2&&!normal_pubs&&nwfn_native.init.transport.completed==4);
++ /* Seventeenth event refuses before touching/rearming it;16 is the whole
++  * BASIC debug+sleepy budget, not a per-kind allowance. */
++ scenario(0,0,1,1);sleep_stream=17;run_worker();assert(manual_halts==1&&nbc_native.state.error==21&&nbc_native.state.sleepy_events==16&&nbc_native.state.rearmed==16&&basic_pubs==1&&!normal_pubs&&nwfn_native.init.transport.completed==4&&nwm_drain_entered);
++ scenario(0,0,1,1);sleep_stream=17;sleep_mixed=1;sleep_bytes=48;run_worker();assert(manual_halts==1&&nbc_native.state.error==21&&nbc_native.state.sleepy_events==8&&nbc_native.state.debug_events==8&&nbc_native.state.rearmed==16&&!normal_pubs);
++ scenario(1,1,1,255);sleep_normal=1;run_worker();assert(!manual_halts&&ncb_native.rx.sleepy==1&&ncb_native.rx.events==2&&ncb_native.rx.scan.done&&ncb_native.rx.history[1].kind==3&&ncb_native.rx.history[1].status==255&&ncb_native.rx.history[1].sequence==255);
++ for(unsigned phase=0;phase<2;phase++)for(unsigned bad=0;bad<5;bad++){
++  scenario(phase?0:1,0,phase?1:0,1);
++  if(bad==0)sleep_bytes=39;if(bad==1)sleep_outer=0x3801;if(bad==2)sleep_eid=0xf0;if(bad==3)sleep_eid=0xed;if(bad==4)sleep_eid=0x28;
++  run_worker();assert(manual_halts==1&&nwm_drain_entered&&!normal_pubs);
++  if(phase)assert(nbc_native.state.halt&&!nbc_native.state.completed&&!nbc_native.state.rearmed&&basic_pubs==1&&nwfn_native.init.transport.completed==4);
++  else assert(ncd_native.diag.halt&&!ncd_native.diag.completed&&!ncd_native.diag.rearmed&&!basic_pubs&&nwfn_native.init.transport.completed==3);
++ }
++ puts("PASS real-owner unsolicited sleepy before CAP/preCID2/postCID2, rawstate0/1/2/255, opaque metadata, total16budget, malformed/unknown/fatal refusal and unchanged softwarecredits/noACK. Synthetic only.");return 0;
++}
++
++#endif
+--- a/tools/test-nord2-wifi-normal.py
++++ b/tools/test-nord2-wifi-normal.py
+@@ -5,7 +5,7 @@
+ R=Path(__file__).resolve().parents[1]
+ parser=argparse.ArgumentParser(description=__doc__)
+ parser.add_argument('--board',type=Path,default=R/'research/nord2/wifi/calibration/WIFI',help='Read-only authenticated 6146-byte board file; never embedded in fixtures/output')
+-parser.add_argument('--only',choices=('all','full','faults'),default='all')
++parser.add_argument('--only',choices=('all','full','faults','sleepy','sleepy-faults','sleepy-decoder'),default='all')
+ parser.add_argument('--cc',default='clang')
+ parser.add_argument('--log-dir',type=Path,help='Optional directory for synthetic captured test output')
+ parser.add_argument('--report',type=Path,help='Optional JSON source/fixture hashes and summaries, no packet/board bytes')
+@@ -29,6 +29,9 @@
+   adapter,n=re.subn(r'(static int ncd_native_'+name+r'\([^)]*\)\s*\{)',r'\1\n#ifdef FULL_FAULTS\nif(full_test_fail())return -1;\n#endif\n',adapter,count=1)
+   if n!=1:raise RuntimeError('callback fixture schema mismatch: '+name)
+  (d/'wifi_capability_bind.inc').write_text(adapter)
++ basic=(S/'wifi_basic_config_bind.inc').read_text();marker=' int result=nbc_prepare'
++ if basic.count(marker)!=1:raise RuntimeError('preCID2 firmware-arrival fixture schema mismatch')
++ (d/'wifi_basic_config_bind.inc').write_text(basic.replace(marker,' sleepy_pre_basic();\n'+marker))
+  # Only the call site is instrumented; the canonical readback helper and native owner remain unchanged.
+  rx=(S/'wifi_normal_rx.c').read_text()
+  marker='#include \"wifi_normal_rx.h\"'
+@@ -36,8 +39,8 @@
+  rx=rx.replace(marker,marker+'\nextern int nrd_host_probe(const struct ncd_io*,void*,struct ncr_state*,struct nrd_snapshot*,unsigned);\n#define nrd_capture nrd_host_probe')
+  (d/'wifi_normal_rx.c').write_text(rx)
+  files=[d/'wifi_normal_rx.c' if x.name=='wifi_normal_rx.c' else x for x in files]
+- for name in (('full','faults') if args.only=='all' else (args.only,)):
+-  exe=d/name;cmd=[args.cc,'-std=c11','-DNCFG_HOST_TEST','-O1','-g','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-fno-sanitize-recover=all','-fno-omit-frame-pointer','-I'+str(d),'-I'+str(S),str(P/('test-'+name+'.c'))]+list(map(str,files))+['-lcrypto','-o',str(exe)]
++ for name in (('full','faults','sleepy','sleepy-faults','sleepy-decoder') if args.only=='all' else (args.only,)):
++  exe=d/name;cmd=[args.cc,'-std=c11','-DNCFG_HOST_TEST','-O1','-g','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-fno-sanitize-recover=all','-fno-omit-frame-pointer','-I'+str(d),'-I'+str(S),str(P/('test-'+name+'.c'))]+list(map(str,[] if name=='sleepy-decoder' else files))+['-lcrypto','-o',str(exe)]
+   subprocess.run(cmd,check=True);run=subprocess.run([str(exe),str(board)],capture_output=True,text=True)
+   if run.returncode:
+    print(run.stdout[-6000:]);print(run.stderr);run.check_returncode()

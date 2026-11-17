@@ -1,0 +1,841 @@
+diff --git a/bsd/dev/rottenapple_mtk_wlan.c b/bsd/dev/rottenapple_mtk_wlan.c
+index 560a70e..9bc20b0 100644
+--- a/bsd/dev/rottenapple_mtk_wlan.c
++++ b/bsd/dev/rottenapple_mtk_wlan.c
+@@ -2440,8 +2440,15 @@ mtk_wlan_scan(struct mtk_wlan *l, unsigned mode)
+ 	l->scan_frame_logs = 0;
+ 	uint32_t types_before = l->rx_types[RX_PKT_TYPE_RX_DATA], sleepy_before = l->sleepy, sw_before = l->rx_sw_frames;
+ 	l->scan_seq = seq;
+-	/* aisFsmSteps AIS_STATE_SCAN: nicActivateNetwork first (sends the own MAC to the firmware) */
+-	err = wl_bss_activate(l, true);
++	/*
++	 * aisFsmSteps AIS_STATE_SCAN: nicActivateNetwork first (sends the own MAC
++	 * to the firmware). While associated the AIS network is already active
++	 * and must stay so: re-activating it before the scan and deactivating it
++	 * afterwards left the firmware dropping every TX frame (status 33) with
++	 * the STA still "connected" (seen with a scan while connected).
++	 */
++	bool keep_bss = l->connected || l->join_active;
++	err = (keep_bss && l->bss_active) ? 0 : wl_bss_activate(l, true);
+ 	if (err == 0) {
+ 		err = wl_set(l, CMD_ID_SCAN_REQ_V2, cmd, SCAN_REQ_LEN, "SCAN_REQ_V2");
+ 	}
+@@ -2466,7 +2473,7 @@ mtk_wlan_scan(struct mtk_wlan *l, unsigned mode)
+ 		scan_done_log(l);
+ 	}
+ 	l->scan_seq = 0;
+-	if (l->bss_active && !l->fw_dead) {
++	if (l->bss_active && !l->fw_dead && !keep_bss && !l->connected) {
+ 		(void)wl_bss_activate(l, false);
+ 	}
+ 	LLOG("scan %s after %llu ms: host received %u management frames (SW frame packets %u, RX data packets %u, sleepy "
+diff --git a/bsd/dev/rottenapple_wifi.c b/bsd/dev/rottenapple_wifi.c
+index d5404d6..111b77b 100644
+--- a/bsd/dev/rottenapple_wifi.c
++++ b/bsd/dev/rottenapple_wifi.c
+@@ -1089,6 +1089,54 @@ rottenapple_wifi_scan_rssi(const uint8_t *bssid)
+ 	return rssi;
+ }
+ 
++_Static_assert(SEC_PRIVACY == ROTTENAPPLE_WIFI_BSS_PRIVACY && SEC_WPA == ROTTENAPPLE_WIFI_BSS_WPA &&
++    SEC_RSN == ROTTENAPPLE_WIFI_BSS_RSN && SEC_PMF_CAPABLE == ROTTENAPPLE_WIFI_BSS_PMF_CAP &&
++    SEC_PMF_REQUIRED == ROTTENAPPLE_WIFI_BSS_PMF_REQ, "exported BSS security bits");
++_Static_assert(AKM_PSK == ROTTENAPPLE_WIFI_AKM_PSK && AKM_SAE == ROTTENAPPLE_WIFI_AKM_SAE &&
++    AKM_OWE == ROTTENAPPLE_WIFI_AKM_OWE && AKM_PSK_SHA256 == ROTTENAPPLE_WIFI_AKM_PSK_SHA256, "exported AKM bits");
++_Static_assert(CIPH_TKIP == ROTTENAPPLE_WIFI_CIPH_TKIP && CIPH_CCMP == ROTTENAPPLE_WIFI_CIPH_CCMP &&
++    CIPH_GCMP256 == ROTTENAPPLE_WIFI_CIPH_GCMP256, "exported cipher bits");
++
++unsigned
++rottenapple_wifi_scan_count(void)
++{
++	unsigned n;
++
++	lck_mtx_lock(&wifi_scan_lock);
++	n = wifi_scan.valid || wifi_scan.collecting ? wifi_scan.n : 0;
++	lck_mtx_unlock(&wifi_scan_lock);
++	return n;
++}
++
++bool
++rottenapple_wifi_scan_entry(unsigned i, struct rottenapple_wifi_bss_entry *e)
++{
++	uint8_t idx[WIFI_BSS_MAX];
++	bool ok = false;
++
++	lck_mtx_lock(&wifi_scan_lock);
++	if (i < wifi_scan.n && !wifi_scan.collecting) {
++		bss_sorted(idx);
++		const struct wifi_bss *b = &wifi_scan.bss[idx[i]];
++		bzero(e, sizeof(*e));
++		memcpy(e->bssid, b->bssid, 6);
++		memcpy(e->ssid, b->ssid, sizeof(e->ssid));
++		e->ssid_len = b->ssid_len;
++		e->channel = b->channel;
++		e->rssi = b->rssi;
++		e->capability = b->capability;
++		e->beacon_int = b->beacon_int;
++		e->sec = b->sec;
++		e->akm_rsn = b->akm_rsn;
++		e->akm_wpa = b->akm_wpa;
++		e->ciph_rsn = b->ciph_rsn;
++		e->ciph_wpa = b->ciph_wpa;
++		ok = true;
++	}
++	lck_mtx_unlock(&wifi_scan_lock);
++	return ok;
++}
++
+ bool
+ rottenapple_wifi_scan_bss(const uint8_t *bssid, struct rottenapple_wifi_bss_info *bi)
+ {
+@@ -1170,6 +1218,8 @@ rottenapple_wifi_scan(unsigned mode)
+ 	wifi_scanning = true;
+ 	lck_mtx_unlock(&wifi_state_lock);
+ 
++	struct rottenapple_wifi_link_info li;
++	rottenapple_wifi_sta_link_info(&li);
+ 	if (w->ops->scan == NULL) {
+ 		SLOG("backend \"%s\" cannot scan", w->ops->compatible);
+ 		err = ENOTSUP;
+@@ -1200,6 +1250,16 @@ rottenapple_wifi_scan(unsigned mode)
+ 	wifi_scanning = false;
+ 	thread_wakeup((event_t)&wifi_scanning);
+ 	lck_mtx_unlock(&wifi_state_lock);
++	if (li.associated && err != 0 && err != ENOTSUP) {
++		/*
++		 * A scan that failed while associated (on the device: no SCAN_DONE,
++		 * then every TX dropped in the firmware) may have broken the link:
++		 * tear it down and let the station layer reconnect (it keeps the
++		 * credentials of the last join).
++		 */
++		SLOG("scan failed while associated (%d): re-establishing the link", err);
++		rottenapple_wifi_link_lost(w, "scan while associated failed");
++	}
+ 	return err;
+ }
+ 
+diff --git a/bsd/dev/rottenapple_wifi.h b/bsd/dev/rottenapple_wifi.h
+index 8ac90a3..0ab4ebe 100644
+--- a/bsd/dev/rottenapple_wifi.h
++++ b/bsd/dev/rottenapple_wifi.h
+@@ -331,6 +331,18 @@ struct rottenapple_wifi_link_info {
+ };
+ void rottenapple_wifi_sta_link_info(struct rottenapple_wifi_link_info *li);
+ 
++/*
++ * Join ssid (in the last scan list) on behalf of userland (stage I3): pmk is
++ * the 32-byte WPA2 PMK the caller derived, or NULL to use the passphrase
++ * file / sysctl (open networks need none). Blocks until connected or failed.
++ * The PMK is kept (in memory only) for the automatic reconnect.
++ */
++int rottenapple_wifi_sta_join(const uint8_t *ssid, uint8_t ssid_len, const uint8_t *pmk);
++/* Join the last successfully joined network again (its saved credentials). */
++int rottenapple_wifi_sta_rejoin_last(void);
++/* Disconnect, no reconnect; forgets a userland PMK. */
++void rottenapple_wifi_sta_disconnect(void);
++
+ /* RSSI of bssid in the last scan list, ROTTENAPPLE_WIFI_RSSI_NONE if absent. */
+ int rottenapple_wifi_scan_rssi(const uint8_t *bssid);
+ 
+@@ -343,6 +355,42 @@ struct rottenapple_wifi_bss_info {
+ };
+ bool rottenapple_wifi_scan_bss(const uint8_t *bssid, struct rottenapple_wifi_bss_info *bi);
+ 
++/* One entry of the last scan list (stage I3: served to userland as scan results). */
++#define ROTTENAPPLE_WIFI_BSS_PRIVACY    (1u << 0)       /* capability privacy bit */
++#define ROTTENAPPLE_WIFI_BSS_WPA        (1u << 1)       /* WPA (vendor) IE */
++#define ROTTENAPPLE_WIFI_BSS_RSN        (1u << 2)       /* RSN IE */
++#define ROTTENAPPLE_WIFI_BSS_PMF_CAP    (1u << 3)
++#define ROTTENAPPLE_WIFI_BSS_PMF_REQ    (1u << 4)
++#define ROTTENAPPLE_WIFI_AKM_EAP        (1u << 0)       /* AKM suite bits (RSN 00-0F-AC-n / WPA 00-50-F2-n) */
++#define ROTTENAPPLE_WIFI_AKM_PSK        (1u << 1)
++#define ROTTENAPPLE_WIFI_AKM_FT_EAP     (1u << 2)
++#define ROTTENAPPLE_WIFI_AKM_FT_PSK     (1u << 3)
++#define ROTTENAPPLE_WIFI_AKM_EAP_SHA256 (1u << 4)
++#define ROTTENAPPLE_WIFI_AKM_PSK_SHA256 (1u << 5)
++#define ROTTENAPPLE_WIFI_AKM_SAE        (1u << 6)
++#define ROTTENAPPLE_WIFI_AKM_FT_SAE     (1u << 7)
++#define ROTTENAPPLE_WIFI_AKM_OWE        (1u << 9)
++#define ROTTENAPPLE_WIFI_CIPH_WEP       (1u << 0)       /* pairwise cipher bits */
++#define ROTTENAPPLE_WIFI_CIPH_TKIP      (1u << 1)
++#define ROTTENAPPLE_WIFI_CIPH_CCMP      (1u << 2)
++#define ROTTENAPPLE_WIFI_CIPH_GCMP      (1u << 3)
++#define ROTTENAPPLE_WIFI_CIPH_CCMP256   (1u << 4)
++#define ROTTENAPPLE_WIFI_CIPH_GCMP256   (1u << 5)
++struct rottenapple_wifi_bss_entry {
++	uint8_t bssid[6];
++	uint8_t ssid[32];
++	uint8_t ssid_len;               /* 0 = hidden */
++	uint8_t channel;
++	int rssi;                       /* dBm, ROTTENAPPLE_WIFI_RSSI_NONE if unknown */
++	uint16_t capability, beacon_int;
++	uint8_t sec;                    /* ROTTENAPPLE_WIFI_BSS_* */
++	uint16_t akm_rsn, akm_wpa;      /* ROTTENAPPLE_WIFI_AKM_* */
++	uint8_t ciph_rsn, ciph_wpa;     /* ROTTENAPPLE_WIFI_CIPH_* */
++};
++/* Number of entries in the last scan list; entry i (strongest first). */
++unsigned rottenapple_wifi_scan_count(void);
++bool rottenapple_wifi_scan_entry(unsigned i, struct rottenapple_wifi_bss_entry *e);
++
+ /* ---- Apple80211 surface (rottenapple_wifi_a80211.c, stage I2; boot-arg rottenapple_a80211=1) ---- */
+ 
+ struct ifnet;
+diff --git a/bsd/dev/rottenapple_wifi_a80211.c b/bsd/dev/rottenapple_wifi_a80211.c
+index 2c03dfb..848434b 100644
+--- a/bsd/dev/rottenapple_wifi_a80211.c
++++ b/bsd/dev/rottenapple_wifi_a80211.c
+@@ -46,6 +46,9 @@
+ #include <net/kpi_interface.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
+ #include <dev/rottenapple_wifi.h>
+ 
+ #define ALOG(fmt, ...)  printf("ROTTEN APPLE: wifi a80211: " fmt "\n", ##__VA_ARGS__)
+@@ -79,6 +82,7 @@ _Static_assert(sizeof(struct ra_a80211_req) == 40, "apple80211 request is 40 byt
+ #define A_NOISE                 17
+ #define A_POWER                 19
+ #define A_ASSOCIATE             20
++#define A_ASSOCIATE_RESULT      21
+ #define A_DISASSOCIATE          22
+ #define A_SUPPORTED_CHANNELS    27
+ #define A_DRIVER_VERSION        43
+@@ -131,7 +135,7 @@ _Static_assert(sizeof(struct ra_a80211_req) == 40, "apple80211 request is 40 byt
+ #define CHF_5GHZ                0x10
+ #define NOISE_FLOOR_DBM         (-92)
+ 
+-static int a80211_on = -1;              /* boot-arg, read once */
++static int a80211_on = -1;              /* boot-arg, read once: 0 off, 1 read-only, >= 2 control */
+ static ifnet_t a80211_ifp;
+ static int16_t a80211_logged[A_TYPES_LOGGED];         /* last result + 1 per type, 0 = never seen */
+ static int16_t a80211_set_logged[A_TYPES_LOGGED];
+@@ -142,9 +146,10 @@ rottenapple_wifi_a80211_enabled(void)
+ 	if (a80211_on < 0) {
+ 		uint32_t v = 0;
+ 		(void)PE_parse_boot_argn("rottenapple_a80211", &v, sizeof(v));
+-		a80211_on = v != 0;
++		a80211_on = (int)MIN(v, 2u);
+ 		if (a80211_on) {
+-			ALOG("enabled (rottenapple_a80211=%u): IEEE80211 media, Apple80211 ioctls (read-only), events", v);
++			ALOG("enabled (rottenapple_a80211=%u): IEEE80211 media, Apple80211 ioctls (%s), events", v,
++			    a80211_on >= 2 ? "scan, associate and disassociate from userland" : "read-only");
+ 		}
+ 	}
+ 	return a80211_on > 0;
+@@ -156,6 +161,38 @@ put32(uint8_t *p, uint32_t v)
+ 	memcpy(p, &v, 4);               /* little-endian host, as userland reads it */
+ }
+ 
++/* ---- I3: scan, associate, disassociate (rottenapple_a80211=2) ---- */
++
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++
++static LCK_GRP_DECLARE(a80211_grp, "rottenapple_a80211");
++static LCK_MTX_DECLARE(a80211_lock, &a80211_grp);
++static volatile bool a80211_scanning;           /* a userland-requested scan runs */
++static uint64_t a80211_scan_done_at;            /* mach_absolute_time of the last SCAN_DONE */
++static unsigned a80211_scan_cursor;             /* next SCAN_RESULT entry */
++static volatile bool a80211_assoc_running;
++static volatile uint32_t a80211_assoc_result;   /* ASSOCIATE_RESULT: 0 pending, 1 success, >= 2 failed */
++static struct {
++	uint8_t ssid[32];
++	uint8_t ssid_len;
++	bool have_pmk;
++	uint8_t pmk[32];                        /* secret: wiped after the join */
++} a80211_assoc;
++
++#define SCAN_REUSE_MS           10000   /* while associated, a scan list younger than this is served as is */
++#define ASSOC_LEN               0x250   /* struct of the ASSOCIATE request (IO80211 _performAssociation) */
++#define AS_AUTH_UPPER           0x08
++#define AS_SSID_LEN             0x0c
++#define AS_SSID                 0x10
++#define AS_KEY_LEN              0x3c    /* passphrase length, or 32 with AS_KEY_TYPE 6 = PMK */
++#define AS_KEY_TYPE             0x40
++#define AS_KEY                  0x48
++#define AS_PMK_LEN              0x1d4   /* 32 when the PMK was derived in userland */
++#define AS_PMK                  0x1d8
++#define AS_KEY_TYPE_PMK         6
++#define ASSOC_RESULT_OK         1
++#define ASSOC_RESULT_FAILED     2
++
+ /* ---- events ---- */
+ 
+ static void
+@@ -203,6 +240,9 @@ rottenapple_wifi_a80211_link(bool up, int rssi)
+ 	bzero(lc, sizeof(lc));
+ 	lc[0] = up ? 0 : 1;
+ 	put32(lc + 4, (uint32_t)(rssi == ROTTENAPPLE_WIFI_RSSI_NONE ? 0 : rssi));
++	if (up && a80211_assoc_running) {
++		a80211_assoc_result = ASSOC_RESULT_OK;  /* before ASSOC_DONE: IO80211 reads it on the event */
++	}
+ 	if (up) {
+ 		a80211_post(M_SSID_CHANGED, NULL, 0);
+ 		a80211_post(M_BSSID_CHANGED, NULL, 0);
+@@ -216,6 +256,8 @@ void
+ rottenapple_wifi_a80211_scan_done(void)
+ {
+ 	uint32_t status = 0;
++	a80211_scan_cursor = 0;
++	a80211_scan_done_at = mach_absolute_time();
+ 	a80211_post(M_SCAN_DONE, &status, sizeof(status));
+ }
+ 
+@@ -272,58 +314,333 @@ put16(uint8_t *p, uint16_t v)
+ 	memcpy(p, &v, 2);
+ }
+ 
+-/* the fixed WPA2-PSK CCMP RSN IE the station layer associates with (no PMF) */
+-static const uint8_t rsn_ie_psk_ccmp[] = {
+-	0x30, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
+-	0x01, 0x00, 0x00, 0x0f, 0xac, 0x02, 0x00, 0x00,
+-};
+ 
+-/* Build the current BSS as a scan result; returns its length (header + IEs). */
++/* RSN / WPA suite selectors from the scan list's bits */
+ static uint32_t
+-a80211_scan_result(uint8_t *sr, const struct rottenapple_wifi_link_info *li)
++suite_cipher(uint8_t c)
++{
++	return (c & ROTTENAPPLE_WIFI_CIPH_CCMP) ? 4 : (c & ROTTENAPPLE_WIFI_CIPH_GCMP256) ? 9 :
++	       (c & ROTTENAPPLE_WIFI_CIPH_GCMP) ? 8 : (c & ROTTENAPPLE_WIFI_CIPH_CCMP256) ? 10 :
++	       (c & ROTTENAPPLE_WIFI_CIPH_TKIP) ? 2 : 4;
++}
++
++/* append a cipher/AKM security IE (RSN: oui 00-0F-AC, id 48; WPA: vendor 00-50-F2 type 1) */
++static uint32_t
++put_sec_ie(uint8_t *ie, bool rsn, uint16_t akm, uint8_t ciph, bool pmf_cap, bool pmf_req)
++{
++	static const uint8_t oui_rsn[3] = { 0x00, 0x0f, 0xac }, oui_wpa[3] = { 0x00, 0x50, 0xf2 };
++	const uint8_t *oui = rsn ? oui_rsn : oui_wpa;
++	uint8_t akms[8], ciphs[4];
++	unsigned na = 0, nc = 0, n = 2;
++
++	if (akm & ROTTENAPPLE_WIFI_AKM_EAP) {
++		akms[na++] = 1;
++	}
++	if (akm & ROTTENAPPLE_WIFI_AKM_PSK) {
++		akms[na++] = 2;
++	}
++	if (rsn && (akm & ROTTENAPPLE_WIFI_AKM_FT_PSK)) {
++		akms[na++] = 4;
++	}
++	if (rsn && (akm & ROTTENAPPLE_WIFI_AKM_PSK_SHA256)) {
++		akms[na++] = 6;
++	}
++	if (rsn && (akm & ROTTENAPPLE_WIFI_AKM_SAE)) {
++		akms[na++] = 8;
++	}
++	if (rsn && (akm & ROTTENAPPLE_WIFI_AKM_OWE)) {
++		akms[na++] = 18;
++	}
++	if (na == 0) {
++		akms[na++] = 2;
++	}
++	if (ciph & ROTTENAPPLE_WIFI_CIPH_CCMP) {
++		ciphs[nc++] = 4;
++	}
++	if (ciph & ROTTENAPPLE_WIFI_CIPH_TKIP) {
++		ciphs[nc++] = 2;
++	}
++	if (rsn && (ciph & ROTTENAPPLE_WIFI_CIPH_GCMP256)) {
++		ciphs[nc++] = 9;
++	}
++	if (nc == 0) {
++		ciphs[nc++] = (uint8_t)suite_cipher(ciph);
++	}
++	if (rsn) {
++		ie[0] = 48;
++	} else {
++		ie[0] = 221;
++		memcpy(ie + n, oui_wpa, 3);
++		ie[n + 3] = 1;
++		n += 4;
++	}
++	ie[n++] = 1;                    /* version 1 */
++	ie[n++] = 0;
++	memcpy(ie + n, oui, 3);         /* group cipher: TKIP when offered, else the pairwise one */
++	ie[n + 3] = (uint8_t)((ciph & ROTTENAPPLE_WIFI_CIPH_TKIP) ? 2 : suite_cipher(ciph));
++	n += 4;
++	ie[n++] = (uint8_t)nc;
++	ie[n++] = 0;
++	for (unsigned i = 0; i < nc; i++, n += 4) {
++		memcpy(ie + n, oui, 3);
++		ie[n + 3] = ciphs[i];
++	}
++	ie[n++] = (uint8_t)na;
++	ie[n++] = 0;
++	for (unsigned i = 0; i < na; i++, n += 4) {
++		memcpy(ie + n, oui, 3);
++		ie[n + 3] = akms[i];
++	}
++	if (rsn) {
++		ie[n++] = (uint8_t)((pmf_req ? 0x40 : 0) | (pmf_cap ? 0x80 : 0));       /* RSN capabilities */
++		ie[n++] = 0;
++	}
++	ie[1] = (uint8_t)(n - 2);
++	return n;
++}
++
++/* One BSS as a scan result (layout above); returns header + IE length. */
++static uint32_t
++a80211_scan_result(uint8_t *sr, const struct rottenapple_wifi_bss_entry *e)
+ {
+-	struct rottenapple_wifi_bss_info bi = { .channel = li->channel, .rssi = li->rssi };
+ 	uint8_t *ie = sr + SR_HDR;
+ 	uint32_t n = 0;
++	int rssi = e->rssi == ROTTENAPPLE_WIFI_RSSI_NONE ? -80 : e->rssi;
++	bool secure = (e->sec & (ROTTENAPPLE_WIFI_BSS_RSN | ROTTENAPPLE_WIFI_BSS_WPA | ROTTENAPPLE_WIFI_BSS_PRIVACY)) != 0;
+ 
+-	(void)rottenapple_wifi_scan_bss(li->bssid, &bi);
+-	int rssi = bi.rssi == ROTTENAPPLE_WIFI_RSSI_NONE ? -60 : bi.rssi;
+ 	bzero(sr, SR_LEN);
+ 	put32(sr + 0x00, 1);
+ 	put32(sr + 0x04, 1);
+-	put32(sr + 0x08, li->channel);
+-	put32(sr + 0x0c, chan_flags(li->channel));
++	put32(sr + 0x08, e->channel);
++	put32(sr + 0x0c, chan_flags(e->channel));
+ 	put16(sr + 0x12, (uint16_t)(int16_t)NOISE_FLOOR_DBM);
+ 	put16(sr + 0x14, (uint16_t)(int16_t)(rssi - NOISE_FLOOR_DBM));
+ 	put16(sr + 0x16, (uint16_t)(int16_t)rssi);
+-	put16(sr + 0x18, bi.beacon_int ? bi.beacon_int : 100);
+-	put16(sr + 0x1a, bi.capability ? bi.capability :
+-	    (uint16_t)(0x0001 | (li->security != ROTTENAPPLE_WIFI_SEC_OPEN ? 0x0010 : 0)));
+-	memcpy(sr + 0x1c, li->bssid, 6);
+-	sr[0x60] = li->ssid_len;
+-	memcpy(sr + 0x61, li->ssid, li->ssid_len);
+-	/* IEs: SSID, supported rates, DS parameter set, RSN */
++	put16(sr + 0x18, e->beacon_int ? e->beacon_int : 100);
++	put16(sr + 0x1a, e->capability ? e->capability : (uint16_t)(0x0001 | (secure ? 0x0010 : 0)));
++	memcpy(sr + 0x1c, e->bssid, 6);
++	sr[0x60] = e->ssid_len;
++	memcpy(sr + 0x61, e->ssid, e->ssid_len);
++	/* IEs: SSID, supported rates, DS parameter set, RSN, WPA */
+ 	ie[n++] = 0;
+-	ie[n++] = li->ssid_len;
+-	memcpy(ie + n, li->ssid, li->ssid_len);
+-	n += li->ssid_len;
++	ie[n++] = e->ssid_len;
++	memcpy(ie + n, e->ssid, e->ssid_len);
++	n += e->ssid_len;
+ 	static const uint8_t rates24[] = { 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24 };
+ 	static const uint8_t rates5[] = { 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c };
+ 	ie[n++] = 1;
+ 	ie[n++] = 8;
+-	memcpy(ie + n, li->channel <= 14 ? rates24 : rates5, 8);
++	memcpy(ie + n, e->channel <= 14 ? rates24 : rates5, 8);
+ 	n += 8;
+ 	ie[n++] = 3;
+ 	ie[n++] = 1;
+-	ie[n++] = li->channel;
+-	if (li->security == ROTTENAPPLE_WIFI_SEC_WPA2_PSK) {
+-		memcpy(ie + n, rsn_ie_psk_ccmp, sizeof(rsn_ie_psk_ccmp));
+-		n += sizeof(rsn_ie_psk_ccmp);
++	ie[n++] = e->channel;
++	if (e->sec & ROTTENAPPLE_WIFI_BSS_RSN) {
++		n += put_sec_ie(ie + n, true, e->akm_rsn, e->ciph_rsn, (e->sec & ROTTENAPPLE_WIFI_BSS_PMF_CAP) != 0,
++		    (e->sec & ROTTENAPPLE_WIFI_BSS_PMF_REQ) != 0);
++	}
++	if (e->sec & ROTTENAPPLE_WIFI_BSS_WPA) {
++		n += put_sec_ie(ie + n, false, e->akm_wpa, e->ciph_wpa, false, false);
+ 	}
+ 	put16(sr + 0x8a, (uint16_t)n);
+ 	return SR_HDR + n;
+ }
+ 
++/* The current BSS as a scan-list entry (scan list values where known). */
++static void
++a80211_current_entry(const struct rottenapple_wifi_link_info *li, struct rottenapple_wifi_bss_entry *e)
++{
++	struct rottenapple_wifi_bss_info bi = { .channel = li->channel, .rssi = li->rssi };
++
++	(void)rottenapple_wifi_scan_bss(li->bssid, &bi);
++	bzero(e, sizeof(*e));
++	memcpy(e->bssid, li->bssid, 6);
++	memcpy(e->ssid, li->ssid, li->ssid_len);
++	e->ssid_len = li->ssid_len;
++	e->channel = li->channel;
++	e->rssi = bi.rssi;
++	e->capability = bi.capability;
++	e->beacon_int = bi.beacon_int;
++	if (li->security == ROTTENAPPLE_WIFI_SEC_WPA2_PSK) {
++		e->sec = ROTTENAPPLE_WIFI_BSS_RSN | ROTTENAPPLE_WIFI_BSS_PRIVACY;
++		e->akm_rsn = ROTTENAPPLE_WIFI_AKM_PSK;
++		e->ciph_rsn = ROTTENAPPLE_WIFI_CIPH_CCMP;
++	}
++}
++
++static uint64_t
++ms_since(uint64_t t)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t, &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++static void
++a80211_scan_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	int err = rottenapple_wifi_scan(ROTTENAPPLE_WIFI_SCAN_ACTIVE);
++	if (err == EBUSY || err == ENXIO || err == ENOTSUP || err == EINVAL) {
++		rottenapple_wifi_a80211_scan_done();    /* no scan ran: end the caller's wait anyway */
++	}
++	ALOG("userland scan finished (%d), %u networks", err, rottenapple_wifi_scan_count());
++	a80211_scanning = false;
++}
++
++static int
++a80211_scan_req(void)
++{
++	struct rottenapple_wifi_link_info li;
++	thread_t th;
++
++	rottenapple_wifi_sta_link_info(&li);
++	lck_mtx_lock(&a80211_lock);
++	if (a80211_scanning) {
++		lck_mtx_unlock(&a80211_lock);
++		return 0;                       /* the running scan posts SCAN_DONE */
++	}
++	if ((li.associated || a80211_assoc_running) && a80211_scan_done_at != 0 &&
++	    ms_since(a80211_scan_done_at) < SCAN_REUSE_MS && rottenapple_wifi_scan_count() > 0) {
++		lck_mtx_unlock(&a80211_lock);
++		rottenapple_wifi_a80211_scan_done();    /* fresh enough: no off-channel scan while associated */
++		return 0;
++	}
++	a80211_scanning = true;
++	lck_mtx_unlock(&a80211_lock);
++	if (kernel_thread_start(a80211_scan_thread, NULL, &th) != KERN_SUCCESS) {
++		a80211_scanning = false;
++		return ENOMEM;
++	}
++	thread_deallocate(th);
++	return 0;
++}
++
++static int
++a80211_scan_result_get(struct ra_a80211_req *r)
++{
++	struct rottenapple_wifi_bss_entry e;
++
++	lck_mtx_lock(&a80211_lock);
++	unsigned i = a80211_scan_cursor;
++	bool ok = !a80211_scanning && rottenapple_wifi_scan_entry(i, &e);
++	a80211_scan_cursor = ok ? i + 1 : 0;   /* EIO ends the list (IO80211 _Apple80211Scan) and rewinds */
++	lck_mtx_unlock(&a80211_lock);
++	if (!ok) {
++		return EIO;
++	}
++	uint8_t *sr = kalloc_data(SR_LEN, Z_WAITOK | Z_ZERO);
++	if (sr == NULL) {
++		return ENOMEM;
++	}
++	uint32_t len = a80211_scan_result(sr, &e);
++	int err = a80211_reply(r, sr, MAX(len, MIN(r->len, (uint32_t)SR_LEN)));
++	kfree_data(sr, SR_LEN);
++	return err;
++}
++
++static void
++a80211_assoc_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	struct rottenapple_wifi_join jp;
++	struct rottenapple_wifi_link_info before;
++	int err;
++
++	rottenapple_wifi_sta_link_info(&before);
++	if (!rottenapple_wifi_scan_lookup(a80211_assoc.ssid, a80211_assoc.ssid_len, &jp)) {
++		(void)rottenapple_wifi_scan(ROTTENAPPLE_WIFI_SCAN_ACTIVE);
++	}
++	err = rottenapple_wifi_sta_join(a80211_assoc.ssid, a80211_assoc.ssid_len,
++	    a80211_assoc.have_pmk ? a80211_assoc.pmk : NULL);
++	bzero(&a80211_assoc, sizeof(a80211_assoc));
++	ALOG("userland join: %s (%d)", err ? "FAILED" : "connected", err);
++	if (err) {
++		a80211_assoc_result = ASSOC_RESULT_FAILED;
++		a80211_post(M_ASSOC_DONE, NULL, 0);
++	}
++	a80211_assoc_running = false;
++	if (err && before.associated) {
++		/* a failed switch must not leave the phone offline: back to the previous network */
++		int e2 = rottenapple_wifi_sta_rejoin_last();
++		ALOG("previous network %s (%d)", e2 ? "NOT restored" : "restored", e2);
++	}
++}
++
++static int
++a80211_associate(struct ra_a80211_req *r)
++{
++	struct rottenapple_wifi_link_info li;
++	uint8_t *as;
++	thread_t th;
++	int err = 0;
++
++	if (r->data == 0 || r->len < AS_PMK + 32) {
++		return EINVAL;
++	}
++	if (a80211_assoc_running) {
++		return EBUSY;
++	}
++	as = kalloc_data(ASSOC_LEN, Z_WAITOK | Z_ZERO);
++	if (as == NULL) {
++		return ENOMEM;
++	}
++	err = copyin((user_addr_t)r->data, as, MIN(r->len, (uint32_t)ASSOC_LEN));
++	if (err) {
++		goto out;
++	}
++	uint32_t ssid_len, key_len, key_type, pmk_len;
++	uint16_t upper;
++	memcpy(&ssid_len, as + AS_SSID_LEN, 4);
++	memcpy(&key_len, as + AS_KEY_LEN, 4);
++	memcpy(&key_type, as + AS_KEY_TYPE, 4);
++	memcpy(&pmk_len, as + AS_PMK_LEN, 4);
++	memcpy(&upper, as + AS_AUTH_UPPER, 2);
++	if (ssid_len == 0 || ssid_len > 32) {
++		err = EINVAL;
++		goto out;
++	}
++	if (upper != AUTH_UPPER_NONE && upper != AUTH_UPPER_WPA2_PSK) {
++		ALOG("associate: auth type 0x%x not supported (open and WPA2-PSK only)", upper);
++		err = EOPNOTSUPP;
++		goto out;
++	}
++	rottenapple_wifi_sta_link_info(&li);
++	if (li.associated && li.ssid_len == ssid_len && memcmp(li.ssid, as + AS_SSID, ssid_len) == 0) {
++		/* already on this network (joined at boot or before): keep the link */
++		ALOG("associate: already associated to the requested network, keeping the link");
++		a80211_assoc_result = ASSOC_RESULT_OK;
++		a80211_post(M_ASSOC_DONE, NULL, 0);
++		goto out;
++	}
++	bzero(&a80211_assoc, sizeof(a80211_assoc));
++	memcpy(a80211_assoc.ssid, as + AS_SSID, ssid_len);
++	a80211_assoc.ssid_len = (uint8_t)ssid_len;
++	if (upper == AUTH_UPPER_WPA2_PSK) {
++		if (pmk_len == 32) {
++			memcpy(a80211_assoc.pmk, as + AS_PMK, 32);
++			a80211_assoc.have_pmk = true;
++		} else if (key_len == 32 && key_type == AS_KEY_TYPE_PMK) {
++			memcpy(a80211_assoc.pmk, as + AS_KEY, 32);
++			a80211_assoc.have_pmk = true;
++		}
++		/* no PMK: the station layer falls back to the passphrase file */
++	}
++	ALOG("associate: WPA2-PSK %s, PMK %s", upper == AUTH_UPPER_WPA2_PSK ? "yes" : "no (open)",
++	    a80211_assoc.have_pmk ? "from userland" : "not given (passphrase file fallback)");
++	a80211_assoc_result = 0;
++	a80211_assoc_running = true;
++	if (kernel_thread_start(a80211_assoc_thread, NULL, &th) != KERN_SUCCESS) {
++		bzero(&a80211_assoc, sizeof(a80211_assoc));
++		a80211_assoc_running = false;
++		err = ENOMEM;
++		goto out;
++	}
++	thread_deallocate(th);
++out:
++	bzero(as, ASSOC_LEN);                   /* holds the key material */
++	kfree_data(as, ASSOC_LEN);
++	return err;
++}
++
+ static int
+ a80211_get(struct ra_a80211_req *r)
+ {
+@@ -369,12 +686,25 @@ a80211_get(struct ra_a80211_req *r)
+ 		if (sr == NULL) {
+ 			return ENOMEM;
+ 		}
+-		uint32_t len = a80211_scan_result(sr, &li);
++		struct rottenapple_wifi_bss_entry e;
++		a80211_current_entry(&li, &e);
++		uint32_t len = a80211_scan_result(sr, &e);
+ 		/* userland presets ie_len to its IE capacity; the copy is clipped to req_len */
+ 		int err = a80211_reply(r, sr, MAX(len, MIN(r->len, (uint32_t)SR_LEN)));
+ 		kfree_data(sr, SR_LEN);
+ 		return err;
+ 	}
++	case A_SCAN_RESULT:
++		if (a80211_on < 2) {
++			return EOPNOTSUPP;
++		}
++		return a80211_scan_result_get(r);
++	case A_ASSOCIATE_RESULT:
++		if (a80211_on < 2) {
++			return EOPNOTSUPP;
++		}
++		r->val = a80211_assoc_result;
++		return 0;
+ 	case A_CARD_CAPABILITIES:
+ 		/* capability bit meanings not mapped yet: an empty bitmap (the bind only needs success) */
+ 		return a80211_reply(r, buf, CAP_BYTES);
+@@ -458,7 +788,26 @@ a80211_set(struct ra_a80211_req *r)
+ 		memcpy(&on, buf + 8, 4);
+ 		return on ? 0 : EPERM;  /* already on; power-off from userland is not wired to the stop path */
+ 	}
+-	return EOPNOTSUPP;              /* read-only for now (no disassociate/associate/scan from userland) */
++	if (a80211_on < 2) {
++		return EOPNOTSUPP;      /* rottenapple_a80211=1: read-only */
++	}
++	switch (r->type) {
++	case A_SCAN_REQ:
++		return a80211_scan_req();
++	case A_ASSOCIATE:
++		return a80211_associate(r);
++	case A_DISASSOCIATE: {
++		struct rottenapple_wifi_link_info li;
++		rottenapple_wifi_sta_link_info(&li);
++		ALOG("disassociate requested by userland (%s)", li.associated ? "associated" : "not associated");
++		if (li.associated && !a80211_assoc_running) {
++			rottenapple_wifi_sta_disconnect();
++		}
++		return 0;
++	}
++	default:
++		return EOPNOTSUPP;
++	}
+ }
+ 
+ int
+diff --git a/bsd/dev/rottenapple_wifi_sta.c b/bsd/dev/rottenapple_wifi_sta.c
+index 09e8efc..d098038 100644
+--- a/bsd/dev/rottenapple_wifi_sta.c
++++ b/bsd/dev/rottenapple_wifi_sta.c
+@@ -111,6 +111,8 @@ struct wifi_sta {
+ 	bool want_reconnect;
+ 	uint8_t reconnect_ssid[32];
+ 	uint8_t reconnect_ssid_len;
++	uint8_t reconnect_pmk[PMK_LEN];         /* PMK handed in by userland (secret; wiped on disconnect) */
++	bool reconnect_have_pmk;
+ 
+ 	/* link info for the log */
+ 	char ip_text[40];
+@@ -852,7 +854,7 @@ sta_teardown_locked(struct wifi_sta *s, bool tell_firmware)
+ #define JOIN_HS_TIMEOUT_MS      5000
+ 
+ static int
+-sta_join(struct wifi_sta *s, const uint8_t *ssid, uint8_t ssid_len)
++sta_join_ex(struct wifi_sta *s, const uint8_t *ssid, uint8_t ssid_len, const uint8_t *pmk_in)
+ {
+ 	struct rottenapple_wifi_join jp;
+ 	int err;
+@@ -886,7 +888,10 @@ sta_join(struct wifi_sta *s, const uint8_t *ssid, uint8_t ssid_len)
+ 	s->hs_done = false;
+ 	s->hs_failed = false;
+ 	s->have_pmk = false;
+-	if (jp.security == ROTTENAPPLE_WIFI_SEC_WPA2_PSK) {
++	if (jp.security == ROTTENAPPLE_WIFI_SEC_WPA2_PSK && pmk_in != NULL) {
++		memcpy(s->pmk, pmk_in, PMK_LEN);        /* from userland (Apple80211 ASSOCIATE): never logged */
++		s->have_pmk = true;
++	} else if (jp.security == ROTTENAPPLE_WIFI_SEC_WPA2_PSK) {
+ 		uint8_t psk[PSK_MAX];
+ 		size_t psk_len = 0;
+ 		err = psk_load(psk, &psk_len);
+@@ -947,6 +952,13 @@ sta_join(struct wifi_sta *s, const uint8_t *ssid, uint8_t ssid_len)
+ 	/* remember for a reconnect */
+ 	memcpy(s->reconnect_ssid, ssid, ssid_len);
+ 	s->reconnect_ssid_len = ssid_len;
++	if (pmk_in != NULL) {
++		memcpy(s->reconnect_pmk, pmk_in, PMK_LEN);
++		s->reconnect_have_pmk = true;
++	} else {
++		bzero(s->reconnect_pmk, PMK_LEN);
++		s->reconnect_have_pmk = false;
++	}
+ 	s->want_reconnect = true;
+ 	lck_mtx_unlock(s->lock);
+ 	TLOG("connected: en1 up with the NVRAM MAC; configure IP over SSH (ifconfig/ipconfig) or "
+@@ -969,15 +981,18 @@ rottenapple_wifi_link_lost(struct rottenapple_wifi *w, const char *reason)
+ 	}
+ 	TLOG("link lost (%s); disconnecting", reason ? reason : "");
+ 	bool reconnect = s->want_reconnect;
+-	uint8_t ssid[32], ssid_len = s->reconnect_ssid_len;
++	uint8_t ssid[32], ssid_len = s->reconnect_ssid_len, pmk[PMK_LEN];
++	bool have_pmk = s->reconnect_have_pmk;
+ 	memcpy(ssid, s->reconnect_ssid, ssid_len);
++	memcpy(pmk, s->reconnect_pmk, PMK_LEN);
+ 	sta_teardown_locked(s, true);
+ 	lck_mtx_unlock(s->lock);
+ 	/* a single best-effort reconnect attempt using the last scan list */
+ 	if (reconnect && ssid_len) {
+ 		TLOG("reconnecting to \"%.*s\"", ssid_len, ssid);
+-		(void)sta_join(s, ssid, ssid_len);
++		(void)sta_join_ex(s, ssid, ssid_len, have_pmk ? pmk : NULL);
+ 	}
++	bzero(pmk, sizeof(pmk));
+ }
+ 
+ void
+@@ -994,6 +1009,54 @@ rottenapple_wifi_sta_stop(struct rottenapple_wifi *w)
+ 	lck_mtx_unlock(s->lock);
+ }
+ 
++int
++rottenapple_wifi_sta_join(const uint8_t *ssid, uint8_t ssid_len, const uint8_t *pmk)
++{
++	if (!sta_ready || ssid_len == 0 || ssid_len > 32) {
++		return EINVAL;
++	}
++	return sta_join_ex(&sta, ssid, ssid_len, pmk);
++}
++
++int
++rottenapple_wifi_sta_rejoin_last(void)
++{
++	uint8_t ssid[32], ssid_len, pmk[PMK_LEN];
++	bool have_pmk;
++	int err;
++
++	if (!sta_ready) {
++		return ENXIO;
++	}
++	lck_mtx_lock(sta.lock);
++	ssid_len = sta.reconnect_ssid_len;
++	memcpy(ssid, sta.reconnect_ssid, sizeof(ssid));
++	memcpy(pmk, sta.reconnect_pmk, PMK_LEN);
++	have_pmk = sta.reconnect_have_pmk;
++	lck_mtx_unlock(sta.lock);
++	if (ssid_len == 0) {
++		return ENOENT;
++	}
++	TLOG("rejoining the last network");
++	err = sta_join_ex(&sta, ssid, ssid_len, have_pmk ? pmk : NULL);
++	bzero(pmk, sizeof(pmk));
++	return err;
++}
++
++void
++rottenapple_wifi_sta_disconnect(void)
++{
++	if (!sta_ready) {
++		return;
++	}
++	lck_mtx_lock(sta.lock);
++	sta.want_reconnect = false;
++	bzero(sta.reconnect_pmk, PMK_LEN);
++	sta.reconnect_have_pmk = false;
++	sta_teardown_locked(&sta, true);
++	lck_mtx_unlock(sta.lock);
++}
++
+ void
+ rottenapple_wifi_sta_link_info(struct rottenapple_wifi_link_info *li)
+ {
+@@ -1068,14 +1131,11 @@ sysctl_wifi_join SYSCTL_HANDLER_ARGS
+ 	slen = strnlen(ssid, 32);
+ 	if (slen == 0) {
+ 		/* empty write = disconnect */
+-		lck_mtx_lock(sta.lock);
+-		sta.want_reconnect = false;
+-		sta_teardown_locked(&sta, true);
+-		lck_mtx_unlock(sta.lock);
++		rottenapple_wifi_sta_disconnect();
+ 		TLOG("disconnected (empty join)");
+ 		return 0;
+ 	}
+-	return sta_join(&sta, (const uint8_t *)ssid, (uint8_t)slen);
++	return sta_join_ex(&sta, (const uint8_t *)ssid, (uint8_t)slen, NULL);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, rottenapple_wifi_join, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
+     sysctl_wifi_join, "A", "rotten-apple Wi-Fi: write an SSID to join (empty to disconnect)");

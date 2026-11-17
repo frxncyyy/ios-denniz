@@ -1,0 +1,252 @@
+--- a/shim/nord2-xnu/wifi_ios_client.cpp
++++ b/shim/nord2-xnu/wifi_ios_client.cpp
+@@ -108,7 +108,7 @@
+  uint64_t generation,scanGeneration,pendingTicket,pendingEpoch;unsigned pendingBss,unsupportedLogs,pipeLogs,scanLogs,queueLogs,completionLogs,eventLogs,resultLogs,outputLogs;
+  struct {uint32_t request,operation,count;} controlTrace[40];
+  char interfaceName[16];struct nils_state cacheLife;struct nils_ticket cacheTicket;
+- struct njs_snapshot *station;uint64_t joinTicket,joinEpoch,powerEpoch,pendingPowerEpoch;unsigned joinLogs;
++ struct njs_snapshot *station;uint64_t joinTicket,joinEpoch,retiringJoinTicket,retiringJoinEpoch,powerEpoch,pendingPowerEpoch;unsigned joinLogs;
+  struct niwa_history *history;struct niwa_snapshot *snapshot;uint32_t producer;IOReturn lastScanError;
+  static void completed(void*,uint64_t,uint64_t,enum nss_status);
+  static void joinCompleted(void*,uint64_t,uint64_t,enum njs_notice);
+@@ -137,7 +137,7 @@
+ };
+ OSDefineMetaClassAndStructors(NiwlLifecycleClient,IOUserClient)
+ bool NiwlLifecycleClient::initWithTask(task_t task,void *security,UInt32 type,OSDictionary *props){
+- station=nullptr;joinTicket=joinEpoch=powerEpoch=pendingPowerEpoch=0;joinLogs=0;pipeLogs=scanLogs=queueLogs=completionLogs=eventLogs=resultLogs=outputLogs=unsupportedLogs=0;bzero(controlTrace,sizeof controlTrace);history=nullptr;snapshot=nullptr;pendingTicket=0;pendingEpoch=0;pendingBss=0;scanGeneration=0;producer=0;lastScanError=kIOReturnNotReady;bzero(&cacheLife,sizeof cacheLife);bzero(interfaceName,sizeof interfaceName);
++ station=nullptr;joinTicket=joinEpoch=retiringJoinTicket=retiringJoinEpoch=powerEpoch=pendingPowerEpoch=0;joinLogs=0;pipeLogs=scanLogs=queueLogs=completionLogs=eventLogs=resultLogs=outputLogs=unsupportedLogs=0;bzero(controlTrace,sizeof controlTrace);history=nullptr;snapshot=nullptr;pendingTicket=0;pendingEpoch=0;pendingBss=0;scanGeneration=0;producer=0;lastScanError=kIOReturnNotReady;bzero(&cacheLife,sizeof cacheLife);bzero(interfaceName,sizeof interfaceName);
+  timingClient=0;timingCalls=timingRequest=timingNormal=timingSlow=0;
+  owner=TASK_NULL;gate=nullptr;phase=Closed;data=state=nullptr;ownsReference=false;generation=0;bzero(reference,sizeof reference);
+  if(!task||current_task()!=task||type)return false;
+@@ -165,7 +165,7 @@
+  if(data){data->release();data=nullptr;}if(state){state->release();state=nullptr;}
+ }
+ void NiwlLifecycleClient::closeOwned(void){
+- if(!gate)return;IOLockLock(gate);phase=Closed;if(generation!=UINT64_MAX)generation++;uint64_t ticket=pendingTicket,jt=joinTicket;discardLocked();IOLockUnlock(gate);if(ticket)nord2_wifi_scan_cancel(ticket);if(jt)nord2_wifi_join_cancel(jt);
++ if(!gate)return;IOLockLock(gate);phase=Closed;if(generation!=UINT64_MAX)generation++;uint64_t ticket=pendingTicket,jt=joinTicket,oldjt=retiringJoinTicket;discardLocked();IOLockUnlock(gate);if(ticket)nord2_wifi_scan_cancel(ticket);if(jt)nord2_wifi_join_cancel(jt);if(oldjt)nord2_wifi_join_cancel(oldjt);
+ }
+ bool NiwlLifecycleClient::traceControl(uint32_t request,uint32_t operation){
+  for(unsigned i=0;i<40;i++)if(controlTrace[i].count&&controlTrace[i].request==request&&controlTrace[i].operation==operation){if(controlTrace[i].count<8){controlTrace[i].count++;return true;}return false;}
+@@ -203,7 +203,9 @@
+     /* Selected DisassociateExt supplies8 bytes: opaque firstword and
+      * signed32 DISASSOC_REASON at+4. Basic Disassociate supplies0. */
+     else if(extent!=0&&extent!=8)result=kIOReturnUnsupported;
+-    else{int x=nord2_wifi_join_disconnect();result=!x?kIOReturnSuccess:x==2?kNiwScanBusy:kIOReturnNotReady;}
++    else{int x=nord2_wifi_join_disconnect();result=!x?kIOReturnSuccess:x==2?kNiwScanBusy:kIOReturnNotReady;
++     if(!x&&joinTicket&&!retiringJoinTicket){retiringJoinTicket=joinTicket;retiringJoinEpoch=joinEpoch;joinTicket=joinEpoch=0;}
++    }
+     if(traceControl(unsupportedSet,0x802869c8)){
+      if(unsupportedSet==22&&(extent==0||extent==8))printf("NORD2 WIFI IOS DISASSOC: bytes=%u reason=%d status=%#x\n",extent,extent==8?(int32_t)niw_u32((const uint8_t*)carrier+12):0,(unsigned)result);
+      printf("NORD2 WIFI IOS JOINCONTROL: request=%u bytes=%u status=%#x t_ms=%llu\n",unsupportedSet,extent,(unsigned)result,niw_ms());
+@@ -284,7 +286,7 @@
+  /* XNU passes an owned wake-port send reference on async calls. Balance every
+   * rejected/replayed call too, not only the accepted stored registration. */
+  OSAsyncReference64 incoming={0};bool incomingRight=a&&a->asyncReference&&a->asyncReferenceCount;
+- if(incomingRight)incoming[0]=a->asyncReference[0];bool adopted=false;uint64_t cancel=0,cancelJoin=0;IOReturn result=kIOReturnNotReady;
++ if(incomingRight)incoming[0]=a->asyncReference[0];bool adopted=false;uint64_t cancel=0,cancelJoin=0,cancelOldJoin=0;IOReturn result=kIOReturnNotReady;
+  /* Capture only monotonic time before locking. No request/user buffer is
+   * inspected here; timingRequest is assigned by existing bounded decode. */
+  uint64_t timing_client=timingClient,entered=0,locked=0,done=0,wait_ms=0,work_ms=0;
+@@ -292,7 +294,7 @@
+  if(gate){
+   if(timing_call)entered=niw_ms();
+   IOLockLock(gate);if(timing_call)locked=niw_ms();timingRequest=0;
+-  if(selector==4){cancel=pendingTicket;cancelJoin=joinTicket;}
++  if(selector==4){cancel=pendingTicket;cancelJoin=joinTicket;cancelOldJoin=retiringJoinTicket;}
+   result=(d||t||r)?kIOReturnBadArgument:outputLocked(selector,a,&adopted);
+   if(timing_call){
+    done=niw_ms();request=timingRequest;clock_ok=entered<=locked&&locked<=done;
+@@ -314,6 +316,7 @@
+  }
+  if(cancel&&result==kIOReturnSuccess)nord2_wifi_scan_cancel(cancel);
+  if(cancelJoin&&result==kIOReturnSuccess)nord2_wifi_join_cancel(cancelJoin);
++ if(cancelOldJoin&&result==kIOReturnSuccess)nord2_wifi_join_cancel(cancelOldJoin);
+  if(incomingRight&&!adopted)IOUserClient::releaseAsyncReference64(incoming);return result;
+ }
+ IOReturn NiwlLifecycleClient::clientMemoryForType(UInt32 type,IOOptionBits*options,IOMemoryDescriptor**memory){
+@@ -481,8 +484,9 @@
+ void NiwlLifecycleClient::joinCompleted(void*cookie,uint64_t epoch,uint64_t ticket,enum njs_notice notice){
+  NiwlLifecycleClient*c=(NiwlLifecycleClient*)cookie;bool retire=false;
+  IOLockLock(c->gate);
+- bool owned=c->joinTicket==ticket&&c->joinEpoch==epoch;
+- bool current=owned&&c->phase==Armed&&c->generation==epoch;
++ bool oldOwned=c->retiringJoinTicket==ticket&&c->retiringJoinEpoch==epoch;
++ bool owned=(c->joinTicket==ticket&&c->joinEpoch==epoch)||oldOwned;
++ bool current=owned&&(!oldOwned||!c->joinTicket)&&c->phase==Armed&&c->generation==epoch;
+  if(current&&notice!=NJS_RETIRED&&!nord2_wifi_join_copy_state(c->station)&&c->station->ticket==ticket&&c->station->client_epoch==epoch){
+   if(notice==NJS_JOINED&&niwj_authorized(c->station)){
+    /* Prioritize terminal completion if the consumer has little ring room.
+@@ -494,8 +498,9 @@
+    c->stationEventLocked(2);c->stationEventLocked(3);c->stationEventLocked(4);
+   }
+  }
+- if(c->joinLogs++<64)printf("NORD2 WIFI IOS JOINNOTICE: notice=%u current=%u phase=%u result=%u authorized=%u generation=%llu ticket=%llu epoch=%llu t_ms=%llu\n",(unsigned)notice,(unsigned)current,c->station->phase,c->station->result,(unsigned)niwj_authorized(c->station),(unsigned long long)c->station->native_generation,(unsigned long long)ticket,(unsigned long long)epoch,niw_ms());
+- if(owned&&notice==NJS_RETIRED){c->joinTicket=0;c->joinEpoch=0;retire=true;}
++ bool coherent=c->station->ticket==ticket&&c->station->client_epoch==epoch;
++ if(c->joinLogs++<64)printf("NORD2 WIFI IOS JOINNOTICE: notice=%u current=%u phase=%u result=%u authorized=%u generation=%llu ticket=%llu epoch=%llu t_ms=%llu\n",(unsigned)notice,(unsigned)current,coherent?c->station->phase:0,coherent?c->station->result:0,(unsigned)(current&&coherent&&niwj_authorized(c->station)),(unsigned long long)(coherent?c->station->native_generation:0),(unsigned long long)ticket,(unsigned long long)epoch,niw_ms());
++ if(owned&&notice==NJS_RETIRED){if(oldOwned)c->retiringJoinTicket=c->retiringJoinEpoch=0;else c->joinTicket=c->joinEpoch=0;retire=true;}
+  IOLockUnlock(c->gate);if(retire)c->release();
+ }
+ bool NiwlLifecycleClient::stationEventLocked(unsigned event){
+--- a/shim/nord2-xnu/wifi_live_control_bind.inc
++++ b/shim/nord2-xnu/wifi_live_control_bind.inc
+@@ -6,7 +6,7 @@
+ static struct {unsigned mode,windows,pending,peer_attempts;
+  uintptr_t peer_selector,peer_entry;} nwl_native;
+ static unsigned nwl_join_ready_locked(void){
+- return !!(nss_native.powered&&njs_native.notice_lock&&!nss_native.failed&&
++ return !!(!njs_handover.state&&nss_native.powered&&njs_native.notice_lock&&!nss_native.failed&&
+   !njs_native.active&&!njs_native.queued&&!njs_native.retiring&&!njs_native.completion&&
+   njs_native.serial<255&&(!njs_native.used||njs_rejoin_ready_locked()));
+ }
+--- a/shim/nord2-xnu/wifi_station_service.h
++++ b/shim/nord2-xnu/wifi_station_service.h
+@@ -21,6 +21,10 @@
+ typedef void (*njs_completion)(void*,uint64_t client_epoch,uint64_t ticket,enum njs_notice);
+ /* 0 accepted,1 unavailable,2 busy,-1 invalid; rejection must be atomic.
+  * Native immediately copies the complete secret input and owns/wipes its copy.
++ * One next request may queue after explicit disconnect; old native ownership
++ * and callbacks retire plus a real fresh scan precede its prepare. The new
++ * ticket waits at most30s, then receives a fresh8s connection budget. Explicit
++ * cancel/OFF wipes its request under lock; callback scalars live until RETIRED.
+  * No inline completion. Cookie retained by IOUC until final RETIRED notice,
+  * exactly once, even on canceled/closed delivery. Callbacks outside native queue
+  * lock, actual retained worker only; no radio calls from callback/client thread.
+--- a/shim/nord2-xnu/wifi_station_service_bind.inc
++++ b/shim/nord2-xnu/wifi_station_service_bind.inc
+@@ -24,6 +24,7 @@
+ #define NJS_LIVE_CONFIGURE() ((void)0)
+ #endif
+ #define NJS_JOIN_BUDGET_US UINT64_C(8000000)
++#define NJS_HANDOVER_BUDGET_US UINT64_C(30000000)
+ #define NJS_TX_SLOTS 8u
+ #define NJS_CACHE_SLOTS 4u
+ #define NJS_RX_SLOTS 16u
+@@ -45,6 +46,11 @@
+  uint8_t tx[NJS_TX_SLOTS][NWIL_ETHERNET_MAX];unsigned tx_bytes[NJS_TX_SLOTS];
+  uint8_t rx[NJS_RX_SLOTS][NWIL_ETHERNET_MAX];unsigned rx_bytes[NJS_RX_SLOTS];
+ } njs_native;
++/* One copied next attempt; old callback/firmware ownership stays intact until
++ * retirement plus the existing real all-queue/fresh-scan barrier. */
++static struct {unsigned state,canceled;uint64_t admitted,deadline,ticket,epoch;
++ void*cookie;njs_completion completion;struct niwj_request request;struct njs_snapshot snapshot;}njs_handover;
++
+ /* At most112 samples (five short state parts each), never packet/secret
+  * bytes. State rows only on phase/action/outcome/error/readiness transitions. */
+ static void njs_trace_locked(unsigned force){
+@@ -62,7 +68,7 @@
+  printf("NORD2 WIFI IOS STATIONPART: sample=%u part=5 rx_delivered=%u rx_raw=%u rx_raw_eapol=%u rx_raw_drop=%u t_ms=%llu security=%u rx_raw_data=%u\n",njs_native.logs,njs_native.rx_delivered,n->rx_untranslated,n->rx_untranslated_eapol,n->rx_untranslated_drop,(unsigned long long)njs_native.driver.now_ms,njs_native.snapshot.security,n->rx_untranslated_data);
+ }
+ static void njs_link_error(unsigned up,int error){IOLockLock(nss_native.lock);unsigned log=njs_native.logs<112;if(log)njs_native.logs++;IOLockUnlock(nss_native.lock);if(log)printf("NORD2 WIFI IOS LINK: generation=%llu up=%u error=%d\n",(unsigned long long)njs_native.native_generation,up,error);}
+-static int njs_pending_locked(void){return njs_native.queued||njs_native.active;}
++static int njs_pending_locked(void){return njs_native.queued||njs_native.active||njs_handover.state;}
+ static int njs_associated_scan_ready_locked(void){return njs_native.active&&njs_native.linked&&!njs_native.queued&&!njs_native.leave&&!njs_native.canceled&&nwo_authorized(&njs_native.driver.owner)&&nst_native.state.controlled_port&&!nst_native.state.cleanup_started;}
+ static int njs_scan_blocked_locked(void){return !nss_native.powered||njs_native.queued||(njs_native.active&&!njs_associated_scan_ready_locked())||(njs_native.used&&!njs_native.active&&!njs_native.scan_returned);}
+ static void njs_cache_scan_locked(const struct nsb_scan*s){
+@@ -82,24 +88,40 @@
+  return q&&q->ssid_length&&q->ssid_length<=32&&q->has_target<=1&&q->association_reason<=2&&((q->security==NIWJ_WPA2_PSK_CCMP&&(q->native_flags==0||q->native_flags==4)&&!memcmp(q->station_rsn,rsn,22))||
+  (q->security==NIWJ_OPEN&&!q->native_flags&&!memcmp(q->station_rsn,(const uint8_t[22]){0},22)&&!memcmp(q->pmk,(const uint8_t[32]){0},32)))&&(!q->has_target||(!(q->target[0]&1)&&(q->target[0]|q->target[1]|q->target[2]|q->target[3]|q->target[4]|q->target[5])));
+ }
++static void njs_accept_locked(const struct niwj_request*q,void*cookie,uint64_t epoch,njs_completion completion,uint64_t next_ticket,uint64_t now_us){
++ njs_native.admitted_us=now_us;njs_native.deadline_us=(now_us/1000+8000)*1000;
++ njs_native.cookie_retired=0;njs_native.request=*q;njs_native.ticket=next_ticket;njs_native.native_generation=njs_native.ticket;
++ if(njs_native.used)nsr_native.admitted_generation=njs_native.native_generation;
++ njs_native.epoch=epoch;njs_native.cookie=cookie;njs_native.completion=completion;njs_native.queued=1;njs_native.canceled=njs_native.leave=njs_native.detach=njs_native.terminal=njs_native.joined=njs_native.retiring=0;
++ njs_native.snapshot=(struct njs_snapshot){.native_generation=njs_native.native_generation,.client_epoch=epoch,.ticket=njs_native.ticket,.phase=NJS_QUEUED,.security=q->security};
++
++}
+ int nord2_wifi_join_enqueue(const struct niwj_request*q,void*cookie,uint64_t epoch,njs_completion completion,uint64_t*ticket){
+  if(!njs_request_ok(q)||!cookie||!epoch||!completion||!ticket)return -1;
+  if(!nss_available())return 1;uint64_t now_us=njs_uptime_us();if(now_us>UINT64_MAX-NJS_JOIN_BUDGET_US)return 1;IOLockLock(nss_native.lock);
+- if(!nss_native.powered||!njs_native.notice_lock||nss_native.failed||(njs_native.used&&!njs_rejoin_ready_locked())||njs_native.serial>=255){IOLockUnlock(nss_native.lock);return 1;}
++ if(!nss_native.powered||!njs_native.notice_lock||nss_native.failed||nst_native.state.halt||nst_native.state.error||nsr_native.bad||njs_native.serial>=255){IOLockUnlock(nss_native.lock);return 1;}
++ if(njs_handover.state){IOLockUnlock(nss_native.lock);return 2;}
++ if(njs_native.used&&!njs_rejoin_ready_locked()){
++  /* Only an explicit old leave or completed teardown awaiting its real scan
++   * permits handover. Never replace a healthy link or overwrite an attempt. */
++  if(!njs_native.leave&&!(njs_native.scan_returned&&!njs_native.active&&!njs_native.queued)){IOLockUnlock(nss_native.lock);return 1;}
++  if(now_us>UINT64_MAX-NJS_HANDOVER_BUDGET_US){IOLockUnlock(nss_native.lock);return 1;}
++  njs_handover.state=1;njs_handover.admitted=now_us;njs_handover.deadline=now_us+NJS_HANDOVER_BUDGET_US;
++  njs_handover.ticket=++njs_native.serial;njs_handover.epoch=epoch;njs_handover.cookie=cookie;njs_handover.completion=completion;njs_handover.request=*q;
++  njs_handover.snapshot=(struct njs_snapshot){.native_generation=njs_handover.ticket,.client_epoch=epoch,.ticket=njs_handover.ticket,.phase=NJS_QUEUED,.security=q->security};
++  *ticket=njs_handover.ticket;IOLockUnlock(nss_native.lock);thread_wakeup((event_t)&nss_native);return 0;
++ }
+  unsigned busy=njs_native.active||njs_native.queued||njs_native.retiring||njs_native.completion;
+  if(busy){IOLockUnlock(nss_native.lock);return 2;}
+- njs_native.admitted_us=now_us;njs_native.deadline_us=(now_us/1000+8000)*1000;
+- njs_native.cookie_retired=0;njs_native.request=*q;njs_native.ticket=++njs_native.serial;njs_native.native_generation=njs_native.ticket;
+- if(njs_native.used)nsr_native.admitted_generation=njs_native.native_generation;
+- njs_native.epoch=epoch;njs_native.cookie=cookie;njs_native.completion=completion;njs_native.queued=1;njs_native.canceled=njs_native.leave=njs_native.detach=njs_native.terminal=njs_native.joined=njs_native.retiring=0;
+- njs_native.snapshot=(struct njs_snapshot){.native_generation=njs_native.native_generation,.client_epoch=epoch,.ticket=njs_native.ticket,.phase=NJS_QUEUED,.security=q->security};
++ njs_accept_locked(q,cookie,epoch,completion,++njs_native.serial,now_us);
+  *ticket=njs_native.ticket;IOLockUnlock(nss_native.lock);thread_wakeup((event_t)&nss_native);return 0;
+ }
+-int nord2_wifi_join_cancel(uint64_t ticket){if(!ticket||!nss_available())return 1;IOLockLock(nss_native.lock);int r=1;if(ticket==njs_native.ticket&&(njs_native.queued||njs_native.active)){if(njs_native.linked&&njs_native.snapshot.phase==NJS_AUTHORIZED)njs_native.detach=1;else njs_native.canceled=1;r=0;}IOLockUnlock(nss_native.lock);if(!r)thread_wakeup((event_t)&nss_native);return r;}
++
++int nord2_wifi_join_cancel(uint64_t ticket){if(!ticket||!nss_available())return 1;IOLockLock(nss_native.lock);int r=1;if(njs_handover.state==1&&ticket==njs_handover.ticket){njs_handover.canceled=1;niwj_clear(&njs_handover.request,sizeof njs_handover.request);r=0;}else if(ticket==njs_native.ticket&&(njs_native.queued||njs_native.active)){if(njs_native.linked&&njs_native.snapshot.phase==NJS_AUTHORIZED)njs_native.detach=1;else njs_native.canceled=1;r=0;}IOLockUnlock(nss_native.lock);if(!r)thread_wakeup((event_t)&nss_native);return r;}
+ static void njs_drop_tx_locked(void);
+ static int njs_disconnect_notice_locked(void){
+  IOLockLock(nss_native.lock);
+- int r=1;unsigned changed=0;uint64_t generation=0;
++ int r=1;unsigned changed=0,wake=0;uint64_t generation=0;if(njs_handover.state==1){njs_handover.canceled=1;niwj_clear(&njs_handover.request,sizeof njs_handover.request);wake=1;r=0;}
+  if(njs_native.queued||njs_native.active){changed=1;njs_native.leave=1;generation=njs_native.native_generation;
+   if(njs_native.active)nst_close_port(&nst_native.state);
+   njs_drop_tx_locked();njs_native.linked=njs_native.tx_admit=0;njs_native.snapshot.associated=njs_native.snapshot.ptk_ready=njs_native.snapshot.gtk_ready=njs_native.snapshot.data_ready=0;njs_native.snapshot.phase=NJS_LEAVING;r=0;}
+@@ -109,7 +131,7 @@
+  else if(!nss_native.failed&&njs_native.snapshot.phase==NJS_IDLE&&!njs_native.used&&!nst_native.attempted&&!nst_native.active&&!njs_native.retiring&&!njs_native.completion&&!njs_native.cookie&&!njs_native.linked&&!njs_native.tx_admit)r=0;
+  IOLockUnlock(nss_native.lock);
+  if(changed&&nord2_wifi_ifnet_link(generation,0))r=-1;
+- if(changed)thread_wakeup((event_t)&nss_native);return r;
++ if(changed||wake)thread_wakeup((event_t)&nss_native);return r;
+ }
+ int nord2_wifi_join_disconnect(void){
+  if(!nss_available()||!njs_native.notice_lock)return 1;
+@@ -159,7 +181,7 @@
+   {NIWC_CCMP,NIWC_END_TO_END},{NIWC_RSN_IE,NIWC_END_TO_END}}};
+  *out=installed;IOLockUnlock(nss_native.lock);return 0;
+ }
+-int nord2_wifi_join_copy_state(struct njs_snapshot*out){if(!out)return -1;if(!nss_available())return 1;IOLockLock(nss_native.lock);*out=njs_native.snapshot;IOLockUnlock(nss_native.lock);return 0;}
++int nord2_wifi_join_copy_state(struct njs_snapshot*out){if(!out)return -1;if(!nss_available())return 1;IOLockLock(nss_native.lock);*out=njs_handover.state?njs_handover.snapshot:njs_native.snapshot;IOLockUnlock(nss_native.lock);return 0;}
+ int nord2_wifi_link_send(const uint8_t*p,size_t n,uint64_t generation){
+  if(!p||n<14||n>NWIL_ETHERNET_MAX||!generation||(p[12]==0x88&&p[13]==0x8e))return NWIL_SEND_INVALID;
+  if(!nss_available())return NWIL_SEND_NOT_READY;IOLockLock(nss_native.lock);
+@@ -247,7 +269,7 @@
+  IOLockLock(nss_native.lock);njs_trace_locked(1);IOLockUnlock(nss_native.lock);return 1;
+ }
+ static int njs_fatal_owner(void){
+- IOLockLock(njs_native.notice_lock);IOLockLock(nss_native.lock);nst_close_port(&nst_native.state);njs_native.linked=njs_native.tx_admit=0;njs_drop_tx_locked();
++ IOLockLock(njs_native.notice_lock);IOLockLock(nss_native.lock);if(njs_handover.state){njs_handover.canceled=1;niwj_clear(&njs_handover.request,sizeof njs_handover.request);}nst_close_port(&nst_native.state);njs_native.linked=njs_native.tx_admit=0;njs_drop_tx_locked();
+  nwp_cancel(&njs_native.driver.owner.transaction.wpa);niwj_clear(&njs_native.driver.owner.transaction.action,sizeof njs_native.driver.owner.transaction.action);niwj_clear(njs_native.driver.owner.transaction.queued_eapol,sizeof njs_native.driver.owner.transaction.queued_eapol);niwj_clear(&njs_native.request,sizeof njs_native.request);
+  njs_trace_locked(1);
+ #ifndef NJS_HOST_TEST
+@@ -259,11 +281,29 @@
+ }
+ /* Returns1 when the actual NSS worker remains occupied by connection;0 idle;
+  * -1 uncertain native DMA/lease failure requiring inherited retained drain. */
++/* Worker only; callback delivery never borrows either native lock. */
++static int njs_handover_work(void){
++ IOLockLock(nss_native.lock);if(njs_handover.state!=1){IOLockUnlock(nss_native.lock);return 0;}
++ uint64_t now=njs_uptime_us();unsigned failed=njs_handover.canceled||!nss_native.powered||nss_native.failed||nst_native.state.halt||nst_native.state.error||nsr_native.bad||now<njs_handover.admitted||now>=njs_handover.deadline||now>UINT64_MAX-NJS_JOIN_BUDGET_US;
++ if(failed){
++  njs_handover.state=2;njs_handover.snapshot.phase=NJS_FAILED;njs_handover.snapshot.result=!njs_handover.canceled&&nss_native.powered&&now>=njs_handover.deadline?9:2;
++  niwj_clear(&njs_handover.request,sizeof njs_handover.request);
++  njs_completion fn=njs_handover.completion;void*cookie=njs_handover.cookie;uint64_t epoch=njs_handover.epoch,ticket=njs_handover.ticket;
++  IOLockUnlock(nss_native.lock);fn(cookie,epoch,ticket,NJS_JOIN_FAILED);fn(cookie,epoch,ticket,NJS_RETIRED);
++  IOLockLock(nss_native.lock);niwj_clear(&njs_handover,sizeof njs_handover);IOLockUnlock(nss_native.lock);return 1;
++ }
++ if(!njs_native.active&&!njs_native.queued&&!njs_native.retiring&&!njs_native.completion&&njs_rejoin_ready_locked()){
++  njs_accept_locked(&njs_handover.request,njs_handover.cookie,njs_handover.epoch,njs_handover.completion,njs_handover.ticket,now);
++  niwj_clear(&njs_handover,sizeof njs_handover);
++ }
++ IOLockUnlock(nss_native.lock);return 0;
++}
+ static int njs_owner_work(void){
++ if(njs_handover_work())return 1;
+  IOLockLock(nss_native.lock);unsigned queued=njs_native.queued,active=njs_native.active,scans=0,canceled=njs_native.canceled||njs_native.leave;
+  if(queued&&!active)for(unsigned k=0;k<NSS_SLOTS;k++)if(nss_native.slot[k].state==NSS_QUEUED||nss_native.slot[k].state==NSS_RUNNING)scans=1;
+  uint64_t admitted=njs_native.admitted_us,deadline=njs_native.deadline_us;IOLockUnlock(nss_native.lock);
+- if(!queued&&!active){njs_rejoin_refresh();return 0;}
++ if(!queued&&!active){njs_rejoin_refresh();if(njs_handover.state){uint64_t pause;clock_interval_to_deadline(1000,NSEC_PER_USEC,&pause);IOLockLock(nss_native.lock);assert_wait_deadline((event_t)&nss_native,THREAD_UNINT,pause);IOLockUnlock(nss_native.lock);thread_block(THREAD_CONTINUE_NULL);}return 0;}
+  if(queued){uint64_t observed=njs_uptime_us();if(canceled||observed<admitted||observed>=deadline){njs_early_finish(!canceled&&observed>=deadline?9:2);return 1;}
+   if(scans)return 0; /* Drain only scans admitted before this first join. */
+  }

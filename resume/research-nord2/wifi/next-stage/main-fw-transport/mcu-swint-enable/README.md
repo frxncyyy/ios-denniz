@@ -1,0 +1,15 @@
+Private measured DMA1 software-interrupt-enable lifecycle correction.
+
+Hardware ownerdiag capture identifies reason5/source2 at0x18025204: raw0x20000000. This is HOST_INT_ENA.mcu2host_sw_int_ena bit29 (SOC3 CODA wf_wfdma_host_dma1.h2270–2283), not HOST_INT_STA29, not coherent20/21, and not evidence of pending SER. The previous DMASTATUS valid0 cannot prove a current pending bit clear. Actual third ACK/FW_READY remain unobserved.
+
+Selected SOC3 source configures enable29 (soc3_0.c438–471); it maps processSoftwareInterrupt to asicConnac2xProcessSoftwareInterrupt (1007). That handler reads MCU2HOST_SW_INT_STA atDMA1+0x1f0 and acknowledges/recovery-handles it (cmm_asic_connac2x.c1049–1092; connac_reg.h218–238 ERROR_DETECT_MASK). Enable alone is not an event. This native polling derivative deliberately keeps GIC407/410 masked; it does not implement that handler or SER. It therefore must not silently ignore pending29.
+
+Only after actual CID41 publication may native owner tolerate DMA1 enable29: stageRETAINED, retained finish_tx CID41/typea0, and either finish_phase1/completed2/submit_attempted1 (no requirement that TX descriptor already observed) or finish_phase2/completed3 (post-ACK through FW_READY). This is a bounded milestone policy; capability completed4/future normal command lifecycle needs separate review. Earlier phase, CID40, no submission, partial event history, other enabled bits, DMA0 enables and GIC policy remain refused.
+
+The same existing DMA1 HOST_INT_STA read now fails reason23/source2 on pending bit29, capturing exact address/raw/mask/expected in existing GUARD fields. No subordinate read, W1C, reset, retry, automatic recovery or extra MMIO. All existing physical guard read order/masks remain except the precisely gated ENA29 exemption and the new pending-summary fail-stop. First guard/error and30s drain preserved. Two captured enable words and validity append to native state for success evidence; nwt/nwi ABI unchanged.
+
+New captured-only row:
+NORD2 WIFI MAIN SWIRQ: ena=%#x/%#x ena_valid=%#x status=%#x status_valid=%#x
+Status raw is meaningful only with status_valid bit1. No claim pending summary was previously clear.
+
+Tests: actual adapter/coordinator ASan/UBSan failfast PASS. Existing18 firstguard/error/readcount tests retained; late enable exactshape admission; allotherenables refusal; pending29 stops regardless unused subordinate register0/nonzero; no subordinate access; postACK pending stillstops; noMMIO afterhalt; early/no-submit/wrongCID/partialhistory refusals. Actual CID40→PHY→CID41 fixture injectsENA29 at hardware publication before descriptor observation and reaches matching ACK in synthetic model. Normal hardware ACK not fabricated. No active/CI/device operations or exact production ARM64 compile claim; parent compiles actual generated sources.

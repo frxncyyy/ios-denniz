@@ -1,0 +1,9 @@
+# Private preflight revision: observed unprogrammed count512
+
+The accepted e0d3a50f boot captured stable disabled globals `0x1010b870/0x1810b870` and all27 affected rings as base0/count0x200/CIDX0/DIDX0. The old all-zero count demand caused a clean refusal before region18 SET or pool access. `hardware-profile.txt` preserves only the captured DMA lines from the growing log; it is a filtered observation, not a device operation.
+
+Selected CODA documents CTRL1 bits11:0 as maximum descriptor count and bits19:16 as base extension. Examples: `gen4m/include/chips/coda/soc3_0/wf_wfdma_host_dma1.h:5765–5782` (TX17), `5924–5941` (RX0). It does not specify the reset value512. Source `hal_pdma.c:2140–2240,2256–2304` writes base/count/index before use; `soc3_0.c:474–555` disables engines and resets indices before ring programming. This supports distinguishing an unprogrammed pointer from the count field. We do not claim the observed count is a documented reset default.
+
+The narrow revised policy permits count0 or the observed count512. It still requires base0, base extension0, CIDX0, DIDX0 on every affected ring, with both global enable/busy masks0 and stable. Any other count, any programmed base/extension/index, active engine or changing global state refuses. Reserved fields remain captured and ignored. The API, 112-read bound, 27 ring addresses and raw schema remain unchanged. No writes, reset or DMA enable exist in this helper.
+
+Tests preserve the 224 callback fault checks and add the complete512-count profile plus independent rejection mutations for base, extension, producer index, consumer index and count513. ASan/UBSan and freestanding ARM64 compile pass. This package is private and requires independent review before promotion. Frozen original preflight and reviewed transport v2 remain unchanged; future native initialization must link this revised implementation after review, rather than accidentally retaining the old count demand.

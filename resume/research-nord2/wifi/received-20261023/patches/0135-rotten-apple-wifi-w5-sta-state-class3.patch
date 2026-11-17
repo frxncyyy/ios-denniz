@@ -1,0 +1,295 @@
+--- a/bsd/dev/rottenapple_mtk_wlan.c
++++ b/bsd/dev/rottenapple_mtk_wlan.c
+@@ -80,6 +80,7 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ #define EVENT_ID_STATISTICS             0x03
+ #define EVENT_ID_ACCESS_REG             0x05
+ #define EVENT_ID_SLEEPY_INFO            0x07    /* unsolicited: the firmware may sleep (nicEventSleepyNotify) */
++#define EVENT_ID_ACTIVATE_STA_REC       0x0c    /* answer to UPDATE_STA_RECORD with ucNeedResp */
+ #define EVENT_ID_SCAN_DONE              0x0d
+ #define EVENT_ID_TX_DONE                0x0f
+ #define EVENT_ID_CH_PRIVILEGE           0x10
+@@ -951,6 +952,8 @@ static void ev_tx_done(struct rottenapple_wifi *w, const struct rottenapple_wifi
+ static void ev_ch_privilege(struct rottenapple_wifi *w, const struct rottenapple_wifi_event *ev, void *arg);
+ static void ev_beacon_timeout(struct rottenapple_wifi *w, const struct rottenapple_wifi_event *ev, void *arg);
+ static void ev_send_deauth(struct rottenapple_wifi *w, const struct rottenapple_wifi_event *ev, void *arg);
++static void ev_sta_rec(struct rottenapple_wifi *w, const struct rottenapple_wifi_event *ev, void *arg);
++static void wl_eapol_watch(struct mtk_wlan *l);
+ 
+ static void
+ wl_rx_frame(struct mtk_wlan *l, const uint8_t *p, uint32_t len, unsigned ring)
+@@ -1210,6 +1213,7 @@ wl_thread(void *arg, __unused wait_result_t wr)
+ 		}
+ 		wl_rx_events(l);
+ 		wl_rx_data(l);
++		wl_eapol_watch(l);
+ 		mtk_wfdma_irq_unmask(l->d);
+ 		if (l->wmt) {
+ 			mtk_wmt_poll(l->wmt);
+@@ -1305,6 +1309,7 @@ mtk_wlan_start(struct mtk_wlan *l)
+ 	(void)rottenapple_wifi_event_register(l->w, EVENT_ID_CH_PRIVILEGE, ev_ch_privilege, l);
+ 	(void)rottenapple_wifi_event_register(l->w, EVENT_ID_BSS_BEACON_TIMEOUT, ev_beacon_timeout, l);
+ 	(void)rottenapple_wifi_event_register(l->w, EVENT_ID_SEND_DEAUTH, ev_send_deauth, l);
++	(void)rottenapple_wifi_event_register(l->w, EVENT_ID_ACTIVATE_STA_REC, ev_sta_rec, l);
+ 	/* W3 open question: the one coredump page written at firmware start (see mtk_connsys_coredump_info) */
+ 	mtk_connsys_coredump_info(l->d->emi, l->d->emi_size);
+ 
+@@ -1469,6 +1474,25 @@ lowest_rate_code(uint8_t band)
+ 	return band == 2 ? 0x004b /* OFDM 6M */ : 0x0000 /* CCK 1M long */;
+ }
+ 
++/*
++ * Fixed rate in the TXD. DW6 is {u16 u2AntID (bandwidth [2:0], dynamic BW
++ * bit 3, antenna index [15:4]), u16 u2FixedRate (rate code [11:0], bit 15 =
++ * take the rate from a CR instead of the TXD)}: the rate code goes in the
++ * upper half (byte 26), FIXED_RATE_MODE (bit 15) stays 0 = "use this TXD
++ * rate", and ucPowerOffset bit 7 enables it (gen4m nic_tx.h DW6 fields,
++ * HAL_MAC_TX_DESC_SET_FR_RATE / _FIXED_RATE_MODE_TO_DESC). Patches up to
++ * 0134 wrote the rate into u2AntID (byte 24): harmless for CCK 1M (code 0,
++ * every 2.4 GHz frame so far) but the OFDM 6M code 0x4b would have asked for
++ * a 160 MHz dynamic-bandwidth transmission on antenna 4 on 5 GHz.
++ */
++static void
++txd_fixed_rate(uint8_t txd[32], uint16_t rate_code)
++{
++	txd[11] |= TXD_FIXED_RATE_EN;                           /* ucPowerOffset */
++	put16(txd + 24, 0);                                     /* u2AntID: BW 20, antenna 0 */
++	put16(txd + 26, (uint16_t)(rate_code & 0x0fff));        /* u2FixedRate, mode = TXD */
++}
++
+ /* Build the 32-byte TXD for a management (is_mgmt) or 802.3 data frame. */
+ static void
+ build_txd(struct mtk_wlan *l, uint8_t txd[32], bool is_mgmt, uint8_t subtype, uint8_t wlan_idx,
+@@ -1512,13 +1536,37 @@ build_txd(struct mtk_wlan *l, uint8_t txd[32], bool is_mgmt, uint8_t subtype, ui
+ 	}
+ 	/* DW6: fixed lowest rate for management reliability (data frames auto-rate) */
+ 	if (is_mgmt) {
+-		txd[11] |= TXD_FIXED_RATE_EN;                   /* ucPowerOffset */
+-		put16(txd + 24, lowest_rate_code(l->peer_band));
++		txd_fixed_rate(txd, lowest_rate_code(l->peer_band));
+ 	}
+ }
+ 
+ /* ---- Event handlers (receive thread) ---- */
+ 
++/*
++ * EVENT_TX_DONE ucStatus (gen4m ENUM_TX_RESULT_CODE). The firmware maps its
++ * internal TX results onto these in txmFreePkt's event builder; a frame it
++ * drops in txmSendHifPackets (inactive BSS, bad packet type, invalid STA
++ * record) is reported as 33.
++ */
++static const char *
++tx_status_name(uint8_t st)
++{
++	switch (st) {
++	case 0: return "acked";
++	case 1: return "lifetime timeout";
++	case 2: return "RTS error";
++	case 3: return "no ACK (MPDU error)";
++	case 4: return "aging timeout";
++	case 5: return "flushed";
++	case 6: return "BIP error";
++	case 7: return "unspecified error";
++	case 33: return "dropped in firmware";
++	case 34: return "queue clearance";
++	case 35: return "inactive BSS";
++	default: return "failed";
++	}
++}
++
+ static void
+ ev_tx_done(__unused struct rottenapple_wifi *w, const struct rottenapple_wifi_event *ev, void *arg)
+ {
+@@ -1528,18 +1576,70 @@ ev_tx_done(__unused struct rottenapple_wifi *w, const struct rottenapple_wifi_ev
+ 	if (ev->len < 6) {
+ 		return;
+ 	}
++	l->txdone_events++;
+ 	if (ev->body[1] != 0) {
+ 		l->tx_fails++;
+ 	}
+-	if (l->txdone_logs < 16) {
+-		l->txdone_logs++;
+-		LLOG("TX done: PID %u%s, status %u (%s), WLAN %u, %u attempt(s)", ev->body[0],
+-		    ev->body[0] == l->eapol_pid && l->eapol_pid ? " (EAPOL)" : "", ev->body[1],
+-		    ev->body[1] == 0 ? "acked" : ev->body[1] == 1 ? "lifetime timeout" : ev->body[1] == 3 ? "no ACK (MPDU error)" :
+-		    "failed", ev->body[4], ev->body[5]);
++	bool eapol = l->eapol_pid != 0 && ev->body[0] == l->eapol_pid;
++	if (eapol) {
++		l->eapol_pending = false;
++	}
++	/* EAPOL completions are always logged; the rest for the first 16 per join */
++	if (eapol || l->txdone_logs < 16) {
++		if (!eapol) {
++			l->txdone_logs++;
++		}
++		LLOG("TX done: PID %u%s, status %u (%s), WLAN %u, %u attempt(s)%s", ev->body[0], eapol ? " (EAPOL)" : "",
++		    ev->body[1], tx_status_name(ev->body[1]), ev->body[4], ev->body[5],
++		    eapol ? (ev->body[1] == 0 ? ": the AP acknowledged it" : ": the firmware accepted it but it failed") : "");
+ 	}
+ }
+ 
++/*
++ * ACTIVATE_STA_REC (EVENT 0x0C): the firmware's answer to an
++ * UPDATE_STA_RECORD with ucNeedResp set, sent only after it accepted the
++ * update (sta_rec.c: the WLAN index, type and BSS matched the record).
++ * Body {MAC[6], STA index, BSS index}; the MAC is not printed.
++ */
++static void
++ev_sta_rec(__unused struct rottenapple_wifi *w, const struct rottenapple_wifi_event *ev, void *arg)
++{
++	struct mtk_wlan *l = arg;
++
++	if (ev->len < 8) {
++		LLOG("ACTIVATE_STA_REC event: %u bytes (short)", ev->len);
++		return;
++	}
++	if (ev->body[6] == l->sta_rec_idx) {
++		l->sta_rec_ack = true;
++	}
++	LLOG("firmware accepted the STA record update: STA %u, BSS %u (EVENT 0x0C ACTIVATE_STA_REC, seq %u)",
++	    ev->body[6], ev->body[7], ev->seq);
++}
++
++/*
++ * Called from the receive thread: an EAPOL frame that got no EVENT_TX_DONE
++ * within a second was taken by the firmware (the DMA consumed it, nothing
++ * reported a drop: drops in txmSendHifPackets come back as status 33) but
++ * never left its queue.
++ */
++static void
++wl_eapol_watch(struct mtk_wlan *l)
++{
++	if (!l->eapol_pending || l->eapol_stall_logged) {
++		return;
++	}
++	uint64_t age = now_us() - l->eapol_tx_us;
++	if (age < 1000000ull) {
++		return;
++	}
++	l->eapol_stall_logged = true;
++	LLOG("EAPOL TX PID %u: no EVENT_TX_DONE after %llu ms (%u TX done events since the join, STA record state-3 %s): "
++	    "the firmware queued it but did not transmit it. Boot with rottenapple_wifi_fwlog=1 to see its TXM warnings",
++	    l->eapol_pid, age / 1000, l->txdone_events, l->sta_rec_ack ? "acknowledged" : "NOT acknowledged");
++	(void)wl_health(l, "EAPOL TX stalled");
++}
++
+ static void
+ ev_ch_privilege(__unused struct rottenapple_wifi *w, const struct rottenapple_wifi_event *ev, void *arg)
+ {
+@@ -1736,7 +1836,7 @@ band_rates(uint8_t band, uint16_t *op, uint16_t *basic)
+ 
+ /*
+  * CMD_UPDATE_STA_RECORD (200 bytes, CFG_SUPPORT_802_11AX build; offsets in
+- * docs/WIFI-PLAN.md "W5"). state 1 creates the WTBL entry, state 3 marks it
++ * docs/WIFI-PLAN.md "W5"). STA_STATE_1 creates the WTBL entry, STA_STATE_3 marks it
+  * associated with the AID.
+  */
+ #define USR_LEN         200
+@@ -1756,8 +1856,24 @@ band_rates(uint8_t band, uint16_t *op, uint16_t *basic)
+ #define USR_RCPI        50
+ #define USR_NEED_RESP   51
+ #define USR_HWRATE      74
+-#define STA_STATE_1     1
+-#define STA_STATE_3     3
++/*
++ * ucStaState is the 802.11 class, zero based (gen4m include/nic/mac.h:
++ * STA_STATE_1 = 0, STA_STATE_2 = 1, STA_STATE_3 = 2). Patches up to 0134
++ * sent 1 and 3: "state 1" was really class 2 and "state 3" an undefined
++ * value. The firmware's UPDATE_STA_RECORD handler (WIFI_RAM_CODE soc2_2,
++ * mlm/sta_rec.c, at 0xf0328a0c) only programs the WTBL entry for class-3
++ * data when the new state == 2 (the "TXM: WTBL[n] MUAR To/From DS QoS ..."
++ * routine at 0xf0326060: To-DS, own-MAC (MUAR) index, QoS/HT, RTS, the
++ * PSM/SKIP_TX bits); any other value resets the entry to the class-1/2
++ * defaults (0xf03235e0). Management frames carry their own 802.11 header,
++ * so auth and association worked; the 802.3 EAPOL frame needs the
++ * firmware/hardware header translation from that WTBL entry: it was taken
++ * from the command ring (no drop report, which would have been TX done
++ * status 33) and never transmitted.
++ */
++#define STA_STATE_1     0
++#define STA_STATE_2     1
++#define STA_STATE_3     2
+ #define STA_TYPE_LEGACY_AP      0x41    /* STA_TYPE_LEGACY_MASK | STA_TYPE_AP_MASK */
+ 
+ static int
+@@ -1784,10 +1900,18 @@ wl_update_sta(struct mtk_wlan *l, uint8_t state)
+ 	cmd[USR_STA_STATE] = state;
+ 	cmd[USR_WLAN_IDX] = l->sta_wlan_idx;
+ 	cmd[USR_BMC_IDX] = l->grp_wlan_idx;
+-	cmd[USR_NEED_RESP] = 0;
++	/*
++	 * As cnmStaRecChangeState: ask for an answer on the change to class 3.
++	 * The firmware sends EVENT 0x0C only after it accepted the update.
++	 */
++	cmd[USR_NEED_RESP] = state == STA_STATE_3 ? 1 : 0;
++	if (state == STA_STATE_3) {
++		l->sta_rec_ack = false;
++	}
+ 	put16(cmd + USR_HWRATE, lowest_rate_code(l->peer_band));
+ 	err = wl_set(l, CMD_ID_UPDATE_STA_RECORD, cmd, USR_LEN, state == STA_STATE_1 ?
+-	    "UPDATE_STA_RECORD (state 1)" : "UPDATE_STA_RECORD (state 3, associated)");
++	    "UPDATE_STA_RECORD (STA_STATE_1 = 0, created)" :
++	    "UPDATE_STA_RECORD (STA_STATE_3 = 2, associated: class-3 data, response requested)");
+ 	kfree_data(cmd, USR_LEN);
+ 	return err;
+ }
+@@ -1978,6 +2102,10 @@ mtk_wlan_join(struct mtk_wlan *l, struct rottenapple_wifi_join *jp)
+ 	l->rx_data_logs = 0;
+ 	l->txdone_logs = 0;
+ 	l->eapol_pid = 0;
++	l->eapol_pending = false;
++	l->eapol_stall_logged = false;
++	l->txdone_events = 0;
++	l->sta_rec_ack = false;
+ 
+ 	/* AIS network on with the own MAC (as the scan path does) */
+ 	if (!l->bss_active && (err = wl_bss_activate(l, true)) != 0) {
+@@ -2153,17 +2281,31 @@ mtk_wlan_tx_data(struct mtk_wlan *l, const uint8_t *eth, uint32_t len, uint32_t
+ 		 * basic rate, fixed in the TXD, and a TXS so EVENT 0x0F reports
+ 		 * whether the AP acknowledged the frame.
+ 		 */
+-		txd[11] |= TXD_FIXED_RATE_EN;
+-		put16(txd + 24, lowest_rate_code(l->peer_band));
++		txd_fixed_rate(txd, lowest_rate_code(l->peer_band));
+ 		l->eapol_pid = txd[20];
+ 	}
+ 	int err = mtk_wfdma_tx_frame(l->d, txd, 32, eth, len);
+ 	if (err == 0) {
+ 		l->tx_frames++;
+-		if (eth[12] == 0x88 && eth[13] == 0x8e) {
++		if (eapol) {
+ 			l->eapol_tx++;
++			l->eapol_tx_us = now_us();
++			l->eapol_stall_logged = false;
++			l->eapol_pending = true;
+ 		}
+ 	}
++	if (eapol) {
++		/*
++		 * The TXD holds no address or key material (the frame's MACs and
++		 * the EAPOL body are not printed): enough to compare against the
++		 * firmware's txmHifPacketSanityCheck / txmSendHifPackets checks.
++		 */
++		LLOG("EAPOL TX #%u: PID %u, WLAN %u, %u-byte frame on the command ring: %s (%d); TXD %08x %08x %08x %08x "
++		    "%08x %08x %08x %08x; STA record state-3 %s", l->eapol_tx, txd[20], txd[4], len,
++		    err ? "NOT SENT" : "DMA done", err, le32(txd), le32(txd + 4), le32(txd + 8), le32(txd + 12),
++		    le32(txd + 16), le32(txd + 20), le32(txd + 24), le32(txd + 28),
++		    l->sta_rec_ack ? "acknowledged (EVENT 0x0C)" : "NOT acknowledged");
++	}
+ 	return err;
+ }
+ 
+--- a/bsd/dev/rottenapple_mtk_wlan.h
++++ b/bsd/dev/rottenapple_mtk_wlan.h
+@@ -79,6 +79,11 @@ struct mtk_wlan {
+ 	uint32_t rx_data_logs;           /* decoded RX-data lines logged (first 12 per join) */
+ 	uint32_t txdone_logs;            /* EVENT_TX_DONE lines logged (first 16 per join) */
+ 	uint8_t eapol_pid;               /* PID of the last EAPOL frame sent */
++	volatile bool eapol_pending;     /* that frame has no EVENT_TX_DONE yet */
++	bool eapol_stall_logged;         /* the "no TX done" line was printed for it */
++	uint64_t eapol_tx_us;            /* when it was handed to the DMA */
++	uint32_t txdone_events;          /* EVENT_TX_DONE count since the join */
++	volatile bool sta_rec_ack;       /* EVENT 0x0C ACTIVATE_STA_REC answered the state-3 update */
+ 
+ 	/* W4: scan and received frames */
+ 	uint8_t scan_seq_next;          /* CMD_SCAN_REQ_V2 ucSeqNum counter (1..255) */

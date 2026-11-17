@@ -1,0 +1,585 @@
+diff --git a/bsd/dev/rottenapple_netif.h b/bsd/dev/rottenapple_netif.h
+new file mode 100644
+index 0000000..eaf2fb4
+--- /dev/null
++++ b/bsd/dev/rottenapple_netif.h
+@@ -0,0 +1,59 @@
++/*
++ * Rotten Apple: IOKit stand-ins for BSD network interfaces (not an exported
++ * header; shared by bsd/dev and iokit/Kernel/arm/RottenAppleNetwork.cpp).
++ *
++ * iOS userland finds network hardware through IOKit, not through the
++ * ifnet list: configd's InterfaceNamer and SCNetworkInterface enumerate
++ * IOServiceMatching("IONetworkInterface"), read the interface's
++ * IOInterfaceType / BSD Name / IOInterfaceNamePrefix / IOInterfaceUnit /
++ * IOBuiltin, then walk to the parent (the controller: IOMACAddress,
++ * IOFeatures, IOSelfNamed) and its parent (the "bus"). A controller that
++ * conforms to IO80211Controller makes the interface "IEEE80211" (Wi-Fi);
++ * any other Ethernet-type controller makes it "Ethernet". InterfaceNamer
++ * also needs an IONetworkStack service it can open, or it never declares
++ * the registry quiet and PreferencesMonitor never builds the network
++ * configuration.
++ *
++ * A BSD driver that owns an ifnet publishes the matching IOKit objects with
++ * rottenapple_netif_publish() once the ifnet is attached, and reports its
++ * link with rottenapple_netif_link(). The objects carry the ifnet's existing
++ * name and unit, so InterfaceNamer never has to name anything.
++ *
++ * Boot-arg rottenapple_netif=0 turns publication (and IONetworkStack) off.
++ */
++#ifndef _BSD_DEV_ROTTENAPPLE_NETIF_H_
++#define _BSD_DEV_ROTTENAPPLE_NETIF_H_
++
++#include <sys/types.h>
++#include <stdbool.h>
++
++__BEGIN_DECLS
++
++#define ROTTENAPPLE_NETIF_ETHERNET      1       /* IOEthernetController / IOEthernetInterface */
++#define ROTTENAPPLE_NETIF_WIFI          2       /* IO80211Controller / IO80211Interface (infrastructure STA) */
++
++struct rottenapple_netif_desc {
++	unsigned kind;                  /* ROTTENAPPLE_NETIF_* */
++	const char *prefix;             /* BSD name prefix, e.g. "en" */
++	uint32_t unit;                  /* BSD unit: the attached ifnet's */
++	uint8_t mac[6];                 /* link-layer address */
++	uint32_t mtu;
++	bool builtin;                   /* IOBuiltin */
++	bool primary;                   /* IOPrimaryInterface */
++	const char *model;              /* IOModel of the controller */
++};
++
++/*
++ * Publish controller + interface for an attached ifnet. Thread context, may
++ * sleep. Returns an opaque handle (never freed: the objects live as long as
++ * the ifnet, which our drivers never detach), NULL when disabled or on
++ * failure (logged).
++ */
++void *rottenapple_netif_publish(const struct rottenapple_netif_desc *d);
++
++/* Link state on the controller (IOLinkStatus, IOLinkSpeed in bit/s). */
++void rottenapple_netif_link(void *handle, bool active, uint64_t speed_bps);
++
++__END_DECLS
++
++#endif
+diff --git a/bsd/dev/rottenapple_wifi.c b/bsd/dev/rottenapple_wifi.c
+index d8c4db5..550cb41 100644
+--- a/bsd/dev/rottenapple_wifi.c
++++ b/bsd/dev/rottenapple_wifi.c
+@@ -335,6 +335,9 @@ rottenapple_wifi_thread(void *arg, __unused wait_result_t wr)
+ 	} else {
+ 		int err = wifi_run(w);
+ 		wifi_set_state(err ? WIFI_OFF : WIFI_RUNNING);
++		if (err == 0) {
++			rottenapple_wifi_sta_attach(w);         /* en1 + IOKit stand-in, link down */
++		}
+ 		WLOG("W3 result: %s (%d)%s", err ? "FAILED, powered down" : "PASSED, Wi-Fi left running", err,
+ 		    err ? "" : "; stop with sysctl kern.rottenapple_wifi=0, scan with sysctl kern.rottenapple_wifi_scan=1");
+ 		if (err == 0 && level == WIFI_LEVEL_SCAN) {
+diff --git a/bsd/dev/rottenapple_wifi.h b/bsd/dev/rottenapple_wifi.h
+index 011d23a..1429773 100644
+--- a/bsd/dev/rottenapple_wifi.h
++++ b/bsd/dev/rottenapple_wifi.h
+@@ -310,6 +310,12 @@ void rottenapple_wifi_rx_data(struct rottenapple_wifi *w, const uint8_t *eth, ui
+  */
+ void rottenapple_wifi_link_lost(struct rottenapple_wifi *w, const char *reason);
+ 
++/*
++ * Called by the core once Wi-Fi runs (level 5 up, MAC known): creates the
++ * en interface and its IOKit stand-in, link down. Idempotent.
++ */
++void rottenapple_wifi_sta_attach(struct rottenapple_wifi *w);
++
+ /* Called from the stop path so the STA layer releases the link and ifnet. */
+ void rottenapple_wifi_sta_stop(struct rottenapple_wifi *w);
+ 
+diff --git a/bsd/dev/rottenapple_wifi_sta.c b/bsd/dev/rottenapple_wifi_sta.c
+index f764d53..3ff3045 100644
+--- a/bsd/dev/rottenapple_wifi_sta.c
++++ b/bsd/dev/rottenapple_wifi_sta.c
+@@ -55,6 +55,7 @@
+ #include <kern/sched_prim.h>
+ #include <dev/rottenapple_wifi.h>
+ #include <dev/rottenapple_wifi_crypto.h>
++#include <dev/rottenapple_netif.h>
+ 
+ extern int vn_rdwr(enum uio_rw, struct vnode *, caddr_t, int, off_t, enum uio_seg, int, kauth_cred_t,
+     int *, proc_t);
+@@ -83,6 +84,7 @@ static const char *const link_name[] = { "idle", "joining", "4-way handshake", "
+ struct wifi_sta {
+ 	struct rottenapple_wifi *w;
+ 	ifnet_t ifp;
++	void *netif;                            /* IOKit stand-in (rottenapple_netif_publish), NULL if none */
+ 	lck_mtx_t *lock;
+ 	lck_grp_t *grp;
+ 
+@@ -211,6 +213,10 @@ psk_load(uint8_t *out, size_t *out_len)
+ 
+ /* ---- The Ethernet interface (en1) ---- */
+ 
++#define STA_IF_PREFIX   "en"
++#define STA_IF_UNIT     1
++#define STA_LINK_BPS    54000000ULL     /* legacy-rate association (no HT/VHT IEs yet) */
++
+ static errno_t
+ sta_if_output(ifnet_t ifp, mbuf_t m)
+ {
+@@ -250,7 +256,13 @@ sta_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
+ 	switch (cmd) {
+ 	case SIOCGIFMEDIA32:
+ 	case SIOCGIFMEDIA64: {
++		static bool media_logged;
+ 		struct ifmediareq *ifmr = (struct ifmediareq *)data;
++		if (!media_logged) {
++			media_logged = true;
++			TLOG("en1: first SIOCGIFMEDIA%s (link %s)", cmd == SIOCGIFMEDIA64 ? "64" : "32",
++			    sta.state == LINK_CONNECTED ? "up" : "down");
++		}
+ 		user_addr_t list = (cmd == SIOCGIFMEDIA64) ? ((struct ifmediareq64 *)ifmr)->ifmu_ulist :
+ 		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
+ 		bool up = sta.state == LINK_CONNECTED;
+@@ -299,8 +311,8 @@ sta_if_create(struct wifi_sta *s)
+ 	init.flags = IFNET_INIT_LEGACY;
+ 	init.uniqueid = "rotten-apple-wifi";
+ 	init.uniqueid_len = sizeof("rotten-apple-wifi") - 1;
+-	init.name = "en";
+-	init.unit = 1;
++	init.name = STA_IF_PREFIX;
++	init.unit = STA_IF_UNIT;
+ 	init.family = IFNET_FAMILY_ETHERNET;
+ 	init.type = IFT_ETHER;
+ 	init.output = sta_if_output;
+@@ -329,6 +341,15 @@ sta_if_create(struct wifi_sta *s)
+ 	}
+ 	ifnet_set_lladdr(s->ifp, s->own_mac, ETHER_ADDR_LEN);
+ 	(void)proto_plumb(PF_INET, s->ifp);
++	if (s->netif == NULL) {
++		/* configd/InterfaceNamer only see interfaces that exist in IOKit (stage I1) */
++		struct rottenapple_netif_desc d = {
++			.kind = ROTTENAPPLE_NETIF_WIFI, .prefix = STA_IF_PREFIX, .unit = STA_IF_UNIT,
++			.mtu = ETHERMTU, .builtin = true, .primary = true, .model = "Wi-Fi",
++		};
++		memcpy(d.mac, s->own_mac, ETHER_ADDR_LEN);
++		s->netif = rottenapple_netif_publish(&d);
++	}
+ 	TLOG("en1 created, MAC from the NVRAM; set an address with ifconfig/ipconfig over SSH, or "
+ 	    "kern.rottenapple_wifi_ip");
+ 	return 0;
+@@ -345,6 +366,7 @@ sta_if_link(struct wifi_sta *s, bool up)
+ 	} else {
+ 		ifnet_set_flags(s->ifp, 0, IFF_RUNNING);
+ 	}
++	rottenapple_netif_link(s->netif, up, up ? STA_LINK_BPS : 0);
+ 	dlil_post_msg(s->ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
+ }
+ 
+@@ -955,6 +977,34 @@ rottenapple_wifi_sta_stop(struct rottenapple_wifi *w)
+ 	lck_mtx_unlock(s->lock);
+ }
+ 
++/*
++ * Create en1 (and its IOKit stand-in) as soon as Wi-Fi runs and the MAC is
++ * known, not at the first join: configd builds its network configuration
++ * from the interfaces present when IOKit goes quiet after boot, and wifid
++ * expects the interface while not associated. The link stays down until a
++ * join completes.
++ */
++void
++rottenapple_wifi_sta_attach(struct rottenapple_wifi *w)
++{
++	struct wifi_sta *s = &sta;
++	static const uint8_t zero[6];
++
++	if (!sta_ready || s->w != w) {
++		return;
++	}
++	if (memcmp(w->mac, zero, sizeof(zero)) == 0) {
++		TLOG("en1 not created at bring-up: no MAC address from the firmware configuration");
++		return;
++	}
++	lck_mtx_lock(s->lock);
++	if (s->ifp == NULL) {
++		memcpy(s->own_mac, w->mac, 6);
++		(void)sta_if_create(s);
++	}
++	lck_mtx_unlock(s->lock);
++}
++
+ /* ---- sysctls ---- */
+ 
+ static int
+diff --git a/iokit/Kernel/arm/RottenAppleNetwork.cpp b/iokit/Kernel/arm/RottenAppleNetwork.cpp
+new file mode 100644
+index 0000000..cf361f5
+--- /dev/null
++++ b/iokit/Kernel/arm/RottenAppleNetwork.cpp
+@@ -0,0 +1,340 @@
++/*
++ * Rotten Apple: IOKit stand-ins for BSD network interfaces
++ * (docs/WIFI-PLAN.md, stage I1; API in bsd/dev/rottenapple_netif.h).
++ *
++ * IONetworkingFamily and IO80211Family are not part of our kernel, so
++ * configd sees no network hardware: its InterfaceNamer plugin times out
++ * waiting for IONetworkStack and SCNetworkInterfaceCopyAll() is empty. This
++ * file provides the minimum IOKit surface userland actually tests:
++ *
++ *   - class names. configd uses IOServiceMatching("IONetworkInterface")
++ *     and IOObjectConformsTo(controller, "IO80211Controller"); wifid looks
++ *     for IO80211 interfaces. The abstract classes below exist only so
++ *     those names resolve along our objects' class chains; they implement
++ *     nothing of Apple's family ABI.
++ *   - IONetworkStack (matched on IOResources, KernelConfigTables.cpp) with
++ *     a user client InterfaceNamer can open (type 0) and send naming
++ *     requests to (IOConnectSetCFProperties). Our interfaces are published
++ *     already named (BSD Name + IOInterfaceUnit), so a request for one of
++ *     them succeeds as a no-op and any other is refused and logged.
++ *   - per interface a controller (IOMACAddress, IOLinkStatus, ...) attached
++ *     to IOResources, and under it the interface (IOInterfaceType 6,
++ *     BSD Name, IOInterfaceNamePrefix, IOInterfaceUnit, IOBuiltin, ...):
++ *     configd's createInterface() reads exactly interface -> parent ->
++ *     grandparent.
++ *
++ * Boot-arg rottenapple_netif=0: nothing is published.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOBSD.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMessage.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSDictionary.h>
++#include <pexpert/pexpert.h>
++
++extern "C" {
++#include "../../../bsd/dev/rottenapple_netif.h"     /* not an exported header */
++}
++
++#define NLOG(fmt, ...)  IOLog("ROTTEN APPLE: netif: " fmt "\n", ##__VA_ARGS__)
++
++/* Property keys (the strings userland reads; Apple's IONetworkingFamily names). */
++#define kRANetInterfaceType             "IOInterfaceType"
++#define kRANetInterfaceNamePrefix       "IOInterfaceNamePrefix"
++#define kRANetInterfaceUnit             "IOInterfaceUnit"
++#define kRANetInterfaceName             "IOInterfaceName"
++#define kRANetBuiltin                   "IOBuiltin"
++#define kRANetPrimaryInterface          "IOPrimaryInterface"
++#define kRANetLocation                  "IOLocation"
++#define kRANetMaxTransferUnit           "IOMaxTransferUnit"
++#define kRANetMediaAddressLength        "IOMediaAddressLength"
++#define kRANetMediaHeaderLength         "IOMediaHeaderLength"
++#define kRANetInterfaceFlags            "IOInterfaceFlags"
++#define kRANetInterfaceState            "IOInterfaceState"
++#define kRANetMACAddress                "IOMACAddress"
++#define kRANetFeatures                  "IOFeatures"
++#define kRANetLinkStatus                "IOLinkStatus"
++#define kRANetLinkSpeed                 "IOLinkSpeed"
++#define kRANetVendor                    "IOVendor"
++#define kRANetModel                     "IOModel"
++#define kRANet80211Role                 "IO80211InterfaceRole"
++#define kRANetStackCommand              "IONetworkStackUserCommand"
++#define kRANetRegistryEntryID           "IORegistryEntryID"
++#define kRANetSelfNamed                 "IOSelfNamed"
++
++#define RA_IFT_ETHER            6               /* IFT_ETHER */
++#define RA_LINK_VALID           0x1             /* kIONetworkLinkValid */
++#define RA_LINK_ACTIVE          0x2             /* kIONetworkLinkActive */
++#define RA_IF_FLAGS             0x8863          /* UP|BROADCAST|SIMPLEX|MULTICAST|RUNNING|NOTRAILERS */
++#define RA_IF_STATE_REGISTERED  0x1             /* attached to BSD (kIONetworkInterfaceRegisteredState) */
++
++static bool
++netif_enabled(void)
++{
++	uint32_t v = 1;
++	(void)PE_parse_boot_argn("rottenapple_netif", &v, sizeof(v));
++	return v != 0;
++}
++
++/* ---- Class names userland conforms against (no behaviour of their own) ---- */
++
++class IONetworkController : public IOService {
++	OSDeclareDefaultStructors(IONetworkController);
++};
++OSDefineMetaClassAndStructors(IONetworkController, IOService);
++
++class IOEthernetController : public IONetworkController {
++	OSDeclareDefaultStructors(IOEthernetController);
++};
++OSDefineMetaClassAndStructors(IOEthernetController, IONetworkController);
++
++class IO80211Controller : public IOEthernetController {
++	OSDeclareDefaultStructors(IO80211Controller);
++};
++OSDefineMetaClassAndStructors(IO80211Controller, IOEthernetController);
++
++class IONetworkInterface : public IOService {
++	OSDeclareDefaultStructors(IONetworkInterface);
++};
++OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
++
++class IOEthernetInterface : public IONetworkInterface {
++	OSDeclareDefaultStructors(IOEthernetInterface);
++};
++OSDefineMetaClassAndStructors(IOEthernetInterface, IONetworkInterface);
++
++class IO80211Interface : public IOEthernetInterface {
++	OSDeclareDefaultStructors(IO80211Interface);
++};
++OSDefineMetaClassAndStructors(IO80211Interface, IOEthernetInterface);
++
++/* ---- Our concrete objects ---- */
++
++class RottenAppleEthernetController : public IOEthernetController {
++	OSDeclareDefaultStructors(RottenAppleEthernetController);
++};
++OSDefineMetaClassAndStructors(RottenAppleEthernetController, IOEthernetController);
++
++class RottenAppleWiFiController : public IO80211Controller {
++	OSDeclareDefaultStructors(RottenAppleWiFiController);
++};
++OSDefineMetaClassAndStructors(RottenAppleWiFiController, IO80211Controller);
++
++class RottenAppleEthernetInterface : public IOEthernetInterface {
++	OSDeclareDefaultStructors(RottenAppleEthernetInterface);
++};
++OSDefineMetaClassAndStructors(RottenAppleEthernetInterface, IOEthernetInterface);
++
++class RottenAppleWiFiInterface : public IO80211Interface {
++	OSDeclareDefaultStructors(RottenAppleWiFiInterface);
++};
++OSDefineMetaClassAndStructors(RottenAppleWiFiInterface, IO80211Interface);
++
++/* ---- IONetworkStack ---- */
++
++class IONetworkStack : public IOService {
++	OSDeclareDefaultStructors(IONetworkStack);
++
++public:
++	IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(IONetworkStack, IOService);
++
++IOService *
++IONetworkStack::probe(IOService *provider, SInt32 *score)
++{
++	if (!netif_enabled()) {
++		return NULL;
++	}
++	return IOService::probe(provider, score);
++}
++
++bool
++IONetworkStack::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "IONetworkStackUserClient");
++	registerService();
++	NLOG("IONetworkStack registered (interfaces arrive pre-named)");
++	return true;
++}
++
++class IONetworkStackUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(IONetworkStackUserClient);
++
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(IONetworkStackUserClient, IOUserClient);
++
++IOReturn
++IONetworkStackUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++/*
++ * A naming request: {IONetworkStackUserCommand, IORegistryEntryID (8-byte
++ * data), IOInterfaceUnit}. Commands 0 (with unit) and 1 (lowest unit). Ours
++ * are already named: accept a request for one of them, refuse the rest.
++ */
++IOReturn
++IONetworkStackUserClient::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	if (dict == NULL) {
++		return kIOReturnBadArgument;
++	}
++	OSNumber *cmd = OSDynamicCast(OSNumber, dict->getObject(kRANetStackCommand));
++	OSData *idd = OSDynamicCast(OSData, dict->getObject(kRANetRegistryEntryID));
++	uint64_t id = 0;
++	if (idd != NULL && idd->getLength() == sizeof(id)) {
++		memcpy(&id, idd->getBytesNoCopy(), sizeof(id));
++	}
++	IOReturn ret = kIOReturnUnsupported;
++	if (id != 0) {
++		OSDictionary *match = IOService::registryEntryIDMatching(id);
++		IOService *svc = match ? IOService::copyMatchingService(match) : NULL;
++		OSSafeReleaseNULL(match);
++		if (svc != NULL && svc->getProperty(kIOBSDNameKey) != NULL &&
++		    OSDynamicCast(IONetworkInterface, svc) != NULL) {
++			ret = kIOReturnSuccess;         /* already named */
++		}
++		OSSafeReleaseNULL(svc);
++	}
++	NLOG("IONetworkStack: naming request command %d for entry 0x%llx: %s",
++	    cmd ? (int)cmd->unsigned32BitValue() : -1, id,
++	    ret == kIOReturnSuccess ? "already named, ok" : "refused (only pre-named interfaces exist)");
++	return ret;
++}
++
++/* ---- Publication ---- */
++
++struct rottenapple_netif {
++	IOService *controller;
++	IOService *interface;
++	char name[16];
++};
++
++static OSNumber *
++num32(uint32_t v)
++{
++	return OSNumber::withNumber((unsigned long long)v, 32);
++}
++
++static void
++set_num(IOService *s, const char *key, uint32_t v)
++{
++	OSNumber *n = num32(v);
++	if (n != NULL) {
++		s->setProperty(key, n);
++		n->release();
++	}
++}
++
++extern "C" void *
++rottenapple_netif_publish(const struct rottenapple_netif_desc *d)
++{
++	if (d == NULL || d->prefix == NULL || !netif_enabled()) {
++		return NULL;
++	}
++	IOService *bus = IOService::getResourceService();
++	bool wifi = d->kind == ROTTENAPPLE_NETIF_WIFI;
++	IOService *ctl = wifi ? (IOService *)OSTypeAlloc(RottenAppleWiFiController) :
++	    (IOService *)OSTypeAlloc(RottenAppleEthernetController);
++	IOService *ifc = wifi ? (IOService *)OSTypeAlloc(RottenAppleWiFiInterface) :
++	    (IOService *)OSTypeAlloc(RottenAppleEthernetInterface);
++	struct rottenapple_netif *h = IOMallocType(struct rottenapple_netif);
++	char name[16];
++
++	snprintf(name, sizeof(name), "%s%u", d->prefix, d->unit);
++	if (bus == NULL || ctl == NULL || ifc == NULL || h == NULL || !ctl->init() || !ifc->init()) {
++		NLOG("%s: publish failed (allocation)", name);
++		goto fail;
++	}
++
++	/* the controller: what configd reads from the interface's parent */
++	{
++		OSData *mac = OSData::withBytes(d->mac, 6);
++		if (mac != NULL) {
++			ctl->setProperty(kRANetMACAddress, mac);
++			mac->release();
++		}
++	}
++	set_num(ctl, kRANetFeatures, 0);
++	set_num(ctl, kRANetLinkStatus, RA_LINK_VALID);
++	ctl->setProperty(kRANetLinkSpeed, 0ULL, 64);
++	ctl->setProperty(kRANetVendor, "Rotten Apple");
++	ctl->setProperty(kRANetModel, d->model ? d->model : (wifi ? "Wi-Fi" : "Ethernet"));
++	ctl->setProperty(kRANetSelfNamed, kOSBooleanFalse);
++
++	/* the interface */
++	set_num(ifc, kRANetInterfaceType, RA_IFT_ETHER);
++	ifc->setProperty(kRANetInterfaceNamePrefix, d->prefix);
++	set_num(ifc, kRANetInterfaceUnit, d->unit);
++	ifc->setProperty(kIOBSDNameKey, name);
++	ifc->setProperty(kRANetInterfaceName, name);
++	ifc->setProperty(kRANetBuiltin, d->builtin ? kOSBooleanTrue : kOSBooleanFalse);
++	ifc->setProperty(kRANetPrimaryInterface, d->primary ? kOSBooleanTrue : kOSBooleanFalse);
++	ifc->setProperty(kRANetLocation, "");
++	set_num(ifc, kRANetMaxTransferUnit, d->mtu ? d->mtu : 1500);
++	set_num(ifc, kRANetMediaAddressLength, 6);
++	set_num(ifc, kRANetMediaHeaderLength, 14);
++	set_num(ifc, kRANetInterfaceFlags, RA_IF_FLAGS);
++	set_num(ifc, kRANetInterfaceState, RA_IF_STATE_REGISTERED);
++	if (wifi) {
++		ifc->setProperty(kRANet80211Role, "Infrastructure");
++	}
++
++	if (!ctl->attach(bus)) {
++		NLOG("%s: publish failed (controller attach)", name);
++		goto fail;
++	}
++	if (!ifc->attach(ctl)) {
++		NLOG("%s: publish failed (interface attach)", name);
++		ctl->detach(bus);
++		goto fail;
++	}
++	ctl->registerService();
++	ifc->registerService();
++
++	h->controller = ctl;
++	h->interface = ifc;
++	strlcpy(h->name, name, sizeof(h->name));
++	NLOG("%s published to IOKit as %s (%s controller)", name, ifc->getMetaClass()->getClassName(),
++	    wifi ? "IO80211" : "Ethernet");
++	return h;
++
++fail:
++	OSSafeReleaseNULL(ctl);
++	OSSafeReleaseNULL(ifc);
++	if (h != NULL) {
++		IOFreeType(h, struct rottenapple_netif);
++	}
++	return NULL;
++}
++
++extern "C" void
++rottenapple_netif_link(void *handle, bool active, uint64_t speed_bps)
++{
++	struct rottenapple_netif *h = (struct rottenapple_netif *)handle;
++	if (h == NULL) {
++		return;
++	}
++	set_num(h->controller, kRANetLinkStatus, RA_LINK_VALID | (active ? RA_LINK_ACTIVE : 0));
++	h->controller->setProperty(kRANetLinkSpeed, active ? speed_bps : 0ULL, 64);
++	h->controller->messageClients(kIOMessageServicePropertyChange);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 9c09a74..3312fd1 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -92,6 +92,11 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = RottenAppleAudioDevice;"
+     "   },"
++    "   {"
++    "     'IOClass'         = IONetworkStack;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IONetworkStack;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index cbeeb09..5a96b22 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -18,6 +18,7 @@ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitc
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/RottenAppleAccelerator.cpp                      optional iokitcpp
+ iokit/Kernel/arm/RottenAppleAudio.cpp                            optional iokitcpp
++iokit/Kernel/arm/RottenAppleNetwork.cpp                          optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp

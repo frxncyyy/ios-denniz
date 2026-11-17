@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Build the unmodified pinned HackiOS/Topaz iOS HAL on macOS; no device access."""
+import argparse,hashlib,json,pathlib,re,subprocess,urllib.request
+PIN='a79ff0772a3454fd1ef127e181e5b3bce6c9ce18'
+FILES={
+ 'audio_plugin.c':'7fab4e652d62f9ecf6cbf3a3c7a610031ac929ddc3413e428e719d2eb35be16f',
+ 'audio_plugin.plist':'8737f502b722742a6a37bce8c512220fabc18add88717f4eb8fae5524a08d6fd',
+ 'redwood_audio.h':'5ab3444730e47cb105a9ee14a924b0dca2df2b7588cf3eeba86e14a234d2dce4'}
+def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+def main():
+ ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('output',type=pathlib.Path);a=ap.parse_args()
+ a.output.mkdir();out=a.output.resolve();src=out/'source';src.mkdir()
+ for name,digest in FILES.items():
+  url=f'https://raw.githubusercontent.com/oosexgang/hackios-xnu-userland/{PIN}/userland/src/{name}'
+  req=urllib.request.Request(url,headers={'User-Agent':'Nord2-audio-build'})
+  with urllib.request.urlopen(req,timeout=45) as r:blob=r.read(131073)
+  if len(blob)>131072 or hashlib.sha256(blob).hexdigest()!=digest:raise SystemExit('upstream hash mismatch: '+name)
+  (src/name).write_bytes(blob)
+ # Preserve the pinned upstream MIT notice alongside the artifact; the runtime
+ # package remains exactly executable+Info.plist.
+ license_url=f'https://raw.githubusercontent.com/oosexgang/hackios-xnu-userland/{PIN}/LICENSE'
+ with urllib.request.urlopen(license_url,timeout=45) as r:license_blob=r.read(8193)
+ license_sha='f6cfd96f40e34d3679e037e1192d24a3794e41aa196ca6df76c0826ed6cd60c5'
+ if len(license_blob)>8192 or hashlib.sha256(license_blob).hexdigest()!=license_sha:
+  raise SystemExit('upstream license hash mismatch')
+ (out/'LICENSE.upstream').write_bytes(license_blob)
+ sdk=subprocess.check_output(['xcrun','--sdk','iphoneos','--show-sdk-path'],text=True).strip()
+ sdk_version=subprocess.check_output(['xcrun','--sdk','iphoneos','--show-sdk-version'],text=True).strip()
+ bundle=out/'RedwoodAudio.driver';bundle.mkdir()
+ subprocess.run(['xcrun','--sdk','iphoneos','clang','-arch','arm64','-miphoneos-version-min=16.0','-O1',
+  '-isysroot',sdk,'-bundle','-framework','CoreFoundation','-Wl,-no_uuid','-Wl,-no_adhoc_codesign','-o',str(bundle/'RedwoodAudio'),str(src/'audio_plugin.c')],check=True)
+ (bundle/'Info.plist').write_bytes((src/'audio_plugin.plist').read_bytes())
+ subprocess.run(['plutil','-lint',str(bundle/'Info.plist')],check=True)
+ checks=[('architecture',['xcrun','lipo','-verify_arch','arm64',str(bundle/'RedwoodAudio')],None),
+ ('platform',['xcrun','vtool','-show-build',str(bundle/'RedwoodAudio')],'platform IOS'),
+ ('factory',['xcrun','nm','-gU',str(bundle/'RedwoodAudio')],' _RedwoodAudio_Create'),
+ ('type',['xcrun','otool','-hv',str(bundle/'RedwoodAudio')],'BUNDLE'),
+ ('dependencies',['xcrun','otool','-L',str(bundle/'RedwoodAudio')],None)]
+ for name,cmd,want in checks:
+  r=subprocess.run(cmd,check=True,stdout=subprocess.PIPE,text=True);(out/(name+'.txt')).write_text(r.stdout)
+  if want and want not in r.stdout:raise SystemExit('HAL check failed: '+name)
+ platform=(out/'platform.txt').read_text()
+ if not re.search(r'^\s*platform\s+IOS\s*$',platform,re.M) or not re.search(r'^\s*minos\s+16\.0(?:\.0)?\s*$',platform,re.M):
+  raise SystemExit('expected iOS device minimum16.0')
+ load_commands=subprocess.check_output(['xcrun','otool','-l',str(bundle/'RedwoodAudio')],text=True)
+ (out/'load-commands.txt').write_text(load_commands)
+ if 'LC_CODE_SIGNATURE' in load_commands:raise SystemExit('unexpected Mach-O signature')
+ subprocess.run(['python3',str(pathlib.Path(__file__).with_name('nord2-audio-package.py')),'build',str(bundle),str(out/'audio.pkg')],check=True)
+ record={'upstream':'oosexgang/hackios-xnu-userland','commit':PIN,'sources':FILES,'license_sha256':license_sha,'sdk_version':sdk_version,'minimum_ios':'16.0','signature':'none',
+  'outputs':{str(p.relative_to(out)):sha(p) for p in [bundle/'RedwoodAudio',bundle/'Info.plist',out/'audio.pkg']}}
+ (out/'provenance.json').write_text(json.dumps(record,indent=2)+'\n')
+ print(json.dumps(record,indent=2))
+if __name__=='__main__':main()

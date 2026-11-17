@@ -1,0 +1,145 @@
+--- a/tools/fixtures/nord2-wifi-live/mailbox.c
++++ b/tools/fixtures/nord2-wifi-live/mailbox.c
+@@ -1,6 +1,6 @@
+ /* Host-only USB model uses the actual kernel mailbox C implementation. */
+ #include "wifi_live_control.h"
+-static unsigned executed;
++static unsigned executed,disconnected,ready_polls;
+ static uint32_t generation=42,capture,windows=32,drop;
+ int mock_initialize(void){return nwl_initialize(UINT64_C(0x12345678));}
+ int mock_write(unsigned value,unsigned index){
+@@ -14,6 +14,9 @@
+   else if(q.op>=NWL_CAPTURE_DHCP&&q.op<=NWL_CAPTURE_STOP){capture=q.op==NWL_CAPTURE_STOP?0:q.op-1;if(capture&&windows)windows--;}
+   else if(q.op==NWL_OFLD_ALLOW)drop=0;
+   else if(q.op==NWL_OFLD_DROP)drop=1;
++  if(q.op==NWL_DISCONNECT&&result==NWL_OK){disconnected=1;ready_polls=0;}
++  if(q.op==NWL_STATUS&&disconnected&&++ready_polls>=2)disconnected=0;
++  s.word[NWL_F_JOIN_READY]=!disconnected;
+   s.word[NWL_F_GENERATION_LO]=generation;s.word[NWL_F_CAPTURE]=capture;s.word[NWL_F_WINDOWS_LEFT]=windows;s.word[NWL_F_OFLD_DROP]=drop;
+   if(nwl_complete(&q,result,&s))return -1;executed++;
+  }}
+@@ -21,3 +24,5 @@
+  return nwl_usb(setup,out,size,&n)==1?(int)n:-9;
+ }
+ unsigned mock_executed(void){return executed;}
++
++unsigned mock_ready_polls(void){return ready_polls;}
+--- a/tools/fixtures/nord2-wifi-live/test.py
++++ b/tools/fixtures/nord2-wifi-live/test.py
+@@ -18,13 +18,17 @@
+  def sleep(self,n):self.now+=n
+ class Mock:
+  def __init__(self):
+-  self.boot=7;self.token=0;self.op=0;self.expected=0;self.pending=0;self.generation=1;self.result=0;self.delay=0;self.reads=0;self.calls=[];self.reply=None;self.fault=None;self.executed=[];self.before_cap=None
++  self.boot=7;self.token=0;self.op=0;self.expected=0;self.pending=0;self.generation=1;self.result=0;self.delay=0;self.reads=0;self.calls=[];self.reply=None;self.fault=None;self.executed=[];self.before_cap=None;self.ready=1;self.recovering=False;self.ready_polls=0;self.ready_after=2
+  def cap(self):return [m.MAGIC,1,64,256,254,4095,65535,self.boot,0,1,self.pending,self.token,self.op,self.expected,0,0]
+  def pump(self):
+   if self.pending:
+    self.reads+=1
+    if self.reads>self.delay:
+-    self.pending=0;w=[0]*64;w[:11]=[m.MAGIC,1,256,self.boot,0,self.token,self.op,self.expected,self.result,self.generation,0];w[40]=32;self.reply=w;self.executed.append((self.token,self.op,self.expected))
++    self.pending=0;w=[0]*64;w[:11]=[m.MAGIC,1,256,self.boot,0,self.token,self.op,self.expected,self.result,self.generation,0];w[40]=32;
++    if self.op==1 and self.recovering:
++     self.ready_polls+=1
++     if self.ready_polls>=self.ready_after:self.ready=1;self.recovering=False
++    w[57]=self.ready;self.reply=w;self.executed.append((self.token,self.op,self.expected))
+  def read(self,code,size):
+   if code==0x60:
+    if self.before_cap:self.before_cap(self)
+@@ -39,7 +43,9 @@
+   if token==self.token:
+    if (op,index)!=(self.op,self.expected):raise m.USBError(-9)
+   elif token!=self.token+1 or self.pending:raise m.USBError(-9)
+-  else:self.token=token;self.op=op;self.expected=index;self.pending=1;self.reads=0
++  else:
++   self.token=token;self.op=op;self.expected=index;self.pending=1;self.reads=0
++   if op==7:self.ready=0;self.recovering=True;self.ready_polls=0
+   if f=='lost-after':self.fault=None;raise m.USBError(-7)
+ def box(t,timeout=5):
+  c=Clock();return m.Mailbox(t,timeout,c.clock,c.sleep),c
+@@ -74,15 +80,18 @@
+ # Delayed completion may return the previous complete reply until its token wins.
+ t=Mock();b,c=box(t);b.command('status');t.delay=3;r=b.exchange(2,1);check(r['token']==2 and c.now>.1)
+ # Disconnect follow-up sends STATUS only and waits on owner flags, never a new7.
+-t=Mock();b,c=box(t);b.command('disconnect');d=b.wait_disconnected();check(d['op']==1);check(sum(x[1]==7 for x in t.calls)==1)
++t=Mock();b,c=box(t);b.command('disconnect');d=b.wait_disconnected();check(d['op']==1 and d['join_ready']==1);check(t.ready_polls==2);check(sum(x[1]==7 for x in t.calls)==1)
+ t=Mock();b,c=box(t,.5);old=t.pump
+ def busy_disconnect():
+  old()
+  if t.reply:t.reply[15]=0xbf
+ t.pump=busy_disconnect;b.command('disconnect');throws(m.Ambiguous,b.wait_disconnected);check(sum(x[1]==7 for x in t.calls)==1)
++# Idle flags alone cannot finish a disconnect while fresh-scan readiness is0.
++t=Mock();t.ready_after=10000;b,c=box(t,.5);b.command('disconnect');throws(m.Ambiguous,b.wait_disconnected);check(t.ready==0 and t.ready_polls>0);check(sum(x[1]==7 for x in t.calls)==1)
++t=Mock();t.generation=0;b,c=box(t);r=b.command('status');check(r['join_ready']==1 and r['generation']==0);check('time_ms' in m.public(r) and 'time_us' not in m.public(r))
+ # Source/header contract pins are checked by the runner; parser mutations stay strict.
+-t=Mock();b,c=box(t);r=b.command('status');raw=t.read(0x62,256);check(len(m.FIELDS)==57)
+-for k,v in [(0,0),(1,2),(2,255),(5,0),(5,4096),(6,0),(6,8),(7,65536),(8,5),(11,9),(15,512),(39,3),(40,33),(41,2),(42,1024),(57,1),(63,1)]:
++t=Mock();b,c=box(t);r=b.command('status');raw=t.read(0x62,256);check(len(m.FIELDS)==58)
++for k,v in [(0,0),(1,2),(2,255),(5,0),(5,4096),(6,0),(6,8),(7,65536),(8,5),(11,9),(15,512),(39,3),(40,33),(41,2),(42,1024),(57,2),(58,1),(63,1)]:
+  w=list(struct.unpack('<64I',raw));w[k]=v;throws(m.ProtocolError,lambda w=w:m.reply(struct.pack('<64I',*w)))
+ for n in(0,1,255,257,512):throws(m.ProtocolError,lambda n=n:m.reply(bytes(n)))
+ for k,v in [(0,0),(1,2),(2,63),(3,255),(4,0),(5,4096),(6,65536),(7,0),(9,0),(9,2),(10,3),(11,4096),(12,8),(13,65536),(14,1),(15,1)]:
+@@ -116,7 +125,7 @@
+    if n<0:raise m.USBError(n)
+    if self.lose:self.lose=False;raise m.USBError(-7)
+  t=Actual();b,c=box(t)
+- check(b.command('status')['generation']==42)
++ first=b.command('status');check(first['generation']==42 and first['join_ready']==1)
+  check(b.command('capture-dhcp')['capture']==1)
+  check(b.command('capture-headers')['capture']==2)
+  check(b.command('capture-off')['capture']==0)
+@@ -124,6 +133,7 @@
+  check(b.command('ofld-allow')['ofld_drop']==0)
+  before=lib.mock_executed();t.lose=True
+  check(b.exchange(7,42)['result']==0);check(lib.mock_executed()==before+1)
++ check(b.wait_disconnected()['join_ready']==1);check(lib.mock_ready_polls()==2)
+  check(b.exchange(5,41)['result']==2)
+  check(len(t.writes)==lib.mock_executed())
+ print(json.dumps({'passed':True,'checks':checks,'USB_device_calls':False,'mocked_transport_only':True,'actual_c_mailbox_bridge':True,'dhcp_or_internet_claim':False}))
+--- a/tools/nord2-wifi-live.py
++++ b/tools/nord2-wifi-live.py
+@@ -25,7 +25,7 @@
+         'offer ack nak rx_error rx_peer rx_key rx_replay rx_plain txs_ok txs_fail '
+         'txs_ambiguous time_lo time_hi capture windows_left ofld_drop data_cursor '
+         'command_cursor rx0 rx1 rx2 rx3 rx4 data_published data_report data_ddone '
+-        'air_pending wire_busy tx_accepted tx_local rx_delivered').split()
++        'air_pending wire_busy tx_accepted tx_local rx_delivered join_ready').split()
+ class ProtocolError(Exception):pass
+ class Busy(ProtocolError):pass
+ class Rebooted(ProtocolError):pass
+@@ -57,7 +57,7 @@
+     if d['op']==1 and d['expected']:raise ProtocolError('STATUS expected generation must be zero')
+     if d['service']>8:raise ProtocolError('service state bounds')
+     if d['flags']&~511 or d['capture']>2 or d['windows_left']>32:raise ProtocolError('snapshot bounds')
+-    for k in ('halt','ofld_drop','data_published','data_report','data_ddone','air_pending','wire_busy'):
++    for k in ('halt','ofld_drop','data_published','data_report','data_ddone','air_pending','wire_busy','join_ready'):
+         if d[k]>1:raise ProtocolError('snapshot boolean')
+     for k in ('data_cursor','command_cursor','rx0','rx1','rx2','rx3','rx4'):
+         if d[k]>=1024:raise ProtocolError('ring cursor bounds')
+@@ -145,12 +145,13 @@
+         return self.exchange(OPS[name],g)
+ 
+     def wait_disconnected(self):
+-        # Only fresh STATUS is repeated. Never replay disconnect with a new
++        # Only fresh STATUS is repeated. join_ready requires the owner's actual
++        # fresh-scan handoff proof, not just the previous disconnect result. Never replay disconnect with a new
+         # token. These are owner-reported closure fields, not RF/firmware proof.
+         while True:
+             d=self.exchange(1)
+             if d['result']!=0:return d
+-            if not (d['flags']&0xbf) and not any(d[k] for k in ('tx_pending','rx_pending','air_pending','wire_busy')):return d
++            if d['join_ready'] and not (d['flags']&0xbf) and not any(d[k] for k in ('tx_pending','rx_pending','air_pending','wire_busy')):return d
+             self.sleep(min(.25,self.remaining()))
+ 
+ class USB:
+--- a/tools/test-nord2-wifi-live.py
++++ b/tools/test-nord2-wifi-live.py
+@@ -4,7 +4,7 @@
+ from pathlib import Path
+ T=Path(__file__).resolve().parent;R=next(p for p in T.parents if(p/'AGENTS.md').is_file());a=argparse.ArgumentParser(description=__doc__);a.add_argument('--log-dir',type=Path,required=True);v=a.parse_args();v.log_dir.mkdir(parents=True,exist_ok=True)
+ h=R/'shim/nord2-xnu/wifi_live_control.h';c=R/'shim/nord2-xnu/wifi_live_control.c'
+-fields=re.search(r'enum nwl_field\s*\{(.*?)\};',h.read_text(),re.S).group(1);fields=re.findall(r'NWL_F_(\w+)',fields);assert fields[-1]=='END' and len(fields)==58
++fields=re.search(r'enum nwl_field\s*\{(.*?)\};',h.read_text(),re.S).group(1);fields=re.findall(r'NWL_F_(\w+)',fields);assert fields[-1]=='END' and len(fields)==59
+ cli=T/'nord2-wifi-live.py';module=cli.read_text();decl=re.search(r"FIELDS=\((.*?)\)\.split\(\)",module,re.S).group(1);strings=re.findall(r"'([^']*)'",decl);assert ''.join(strings).split()==[x.lower() for x in fields[:-1]]
+ p=subprocess.run(['python3',str(T/'fixtures/nord2-wifi-live/test.py'),str(cli)],capture_output=True,text=True);(v.log_dir/'tests.log').write_text(p.stdout+p.stderr);assert p.returncode==0,p.stdout+p.stderr
+ r=json.loads(p.stdout);r['source_pins']={str(x.relative_to(R)):hashlib.sha256(x.read_bytes()).hexdigest() for x in(h,c)};r['cli_sha256']=hashlib.sha256(cli.read_bytes()).hexdigest();(v.log_dir/'report.json').write_text(json.dumps(r,indent=2)+'\n');print(json.dumps(r,indent=2))

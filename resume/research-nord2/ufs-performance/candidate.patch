@@ -1,0 +1,137 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -208,6 +208,14 @@
+ 	uint64_t command_ticks, command_max_ticks, doorbell_ticks, doorbell_max_ticks;
+ 	uint64_t errors, timeouts;
+ } nord2_ufs_stats;
++/* Candidate instrumentation only: mapped nonzero strategy buffers. Times
++ * include descheduling; aggregate waiter times overlap and are not boot wall. */
++static struct nord2_ufs_strategy_stats {
++	uint64_t buffers, read_buffers, requested_bytes, rmw_reads;
++	uint64_t map_ticks, mutex_wait_ticks, mutex_wait_max, held_ticks, copy_ticks;
++	uint64_t raw_buffers, cluster_buffers, pageio_buffers, async_buffers;
++	uint64_t sizes[8]; /* <=4/8/16/32/64/256/1024KiB, then larger */
++} nord2_ufs_strategy_stats;
+ static struct nord2_ufs_link_stats {
+ 	uint32_t values[6], valid_mask, completed, result;
+ 	int error;
+@@ -370,6 +378,7 @@
+ {
+ 	if (!nord2_ufs_profile_enabled) { return; }
+ 	struct nord2_ufs_profile_stats stats;
++	struct nord2_ufs_strategy_stats strategy;
+ 	struct nord2_ufs_link_stats link;
+ 	struct nord2_ufs_limit_stats limits;
+ 	bool pending;
+@@ -377,10 +386,20 @@
+ 	if (nord2_ufs_profile_reported) { lck_mtx_unlock(&sweet_ufs_lock); return; }
+ 	nord2_ufs_profile_reported = true;
+ 	stats = nord2_ufs_stats;
++	strategy = nord2_ufs_strategy_stats;
+ 	link = nord2_ufs_link;
+ 	limits = nord2_ufs_limits;
+ 	pending = nord2_ufs_uic_pending;
+ 	lck_mtx_unlock(&sweet_ufs_lock);
++	printf("NORD2 UFS STRATEGY: buffers=%llu reads=%llu requested_bytes=%llu rmw_reads=%llu\n",
++	    strategy.buffers, strategy.read_buffers, strategy.requested_bytes, strategy.rmw_reads);
++	printf("NORD2 UFS PHASES: map=%llu mutex_wait=%llu mutex_wait_max=%llu held=%llu copy=%llu\n",
++	    strategy.map_ticks, strategy.mutex_wait_ticks, strategy.mutex_wait_max, strategy.held_ticks, strategy.copy_ticks);
++	printf("NORD2 UFS CALLERS: raw=%llu cluster=%llu pageio=%llu async=%llu\n",
++	    strategy.raw_buffers, strategy.cluster_buffers, strategy.pageio_buffers, strategy.async_buffers);
++	printf("NORD2 UFS SIZES: le4k=%llu le8k=%llu le16k=%llu le32k=%llu le64k=%llu le256k=%llu le1m=%llu larger=%llu\n",
++	    strategy.sizes[0], strategy.sizes[1], strategy.sizes[2], strategy.sizes[3],
++	    strategy.sizes[4], strategy.sizes[5], strategy.sizes[6], strategy.sizes[7]);
+ 	printf("NORD2 UFS PROFILE: freq=%llu commands=%llu reads=%llu writes=%llu syncs=%llu read_bytes=%llu write_bytes=%llu cmd_ticks=%llu cmd_max=%llu doorbell_ticks=%llu doorbell_max=%llu errors=%llu timeouts=%llu\n",
+ 	    __builtin_arm_rsr64("CNTFRQ_EL0"), stats.commands, stats.reads, stats.writes,
+ 	    stats.syncs, stats.read_bytes, stats.write_bytes, stats.command_ticks,
+@@ -1323,12 +1342,39 @@
+ 	if (count == 0) {
+ 		goto done;
+ 	}
++#if defined(NORD2)
++	bool measure = nord2_ufs_profile_enabled;
++	uint64_t map_begin = measure ? nord2_ufs_counter() : 0;
++#endif
+ 	if (buf_map(bp, &vaddr)) {
+ 		error = EIO;
+ 		goto done;
+ 	}
+ 
++#if defined(NORD2)
++	uint64_t wait_begin = measure ? nord2_ufs_counter() : 0;
++#endif
+ 	lck_mtx_lock(&sweet_ufs_lock);
++#if defined(NORD2)
++	uint64_t held_begin = measure ? nord2_ufs_counter() : 0;
++	if (measure) {
++		struct nord2_ufs_strategy_stats *p = &nord2_ufs_strategy_stats;
++		p->buffers++; p->read_buffers += rd; p->requested_bytes += count;
++		p->map_ticks += wait_begin - map_begin;
++		uint64_t wait = held_begin - wait_begin;
++		p->mutex_wait_ticks += wait;
++		if (wait > p->mutex_wait_max) { p->mutex_wait_max = wait; }
++		unsigned flags = buf_flags(bp);
++		p->raw_buffers += (flags & B_RAW) != 0;
++		p->cluster_buffers += (flags & B_CLUSTER) != 0;
++		p->pageio_buffers += (flags & B_PAGEIO) != 0;
++		p->async_buffers += (flags & B_ASYNC) != 0;
++		static const uint32_t ends[7] = {4096,8192,16384,32768,65536,262144,1048576};
++		unsigned bucket = 0;
++		while (bucket < 7 && count > ends[bucket]) { bucket++; }
++		p->sizes[bucket]++;
++	}
++#endif
+ 	for (uint32_t done = 0; done < count;) {
+ 		uint64_t pos = off + done;
+ 		uint64_t lba = pos / UFS_BLOCK;
+@@ -1339,15 +1385,30 @@
+ 		if (rd) {
+ 			error = ufs_read_blocks(su.first_block + lba, blocks);
+ 			if (!error) {
++#if defined(NORD2)
++				uint64_t copy_begin = measure ? nord2_ufs_counter() : 0;
++#endif
+ 				memcpy(vaddr + done, (const char *)bounce + skip, want);
++#if defined(NORD2)
++				if (measure) { nord2_ufs_strategy_stats.copy_ticks += nord2_ufs_counter() - copy_begin; }
++#endif
+ 			}
+ 		} else {
+ 			/* Partial device blocks at either end: read, merge, write back. */
+ 			if (skip || (want % UFS_BLOCK)) {
++#if defined(NORD2)
++				if (measure) { nord2_ufs_strategy_stats.rmw_reads++; }
++#endif
+ 				error = ufs_read_blocks(su.first_block + lba, blocks);
+ 			}
+ 			if (!error) {
++#if defined(NORD2)
++				uint64_t copy_begin = measure ? nord2_ufs_counter() : 0;
++#endif
+ 				memcpy((char *)bounce + skip, vaddr + done, want);
++#if defined(NORD2)
++				if (measure) { nord2_ufs_strategy_stats.copy_ticks += nord2_ufs_counter() - copy_begin; }
++#endif
+ 				error = ufs_write_blocks(su.first_block + lba, blocks);
+ 			}
+ 		}
+@@ -1357,6 +1418,9 @@
+ 		done += want;
+ 		buf_setresid(bp, count - done);
+ 	}
++#if defined(NORD2)
++	if (measure) { nord2_ufs_strategy_stats.held_ticks += nord2_ufs_counter() - held_begin; }
++#endif
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	buf_unmap(bp);
+ 
+@@ -1375,6 +1439,9 @@
+ 	uint64_t *o = (uint64_t *)data;
+ 
+ 	switch (cmd) {
++	case DKIOCGETFEATURES:
++		*f = 0; /* no FUA/barrier/priority/unmap capability advertised */
++		return 0;
+ 	case DKIOCGETBLOCKSIZE:
+ 		*f = su.secsize;
+ 		return 0;

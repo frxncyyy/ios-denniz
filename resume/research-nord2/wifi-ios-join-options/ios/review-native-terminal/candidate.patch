@@ -1,0 +1,61 @@
+--- a/shim/nord2-xnu/wifi_station_transport.c
++++ b/shim/nord2-xnu/wifi_station_transport.c
+@@ -68,7 +68,12 @@
+  return !write&&s->phase==NST_RX_FRAME&&n==s->rx_bytes&&a==q->ring.buffers+4096u*q->next;
+ }
+ int nst_register_write(const struct nst*s,uint32_t a,uint32_t v){if(!source(s)||!s->active)return 0;if(a==0x18025418)return s->phase==NST_TX_PUBLISH&&s->wire_busy&&!s->published&&v==(s->tx_next+1)%1024;if(s->rx_current>=5||s->phase!=NST_RX_PUBLISH)return 0;const struct ncr_queue*q=&s->queue[s->rx_current];return a==q->ring.base+8&&v==q->next;}
+-static int before(struct nst*s,const struct ncd_io*o,void*c){uint64_t now;if(!nst_lease_window(s,s->init)||o->bus->owner(c)||o->now_us(c,&now)||now<s->last)return fail(s,1);s->last=now;if(!s->controlled_port&&now>=s->deadline)return fail(s,2);if((s->wire_busy||s->air_pending)&&s->published&&now>=s->operation_deadline)return fail(s,3);if(s->channel_held&&s->grant_deadline&&now>=s->grant_deadline&&!s->cleanup_started)return fail(s,4);return 0;}
++/* A missing security/cleanup-deauth TXS after verified DDONE is a negative
++ * frame outcome, not unknown host DMA ownership. It never supplies success.
++ * Cleanup frame() admits only deauth; ordinary management/data remain strict.
++ * Commands, ordinary data and every pre-DDONE timeout remain fail-closed. */
++static int retired_air_failure(const struct nst*s){return (s->wire_type==2||(s->cleanup_started&&s->wire_type==1))&&s->air_pending&&s->dma_done&&!s->wire_busy&&s->submitted==s->dma_completed;}
++static int before(struct nst*s,const struct ncd_io*o,void*c){uint64_t now;if(!nst_lease_window(s,s->init)||o->bus->owner(c)||o->now_us(c,&now)||now<s->last)return fail(s,1);s->last=now;if(!s->controlled_port&&now>=s->deadline)return fail(s,2);if((s->wire_busy||s->air_pending)&&s->published&&now>=s->operation_deadline&&!retired_air_failure(s))return fail(s,3);if(s->channel_held&&s->grant_deadline&&now>=s->grant_deadline&&!s->cleanup_started)return fail(s,4);return 0;}
+ static int rr(struct nst*s,const struct ncd_io*o,void*c,uint32_t a,uint32_t*v){return before(s,o,c)||o->bus->reg_read(c,a,v)?fail(s,5):0;}
+ static int rw(struct nst*s,const struct ncd_io*o,void*c,uint32_t a,uint32_t v){if(before(s,o,c)||!nst_register_write(s,a,v))return fail(s,6);s->mutated=1;return o->bus->reg_write(c,a,v)?fail(s,6):0;}
+ static int mr(struct nst*s,const struct ncd_io*o,void*c,uint64_t a,void*p,uint32_t n){return before(s,o,c)||!nst_memory_range(s,a,n,0)||o->bus->mem_read(c,a,p,n)?fail(s,7):0;}
+@@ -175,7 +180,16 @@
+  if(!source(s)||s->active||s->callback_active||!o||!o->bus||!o->now_us||!o->bus->owner||!o->bus->reg_read||!o->bus->reg_write||!o->bus->mem_read||!o->bus->mem_write||!o->bus->sync||!budget||budget>16)return -1;
+  s->active=1;s->entered=1;s->phase=NST_IDLE;if(before(s,o,c)||coherent(s,o,c)||transmit(s,o,c,fn,ctx))return -1;
+  static const unsigned order[5]={0,2,3,4,1};unsigned used=0;while(used<budget){unsigned progress=0;for(unsigned j=0;j<5&&used<budget;j++){int e=receive(s,o,c,order[j],fn,ctx);if(e<0)return -1;if(e){used++;progress++;}}if(!progress)break;}
+- if(s->air_pending&&s->air_done&&s->dma_done){struct nst_event e={.kind=NST_FRAME_RESULT,.ticket=s->ticket,.status=s->air_status,.pid=(uint8_t)s->wire_pid,.wlan=(uint8_t)s->wire_wlan};s->air_pending=0;s->next_pid=s->wire_pid==127?1:s->wire_pid+1;if(emit(s,fn,ctx,&e))return -1;}
++ if(s->air_pending&&s->dma_done&&(s->air_done||(retired_air_failure(s)&&s->last>=s->operation_deadline))){
++  /*0x100 is explicitly local timeout, outside every firmware8-bit status.
++   * Advance the retired PID before callback/cleanup; a late old TXS may not
++   * complete the next deauthentication. No authorization follows failure. */
++  unsigned status=s->air_done?s->air_status:NST_TX_LOCAL_TIMEOUT;
++  struct nst_event e={.kind=NST_FRAME_RESULT,.ticket=s->ticket,.status=status,.pid=(uint8_t)s->wire_pid,.wlan=(uint8_t)s->wire_wlan};
++  s->air_pending=0;s->next_pid=s->wire_pid==127?1:s->wire_pid+1;
++  if(status==NST_TX_LOCAL_TIMEOUT)nst_close_port(s);
++  if(emit(s,fn,ctx,&e))return -1;
++ }
+  if(peer_progress(s,fn,ctx))return -1;s->phase=NST_IDLE;s->active=0;return 0;
+ }
+ /* Original legacy policy: bit4/5 are unsupported22/33Mbps, not OFDM6/9. */
+--- a/shim/nord2-xnu/wifi_station_transport.h
++++ b/shim/nord2-xnu/wifi_station_transport.h
+@@ -7,6 +7,9 @@
+ #define NST_MAX_ETHERNET 1514u
+ #define NST_RX_BYTES 3840u
+ #define NST_FRAME_BYTES 1600u
++/* FRAME_RESULT status0..255 is firmware status. This disjoint local value
++ * is negative-only, after proved DDONE; it never means air success/ACK. */
++#define NST_TX_LOCAL_TIMEOUT 0x100u
+ /* Only the actual CAP worker may prepare/run this object. The native binder
+  * authenticates exact addresses/thread; these public structs alone grant no IO. */
+ enum nst_kind {NST_NONE,NST_COMMAND_DMA,NST_FRAME_RESULT,NST_CHANNEL_GRANT,
+--- a/shim/nord2-xnu/wifi_station_transaction.c
++++ b/shim/nord2-xnu/wifi_station_transaction.c
+@@ -93,7 +93,11 @@
+ int stc_receipt(struct stc*s,uint64_t gen,uint64_t ticket,int success,uint64_t now){
+  if(!current(s,gen,now)||!ticket||ticket!=s->action.ticket||!s->action.kind)return 0;
+  unsigned phase=s->phase;erase(&s->action,sizeof s->action);
+- if(success!=1){if(phase>=STC_DEAUTH)return halt(s);return stop(s,STC_FAILED);}
++ /* Deauthentication is best-effort over air, not a firmware retirement
++  * barrier. A negative air result must still run actual key/peer cleanup.
++  * Failed command deletion/retirement remains fatal. Native unknown-DMA
++  * failures never deliver an air receipt and keep their retained halt. */
++ if(success!=1){if(phase==STC_DEAUTH)return cleanup_next(s);if(phase>=STC_DEAUTH)return halt(s);return stop(s,STC_FAILED);}
+  size_t n=0;
+  switch(phase){
+  case STC_PREPARE:s->channel_held=1;if(emit(s,STC_CHANNEL,STC_CID_CHANNEL)<0)return -1;if(sw_channel(s->action.payload,sizeof s->action.payload,&n,&s->channel))return stop(s,STC_FAILED);s->action.bytes=(unsigned)n;return 1;

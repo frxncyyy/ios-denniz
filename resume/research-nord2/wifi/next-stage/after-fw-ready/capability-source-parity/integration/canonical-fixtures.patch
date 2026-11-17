@@ -1,0 +1,119 @@
+--- a/tools/fixtures/nord2-wifi-capability/test-native-adapter.c
++++ b/tools/fixtures/nord2-wifi-capability/test-native-adapter.c
+@@ -49,7 +49,10 @@
+ static void panic(const char*s){assert(strstr(s,"manual reset"));panic_count++;longjmp(terminal,2);}
+ #include "wifi_capability_bind.inc"
+ static void native_fixture(void){nwm_drain_entered=drain_blocks=drain_waiting=0;sleepable=1;fixture();memset(&ncd_native,0,sizeof(ncd_native));memset(&nwfn_native,0,sizeof(nwfn_native));nwfn_native.init=init;nwfn_native.stage=NWFN_RETAINED;nfp_native=firmware;nfp_native.host_io=npa_native.host;nwfn_main.ready=1;nwfn_main.halt=0;flag=1;spawns=deallocations=spawn_error=panic_count=parked=0;running_thread=1;worker_entry=0;model=(struct mock){.txidx=3,.rxidx=3};}
+-int main(void){native_fixture();flag=0;ncd_schedule();assert(!spawns&&!model.calls);
++#ifndef NCD_NATIVE_FIXTURE_MAIN
++#define NCD_NATIVE_FIXTURE_MAIN main
++#endif
++int NCD_NATIVE_FIXTURE_MAIN(void){native_fixture();flag=0;ncd_schedule();assert(!spawns&&!model.calls);
+  native_fixture();nfp_native.ready=0;ncd_schedule();assert(!spawns&&!model.calls);
+  native_fixture();spawn_error=1;ncd_schedule();assert(spawns==1&&!model.calls&&ncd_native.schedule_error==5);ncd_schedule();assert(spawns==1);
+  native_fixture();ncd_schedule();assert(spawns==1&&deallocations==1&&worker_entry&&!model.calls);assert(ncd_native_owner(&ncd_native)<0&&!model.calls);running_thread=2;
+@@ -65,4 +68,5 @@
+  }
+  puts("PASS capability uncertain-transaction failure: sharedhalt before actual fixed30s scheduler drain, unsafe-context skip thenpanic, no postfailure backend callback.");
+  puts("PASS native capability adapter: default off, real receipt gating, deferred dedicated worker, exact worker/pointer ownership, actual clock conversion boundary, static buffers, one-use schedule, wrong-thread refusal, parked retained success and shared-halt/panic on uncertainty. Synthetic model only.");
++ return 0;
+ }
+--- a/tools/fixtures/nord2-wifi-capability/test-dispatcher.c
++++ b/tools/fixtures/nord2-wifi-capability/test-dispatcher.c
+@@ -19,8 +19,9 @@
+  case 0x18025418:*v=m->txidx;break;case 0x1802541c:*v=m->timeout?3:m->txidx;break;
+  case 0x1802550c:*v=m->rxidx;break;case 0x18024200:case 0x18025200:*v=(m->coherent==1||(m->coherent==2&&m->frame_copied))?0x100000:0;break;default:assert(0);}
+  return 0;}
++static unsigned diagnostic_fault;
+ static void event(struct mock*m,unsigned ring,unsigned kind){
+- struct nwt_state*t=&init.transport;uint8_t*d=ptr(t->rx_ring+16*ring,16),*p=ptr(t->rx_buffers+4096*ring,64);unsigned bytes=kind?56:48;
++ struct nwt_state*t=&init.transport;uint8_t*d=ptr(t->rx_ring+16*ring,16),*p=ptr(t->rx_buffers+4096*ring,64);unsigned bytes=kind?56:48;if(m->mode>=100)bytes=504;if(diagnostic_fault==3)bytes=39;
+  memset(p,0,64);p[3]=0x38;p[27]=0xe0;p[28]=kind==0?0x27:0xec;p[29]=t->next_sequence-(kind==2);
+  if(kind==0){p[38]=3;p[44]=0;}
+  else {p[36]=1;put(p+40,7);put(p+44,8);p[48]=2;p[49]=4;}
+@@ -29,7 +30,14 @@
+  if(m->mode==4)p[28]=0xf0;
+  if(m->mode==5){p[28]=0x27;p[38]=3;p[44]=0xff;p[45]=0xff;}
+  if(m->mode==7){p[28]=0xec;p[29]=t->next_sequence;p[36]=1;put(p+44,0xffffffffu);}
+- put(d+4,(bytes<<16)|0xc0000000u);if(m->mode==8)put(d+8,1);if(m->mode==9)put(d+4,(bytes<<16)|0x80000000u);
++ if(m->mode>=100){p[0]=504&255;p[1]=504>>8;p[24]=480&255;p[25]=480>>8;p[26]=(m->mode-100)&255;p[27]=(m->mode-100)>>8;}
++ if(diagnostic_fault==1)p[2]=1;
++ if(diagnostic_fault==2)p[28]=0xed;
++ if(diagnostic_fault==4)put(p+44,0xffffffffu);
++ if(diagnostic_fault==5){p[36]=2;put(p+56,7);put(p+60,8);}
++ if(diagnostic_fault==7){p[28]=0x27;p[38]=2;}
++ if(diagnostic_fault==8)p[29]=3;
++ put(d+4,(bytes<<16)|0xc0000000u);if(diagnostic_fault==6)put(d+8,1);if(m->mode==8)put(d+8,1);if(m->mode==9)put(d+4,(bytes<<16)|0x80000000u);
+ }
+ static int rw(void*c,uint32_t a,uint32_t v){struct mock*m=c;int error=step(m);m->writes++;
+  if(a==0x18025418){assert(m->synctx&&m->syncdesc);unsigned previous=m->txidx;m->txidx=v;uint8_t*d=ptr(init.transport.tx_ring+16*previous,16);put(d+4,(get(d+4)|0x80000000u)&(m->mode==6?~0x40000000u:0xffffffffu));
+@@ -39,8 +47,8 @@
+   if(m->mode==15){put(d+4,0x80000000u);put(d,0);}
+   if(m->mode==16){put(d+4,0x80000000u);put(d+8,1);}
+   if(m->mode==17){put(d+4,0x80000000u);put(d+12,1);}
+-  unsigned count=m->mode==1?1:m->mode==2?15:3;m->events=count;
+-  for(unsigned k=0;k<count;k++)event(m,(3+k)%16,m->mode==1?1:m->mode==2?0:k==0?0:k==1?2:1);
++  unsigned count=m->mode>=100?1:m->mode==1?1:m->mode==2?15:3;m->events=count;
++  for(unsigned k=0;k<count;k++)event(m,(3+k)%16,m->mode>=100?1:m->mode==1?1:m->mode==2?0:k==0?0:k==1?2:1);
+   m->rxidx=(3+count)%16;
+  }else {assert(a==0x18025508);m->rxpub++;if(m->mode==2&&m->rxpub==1){event(m,2,0);m->rxidx=3;}assert(v==(3+m->rxpub-1)%16);}
+  return error;}
+--- /dev/null
++++ b/tools/fixtures/nord2-wifi-capability/test-header.c
+@@ -0,0 +1,56 @@
++#define NCD_NATIVE_FIXTURE_MAIN header_fixture_main
++#include "test-native-adapter.c"
++#include <stddef.h>
++int main(void){
++ /* Every u16 inner type is captured byte-exact before the unchanged policy.
++  * All inner values remain opaque only on the exact bounded capability path. */
++ for(unsigned type=0;type<=65535;type++){
++  fixture();struct mock m={.txidx=3,.rxidx=3,.mode=100+type};struct ncd_state s={0};
++  int rc=ncd_run(&io,&m,&init,&firmware,&s,1);
++  assert(s.events==1&&s.history[0].header_valid==1&&s.history[0].inner_type==type);
++  struct ncd_event*h=&s.history[0];
++  assert(h->bytes==504&&h->rxd_bytes==504&&h->event_bytes==480&&h->rx_class==0x3800&&h->eid==0xec&&h->sequence==4);
++  assert(!memcmp(h->header,s.frame,36));
++  assert(!rc&&s.completed&&s.rearmed==1&&h->kind==1&&!s.halt&&!s.error);
++  unsigned calls=m.calls;assert(ncd_run(&io,&m,&init,&firmware,&s,1)<0&&m.calls==calls);
++ }
++ /* Opaque inner metadata cannot bypass outer/EID/descriptor/TLV/debug
++  * guards, and sequence metadata retains the source-selected semantics. */
++ const unsigned types[]={0,7,0xe000,65535};
++ for(unsigned ti=0;ti<4;ti++)for(diagnostic_fault=1;diagnostic_fault<=8;diagnostic_fault++){
++  fixture();struct mock m={.txidx=3,.rxidx=3,.mode=100+types[ti]};struct ncd_state s={0};
++  int rc=ncd_run(&io,&m,&init,&firmware,&s,1);
++  if(diagnostic_fault==1){assert(!s.history[0].header_valid&&!s.history[0].inner_type);for(unsigned k=0;k<36;k++)assert(!s.history[0].header[k]);}
++  if(diagnostic_fault==8){assert(!rc&&s.completed&&s.rearmed==1&&!s.sequence_echo&&s.sequence_mismatches==1);}
++  else{assert(rc<0&&!s.completed&&!s.matched&&!s.rearmed&&s.halt&&init.halt&&init.transport.halt);}
++ }
++ diagnostic_fault=0;
++ /* Redundant inner guard is removed from the pure parser only; wrong EID,
++  * wrong supplied sequence and every structurally incomplete extent refuse,
++  * preserving the output object atomically. No raw MAC is printed. */
++ uint8_t packet[504]={0};packet[3]=0x38;packet[28]=0xec;packet[29]=4;packet[36]=1;put(packet+40,7);put(packet+44,8);packet[48]=2;
++ for(unsigned ti=0;ti<4;ti++){
++  packet[26]=types[ti]&255;packet[27]=types[ti]>>8;
++  struct ncp_result r,before;memset(&r,0xa5,sizeof(r));before=r;
++  for(unsigned n=0;n<56;n++){assert(ncp_parse(packet,n,4,&r)<0&&!memcmp(&r,&before,sizeof(r)));}
++  packet[2]=1;assert(ncp_parse(packet,sizeof(packet),4,&r)<0&&!memcmp(&r,&before,sizeof(r)));packet[2]=0;
++  packet[3]=0;assert(ncp_parse(packet,sizeof(packet),4,&r)<0&&!memcmp(&r,&before,sizeof(r)));packet[3]=0x38;
++  packet[28]=0xed;assert(ncp_parse(packet,sizeof(packet),4,&r)<0&&!memcmp(&r,&before,sizeof(r)));packet[28]=0xec;
++  assert(ncp_parse(packet,sizeof(packet),3,&r)<0&&!memcmp(&r,&before,sizeof(r)));
++  assert(!ncp_parse(packet,sizeof(packet),4,&r)&&r.decoded&&r.mac_valid);
++  packet[3]=0x78;assert(!ncp_parse(packet,sizeof(packet),4,&r));packet[3]=0x38;
++  packet[2]=0x10;assert(!ncp_parse(packet,sizeof(packet),4,&r));packet[2]=0;
++ }
++ /* Native success report uses retained header after completion/parking. */
++ native_fixture();ncd_schedule();model.mode=107;running_thread=2;
++ int end=setjmp(terminal);if(!end)worker_entry(0,0);
++ assert(end==1&&!panic_count&&!nwm_drain_entered&&!drain_blocks&&!ncd_native.halt&&!nwfn_native.halt&&!nwfn_native.init.halt&&!nfp_native.halt&&ncd_native.parked);
++ assert(ncd_native.diag.history[0].inner_type==7&&ncd_native.diag.history[0].header_valid==1&&!ncd_native.diag.error&&ncd_native.diag.rearmed==1);
++ unsigned calls=model.calls;
++ /* Poison every body byte in retained copy after completion. Header logging must
++  * remain identical and never observe any payload/TLV/MAC body byte. */
++ memset(ncd_native.diag.frame+36,0xa5,sizeof(ncd_native.diag.frame)-36);
++ ncd_report(0);assert(model.calls==calls&&!model.after);
++ printf("PASS header-only diagnostics: all65536 inner types captured; opaque inner only for bounded EIDec;32crossed guard cases and224pure truncations and8wrongouter atomic refusals; actual-shaped504/480 synthetic match; no after-completion callbacks/body output; eventsize=%zu state=%zu headeroffset=%zu. NO actual inner value inferred.\n",sizeof(struct ncd_event),sizeof(struct ncd_state),offsetof(struct ncd_event,header));
++ return 0;
++}

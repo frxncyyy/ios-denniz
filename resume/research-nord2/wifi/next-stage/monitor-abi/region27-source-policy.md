@@ -1,0 +1,36 @@
+# Selected region27 initialization: source and monitor contract
+
+Offline only,2026-10-21. No SET, alternate FID, device/USB/CI, target execution, implementation or active change. `region27-source-policy.json` pins selected source04d00c2565764c3922c9b4826b5acff1106e533f and original tee1 plus independently byte-checked bounded `region27-source-policy-disasm.txt`. Current monitor identity is still not attested. This report answers what initialization does, rather than inferring its runtime success from the unsupported getter.
+
+Authoritative selected Linux path:
+
+`consys_hw.c:760` calls `emi_mng_init` before `pmic_mng_init`. `mt6893.c:155` selects `g_consys_platform_emi_ops_mt6893`. `emi_mng.c:209-240` resolves CONN base/size from reserved-memory or LK2 properties, resolves CCCI MCIF sharing, then invokes the platform MPU callback. It does not need the read getter. The independent `emi_mng_set_region_protection` wrapper exposes the same callback, but no other caller was found in the bounded conninfra C search. Later power-on remap at `consys_hw.c:364` is a distinct HOST register operation, not MPU policy setup.
+
+`mt6893_emi.c:88-103` initializes region27, sets [gConEmiPhyBase,gConEmiPhyBase+size-1], assigns APdomain0/CONN2/SCP3 unrestricted, calls protection setter then frees software storage. Region initialization `emimpu_old.c:690-727` sets all16 domains forbidden5 and lock=false. Other13 domains stay5. Source APIs do not silently grant every domain. Saved historical CONN8fb00000+450000 gives inclusive8ff4ffff; this is historical chosen address provenance, not current exclusive ownership.
+
+Exact ARM64 caller packing (`emimpu_old.c:819-860`, header `MTK_SIP_EMIMPU_CONTROL=SMC64function50b`, SET=0):
+
+| Order | Group | x0 | x1 | x2 packed start | x3 packed end | x4 requested APC |
+|---|---:|---|---:|---|---|---|
+| 1 | 1 | c200050b | 0 | 1b008fb0 | 01008ff4 | 00b6db6d |
+| 2 | 0 | c200050b | 0 | 1b008fb0 | 00008ff4 | 00b6d028 |
+
+x5..7zero. Start=(physicalstart>>16)|(region<<24); end=(physicalinclusiveend>>16)|(group<<24). Each group packs eight3bit fields. These are physical-address units, **not** already DRAM-relative4fb0/4ff4. Backed-up setter subtracts4000 before register writes. Source lock=false means Linux does not requestbit31; the monitor still forces lock as below.
+
+Linux return0 does not establish acceptance. `mtk_emimpu_set_protection` checks platform/APC availability then calls both groups while ignoring `smc_res`; returns0 after issuing calls. MT6893 callback ignores every helper return and returns0. `emi_mng_init` ignores callback return and returns0. Historical Android remap log/working Wi-Fi therefore corroborates a functioning Linux path, but cannot supply exact SET return/error evidence or prove inherited XNU permissions.
+
+Backed-up ATF action0 contract, using original file offsets:
+
+- Existing dual50b dispatcher passes originalx1 action into helperd30c. For action0, it invokes validator1d75c using region from packedstart. The validator consults runtime table entries, can return nonzero0x200c, and that result is propagated; table identity/contents are not established. Do not reduce all failures to four negative SiP codes.
+- d220 validates region<=31,group<=2; software lock byte1 returns-4 before hardware writes. Low24 end must be>=start and start>3fff or returns-3. Candidate source groups are only1and0, despite firmware accepting a wider group bound.
+- **Monitor forces group0 lock.** ed84-ed98 checks action0 and originalx3groupbits31:24==0, then ORs originalx4bit31 unconditionally. d260-d26c sets region software lock byte when group0/bit31. This occurs before subsequent range validation/MMIOwrites. Thus Linuxlock=false does not keep this monitor's region unlocked. Calling group0 can create a one-way software lock even though raw hardware APC payload later masks00ffffff.
+- After validation d28c/d2a0 subtract4000 from start/end units; writes32bit SA/EA/APC across10226000 and10225000 MPU controller banks with barriers. Group1 APC address1022646c/group0 APC1022636c for region27; SA1022616c/EA1022626c. Mirror addresses are1000lower. Hardware APC writes drop high bits. Successful return0 follows stores/barriers; no register readback is performed in this helper.
+- Existing lock/validator rejection can prevent writes. Group1 success followed by group0 rejection/error can leave partial policy. Group0 software locking precedes hardware update, so uncertainty can retain a new lock without a proved complete policy. No unreviewed replay, CLEAR, unlock or restoration follows from this analysis. Structured CLEAR1 in the same backed-up handler is not the expected Linux clear implementation; prior report shows nonzero action1 simply returns1.
+
+Can source-owned setup exist without a getter? Yes: selected Linux establishes intended region27 policy by explicit initialization; it never requires the getter to set it. An unsupported read does not invalidate the source sequence, nor block current persistent CONN register initialization. A future separately authorized source-owned initialization can be designed around exact request fields, complete return/error evidence, irreversible software-lock/partial-failure semantics and an accepted platform policy model. The getter is not itself a mandatory mechanism.
+
+What cannot be claimed now: current region27 lock/policy, actual current setter route/acceptance, ability to reverse or restore unknown prior policy, or effective AP/CONN access under unknown overlapping regions/master routing. A source request and a successful barrier-return setter would establish a performed source policy operation under its attested contract; they are not a readback of all policy state. Do not convert ignored Linuxreturn0 or unsupported getter-1 into that evidence.
+
+Precise next gap before ROM placement: choose and review the **source-owned carveout policy initialization** contract as a distinct persistent and potentially one-way MPU change, with exact region27/base/size/domain scope, current monitor/SET acceptance expectations, rejection/partial-update halting and explicit approval. Independently discharge ownership/cache-alias/mapping rules for the four planned ROM/datecode spans. `wifi_rom_transaction.h` permission/reservation/noalias/exclusive checks are assertions from a future audited adapter; no getter result is prescribed by those interfaces, and they must not be filled with an arbitrarytrue callback. Current register-only historical-base provenance is insufficient for writing DRAM. If no approved source-owned policy/ownership contract exists yet, placement stays unimplemented, without blocking phase10.
+
+Ordering with persistent phase10: Linux's MPU initialization precedes PMIC/power-on, while existing persistent implementation deliberately closes at HW-control handoff. Any subsequent CONN register/ROM execution operation needs a separately source-backed wake/access boundary; do not resume generic MMIO guards after terminal handoff. Parent/author should stage that boundary and policy/ROM consumer explicitly rather than retrofit the unsupported observer as a success gate. No CPU release, ROM_DONE, RF or networking readiness follows from region27 source policy alone.

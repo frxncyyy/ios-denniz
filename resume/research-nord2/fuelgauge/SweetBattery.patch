@@ -1,0 +1,93 @@
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -15,6 +15,12 @@
+ extern "C" void nord2_stop_at(unsigned int point, const char *label);
+ #endif
+ #include <pexpert/pexpert.h>
++#if defined(NORD2)
++extern "C" {
++#include "nord2_battery.h"
++int nord2_battery_platform_sample(struct nbg_sample *);
++}
++#endif
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+@@ -36,6 +42,9 @@
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
+ 	void poll(void);
++#if defined(NORD2)
++	void pollNord2(void);
++#endif
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value);
+@@ -206,9 +215,53 @@
+ 	return 100;
+ }
+ 
++#if defined(NORD2)
++void
++SweetBattery::pollNord2(void)
++{
++ struct nbg_sample s = {};
++ int rc = fReal ? nord2_battery_platform_sample(&s) : -1;
++ if(rc != 0){s = (struct nbg_sample){};}
++ bool valid = rc == 0 && s.soc_valid && s.percent <= 100;
++ /* Percentage units on BOTH capacity keys; never claim5020mAh for Nord2.
++  * No voltage-derived SOC or fabricated100% on disabled/transport failure.
++  * MaxCapacity0 + ErrorCondition explicitly invalidates unavailable SOC. */
++ setBatteryInstalled(true);
++ setCurrentCapacity(valid ? s.percent : 0);
++ setMaxCapacity(valid ? 100 : 0);
++ setTimeRemaining(-1);
++ setExternalConnected(s.charger_valid && s.external);
++ setExternalChargeCapable(s.charger_valid && s.external);
++ setIsCharging(s.charger_valid && s.charging);
++ setVoltage(s.voltage_valid ? s.pack_mv : 0);
++ setAmperage(s.current_valid ? s.current_ma : 0);
++ setAtWarnLevel(false); setAtCriticalLevel(false);
++ putBool("FullyCharged", s.charger_valid && s.full);
++ putBool("Nord2BatterySOCValid", valid);
++ putBool("Nord2BatteryGaugeComputedSOC", valid);
++ putBool("Nord2BatterySOCStale", !valid);
++ putBool("Nord2BatteryChargerValid", s.charger_valid);
++ putBool("Nord2BatteryCurrentValid", s.current_valid);
++ putBool("Nord2BatteryVoltageValid", s.voltage_valid);
++ putBool("Nord2BatteryTemperatureValid", s.temperature_valid);
++ putNumber("Temperature", s.temperature_valid ? (UInt32)s.temperature_centi_c : 0);
++ putBool("SweetBatterySOCEstimated", false);
++ putBool("SweetBatteryTemperatureEstimated", false);
++ putBool("SweetBatteryFallback", false);
++ const OSSymbol *error = OSSymbol::withCString(valid ? "" : "Battery sample unavailable");
++ if(error){setErrorCondition((OSSymbol *)error);error->release();}
++ updateStatus();
++ int mode = valid ? 2 : 3;
++ if(mode != fLastMode){IOLog("NORD2 BATTERY: soc_valid=%d percent=%u charger_valid=%u external=%u charging=%u\n",valid,valid?s.percent:0,s.charger_valid,s.external,s.charging);fLastMode=mode;}
++}
++#endif
++
+ void
+ SweetBattery::poll(void)
+ {
++#if defined(NORD2)
++ pollNord2();return;
++#endif
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -267,7 +320,12 @@
+ 	}
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_spmi_init() == 0;
++	#if defined(NORD2)
++ real=0;(void)PE_parse_boot_argn("nord2battery", &real, sizeof(real));
++ fReal = real == 1; /*Only read-only Nord2 provider; never Qualcomm SPMI.*/
++#else
++ fReal = real == 1 && sweet_spmi_init() == 0;
++#endif
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {

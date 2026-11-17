@@ -1,0 +1,94 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -199,6 +200,8 @@
+ static bool nord2_ufs_profile_enabled, nord2_ufs_profile_reported;
+ static bool nord2_ufs_uic_pending;
+ static bool nord2_root_owned;
++/* Future isolated diagnostic: never publish/root-return after entering it. */
++static bool nord2_x2_in_progress, nord2_x2_uncertain, nord2_x2_stop;
+ static struct nord2_ufs_profile_stats {
+ 	uint64_t commands, reads, writes, syncs, read_bytes, write_bytes;
+ 	uint64_t command_ticks, command_max_ticks, doorbell_ticks, doorbell_max_ticks;
+@@ -488,6 +491,12 @@
+ #if defined(NORD2)
+ 			if (nord2_ufs_profile_enabled) { nord2_ufs_profile_wait(profile_issued); }
+ #endif
++#if defined(NORD2)
++			if (nord2_x2_in_progress) {
++				nord2_x2_uncertain = true;
++				return ETIMEDOUT; /* preserve outstanding DMA; never abort */
++			}
++#endif
+ 			ufs_wr(REG_UTRLCLR, ~1u);
+ 			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
+ 			return ETIMEDOUT;
+@@ -511,6 +520,10 @@
+ 	/* A timed-out observation may finish late. Preserve its completion for
+ 	 * the bounded recovery drain; SCSI must not consume another owner's UIC. */
+ 	uint32_t status = ufs_rd(REG_IS);
++	if (nord2_x2_in_progress && status != 1u) {
++		nord2_x2_uncertain = true;
++		return EIO; /* retain all unexpected status; no hidden fatal ACK */
++	}
+ 	if (nord2_ufs_uic_pending) { status &= ~N2_UIC_COMPLETE; }
+ 	ufs_wr(REG_IS, status);
+ #else
+@@ -1035,6 +1048,10 @@
+  d.count,d.entry_size,d.entries_crc);
+ }
+ 
++/* Included exactly once; do not also compile a separate module object. */
++#include "ufs_two_lane.c"
++#include "adapter.inc"
++
+ static bool
+ nord2_ufs_wait(uint32_t off, uint32_t mask, uint32_t value)
+ {
+@@ -1065,6 +1082,7 @@
+ static bool
+ nord2_ufs_restore(const struct nord2_ufs_saved *saved)
+ {
++	if (nord2_x2_stop || nord2_x2_uncertain) { return false; }
+ 	if (!nord2_ufs_uic_drain()) { return false; }
+ 	if (ufs_rd(REG_UTRLDBR)) {
+ 		nord2_ufs_write_reg(REG_UTRLCLR, ~1u);
+@@ -1203,6 +1221,7 @@
+ int
+ nord2_ufs_prepare_return(void)
+ {
++	if (nord2_x2_stop || nord2_x2_uncertain) { return -1; }
+ 	if (!nord2_root_owned) {
+ 		return 0;
+ 	}
+@@ -1443,6 +1462,12 @@
+ static int
+ sweet_ufs_init(void)
+ {
++#if defined(NORD2)
++	/* Arm before any allocation/DT failure or panic can enter fallback. */
++	uint32_t x2_stop_optin = 0;
++	PE_parse_boot_argn("nord2ufs2lane", &x2_stop_optin, sizeof(x2_stop_optin));
++	if (x2_stop_optin == 1) { nord2_x2_stop = true; }
++#endif
+ 	DTEntry node;
+ 	uintptr_t const *reg = NULL;
+ 	unsigned int size = 0;
+@@ -1555,6 +1580,18 @@
+ 	}
+ #if defined(NORD2)
+ 	if (!error) { nord2_ufs_profile_link(); }
++	uint32_t x2_optin = 0;
++	PE_parse_boot_argn("nord2ufs2lane", &x2_optin, sizeof(x2_optin));
++	if (x2_optin == 1) {
++		/* Dedicated stop-only mode: even a prior init/profile error cannot
++		 * fall through to root publication or normal Linux chain-back. */
++		nord2_x2_stop = true;
++		struct n2l_result result = { 0 };
++		if (!error) { error = nord2_x2_run(&result); }
++		else { result.error = error; }
++		lck_mtx_unlock(&sweet_ufs_lock);
++		nord2_x2_halt(error, &result); /* never returns, no root published */
++	}
+ #endif
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {

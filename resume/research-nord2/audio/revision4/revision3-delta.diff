@@ -1,0 +1,94 @@
+--- revision3/shim/nord2-xnu/audio_i2c8.c
++++ revision4/shim/nord2-xnu/audio_i2c8.c
+@@ -164,9 +164,9 @@
+ 	}
+ 
+ 	/* 8: all three channels idle; START bit0 TRANSAC_START, bit1 RESUME_ARBIT
+-	 * (i2c-mtk.h:55-56, i2c-mtk.c:1253-1256). DEBUGSTAT bit15 I3C_EN would
+-	 * select the source HFIFO path that this I2C-only transport does not
+-	 * implement (i2c-mtk.c:1029-1040). */
++	 * (i2c-mtk.h:55-56, i2c-mtk.c:1253-1256). The source reads bit15 I3C_EN
++	 * from V2 DMA_FSM_DEBUG at 0xec, not DEBUGSTAT at 0xe4
++	 * (i2c-mtk.h:275,295; i2c-mtk.c:1040). Refuse that separate mode. */
+ 	s->stage = 8;
+ 	R(NA8_SH + 0x24, 2, &s->sh_start);
+ 	if (s->sh_start & 3) { REFUSE(18); }
+@@ -186,7 +186,7 @@
+ 	if (v != 0 && v != 1) { REFUSE(8); }
+ 	R(NA8_CH + 0xf4, 2, &v);
+ 	if (v) { REFUSE(9); }
+-	R(NA8_CH + 0xe4, 2, &s->i3c);
++	R(NA8_CH + 0xec, 2, &s->i3c);
+ 	if (s->i3c & NA8_I3C_EN) { REFUSE(21); }
+ 	if (s->prior_irq == 1) {
+ 		/* Same exact-completion adoption as the reviewed battery handoff;
+--- revision3/shim/nord2-xnu/audio_id_bind.inc
++++ revision4/shim/nord2-xnu/audio_id_bind.inc
+@@ -149,7 +149,7 @@
+ 	if (pa == 0x11d04024 || pa == 0x11d04224 || pa == 0x11d04210 || pa == 0x11d04010 || pa == 0x11d040f4 || pa == 0x11d042f4) { return 1; }
+ 	if ((pa & ~0xffu) != NAB_CH) { return 0; }
+ 	uint32_t off = pa & 0xff;
+-	return nab_ch_config(off) || off == 0x0c || off == 0x24 || off == 0xe4 || off == 0xf4;
++	return nab_ch_config(off) || off == 0x0c || off == 0x24 || off == 0xec || off == 0xf4;
+ }
+ 
+ static int
+--- revision3/tools/fixtures/nord2-audio-i2c8-model.h
++++ revision4/tools/fixtures/nord2-audio-i2c8-model.h
+@@ -18,6 +18,9 @@
+ #define M_SLAVES 7
+ 
+ enum { M_NORMAL, M_HANG, M_BUSERR, M_SLOW };
++/* Selected V2 map: DEBUGSTAT is 0xe4; I3C_EN is read by the driver from
++ * DMA_FSM_DEBUG at 0xec (i2c-mtk.h:275,295; i2c-mtk.c:1040). */
++enum { M_V2_DEBUGSTAT = 0xe4, M_V2_DMA_FSM_DEBUG = 0xec };
+ 
+ struct m_slave {
+ 	uint8_t addr;
+@@ -178,6 +181,9 @@
+ 		return m->rx[m->rxpos++];
+ 	}
+ 	M_CHECK(w == 2 && !(off & 1) && off != 0);
++	/* This PIO derivative has no DEBUGSTAT read; silently treating it as
++	 * DMA_FSM_DEBUG would invalidate the I3C refusal test. */
++	M_CHECK(ch != 1 || off != M_V2_DEBUGSTAT);
+ 	if (ch == 1 && off == 0x0c && m->behaviour == M_SLOW && m->nrx && !m->ch[1][6]) {
+ 		if (++m->polls >= m->slow_polls) { m->ch[1][6] = 1; }
+ 	}
+--- revision3/tools/fixtures/nord2-audio-id-bind.c
++++ revision4/tools/fixtures/nord2-audio-id-bind.c
+@@ -52,9 +52,11 @@
+     setup(2);model.behaviour=M_HANG;nab_audio_id();assert(nab.bus.uncertain&&!nab_prepare_return());
+     before=reads+writes;model.behaviour=M_NORMAL;
+     assert(!nab_prepare_return()&&!nab_prepare_return()&&before==reads+writes);
+-    /* I3C-enabled AP debug status refuses before any write. */
+-    setup(2);model.ch[1][0xe4/2]=0x8000;nab_audio_id();
++    /* I3C_EN lives in AP DMA_FSM_DEBUG 0xec, not DEBUGSTAT 0xe4. */
++    setup(2);model.ch[1][M_V2_DMA_FSM_DEBUG/2]=0x8000;nab_audio_id();
+     assert(!writes&&!model.starts&&nab.bus.failure==21&&nab.bus.offline&&!nab.bus.uncertain&&nab_prepare_return());
++    setup(2);model.ch[1][M_V2_DEBUGSTAT/2]=0x8000;nab_audio_id();
++    assert(nab.probed&&!nab.probe_rc&&model.starts&&nab.bus.i3c==0&&nab_prepare_return());
+     /* CAM power blocks the probe. */
+     setup(2);words[NAU_S_PWR_STATUS]=1u<<23;nab_audio_id();assert(!nab.probed&&!writes&&!model.starts);
+     /* Gated I2C8 leaf: snapshot only. */
+--- revision3/tools/fixtures/nord2-audio-id-core.c
++++ revision4/tools/fixtures/nord2-audio-id-core.c
+@@ -307,10 +307,17 @@
+ 		if (k == 10) { c.m.ch[2][0xf4 / 2] = 1; }
+ 		if (k == 11) { c.m.ifr1 = 0; c.m.dma[2] = 1; }
+ 		if (k == 12) { c.m.ch[2][0x10 / 2] = 4; }
+-		if (k == 13) { c.m.ch[1][0xe4 / 2] = 0x8000; }
++		if (k == 13) { c.m.ch[1][M_V2_DMA_FSM_DEBUG / 2] = 0x8000; }
+ 		assert(na8_read16(&io, &c, &s, 0x34, 3, &v) == -1);
+ 		assert(!c.writes && !c.m.starts && na8_return_ok(&s));
+ 	}
++	/* DEBUGSTAT 0xe4 is distinct: its bit15 cannot stand in for source
++	 * DMA_FSM_DEBUG 0xec bit15. */
++	setup(&c);
++	c.m.ch[1][M_V2_DEBUGSTAT / 2] = 0x8000;
++	s = (struct na8_state){0};
++	assert(na8_read16(&io, &c, &s, 0x34, 3, &v) == 0 && c.m.starts == 1 &&
++	    s.i3c == 0 && na8_return_ok(&s));
+ 	setup(&c);
+ 	s = (struct na8_state){0};
+ 	assert(na8_read16(&io, &c, &s, 0x51, 3, &v) == -1 && !c.calls && !c.writes);

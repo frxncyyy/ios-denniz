@@ -1,0 +1,14 @@
+# Portable boundary: concrete Nord2 implementation checklist
+
+Reference exactTopaz89451b8, backendpatches0126/0129/0130. Publictree exports hooks but lacks their iOSadapterconsumers; do not assume a dropinIO80211 implementation exists.
+
+1. **Backend contract first, inactive bydefault.** ready/state + MAC; asynchronous scan request/completion; scan snapshot with binarySSIDexplicitlength32/BSSID/frequency/RSSI/beaconcapability/fullIEbytes/age; join bySSID/BSSIDoptional and PMK32; disconnect; link/error callback; boundedEthernetTX/RX. Add cancellation/generation IDs and explicit TXbackpressure. Use ENXIO until actualNord2 backendready, no fabricated scanresults/carrier.
+2. **Hostfake adaptertests independent ofRF.** Test malformedIEs/SSIDlength, empty/hiddenSSID, timeout/cancel/restart, disconnectmidTX, boundedqueue ownership and RXmbuf lifetime. Keep requestcompletion off input/IOKitgated threads; Topaz synchronous30swait is not suitable for ourbootinputthread.
+3. **Hardwarebackend mapsselectedMTK semantics.** Retain current verifiedvendorloader, coldcommon/scopedID work. Actualbackend readiness requires A-die/AFE/PLL+ROM placement/remap/CPUboot and gen4m patch/main downloads;4 verifiedfiles is notready. Use MTKscan/association/keys/WFDMAevents/descriptors, never TopazPAS/WLFW/WMI/CE or boardcalibration.
+4. **Separate iOScontrolbridge.** Determine exact iOS16wifid IORegistrymatching/userclient/control/event ABI and implement servicepersonality/control requestvalidation against thisbackend. Accept PMKwithoutloggingsecrets. TopazpublicPMKAPI gives the useful seam but not the missing Appleuserclient ABI. Do not choose fakecapabilities to forceUIready.
+5. **AttachBSDdatapath+IOKitnetworkidentity.** Add real ifnet/TX/RX/carrier and packetownership, then networkinterface discovery/publish needed byconfigd. Existing Nord2USBifnet provides mbuf plumbing examples only; it cannot express scan/join/security byitself.
+6. **ResolveIOKitquiet with evidence.** Measure realbusycount/daemoncompletion before changing lifecycle. Topaz0128 removes an unmatchedrootbusyhold AND paireddecrement; adapt only ifourcapturedstate demonstrates samecause.
+7. **ADTlaunchgate LAST with usablebridge.** Actualcurrentce84ADT children gic/wdt/disp0, no wlan. Later add Nord2-specific `/arm-io/wlan` device_typewlan so launchd's wifidfiltermatches, pairedwithrealservice. Do NOT add a lone wlan node during current power/firmware probes merely tolaunch an unsupporteddaemon.
+8. **Validate separate milestones.** FirmwareROMready -> backendscan -> association+WPA2keyinstall -> BSDcarrier -> DHCP/IP/defaultgateway -> DNS/HTTPS -> Settings/keychainreconnect. Each needs itsown evidence; no networkingclaim from firmwarehash orscan success.
+
+Publicreferences and exactsymbol/ADTsearch evidence: report.md, evidence.json, nord2-actual-adt.json in thisdirectory. No implementation/ADT/daemon/activekernel changes made.

@@ -1,0 +1,5 @@
+Await explicit artifact-ready notice from root. Use bounded extract.py only after that notice. It captures actual kernel identity and public runtime functions; extraction alone is not a verdict.
+
+Shared nwe_sleepy is static inline, so inspect actual CAP event consumer, BASIC drain and normal copied-event classifier, including any compiler-emitted local helper reached by actual public entries. Verify exact outer380f->3800/EID7/min40 path then byte36 load, every uint8 accepted, no inner/sequence/declaredlength echo, and unchanged malformed/unknown/fatal policies. The captured raw state is metadata, never permission to yield driver ownership, sleep, recover or produce firmwareACK.
+
+Trace actual CAP/BASIC same worker and newreport strings/state arithmetic, BASICtotalbudget16 and RXindex, and prior22command/fivequeue readback/done/expiry/zeroBSSID/drain. Inspect linked symbols/disassembly/constantdata; do not rerun source suites or build. Pin report+manifest with exact source/kernel hashes and limitation of static evidence.

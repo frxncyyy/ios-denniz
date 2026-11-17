@@ -1,0 +1,1474 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -144,6 +144,7 @@ bsd/dev/rottenapple_sm5602.c		standard
+ bsd/dev/rottenapple_sc89601a.c		standard
+ bsd/dev/rottenapple_wifi.c		standard
+ bsd/dev/rottenapple_mtk_connsys.c	standard
++bsd/dev/rottenapple_mtk_wfdma.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/rottenapple_mtk_connsys.c
++++ b/bsd/dev/rottenapple_mtk_connsys.c
+@@ -25,6 +25,7 @@
+  *   mediatek,infracfg = "<infracfg_ao syscon>";  mediatek,spm = "<SPM syscon>";
+  *   mediatek,emi = <pa size>;                    (u64; CONNSYS sees it at 0xF0000000)
+  *   mediatek,dma-pool = <pa size>;               (u64; WFDMA rings, from W2 on)
++ *   mediatek,wifi-ram-code = "<file>";            (W2: WIFI_RAM_CODE for the a-die)
+  *   mediatek,adie-id = <0x6631>;                 (expected RF chip)
+  *   mediatek,patches = "<file>", ...;  mediatek,patch-offsets = <EMI offset>, ...;
+  *
+@@ -39,6 +40,9 @@
+  *   patches (48-byte header stripped) into EMI and verify them; EMI entry
+  *   addresses; a-die select; bus timeout; MCU memory power-down delay;
+  *   release the CPU; poll COM_REG0 for the ROM idle code 0x1D1E.
++ * W2 (wifi_on/wifi_off, rottenapple_mtk_wfdma.c): with the CPU at ROM idle,
++ * WFDMA rings in mediatek,dma-pool, RAM-code download, WIFI_START, ready
++ * bits; then DMA off and ownership back before the W1 power-off.
+  * Power-off is the reverse of whatever was done (Linux order: CON_STA,
+  * domain off, PCCIF4 acknowledge, CCIF4 clock, VCN28, pins, VCN33, 300 us,
+  * VCN18). Registers inside the CONNSYS window are only touched while the
+@@ -51,6 +55,7 @@
+ #include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <dev/rottenapple_wifi.h>
++#include <dev/rottenapple_mtk_wfdma.h>
+ 
+ #define CLOG(fmt, ...)  printf("ROTTEN APPLE: wifi connsys: " fmt "\n", ##__VA_ARGS__)
+ 
+@@ -202,6 +207,11 @@ struct connsys {
+ 	} saved[MAX_SAVED];
+ 	unsigned nsaved;
+ 	uint32_t saved_drive;
++	/* W2 */
++	const char *ram_code;
++	uint64_t pool_pa, pool_size;
++	uintptr_t pool;
++	struct mtk_wfdma wlan;
+ };
+ 
+ static struct connsys mtk_connsys;
+@@ -496,6 +506,11 @@ connsys_probe(struct rottenapple_wifi *w)
+ 	if ((err = rottenapple_wifi_carveout(w, "mediatek,dma-pool", &pool_pa, &pool_size, NULL)) != 0) {
+ 		return err;
+ 	}
++	if (pool_pa >> 36) {
++		CLOG("DMA pool 0x%llx beyond the 36-bit WFDMA address range", pool_pa);
++		return EINVAL;
++	}
++	c->ram_code = rottenapple_prop_string(w->node, "mediatek,wifi-ram-code", 0);
+ 	CLOG("%s, a-die 0x%x expected; EMI 0x%llx+0x%llx (CONNSYS 0x%08x); %u patches",
+ 	    c->soc->compatible, c->adie, c->emi_pa, c->emi_size, c->soc->emi_fw_base, c->npatches);
+ 	return 0;
+@@ -854,12 +869,55 @@ connsys_power_off(struct rottenapple_wifi *w)
+ 	rail_log(c, "after");
+ }
+ 
++/* ---- W2: Wi-Fi firmware over WFDMA (rottenapple_mtk_wfdma.c) ---- */
++
++static int
++connsys_wifi_on(struct rottenapple_wifi *w, unsigned level)
++{
++	struct connsys *c = w->priv;
++	struct mtk_wfdma *d = &c->wlan;
++	int err;
++
++	if (c->ram_code == NULL) {
++		CLOG("no mediatek,wifi-ram-code: W2 not possible");
++		return EINVAL;
++	}
++	if (!(c->state & ST_CPU)) {
++		CLOG("W2 needs the CONNSYS CPU at ROM idle");
++		return ENXIO;
++	}
++	if (c->pool == 0 &&
++	    (err = rottenapple_wifi_carveout(w, "mediatek,dma-pool", &c->pool_pa, &c->pool_size, &c->pool)) != 0) {
++		return err;
++	}
++	bzero(d, sizeof(*d));
++	d->w = w;
++	d->conn = c->conn;
++	d->emi = c->emi;
++	d->emi_size = c->emi_size;
++	d->pool = c->pool;
++	d->pool_pa = c->pool_pa;
++	d->pool_size = c->pool_size;
++	d->ram_code = c->ram_code;
++	return mtk_wfdma_wifi_on(d, level);
++}
++
++static void
++connsys_wifi_off(struct rottenapple_wifi *w)
++{
++	struct connsys *c = w->priv;
++
++	mtk_wfdma_wifi_off(&c->wlan);
++}
++
+ static const struct rottenapple_wifi_ops rottenapple_mtk_connsys_ops = {
+ 	.compatible = "mediatek,mt6789-connsys",
+ 	.probe = connsys_probe,
+ 	.report = connsys_report,
+ 	.power_on = connsys_power_on,
+ 	.power_off = connsys_power_off,
++	.wifi_on = connsys_wifi_on,
++	.wifi_off = connsys_wifi_off,
+ };
+ ROTTENAPPLE_BACKEND(wifi, rottenapple_mtk_connsys_ops);
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/bsd/dev/rottenapple_mtk_wfdma.c
+@@ -0,0 +1,1163 @@
++/*
++ * Rotten Apple: MediaTek CONNAC1 Wi-Fi host interface for the CONNSYS
++ * backend: driver ownership, WFDMA (CONN_HIF_PDMA) rings in the reserved
++ * Wi-Fi DMA pool, the ROM's init-command protocol, the WIFI_RAM_CODE
++ * download and WIFI_START (milestone W2), and one NIC_CAPABILITY_V2 query
++ * (rottenapple_wifi=3).
++ *
++ * Clean-room: behaviour, register offsets and packet layouts were read from
++ * the vendor gen4m driver (drivers/misc/mediatek/connectivity/wlan/core/
++ * gen4m: chips/soc2_1x1, chips/common/{cmm_asic_connac,fw_dl}.c,
++ * os/linux/hif/{common,axi}, common/wlan_lib.c, nic/); the code is our own.
++ * Every structure below is listed with its gen4m file:line in
++ * docs/WIFI-PLAN.md, section "W2".
++ *
++ * Sequence (gen4m wlanAdapterStart for soc2_1x1 over AXI):
++ *   load + parse WIFI_RAM_CODE (CONNAC tailer) before touching hardware;
++ *   CONN_HIF_ON IRQ_ENA = 1; driver own (LPCTL CLR_OWN, wait FW_OWN = 0);
++ *   DMASHDL quotas; WFDMA off + pointer reset + HIF reset under PDMA sleep
++ *   protection; TX rings 0/1 (data), 15 (commands), 3 (firmware download),
++ *   RX rings 0 (data) and 1 (events) in the pool; WFDMA on (mask
++ *   0x200800b3); ring 3 bypasses DMASHDL during the download;
++ *   ACCESS_REG reads of TOP_HVR/TOP_FVR (the first round trip over the
++ *   rings); per tailer region: WFDMA regions get DOWNLOAD_CONFIG (acked)
++ *   + FW_SCATTER chunks of 2048 bytes, EMI regions are copied into the
++ *   CONNSYS EMI; WIFI_START with the RAM entry point (acked); wait for the
++ *   ready bits (CONN_ON_MISC DRV_FM_STAT_SYNC = 0x3).
++ * All waits poll the ring indexes with a timeout. SPI 409 is installed as a
++ * one-shot probe: its handler masks the WFDMA interrupt and records the
++ * status (proves the wiring for W3, which will use it).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <dev/rottenapple_mtk_wfdma.h>
++
++#define DLOG(fmt, ...)  printf("ROTTEN APPLE: wifi wfdma: " fmt "\n", ##__VA_ARGS__)
++
++/* ---- Registers, offsets in the CONNSYS window (bus 0x18000000) ---- */
++
++/* CONN_HIF_PDMA (chip 0x50000000) */
++#define PDMA_DUMMY_CR           0x40a8
++#define PDMA_DUMMY_MAGIC        0x13            /* "sleep mode" marker written by the driver */
++#define PDMA_HIF_RST            0x4100
++#define PDMA_HOST2MCU_SW_INT    0x4108
++#define PDMA_SLP_PROT           0x4154
++#define PDMA_SLP_PROT_EN        (1u << 0)
++#define PDMA_SLP_PROT_RREADY    (1u << 1)       /* AXI rready forced high (WMT, chip reset) */
++#define PDMA_SLP_PROT_RDY       (1u << 16)
++#define PDMA_APSRC_ACK          0x4160
++#define PDMA_APSRC_ACK_LOCK     (1u << 4)
++#define PDMA_MCU2HOST_SW_STA    0x41f0
++#define PDMA_MCU2HOST_SW_ENA    0x41f4
++#define PDMA_ERROR_DETECT_MASK  0x3c            /* STOP_PDMA | RESET_DONE | RECOVERY_DONE | MCU_NORMAL */
++#define PDMA_INT_STA            0x4200
++#define PDMA_INT_MSK            0x4204
++#define PDMA_GLO_CFG            0x4208
++#define PDMA_RST_PTR            0x420c
++#define PDMA_PAUSE_TX_Q         0x4224
++#define PDMA_PAUSE_RX_Q_TH10    0x4260
++#define PDMA_PAUSE_RX_Q_TH32    0x4264
++#define PDMA_TX_RING(n)         (0x4300 + 0x10 * (n))   /* +0 base, +4 count, +8 CPU idx, +c DMA idx */
++#define PDMA_RX_RING(n)         (0x4400 + 0x10 * (n))
++#define PDMA_TX_BASE_EXT(n)     (0x4500 + 4 * (n))
++#define PDMA_RX_BASE_EXT(n)     (0x4580 + 4 * (n))
++#define RING_BASE               0x0
++#define RING_CNT                0x4
++#define RING_CIDX               0x8
++#define RING_DIDX               0xc
++
++/* WPDMA_GLO_CFG (CONNAC1 "field_conn" layout) */
++#define GLO_TX_DMA_EN           (1u << 0)
++#define GLO_TX_DMA_BUSY         (1u << 1)
++#define GLO_RX_DMA_EN           (1u << 2)
++#define GLO_RX_DMA_BUSY         (1u << 3)
++#define GLO_BT_SIZE_MASK        (3u << 4)
++#define GLO_BT_SIZE_128B        (3u << 4)
++#define GLO_TX_WB_DDONE         (1u << 6)
++#define GLO_BYPASS_DMASHDL_RING3 (1u << 9)      /* firmware download ring skips DMASHDL */
++#define GLO_MULTI_DMA_MASK      (3u << 10)
++#define GLO_MULTI_DMA_2         (2u << 10)
++#define GLO_FIFO_LE             (1u << 12)
++#define GLO_ADDR_EXT_EN         (1u << 26)      /* 36-bit descriptors (base-ext + SDPtrExt) */
++#define GLO_CLK_GATE_DIS        (1u << 30)
++
++/* WPDMA_INT_MSK/STA bits gen4m enables (asicPdmaIntMaskConfig): RX done 0/1,
++ * TX done for rings 0, 1, 3, 15 (bit 4 + ring), MCU2HOST SW interrupt;
++ * 0x200800b3. The disable path clears those plus coherent/delay bits. */
++#define INT_RX_DONE(n)          (1u << (n))
++#define INT_TX_DONE(n)          (1u << (4 + (n)))
++#define INT_MCU2HOST_SW         (1u << 29)
++#define INT_TRX_ALL             (0x3u | (0xffffu << 4) | (0xfu << 20))
++
++/* DMASHDL (chip 0x5000A000) */
++#define DMASHDL_REFILL          0x6010
++#define DMASHDL_PKT_MAX_SIZE    0x601c
++#define DMASHDL_GROUP_CTRL(n)   (0x6020 + 4 * (n))
++#define DMASHDL_Q_MAP0          0x60d0
++#define DMASHDL_STATUS_RD       0x6100
++
++/* CONN_HIF_ON = host CSR (chip 0x000E0000) */
++#define HIF_ON_LPCTL            0x7000
++#define LPCTL_SET_OWN           (1u << 0)       /* write: give to firmware; read: 1 = firmware owns */
++#define LPCTL_CLR_OWN           (1u << 1)       /* write: request driver ownership */
++#define HIF_ON_IRQ_STAT         0x7004
++#define HIF_ON_IRQ_ENA          0x7008
++#define HIF_ON_DBGCR01          0x7104          /* MCU program counter */
++#define HIF_ON_MAILBOX_DBG      0x711c
++
++/* CONN_MCU_CONFIG (chip 0x80000000) */
++#define MCU_FW_VER              0x2004
++#define MCU_COM_REG0            0x2600
++
++/* CONN_CFG_ON CONN_ON_MISC (chip 0x81021140): DRV_FM_STAT_SYNC[3:1] */
++#define CFG_ON_MISC             0xc1140
++#define READY_SHIFT             1
++#define READY_BITS              0x3             /* WIFI_FUNC_INIT_DONE | WIFI_FUNC_N9_DONE (no CR4) */
++
++/* Chip addresses read with ACCESS_REG (TOP_CFG 0x80020000) */
++#define CHIP_TOP_HVR            0x80021000
++#define CHIP_TOP_FVR            0x80021004
++
++/* ---- Ring geometry and pool layout (offsets in the Wi-Fi DMA pool) ---- */
++
++#define TX_RING_SIZE            512             /* gen4m soc2_1x1 (CONFIG_MTK_WIFI_VHT80) */
++#define RX0_RING_SIZE           512
++#define RX1_RING_SIZE           16
++#define DESC_SIZE               16
++#define TX_NBUF                 16              /* each send waits for its DMA, so slots recycle */
++#define BUF_STRIDE              0x1000
++#define RX0_BUF_SIZE            2352            /* CFG_RX_MAX_PKT_SIZE */
++#define RX1_BUF_SIZE            3840            /* RX_BUFFER_AGGRESIZE */
++
++#define POOL_TX0_DESC           0x000000
++#define POOL_TX1_DESC           0x002000
++#define POOL_TX15_DESC          0x004000
++#define POOL_TX3_DESC           0x006000
++#define POOL_RX0_DESC           0x008000
++#define POOL_RX1_DESC           0x00a000
++#define POOL_FWDL_BUF           0x010000
++#define POOL_CMD_BUF            0x020000
++#define POOL_RX1_BUF            0x030000
++#define POOL_RX0_BUF            0x100000
++#define POOL_USED               (POOL_RX0_BUF + RX0_RING_SIZE * BUF_STRIDE)
++
++/* TX/RX descriptor word 1 */
++#define DESC_SDLEN0_SHIFT       16
++#define DESC_SDLEN_MASK         0x3fffu
++#define DESC_LS0                (1u << 30)
++#define DESC_DMADONE            (1u << 31)
++
++/* ---- Init commands (ROM protocol) and events ---- */
++
++#define INIT_TXD_LEN            32              /* INIT_HIF_TX_HEADER_PENDING_FOR_HW_32BYTES */
++#define INIT_HDR_LEN            32              /* INIT_HIF_TX_HEADER (4) + INIT_WIFI_CMD (28) */
++#define INIT_CMD_PQ_ID          0x8000
++#define INIT_PDA_PQ_ID          0xf800
++#define INIT_PKT_TYPE           0xa0
++#define INIT_PKT_FT_CMD         2
++#define INIT_PKT_FT_PDA_FWDL    3
++
++#define INIT_CMD_FW_SCATTER     0x00
++#define INIT_CMD_DOWNLOAD_CONFIG 0x01
++#define INIT_CMD_WIFI_START     0x02
++#define INIT_CMD_ACCESS_REG     0x03
++
++#define INIT_EVT_CMD_RESULT     0x01
++#define INIT_EVT_ACCESS_REG     0x02
++
++#define RXD_LEN                 20              /* init_evt_rxd_size / rxd_size */
++#define EVT_EID                 (RXD_LEN + 4)
++#define EVT_SEQ                 (RXD_LEN + 5)
++#define INIT_EVT_BODY           (RXD_LEN + 8)   /* INIT_WIFI_EVENT is 8 bytes */
++#define EVT_BODY                (RXD_LEN + 12)  /* WIFI_EVENT is 12 bytes */
++
++#define SCATTER_CHUNK           2048            /* CMD_PKT_SIZE_FOR_IMAGE */
++
++/* DOWNLOAD_CONFIG data mode */
++#define DL_ENCRYPT              (1u << 0)
++#define DL_KEY_MASK             (3u << 1)
++#define DL_RESET_SEC_IV         (1u << 3)
++#define DL_ENCRY_MODE_SEL       (1u << 6)
++#define DL_NEED_ACK             (1u << 31)
++/* tailer feature set */
++#define FEAT_ENCRY              (1u << 0)
++#define FEAT_KEY_MASK           (3u << 1)
++#define FEAT_ENCRY_MODE         (1u << 4)
++#define FEAT_RAM_ENTRY          (1u << 5)
++#define FEAT_NOT_DOWNLOAD       (1u << 6)
++#define FEAT_DL_TO_EMI          (1u << 7)
++#define START_OVERRIDE_ADDR     (1u << 0)
++
++/* CONNAC tailer at the end of WIFI_RAM_CODE */
++#define TAILER_COMMON_LEN       36
++#define TAILER_REGION_LEN       40
++#define TAILER_MAX_REGIONS      10
++#define EMI_ADDR_MASK           0xffffffu
++
++/* Normal command (WIFI_CMD) and NIC_CAPABILITY_V2 */
++#define WIFI_CMD_LEN            64
++#define CMD_ID_NIC_CAP_V2       0x8a
++#define EVT_ID_NIC_CAP_V2       0xec
++#define S2D_H2N_H2C             3
++#define RX_PKT_TYPE_SW_MASK     0xe00f
++#define RX_PKT_TYPE_SW_EVENT    0xe000
++
++/* Timeouts */
++#define OWN_TIMEOUT_US          2048000         /* LP_OWN_BACK_TOTAL_DELAY_MS */
++#define TX_DMA_TIMEOUT_US       1000000
++#define EVT_TIMEOUT_US          3000000         /* CFG_DEFAULT_RX_RESPONSE_TIMEOUT */
++#define READY_TIMEOUT_US        5000000         /* CFG_RESPONSE_POLLING_TIMEOUT x DELAY */
++#define IDLE_TIMEOUT_US         100000
++#define SLP_PROT_TIMEOUT_US     20000
++
++/* progress, undone by mtk_wfdma_wifi_off */
++#define ST_OWN                  (1u << 0)
++#define ST_DMA                  (1u << 1)
++#define ST_IRQ                  (1u << 2)
++#define ST_FWDL                 (1u << 3)
++
++struct ram_region {
++	uint32_t addr, len, offset;
++	uint8_t feature;
++};
++
++/* ---- Helpers ---- */
++
++static inline uint32_t
++rd(struct mtk_wfdma *d, uint32_t off)
++{
++	return *(volatile uint32_t *)(d->conn + off);
++}
++
++static inline void
++wr(struct mtk_wfdma *d, uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(d->conn + off) = val;
++	__builtin_arm_dsb(0xf);
++}
++
++static inline void
++mem_wr32(uintptr_t va, uint32_t val)
++{
++	*(volatile uint32_t *)va = val;
++}
++
++static inline uint32_t
++mem_rd32(uintptr_t va)
++{
++	return *(volatile uint32_t *)va;
++}
++
++static inline uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static inline uint16_t
++le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | (p[1] << 8));
++}
++
++static inline void
++put16(uint8_t *p, uint16_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++}
++
++static inline void
++put32(uint8_t *p, uint32_t v)
++{
++	put16(p, (uint16_t)v);
++	put16(p + 2, (uint16_t)(v >> 16));
++}
++
++static uint64_t
++now_us(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++
++static void
++wfdma_dump(struct mtk_wfdma *d, const char *why)
++{
++	DLOG("state (%s): GLO_CFG 0x%08x INT_STA 0x%08x INT_MSK 0x%08x MCU2HOST 0x%08x SLP_PROT 0x%08x", why,
++	    rd(d, PDMA_GLO_CFG), rd(d, PDMA_INT_STA), rd(d, PDMA_INT_MSK), rd(d, PDMA_MCU2HOST_SW_STA),
++	    rd(d, PDMA_SLP_PROT));
++	DLOG("state (%s): TX3 cidx %u didx %u, TX15 cidx %u didx %u, RX1 cidx %u didx %u, RX0 cidx %u didx %u", why,
++	    rd(d, PDMA_TX_RING(3) + RING_CIDX), rd(d, PDMA_TX_RING(3) + RING_DIDX),
++	    rd(d, PDMA_TX_RING(15) + RING_CIDX), rd(d, PDMA_TX_RING(15) + RING_DIDX),
++	    rd(d, PDMA_RX_RING(1) + RING_CIDX), rd(d, PDMA_RX_RING(1) + RING_DIDX),
++	    rd(d, PDMA_RX_RING(0) + RING_CIDX), rd(d, PDMA_RX_RING(0) + RING_DIDX));
++	DLOG("state (%s): LPCTL 0x%08x HIF_ON IRQ 0x%08x/0x%08x, CONN_ON_MISC 0x%08x, COM_REG0 0x%08x, PC 0x%08x, "
++	    "mailbox 0x%08x, SPI 409 x%u (INT_STA 0x%08x)", why, rd(d, HIF_ON_LPCTL), rd(d, HIF_ON_IRQ_STAT),
++	    rd(d, HIF_ON_IRQ_ENA), rd(d, CFG_ON_MISC), rd(d, MCU_COM_REG0), rd(d, HIF_ON_DBGCR01),
++	    rd(d, HIF_ON_MAILBOX_DBG), d->irq_count, d->irq_sta);
++}
++
++/* ---- Firmware image ---- */
++
++static int
++ram_code_parse(struct mtk_wfdma *d, struct ram_region *regs, unsigned *nregs, uint32_t *entry)
++{
++	const uint8_t *fw = d->fw, *t;
++	size_t size = d->fw_size, end = 0;
++	char ver[11], date[16];
++
++	if (size < TAILER_COMMON_LEN + TAILER_REGION_LEN) {
++		DLOG("%s: %zu bytes, too small for a CONNAC tailer", d->ram_code, size);
++		return EINVAL;
++	}
++	t = fw + size - TAILER_COMMON_LEN;
++	unsigned n = t[2];
++	memcpy(ver, t + 7, 10);
++	ver[10] = '\0';
++	memcpy(date, t + 17, 15);
++	date[15] = '\0';
++	DLOG("%s: tailer chip %u E%u, %u regions, format %u/%u, version \"%s\", built %s", d->ram_code, t[0],
++	    t[1] + 1, n, t[3], t[4], ver, date);
++	if (n == 0 || n > TAILER_MAX_REGIONS ||
++	    size < TAILER_COMMON_LEN + (size_t)n * TAILER_REGION_LEN) {
++		DLOG("%s: bad region count %u", d->ram_code, n);
++		return EINVAL;
++	}
++	size_t tailer = size - TAILER_COMMON_LEN - (size_t)n * TAILER_REGION_LEN;
++	*entry = 0;
++	for (unsigned i = 0; i < n; i++) {
++		const uint8_t *r = fw + tailer + i * TAILER_REGION_LEN;
++		regs[i].addr = le32(r + 16);
++		regs[i].len = le32(r + 20);
++		regs[i].feature = r[24];
++		regs[i].offset = (uint32_t)end;
++		end += regs[i].len;
++		const char *to = (regs[i].feature & FEAT_NOT_DOWNLOAD) ? "skipped" :
++		    (regs[i].feature & FEAT_DL_TO_EMI) ? "EMI copy" : "WFDMA";
++		DLOG("  region %u: address 0x%08x length 0x%x feature 0x%02x (%s%s) at file offset 0x%x", i,
++		    regs[i].addr, regs[i].len, regs[i].feature, to,
++		    (regs[i].feature & FEAT_ENCRY) ? ", encrypted" : "", regs[i].offset);
++		if (end > tailer) {
++			DLOG("%s: region %u runs past the tailer", d->ram_code, i);
++			return EINVAL;
++		}
++		if ((regs[i].feature & FEAT_DL_TO_EMI) &&
++		    (uint64_t)(regs[i].addr & EMI_ADDR_MASK) + regs[i].len > d->emi_size) {
++			DLOG("%s: region %u does not fit the EMI carve-out", d->ram_code, i);
++			return EFBIG;
++		}
++		if ((regs[i].feature & FEAT_RAM_ENTRY) && *entry == 0) {
++			*entry = regs[i].addr;
++		}
++	}
++	*nregs = n;
++	/* Release info (format flag 1): 16-byte separator, an outer header, then <len pad tag> items */
++	if (t[4] && end + 16 + 4 <= tailer) {
++		const uint8_t *p = fw + end + 16;
++		size_t rel_len = le16(p), off = 0;
++		p += 4;
++		while (off + 4 <= rel_len && (size_t)(p - fw) + 4 <= tailer) {
++			size_t len = le16(p), pad = p[2];
++			uint8_t tag = p[3];
++			if ((size_t)(p - fw) + 4 + len > tailer) {
++				break;
++			}
++			if (tag == 1 && len > 0) {
++				char manifest[128];
++				size_t m = MIN(len, sizeof(manifest) - 1);
++				memcpy(manifest, p + 4, m);
++				manifest[m] = '\0';
++				DLOG("%s: release manifest \"%s\"", d->ram_code, manifest);
++			}
++			p += 4 + len + pad;
++			off += 4 + len + pad;
++		}
++	}
++	DLOG("%s: RAM entry 0x%08x", d->ram_code, *entry);
++	return 0;
++}
++
++/* ---- Rings ---- */
++
++static void
++ring_setup(struct mtk_wfdma *d, struct mtk_wfdma_ring *r, const char *name, uint32_t hw, uint32_t ext,
++    uint32_t count, uint32_t desc_off, uint32_t buf_off, uint32_t nbuf, uint32_t buf_size)
++{
++	r->name = name;
++	r->hw = hw;
++	r->ext = ext;
++	r->count = count;
++	r->idx = 0;
++	r->desc = d->pool + desc_off;
++	r->desc_pa = d->pool_pa + desc_off;
++	r->nbuf = nbuf;
++	r->buf_size = buf_size;
++	r->buf = nbuf ? d->pool + buf_off : 0;
++	r->buf_pa = nbuf ? d->pool_pa + buf_off : 0;
++}
++
++/* halWpdmaInitTxRing: empty descriptors (DMADONE set), base/count/CPU index, base extension. */
++static void
++tx_ring_init(struct mtk_wfdma *d, struct mtk_wfdma_ring *r)
++{
++	for (uint32_t i = 0; i < r->count; i++) {
++		uintptr_t desc = r->desc + i * DESC_SIZE;
++		mem_wr32(desc + 0, 0);
++		mem_wr32(desc + 4, DESC_DMADONE);
++		mem_wr32(desc + 8, 0);
++		mem_wr32(desc + 12, 0);
++	}
++	__builtin_arm_dsb(0xf);
++	r->idx = 0;
++	wr(d, PDMA_TX_RING(r->hw) + RING_BASE, (uint32_t)r->desc_pa);
++	wr(d, PDMA_TX_RING(r->hw) + RING_CIDX, 0);
++	wr(d, PDMA_TX_RING(r->hw) + RING_CNT, r->count);
++	wr(d, PDMA_TX_BASE_EXT(r->ext), (uint32_t)(r->desc_pa >> 32) & 0xf);
++	DLOG("TX ring %u (%s): base 0x%08x (reads 0x%08x) count %u cidx %u didx %u", r->hw, r->name,
++	    (uint32_t)r->desc_pa, rd(d, PDMA_TX_RING(r->hw) + RING_BASE), rd(d, PDMA_TX_RING(r->hw) + RING_CNT),
++	    rd(d, PDMA_TX_RING(r->hw) + RING_CIDX), rd(d, PDMA_TX_RING(r->hw) + RING_DIDX));
++}
++
++static void
++rx_desc_arm(struct mtk_wfdma_ring *r, uint32_t i)
++{
++	uintptr_t desc = r->desc + i * DESC_SIZE;
++	uint64_t pa = r->buf_pa + (uint64_t)i * BUF_STRIDE;
++
++	mem_wr32(desc + 0, (uint32_t)pa);
++	mem_wr32(desc + 8, (uint32_t)(pa >> 32) & 0xf);
++	mem_wr32(desc + 12, 0);
++	mem_wr32(desc + 4, (r->buf_size & DESC_SDLEN_MASK) << DESC_SDLEN0_SHIFT);       /* DMADONE = 0 */
++}
++
++/* halWpdmaInitRxRing: every descriptor owns a buffer; CPU index = count - 1 (all to the DMA). */
++static void
++rx_ring_init(struct mtk_wfdma *d, struct mtk_wfdma_ring *r)
++{
++	for (uint32_t i = 0; i < r->count; i++) {
++		rx_desc_arm(r, i);
++	}
++	__builtin_arm_dsb(0xf);
++	r->idx = r->count - 1;
++	wr(d, PDMA_RX_RING(r->hw) + RING_BASE, (uint32_t)r->desc_pa);
++	wr(d, PDMA_RX_RING(r->hw) + RING_CIDX, r->idx);
++	wr(d, PDMA_RX_RING(r->hw) + RING_CNT, r->count);
++	wr(d, PDMA_RX_BASE_EXT(r->ext), (uint32_t)(r->desc_pa >> 32) & 0xf);
++	DLOG("RX ring %u (%s): base 0x%08x (reads 0x%08x) count %u cidx %u didx %u, %u-byte buffers", r->hw,
++	    r->name, (uint32_t)r->desc_pa, rd(d, PDMA_RX_RING(r->hw) + RING_BASE),
++	    rd(d, PDMA_RX_RING(r->hw) + RING_CNT), rd(d, PDMA_RX_RING(r->hw) + RING_CIDX),
++	    rd(d, PDMA_RX_RING(r->hw) + RING_DIDX), r->buf_size);
++}
++
++/*
++ * Copy hdr + payload into the slot buffer of the CPU index, queue it as one
++ * single-segment descriptor and wait until the DMA has consumed it.
++ */
++static int
++tx_send(struct mtk_wfdma *d, struct mtk_wfdma_ring *r, const void *hdr, uint32_t hlen, const void *payload,
++    uint32_t plen)
++{
++	uint32_t slot = r->idx % r->nbuf, didx = 0, len = hlen + plen;
++	uintptr_t buf = r->buf + (uintptr_t)slot * BUF_STRIDE;
++	uint64_t pa = r->buf_pa + (uint64_t)slot * BUF_STRIDE;
++	uintptr_t desc = r->desc + r->idx * DESC_SIZE;
++	uint32_t padded = (len + 3) & ~3u;
++
++	if (padded > BUF_STRIDE) {
++		return EMSGSIZE;
++	}
++	memcpy((void *)buf, hdr, hlen);
++	if (plen) {
++		memcpy((void *)(buf + hlen), payload, plen);
++	}
++	if (padded != len) {
++		bzero((void *)(buf + len), padded - len);
++	}
++	mem_wr32(desc + 0, (uint32_t)pa);
++	mem_wr32(desc + 8, 0);
++	mem_wr32(desc + 12, (uint32_t)(pa >> 32) & 0xf);                /* SDPtr0Ext */
++	mem_wr32(desc + 4, (padded << DESC_SDLEN0_SHIFT) | DESC_LS0);   /* DMADONE = 0 */
++	__builtin_arm_dsb(0xf);                                         /* descriptor + data before the doorbell */
++	r->idx = (r->idx + 1) % r->count;
++	wr(d, PDMA_TX_RING(r->hw) + RING_CIDX, r->idx);
++
++	uint64_t t0 = now_us();
++	while ((didx = rd(d, PDMA_TX_RING(r->hw) + RING_DIDX)) != r->idx) {
++		if (now_us() - t0 > TX_DMA_TIMEOUT_US) {
++			DLOG("TX ring %u: DMA index stuck at %u (CPU index %u) after %u us", r->hw, didx, r->idx,
++			    TX_DMA_TIMEOUT_US);
++			wfdma_dump(d, "TX timeout");
++			return ETIMEDOUT;
++		}
++		delay(10);
++	}
++	if (!(mem_rd32(desc + 4) & DESC_DMADONE)) {
++		DLOG("TX ring %u: DMA index advanced but DMADONE not written back (0x%08x)", r->hw,
++		    mem_rd32(desc + 4));
++	}
++	return 0;
++}
++
++/*
++ * Next packet from an RX ring: the slot after the CPU index once the DMA
++ * index has moved past it and its DMADONE is set. Copies at most bufsz bytes,
++ * re-arms the descriptor and hands it back. Segmented packets are skipped.
++ */
++static int
++rx_poll(struct mtk_wfdma *d, struct mtk_wfdma_ring *r, uint8_t *out, uint32_t bufsz, uint32_t *len,
++    uint32_t timeout_us)
++{
++	uint64_t t0 = now_us();
++
++	for (;;) {
++		uint32_t next = (r->idx + 1) % r->count;
++		uint32_t didx = rd(d, PDMA_RX_RING(r->hw) + RING_DIDX);
++		if (next != didx) {
++			uintptr_t desc = r->desc + next * DESC_SIZE;
++			uint32_t w1 = mem_rd32(desc + 4);
++			uint64_t t1 = now_us();
++			while (!(w1 & DESC_DMADONE) && now_us() - t1 < 10000) {
++				delay(10);
++				w1 = mem_rd32(desc + 4);
++			}
++			if (!(w1 & DESC_DMADONE)) {
++				DLOG("RX ring %u: DMA index %u but slot %u has no DMADONE (0x%08x)", r->hw, didx, next, w1);
++				wfdma_dump(d, "RX DMADONE");
++				return EIO;
++			}
++			uint32_t n = (w1 >> DESC_SDLEN0_SHIFT) & DESC_SDLEN_MASK;
++			bool last = (w1 & DESC_LS0) != 0;
++			if (last && n <= r->buf_size) {
++				memcpy(out, (const void *)(r->buf + (uintptr_t)next * BUF_STRIDE), MIN(n, bufsz));
++			}
++			rx_desc_arm(r, next);
++			__builtin_arm_dsb(0xf);
++			r->idx = next;
++			wr(d, PDMA_RX_RING(r->hw) + RING_CIDX, r->idx);
++			if (!last || n > r->buf_size) {
++				DLOG("RX ring %u: skipped a %u-byte %s packet", r->hw, n, last ? "oversized" : "segmented");
++				continue;
++			}
++			*len = n;
++			return 0;
++		}
++		if (now_us() - t0 > timeout_us) {
++			return ETIMEDOUT;
++		}
++		delay(50);
++	}
++}
++
++/* ---- Init commands over TX ring 3, events on RX ring 1 ---- */
++
++/*
++ * One init command: a 32-byte hardware TXD (INIT_HIF_TX_HEADER_PENDING_FOR_HW),
++ * then INIT_HIF_TX_HEADER {length, PQ, INIT_WIFI_CMD {CID, 0xA0, 0, seq,
++ * 24 reserved bytes}} and the payload (asicFillInitCmdTxdInfo).
++ */
++static int
++init_cmd(struct mtk_wfdma *d, uint8_t cid, const void *payload, uint32_t plen, uint8_t *seq_out)
++{
++	uint8_t pkt[INIT_TXD_LEN + INIT_HDR_LEN];
++	uint32_t pkt_len = INIT_TXD_LEN + INIT_HDR_LEN + plen;
++	bool pda = (cid == INIT_CMD_FW_SCATTER);
++
++	if (plen > SCATTER_CHUNK) {
++		return EMSGSIZE;
++	}
++	bzero(pkt, sizeof(pkt));
++	put16(pkt + 0, (uint16_t)pkt_len);
++	put16(pkt + 2, pda ? INIT_PDA_PQ_ID : INIT_CMD_PQ_ID);
++	pkt[5] = INIT_PKT_TYPE;                                         /* ucHeaderFormat */
++	pkt[7] = pda ? INIT_PKT_FT_PDA_FWDL : INIT_PKT_FT_CMD;          /* ucPktFt:2, ucOwnMAC:6 */
++	put16(pkt + INIT_TXD_LEN + 0, (uint16_t)(pkt_len - INIT_TXD_LEN));
++	pkt[INIT_TXD_LEN + 4] = cid;
++	pkt[INIT_TXD_LEN + 5] = INIT_PKT_TYPE;
++	pkt[INIT_TXD_LEN + 7] = ++d->seq;
++	if (seq_out) {
++		*seq_out = d->seq;
++	}
++	int err = tx_send(d, &d->tx_fwdl, pkt, sizeof(pkt), payload, plen);
++	if (err) {
++		DLOG("init command 0x%02x seq %u (%u bytes): not sent (%d)", cid, d->seq, pkt_len, err);
++	}
++	return err;
++}
++
++/* Wait for the init event eid with sequence number seq; out gets the whole packet (RXD first). */
++static int
++init_event(struct mtk_wfdma *d, uint8_t eid, uint8_t seq, uint8_t *out, uint32_t outsz, uint32_t *len)
++{
++	uint64_t t0 = now_us();
++
++	for (;;) {
++		uint64_t spent = now_us() - t0;
++		if (spent >= EVT_TIMEOUT_US) {
++			break;
++		}
++		int err = rx_poll(d, &d->rx_evt, out, outsz, len, (uint32_t)(EVT_TIMEOUT_US - spent));
++		if (err == ETIMEDOUT) {
++			break;
++		}
++		if (err) {
++			return err;
++		}
++		if (*len < INIT_EVT_BODY) {
++			DLOG("event: %u-byte packet, too short; ignored", *len);
++			continue;
++		}
++		DLOG("event: %u bytes, RXD 0x%08x 0x%08x, type 0x%04x, EID 0x%02x seq %u, body 0x%08x", *len,
++		    le32(out), le32(out + 4), le16(out + RXD_LEN + 2), out[EVT_EID], out[EVT_SEQ],
++		    *len >= INIT_EVT_BODY + 4 ? le32(out + INIT_EVT_BODY) : 0);
++		if (out[EVT_EID] == eid && out[EVT_SEQ] == seq) {
++			return 0;
++		}
++		DLOG("event: not the expected EID 0x%02x seq %u; ignored", eid, seq);
++	}
++	DLOG("no event EID 0x%02x seq %u within %u ms", eid, seq, EVT_TIMEOUT_US / 1000);
++	wfdma_dump(d, "event timeout");
++	return ETIMEDOUT;
++}
++
++/* INIT_EVENT_CMD_RESULT {status, CID, 2 reserved}: 0 = success. */
++static int
++init_cmd_result(struct mtk_wfdma *d, const char *what, uint8_t seq)
++{
++	uint8_t ev[64];
++	uint32_t len = 0;
++	int err = init_event(d, INIT_EVT_CMD_RESULT, seq, ev, sizeof(ev), &len);
++
++	if (err) {
++		DLOG("%s: no CMD_RESULT (%d)", what, err);
++		return err;
++	}
++	if (len < INIT_EVT_BODY + 4) {
++		DLOG("%s: CMD_RESULT too short (%u bytes)", what, len);
++		return EIO;
++	}
++	uint8_t status = ev[INIT_EVT_BODY], cid = ev[INIT_EVT_BODY + 1];
++	DLOG("%s: CMD_RESULT status %u (CID 0x%02x)%s", what, status, cid,
++	    status == 0 ? "" : status == 1 ? ": invalid parameters" : status == 2 ? ": CRC error" :
++	    status == 3 ? ": decryption failed" : status == 0xfe ? ": command not supported" : ": failed");
++	return status == 0 ? 0 : EIO;
++}
++
++/* INIT_CMD_ACCESS_REG {set/query, 3 reserved, address, data} -> INIT_EVENT_ACCESS_REG {address, data}. */
++static int
++access_reg_read(struct mtk_wfdma *d, uint32_t addr, uint32_t *val)
++{
++	uint8_t cmd[12] = { 0 }, ev[64], seq = 0;
++	uint32_t len = 0;
++	int err;
++
++	put32(cmd + 4, addr);
++	if ((err = init_cmd(d, INIT_CMD_ACCESS_REG, cmd, sizeof(cmd), &seq)) != 0) {
++		return err;
++	}
++	DLOG("ACCESS_REG read 0x%08x sent (seq %u)", addr, seq);
++	if ((err = init_event(d, INIT_EVT_ACCESS_REG, seq, ev, sizeof(ev), &len)) != 0) {
++		return err;
++	}
++	if (len < INIT_EVT_BODY + 8 || le32(ev + INIT_EVT_BODY) != addr) {
++		DLOG("ACCESS_REG: event for address 0x%08x (%u bytes), expected 0x%08x",
++		    len >= INIT_EVT_BODY + 4 ? le32(ev + INIT_EVT_BODY) : 0, len, addr);
++		return EIO;
++	}
++	*val = le32(ev + INIT_EVT_BODY + 4);
++	return 0;
++}
++
++static uint32_t
++data_mode(uint8_t feature)
++{
++	uint32_t mode = DL_NEED_ACK;
++
++	if (feature & FEAT_ENCRY) {
++		mode |= DL_RESET_SEC_IV | (feature & FEAT_KEY_MASK) | DL_ENCRYPT;
++		if (feature & FEAT_ENCRY_MODE) {
++			mode |= DL_ENCRY_MODE_SEL;
++		}
++	}
++	return mode;
++}
++
++/* DOWNLOAD_CONFIG (acked), then FW_SCATTER chunks (not acked). */
++static int
++region_download(struct mtk_wfdma *d, unsigned i, const struct ram_region *r)
++{
++	uint8_t cmd[12], seq = 0;
++	uint32_t mode = data_mode(r->feature);
++	char what[48];
++	int err;
++
++	put32(cmd + 0, r->addr);
++	put32(cmd + 4, r->len);
++	put32(cmd + 8, mode);
++	if ((err = init_cmd(d, INIT_CMD_DOWNLOAD_CONFIG, cmd, sizeof(cmd), &seq)) != 0) {
++		return err;
++	}
++	snprintf(what, sizeof(what), "region %u DOWNLOAD_CONFIG", i);
++	DLOG("%s: address 0x%08x length 0x%x mode 0x%08x (seq %u)", what, r->addr, r->len, mode, seq);
++	if ((err = init_cmd_result(d, what, seq)) != 0) {
++		return err;
++	}
++	unsigned chunks = 0;
++	for (uint32_t off = 0; off < r->len; off += SCATTER_CHUNK, chunks++) {
++		uint32_t n = MIN(SCATTER_CHUNK, r->len - off);
++		if ((err = init_cmd(d, INIT_CMD_FW_SCATTER, d->fw + r->offset + off, n, &seq)) != 0) {
++			DLOG("region %u: FW_SCATTER at +0x%x failed (%d)", i, off, err);
++			return err;
++		}
++	}
++	DLOG("region %u: %u FW_SCATTER chunks sent (last seq %u)", i, chunks, seq);
++	return 0;
++}
++
++static int
++region_emi(struct mtk_wfdma *d, unsigned i, const struct ram_region *r)
++{
++	uint32_t off = r->addr & EMI_ADDR_MASK;
++	uint8_t *dst = (uint8_t *)(d->emi + off);
++
++	memcpy(dst, d->fw + r->offset, r->len);
++	__builtin_arm_dsb(0xf);
++	if (memcmp(dst, d->fw + r->offset, r->len) != 0) {
++		DLOG("region %u: EMI readback at +0x%x differs", i, off);
++		return EIO;
++	}
++	DLOG("region %u: 0x%x bytes copied to EMI +0x%x (CONNSYS 0x%08x), verified", i, r->len, off, r->addr);
++	return 0;
++}
++
++/* INIT_CMD_WIFI_START {override, address} (wlanConfigWifiFunc), acked by CMD_RESULT. */
++static int
++wifi_start(struct mtk_wfdma *d, uint32_t entry)
++{
++	uint8_t cmd[8], seq = 0;
++	uint32_t override = entry ? START_OVERRIDE_ADDR : 0;
++	int err;
++
++	put32(cmd + 0, override);
++	put32(cmd + 4, entry);
++	if ((err = init_cmd(d, INIT_CMD_WIFI_START, cmd, sizeof(cmd), &seq)) != 0) {
++		return err;
++	}
++	uint64_t t0 = now_us();
++	DLOG("WIFI_START sent: override 0x%x address 0x%08x (seq %u)", override, entry, seq);
++	err = init_cmd_result(d, "WIFI_START", seq);
++	DLOG("WIFI_START %s after %llu us", err ? "FAILED" : "acknowledged", now_us() - t0);
++	return err;
++}
++
++static bool
++ready(struct mtk_wfdma *d, uint32_t *v)
++{
++	*v = rd(d, CFG_ON_MISC);
++	return ((*v >> READY_SHIFT) & READY_BITS) == READY_BITS;
++}
++
++/* ---- WFDMA bring-up (halWpdmaInitRing with fgResetHif = true) ---- */
++
++static int
++own_driver(struct mtk_wfdma *d)
++{
++	uint32_t before = rd(d, HIF_ON_LPCTL), v = before;
++	uint64_t t0 = now_us();
++
++	wr(d, HIF_ON_LPCTL, LPCTL_CLR_OWN);
++	while ((v = rd(d, HIF_ON_LPCTL)) & LPCTL_SET_OWN) {
++		if (now_us() - t0 > OWN_TIMEOUT_US) {
++			DLOG("driver own: LPCTL 0x%08x -> still 0x%08x after %u ms (firmware keeps ownership)", before, v,
++			    OWN_TIMEOUT_US / 1000);
++			return ETIMEDOUT;
++		}
++		delay(100);
++	}
++	d->state |= ST_OWN;
++	DLOG("driver own: LPCTL 0x%08x -> 0x%08x after %llu us", before, v, now_us() - t0);
++	return 0;
++}
++
++/* asicPcieDmaShdlInit with data rings 0 and 1 (group 0 and 1), no ring 2. */
++static void
++dmashdl_init(struct mtk_wfdma *d)
++{
++	uint32_t v = rd(d, DMASHDL_PKT_MAX_SIZE);
++
++	wr(d, DMASHDL_PKT_MAX_SIZE, (v & ~0x0fff0fffu) | 0x1 | (0x18u << 16));  /* PLE 1 page, PSE 0x18 x 128 */
++	wr(d, DMASHDL_REFILL, 0xfffc0000);                      /* refill off for groups 2..15 */
++	wr(d, DMASHDL_GROUP_CTRL(0), 0x0fff0003);               /* min 3, max 0xfff */
++	wr(d, DMASHDL_GROUP_CTRL(1), 0x0fff0003);
++	wr(d, DMASHDL_GROUP_CTRL(2), 0);
++	wr(d, DMASHDL_Q_MAP0, 0x11110000);                      /* WMM set 1 queues -> group 1 */
++	for (unsigned g = 3; g <= 14; g++) {
++		wr(d, DMASHDL_GROUP_CTRL(g), 0);
++	}
++	DLOG("DMASHDL: packet max 0x%08x (was 0x%08x), refill 0x%08x, groups 0x%08x/0x%08x, Q_MAP0 0x%08x, "
++	    "free pages %u", rd(d, DMASHDL_PKT_MAX_SIZE), v, rd(d, DMASHDL_REFILL), rd(d, DMASHDL_GROUP_CTRL(0)),
++	    rd(d, DMASHDL_GROUP_CTRL(1)), rd(d, DMASHDL_Q_MAP0), (rd(d, DMASHDL_STATUS_RD) >> 16) & 0xfff);
++}
++
++static bool
++dma_idle(struct mtk_wfdma *d, uint32_t *glo)
++{
++	uint64_t t0 = now_us();
++
++	while ((*glo = rd(d, PDMA_GLO_CFG)) & (GLO_TX_DMA_BUSY | GLO_RX_DMA_BUSY)) {
++		if (now_us() - t0 > IDLE_TIMEOUT_US) {
++			return false;
++		}
++		delay(1000);
++	}
++	return true;
++}
++
++/* asicPdmaConfig(FALSE, reset): interrupts and DMA off, idle, index reset, optional HIF reset. */
++static int
++pdma_off(struct mtk_wfdma *d, bool reset_hif)
++{
++	uint32_t glo, v;
++
++	wr(d, PDMA_INT_MSK, rd(d, PDMA_INT_MSK) & ~(INT_TRX_ALL | INT_MCU2HOST_SW));
++	wr(d, PDMA_GLO_CFG, rd(d, PDMA_GLO_CFG) & ~(GLO_TX_DMA_EN | GLO_RX_DMA_EN));
++	wr(d, PDMA_PAUSE_TX_Q, 0);
++	wr(d, PDMA_MCU2HOST_SW_ENA, PDMA_ERROR_DETECT_MASK);
++	wr(d, PDMA_APSRC_ACK, rd(d, PDMA_APSRC_ACK) | PDMA_APSRC_ACK_LOCK);
++	bool idle = dma_idle(d, &glo);
++	wr(d, PDMA_RST_PTR, 0xffffffff);
++	DLOG("WFDMA off: INT_MSK 0x%08x GLO_CFG 0x%08x (%s), pointers reset", rd(d, PDMA_INT_MSK), glo,
++	    idle ? "idle" : "STILL BUSY");
++	if (!reset_hif) {
++		return idle ? 0 : EBUSY;
++	}
++	/* halEnableSlpProt, halDefaultHifRst, halDisableSlpProt */
++	wr(d, PDMA_SLP_PROT, rd(d, PDMA_SLP_PROT) | PDMA_SLP_PROT_EN);
++	uint64_t t0 = now_us();
++	while (!((v = rd(d, PDMA_SLP_PROT)) & PDMA_SLP_PROT_RDY)) {
++		if (now_us() - t0 > SLP_PROT_TIMEOUT_US) {
++			break;
++		}
++		delay(1);
++	}
++	if (!(v & PDMA_SLP_PROT_RDY)) {
++		DLOG("PDMA sleep protection not ready (0x%08x); no HIF reset", v);
++		wr(d, PDMA_SLP_PROT, rd(d, PDMA_SLP_PROT) & ~PDMA_SLP_PROT_EN);
++		return EBUSY;
++	}
++	wr(d, PDMA_HIF_RST, 0x20);
++	wr(d, PDMA_HIF_RST, 0x30);
++	wr(d, PDMA_SLP_PROT, rd(d, PDMA_SLP_PROT) & ~PDMA_SLP_PROT_EN);
++	DLOG("HIF reset under PDMA sleep protection (0x%08x, ready after %llu us); SLP_PROT now 0x%08x", v,
++	    now_us() - t0, rd(d, PDMA_SLP_PROT));
++	return idle ? 0 : EBUSY;
++}
++
++/* asicPdmaConfig(TRUE): interrupt mask, DMA on with the CONNAC1 settings, RX pause thresholds. */
++static void
++pdma_on(struct mtk_wfdma *d)
++{
++	uint32_t msk = rd(d, PDMA_INT_MSK) | INT_MCU2HOST_SW | INT_RX_DONE(0) | INT_RX_DONE(1) |
++	    INT_TX_DONE(d->tx_fwdl.hw) | INT_TX_DONE(d->tx_cmd.hw) | INT_TX_DONE(d->tx_data0.hw) |
++	    INT_TX_DONE(d->tx_data1.hw) | INT_TX_DONE(0);       /* gen4m adds data ring 2's index, 0 here */
++	msk &= ~(0xfu << 20);                                   /* no coherent / delay interrupts */
++	wr(d, PDMA_INT_MSK, msk);
++	uint32_t glo = rd(d, PDMA_GLO_CFG);
++	glo &= ~(GLO_BT_SIZE_MASK | GLO_MULTI_DMA_MASK);
++	glo |= GLO_TX_DMA_EN | GLO_RX_DMA_EN | GLO_BT_SIZE_128B | GLO_ADDR_EXT_EN | GLO_TX_WB_DDONE |
++	    GLO_MULTI_DMA_2 | GLO_FIFO_LE | GLO_CLK_GATE_DIS;
++	wr(d, PDMA_GLO_CFG, glo);
++	wr(d, PDMA_PAUSE_TX_Q, 0);
++	wr(d, PDMA_MCU2HOST_SW_ENA, PDMA_ERROR_DETECT_MASK);
++	wr(d, PDMA_APSRC_ACK, rd(d, PDMA_APSRC_ACK) | PDMA_APSRC_ACK_LOCK);
++	wr(d, PDMA_PAUSE_TX_Q, 0);
++	wr(d, PDMA_PAUSE_RX_Q_TH10, 2 | (2u << 16));
++	wr(d, PDMA_PAUSE_RX_Q_TH32, 2 | (2u << 16));
++	DLOG("WFDMA on: INT_MSK 0x%08x (gen4m 0x200800b3), GLO_CFG 0x%08x", rd(d, PDMA_INT_MSK), rd(d, PDMA_GLO_CFG));
++}
++
++static void
++fwdl_mode(struct mtk_wfdma *d, bool on)
++{
++	uint32_t glo = rd(d, PDMA_GLO_CFG);
++	wr(d, PDMA_GLO_CFG, on ? (glo | GLO_BYPASS_DMASHDL_RING3) : (glo & ~GLO_BYPASS_DMASHDL_RING3));
++	if (on) {
++		d->state |= ST_FWDL;
++	} else {
++		d->state &= ~ST_FWDL;
++	}
++}
++
++/* One-shot probe of SPI 409: mask WFDMA interrupts at the source, record why. */
++static void
++wfdma_irq(void *arg)
++{
++	struct mtk_wfdma *d = arg;
++
++	d->irq_sta |= rd(d, PDMA_INT_STA);
++	wr(d, PDMA_INT_MSK, 0);
++	if (++d->irq_count > 4) {
++		wr(d, HIF_ON_IRQ_ENA, 0);       /* still firing: gate the whole host interrupt */
++	}
++}
++
++static int
++wfdma_init(struct mtk_wfdma *d)
++{
++	int err;
++
++	if (d->pool_size < POOL_USED) {
++		DLOG("DMA pool 0x%llx bytes, need 0x%x", d->pool_size, POOL_USED);
++		return ENOSPC;
++	}
++	bzero((void *)d->pool, POOL_USED);
++	__builtin_arm_dsb(0xf);
++	/*
++	 * gen4m software ring -> hardware ring (soc2_1x1 bus_info): data 0 -> 0,
++	 * data 1 -> 1, command -> 15, firmware download -> 3. The base-extension
++	 * register is indexed by the software ring (asicPdmaTxRingExtCtrl).
++	 */
++	ring_setup(d, &d->tx_data0, "data 0", 0, 0, TX_RING_SIZE, POOL_TX0_DESC, 0, 0, 0);
++	ring_setup(d, &d->tx_data1, "data 1", 1, 1, TX_RING_SIZE, POOL_TX1_DESC, 0, 0, 0);
++	ring_setup(d, &d->tx_cmd, "command", 15, 3, TX_RING_SIZE, POOL_TX15_DESC, POOL_CMD_BUF, TX_NBUF, BUF_STRIDE);
++	ring_setup(d, &d->tx_fwdl, "firmware download", 3, 4, TX_RING_SIZE, POOL_TX3_DESC, POOL_FWDL_BUF, TX_NBUF,
++	    BUF_STRIDE);
++	ring_setup(d, &d->rx_data, "data", 0, 0, RX0_RING_SIZE, POOL_RX0_DESC, POOL_RX0_BUF, RX0_RING_SIZE,
++	    RX0_BUF_SIZE);
++	ring_setup(d, &d->rx_evt, "events", 1, 1, RX1_RING_SIZE, POOL_RX1_DESC, POOL_RX1_BUF, RX1_RING_SIZE,
++	    RX1_BUF_SIZE);
++
++	dmashdl_init(d);
++	d->state |= ST_DMA;
++	if ((err = pdma_off(d, true)) != 0) {
++		return err;
++	}
++	tx_ring_init(d, &d->tx_data0);
++	tx_ring_init(d, &d->tx_data1);
++	tx_ring_init(d, &d->tx_cmd);
++	tx_ring_init(d, &d->tx_fwdl);
++	rx_ring_init(d, &d->rx_data);
++	rx_ring_init(d, &d->rx_evt);
++	pdma_on(d);
++	wr(d, PDMA_DUMMY_CR, PDMA_DUMMY_MAGIC);
++	DLOG("DMA pool 0x%llx: rings and buffers in the first 0x%x bytes", d->pool_pa, POOL_USED);
++
++	err = rottenapple_irq_request(d->w->name, 0, wfdma_irq, d);
++	if (err == 0) {
++		d->state |= ST_IRQ;
++		DLOG("SPI 409 (\"wifi\") installed as a one-shot probe; the download polls");
++	} else {
++		DLOG("SPI 409 not installed (%d); polling only", err);
++	}
++	return 0;
++}
++
++/* ---- NIC_CAPABILITY_V2 over the command ring (rottenapple_wifi=3) ---- */
++
++static int
++nic_capability(struct mtk_wfdma *d)
++{
++	uint8_t cmd[WIFI_CMD_LEN], *ev;
++	uint32_t len = 0;
++	int err;
++
++	/* WIFI_CMD: 32-byte TXD, then length, PQ, CID, 0xA0, set/query, seq, ..., S2D index */
++	bzero(cmd, sizeof(cmd));
++	put16(cmd + 0, WIFI_CMD_LEN);
++	put16(cmd + 2, INIT_CMD_PQ_ID);
++	cmd[5] = INIT_PKT_TYPE;
++	cmd[7] = INIT_PKT_FT_CMD;
++	put16(cmd + 32, WIFI_CMD_LEN - 32);
++	cmd[36] = CMD_ID_NIC_CAP_V2;
++	cmd[37] = INIT_PKT_TYPE;
++	cmd[38] = 0;                    /* query */
++	cmd[39] = ++d->seq;
++	cmd[42] = S2D_H2N_H2C;
++	uint8_t seq = d->seq;
++	if ((err = tx_send(d, &d->tx_cmd, cmd, sizeof(cmd), NULL, 0)) != 0) {
++		DLOG("NIC_CAPABILITY_V2: not sent (%d)", err);
++		return err;
++	}
++	DLOG("NIC_CAPABILITY_V2 query sent on TX ring %u (seq %u)", d->tx_cmd.hw, seq);
++
++	ev = kalloc_data(RX1_BUF_SIZE, Z_WAITOK | Z_ZERO);
++	if (ev == NULL) {
++		return ENOMEM;
++	}
++	uint64_t t0 = now_us();
++	for (;;) {
++		uint64_t spent = now_us() - t0;
++		err = spent >= EVT_TIMEOUT_US ? ETIMEDOUT :
++		    rx_poll(d, &d->rx_evt, ev, RX1_BUF_SIZE, &len, (uint32_t)(EVT_TIMEOUT_US - spent));
++		if (err) {
++			DLOG("NIC_CAPABILITY_V2: no event (%d)", err);
++			if (err == ETIMEDOUT) {
++				wfdma_dump(d, "NIC capability");
++			}
++			goto out;
++		}
++		if (len < EVT_BODY + 4) {
++			continue;
++		}
++		uint16_t type = (uint16_t)(le32(ev) >> 16);
++		DLOG("event: %u bytes, packet type 0x%04x, EID 0x%02x seq %u", len, type, ev[EVT_EID], ev[EVT_SEQ]);
++		if ((type & RX_PKT_TYPE_SW_MASK) == RX_PKT_TYPE_SW_EVENT && ev[EVT_EID] == EVT_ID_NIC_CAP_V2) {
++			break;
++		}
++	}
++	uint32_t n = le16(ev + EVT_BODY), off = EVT_BODY + 4;
++	DLOG("NIC_CAPABILITY_V2: %u elements", n);
++	for (uint32_t i = 0; i < n && off + 8 <= len; i++) {
++		uint32_t tag = le32(ev + off), blen = le32(ev + off + 4);
++		const uint8_t *b = ev + off + 8;
++		if (blen > len - off - 8) {
++			DLOG("  tag 0x%x: body of %u bytes runs past the event", tag, blen);
++			break;
++		}
++		if (tag == 0x5 && blen >= 20) {
++			DLOG("  HW version: product 0x%04x ECO %u, MAC IP 0x%08x, BB IP 0x%08x, TOP IP 0x%08x, config 0x%08x",
++			    le16(b), b[2], le32(b + 4), le32(b + 8), le32(b + 12), le32(b + 16));
++		} else if (tag == 0x6 && blen >= 24) {
++			DLOG("  SW version: %u.%u build %u, branch \"%.4s\", date \"%.16s\"", le16(b) >> 8, le16(b) & 0xff,
++			    le16(b + 2), (const char *)b + 4, (const char *)b + 8);
++		} else if (tag == 0x7 && blen >= 6) {
++			DLOG("  MAC address (efuse): %02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5]);
++		} else if (tag == 0x14 && blen >= 4) {
++			DLOG("  a-die: product 0x%04x ECO 0x%04x", le16(b), le16(b + 2));
++		} else if (tag == 0x8 && blen >= 6) {
++			DLOG("  PHY: HT %u VHT %u 5G %u max BW %u NSS %u DBDC %u", b[0], b[1], b[2], b[3], b[4], b[5]);
++		} else {
++			DLOG("  tag 0x%x: %u bytes", tag, blen);
++		}
++		off += 8 + blen;
++	}
++	err = 0;
++out:
++	kfree_data(ev, RX1_BUF_SIZE);
++	return err;
++}
++
++/* ---- W2 ---- */
++
++int
++mtk_wfdma_wifi_on(struct mtk_wfdma *d, unsigned level)
++{
++	struct ram_region regs[TAILER_MAX_REGIONS];
++	unsigned nregs = 0;
++	uint32_t entry = 0, v, hw = 0, sw = 0;
++	int err;
++
++	d->state = 0;
++	d->seq = 0;
++	d->irq_count = 0;
++	d->irq_sta = 0;
++
++	/* Firmware first: a missing or bad file stops here, before any WFDMA write. */
++	if ((err = rottenapple_wifi_firmware_load(d->w, d->ram_code, &d->fw, &d->fw_size)) != 0) {
++		return err;
++	}
++	if ((err = ram_code_parse(d, regs, &nregs, &entry)) != 0) {
++		return err;
++	}
++
++	DLOG("before: LPCTL 0x%08x HIF_ON IRQ 0x%08x/0x%08x GLO_CFG 0x%08x INT_STA 0x%08x CONN_ON_MISC 0x%08x "
++	    "COM_REG0 0x%08x", rd(d, HIF_ON_LPCTL), rd(d, HIF_ON_IRQ_STAT), rd(d, HIF_ON_IRQ_ENA), rd(d, PDMA_GLO_CFG),
++	    rd(d, PDMA_INT_STA), rd(d, CFG_ON_MISC), rd(d, MCU_COM_REG0));
++	wr(d, HIF_ON_IRQ_ENA, 1);               /* asicCapInit */
++	if ((err = own_driver(d)) != 0) {
++		wfdma_dump(d, "driver own");
++		return err;
++	}
++	if ((err = wfdma_init(d)) != 0) {
++		wfdma_dump(d, "WFDMA init");
++		return err;
++	}
++	fwdl_mode(d, true);                     /* HAL_ENABLE_FWDL: ring 3 bypasses DMASHDL */
++
++	/* wlanSetChipEcoInfo: the first round trip over TX ring 3 / RX ring 1 */
++	if ((err = access_reg_read(d, CHIP_TOP_HVR, &hw)) != 0 || (err = access_reg_read(d, CHIP_TOP_FVR, &sw)) != 0) {
++		DLOG("chip ID over ACCESS_REG failed (%d): the ROM does not answer init commands", err);
++		return err;
++	}
++	DLOG("ACCESS_REG: HW ver 0x%08x SW ver 0x%08x (expect 0x8a00/0x8a00)", hw, sw);
++
++	if (ready(d, &v)) {
++		DLOG("Wi-Fi already ready (CONN_ON_MISC 0x%08x) before the download; not supported", v);
++		return EBUSY;
++	}
++	uint64_t t0 = now_us();
++	for (unsigned i = 0; i < nregs; i++) {
++		if (regs[i].feature & FEAT_NOT_DOWNLOAD) {
++			continue;
++		}
++		err = (regs[i].feature & FEAT_DL_TO_EMI) ? region_emi(d, i, &regs[i]) : region_download(d, i, &regs[i]);
++		if (err) {
++			DLOG("RAM-code download stopped at region %u (%d)", i, err);
++			wfdma_dump(d, "download");
++			return err;
++		}
++	}
++	DLOG("RAM code in place after %llu us (%u commands so far)", now_us() - t0, d->seq);
++	if ((err = wifi_start(d, entry)) != 0) {
++		return err;
++	}
++	fwdl_mode(d, false);
++
++	/* wlanCheckWifiFunc */
++	t0 = now_us();
++	while (!ready(d, &v)) {
++		if (now_us() - t0 > READY_TIMEOUT_US) {
++			DLOG("ready bits not set: CONN_ON_MISC 0x%08x (bits [3:1] = 0x%x, expect 0x%x) after %u ms", v,
++			    (v >> READY_SHIFT) & 7, READY_BITS, READY_TIMEOUT_US / 1000);
++			wfdma_dump(d, "ready");
++			return ETIMEDOUT;
++		}
++		delay(5000);
++	}
++	DLOG("Wi-Fi ready: CONN_ON_MISC 0x%08x after %llu us; COM_REG0 0x%08x FW ver 0x%08x PC 0x%08x mailbox 0x%08x",
++	    v, now_us() - t0, rd(d, MCU_COM_REG0), rd(d, MCU_FW_VER), rd(d, HIF_ON_DBGCR01),
++	    rd(d, HIF_ON_MAILBOX_DBG));
++	DLOG("SPI 409: %u interrupt(s), INT_STA 0x%08x", d->irq_count, d->irq_sta);
++
++	if (level >= 3 && (err = nic_capability(d)) != 0) {
++		DLOG("W3 preview: NIC_CAPABILITY_V2 failed (%d)", err);
++		return err;
++	}
++	return 0;
++}
++
++void
++mtk_wfdma_wifi_off(struct mtk_wfdma *d)
++{
++	if (d->state & ST_IRQ) {
++		wr(d, PDMA_INT_MSK, 0);
++		rottenapple_irq_free(d->w->name, 0);
++		d->state &= ~ST_IRQ;
++		DLOG("SPI 409 freed (%u interrupt(s), INT_STA 0x%08x)", d->irq_count, d->irq_sta);
++	}
++	if (d->state & ST_FWDL) {
++		fwdl_mode(d, false);
++	}
++	if (d->state & ST_DMA) {
++		(void)pdma_off(d, false);
++		d->state &= ~ST_DMA;
++	}
++	if (d->state & ST_OWN) {
++		/* halSetFWOwn: sleep-mode marker, then SET_OWN */
++		wr(d, PDMA_DUMMY_CR, PDMA_DUMMY_MAGIC);
++		uint32_t before = rd(d, HIF_ON_LPCTL);
++		wr(d, HIF_ON_LPCTL, LPCTL_SET_OWN);
++		delay(100);
++		DLOG("ownership returned to the firmware: LPCTL 0x%08x -> 0x%08x", before, rd(d, HIF_ON_LPCTL));
++		d->state &= ~ST_OWN;
++	}
++	rottenapple_wifi_firmware_free(d->fw, d->fw_size);
++	d->fw = NULL;
++	d->fw_size = 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/bsd/dev/rottenapple_mtk_wfdma.h
+@@ -0,0 +1,58 @@
++/*
++ * Rotten Apple: MediaTek CONNAC1 Wi-Fi host interface (WFDMA rings, init
++ * commands, RAM-code download, firmware start) for the CONNSYS backend
++ * (rottenapple_mtk_connsys.c). Milestone W2, docs/WIFI-PLAN.md "W2".
++ */
++#ifndef _BSD_DEV_ROTTENAPPLE_MTK_WFDMA_H_
++#define _BSD_DEV_ROTTENAPPLE_MTK_WFDMA_H_
++
++#include <dev/rottenapple_wifi.h>
++
++__BEGIN_DECLS
++
++struct mtk_wfdma_ring {
++	const char *name;
++	uint32_t hw;                    /* hardware ring number (register block) */
++	uint32_t ext;                   /* base-extension register index */
++	uint32_t count;                 /* descriptors */
++	uint32_t idx;                   /* TX: next CPU index; RX: last index handed back (CIDX) */
++	uintptr_t desc;                 /* 16-byte descriptors, write-combined */
++	uint64_t desc_pa;
++	uintptr_t buf;                  /* nbuf buffers of buf_size bytes */
++	uint64_t buf_pa;
++	uint32_t nbuf, buf_size;
++};
++
++struct mtk_wfdma {
++	/* filled by the caller before mtk_wfdma_wifi_on */
++	struct rottenapple_wifi *w;
++	uintptr_t conn;                 /* CONNSYS window (bus 0x18000000), mapped uncached */
++	uintptr_t emi;                  /* CONNSYS EMI carve-out (firmware view 0xF0000000) */
++	uint64_t emi_size;
++	uintptr_t pool;                 /* Wi-Fi DMA pool, write-combined */
++	uint64_t pool_pa, pool_size;
++	const char *ram_code;           /* WIFI_RAM_CODE file name in the firmware directory */
++
++	/* state */
++	uint8_t *fw;
++	size_t fw_size;
++	struct mtk_wfdma_ring tx_data0, tx_data1, tx_cmd, tx_fwdl, rx_data, rx_evt;
++	uint8_t seq;
++	uint32_t state;
++	volatile uint32_t irq_count, irq_sta;
++};
++
++/*
++ * W2 on a CONNSYS whose CPU sits in its ROM idle loop (W1 power_on done):
++ * driver ownership, WFDMA rings in the DMA pool, chip ID over ACCESS_REG,
++ * RAM-code download (WFDMA and EMI regions), WIFI_START, ready bits.
++ * level >= 3 also queries NIC_CAPABILITY_V2 (firmware version, MAC address).
++ * Every wait has a timeout; nothing panics. mtk_wfdma_wifi_off undoes it and
++ * is always called afterwards, also on failure.
++ */
++int mtk_wfdma_wifi_on(struct mtk_wfdma *d, unsigned level);
++void mtk_wfdma_wifi_off(struct mtk_wfdma *d);
++
++__END_DECLS
++
++#endif
+--- a/bsd/dev/rottenapple_wifi.c
++++ b/bsd/dev/rottenapple_wifi.c
+@@ -32,6 +32,7 @@ ROTTENAPPLE_BACKEND_SET(wifi, struct rottenapple_wifi_ops);
+ #define WIFI_FW_DIR             "/usr/share/firmware/rottenapple/wifi"
+ #define WIFI_FW_MAX             (4u << 20)
+ #define WIFI_W1_CYCLES          2
++#define WIFI_MAX_LEVEL          3
+ #define WIFI_PAGE               0x4000ull
+ 
+ #define WLOG(fmt, ...)  printf("ROTTEN APPLE: wifi: " fmt "\n", ##__VA_ARGS__)
+@@ -215,17 +216,64 @@ wifi_w1(struct rottenapple_wifi *w)
+ 	    passed, WIFI_W1_CYCLES);
+ }
+ 
++/*
++ * W2 (level 2) / W2 + first query (level 3): W1's power-up, then the Wi-Fi
++ * firmware up to "ready", then stop it and power down; WIFI_W1_CYCLES times.
++ */
++static void
++wifi_w2(struct rottenapple_wifi *w, unsigned level)
++{
++	unsigned passed = 0;
++
++	if (w->ops->power_on == NULL || w->ops->power_off == NULL || w->ops->wifi_on == NULL ||
++	    w->ops->wifi_off == NULL) {
++		WLOG("W2: backend has no power or Wi-Fi hooks");
++		return;
++	}
++	if (w->ops->report) {
++		w->ops->report(w);
++	}
++	for (unsigned cycle = 1; cycle <= WIFI_W1_CYCLES; cycle++) {
++		WLOG("W2 cycle %u/%u: powering up", cycle, WIFI_W1_CYCLES);
++		int err = w->ops->power_on(w);
++		if (err) {
++			WLOG("W2 cycle %u/%u: power-up FAILED (%d); powering down", cycle, WIFI_W1_CYCLES, err);
++		} else {
++			WLOG("W2 cycle %u/%u: chip CPU at its idle loop; starting the Wi-Fi firmware", cycle,
++			    WIFI_W1_CYCLES);
++			err = w->ops->wifi_on(w, level);
++			WLOG("W2 cycle %u/%u: %s (%d); stopping Wi-Fi, powering down", cycle, WIFI_W1_CYCLES,
++			    err ? "Wi-Fi firmware FAILED" : "Wi-Fi firmware ready", err);
++			w->ops->wifi_off(w);
++		}
++		w->ops->power_off(w);
++		if (w->ops->report) {
++			w->ops->report(w);
++		}
++		if (err) {
++			break;          /* a failed cycle is not repeated */
++		}
++		passed++;
++	}
++	WLOG("W2 result: %s (%u/%u cycles)", passed == WIFI_W1_CYCLES ? "PASSED" : "FAILED", passed,
++	    WIFI_W1_CYCLES);
++}
++
+ static void
+ rottenapple_wifi_thread(void *arg, __unused wait_result_t wr)
+ {
+ 	unsigned level = (unsigned)(uintptr_t)arg;
+ 	struct rottenapple_wifi *w = &rottenapple_wifi_dev;
+ 
+-	WLOG("milestone W%u (rottenapple_wifi=%u)", level, level);
++	WLOG("milestone W%u (rottenapple_wifi=%u)", level == 3 ? 2 : level, level);
+ 	if (wifi_attach(w, WIFI_NODE) != 0) {
+ 		return;
+ 	}
+-	wifi_w1(w);
++	if (level == 1) {
++		wifi_w1(w);
++	} else {
++		wifi_w2(w, level);
++	}
+ }
+ 
+ void
+@@ -237,8 +285,9 @@ rottenapple_wifi_start(void)
+ 	if (!PE_parse_boot_argn("rottenapple_wifi", &level, sizeof(level)) || level == 0) {
+ 		return;                 /* default: Wi-Fi hardware is not touched */
+ 	}
+-	if (level != 1) {
+-		WLOG("rottenapple_wifi=%u unknown (1 = W1); hardware not touched", level);
++	if (level > WIFI_MAX_LEVEL) {
++		WLOG("rottenapple_wifi=%u unknown (1 = W1, 2 = W2, 3 = W2 + NIC capability); hardware not touched",
++		    level);
+ 		return;
+ 	}
+ 	if (kernel_thread_start(rottenapple_wifi_thread, (void *)(uintptr_t)level, &thread) == KERN_SUCCESS) {
+--- a/bsd/dev/rottenapple_wifi.h
++++ b/bsd/dev/rottenapple_wifi.h
+@@ -22,6 +22,11 @@
+  *      see it reach its idle loop, power down; twice. Runs on a kernel
+  *      thread after the root file system is mounted (firmware comes from
+  *      the root), never panics: any failure is logged and powers down.
++ *   2  W2: W1's power-up, then the Wi-Fi firmware: host interface (DMA
++ *      rings), firmware download and start, "Wi-Fi ready"; then stop it,
++ *      power down; twice.
++ *   3  W2 plus the first post-start query (W3 preview: firmware version,
++ *      MAC address).
+  */
+ #ifndef _BSD_DEV_ROTTENAPPLE_WIFI_H_
+ #define _BSD_DEV_ROTTENAPPLE_WIFI_H_
+@@ -58,6 +63,14 @@ struct rottenapple_wifi_ops {
+ 	/* W1: power, identify, firmware into place, CPU to its idle loop. */
+ 	int (*power_on)(struct rottenapple_wifi *w);
+ 	void (*power_off)(struct rottenapple_wifi *w);
++	/*
++	 * W2, after a successful power_on: host interface up, Wi-Fi firmware
++	 * downloaded and started, ready; level is the milestone (2 or 3).
++	 * wifi_off is always called after wifi_on, also when it failed, and
++	 * before power_off: it stops the host interface and returns ownership.
++	 */
++	int (*wifi_on)(struct rottenapple_wifi *w, unsigned level);
++	void (*wifi_off)(struct rottenapple_wifi *w);
+ };
+ 
+ /* Index of the "reg-names" entry name, -1 if absent or unmapped. */
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -956,7 +956,7 @@ bsd_init(void)
+ 		extern void rottenapple_root_fixups(void);      /* bsd/dev/rottenapple_rootfix.c */
+ 		extern void rottenapple_wifi_start(void);       /* bsd/dev/rottenapple_wifi.c */
+ 		rottenapple_root_fixups();
+-		rottenapple_wifi_start();                       /* boot-arg rottenapple_wifi=1 only */
++		rottenapple_wifi_start();                       /* boot-arg rottenapple_wifi=1..3 only */
+ 	}
+ #endif
+ 

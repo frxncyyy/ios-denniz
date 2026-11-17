@@ -1,0 +1,122 @@
+--- a/shim/nord2-xnu/audio_hw.h
++++ b/shim/nord2-xnu/audio_hw.h
+@@ -41,6 +41,10 @@
+  int (*apply)(void *, const struct na8_io *, struct na8_state *, unsigned amp);
+  int (*supports)(uint16_t revision, unsigned slave);
+ };
++/* Fixed startup observations, captured once after both AMPE enables.
++ * No generic register access or live ABI is exposed. */
++enum { NAH_O_SYS0,NAH_O_STATUS10,NAH_O_STATUS11,NAH_O_STATUS13,
++ NAH_O_STATUS14,NAH_O_MUTE58,NAH_O_TDM20,NAH_O_TDM23,NAH_O_TDM26,NAH_O_FIELDS };
+ struct nah_status {
+  unsigned initialized, running, silent_only, uncertain, gate, retained_shared_clock;
+  unsigned amp_reset_held; /* uncertain amp transport: local GPIO reset latched high */
+@@ -50,6 +54,8 @@
+  uint32_t current_pa, consumed_frames, queued_frames, fed_frames;
+  uint32_t pcm_frames, silence_frames, underruns, ticks, max_tick_gap_us;
+  uint16_t amp_revision[2], amp_status[2];
++ uint16_t amp_observed[2][NAH_O_FIELDS];
++ unsigned amp_observed_valid[2], amp_observed_seq;
+  /* Saved-state diagnostics only: naf_own_mask of the boot snapshot and the
+   * last I2C8 register/value the transport touched (no extra MMIO). */
+  uint32_t ownership, i2c_last_pa, i2c_last_value;
+--- a/shim/nord2-xnu/audio_hw.c
++++ b/shim/nord2-xnu/audio_hw.c
+@@ -80,6 +80,25 @@
+  h->status.amp_status[amp]=status;
+  if ((status&(tdmmask|noclkmask)) || !(clocks&clockmask)) return NAH_E_AMP_FAULT;
+  return amp_rmw(h,amp,0x00,8,8);
++}
++static int amp_observe_startup(struct nau_hw *h)
++{
++ /* Both outputs have source-backed enable/readback, DMA is still all
++  * zeros. Fixed18 reads total, no ongoing polling or extra writes.
++  * A failed transfer ends capture immediately; the valid masks preserve
++  * partial evidence and normal start-failure containment handles cleanup. */
++ static const uint8_t regs[NAH_O_FIELDS]={0x00,0x10,0x11,0x13,0x14,0x58,0x20,0x23,0x26};
++ for (unsigned a=0;a<2;a++) for (unsigned i=0;i<NAH_O_FIELDS;i++) {
++  uint16_t v=0;
++  if (amp_read(h,a,regs[i],&v)) return NAH_E_IO;
++  h->status.amp_observed[a][i]=v;
++  h->status.amp_observed_valid[a]|=1u<<i;
++  /* STATUS10 clears NOCLK on read. Preserve and act on that evidence,
++   * rather than accidentally consuming a new fault as diagnostics. */
++  if (i==NAH_O_STATUS10 && (v&((h->amps[a].rev&255)==0x74?0xc0:0x500)))
++   return NAH_E_AMP_FAULT;
++ }
++ return 0;
+ }
+ static int board_valid(const struct nau_hw *h)
+ {
+@@ -251,6 +270,11 @@
+   int prep=amps_prepare(h);
+   if (prep) return h->status.error=prep;
+  }
++ if (!++h->status.amp_observed_seq) h->status.amp_observed_seq=1;
++ for (unsigned a=0;a<2;a++) {
++  h->status.amp_observed_valid[a]=0;
++  for (unsigned i=0;i<NAH_O_FIELDS;i++)h->status.amp_observed[a][i]=0;
++ }
+  h->status.silent_only=silent; h->gain_q15=gain;
+  h->qr=h->qw=h->qcount=h->last_frame=h->idle_ticks=0;
+  h->last_us=h->last_feed_us=now; h->deadline_us=duration ? now+duration:0;
+@@ -277,6 +301,7 @@
+    if (amp_read(h,i,0x00,&v) || (v&9)!=1) { rc=NAH_E_BOARD_CONFIG; goto fail; }
+   }
+   for (unsigned i=0;i<2;i++) if ((rc=amp_enable(h,i))) goto fail;
++  if ((rc=amp_observe_startup(h))) goto fail;
+   if ((rc=lease(h,0))) goto fail;
+  }
+  h->status.error=0;
+--- a/shim/nord2-xnu/audio_i2c8.c
++++ b/shim/nord2-xnu/audio_i2c8.c
+@@ -81,7 +81,7 @@
+ {
+ 	return (slave == 0x34 || slave == 0x37) &&
+         (reg == 0x03 || reg == 0x00 || reg == 0x01 || reg == 0x02 ||
+-         reg == 0x04 || nah_board_register_allowed(reg) || reg == 0xfb || na8_silicon_value(reg,0) || reg == 0x10 || reg == 0x11 || reg == 0x14 ||
++         reg == 0x04 || nah_board_register_allowed(reg) || reg == 0xfb || na8_silicon_value(reg,0) || reg == 0x10 || reg == 0x11 || reg == 0x13 || reg == 0x14 ||
+          (reg >= 0x20 && reg <= 0x27) || reg == 0x5f);
+ }
+ 
+--- a/shim/nord2-xnu/audio_device.c
++++ b/shim/nord2-xnu/audio_device.c
+@@ -32,7 +32,7 @@
+ static struct nsa_stream stream;
+ static struct nau_hw hardware;
+ static struct { unsigned ready, opens, stop, starts, tone_frames, tone_phase;
+- unsigned tone_active, hal_status; uint64_t report_us, last_pending_us; } device;
++ unsigned tone_active, hal_status, amp_report_seq; uint64_t report_us, last_pending_us; } device;
+ static uint64_t now_us(void) {
+  uint64_t ns=0; absolutetime_to_nanoseconds(mach_absolute_time(),&ns); return ns/1000;
+ }
+@@ -94,6 +94,21 @@
+  w[NAL_F_PEAK]=stream.peak;w[NAL_F_VOLUME]=stream.below;w[NAL_F_MUTED]=stream.muted;
+  w[NAL_F_OPENS]=stream.opens;w[NAL_F_WRITES]=stream.writes;
+  lck_mtx_unlock(&nsa_lock);
++}
++static void report_amp_observed(void) {
++ /* Saved startup evidence only. No console output while DMA is running;
++  * each startup is reported at most once, after stop or failed startup. */
++ if(hardware.status.running || !hardware.status.amp_observed_seq ||
++    device.amp_report_seq==hardware.status.amp_observed_seq)return;
++ device.amp_report_seq=hardware.status.amp_observed_seq;
++ for(unsigned a=0;a<2;a++) {
++  const uint16_t *v=hardware.status.amp_observed[a];
++  if(!hardware.status.amp_observed_valid[a])continue;
++  printf("NORD2 AUDIO AMP START: seq=%u amp=%u valid=%x sys=%04x s10=%04x s11=%04x s13=%04x s14=%04x mute58=%04x tdm20=%04x tdm23=%04x tdm26=%04x\n",
++   hardware.status.amp_observed_seq,a,hardware.status.amp_observed_valid[a],
++   v[NAH_O_SYS0],v[NAH_O_STATUS10],v[NAH_O_STATUS11],v[NAH_O_STATUS13],
++   v[NAH_O_STATUS14],v[NAH_O_MUTE58],v[NAH_O_TDM20],v[NAH_O_TDM23],v[NAH_O_TDM26]);
++ }
+ }
+ static void diagnose(const char *where,int reason,unsigned initial) {
+  /* Saved evidence only: never read hardware again after a failed access.
+@@ -258,6 +273,7 @@
+   } else {lck_mtx_lock(&nsa_lock);
+    nsa_flush_idle(&stream,now_us());
+    lck_mtx_unlock(&nsa_lock);}
++  report_amp_observed();
+   if(!hardware.status.running && t-device.report_us>=5000000) {
+    struct nal_snapshot s;snapshot(&s);device.report_us=t;
+    printf("NORD2 AUDIO PCM: opens=%u writes=%u queued=%u peak=%u running=%u error=%d pcm=%u\n",

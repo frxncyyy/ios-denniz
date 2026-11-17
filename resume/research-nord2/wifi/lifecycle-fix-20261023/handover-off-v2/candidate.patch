@@ -1,0 +1,59 @@
+--- a/shim/nord2-xnu/wifi_ios_client.cpp
++++ b/shim/nord2-xnu/wifi_ios_client.cpp
+@@ -215,7 +215,9 @@
+    if(unsupportedSet==19&&niw_u32((const uint8_t*)carrier+4)==24&&traceControl(19,0))printf("NORD2 WIFI IOS POWERSET: version=%u radios=%u state=%u\n",niw_u32(power),niw_u32(power+4),niw_u32(power+8));
+    if(unsupportedSet==19&&!a->structureOutputSize&&niw_u32((const uint8_t*)carrier+4)==24&&!niw_u32((const uint8_t*)carrier+tail+20)&&niw_u32(power)==1&&niw_u32(power+4)==1&&niw_u32(power+8)<=1){
+     unsigned on=niw_u32(power+8);result=nord2_wifi_power_set(on)?kIOReturnNotReady:kIOReturnSuccess;
+-    if(result==kIOReturnSuccess){if(!on){if(pendingTicket)(void)nord2_wifi_scan_cancel(pendingTicket);clearScanLocked();}powerEventLocked();}
++    if(result==kIOReturnSuccess){if(!on){
++     if(joinTicket&&!retiringJoinTicket){retiringJoinTicket=joinTicket;retiringJoinEpoch=joinEpoch;joinTicket=joinEpoch=0;}
++     if(pendingTicket)(void)nord2_wifi_scan_cancel(pendingTicket);clearScanLocked();}powerEventLocked();}
+     if(traceControl(19,0x802869c8))printf("NORD2 WIFI IOS CONTROL: selector=%u request=19 operation=0x802869c8 bytes=24 status=%#x\n",selector,(unsigned)result);
+     if(copy)niwj_free(copy,bytes);return result; /* Logical admission change; native owner drains existing firmware work. */
+    }
+@@ -499,6 +501,7 @@
+   }
+  }
+  bool coherent=c->station->ticket==ticket&&c->station->client_epoch==epoch;
++ if(notice!=NJS_RETIRED&&!coherent)current=false;
+  if(c->joinLogs++<64)printf("NORD2 WIFI IOS JOINNOTICE: notice=%u current=%u phase=%u result=%u authorized=%u generation=%llu ticket=%llu epoch=%llu t_ms=%llu\n",(unsigned)notice,(unsigned)current,coherent?c->station->phase:0,coherent?c->station->result:0,(unsigned)(current&&coherent&&niwj_authorized(c->station)),(unsigned long long)(coherent?c->station->native_generation:0),(unsigned long long)ticket,(unsigned long long)epoch,niw_ms());
+  if(owned&&notice==NJS_RETIRED){if(oldOwned)c->retiringJoinTicket=c->retiringJoinEpoch=0;else c->joinTicket=c->joinEpoch=0;retire=true;}
+  IOLockUnlock(c->gate);if(retire)c->release();
+--- a/tools/test-nord2-wifi-handover-client.py
++++ b/tools/test-nord2-wifi-handover-client.py
+@@ -5,10 +5,14 @@
+ stubs=(P/'test-join-stubs.inc').read_text().replace('int nord2_wifi_join_enqueue(', 'int original_join_enqueue(').replace('int nord2_wifi_join_cancel(', 'int original_join_cancel(')
+ stubs+='''
+ static njs_completion old_cb;static void*old_cookie;static uint64_t old_epoch,old_ticket;static bool old_canceled;
+-extern "C" int nord2_wifi_join_enqueue(const niwj_request*q,void*c,uint64_t e,njs_completion f,uint64_t*t){if(jactive){assert(js.phase==NJS_LEAVING&&!old_cb);old_cb=jcb;old_cookie=jcookie;old_epoch=jepoch;old_ticket=jticket;old_canceled=false;jactive=false;}return original_join_enqueue(q,c,e,f,t);}
++extern "C" int nord2_wifi_join_enqueue(const niwj_request*q,void*c,uint64_t e,njs_completion f,uint64_t*t){if(!logical_power)return 1;if(jactive){assert(js.phase==NJS_LEAVING&&!old_cb);old_cb=jcb;old_cookie=jcookie;old_epoch=jepoch;old_ticket=jticket;old_canceled=false;jactive=false;}return original_join_enqueue(q,c,e,f,t);}
+ extern "C" int nord2_wifi_join_cancel(uint64_t t){if(old_cb&&t==old_ticket){old_canceled=true;return 0;}return original_join_cancel(t);}
++static void handover_power_off(void){if(jactive){js.phase=NJS_LEAVING;js.associated=js.ptk_ready=js.gtk_ready=js.data_ready=0;}}
+ static void oldNotice(njs_notice n){assert(old_cb);old_cb(old_cookie,old_epoch,old_ticket,n);if(n==NJS_RETIRED)old_cb=nullptr;}
+ '''
+ s=s.replace("(P/'test-join-stubs.inc').read_text()",repr(stubs));extra=(P/'test-join.inc').read_text().split('int main(){',1)[0]+(F/'client.inc').read_text();s=s.replace("(P/'test-disconnect.inc').read_text()",repr(extra))
++needle="(d/'test.cpp').write_text(source)"
++power_patch="source=source.replace('extern \"C\" int nord2_wifi_power_set','static void handover_power_off(void);\\nextern \"C\" int nord2_wifi_power_set').replace('logical_power=on;return 0;','logical_power=on;if(!on)handover_power_off();return 0;');"
++s=s.replace(needle,power_patch+needle)
+ with tempfile.TemporaryDirectory()as t:
+  f=Path(t)/'run.py';f.write_text(s);subprocess.run(['python3',str(f),'--only','disconnect','--candidate',str(x.candidate.resolve()),'--log',str(x.log.resolve())],check=True)
+--- a/tools/fixtures/nord2-wifi-handover/client.inc
++++ b/tools/fixtures/nord2-wifi-handover/client.inc
+@@ -1,11 +1,12 @@
+-int main(){for(unsigned mode=0;mode<3;mode++){
++int main(){for(unsigned mode=0;mode<6;mode++){
+  assert(!jactive&&!old_cb);IOMemoryDescriptor*d,*s;IOUserClient*c=armed(&d,&s);IOExternalMethodArguments a={};joinWire();a.structureInput=carrier;a.structureInputSize=sizeof carrier;assert(!call(c,0,a));joined();joinNotice(NJS_JOINED);unsigned after_up=notifications;
+- envelope(carrier,0x802869c8,22,8);put(carrier+8,0xaaaaaaaa);put(carrier+12,8);assert(!call(c,0,a)&&js.phase==NJS_LEAVING);
++ if(mode<3){envelope(carrier,0x802869c8,22,8);put(carrier+8,0xaaaaaaaa);put(carrier+12,8);assert(!call(c,0,a)&&js.phase==NJS_LEAVING);}
++ else{uint64_t epoch=logical_epoch;envelope(carrier,0x802869c8,19,24);put(carrier+8,1);put(carrier+12,1);put(carrier+16,0);assert(!call(c,0,a)&&!logical_power&&logical_epoch==epoch+1&&js.phase==NJS_LEAVING);joinWire();assert(call(c,0,a)==kIOReturnNotReady&&jactive&&!old_cb);envelope(carrier,0x802869c8,19,24);put(carrier+8,1);put(carrier+12,1);put(carrier+16,1);assert(!call(c,0,a)&&logical_power&&logical_epoch==epoch+2&&notifications==after_up+2);after_up=notifications;}
+  /* Actual old ticket still owns its retained cookie; first replacement call
+   * must not return BUSY before the selected592byte decoder runs. */
+  joinWire();assert(!call(c,0,a)&&old_cb&&jactive&&js.phase==NJS_QUEUED);assert(call(c,0,a)==(IOReturn)16);uint8_t output[4];envelope(carrier,NIW_GET,21,0);a.structureOutput=output;a.structureOutputSize=4;assert(!call(c,0,a)&&niw_u32(output)==0);
+- if(mode==1){assert(!c->clientClose()&&jcanceled&&old_canceled);c->release();oldNotice(NJS_LEFT);oldNotice(NJS_RETIRED);js.phase=NJS_FAILED;js.result=2;joinNotice(NJS_JOIN_FAILED);joinNotice(NJS_RETIRED);assert(notifications==after_up);}
+- else if(mode==2){js.phase=NJS_FAILED;js.result=9;unsigned before=notifications;joinNotice(NJS_JOIN_FAILED);joinNotice(NJS_RETIRED);assert(notifications==before+1&&old_cb);oldNotice(NJS_LEFT);oldNotice(NJS_RETIRED);assert(!c->clientClose());c->release();}
++ if(mode%3==1){assert(!c->clientClose()&&jcanceled&&old_canceled);c->release();oldNotice(NJS_LEFT);oldNotice(NJS_RETIRED);js.phase=NJS_FAILED;js.result=2;joinNotice(NJS_JOIN_FAILED);joinNotice(NJS_RETIRED);assert(notifications==after_up);}
++ else if(mode%3==2){js.phase=NJS_FAILED;js.result=9;unsigned before=notifications;joinNotice(NJS_JOIN_FAILED);joinNotice(NJS_RETIRED);assert(notifications==before+1&&old_cb);oldNotice(NJS_LEFT);oldNotice(NJS_RETIRED);assert(!c->clientClose());c->release();}
+  else{unsigned before=notifications;oldNotice(NJS_LEFT);oldNotice(NJS_RETIRED);assert(notifications==before);joined();joinNotice(NJS_JOINED);assert(notifications==before+4);envelope(carrier,NIW_GET,21,0);assert(!call(c,0,a)&&niw_u32(output)==1);envelope(carrier,0x802869c8,22,0);a.structureOutput=nullptr;a.structureOutputSize=0;assert(!call(c,0,a));joinNotice(NJS_LEFT);joinNotice(NJS_RETIRED);assert(!c->clientClose());c->release();}
+  d->release();s->release();assert(!jactive&&!old_cb&&!malloc_count&&!buffer_count&&!rights&&!locks&&ownerTask.refs==1);
+- }puts("PASS actual IOUC first SET22→SET20 before old RETIRED, pending GET21, no stale old event, two retained cookies, close/cancel both, pending failure before old retirement, balanced OOL/refs");return 0;}
++ }puts("PASS actual IOUC SET22→SET20 and OFF→ON→SET20 before old RETIRED, pending GET21, no stale old event, two retained cookies, close/cancel both, pending failure before old retirement, balanced OOL/refs");return 0;}

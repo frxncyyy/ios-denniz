@@ -1,0 +1,332 @@
+diff --git a/bsd/dev/rottenapple_wifi.c b/bsd/dev/rottenapple_wifi.c
+index 5fcfe8f..d5404d6 100644
+--- a/bsd/dev/rottenapple_wifi.c
++++ b/bsd/dev/rottenapple_wifi.c
+@@ -1089,6 +1089,27 @@ rottenapple_wifi_scan_rssi(const uint8_t *bssid)
+ 	return rssi;
+ }
+ 
++bool
++rottenapple_wifi_scan_bss(const uint8_t *bssid, struct rottenapple_wifi_bss_info *bi)
++{
++	bool found = false;
++
++	lck_mtx_lock(&wifi_scan_lock);
++	for (unsigned i = 0; i < wifi_scan.n; i++) {
++		const struct wifi_bss *b = &wifi_scan.bss[i];
++		if (memcmp(b->bssid, bssid, 6) == 0) {
++			bi->channel = b->channel;
++			bi->rssi = b->rssi;
++			bi->capability = b->capability;
++			bi->beacon_int = b->beacon_int;
++			found = true;
++			break;
++		}
++	}
++	lck_mtx_unlock(&wifi_scan_lock);
++	return found;
++}
++
+ bool
+ rottenapple_wifi_scan_lookup(const uint8_t *ssid, uint8_t ssid_len, struct rottenapple_wifi_join *jp)
+ {
+diff --git a/bsd/dev/rottenapple_wifi.h b/bsd/dev/rottenapple_wifi.h
+index 3815c70..8ac90a3 100644
+--- a/bsd/dev/rottenapple_wifi.h
++++ b/bsd/dev/rottenapple_wifi.h
+@@ -334,6 +334,15 @@ void rottenapple_wifi_sta_link_info(struct rottenapple_wifi_link_info *li);
+ /* RSSI of bssid in the last scan list, ROTTENAPPLE_WIFI_RSSI_NONE if absent. */
+ int rottenapple_wifi_scan_rssi(const uint8_t *bssid);
+ 
++/* What the last scan list knows about one BSS (false if it is not in it). */
++struct rottenapple_wifi_bss_info {
++	uint8_t channel;
++	int rssi;                       /* dBm, ROTTENAPPLE_WIFI_RSSI_NONE if unknown */
++	uint16_t capability;            /* beacon capability field */
++	uint16_t beacon_int;            /* TU */
++};
++bool rottenapple_wifi_scan_bss(const uint8_t *bssid, struct rottenapple_wifi_bss_info *bi);
++
+ /* ---- Apple80211 surface (rottenapple_wifi_a80211.c, stage I2; boot-arg rottenapple_a80211=1) ---- */
+ 
+ struct ifnet;
+@@ -344,7 +353,7 @@ int rottenapple_wifi_a80211_ioctl(unsigned long cmd, void *data);
+ /* the en interface exists (posts POWER_CHANGED) */
+ void rottenapple_wifi_a80211_attach(struct ifnet *ifp);
+ /* link up/down events (SSID/BSSID_CHANGED, ASSOC_DONE, LINK_CHANGED); never takes the STA lock */
+-void rottenapple_wifi_a80211_link(bool up);
++void rottenapple_wifi_a80211_link(bool up, int rssi);
+ void rottenapple_wifi_a80211_scan_done(void);
+ 
+ __END_DECLS
+diff --git a/bsd/dev/rottenapple_wifi_a80211.c b/bsd/dev/rottenapple_wifi_a80211.c
+index 9fc69dd..2c03dfb 100644
+--- a/bsd/dev/rottenapple_wifi_a80211.c
++++ b/bsd/dev/rottenapple_wifi_a80211.c
+@@ -45,6 +45,7 @@
+ #include <net/if.h>
+ #include <net/kpi_interface.h>
+ #include <pexpert/pexpert.h>
++#include <kern/kalloc.h>
+ #include <dev/rottenapple_wifi.h>
+ 
+ #define ALOG(fmt, ...)  printf("ROTTEN APPLE: wifi a80211: " fmt "\n", ##__VA_ARGS__)
+@@ -83,6 +84,8 @@ _Static_assert(sizeof(struct ra_a80211_req) == 40, "apple80211 request is 40 byt
+ #define A_DRIVER_VERSION        43
+ #define A_HARDWARE_VERSION      44
+ #define A_COUNTRY_CODE          51
++#define A_CURRENT_NETWORK       103
++#define A_HW_SUPPORTED_CHANNELS 254
+ #define A_TYPES_LOGGED          512
+ 
+ /* event codes (APPLE80211_M_*) */
+@@ -101,6 +104,24 @@ _Static_assert(sizeof(struct ra_a80211_req) == 40, "apple80211 request is 40 byt
+ #define CHANNEL_LEN             0x10    /* version, {version, channel, flags} */
+ #define CHANNELS_MAX            400     /* SUPPORTED_CHANNELS: version, count, {version, channel, flags}[400] */
+ 
++/*
++ * One scan result as IO80211's _addScanResultToList (0x1d3ebcb38) reads it
++ * (CURRENT_NETWORK passes a 0x48c-byte buffer with ie_len preset to 0x400):
++ *   0x00 version   0x04 channel {version, channel, flags}   0x10 (u16)
++ *   0x12 noise  0x14 snr  0x16 rssi  0x18 beacon interval  0x1a capability (s16/u16)
++ *   0x1c bssid[6]  0x22 rate count  0x24 rates (u32, not filled)
++ *   0x60 ssid_len  0x61 ssid[32]  0x84 age (u32)  0x88 flags
++ *   0x8a ie_len (u16)  0x8c IEs (up to 0x400 inline)
++ */
++#define SR_HDR                  0x8c
++#define SR_IE_MAX               0x400
++#define SR_LEN                  (SR_HDR + SR_IE_MAX)    /* 0x48c */
++
++/* AUTH_TYPE upper values (IPConfiguration WiFiAuthTypeGetString switch, confirmed) */
++#define AUTH_UPPER_NONE         0x0
++#define AUTH_UPPER_WPA2_PSK     0x8
++#define AUTH_LOWER_OPEN         1       /* [I] */
++
+ /* [I] values (public-header era enums, not yet confirmed from a binary) */
+ #define STATE_INIT              0
+ #define STATE_RUN               4
+@@ -112,8 +133,8 @@ _Static_assert(sizeof(struct ra_a80211_req) == 40, "apple80211 request is 40 byt
+ 
+ static int a80211_on = -1;              /* boot-arg, read once */
+ static ifnet_t a80211_ifp;
+-static uint8_t a80211_logged[A_TYPES_LOGGED / 8];
+-static uint8_t a80211_set_logged[A_TYPES_LOGGED / 8];
++static int16_t a80211_logged[A_TYPES_LOGGED];         /* last result + 1 per type, 0 = never seen */
++static int16_t a80211_set_logged[A_TYPES_LOGGED];
+ 
+ bool
+ rottenapple_wifi_a80211_enabled(void)
+@@ -129,10 +150,16 @@ rottenapple_wifi_a80211_enabled(void)
+ 	return a80211_on > 0;
+ }
+ 
++static void
++put32(uint8_t *p, uint32_t v)
++{
++	memcpy(p, &v, 4);               /* little-endian host, as userland reads it */
++}
++
+ /* ---- events ---- */
+ 
+ static void
+-a80211_post(uint32_t code)
++a80211_post(uint32_t code, const void *payload, uint32_t plen)
+ {
+ 	struct kev_msg ev;
+ 	char name[IFNAMSIZ];
+@@ -149,6 +176,10 @@ a80211_post(uint32_t code)
+ 	ev.event_code = code;
+ 	ev.dv[0].data_length = IFNAMSIZ;
+ 	ev.dv[0].data_ptr = name;
++	if (payload != NULL && plen > 0) {
++		ev.dv[1].data_length = plen;
++		ev.dv[1].data_ptr = __DECONST(void *, payload);
++	}
+ 	(void)kev_post_msg(&ev);
+ }
+ 
+@@ -156,36 +187,49 @@ void
+ rottenapple_wifi_a80211_attach(ifnet_t ifp)
+ {
+ 	a80211_ifp = ifp;
+-	a80211_post(M_POWER_CHANGED);
++	a80211_post(M_POWER_CHANGED, NULL, 0);
+ }
+ 
++/*
++ * LINK_CHANGED payload as IO80211's _dispatchLinkChangedEvent reads it (it
++ * drops events shorter than 32 bytes): 0 is-link-down (u8), 4 RSSI (s32),
++ * 0x10 involuntary (u8), 0x14 reason (s32), 0x18 subreason (s32).
++ */
+ void
+-rottenapple_wifi_a80211_link(bool up)
++rottenapple_wifi_a80211_link(bool up, int rssi)
+ {
++	uint8_t lc[32];
++
++	bzero(lc, sizeof(lc));
++	lc[0] = up ? 0 : 1;
++	put32(lc + 4, (uint32_t)(rssi == ROTTENAPPLE_WIFI_RSSI_NONE ? 0 : rssi));
+ 	if (up) {
+-		a80211_post(M_SSID_CHANGED);
+-		a80211_post(M_BSSID_CHANGED);
+-		a80211_post(M_ASSOC_DONE);
++		a80211_post(M_SSID_CHANGED, NULL, 0);
++		a80211_post(M_BSSID_CHANGED, NULL, 0);
++		a80211_post(M_ASSOC_DONE, NULL, 0);
+ 	}
+-	a80211_post(M_LINK_CHANGED);
++	a80211_post(M_LINK_CHANGED, lc, sizeof(lc));
+ }
+ 
++/* SCAN_DONE carries a 4-byte status (IO80211 reads it when the payload is 4 bytes) */
+ void
+ rottenapple_wifi_a80211_scan_done(void)
+ {
+-	a80211_post(M_SCAN_DONE);
++	uint32_t status = 0;
++	a80211_post(M_SCAN_DONE, &status, sizeof(status));
+ }
+ 
+ /* ---- requests ---- */
+ 
+ static void
+-a80211_log_once(uint8_t *map, const char *what, const struct ra_a80211_req *r, int err)
++a80211_log_once(int16_t *last, const char *what, const struct ra_a80211_req *r, int err)
+ {
++	/* log a type the first time and whenever its result changes */
+ 	if (r->type < A_TYPES_LOGGED) {
+-		if (map[r->type / 8] & (1u << (r->type % 8))) {
++		if (last[r->type] == (int16_t)(err + 1)) {
+ 			return;
+ 		}
+-		map[r->type / 8] |= (uint8_t)(1u << (r->type % 8));
++		last[r->type] = (int16_t)(err + 1);
+ 	}
+ 	char proc[24];
+ 	proc_selfname(proc, sizeof(proc));
+@@ -216,16 +260,68 @@ a80211_reply(struct ra_a80211_req *r, const void *buf, uint32_t len)
+ 	return 0;
+ }
+ 
++static uint32_t
++chan_flags(unsigned ch)
++{
++	return CHF_20MHZ | (ch <= 14 ? CHF_2GHZ : CHF_5GHZ);
++}
++
+ static void
+-put32(uint8_t *p, uint32_t v)
++put16(uint8_t *p, uint16_t v)
+ {
+-	memcpy(p, &v, 4);               /* little-endian host, as userland reads it */
++	memcpy(p, &v, 2);
+ }
+ 
++/* the fixed WPA2-PSK CCMP RSN IE the station layer associates with (no PMF) */
++static const uint8_t rsn_ie_psk_ccmp[] = {
++	0x30, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
++	0x01, 0x00, 0x00, 0x0f, 0xac, 0x02, 0x00, 0x00,
++};
++
++/* Build the current BSS as a scan result; returns its length (header + IEs). */
+ static uint32_t
+-chan_flags(unsigned ch)
++a80211_scan_result(uint8_t *sr, const struct rottenapple_wifi_link_info *li)
+ {
+-	return CHF_20MHZ | (ch <= 14 ? CHF_2GHZ : CHF_5GHZ);
++	struct rottenapple_wifi_bss_info bi = { .channel = li->channel, .rssi = li->rssi };
++	uint8_t *ie = sr + SR_HDR;
++	uint32_t n = 0;
++
++	(void)rottenapple_wifi_scan_bss(li->bssid, &bi);
++	int rssi = bi.rssi == ROTTENAPPLE_WIFI_RSSI_NONE ? -60 : bi.rssi;
++	bzero(sr, SR_LEN);
++	put32(sr + 0x00, 1);
++	put32(sr + 0x04, 1);
++	put32(sr + 0x08, li->channel);
++	put32(sr + 0x0c, chan_flags(li->channel));
++	put16(sr + 0x12, (uint16_t)(int16_t)NOISE_FLOOR_DBM);
++	put16(sr + 0x14, (uint16_t)(int16_t)(rssi - NOISE_FLOOR_DBM));
++	put16(sr + 0x16, (uint16_t)(int16_t)rssi);
++	put16(sr + 0x18, bi.beacon_int ? bi.beacon_int : 100);
++	put16(sr + 0x1a, bi.capability ? bi.capability :
++	    (uint16_t)(0x0001 | (li->security != ROTTENAPPLE_WIFI_SEC_OPEN ? 0x0010 : 0)));
++	memcpy(sr + 0x1c, li->bssid, 6);
++	sr[0x60] = li->ssid_len;
++	memcpy(sr + 0x61, li->ssid, li->ssid_len);
++	/* IEs: SSID, supported rates, DS parameter set, RSN */
++	ie[n++] = 0;
++	ie[n++] = li->ssid_len;
++	memcpy(ie + n, li->ssid, li->ssid_len);
++	n += li->ssid_len;
++	static const uint8_t rates24[] = { 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24 };
++	static const uint8_t rates5[] = { 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c };
++	ie[n++] = 1;
++	ie[n++] = 8;
++	memcpy(ie + n, li->channel <= 14 ? rates24 : rates5, 8);
++	n += 8;
++	ie[n++] = 3;
++	ie[n++] = 1;
++	ie[n++] = li->channel;
++	if (li->security == ROTTENAPPLE_WIFI_SEC_WPA2_PSK) {
++		memcpy(ie + n, rsn_ie_psk_ccmp, sizeof(rsn_ie_psk_ccmp));
++		n += sizeof(rsn_ie_psk_ccmp);
++	}
++	put16(sr + 0x8a, (uint16_t)n);
++	return SR_HDR + n;
+ }
+ 
+ static int
+@@ -257,6 +353,28 @@ a80211_get(struct ra_a80211_req *r)
+ 		put32(buf + 8, li.channel);
+ 		put32(buf + 12, chan_flags(li.channel));
+ 		return a80211_reply(r, buf, CHANNEL_LEN);
++	case A_AUTH_TYPE:
++		if (!li.associated) {
++			return ENXIO;
++		}
++		put32(buf + 0, 1);
++		put32(buf + 4, AUTH_LOWER_OPEN);
++		put32(buf + 8, li.security == ROTTENAPPLE_WIFI_SEC_WPA2_PSK ? AUTH_UPPER_WPA2_PSK : AUTH_UPPER_NONE);
++		return a80211_reply(r, buf, 16);
++	case A_CURRENT_NETWORK: {
++		if (!li.associated) {
++			return ENXIO;
++		}
++		uint8_t *sr = kalloc_data(SR_LEN, Z_WAITOK | Z_ZERO);
++		if (sr == NULL) {
++			return ENOMEM;
++		}
++		uint32_t len = a80211_scan_result(sr, &li);
++		/* userland presets ie_len to its IE capacity; the copy is clipped to req_len */
++		int err = a80211_reply(r, sr, MAX(len, MIN(r->len, (uint32_t)SR_LEN)));
++		kfree_data(sr, SR_LEN);
++		return err;
++	}
+ 	case A_CARD_CAPABILITIES:
+ 		/* capability bit meanings not mapped yet: an empty bitmap (the bind only needs success) */
+ 		return a80211_reply(r, buf, CAP_BYTES);
+@@ -292,7 +410,8 @@ a80211_get(struct ra_a80211_req *r)
+ 		put32(buf + 4, 1);              /* radios */
+ 		put32(buf + 8, 1);              /* radio 0 on: the driver only exists while Wi-Fi runs */
+ 		return a80211_reply(r, buf, POWER_LEN);
+-	case A_SUPPORTED_CHANNELS: {
++	case A_SUPPORTED_CHANNELS:
++	case A_HW_SUPPORTED_CHANNELS: {
+ 		static const uint8_t ch5[] = { 36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124,
+ 			                       128, 132, 136, 140, 149, 153, 157, 161, 165 };
+ 		uint8_t list[8 + 12 * (13 + sizeof(ch5))];
+diff --git a/bsd/dev/rottenapple_wifi_sta.c b/bsd/dev/rottenapple_wifi_sta.c
+index a4dd31c..09e8efc 100644
+--- a/bsd/dev/rottenapple_wifi_sta.c
++++ b/bsd/dev/rottenapple_wifi_sta.c
+@@ -382,7 +382,7 @@ sta_if_link(struct wifi_sta *s, bool up)
+ 		ifnet_set_flags(s->ifp, 0, IFF_RUNNING);
+ 	}
+ 	rottenapple_netif_link(s->netif, up, up ? STA_LINK_BPS : 0);
+-	rottenapple_wifi_a80211_link(up);
++	rottenapple_wifi_a80211_link(up, up ? rottenapple_wifi_scan_rssi(s->tgt.bssid) : ROTTENAPPLE_WIFI_RSSI_NONE);
+ 	dlil_post_msg(s->ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
+ }
+ 

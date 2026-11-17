@@ -1,0 +1,79 @@
+--- a/shim/nord2-xnu/audio_i2c8.c
++++ b/shim/nord2-xnu/audio_i2c8.c
+@@ -399,6 +399,21 @@
+  }
+  return rc;
+ }
++int na8_amp_i2cr(const struct na8_io *o, void *c, struct na8_state *s,
++    unsigned slave)
++{
++ /* tfa98xx_init writes I2CR as literal2, not a runtime RMW. Do not add
++  * bit1 to the ordinary reg00 allowlist: only this cold-init primitive
++  * may reset defaults, and only after fresh output-disabled evidence. */
++ if (!s || s->offline || s->inflight) return -1;
++ unsigned allowed=(slave==0x34 || slave==0x37) && s->prior_amp_valid &&
++  s->prior_amp_slave==slave && s->prior_amp_reg==0 &&
++  (s->prior_amp_value&11)==1;
++ s->prior_amp_valid=0;
++ if (!allowed) { s->failure=19; return -1; }
++ uint16_t value=2;
++ return na8_transfer16(o,c,s,slave,0,&value,1);
++}
+ int na8_write16(const struct na8_io *o, void *c, struct na8_state *s,
+     unsigned slave, unsigned reg, uint16_t value)
+ {
+@@ -415,6 +430,8 @@
+    (reg==0x02 && !((old^value)&~15u) && (value&15)==8) ||
+    (reg==0x04 && !((old^value)&~256u) && !(value&256));
+  }
++ /* Runtime/profile paths must never reassert the self-clearing I2CR. */
++ if (reg==0 && (value&2)) allowed=0;
+  s->prior_amp_valid=0;
+  if (!allowed) { s->failure=19; return -1; }
+  return na8_transfer16(o,c,s,slave,reg,&value,1);
+--- a/shim/nord2-xnu/audio_i2c8.h
++++ b/shim/nord2-xnu/audio_i2c8.h
+@@ -92,6 +92,8 @@
+  * amplifier is probed only after clean completions. */
+ int na8_probe(const struct na8_io *, void *, struct na8_state *, struct na8_amp amp[2]);
+ unsigned na8_classify(uint16_t rev);
++/* Cold-init only: fixed reg00=2, requires preceding same-amp PWDN1/AMPE0 read. */
++int na8_amp_i2cr(const struct na8_io *, void *, struct na8_state *, unsigned slave);
+ int na8_write16(const struct na8_io *, void *, struct na8_state *,
+     unsigned slave, unsigned reg, uint16_t value);
+ #endif
+--- a/shim/nord2-xnu/audio_amp.c
++++ b/shim/nord2-xnu/audio_amp.c
+@@ -27,6 +27,17 @@
+  }
+  uint16_t system=0,key=0;
+  if (na8_read16(io,cookie,bus,slave,0x00,&system) || (system&9)!=1) return -1;
++ /* Selected Android tfa_dsp.c611: reset I2C defaults BEFORE silicon
++  * optimal settings. I2CR is self clearing; literal2 must not be compared
++  * as retained state or reissued while waiting for completion. */
++ if (na8_amp_i2cr(io,cookie,bus,slave)) return -2;
++ unsigned reset_ready=0;
++ for (unsigned k=0;k<10;k++) {
++  if (na8_read16(io,cookie,bus,slave,0,&system)) return -2;
++  if (!(system&2)) { reset_ready=(system&9)==1; break; }
++  if (io->delay_us(cookie,1000)) return -2;
++ }
++ if (!reset_ready) return -2;
+  #define WRITE(r,v) do { if (na8_write16(io,cookie,bus,slave,(r),(v))) return -2; } while (0)
+  WRITE(0x0f,0x5a6b);
+  if (na8_read16(io,cookie,bus,slave,0xfb,&key)) return -2;
+--- a/shim/nord2-xnu/audio_board.c
++++ b/shim/nord2-xnu/audio_board.c
+@@ -59,6 +59,12 @@
+ {
+  struct nau_hw *h=cookie;
+  if(!h||!io||!bus||amp>1||h->amps[amp].addr!=(amp?0x37:0x34)||!supports(h->amps[amp].rev,h->amps[amp].addr))return NAH_E_BOARD_CONFIG;
++ /* Exact pinned device preamble, replayed by Android's
++  * tfaContWriteRegsDev_v6 AFTER silicon init and before all bitfields.
++  * These are volatile key latches, not MTP programming commands. */
++ if(na8_write16(io,h,bus,h->amps[amp].addr,0x0f,0x5a6b) ||
++    na8_write16(io,h,bus,h->amps[amp].addr,0xa1,0x005a) ||
++    na8_write16(io,h,bus,h->amps[amp].addr,0xa0,0x005a))return NAH_E_IO;
+  for(unsigned i=0;i<52;i++) {
+   const struct board_op *p=&plan[amp][i];uint16_t old=0,check=0;
+   if(na8_read16(io,h,bus,h->amps[amp].addr,p->reg,&old))return NAH_E_IO;

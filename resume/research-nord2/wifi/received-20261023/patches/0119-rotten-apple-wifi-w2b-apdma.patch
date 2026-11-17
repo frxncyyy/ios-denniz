@@ -1,0 +1,992 @@
+--- a/bsd/dev/rottenapple_mtk_connsys.c
++++ b/bsd/dev/rottenapple_mtk_connsys.c
+@@ -12,11 +12,11 @@
+  *
+  * Node (board profile tools/boards/vidofnir.py):
+  *   compatible = "mediatek,mt6789-connsys", ...;
+- *   reg = <CONNSYS window> <TOPRGU> <AP2MD PCCIF4> <IOCFG_RT> [<BTIF> <CONNSYS BTIF>];
+- *   reg-names = "conn", "toprgu", "pccif4", "iocfg" [, "btif", "conn-btif"];
++ *   reg = <CONNSYS window> <TOPRGU> <AP2MD PCCIF4> <IOCFG_RT> [<BTIF> <CONNSYS BTIF> [<AP-DMA BTIF>]];
++ *   reg-names = "conn", "toprgu", "pccif4", "iocfg" [, "btif", "conn-btif" [, "btif-dma"]];
+  *   power-domains = "<scpsys>:conn";
+- *   clocks = "<infracfg_ao>:<ccif4 gate>" [, "<infracfg_ao>:<btif gate>"];
+- *   clock-names = "ccif" [, "btif"];      (btif: W2b only)
++ *   clocks = "<infracfg_ao>:<ccif4 gate>" [, "<infracfg_ao>:<btif gate>" [, "<infracfg_ao>:<ap-dma gate>"]];
++ *   clock-names = "ccif" [, "btif" [, "apdma"]];      (btif, btif-dma, apdma: W2b only)
+  *   vcn18-supply, vcn33-supply, vcn28-supply = "<pmic regulators>:<rail>";
+  *   mediatek,pmic = "<PMIC regmap>";
+  *   mediatek,vcn18-mode / vcn33-mode / vcn28-mode = <reg value restore>, ...;
+@@ -222,9 +222,11 @@ struct connsys {
+ 	uintptr_t pool;
+ 	struct mtk_wfdma wlan;
+ 	/* W2b */
+-	uintptr_t btif, conn_btif;
+-	struct rottenapple_clk *btif_clk;
++	uintptr_t btif, conn_btif, btif_dma;
++	struct rottenapple_clk *btif_clk, *apdma_clk;
+ 	struct mtk_wmt wmt;
++	unsigned w2b_runs;              /* W2b attempts this boot */
++	int w2b_last_err;               /* result of the previous attempt */
+ };
+ 
+ static struct connsys mtk_connsys;
+@@ -534,6 +536,13 @@ connsys_probe(struct rottenapple_wifi *w)
+ 	if (rottenapple_prop_string_index(w->node, "clock-names", "btif") >= 0) {
+ 		c->btif_clk = rottenapple_clk_of(w->name, "btif");
+ 	}
++	/* AP-DMA channels of the BTIF (stock DT btif node: TX 0x10217b00, RX 0x10217b80) and their clock */
++	if ((i = rottenapple_wifi_reg_index(w, "btif-dma")) >= 0) {
++		c->btif_dma = w->regs[i];
++	}
++	if (rottenapple_prop_string_index(w->node, "clock-names", "apdma") >= 0) {
++		c->apdma_clk = rottenapple_clk_of(w->name, "apdma");
++	}
+ 	CLOG("%s, a-die 0x%x expected; EMI 0x%llx+0x%llx (CONNSYS 0x%08x); %u patches",
+ 	    c->soc->compatible, c->adie, c->emi_pa, c->emi_size, c->soc->emi_fw_base, c->npatches);
+ 	return 0;
+@@ -930,13 +939,28 @@ connsys_wifi_on(struct rottenapple_wifi *w, unsigned level)
+ 		m->btif = c->btif;
+ 		m->conn_btif = c->conn_btif;
+ 		m->clk = c->btif_clk;
++		m->apdma = c->btif_dma;
++		m->dma_clk = c->apdma_clk;
++		/*
++		 * Transport per attempt (W2b runs 1-3 with PIO: one answer per power
++		 * cycle). First AP-DMA for TX and RX as Android; after a success the
++		 * same again; after a failure PIO, as the reference with the same
++		 * diagnostics.
++		 */
++		bool dma = c->w2b_runs == 0 || c->w2b_last_err == 0;
++		m->tx_dma = m->rx_dma = dma;
++		c->w2b_runs++;
++		CLOG("W2b attempt %u: BTIF over %s%s", c->w2b_runs, dma ? "AP-DMA (TX and RX, as Android)" : "PIO",
++		    c->w2b_runs == 1 ? "" : dma ? " (the previous attempt passed)" : " (the AP-DMA attempt failed; reference)");
+ 		m->chip_id = c->soc->chip_id;
+ 		m->adie = c->adie;
+ 		m->emi = c->emi;
+ 		m->emi_size = c->emi_size;
+ 		CLOG("W2b: rail vcn28 %s (kept on through the RF calibration)",
+ 		    rottenapple_regulator_is_enabled(c->vcn28) == 1 ? "on" : "OFF");
+-		if ((err = mtk_wmt_on(m)) != 0) {
++		err = mtk_wmt_on(m);
++		c->w2b_last_err = err;
++		if (err != 0) {
+ 			CLOG("W2b (WMT init) failed (%d): W2 not started", err);
+ 			return err;
+ 		}
+--- a/bsd/dev/rottenapple_mtk_wmt.c
++++ b/bsd/dev/rottenapple_mtk_wmt.c
+@@ -16,13 +16,17 @@
+  * +0x64, HANDSHAKE +0x6c; TX FIFO 16, RX FIFO 8 bytes. Linux's open: clock
+  * "btifc" on, FAKELCR normal, "new handshake" on, both FIFOs cleared,
+  * trigger levels TX 8 / RX 1, loopback off, DMA off for both directions,
+- * DMA auto-reset on, TX interrupt off, RX interrupt on. We poll (SPI 190 is
+- * never enabled) and drain the RX FIFO while sending. Before every frame the
+- * CONNSYS-side DMA_EN (0x180a204c) is read: its RX DMA runs with auto-reset
+- * off, where a read re-arms the RX timeout (btif_priv.h). CONNSYS side: 0x180a2064 = 1 (Linux
+- * consys_wakeup_btif_irq_pull_low, mt6789.c). WAK (ap_wakeup_consys) is
+- * pulsed and then held low for the whole of W2b and W2 (see "CONNSYS
+- * wake" below).
++ * DMA auto-reset on, TX interrupt off, RX interrupt on. Then, as Android
++ * (mtk_btif.h ENABLE_BTIF_TX_DMA/RX_DMA, btif_dma_plat.c), both directions
++ * go through AP-DMA virtual FIFOs (TX channel 0x10217b00, RX 0x10217b80,
++ * clock "apdmac"): the BTIF FIFOs are then fed and drained by the DMA
++ * engine, not by the CPU. PIO (the CPU writes THR / reads RBR) is kept as
++ * the fallback and as the comparison variant (connsys picks the transport
++ * per power cycle). Interrupts are never enabled; everything is polled.
++ * W2b runs 1-3 (PIO): the ROM answers exactly one command per power cycle.
++ * Linux touches nothing else on either side before the first command (no
++ * WAK pulse, no CONNSYS-side register), so neither do we; the old wake
++ * tricks are only steps of the retry ladder now (see wmt_cmd).
+  *
+  * STP (stp_core.c): frame = 4-byte header + payload + 2 bytes.
+  *   mandatory mode: 80, type << 4 | len[11:8], len[7:0], 00; payload; 00 00
+@@ -58,8 +62,14 @@
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
+ #include <dev/rottenapple_mtk_wmt.h>
+ 
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
+ #define MLOG(fmt, ...)  printf("ROTTEN APPLE: wifi wmt: " fmt "\n", ##__VA_ARGS__)
+ 
+ /* ---- BTIF registers ---- */
+@@ -104,6 +114,38 @@
+ #define CONN_MCU_COM_REG0       0x2600
+ #define CONN_HIF_ON_PC          0x7104
+ #define CONN_CFG_ON_MISC        0xc1140
++#define CONN_MCU_DMA            0xa1000 /* CONN_MCU_DMA 0x80010000, 0x1000 (gen4m soc2_1x1 bus2chip) */
++#define CONN_MCU_DMA_SIZE       0x1000
++#define CONN_MCU_CIRQ           0xa5000 /* CONN_MCU_CIRQ, 0x800 in the stock consys node */
++#define CONN_MCU_CIRQ_SIZE      0x800
++#define SNAP_MAX_SHOWN          64      /* words logged per window per snapshot */
++
++/* ---- AP-DMA BTIF channels (btif_dma_priv.h); TX at +0x0, RX at +0x80 ---- */
++#define APDMA_TX                0x00
++#define APDMA_RX                0x80
++#define DMA_INT_FLAG            0x00    /* RX: bit 0 THRE, bit 1 DONE (Linux clears by setting); TX: bit 0 */
++#define DMA_INT_EN              0x04
++#define DMA_EN                  0x08    /* bit 0; the TX channel clears it itself after a flush */
++#define DMA_RST                 0x0c    /* bit 0 warm, bit 1 hard */
++#define DMA_STOP                0x10
++#define DMA_FLUSH               0x14    /* TX: push out a remainder below 8 bytes */
++#define DMA_VFF_ADDR            0x1c
++#define DMA_VFF_LEN             0x24
++#define DMA_VFF_THRE            0x28
++#define DMA_VFF_WPT             0x2c
++#define DMA_VFF_RPT             0x30
++#define DMA_34                  0x34    /* TX: W_INT_BUF_SIZE, RX: FLOW_CTRL_THRE */
++#define DMA_INT_BUF_SIZE        0x38
++#define DMA_VFF_VALID           0x3c
++#define DMA_VFF_LEFT            0x40
++#define DMA_DEBUG_STATUS        0x50
++#define DMA_VFF_ADDR_H          0x54
++#define DMA_PTR_MASK            0xffffu
++#define DMA_WRAP                (1u << 16)
++#define VFF_SIZE                0x1000  /* per direction (Linux: 8 KB; LEN is a multiple of 8) */
++#define VFF_TX_OFF              0x0000
++#define VFF_RX_OFF              0x2000
++#define VFF_ALLOC               0x4000
+ 
+ /* ---- STP ---- */
+ #define STP_TYPE_WMT            4
+@@ -135,6 +177,13 @@ enum { P_SYNC, P_HDR1, P_HDR2, P_HDR3, P_DATA, P_CRC1, P_CRC2 };
+ /* state, undone by mtk_wmt_off */
+ #define ST_CLK                  (1u << 0)
+ #define ST_BTIF                 (1u << 1)
++#define ST_DMA_CLK              (1u << 2)
++#define ST_TXDMA                (1u << 3)
++#define ST_RXDMA                (1u << 4)
++
++/* The vFIFOs: one physically contiguous page, kept for the whole boot (a DMA engine may still look at it). */
++static vm_offset_t wmt_vff;
++static uint64_t wmt_vff_pa;
+ 
+ static const char *const stp_mode_name[] = { "off", "mandatory", "full" };
+ 
+@@ -174,13 +223,104 @@ cb_rd(struct mtk_wmt *m, uint32_t off)
+ 	return *(volatile uint32_t *)(m->conn_btif + off);
+ }
+ 
++/*
++ * The CONNSYS-side BTIF registers. Its DMA_EN is only read when dma_en is
++ * set: with auto-reset off (the ROM's setting, 0x1) a read of DMA_EN clears
++ * a pending RX timeout, i.e. could take the ROM's own RX-timeout event away.
++ */
+ static void
+-conn_btif_log(struct mtk_wmt *m, const char *why)
++conn_btif_log(struct mtk_wmt *m, const char *why, bool dma_en)
+ {
++	char de[24];
++
++	if (dma_en) {
++		snprintf(de, sizeof(de), "0x%x", cb_rd(m, BTIF_DMA_EN));
++	} else {
++		strlcpy(de, "(not read)", sizeof(de));
++	}
+ 	MLOG("CONNSYS BTIF (%s): IER 0x%02x FAKELCR 0x%02x LSR 0x%02x SLEEP_EN 0x%x RTOCNT 0x%x TRI_LVL 0x%02x "
+-	    "WAT_TIME 0x%x HANDSHAKE 0x%x DMA_EN 0x%x", why, cb_rd(m, BTIF_IER), cb_rd(m, BTIF_FAKELCR),
++	    "WAT_TIME 0x%x HANDSHAKE 0x%x DMA_EN %s", why, cb_rd(m, BTIF_IER), cb_rd(m, BTIF_FAKELCR),
+ 	    cb_rd(m, BTIF_LSR), cb_rd(m, BTIF_SLEEP_EN), cb_rd(m, BTIF_RTOCNT), cb_rd(m, BTIF_TRI_LVL),
+-	    cb_rd(m, BTIF_WAT_TIME), cb_rd(m, BTIF_HANDSHAKE), cb_rd(m, BTIF_DMA_EN));
++	    cb_rd(m, BTIF_WAT_TIME), cb_rd(m, BTIF_HANDSHAKE), de);
++}
++
++/* AP-DMA BTIF channel registers (ch = APDMA_TX / APDMA_RX) */
++static inline uint32_t
++d_rd(struct mtk_wmt *m, uint32_t ch, uint32_t off)
++{
++	return *(volatile uint32_t *)(m->apdma + ch + off);
++}
++
++static inline void
++d_wr(struct mtk_wmt *m, uint32_t ch, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(m->apdma + ch + off) = v;
++	__builtin_arm_dsb(0xf);
++}
++
++static void
++dma_chan_log(struct mtk_wmt *m, uint32_t ch, const char *why)
++{
++	MLOG("AP-DMA BTIF %s (%s): EN 0x%x STOP 0x%x FLUSH 0x%x INT_FLAG 0x%x INT_EN 0x%x VFF 0x%x%08x+0x%x THRE 0x%x "
++	    "WPT 0x%05x RPT 0x%05x VALID 0x%x LEFT 0x%x INT_BUF 0x%x %s 0x%x DEBUG 0x%x", ch == APDMA_TX ? "TX" : "RX",
++	    why, d_rd(m, ch, DMA_EN), d_rd(m, ch, DMA_STOP), d_rd(m, ch, DMA_FLUSH), d_rd(m, ch, DMA_INT_FLAG),
++	    d_rd(m, ch, DMA_INT_EN), d_rd(m, ch, DMA_VFF_ADDR_H), d_rd(m, ch, DMA_VFF_ADDR), d_rd(m, ch, DMA_VFF_LEN),
++	    d_rd(m, ch, DMA_VFF_THRE), d_rd(m, ch, DMA_VFF_WPT), d_rd(m, ch, DMA_VFF_RPT), d_rd(m, ch, DMA_VFF_VALID),
++	    d_rd(m, ch, DMA_VFF_LEFT), d_rd(m, ch, DMA_INT_BUF_SIZE), ch == APDMA_TX ? "W_INT_BUF" : "FLOW_CTRL_THRE",
++	    d_rd(m, ch, DMA_34), d_rd(m, ch, DMA_DEBUG_STATUS));
++}
++
++/*
++ * Snapshot of two CONNSYS blocks the ROM's BTIF receive path goes through:
++ * its MCU DMA (the BTIF RX channel's pointers should move when our bytes
++ * arrive and when the ROM consumes them) and its interrupt controller
++ * (pending vs masked). The first snapshot logs the non-zero words, later
++ * ones the words that changed. Only taken after a stall (a command with
++ * nothing back for 300 ms) and at a failure, never on the normal path.
++ */
++static void
++snap_window(struct mtk_wmt *m, const char *name, uint32_t base, uint32_t *prev, unsigned words, const char *why)
++{
++	char line[8 * 24 + 1];
++	size_t k = 0;
++	unsigned hits = 0, shown = 0;
++
++	for (unsigned i = 0; i < words; i++) {
++		uint32_t v = c_rd(m, base + 4 * i);
++		bool hit = m->snap_valid ? v != prev[i] : v != 0;
++		if (hit) {
++			hits++;
++			if (shown < SNAP_MAX_SHOWN) {
++				if (m->snap_valid) {
++					k += (size_t)snprintf(line + k, sizeof(line) - k, " +%03x %x>%x", 4 * i, prev[i], v);
++				} else {
++					k += (size_t)snprintf(line + k, sizeof(line) - k, " +%03x %x", 4 * i, v);
++				}
++				shown++;
++				if (shown % 6 == 0 || k > sizeof(line) - 30) {
++					MLOG("  %s:%s", name, line);
++					k = 0;
++				}
++			}
++		}
++		prev[i] = v;
++	}
++	if (k) {
++		MLOG("  %s:%s", name, line);
++	}
++	MLOG("%s (%s): %u word(s) %s%s", name, why, hits, m->snap_valid ? "changed since the last snapshot" : "non-zero",
++	    hits > shown ? " (first ones shown)" : "");
++}
++
++static void
++conn_snap(struct mtk_wmt *m, const char *why)
++{
++	snap_window(m, "CONNSYS MCU DMA 0x180a1000", CONN_MCU_DMA, m->snap_dma, CONN_MCU_DMA_SIZE / 4, why);
++	snap_window(m, "CONNSYS MCU CIRQ 0x180a5000", CONN_MCU_CIRQ, m->snap_cirq, CONN_MCU_CIRQ_SIZE / 4, why);
++	m->snap_valid = true;
++	m->snaps++;
++	MLOG("CONNSYS (%s): PC 0x%05x 0x%05x COM_REG0 0x%08x", why, c_rd(m, CONN_HIF_ON_PC), c_rd(m, CONN_HIF_ON_PC),
++	    c_rd(m, CONN_MCU_COM_REG0));
+ }
+ 
+ static void
+@@ -261,8 +401,20 @@ wmt_dump(struct mtk_wmt *m, const char *why)
+ 	MLOG("STP (%s): mode %s, txseq %u txack %u, last rx ack %u, expected rx seq %u, %s; parser state %u "
+ 	    "(type %u len %u got %u)", why, stp_mode_name[m->mode], m->txseq, m->txack, m->rxack, m->rxseq,
+ 	    m->out_pending ? "last frame NOT acked" : "nothing unacked", m->pstate, m->ptype, m->plen, m->pcount);
+-	MLOG("BTIF WAK (%s): %s, %u pulse(s), preferred level %s", why, m->wak_held ? "held low (asserted)" :
+-	    "high", m->wak_pulses, m->wak_end_high ? "high" : "low");
++	MLOG("BTIF transport (%s): TX %s, RX %s; first byte back %s", why, m->txd ? "AP-DMA" : "PIO",
++	    m->rxd ? "AP-DMA" : "PIO", m->t_first_rx ? "yes" : "never");
++	if (m->txd) {
++		dma_chan_log(m, APDMA_TX, why);
++	}
++	if (m->rxd) {
++		dma_chan_log(m, APDMA_RX, why);
++	}
++	if (m->txd || m->rxd) {
++		MLOG("AP-DMA (%s): %u TX flushes, %u RX chunks, %u inconsistent RX pointer reads", why, m->dma_flushes,
++		    m->dma_rx_chunks, m->dma_rx_bad);
++	}
++	MLOG("BTIF WAK (%s): %s, %u pulse(s)", why, m->wak_pulses ? "high (Linux resting level)" :
++	    "never driven (as Linux during the init)", m->wak_pulses);
+ 	MLOG("STP (%s): rx %u bytes / %u frames / %u acks, tx %u bytes / %u frames / %u acks; header errors %u, "
+ 	    "CRC errors %u, seq errors %u, junk bytes %u, LSR overruns %u, firmware messages %u", why, m->rx_bytes,
+ 	    m->rx_frames, m->acks_rx, m->tx_bytes, m->tx_frames, m->acks_tx, m->hdr_errs, m->crc_errs, m->seq_errs,
+@@ -272,9 +424,10 @@ wmt_dump(struct mtk_wmt *m, const char *why)
+ 	MLOG("CONNSYS (%s): COM_REG0 0x%08x SW_DBG 0x%08x PC 0x%05x 0x%05x 0x%05x 0x%05x CONN_ON_MISC 0x%08x", why,
+ 	    c_rd(m, CONN_MCU_COM_REG0), c_rd(m, CONN_MCU_SW_DBG), c_rd(m, CONN_HIF_ON_PC), c_rd(m, CONN_HIF_ON_PC),
+ 	    c_rd(m, CONN_HIF_ON_PC), c_rd(m, CONN_HIF_ON_PC), c_rd(m, CONN_CFG_ON_MISC));
+-	conn_btif_log(m, why);
+-	MLOG("retry statistics (%s): %u CONNSYS RX-timeout resets (DMA_EN reads), %u double sends, %u WAK pulses", why,
+-	    m->rto_resets, m->double_sends, m->wak_pulses);
++	conn_btif_log(m, why, true);
++	conn_snap(m, why);
++	MLOG("retry statistics (%s): %u stalled commands, %u CONNSYS RX-timeout re-arms (DMA_EN reads), %u WAK pulses",
++	    why, m->stalls, m->rto_resets, m->wak_pulses);
+ }
+ 
+ /* ---- STP receive ---- */
+@@ -441,9 +594,23 @@ stp_rx_byte(struct mtk_wmt *m, uint8_t b)
+ 	}
+ }
+ 
+-/* Drain the RX FIFO into the parser. */
+ static void
+-btif_poll(struct mtk_wmt *m)
++rx_byte(struct mtk_wmt *m, uint8_t b)
++{
++	if (m->t_first_rx == 0) {
++		m->t_first_rx = now_us() - m->t_open;
++		if (m->t_first_rx == 0) {
++			m->t_first_rx = 1;
++		}
++	}
++	m->rx_bytes++;
++	trace_add(m->rx_trace, &m->rx_trace_n, b);
++	stp_rx_byte(m, b);
++}
++
++/* PIO: drain the RX FIFO into the parser. */
++static void
++pio_rx_poll(struct mtk_wmt *m)
+ {
+ 	uint32_t lsr;
+ 
+@@ -451,68 +618,97 @@ btif_poll(struct mtk_wmt *m)
+ 		if (lsr & BTIF_LSR_OE) {
+ 			m->overruns++;
+ 		}
+-		uint8_t b = *(volatile uint8_t *)(m->btif + BTIF_RBR);
+-		m->rx_bytes++;
+-		trace_add(m->rx_trace, &m->rx_trace_n, b);
+-		stp_rx_byte(m, b);
++		rx_byte(m, *(volatile uint8_t *)(m->btif + BTIF_RBR));
+ 	}
+ }
+ 
+-/* ---- CONNSYS wake (ap_wakeup_consys) ----
+- *
+- * BTIF_WAK (+0x64) drives ap_wakeup_consys. Linux hal_btif_raise_wak_sig
+- * pulses it (0, > one 32 kHz period, 1) and leaves it high; Linux never
+- * touches it during the WMT init (PSM is off until STP is ready). W2b run 1
+- * showed the ROM answering only the one command sent right after such a
+- * pulse: with the line high it stops listening once it is idle, i.e. low =
+- * "AP wants CONNSYS awake" (guess for Android: the line sits low from reset
+- * until the first PSM wake-up, which keeps the ROM awake through the init;
+- * on our boot it is high). So W2b gives the Linux pulse (both edges), then
+- * holds the line low until mtk_wmt_off releases it to the Linux resting
+- * level (high). W2b run 2 showed this alone is not enough (still one answer
+- * per power cycle). A mandatory-mode command with no byte back is resent
+- * (wmt_cmd: CONNSYS wake IRQ clear + the frame twice, then WAK pulses); a
+- * full-mode frame with no ACK gets a pulse and a retransmission. If an answer
+- * only comes with the line left high, that level is kept from then on.
++/*
++ * AP-DMA: whatever the RX channel wrote into the vFIFO since our read
++ * pointer (Linux hal_rx_dma_irq_handler: length from WPT/RPT and their wrap
++ * bits, then RPT forward, then the THRE/DONE flags cleared). Not re-entered
++ * from the parser (an ACK sent while parsing polls RX too): the bytes stay in
++ * the vFIFO for the outer loop.
+  */
+ static void
+-btif_wake(struct mtk_wmt *m, const char *why, bool end_high)
++dma_rx_poll(struct mtk_wmt *m)
+ {
+-	b_wr(m, BTIF_WAK, 0);
+-	delay(150);
+-	b_wr(m, BTIF_WAK, 1);           /* the Linux pulse: falling and rising edge */
+-	m->wak_pulses++;
+-	if (end_high) {
+-		m->wak_held = false;
+-		MLOG("BTIF WAK (%s): pulse low 150 us, then left high (Linux style)", why);
++	if (m->in_rx) {
+ 		return;
+ 	}
+-	delay(150);
+-	b_wr(m, BTIF_WAK, 0);           /* then held asserted (low) */
+-	m->wak_held = true;
+-	MLOG("BTIF WAK (%s): pulse low/high 150 us each, then held low (ap_wakeup_consys asserted)", why);
++	m->in_rx = true;
++	for (unsigned k = 0; k < 4; k++) {
++		uint32_t wpt = d_rd(m, APDMA_RX, DMA_VFF_WPT) & (DMA_WRAP | DMA_PTR_MASK);
++		if (wpt == m->rxr) {
++			break;
++		}
++		uint32_t r = m->rxr & DMA_PTR_MASK, w = wpt & DMA_PTR_MASK, wrap = m->rxr & DMA_WRAP;
++		uint32_t n = ((wpt ^ m->rxr) & DMA_WRAP) ? w + VFF_SIZE - r : w - r;
++		if (n == 0 || n > VFF_SIZE || w >= VFF_SIZE) {
++			m->dma_rx_bad++;
++			if (m->dma_rx_bad <= 3) {
++				MLOG("AP-DMA RX: WPT 0x%05x with our RPT 0x%05x makes no sense; resynchronised", wpt, m->rxr);
++			}
++			m->rxr = wpt;
++			d_wr(m, APDMA_RX, DMA_VFF_RPT, m->rxr);
++			break;
++		}
++		flush_dcache64((addr64_t)m->rxv_pa, VFF_SIZE, TRUE);     /* drop stale lines before reading */
++		for (uint32_t i = 0; i < n; i++) {
++			uint8_t b = ((volatile uint8_t *)m->rxv)[r];
++			if (++r == VFF_SIZE) {
++				r = 0;
++				wrap ^= DMA_WRAP;
++			}
++			m->rxr = r | wrap;
++			rx_byte(m, b);
++		}
++		d_wr(m, APDMA_RX, DMA_VFF_RPT, m->rxr);
++		d_wr(m, APDMA_RX, DMA_INT_FLAG, d_rd(m, APDMA_RX, DMA_INT_FLAG) | 0x3);
++		m->dma_rx_chunks++;
++	}
++	m->in_rx = false;
+ }
+ 
++/* Everything received so far into the parser. */
+ static void
+-btif_wake_release(struct mtk_wmt *m)
++btif_poll(struct mtk_wmt *m)
+ {
+-	if (m->wak_held) {
+-		b_wr(m, BTIF_WAK, 1);
+-		m->wak_held = false;
++	if (m->rxd) {
++		dma_rx_poll(m);
++	} else {
++		pio_rx_poll(m);
+ 	}
+-	MLOG("BTIF WAK high (the Linux resting level) after %u pulse(s)", m->wak_pulses);
++}
++
++/* ---- CONNSYS wake (ap_wakeup_consys) ----
++ *
++ * BTIF_WAK (+0x64) drives ap_wakeup_consys. Its only writer in Linux is
++ * hal_btif_raise_wak_sig (btif_plat.c): 0, 128-160 us (> one 32 kHz
++ * period), 1. It is reached only through the STP power-saving wake-up
++ * (mtk_wcn_stp_wakeup_consys <- PSM), which is off until STP is ready, so
++ * Linux never drives the line during the WMT init. Runs 1-3 tried pulses,
++ * holding it low and both levels: no effect on the one-answer pattern. Here
++ * it is only a step of the retry ladder, Linux style (left high).
++ */
++static void
++btif_wake(struct mtk_wmt *m, const char *why)
++{
++	b_wr(m, BTIF_WAK, 0);
++	delay(150);
++	b_wr(m, BTIF_WAK, 1);
++	m->wak_pulses++;
++	MLOG("BTIF WAK (%s): pulse low 150 us, left high (Linux hal_btif_raise_wak_sig)", why);
+ }
+ 
+ /* ---- STP send ---- */
+ 
+-/* Bytes into the TX FIFO as room allows (TEMT: 16, THRE: 16 - trigger level), RX drained meanwhile. */
++/* PIO: bytes into the TX FIFO as room allows (TEMT: 16, THRE: 16 - trigger level), RX drained meanwhile. */
+ static int
+-btif_tx(struct mtk_wmt *m, const uint8_t *p, size_t len)
++pio_tx(struct mtk_wmt *m, const uint8_t *p, size_t len)
+ {
+ 	uint64_t t0 = now_us();
+ 	size_t i = 0;
+ 
+-	m->in_tx = true;
+ 	while (i < len) {
+ 		uint32_t lsr = b_rd(m, BTIF_LSR);
+ 		unsigned room = (lsr & BTIF_LSR_TEMT) ? BTIF_TX_FIFO : (lsr & BTIF_LSR_THRE) ? BTIF_TX_FIFO - BTIF_TX_THRE : 0;
+@@ -524,16 +720,86 @@ btif_tx(struct mtk_wmt *m, const uint8_t *p, size_t len)
+ 		__builtin_arm_dsb(0xf);
+ 		btif_poll(m);
+ 		if (i < len && now_us() - t0 > 100000) {
+-			m->in_tx = false;
+ 			MLOG("TX stalled: %zu of %zu bytes in the FIFO after 100 ms (LSR 0x%02x)", i, len, b_rd(m, BTIF_LSR));
+ 			return ETIMEDOUT;
+ 		}
+ 	}
+-	m->tx_bytes += (uint32_t)len;
+-	m->in_tx = false;
+ 	return 0;
+ }
+ 
++/*
++ * AP-DMA (Linux hal_dma_send_data): wait until no flush is running, copy the
++ * frame into the TX vFIFO at WPT (wrapping), make sure the channel is
++ * enabled (it disables itself after a flush), write WPT with its wrap bit;
++ * a remainder of 1-7 bytes is only sent after a flush (Linux does it at once
++ * and from the TX DMA interrupt; we poll). Waits until the vFIFO, the
++ * channel buffer and the BTIF TX FIFO are empty, RX serviced meanwhile.
++ */
++static int
++dma_tx(struct mtk_wmt *m, const uint8_t *p, size_t len)
++{
++	uint64_t t0 = now_us();
++
++	while (d_rd(m, APDMA_TX, DMA_FLUSH) & 1) {
++		btif_poll(m);
++		if (now_us() - t0 > 10000) {
++			MLOG("AP-DMA TX: a flush is still running after 10 ms");
++			dma_chan_log(m, APDMA_TX, "TX blocked");
++			return ETIMEDOUT;
++		}
++	}
++	uint32_t left = d_rd(m, APDMA_TX, DMA_VFF_LEFT);
++	if (len > left) {
++		MLOG("AP-DMA TX: %zu bytes to send, vFIFO has room for %u", len, left);
++		dma_chan_log(m, APDMA_TX, "TX full");
++		return ENOSPC;
++	}
++	uint32_t w = m->txw & DMA_PTR_MASK, wrap = m->txw & DMA_WRAP;
++	for (size_t i = 0; i < len; i++) {
++		((uint8_t *)m->txv)[w] = p[i];
++		trace_add(m->tx_trace, &m->tx_trace_n, p[i]);
++		if (++w == VFF_SIZE) {
++			w = 0;
++			wrap ^= DMA_WRAP;
++		}
++	}
++	flush_dcache64((addr64_t)m->txv_pa, VFF_SIZE, TRUE);     /* the engine reads DRAM */
++	m->txw = w | wrap;
++	d_wr(m, APDMA_TX, DMA_EN, d_rd(m, APDMA_TX, DMA_EN) | 1);
++	d_wr(m, APDMA_TX, DMA_VFF_WPT, m->txw);
++	for (;;) {
++		uint32_t valid = d_rd(m, APDMA_TX, DMA_VFF_VALID);
++		uint32_t ibuf = d_rd(m, APDMA_TX, DMA_INT_BUF_SIZE);
++		if (valid == 0 && ibuf == 0 && (b_rd(m, BTIF_LSR) & BTIF_LSR_TEMT)) {
++			break;
++		}
++		if (valid > 0 && valid < 8 && !(d_rd(m, APDMA_TX, DMA_FLUSH) & 1) && !(d_rd(m, APDMA_TX, DMA_STOP) & 1)) {
++			d_wr(m, APDMA_TX, DMA_FLUSH, d_rd(m, APDMA_TX, DMA_FLUSH) | 1);
++			m->dma_flushes++;
++		}
++		btif_poll(m);
++		if (now_us() - t0 > 100000) {
++			MLOG("AP-DMA TX stalled: %zu-byte frame not out after 100 ms (valid %u, channel buffer %u, LSR 0x%02x)",
++			    len, valid, ibuf, b_rd(m, BTIF_LSR));
++			dma_chan_log(m, APDMA_TX, "TX stalled");
++			return ETIMEDOUT;
++		}
++	}
++	return 0;
++}
++
++static int
++btif_tx(struct mtk_wmt *m, const uint8_t *p, size_t len)
++{
++	m->in_tx = true;
++	int err = m->txd ? dma_tx(m, p, len) : pio_tx(m, p, len);
++	m->in_tx = false;
++	if (err == 0) {
++		m->tx_bytes += (uint32_t)len;
++	}
++	return err;
++}
++
+ static void
+ stp_send_ack(struct mtk_wmt *m)
+ {
+@@ -567,15 +833,6 @@ stp_xmit(struct mtk_wmt *m)
+ 	f[4 + len] = (uint8_t)crc;
+ 	f[5 + len] = (uint8_t)(crc >> 8);
+ 	m->ack_due = false;     /* the header carries our current ack */
+-	/*
+-	 * The CONNSYS-side BTIF runs its RX DMA with auto-reset off (DMA_EN 0x1):
+-	 * per btif_priv.h, after an RX timeout software must read DMA_EN to re-arm
+-	 * it. W2b runs 1 and 2: the ROM serves exactly one command per power cycle
+-	 * and then idles with our next frames unprocessed; re-arm it before each
+-	 * frame (a read, no write).
+-	 */
+-	(void)cb_rd(m, BTIF_DMA_EN);
+-	m->rto_resets++;
+ 	int err = btif_tx(m, f, 6u + len);
+ 	if (m->ack_due) {
+ 		stp_send_ack(m);
+@@ -631,6 +888,50 @@ stp_idle(struct mtk_wmt *m, uint64_t us)
+ 
+ /* ---- WMT ---- */
+ 
++/*
++ * Retry ladder for a command that got nothing back (mandatory mode: no byte
++ * at all; full mode: no ACK) for 300 ms. Each step first logs what the
++ * CONNSYS side looks like (snapshot / diff of its MCU DMA and interrupt
++ * controller, its BTIF registers without the DMA_EN side effect), then:
++ *   1 the same frame again, nothing else (does a second copy push the first
++ *     one through, as in runs 1-3?);
++ *   2 WAK pulse (Linux hal_btif_raise_wak_sig) + the frame;
++ *   3 CONNSYS side: 0x180a2064 = 1 (Linux consys_wakeup_btif_irq_pull_low)
++ *     and a DMA_EN read (re-arms its RX timeout) + the frame.
++ * The step that brings the first answer is logged with the event.
++ */
++static int
++wmt_retry(struct mtk_wmt *m, const char *name, unsigned step)
++{
++	char why[64];
++
++	snprintf(why, sizeof(why), "%s, stall %u", name, step);
++	if (step == 1) {
++		m->stalls++;
++	}
++	conn_snap(m, why);
++	conn_btif_log(m, why, false);
++	MLOG("BTIF (%s): LSR 0x%02x IIR 0x%02x; rx %u bytes so far", why, b_rd(m, BTIF_LSR), b_rd(m, BTIF_IIR),
++	    m->rx_bytes);
++	switch (step) {
++	case 1:
++		MLOG("%s: nothing back after %u ms; retry 1: the same frame again", name, STP_ACK_TIMEOUT_US / 1000);
++		break;
++	case 2:
++		MLOG("%s: nothing back; retry 2: BTIF WAK pulse + the frame", name);
++		btif_wake(m, why);
++		break;
++	default:
++		*(volatile uint32_t *)(m->conn_btif + CONN_BTIF_WAK) = 1;
++		__builtin_arm_dsb(0xf);
++		(void)cb_rd(m, BTIF_DMA_EN);
++		m->rto_resets++;
++		MLOG("%s: nothing back; retry 3: CONNSYS 0x180a2064 = 1 + CONNSYS DMA_EN read + the frame", name);
++		break;
++	}
++	return stp_xmit(m);
++}
++
+ /*
+  * One command: send it, wait for the event with the same opcode, log both
+  * as hex, compare with exp (all exp_len bytes, or with WMT_F_STATUS the
+@@ -643,7 +944,6 @@ wmt_cmd(struct mtk_wmt *m, const char *name, const uint8_t *cmd, size_t len, con
+ {
+ 	char what[80];
+ 	unsigned tries = 0;
+-	bool end_high = m->wak_end_high;
+ 	int err;
+ 
+ 	snprintf(what, sizeof(what), "cmd  %s", name);
+@@ -662,47 +962,14 @@ wmt_cmd(struct mtk_wmt *m, const char *name, const uint8_t *cmd, size_t len, con
+ 			stp_send_ack(m);
+ 		}
+ 		uint64_t now = now_us();
+-		if (m->mode == STP_MODE_FULL && m->out_pending && now - last > STP_ACK_TIMEOUT_US &&
+-		    tries < STP_RETRIES) {
++		bool silent = m->mode == STP_MODE_FULL ? m->out_pending : m->rx_bytes == rx0;
++		if (silent && now - last > STP_ACK_TIMEOUT_US && tries < STP_RETRIES) {
+ 			tries++;
+ 			last = now;
+-			MLOG("%s: frame seq %u not acked after %u ms; wake + retransmission %u", name, m->out_seq,
+-			    STP_ACK_TIMEOUT_US / 1000, tries);
+-			end_high = (tries & 1) ? m->wak_end_high : !m->wak_end_high;
+-			btif_wake(m, "no ACK", end_high);
+-			if ((err = stp_xmit(m)) != 0) {
++			if ((err = wmt_retry(m, name, tries)) != 0) {
+ 				goto fail;
+ 			}
+ 		}
+-		if (m->mode == STP_MODE_MAND && m->rx_bytes == rx0 && now - last > STP_ACK_TIMEOUT_US &&
+-		    tries < STP_RETRIES) {
+-			/*
+-			 * Mandatory mode has no ACKs: nothing at all came back. Runs 1/2: the
+-			 * only answers came when the ROM had two copies of the frame. Ladder:
+-			 * 1 CONNSYS wake IRQ cleared (0x180a2064 = 1) + the frame twice;
+-			 * 2 WAK pulse (preferred level) + once; 3 WAK pulse, other level, twice.
+-			 */
+-			tries++;
+-			last = now;
+-			bool twice = tries != 2;
+-			if (tries == 1) {
+-				*(volatile uint32_t *)(m->conn_btif + CONN_BTIF_WAK) = 1;
+-				__builtin_arm_dsb(0xf);
+-				MLOG("%s: no byte back after %u ms; resend %u: CONNSYS 0x180a2064 = 1, frame sent twice", name,
+-				    STP_ACK_TIMEOUT_US / 1000, tries);
+-			} else {
+-				end_high = (tries == 2) ? m->wak_end_high : !m->wak_end_high;
+-				MLOG("%s: no byte back after %u ms; resend %u: WAK pulse, frame sent %s", name,
+-				    STP_ACK_TIMEOUT_US / 1000, tries, twice ? "twice" : "once");
+-				btif_wake(m, "no answer", end_high);
+-			}
+-			if ((err = stp_xmit(m)) != 0 || (twice && (err = stp_xmit(m)) != 0)) {
+-				goto fail;
+-			}
+-			if (twice) {
+-				m->double_sends++;
+-			}
+-		}
+ 		if (now - t0 > (uint64_t)timeout_ms * 1000) {
+ 			MLOG("%s: no event 02 %02x within %u ms (frame %s)", name, m->want_op, timeout_ms,
+ 			    m->mode != STP_MODE_FULL ? "sent in mandatory mode: no ACKs" :
+@@ -712,11 +979,11 @@ wmt_cmd(struct mtk_wmt *m, const char *name, const uint8_t *cmd, size_t len, con
+ 		}
+ 	}
+ 	snprintf(what, sizeof(what), "evt  %s (%llu us%s)", name, now_us() - t0, tries == 0 ? "" :
+-	    tries == 1 ? ", after resend 1" : tries == 2 ? ", after resend 2" : ", after resend 3");
++	    tries == 1 ? ", after retry 1 (same frame)" : tries == 2 ? ", after retry 2 (WAK)" :
++	    ", after retry 3 (CONNSYS side)");
+ 	hex_log(what, m->evt, m->evt_len);
+-	if (tries >= 2 && end_high != m->wak_end_high) {
+-		m->wak_end_high = end_high;
+-		MLOG("answered with WAK left %s: keeping that level from now on", end_high ? "HIGH" : "low");
++	if (tries) {
++		conn_snap(m, "answered after a stall");
+ 	}
+ 	if (exp != NULL) {
+ 		bool ok;
+@@ -778,10 +1045,93 @@ wmt_reg_read(struct mtk_wmt *m, const char *name, uint32_t addr, uint32_t mask,
+ 
+ /* ---- BTIF ---- */
+ 
++/* The vFIFO page: allocated once, below 4 GB if possible (Linux: GFP_DMA32), zeroed and cleaned to DRAM. */
++static int
++vff_alloc(void)
++{
++	if (wmt_vff != 0) {
++		return 0;
++	}
++	vm_offset_t va = 0;
++	if (kmem_alloc_contig(kernel_map, &va, VFF_ALLOC, PAGE_MASK, (ppnum_t)atop_64(0x100000000ULL) - 1, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS &&
++	    /* the channels also take address bits 32+ (VFF_ADDR_H) */
++	    kmem_alloc_contig(kernel_map, &va, VFF_ALLOC, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va));
++	uint64_t pa_end = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)(va + VFF_ALLOC - 1)));
++	if (pa == 0 || pa_end - pa != ((VFF_ALLOC - 1) & ~(uint64_t)PAGE_MASK)) {
++		MLOG("vFIFO page at PA 0x%llx..0x%llx is not contiguous", pa, pa_end);
++		return EFAULT;
++	}
++	flush_dcache64((addr64_t)pa, VFF_ALLOC, TRUE);
++	wmt_vff = va;
++	wmt_vff_pa = pa;
++	MLOG("AP-DMA vFIFOs: 0x%x bytes each at PA 0x%llx (TX) / 0x%llx (RX)%s", VFF_SIZE, pa + VFF_TX_OFF,
++	    pa + VFF_RX_OFF, (pa >> 32) ? " - above 4 GB, VFF_ADDR_H set" : "");
++	return 0;
++}
++
++/*
++ * One AP-DMA BTIF channel (Linux hal_btif_dma_hw_init + hal_btif_dma_ctrl
++ * enable): warm reset (a hard reset if the channel stays enabled for 1 ms),
++ * vFIFO address/length, pointers 0, threshold (TX: size - 7, RX: 1),
++ * interrupt flags cleared (RX: THRE + DONE enabled, TX: off; the GIC lines
++ * SPI 184/185 are never enabled), channel on.
++ */
++static void
++dma_chan_init(struct mtk_wmt *m, uint32_t ch, uint64_t pa)
++{
++	bool rx = ch == APDMA_RX;
++	unsigned n;
++
++	d_wr(m, ch, DMA_RST, d_rd(m, ch, DMA_RST) | 0x1);
++	for (n = 0; n < 10 && (d_rd(m, ch, DMA_EN) & 1); n++) {
++		delay(100);
++	}
++	if (n == 10) {
++		d_wr(m, ch, DMA_RST, d_rd(m, ch, DMA_RST) | 0x2);
++		d_wr(m, ch, DMA_RST, d_rd(m, ch, DMA_RST) & ~0x2u);
++		MLOG("AP-DMA BTIF %s: warm reset did not stop the channel; hard reset", rx ? "RX" : "TX");
++	}
++	d_wr(m, ch, DMA_VFF_ADDR, (uint32_t)pa);
++	d_wr(m, ch, DMA_VFF_ADDR_H, (uint32_t)(pa >> 32));
++	d_wr(m, ch, DMA_VFF_LEN, VFF_SIZE);
++	d_wr(m, ch, DMA_VFF_WPT, 0);
++	d_wr(m, ch, DMA_VFF_RPT, 0);
++	d_wr(m, ch, DMA_VFF_THRE, rx ? 1 : VFF_SIZE - 7);
++	if (rx) {
++		d_wr(m, ch, DMA_INT_FLAG, d_rd(m, ch, DMA_INT_FLAG) | 0x3);
++		d_wr(m, ch, DMA_INT_EN, d_rd(m, ch, DMA_INT_EN) | 0x3);
++	} else {
++		d_wr(m, ch, DMA_INT_FLAG, d_rd(m, ch, DMA_INT_FLAG) & ~0x1u);
++		d_wr(m, ch, DMA_INT_EN, d_rd(m, ch, DMA_INT_EN) & ~0x1u);
++	}
++	d_wr(m, ch, DMA_EN, d_rd(m, ch, DMA_EN) | 1);
++}
++
++/* Linux btif_tx/rx_dma_ctrl(DISABLE): STOP until it reads back 0, at most 10 ms. */
++static void
++dma_chan_stop(struct mtk_wmt *m, uint32_t ch)
++{
++	uint64_t t0 = now_us();
++
++	do {
++		d_wr(m, ch, DMA_STOP, d_rd(m, ch, DMA_STOP) | 1);
++		if (!(d_rd(m, ch, DMA_STOP) & 1)) {
++			return;
++		}
++	} while (now_us() - t0 < 10000);
++	MLOG("AP-DMA BTIF %s: STOP still set after 10 ms", ch == APDMA_TX ? "TX" : "RX");
++}
++
+ static int
+ btif_on(struct mtk_wmt *m)
+ {
+ 	int err;
++	bool want_dma = m->tx_dma || m->rx_dma;
+ 
+ 	if ((err = rottenapple_clk_enable(m->clk)) != 0) {
+ 		MLOG("BTIF clock enable failed (%d)", err);
+@@ -791,6 +1141,22 @@ btif_on(struct mtk_wmt *m)
+ 	MLOG("BTIF clock %s; before: IER 0x%02x LSR 0x%02x DMA_EN 0x%x TRI_LVL 0x%02x HANDSHAKE 0x%x",
+ 	    rottenapple_clk_is_enabled(m->clk) == 1 ? "running" : "GATED", b_rd(m, BTIF_IER), b_rd(m, BTIF_LSR),
+ 	    b_rd(m, BTIF_DMA_EN), b_rd(m, BTIF_TRI_LVL), b_rd(m, BTIF_HANDSHAKE));
++	if (want_dma && (m->apdma == 0 || m->dma_clk == NULL)) {
++		MLOG("AP-DMA asked for, but the ADT has no reg \"btif-dma\" / clock \"apdma\": PIO");
++		want_dma = false;
++	}
++	if (want_dma && (err = vff_alloc()) != 0) {
++		MLOG("AP-DMA vFIFO allocation failed (%d): PIO", err);
++		want_dma = false;
++	}
++	if (want_dma) {
++		if ((err = rottenapple_clk_enable(m->dma_clk)) != 0) {
++			MLOG("AP-DMA clock enable failed (%d): PIO", err);
++			want_dma = false;
++		} else {
++			m->state |= ST_DMA_CLK;
++		}
++	}
+ 	/* Linux hal_btif_hw_init order */
+ 	/* Linux enables the RX interrupt (RXFEN); the GIC line (SPI 190) is never enabled here, so we still poll */
+ 	b_wr(m, BTIF_IER, BTIF_IER_RXFEN);
+@@ -810,15 +1176,34 @@ btif_on(struct mtk_wmt *m)
+ 		(void)*(volatile uint8_t *)(m->btif + BTIF_RBR);
+ 		stale++;
+ 	}
+-	MLOG("BTIF on (PIO, polled): IER 0x%02x LSR 0x%02x DMA_EN 0x%x TRI_LVL 0x%02x HANDSHAKE 0x%x FAKELCR 0x%x%s",
+-	    b_rd(m, BTIF_IER), b_rd(m, BTIF_LSR), b_rd(m, BTIF_DMA_EN), b_rd(m, BTIF_TRI_LVL), b_rd(m, BTIF_HANDSHAKE),
+-	    b_rd(m, BTIF_FAKELCR), stale ? " (stale RX bytes discarded)" : "");
+-	/* CONNSYS side: Linux consys_wakeup_btif_irq_pull_low */
+-	*(volatile uint32_t *)(m->conn_btif + CONN_BTIF_WAK) = 1;
+-	__builtin_arm_dsb(0xf);
+-	MLOG("CONNSYS BTIF wake 0x180a2064 = 1");
+-	btif_wake(m, "BTIF open", m->wak_end_high);
+-	conn_btif_log(m, "before the first frame");
++	/* Linux _btif_init: controller, then the TX channel, then the RX channel (each: DMA on, then BTIF DMA mode) */
++	if (want_dma && m->tx_dma) {
++		m->txv = wmt_vff + VFF_TX_OFF;
++		m->txv_pa = wmt_vff_pa + VFF_TX_OFF;
++		m->txw = 0;
++		dma_chan_init(m, APDMA_TX, m->txv_pa);
++		b_wr(m, BTIF_DMA_EN, b_rd(m, BTIF_DMA_EN) | BTIF_DMA_EN_TX);
++		m->state |= ST_TXDMA;
++		m->txd = true;
++		dma_chan_log(m, APDMA_TX, "open");
++	}
++	if (want_dma && m->rx_dma) {
++		m->rxv = wmt_vff + VFF_RX_OFF;
++		m->rxv_pa = wmt_vff_pa + VFF_RX_OFF;
++		m->rxr = 0;
++		dma_chan_init(m, APDMA_RX, m->rxv_pa);
++		b_wr(m, BTIF_DMA_EN, b_rd(m, BTIF_DMA_EN) | BTIF_DMA_EN_RX);
++		m->state |= ST_RXDMA;
++		m->rxd = true;
++		dma_chan_log(m, APDMA_RX, "open");
++	}
++	MLOG("BTIF on (TX %s, RX %s; polled): IER 0x%02x LSR 0x%02x DMA_EN 0x%x TRI_LVL 0x%02x HANDSHAKE 0x%x "
++	    "FAKELCR 0x%x SLEEP_EN 0x%x%s", m->txd ? "AP-DMA" : "PIO", m->rxd ? "AP-DMA" : "PIO", b_rd(m, BTIF_IER),
++	    b_rd(m, BTIF_LSR), b_rd(m, BTIF_DMA_EN), b_rd(m, BTIF_TRI_LVL), b_rd(m, BTIF_HANDSHAKE),
++	    b_rd(m, BTIF_FAKELCR), b_rd(m, BTIF_SLEEP_EN), stale ? " (stale RX bytes discarded)" : "");
++	/* As Linux: no WAK pulse and no CONNSYS-side write before the first command */
++	conn_btif_log(m, "before the first frame", false);
++	m->t_open = now_us();
+ 	return 0;
+ }
+ 
+@@ -892,7 +1277,8 @@ mtk_wmt_on(struct mtk_wmt *m)
+ 	m->state = 0;
+ 	m->mode = STP_MODE_OFF;
+ 	m->cal_us = 0;
+-	MLOG("WMT init over BTIF: chip 0x%04x, a-die 0x%04x expected", m->chip_id, m->adie);
++	MLOG("WMT init over BTIF: chip 0x%04x, a-die 0x%04x expected; transport asked: TX %s, RX %s", m->chip_id,
++	    m->adie, m->tx_dma ? "AP-DMA" : "PIO", m->rx_dma ? "AP-DMA" : "PIO");
+ 	MLOG("CONNSYS before: COM_REG0 0x%08x PC 0x%05x CONN_ON_MISC 0x%08x", c_rd(m, CONN_MCU_COM_REG0),
+ 	    c_rd(m, CONN_HIF_ON_PC), c_rd(m, CONN_CFG_ON_MISC));
+ 	if ((err = btif_on(m)) != 0) {
+@@ -1004,6 +1390,9 @@ mtk_wmt_on(struct mtk_wmt *m)
+ 	MLOG("WMT init done in %llu ms (RF calibration %llu ms); STP: rx %u frames, tx %u frames, %u CRC / %u "
+ 	    "header / %u seq errors, %u firmware messages", (now_us() - t0) / 1000, m->cal_us / 1000, m->rx_frames,
+ 	    m->tx_frames, m->crc_errs, m->hdr_errs, m->seq_errs, m->fw_msgs);
++	MLOG("WMT init transport: TX %s, RX %s; first byte back %llu us after BTIF open; %u stalled command(s), "
++	    "%u WAK pulse(s), %u AP-DMA TX flush(es)", m->txd ? "AP-DMA" : "PIO", m->rxd ? "AP-DMA" : "PIO",
++	    m->t_first_rx, m->stalls, m->wak_pulses, m->dma_flushes);
+ 	MLOG("CONNSYS after: COM_REG0 0x%08x PC 0x%05x 0x%05x CONN_ON_MISC 0x%08x", c_rd(m, CONN_MCU_COM_REG0),
+ 	    c_rd(m, CONN_HIF_ON_PC), c_rd(m, CONN_HIF_ON_PC), c_rd(m, CONN_CFG_ON_MISC));
+ 	return 0;
+@@ -1023,11 +1412,31 @@ mtk_wmt_off(struct mtk_wmt *m)
+ 		    m->rx_bytes, m->rx_frames, m->tx_bytes, m->tx_frames, m->out_pending ? ", last frame unacked" : "");
+ 		m->mode = STP_MODE_OFF;
+ 	}
++	/* Linux btif_close: both channels stopped (STOP), then the clocks; we also take the BTIF out of DMA mode */
++	if (m->state & ST_TXDMA) {
++		dma_chan_stop(m, APDMA_TX);
++		m->state &= ~ST_TXDMA;
++	}
++	if (m->state & ST_RXDMA) {
++		dma_chan_stop(m, APDMA_RX);
++		m->state &= ~ST_RXDMA;
++	}
+ 	if (m->state & ST_BTIF) {
+-		btif_wake_release(m);
++		b_wr(m, BTIF_DMA_EN, b_rd(m, BTIF_DMA_EN) & ~(BTIF_DMA_EN_TX | BTIF_DMA_EN_RX));
++		if (m->wak_pulses) {
++			b_wr(m, BTIF_WAK, 1);   /* the Linux resting level (already left there by every pulse) */
++		}
++		MLOG("BTIF WAK: %s", m->wak_pulses ? "high (the Linux resting level)" : "never driven");
+ 		b_wr(m, BTIF_IER, 0);
+ 		m->state &= ~ST_BTIF;
+ 	}
++	if (m->state & ST_DMA_CLK) {
++		rottenapple_clk_disable(m->dma_clk);
++		m->state &= ~ST_DMA_CLK;
++		MLOG("AP-DMA clock %s", rottenapple_clk_is_enabled(m->dma_clk) == 1 ?
++		    "still running (shared with the UART DMA or boot-on)" : "gated");
++	}
++	m->txd = m->rxd = false;
+ 	if (m->state & ST_CLK) {
+ 		rottenapple_clk_disable(m->clk);
+ 		m->state &= ~ST_CLK;
+--- a/bsd/dev/rottenapple_mtk_wmt.h
++++ b/bsd/dev/rottenapple_mtk_wmt.h
+@@ -27,6 +27,9 @@ struct mtk_wmt {
+ 	uintptr_t btif;                 /* AP-side BTIF (0x1100c000) */
+ 	uintptr_t conn_btif;            /* CONNSYS-side BTIF (0x180a2000) */
+ 	struct rottenapple_clk *clk;    /* BTIF clock gate ("btifc") */
++	uintptr_t apdma;                /* AP-DMA BTIF channels (0x10217b00: TX +0x0, RX +0x80); 0 = none */
++	struct rottenapple_clk *dma_clk;        /* AP-DMA clock gate ("apdmac") */
++	bool tx_dma, rx_dma;            /* transport asked for (falls back to PIO without apdma/dma_clk) */
+ 	uint32_t chip_id;               /* SoC id for SET_CHIP_ID (0x6789) */
+ 	uint32_t adie;                  /* expected RF chip (0x6631) */
+ 	uintptr_t emi;                  /* CONNSYS EMI (for the calibration backup check) */
+@@ -54,10 +57,22 @@ struct mtk_wmt {
+ 	uint8_t out_type, out_seq;
+ 	bool out_pending;               /* sent in full mode, no ACK yet */
+ 	bool in_tx, ack_due;            /* an ACK to send once the current frame is out */
+-	bool wak_held;                  /* BTIF WAK held low (ap_wakeup_consys asserted) */
+-	bool wak_end_high;              /* level WAK is left at after a pulse (default low) */
+-	uint32_t wak_pulses;
+-	uint32_t rto_resets, double_sends;      /* CONNSYS RX-timeout re-arms, frames sent twice */
++	uint32_t wak_pulses;            /* BTIF WAK pulses (Linux style, left high); 0 = never driven */
++	uint32_t rto_resets;            /* CONNSYS BTIF DMA_EN reads (RX-timeout re-arm) in the retry ladder */
++	uint32_t stalls;                /* commands that got nothing back for 300 ms */
++	/* AP-DMA transport (W2b run 4) */
++	bool txd, rxd;                  /* in use */
++	bool in_rx;                     /* RX vFIFO being parsed (no nested RX poll) */
++	uintptr_t txv, rxv;             /* vFIFOs (kernel VA, cached; maintained by PA) */
++	uint64_t txv_pa, rxv_pa;
++	uint32_t txw, rxr;              /* TX write / RX read pointer with the wrap bit (16) */
++	uint32_t dma_flushes, dma_rx_chunks, dma_rx_bad;
++	uint64_t t_first_rx;            /* us from BTIF open to the first received byte, 0 = none */
++	uint64_t t_open;
++	/* CONNSYS MCU DMA (0x180a1000) and CIRQ (0x180a5000) snapshots, taken only after a stall */
++	bool snap_valid;
++	uint32_t snaps;
++	uint32_t snap_dma[1024], snap_cirq[512];
+ 	/* statistics and trace for the dumps */
+ 	uint32_t rx_bytes, tx_bytes, rx_frames, tx_frames, acks_rx, acks_tx;
+ 	uint32_t hdr_errs, crc_errs, seq_errs, junk, overruns, fw_msgs;
+--- a/bsd/dev/rottenapple_wifi.c
++++ b/bsd/dev/rottenapple_wifi.c
+@@ -195,6 +195,7 @@ wifi_w2(struct rottenapple_wifi *w, unsigned level)
+ 	for (unsigned cycle = 1; cycle <= WIFI_W1_CYCLES; cycle++) {
+ 		WLOG("W2 cycle %u/%u: powering up", cycle, WIFI_W1_CYCLES);
+ 		int err = w->ops->power_on(w);
++		bool powered = err == 0;
+ 		if (err) {
+ 			WLOG("W2 cycle %u/%u: power-up FAILED (%d); powering down", cycle, WIFI_W1_CYCLES, err);
+ 		} else {
+@@ -209,9 +210,15 @@ wifi_w2(struct rottenapple_wifi *w, unsigned level)
+ 		if (w->ops->report) {
+ 			w->ops->report(w);
+ 		}
+-		if (err) {
++		if (err && (level < 4 || !powered)) {
+ 			break;          /* a failed cycle is not repeated */
+ 		}
++		if (err) {
++			/* level 4: the backend changes the W2b transport after a failure; the second cycle compares */
++			WLOG("W2 cycle %u/%u failed; level 4 runs the next cycle anyway (another W2b variant)", cycle,
++			    WIFI_W1_CYCLES);
++			continue;
++		}
+ 		passed++;
+ 	}
+ 	WLOG("W2 result: %s (%u/%u cycles)", passed == WIFI_W1_CYCLES ? "PASSED" : "FAILED", passed,

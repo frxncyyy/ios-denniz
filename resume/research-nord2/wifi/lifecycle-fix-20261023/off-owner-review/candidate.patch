@@ -1,0 +1,147 @@
+--- a/shim/nord2-xnu/wifi_station_service_bind.inc
++++ b/shim/nord2-xnu/wifi_station_service_bind.inc
+@@ -166,7 +166,7 @@
+  nss_native.scan_sequence=sequence;slot->state=NSS_RUNNING;return 0;
+ }
+ static struct nss_slot*njs_associated_scan_done_locked(void){
+- struct nsb_scan*scan=nst_native.state.associated_scan;if(!scan||(!scan->done&&!nst_native.state.associated_scan_canceled)||scan->active||(nst_native.state.wire_busy&&(nst_native.state.wire_cid==3||nst_native.state.wire_cid==4)))return 0;
++ struct nsb_scan*scan=nst_native.state.associated_scan;if(!scan||(!scan->done&&!nst_native.state.associated_scan_canceled)||scan->active||(nst_native.state.wire_busy&&(nst_native.state.wire_cid==3||nst_native.state.wire_cid==NST_CID_SCAN_CANCEL)))return 0;
+  for(unsigned k=0;k<NSS_SLOTS;k++)if(&nss_native.slot[k].scan==scan){if(nst_associated_scan_detach(&nst_native.state,scan))return 0;nss_native.slot[k].captured=scan->last;return &nss_native.slot[k];}return 0;
+ }
+ /* Compiled native module implements all six operations for this checked
+--- a/shim/nord2-xnu/wifi_station_transport.c
++++ b/shim/nord2-xnu/wifi_station_transport.c
+@@ -49,7 +49,7 @@
+ }
+ static int acceptable(const struct nst*s){return source(s)&&!s->callback_active;}
+ static int busy(const struct nst*s){return s->wire_busy||s->air_pending||s->peer_kind;}
+-static int cid_size(uint8_t cid,size_t n){switch(cid){case 3:return n==1188;case 4:return n==4;case 7:return n==64;case 0x0a:return n==68;case 0x11:return n==12;case 0x12:return n==116;case 0x13:return n==200;case 0x14:return n==4;case 0x16:return n==12;case 0x17:return n==4;case 0x19:return n==22;case 0x1c:return n==24;default:return 0;}}
++static int cid_size(uint8_t cid,size_t n){switch(cid){case 3:return n==1188;case NST_CID_SCAN_CANCEL:return n==4;case 7:return n==64;case 0x0a:return n==68;case 0x11:return n==12;case 0x12:return n==116;case 0x13:return n==200;case 0x14:return n==4;case 0x16:return n==12;case 0x17:return n==4;case 0x19:return n==22;case 0x1c:return n==24;default:return 0;}}
+ static int group_slot(const struct nst*s,unsigned key){
+  if(key>3)return -1;if(s->gtk_mapped&(1u<<key))return s->gtk_wlan[key];
+  if(!s->gtk_mapped)return s->peer.group_wlan;
+@@ -59,7 +59,7 @@
+ static int command(struct nst*s,uint64_t ticket,uint8_t cid,const uint8_t*p,size_t n,unsigned internal){
+  if(!acceptable(s)||!ticket||!p||!cid_size(cid,n))return -1;if(s->wire_busy||s->air_pending)return 1;
+  if(cid==7&&s->security==SW_SECURITY_OPEN)return -1;
+- if((cid==3&&internal!=3)||(cid==4&&internal!=4))return -1;
++ if((cid==3&&internal!=3)||(cid==NST_CID_SCAN_CANCEL&&internal!=4))return -1;
+  if(cid==7&&(p[10]!=s->peer.bss||!eq(p+4,s->peer.ap,6)||p[11]!=(p[0]?4:0)||p[12]>3||p[13]!=(p[0]?16:0)||p[14]!=(p[2]?s->peer.wlan:group_slot(s,p[12]))||p[0]>1||p[2]>1||p[3]||p[1]!=(p[0]?p[2]:0)||(p[2]&&p[12])))return -1;
+  if(cid==7&&!p[2]&&((!p[0]&&!(s->gtk_mapped&(1u<<p[12])))||(p[0]&&s->gtk_submission_serial==UINT32_MAX)))return -1;
+  if(cid==0x1c&&(p[0]!=s->peer.bss||(!p[2]&&(p[3]!=s->peer.channel||p[5]!=s->peer.band))||p[2]>1))return -1;
+@@ -78,7 +78,7 @@
+ }
+ int nst_associated_scan_cancel(struct nst*s){if(!source(s)||!s->associated_scan)return -1;s->associated_scan_cancel=1;return 0;}
+ int nst_associated_scan_detach(struct nst*s,struct nsb_scan*scan){
+- if(!s||!scan||s->associated_scan!=scan||(!scan->done&&!s->associated_scan_canceled)||scan->active||(s->wire_busy&&(s->wire_cid==3||s->wire_cid==4)))return -1;
++ if(!s||!scan||s->associated_scan!=scan||(!scan->done&&!s->associated_scan_canceled)||scan->active||(s->wire_busy&&(s->wire_cid==3||s->wire_cid==NST_CID_SCAN_CANCEL)))return -1;
+  s->associated_scan=0;s->associated_scan_published=s->associated_scan_cancel=s->associated_scan_canceled=0;return 0;
+ }
+ static int frame(struct nst*s,uint64_t ticket,const uint8_t*p,size_t n,unsigned type,unsigned protect){
+@@ -332,7 +332,7 @@
+ int nst_step(struct nst*s,const struct ncd_io*o,void*c,unsigned budget,nst_event_fn fn,void*ctx){
+  if(!source(s)||s->active||s->callback_active||!o||!o->bus||!o->now_us||!o->bus->owner||!o->bus->reg_read||!o->bus->reg_write||!o->bus->mem_read||!o->bus->mem_write||!o->bus->sync||!budget||budget>16)return -1;
+  s->active=1;s->entered=1;s->phase=NST_IDLE;
+- if(s->associated_scan&&s->associated_scan_cancel&&!s->associated_scan->done&&!s->associated_scan_canceled&&!s->wire_busy&&!s->air_pending){uint8_t cancel[4]={s->associated_scan->sequence,0,0,0};if(command(s,UINT64_MAX-2,4,cancel,sizeof cancel,4))return fail(s,49);}
++ if(s->associated_scan&&s->associated_scan_cancel&&!s->associated_scan->done&&!s->associated_scan_canceled&&!s->wire_busy&&!s->air_pending){uint8_t cancel[4]={s->associated_scan->sequence,0,0,0};if(command(s,UINT64_MAX-2,NST_CID_SCAN_CANCEL,cancel,sizeof cancel,4))return fail(s,49);}
+  if(before(s,o,c)||coherent(s,o,c)||transmit(s,o,c,fn,ctx))return -1;
+  static const unsigned order[5]={0,2,3,4,1};unsigned used=0;while(used<budget){unsigned progress=0;for(unsigned j=0;j<5&&used<budget;j++){int e=receive(s,o,c,order[j],fn,ctx);if(e<0)return -1;if(e){used++;progress++;}}if(!progress)break;}
+  if(s->air_pending&&s->dma_done&&(s->air_done||(retired_air_failure(s)&&s->last>=s->operation_deadline))){
+--- a/shim/nord2-xnu/wifi_station_transport.h
++++ b/shim/nord2-xnu/wifi_station_transport.h
+@@ -6,6 +6,9 @@
+ #include "wifi_station_wire.h"
+ #include "wifi_station_data_diag.h"
+ #include "wifi_station_tx.h"
++/* Selected gen4m ENUM_CMD_ID: 0x04 is NIC_POWER_CTRL, never scan cancel.
++ * Internal_wire4 is a host role and must not be used as a wire CID. */
++#define NST_CID_SCAN_CANCEL 0x1bu
+ #define NST_MAX_ETHERNET 1514u
+ #define NST_RX_BYTES 3840u
+ #define NST_FRAME_BYTES 1600u
+--- a/tools/fixtures/nord2-wifi-lifecycle/owner.c
++++ b/tools/fixtures/nord2-wifi-lifecycle/owner.c
+@@ -67,9 +67,9 @@
+  assert(station_hardware&&s->wire_busy);station_pubs++;
+  if(s->wire_type){station_frames++;assert(s->wire_type==1);uint8_t*r=station_packet(1,7,124);r[28]=15;r[36]=s->wire_pid;r[40]=s->wire_wlan;if(s->generation>1){uint8_t*late=station_packet(4,7,124);late[28]=15;late[36]=1;late[40]=s->wire_wlan;}
+  unsigned fc=s->wire[32];if(fc==0xb0||fc==0)station_mgmt(fc==0xb0?0xb0:0x10);}
+- else{station_commands++;assert(p[37]==0xa0&&p[39]==t->next_sequence);
++ else{station_commands++;assert(p[36]!=0x04);assert(p[37]==0xa0&&p[39]==t->next_sequence);
+  if(p[36]==3){assert(njs_native.linked&&nst_native.state.controlled_port);if(scan_hold)held_sequence=p[64];else associated_frames(p[64]);if(hold_scan_dma){held_scan_next=next;return;}}
+- if(p[36]==4){assert(p[64]==held_sequence&&!p[65]&&!p[66]&&!p[67]);cancel_commands++;if(hold_cancel_dma){held_cancel_next=next;return;}}
++ if(p[36]==NST_CID_SCAN_CANCEL){assert(p[64]==held_sequence&&!p[65]&&!p[66]&&!p[67]);cancel_commands++;if(hold_cancel_dma){held_cancel_next=next;return;}}
+  if(p[36]==0x1c&&!p[66]){uint8_t*r=station_packet(1,7,60);r[28]=16;r[36]=s->peer.bss;r[37]=p[65];r[39]=s->peer.channel;r[41]=s->peer.band;put32(r+48,4000);}
+  if(p[36]==0x13&&p[84]==SW_STA_CLASS_3&&p[115]){uint8_t*r=station_packet(1,7,44);r[28]=12;r[29]=p[39];memcpy(r+36,s->peer.ap,6);r[42]=s->peer.sta;r[43]=s->peer.bss;}
+  if(p[36]==7&&p[64]&&p[66]){uint8_t*r=station_packet(1,7,44);r[28]=36;r[36]=s->peer.bss;memcpy(r+38,s->peer.ap,6);}
+@@ -133,12 +133,12 @@
+   associated_frames(held_sequence);scan_hold=0;
+   for(unsigned k=0;k<100&&associated_callbacks<cycle+1;k++)assert(checked_owner()==1);
+   assert(associated_callbacks==cycle+1&&station_commands==commands_before+2&&njs_native.linked&&nst_native.state.sta_active&&!nst_native.state.associated_scan);
+-  /* Missing SCAN_DONE takes actual source CID04 path, no fabricated DONE. */
++  /* Missing SCAN_DONE takes actual source CID1b path, no fabricated DONE. */
+   scan_hold=1;held_sequence=0;uint64_t timeout_ticket=0;assert(!nord2_wifi_scan_enqueue(&aq,&timeout_callbacks,90,timeout_completed,&timeout_ticket));for(unsigned k=0;k<100&&!held_sequence;k++)assert(checked_owner()==1);drain_now+=UINT64_C(14001000000);for(unsigned k=0;k<100&&timeout_callbacks<cycle+1;k++)assert(checked_owner()==1);assert(timeout_callbacks==cycle+1&&njs_native.linked&&nst_native.state.controlled_port&&!nst_native.state.associated_scan&&!nst_native.state.halt);scan_hold=0;
+   /* Pending DMA/keys/port/cookie cannot become a reusable session. */
+   assert(!njs_rejoin_ready_locked());
+   scan_hold=1;held_sequence=0;uint64_t canceled_ticket=0;assert(!nord2_wifi_scan_enqueue(&aq,&associated_canceled,89,canceled_completed,&canceled_ticket));for(unsigned k=0;k<100&&!held_sequence;k++)assert(checked_owner()==1);assert(nst_native.state.associated_scan->active);unsigned before_delete=key_deletes;
+-  hold_cancel_dma=1;held_cancel_next=0;assert(!nord2_wifi_power_set(0));assert(!nst_native.state.controlled_port&&!njs_native.linked);for(unsigned k=0;k<100&&!held_cancel_next;k++)assert(checked_owner()==1);assert(held_cancel_next&&nst_native.state.wire_busy&&nst_native.state.wire_cid==4);associated_frames(held_sequence);assert(checked_owner()==1&&associated_canceled==cycle&&nst_native.state.associated_scan&&nst_native.state.associated_scan->done);assert(nst_associated_scan_detach(&nst_native.state,nst_native.state.associated_scan)<0);{struct nst*ns=&nst_native.state;uint8_t*d=pool_memory+(ns->init->transport.tx_ring-NDP_POOL_BASE)+16*ns->tx_next;put32(d+4,0xc0000000u);hardware_register(0x1802541c,held_cancel_next);}hold_cancel_dma=0;for(unsigned k=0;k<100&&associated_canceled<cycle+1;k++)assert(checked_owner()==1);assert(cancel_commands==(cycle+1)*2&&associated_canceled==cycle+1&&key_deletes==before_delete&&!nst_native.state.associated_scan);scan_hold=0;struct nss_info offinfo;assert(!nord2_wifi_scan_info(&offinfo)&&!offinfo.powered);assert(nord2_wifi_scan_enqueue(&aq,&associated_callbacks,88,associated_completed,&scan_ticket)==2);assert(nord2_wifi_link_send(data,sizeof data,ticket)==NWIL_SEND_NOT_READY);uint64_t refused=999;assert(nord2_wifi_join_enqueue(&q,notices,7,join_completed,&refused)==-1||refused==999);
++  hold_cancel_dma=1;held_cancel_next=0;assert(!nord2_wifi_power_set(0));assert(!nst_native.state.controlled_port&&!njs_native.linked);for(unsigned k=0;k<100&&!held_cancel_next;k++)assert(checked_owner()==1);assert(held_cancel_next&&nst_native.state.wire_busy&&nst_native.state.wire_cid==NST_CID_SCAN_CANCEL);associated_frames(held_sequence);assert(checked_owner()==1&&associated_canceled==cycle&&nst_native.state.associated_scan&&nst_native.state.associated_scan->done);assert(nst_associated_scan_detach(&nst_native.state,nst_native.state.associated_scan)<0);{struct nst*ns=&nst_native.state;uint8_t*d=pool_memory+(ns->init->transport.tx_ring-NDP_POOL_BASE)+16*ns->tx_next;put32(d+4,0xc0000000u);hardware_register(0x1802541c,held_cancel_next);}hold_cancel_dma=0;for(unsigned k=0;k<100&&associated_canceled<cycle+1;k++)assert(checked_owner()==1);assert(cancel_commands==(cycle+1)*2&&associated_canceled==cycle+1&&key_deletes==before_delete&&!nst_native.state.associated_scan);scan_hold=0;struct nss_info offinfo;assert(!nord2_wifi_scan_info(&offinfo)&&!offinfo.powered);assert(nord2_wifi_scan_enqueue(&aq,&associated_callbacks,88,associated_completed,&scan_ticket)==2);assert(nord2_wifi_link_send(data,sizeof data,ticket)==NWIL_SEND_NOT_READY);uint64_t refused=999;assert(nord2_wifi_join_enqueue(&q,notices,7,join_completed,&refused)==-1||refused==999);
+   for(unsigned k=0;k<1000&&!njs_native.scan_returned;k++)assert(checked_owner()==1);assert(njs_native.scan_returned&&!nsr_native.scan_ready);uint64_t actual_closed=nsr_native.closed_us;drain_now+=UINT64_C(60000000000);assert(checked_owner()==0&&!nsr_native.scan_ready&&nsr_native.closed_us==actual_closed);assert(!nord2_wifi_power_set(1));assert(!nord2_wifi_scan_info(&offinfo)&&offinfo.powered);assert(checked_owner()==0&&nsr_native.scan_state==2&&nsr_native.scan_ticket&&nsr_native.refresh_requested_us>=actual_closed+UINT64_C(60000000)&&nsr_native.closed_us==actual_closed);
+   assert(njs_native.scan_returned&&!nsr_native.ptk&&!nsr_native.gtk&&!nsr_native.pending&&!nsr_native.bad&&key_deletes==(cycle+1)*3&&notices[NJS_RETIRED]==cycle+1);
+   assert(njs_native.used&&nst_native.attempted&&njs_native.arbiter.connection_used&&!njs_rejoin_ready_locked());saved_pid=nst_native.state.next_pid;saved_token=nst_native.state.normal.token_next;saved_hw=nst_native.state.normal.next;
+--- a/tools/fixtures/nord2-wifi-power-cleanup/owner.c
++++ b/tools/fixtures/nord2-wifi-power-cleanup/owner.c
+@@ -68,9 +68,9 @@
+  assert(station_hardware&&s->wire_busy);station_pubs++;
+  if(s->wire_type){station_frames++;assert(s->wire_type==1);unsigned suppress_deauth=s->wire[32]==0xc0;if(suppress_deauth)previous_deauth_pid=s->wire_pid;if(suppress_deauth&&test_unknown_dma)return;if(!suppress_deauth){uint8_t*r=station_packet(1,7,124);r[28]=15;r[36]=s->wire_pid;r[40]=s->wire_wlan;if(s->generation>1&&s->wire[32]==0xb0){assert(previous_deauth_pid&&s->wire_pid>previous_deauth_pid);uint8_t*late=station_packet(4,7,124);late[28]=15;late[36]=(uint8_t)previous_deauth_pid;late[40]=s->wire_wlan;late=station_packet(3,7,124);late[28]=15;late[36]=(uint8_t)previous_deauth_pid;late[37]=7;late[40]=s->wire_wlan;}}
+  unsigned fc=s->wire[32];if(fc==0xb0||fc==0)station_mgmt(fc==0xb0?0xb0:0x10);}
+- else{station_commands++;assert(p[37]==0xa0&&p[39]==t->next_sequence);
++ else{station_commands++;assert(p[36]!=0x04);assert(p[37]==0xa0&&p[39]==t->next_sequence);
+  if(p[36]==3){assert(njs_native.linked&&nst_native.state.controlled_port);if(scan_hold)held_sequence=p[64];else associated_frames(p[64]);if(hold_scan_dma){held_scan_next=next;return;}}
+- if(p[36]==4){assert(p[64]==held_sequence&&!p[65]&&!p[66]&&!p[67]);cancel_commands++;if(hold_cancel_dma){held_cancel_next=next;return;}}
++ if(p[36]==NST_CID_SCAN_CANCEL){assert(p[64]==held_sequence&&!p[65]&&!p[66]&&!p[67]);cancel_commands++;if(hold_cancel_dma){held_cancel_next=next;return;}}
+  if(p[36]==0x1c&&!p[66]){uint8_t*r=station_packet(1,7,60);r[28]=16;r[36]=s->peer.bss;r[37]=p[65];r[39]=s->peer.channel;r[41]=s->peer.band;put32(r+48,4000);}
+  if(p[36]==0x13&&p[84]==SW_STA_CLASS_3&&p[115]){uint8_t*r=station_packet(1,7,44);r[28]=12;r[29]=p[39];memcpy(r+36,s->peer.ap,6);r[42]=s->peer.sta;r[43]=s->peer.bss;}
+  if(p[36]==7&&p[64]&&p[66]){uint8_t*r=station_packet(1,7,44);r[28]=36;r[36]=s->peer.bss;memcpy(r+38,s->peer.ap,6);}
+@@ -142,12 +142,12 @@
+   associated_frames(held_sequence);scan_hold=0;
+   for(unsigned k=0;k<100&&associated_callbacks<cycle+1;k++)assert(checked_owner()==1);
+   assert(associated_callbacks==cycle+1&&station_commands==commands_before+2&&njs_native.linked&&nst_native.state.sta_active&&!nst_native.state.associated_scan);
+-  /* Missing SCAN_DONE takes actual source CID04 path, no fabricated DONE. */
++  /* Missing SCAN_DONE takes actual source CID1b path, no fabricated DONE. */
+   scan_hold=1;held_sequence=0;uint64_t timeout_ticket=0;assert(!nord2_wifi_scan_enqueue(&aq,&timeout_callbacks,90,timeout_completed,&timeout_ticket));for(unsigned k=0;k<100&&!held_sequence;k++)assert(checked_owner()==1);drain_now+=UINT64_C(14001000000);for(unsigned k=0;k<100&&timeout_callbacks<cycle+1;k++)assert(checked_owner()==1);assert(timeout_callbacks==cycle+1&&njs_native.linked&&nst_native.state.controlled_port&&!nst_native.state.associated_scan&&!nst_native.state.halt);scan_hold=0;
+   /* Pending DMA/keys/port/cookie cannot become a reusable session. */
+   assert(!njs_rejoin_ready_locked());
+   scan_hold=1;held_sequence=0;uint64_t canceled_ticket=0;assert(!nord2_wifi_scan_enqueue(&aq,&associated_canceled,89,canceled_completed,&canceled_ticket));for(unsigned k=0;k<100&&!held_sequence;k++)assert(checked_owner()==1);assert(nst_native.state.associated_scan->active);unsigned before_delete=key_deletes;
+-  hold_cancel_dma=1;held_cancel_next=0;assert(!nord2_wifi_power_set(0));assert(!nst_native.state.controlled_port&&!njs_native.linked);for(unsigned k=0;k<100&&!held_cancel_next;k++)assert(checked_owner()==1);assert(held_cancel_next&&nst_native.state.wire_busy&&nst_native.state.wire_cid==4);associated_frames(held_sequence);assert(checked_owner()==1&&associated_canceled==cycle&&nst_native.state.associated_scan&&nst_native.state.associated_scan->done);assert(nst_associated_scan_detach(&nst_native.state,nst_native.state.associated_scan)<0);{struct nst*ns=&nst_native.state;uint8_t*d=pool_memory+(ns->init->transport.tx_ring-NDP_POOL_BASE)+16*ns->tx_next;put32(d+4,0xc0000000u);hardware_register(0x1802541c,held_cancel_next);}hold_cancel_dma=0;for(unsigned k=0;k<100&&associated_canceled<cycle+1;k++)assert(checked_owner()==1);assert(cancel_commands==(cycle+1)*2&&associated_canceled==cycle+1&&key_deletes==before_delete&&!nst_native.state.associated_scan);scan_hold=0;struct nss_info offinfo;assert(!nord2_wifi_scan_info(&offinfo)&&!offinfo.powered);assert(nord2_wifi_scan_enqueue(&aq,&associated_callbacks,88,associated_completed,&scan_ticket)==2);assert(nord2_wifi_link_send(data,sizeof data,ticket)==NWIL_SEND_NOT_READY);uint64_t refused=999;assert(nord2_wifi_join_enqueue(&q,notices,7,join_completed,&refused)==-1||refused==999);
++  hold_cancel_dma=1;held_cancel_next=0;assert(!nord2_wifi_power_set(0));assert(!nst_native.state.controlled_port&&!njs_native.linked);for(unsigned k=0;k<100&&!held_cancel_next;k++)assert(checked_owner()==1);assert(held_cancel_next&&nst_native.state.wire_busy&&nst_native.state.wire_cid==NST_CID_SCAN_CANCEL);associated_frames(held_sequence);assert(checked_owner()==1&&associated_canceled==cycle&&nst_native.state.associated_scan&&nst_native.state.associated_scan->done);assert(nst_associated_scan_detach(&nst_native.state,nst_native.state.associated_scan)<0);{struct nst*ns=&nst_native.state;uint8_t*d=pool_memory+(ns->init->transport.tx_ring-NDP_POOL_BASE)+16*ns->tx_next;put32(d+4,0xc0000000u);hardware_register(0x1802541c,held_cancel_next);}hold_cancel_dma=0;for(unsigned k=0;k<100&&associated_canceled<cycle+1;k++)assert(checked_owner()==1);assert(cancel_commands==(cycle+1)*2&&associated_canceled==cycle+1&&key_deletes==before_delete&&!nst_native.state.associated_scan);scan_hold=0;struct nss_info offinfo;assert(!nord2_wifi_scan_info(&offinfo)&&!offinfo.powered);assert(nord2_wifi_scan_enqueue(&aq,&associated_callbacks,88,associated_completed,&scan_ticket)==2);assert(nord2_wifi_link_send(data,sizeof data,ticket)==NWIL_SEND_NOT_READY);uint64_t refused=999;assert(nord2_wifi_join_enqueue(&q,notices,7,join_completed,&refused)==-1||refused==999);
+   for(unsigned k=0;k<1000&&!njs_native.scan_returned;k++)assert(checked_owner()==1);assert(njs_native.scan_returned&&!nsr_native.scan_ready);uint64_t actual_closed=nsr_native.closed_us;drain_now+=UINT64_C(60000000000);assert(checked_owner()==0&&!nsr_native.scan_ready&&nsr_native.closed_us==actual_closed);assert(!nord2_wifi_power_set(1));assert(!nord2_wifi_scan_info(&offinfo)&&offinfo.powered);assert(checked_owner()==0&&nsr_native.scan_state==2&&nsr_native.scan_ticket&&nsr_native.refresh_requested_us>=actual_closed+UINT64_C(60000000)&&nsr_native.closed_us==actual_closed);
+   assert(njs_native.scan_returned&&!nsr_native.ptk&&!nsr_native.gtk&&!nsr_native.pending&&!nsr_native.bad&&key_deletes==(cycle+1)*3&&notices[NJS_RETIRED]==cycle+1);
+   assert(njs_native.used&&nst_native.attempted&&njs_native.arbiter.connection_used&&!njs_rejoin_ready_locked());saved_pid=nst_native.state.next_pid;saved_token=nst_native.state.normal.token_next;saved_hw=nst_native.state.normal.next;
+--- /dev/null
++++ b/tools/test-nord2-wifi-scan-cancel.py
+@@ -0,0 +1,25 @@
++#!/usr/bin/env python3
++"""Source-pinned scan-cancel command identity/extent oracle; offline only."""
++from pathlib import Path
++import argparse, hashlib, json, re, subprocess
++R=next(p for p in Path(__file__).resolve().parents if (p/'AGENTS.md').exists())
++a=argparse.ArgumentParser();a.add_argument('--source-root',type=Path,required=True);a.add_argument('--candidate',type=Path,default=R/'shim/nord2-xnu');a.add_argument('--log-dir',type=Path,required=True);x=a.parse_args();w=x.log_dir.resolve();w.mkdir(parents=True,exist_ok=True)
++h=x.source_root.resolve()/'drivers/misc/mediatek/connectivity/wlan/core/gen4m/include/wsys_cmd_handler_fw.h'
++s=h.read_text();start=s.index('enum ENUM_CMD_ID {');end=s.index('CMD_ID_SCAN_CANCEL,',start)+len('CMD_ID_SCAN_CANCEL,');enum=s[start:end]+'\n};\n'
++start=s.index('struct CMD_SCAN_CANCEL {');end=s.index('};',start)+2;shape=s[start:end]
++t=(x.candidate/'wifi_station_transport.c').read_text();start=t.index('static int cid_size(');end=t.index('\n',start);size=t[start:end]
++code='#include <assert.h>\n#include "wifi_station_transport.h"\n'+enum+shape+'\n'+size+'''
++_Static_assert(CMD_ID_SCAN_REQ_V2==3,"scan v2 ABI");
++_Static_assert(CMD_ID_NIC_POWER_CTRL==4,"power ABI");
++_Static_assert(CMD_ID_SCAN_CANCEL==0x1b,"cancel ABI");
++_Static_assert(NST_CID_SCAN_CANCEL==CMD_ID_SCAN_CANCEL,"native cancellation must use source wire ID");
++_Static_assert(sizeof(struct CMD_SCAN_CANCEL)==4,"cancel extent");
++_Static_assert(offsetof(struct CMD_SCAN_CANCEL,ucSeqNum)==0,"sequence");
++_Static_assert(offsetof(struct CMD_SCAN_CANCEL,ucIsExtChannel)==1,"extension");
++_Static_assert(offsetof(struct CMD_SCAN_CANCEL,aucReserved)==2,"reserved");
++int main(void){for(size_t n=0;n<65;n++){assert(cid_size(CMD_ID_SCAN_CANCEL,n)==(n==sizeof(struct CMD_SCAN_CANCEL)));assert(!cid_size(CMD_ID_NIC_POWER_CTRL,n));}return 0;}
++'''
++(w/'oracle.c').write_text(code);cmd=['cc','-std=c11','-Wall','-Wextra','-Werror','-I'+str(x.candidate.resolve()),'-I'+str(R/'shim/nord2-xnu'),str(w/'oracle.c'),'-o',str(w/'oracle')];subprocess.run(cmd,check=True);subprocess.run([str(w/'oracle')],check=True)
++sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
++report={'status':'PASS','assertions':138,'source_header_sha256':sha(h),'candidate_header_sha256':sha(x.candidate/'wifi_station_transport.h'),'candidate_transport_sha256':sha(x.candidate/'wifi_station_transport.c'),'cancel_wire_id':27,'power_wire_id':4,'cancel_bytes':4,'hardware_actions':False}
++(w/'report.json').write_text(json.dumps(report,indent=2)+'\n');print('PASS original Android command enum, cancel layout and actual native cid_size; power command refused')

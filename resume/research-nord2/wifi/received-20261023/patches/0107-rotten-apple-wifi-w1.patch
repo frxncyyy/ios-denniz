@@ -1,0 +1,1254 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -142,6 +142,8 @@ bsd/dev/rottenapple_mtk_pmic_regulator.c	standard
+ bsd/dev/rottenapple_battery.c		standard
+ bsd/dev/rottenapple_sm5602.c		standard
+ bsd/dev/rottenapple_sc89601a.c		standard
++bsd/dev/rottenapple_wifi.c		standard
++bsd/dev/rottenapple_mtk_connsys.c	standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- /dev/null
++++ b/bsd/dev/rottenapple_mtk_connsys.c
+@@ -0,0 +1,865 @@
++/*
++ * Rotten Apple: MediaTek CONNSYS (CONNAC1.x "SOC" combo, legacy WMT
++ * platform; MT6789 "soc2_2" with an MT6631 RF chip) as a Wi-Fi backend of
++ * rottenapple_wifi.c, registered with ROTTENAPPLE_BACKEND(wifi, ...).
++ *
++ * Clean-room: the sequence and register facts were read from the vendor
++ * kernel (drivers/misc/mediatek/connectivity/common/common_main:
++ * platform/mt6789.c, mt6789_pos_gen.c, mtk_wcn_consys_hw.c,
++ * core/wmt_ic_soc.c mtk_wcn_soc_rom_patch_dwn) for behaviour only; the code
++ * is our own. Notes with citations: research/wifi/hw-notes.md,
++ * docs/WIFI-PLAN.md.
++ *
++ * Node (board profile tools/boards/vidofnir.py):
++ *   compatible = "mediatek,mt6789-connsys", ...;
++ *   reg = <CONNSYS window> <TOPRGU> <AP2MD PCCIF4> <IOCFG_RT>;
++ *   reg-names = "conn", "toprgu", "pccif4", "iocfg";
++ *   power-domains = "<scpsys>:conn";  clocks = "<infracfg_ao>:<ccif4 gate>";
++ *   vcn18-supply, vcn33-supply, vcn28-supply = "<pmic regulators>:<rail>";
++ *   mediatek,pmic = "<PMIC regmap>";
++ *   mediatek,vcn18-mode / vcn33-mode / vcn28-mode = <reg value restore>, ...;
++ *        PMIC writes after the rail is enabled, in order; restore 1: the
++ *        boot value is saved first and written back at power-off (after the
++ *        rail is disabled), 0: not restored (enable bits, SET/CLR aliases)
++ *   pinctrl-default / pinctrl-sleep: D-die <-> A-die pins (aux 1 / aux 0)
++ *   mediatek,infracfg = "<infracfg_ao syscon>";  mediatek,spm = "<SPM syscon>";
++ *   mediatek,emi = <pa size>;                    (u64; CONNSYS sees it at 0xF0000000)
++ *   mediatek,dma-pool = <pa size>;               (u64; WFDMA rings, from W2 on)
++ *   mediatek,adie-id = <0x6631>;                 (expected RF chip)
++ *   mediatek,patches = "<file>", ...;  mediatek,patch-offsets = <EMI offset>, ...;
++ *
++ * W1 power-on (Linux mtk_wcn_consys_hw_reg_ctrl with co-clock, rc mode
++ * off, a 6631 a-die); the CPU stays in reset until the patches are in EMI:
++ *   rails VCN18, VCN33 (3.3 V) + their mode bits; pinmux + TOP_SPI drive;
++ *   VCN28 (co-clock: SW mode, efuse/PA LDO on); CPU reset asserted (TOPRGU);
++ *   SPM register access; EMI remap; CCIF4 clock; "conn" power domain (bus
++ *   protection released by the domain backend); CON_STA cleared; check
++ *   PWR_CON / bus protection; poll the CONNSYS version, check HW ID 0x8A00;
++ *   EMI HW mode; oscillator; read the a-die ID over CONN_RF_SPI; copy the
++ *   patches (48-byte header stripped) into EMI and verify them; EMI entry
++ *   addresses; a-die select; bus timeout; MCU memory power-down delay;
++ *   release the CPU; poll COM_REG0 for the ROM idle code 0x1D1E.
++ * Power-off is the reverse of whatever was done (Linux order: CON_STA,
++ * domain off, PCCIF4 acknowledge, CCIF4 clock, VCN28, pins, VCN33, 300 us,
++ * VCN18). Registers inside the CONNSYS window are only touched while the
++ * domain is on and its bus protection is released (anything else hangs the
++ * bus).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <dev/rottenapple_wifi.h>
++
++#define CLOG(fmt, ...)  printf("ROTTEN APPLE: wifi connsys: " fmt "\n", ##__VA_ARGS__)
++
++/* ---- Per-SoC register facts (MT6789; mt6789.h, mt6789_pos_gen.h) ---- */
++
++struct mtk_connsys_soc {
++	const char *compatible;
++	/* offsets in the CONNSYS window (0x18000000) */
++	uint32_t mcu_cfg;               /* CONN_MCU_CONFIG */
++	uint32_t hif_on;                /* CONN_HIF_ON (host CSR) */
++	uint32_t top_misc_off;          /* CONN_TOP_MISC_OFF */
++	uint32_t rgu_on;                /* CONN_RGU_ON */
++	uint32_t top_misc_on;           /* CONN_TOP_MISC_ON */
++	uint32_t rf_spi;                /* CONN_RF_SPI (a-die top SPI) */
++	/* identity */
++	uint32_t conn_version;          /* TOP_MISC_OFF+0x10 */
++	uint32_t config_id;             /* TOP_MISC_OFF+0x1c [3:0] */
++	uint32_t hw_ver;                /* MCU_CFG+0x0 [15:0] */
++	uint32_t idle;                  /* MCU_CFG+0x600 when the ROM idles */
++	/* firmware view of EMI and the patch entry points */
++	uint32_t emi_fw_base;
++	uint32_t bt_entry, wf_entry;
++	uint32_t bushang;               /* MCU_CFG+0x440 */
++	/* SPM, INFRACFG_AO, TOPRGU */
++	uint32_t spm_poweron_config, spm_pwr_sta, spm_pwr_sta2, spm_conn_pwr_con, spm_conn_bit;
++	uint32_t conn_pwr_con_on;       /* CONN_PWR_CON when on (RST_B | PWR_ON | PWR_ON_S) */
++	uint32_t infra_emi_remap, infra_peri_remap, infra_con_sta;
++	uint32_t infra_prot_sta, infra_prot_mask, infra_prot_sta1, infra_prot_mask1;
++	uint32_t peri_base;             /* PERI remap target */
++	uint32_t rgu_swsysrst, rgu_mask, rgu_assert, rgu_deassert;
++	uint32_t pccif_ack;
++	uint32_t iocfg_drv, iocfg_drv_mask, iocfg_drv_val;
++};
++
++static const struct mtk_connsys_soc mtk_connsys_socs[] = {
++	{
++		.compatible = "mediatek,mt6789-connsys",
++		.mcu_cfg = 0x2000, .hif_on = 0x7000, .top_misc_off = 0xb1000,
++		.rgu_on = 0xc0000, .top_misc_on = 0xc1000, .rf_spi = 0xc6000,
++		.conn_version = 0x100c0000, .config_id = 1, .hw_ver = 0x8a00, .idle = 0x1d1e,
++		.emi_fw_base = 0xf0000000, .bt_entry = 0xf0170000, .wf_entry = 0xf02a0000,
++		.bushang = 0x90000002,
++		.spm_poweron_config = 0x000, .spm_pwr_sta = 0x16c, .spm_pwr_sta2 = 0x170,
++		.spm_conn_pwr_con = 0x304, .spm_conn_bit = 1u << 1, .conn_pwr_con_on = 0xd,
++		.infra_emi_remap = 0x380, .infra_peri_remap = 0x388, .infra_con_sta = 0xc14,
++		.infra_prot_sta = 0x228, .infra_prot_mask = (1u << 13) | (1u << 14) | (1u << 18),
++		.infra_prot_sta1 = 0x258, .infra_prot_mask1 = 1u << 10,
++		.peri_base = 0x10003000,
++		.rgu_swsysrst = 0x18, .rgu_mask = 0xff001000, .rgu_assert = 0x88001000,
++		.rgu_deassert = 0x88000000,
++		.pccif_ack = 0x14,
++		.iocfg_drv = 0x10, .iocfg_drv_mask = 0x3ffffff8, .iocfg_drv_val = 0x9048,
++	},
++};
++
++/* CONN_MCU_CONFIG */
++#define MCU_HW_VER              0x000
++#define MCU_FW_VER              0x004
++#define MCU_SW_DBG              0x16c
++#define MCU_BUSHANGCR           0x440
++#define MCU_BT_EMI_ENTRY        0x504
++#define MCU_WF_EMI_ENTRY        0x508
++#define MCU_COM_REG0            0x600
++/* CONN_HIF_ON */
++#define HIF_ON_CFG_RSV          0x01c
++#define HIF_ON_CFG_RSV_CPU_GO   (1u << 7)
++#define HIF_ON_CPUPCR           0x104
++/* CONN_TOP_MISC_OFF */
++#define MISC_OFF_VERSION        0x010
++#define MISC_OFF_CONFIG         0x01c
++/* CONN_RGU_ON */
++#define RGU_ON_DLY_CHAIN        0x284
++/* CONN_TOP_MISC_ON */
++#define MISC_ON_RSV             0x130
++#define MISC_ON_RSV_ADIE_6631   (1u << 8)
++#define MISC_ON_EMI_SLPPROT     0x168
++#define MISC_ON_OSC_CTL         0x200
++#define MISC_ON_OSC_CTL_2       0x204
++#define MISC_ON_RC_OSC_CTL_0    0x240
++#define MISC_ON_ADIE_CTL        0x500
++/* CONN_RF_SPI */
++#define RF_SPI_STA              0x000
++#define RF_SPI_STA_BUSY         (1u << 0)
++#define RF_SPI_STA_TOP_BUSY     (1u << 5)
++#define RF_SPI_TOP_ADDR         0x050
++#define RF_SPI_TOP_WDAT         0x054
++#define RF_SPI_TOP_RDAT         0x058
++
++/* ROM patch file header (struct wmt_rom_patch, 48 bytes) */
++#define PATCH_HDR_SIZE          48
++#define PATCH_HDR_PLAT          16      /* "ALPS" */
++#define PATCH_HDR_HWVER         20      /* u16, big-endian 0x8a00 */
++#define PATCH_HDR_ADDR          24      /* u32 LE: CONNSYS address of the body (+ flags in the low bits) */
++#define PATCH_HDR_TYPE          28
++
++#define MAX_PATCHES             4
++#define MAX_SAVED               24
++
++#define CHIPID_TRIES            11
++#define CHIPID_INTERVAL_US      20000
++#define IDLE_TIMEOUT_US         250000
++#define IDLE_POLL_US            1000
++#define RF_SPI_TRIES            10
++#define RF_SPI_INTERVAL_US      500
++
++/* A-die (RF chip) ID register on its top SPI, per chip */
++static const struct {
++	uint32_t id, spi_addr;
++} mtk_connsys_adies[] = {
++	{ 0x6631, 0xb024 },
++	{ 0x6635, 0xb02c },
++};
++
++/* power_on progress, undone by power_off */
++#define ST_VCN18        (1u << 0)
++#define ST_VCN33        (1u << 1)
++#define ST_PINS         (1u << 2)
++#define ST_DRIVE        (1u << 3)
++#define ST_VCN28        (1u << 4)
++#define ST_RESET        (1u << 5)       /* CPU reset asserted by us */
++#define ST_CLK          (1u << 6)
++#define ST_PD           (1u << 7)
++#define ST_CPU          (1u << 8)       /* CPU released */
++
++struct connsys_patch {
++	const char *file;
++	uint32_t offset;
++	uint8_t *data;
++	size_t size;
++};
++
++struct connsys {
++	const struct mtk_connsys_soc *soc;
++	struct rottenapple_wifi *w;
++	uintptr_t conn, toprgu, pccif4, iocfg;
++	struct rottenapple_regmap *infra, *spm, *pmic;
++	struct rottenapple_pd *pd;
++	struct rottenapple_clk *ccif;
++	struct rottenapple_regulator *vcn18, *vcn33, *vcn28;
++	uint64_t emi_pa, emi_size;
++	uintptr_t emi;
++	uint32_t adie, adie_spi;
++	struct connsys_patch patches[MAX_PATCHES];
++	unsigned npatches;
++	uint32_t state;
++	struct {
++		uint32_t reg, val;
++		const char *rail;
++	} saved[MAX_SAVED];
++	unsigned nsaved;
++	uint32_t saved_drive;
++};
++
++static struct connsys mtk_connsys;
++
++/* ---- Register helpers ---- */
++
++static inline uint32_t
++mmio_rd(uintptr_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static inline void
++mmio_wr(uintptr_t base, uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(base + off) = val;
++	__builtin_arm_dsb(0xf);
++}
++
++/* Linux CONSYS_REG_WRITE_MASK: (old & ~mask) | (val & mask). Returns the old value. */
++static uint32_t
++mmio_mask(uintptr_t base, uint32_t off, uint32_t mask, uint32_t val)
++{
++	uint32_t old = mmio_rd(base, off);
++	mmio_wr(base, off, (old & ~mask) | (val & mask));
++	return old;
++}
++
++/* Inside the CONNSYS window: block (mcu_cfg, ...) + register. Only while powered. */
++static inline uint32_t
++conn_rd(struct connsys *c, uint32_t block, uint32_t off)
++{
++	return mmio_rd(c->conn, block + off);
++}
++
++static inline void
++conn_wr(struct connsys *c, uint32_t block, uint32_t off, uint32_t val)
++{
++	mmio_wr(c->conn, block + off, val);
++}
++
++static void
++conn_mask(struct connsys *c, const char *what, uint32_t block, uint32_t off, uint32_t mask, uint32_t val)
++{
++	uint32_t old = mmio_mask(c->conn, block + off, mask, val);
++	CLOG("%s: 0x%08x: 0x%08x -> 0x%08x", what, 0x18000000u + block + off, old, conn_rd(c, block, off));
++}
++
++static uint32_t
++map_rd(struct rottenapple_regmap *map, uint32_t reg)
++{
++	uint32_t v = 0xdeadbeef;
++	(void)rottenapple_regmap_read(map, reg, &v);
++	return v;
++}
++
++static int
++map_mask(struct rottenapple_regmap *map, uint32_t reg, uint32_t mask, uint32_t val, uint32_t *old)
++{
++	uint32_t v;
++	int err = rottenapple_regmap_read(map, reg, &v);
++	if (!err) {
++		if (old) {
++			*old = v;
++		}
++		err = rottenapple_regmap_write(map, reg, (v & ~mask) | (val & mask));
++	}
++	return err;
++}
++
++/* ---- PMIC rails ---- */
++
++static void
++rail_log(struct connsys *c, const char *when)
++{
++	struct rottenapple_regulator *r[] = { c->vcn18, c->vcn33, c->vcn28 };
++	for (unsigned i = 0; i < ROTTENAPPLE_COUNT(r); i++) {
++		CLOG("rail %s %s: %s, %d uV", rottenapple_regulator_name(r[i]), when,
++		    rottenapple_regulator_is_enabled(r[i]) == 1 ? "on" : "off", rottenapple_regulator_get_voltage(r[i]));
++	}
++}
++
++static bool
++pmic_saved(struct connsys *c, uint32_t reg)
++{
++	for (unsigned i = 0; i < c->nsaved; i++) {
++		if (c->saved[i].reg == reg) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* The mode rows of one rail: <reg value restore>, written in order, every write read back. */
++static int
++pmic_rows(struct connsys *c, const char *rail, const char *prop)
++{
++	uint32_t const *rows;
++	unsigned n;
++
++	if (!rottenapple_prop_cells(c->w->node, prop, &rows, &n) || n % 3) {
++		return 0;
++	}
++	for (unsigned i = 0; i + 3 <= n; i += 3) {
++		uint32_t reg = rows[i], val = rows[i + 1], before = 0, after = 0;
++		int err = rottenapple_regmap_read(c->pmic, reg, &before);
++		if (!err && rows[i + 2] && !pmic_saved(c, reg)) {
++			if (c->nsaved == MAX_SAVED) {
++				return ENOSPC;
++			}
++			c->saved[c->nsaved].reg = reg;
++			c->saved[c->nsaved].val = before;
++			c->saved[c->nsaved].rail = rail;
++			c->nsaved++;
++		}
++		if (!err) {
++			err = rottenapple_regmap_write(c->pmic, reg, val);
++		}
++		if (!err) {
++			err = rottenapple_regmap_read(c->pmic, reg, &after);
++		}
++		CLOG("%s: pmic 0x%04x: 0x%04x -> write 0x%04x -> reads 0x%04x%s", rail, reg, before, val, after,
++		    err ? " (regmap error)" : "");
++		if (err) {
++			return err;
++		}
++	}
++	return 0;
++}
++
++/* Write back the saved boot values of one rail's rows, last saved first. */
++static void
++pmic_restore(struct connsys *c, const char *rail)
++{
++	for (unsigned i = c->nsaved; i-- > 0;) {
++		if (c->saved[i].rail == NULL || strcmp(c->saved[i].rail, rail) != 0) {
++			continue;
++		}
++		uint32_t before = map_rd(c->pmic, c->saved[i].reg);
++		int err = rottenapple_regmap_write(c->pmic, c->saved[i].reg, c->saved[i].val);
++		CLOG("%s: pmic 0x%04x restored: 0x%04x -> 0x%04x (reads 0x%04x)%s", rail, c->saved[i].reg, before,
++		    c->saved[i].val, map_rd(c->pmic, c->saved[i].reg), err ? " (regmap error)" : "");
++		c->saved[i].rail = NULL;
++	}
++}
++
++/* Voltage, enable (counted; st is set once enabled), then the vendor's mode bits. */
++static int
++rail_on(struct connsys *c, struct rottenapple_regulator *r, const char *rail, unsigned uv, const char *prop,
++    uint32_t st)
++{
++	int err = rottenapple_regulator_set_voltage(r, uv, uv);
++	if (!err) {
++		err = rottenapple_regulator_enable(r);
++	}
++	if (err) {
++		CLOG("%s: %u uV / enable failed (%d)", rail, uv, err);
++		return err;
++	}
++	c->state |= st;
++	CLOG("%s: on, %d uV", rail, rottenapple_regulator_get_voltage(r));
++	return pmic_rows(c, rail, prop);
++}
++
++static void
++rail_off(struct connsys *c, struct rottenapple_regulator *r, const char *rail)
++{
++	rottenapple_regulator_disable(r);
++	pmic_restore(c, rail);
++	CLOG("%s: %s", rail, rottenapple_regulator_is_enabled(r) == 1 ? "still on (always-on or shared)" : "off");
++}
++
++/* ---- Report (no CONNSYS window access: it hangs the bus while the domain is off) ---- */
++
++static void
++connsys_report(struct rottenapple_wifi *w)
++{
++	struct connsys *c = w->priv;
++	const struct mtk_connsys_soc *s = c->soc;
++
++	CLOG("SPM CONN_PWR_CON 0x%08x PWR_STATUS 0x%08x/0x%08x (conn %s); domain %s",
++	    map_rd(c->spm, s->spm_conn_pwr_con), map_rd(c->spm, s->spm_pwr_sta), map_rd(c->spm, s->spm_pwr_sta2),
++	    (map_rd(c->spm, s->spm_pwr_sta) & s->spm_conn_bit) ? "on" : "off",
++	    rottenapple_pd_is_on(c->pd) == 1 ? "on" : "off");
++	CLOG("INFRACFG_AO EMI remap 0x%08x PERI remap 0x%08x CON_STA 0x%08x bus prot STA 0x%08x STA1_1 0x%08x; "
++	    "CCIF4 clock %s", map_rd(c->infra, s->infra_emi_remap), map_rd(c->infra, s->infra_peri_remap),
++	    map_rd(c->infra, s->infra_con_sta), map_rd(c->infra, s->infra_prot_sta), map_rd(c->infra, s->infra_prot_sta1),
++	    rottenapple_clk_is_enabled(c->ccif) == 1 ? "running" : "gated");
++	CLOG("TOPRGU SWSYSRST 0x%08x (CONNSYS CPU reset %s); IOCFG_RT drive 0x%08x",
++	    mmio_rd(c->toprgu, s->rgu_swsysrst),
++	    (mmio_rd(c->toprgu, s->rgu_swsysrst) & (s->rgu_assert & ~0xff000000u)) ? "asserted" : "released",
++	    mmio_rd(c->iocfg, s->iocfg_drv));
++	rail_log(c, "now");
++}
++
++/* ---- Probe ---- */
++
++static struct rottenapple_regmap *
++named_map(DTEntry node, const char *prop)
++{
++	const char *name = rottenapple_prop_string(node, prop, 0);
++	return name ? rottenapple_regmap(name) : NULL;
++}
++
++static int
++connsys_probe(struct rottenapple_wifi *w)
++{
++	struct connsys *c = &mtk_connsys;
++	const char *compat;
++	uint32_t const *offs;
++	unsigned noffs;
++	uint64_t pool_pa, pool_size;
++	int i, err;
++
++	bzero(c, sizeof(*c));
++	c->w = w;
++	w->priv = c;
++	for (unsigned k = 0; (compat = rottenapple_prop_string(w->node, "compatible", k)) != NULL && !c->soc; k++) {
++		for (unsigned j = 0; j < ROTTENAPPLE_COUNT(mtk_connsys_socs); j++) {
++			if (strcmp(compat, mtk_connsys_socs[j].compatible) == 0) {
++				c->soc = &mtk_connsys_socs[j];
++			}
++		}
++	}
++	if (c->soc == NULL) {
++		return ENOTSUP;
++	}
++	static const char *const regs[] = { "conn", "toprgu", "pccif4", "iocfg" };
++	uintptr_t *bases[] = { &c->conn, &c->toprgu, &c->pccif4, &c->iocfg };
++	for (unsigned k = 0; k < ROTTENAPPLE_COUNT(regs); k++) {
++		if ((i = rottenapple_wifi_reg_index(w, regs[k])) < 0) {
++			CLOG("no \"%s\" reg range", regs[k]);
++			return EINVAL;
++		}
++		*bases[k] = w->regs[i];
++	}
++	if (w->reg_size[rottenapple_wifi_reg_index(w, "conn")] < c->soc->rf_spi + 0x100) {
++		CLOG("\"conn\" reg range too small");
++		return EINVAL;
++	}
++	c->infra = named_map(w->node, "mediatek,infracfg");
++	c->spm = named_map(w->node, "mediatek,spm");
++	c->pmic = named_map(w->node, "mediatek,pmic");
++	c->pd = rottenapple_pd_of(w->name, NULL);
++	c->ccif = rottenapple_clk_of(w->name, NULL);
++	c->vcn18 = rottenapple_regulator_of(w->name, "vcn18");
++	c->vcn33 = rottenapple_regulator_of(w->name, "vcn33");
++	c->vcn28 = rottenapple_regulator_of(w->name, "vcn28");
++	if (!c->infra || !c->spm || !c->pmic || !c->pd || !c->ccif || !c->vcn18 || !c->vcn33 || !c->vcn28) {
++		CLOG("missing provider: infracfg %d spm %d pmic %d domain %d clock %d vcn18 %d vcn33 %d vcn28 %d",
++		    !!c->infra, !!c->spm, !!c->pmic, !!c->pd, !!c->ccif, !!c->vcn18, !!c->vcn33, !!c->vcn28);
++		return ENXIO;
++	}
++	if (!rottenapple_prop_u32(w->node, "mediatek,adie-id", &c->adie)) {
++		CLOG("no mediatek,adie-id");
++		return EINVAL;
++	}
++	for (unsigned k = 0; k < ROTTENAPPLE_COUNT(mtk_connsys_adies); k++) {
++		if (mtk_connsys_adies[k].id == c->adie) {
++			c->adie_spi = mtk_connsys_adies[k].spi_addr;
++		}
++	}
++	if (c->adie != 0x6631) {
++		/* 0x6635 needs VCN13 through GPIO68 and other settings: not implemented */
++		CLOG("a-die 0x%x not supported (only 0x6631)", c->adie);
++		return ENOTSUP;
++	}
++	if (!rottenapple_prop_cells(w->node, "mediatek,patch-offsets", &offs, &noffs)) {
++		noffs = 0;
++	}
++	for (c->npatches = 0; c->npatches < MAX_PATCHES &&
++	    (compat = rottenapple_prop_string(w->node, "mediatek,patches", c->npatches)) != NULL; c->npatches++) {
++		if (c->npatches >= noffs) {
++			CLOG("mediatek,patch-offsets shorter than mediatek,patches");
++			return EINVAL;
++		}
++		c->patches[c->npatches].file = compat;
++		c->patches[c->npatches].offset = offs[c->npatches];
++	}
++	if (c->npatches == 0) {
++		CLOG("no mediatek,patches");
++		return EINVAL;
++	}
++	if ((err = rottenapple_wifi_carveout(w, "mediatek,emi", &c->emi_pa, &c->emi_size, &c->emi)) != 0) {
++		return err;
++	}
++	if (c->emi_pa >> 36 || ((c->emi_pa >> 16) << 16) != c->emi_pa) {
++		CLOG("EMI 0x%llx cannot be remapped (64 KB granule, 36 bits)", c->emi_pa);
++		return EINVAL;
++	}
++	/* Only checked here (W2 maps it for the WFDMA rings). */
++	if ((err = rottenapple_wifi_carveout(w, "mediatek,dma-pool", &pool_pa, &pool_size, NULL)) != 0) {
++		return err;
++	}
++	CLOG("%s, a-die 0x%x expected; EMI 0x%llx+0x%llx (CONNSYS 0x%08x); %u patches",
++	    c->soc->compatible, c->adie, c->emi_pa, c->emi_size, c->soc->emi_fw_base, c->npatches);
++	return 0;
++}
++
++/* ---- Firmware: ROM patches ---- */
++
++static void
++patches_free(struct connsys *c)
++{
++	for (unsigned i = 0; i < c->npatches; i++) {
++		rottenapple_wifi_firmware_free(c->patches[i].data, c->patches[i].size);
++		c->patches[i].data = NULL;
++		c->patches[i].size = 0;
++	}
++}
++
++/* Load and check every patch before any hardware is touched. */
++static int
++patches_load(struct connsys *c)
++{
++	for (unsigned i = 0; i < c->npatches; i++) {
++		struct connsys_patch *p = &c->patches[i];
++		int err = rottenapple_wifi_firmware_load(c->w, p->file, &p->data, &p->size);
++		if (err) {
++			return err;
++		}
++		if (p->size <= PATCH_HDR_SIZE) {
++			CLOG("patch %s: %zu bytes, no body", p->file, p->size);
++			return EINVAL;
++		}
++		uint32_t addr, type;
++		memcpy(&addr, p->data + PATCH_HDR_ADDR, 4);
++		memcpy(&type, p->data + PATCH_HDR_TYPE, 4);
++		uint32_t hw = ((uint32_t)p->data[PATCH_HDR_HWVER] << 8) | p->data[PATCH_HDR_HWVER + 1];
++		uint32_t sw = ((uint32_t)p->data[PATCH_HDR_HWVER + 2] << 8) | p->data[PATCH_HDR_HWVER + 3];
++		char date[17];
++		memcpy(date, p->data, 16);
++		date[16] = '\0';
++		for (unsigned k = 0; k < 16; k++) {
++			if (date[k] != '\0' && (date[k] < 0x20 || date[k] > 0x7e)) {
++				date[k] = '?';
++			}
++		}
++		size_t body = p->size - PATCH_HDR_SIZE;
++		CLOG("patch %s: built %s, platform %.4s, HW 0x%04x SW 0x%04x, type 0x%08x, address 0x%08x, "
++		    "body 0x%zx bytes -> EMI +0x%x", p->file, date, (const char *)p->data + PATCH_HDR_PLAT, hw, sw, type,
++		    addr, body, p->offset);
++		if (memcmp(p->data + PATCH_HDR_PLAT, "ALPS", 4) != 0 || hw != c->soc->hw_ver) {
++			CLOG("patch %s: not a 0x%x ROM patch", p->file, c->soc->hw_ver);
++			return EINVAL;
++		}
++		if ((addr & 0xffff0000u) != c->soc->emi_fw_base + p->offset) {
++			CLOG("patch %s: header address 0x%08x does not match EMI offset 0x%x", p->file, addr, p->offset);
++			return EINVAL;
++		}
++		if ((uint64_t)p->offset + body > c->emi_size) {
++			CLOG("patch %s: does not fit the EMI region", p->file);
++			return EFBIG;
++		}
++		for (unsigned k = 0; k < i; k++) {
++			struct connsys_patch *q = &c->patches[k];
++			if (p->offset < q->offset + (q->size - PATCH_HDR_SIZE) && q->offset < p->offset + body) {
++				CLOG("patch %s overlaps %s in EMI", p->file, q->file);
++				return EINVAL;
++			}
++		}
++	}
++	return 0;
++}
++
++/* Copy the bodies into EMI (the CONNSYS CPU is held in reset) and compare them back. */
++static int
++patches_copy(struct connsys *c)
++{
++	for (unsigned i = 0; i < c->npatches; i++) {
++		struct connsys_patch *p = &c->patches[i];
++		size_t body = p->size - PATCH_HDR_SIZE;
++		uint8_t *dst = (uint8_t *)(c->emi + p->offset);
++		memcpy(dst, p->data + PATCH_HDR_SIZE, body);
++		__builtin_arm_dsb(0xf);
++		if (memcmp(dst, p->data + PATCH_HDR_SIZE, body) != 0) {
++			CLOG("patch %s: EMI readback differs", p->file);
++			return EIO;
++		}
++		CLOG("patch %s: 0x%zx bytes at EMI 0x%llx (CONNSYS 0x%08x), verified", p->file, body,
++		    c->emi_pa + p->offset, c->soc->emi_fw_base + p->offset);
++	}
++	return 0;
++}
++
++/* ---- A-die ---- */
++
++static int
++adie_read_id(struct connsys *c, uint32_t *id)
++{
++	const struct mtk_connsys_soc *s = c->soc;
++	uint32_t sta = 0;
++	unsigned t;
++	int err = 0;
++
++	conn_mask(c, "a-die SPI enable (ADIE_CTL)", s->top_misc_on, MISC_ON_ADIE_CTL, 1u << 0, 1u << 0);
++	for (t = 0; t < RF_SPI_TRIES && ((sta = conn_rd(c, s->rf_spi, RF_SPI_STA)) & RF_SPI_STA_BUSY); t++) {
++		delay(RF_SPI_INTERVAL_US);
++	}
++	if (sta & RF_SPI_STA_BUSY) {
++		CLOG("a-die SPI busy (0x%08x)", sta);
++		err = ETIMEDOUT;
++		goto out;
++	}
++	conn_wr(c, s->rf_spi, RF_SPI_TOP_ADDR, c->adie_spi);
++	conn_wr(c, s->rf_spi, RF_SPI_TOP_WDAT, 0);
++	for (t = 0; t < RF_SPI_TRIES && ((sta = conn_rd(c, s->rf_spi, RF_SPI_STA)) & RF_SPI_STA_TOP_BUSY); t++) {
++		delay(RF_SPI_INTERVAL_US);
++	}
++	if (sta & RF_SPI_STA_TOP_BUSY) {
++		CLOG("a-die SPI read of 0x%x timed out (0x%08x)", c->adie_spi, sta);
++		err = ETIMEDOUT;
++		goto out;
++	}
++	uint32_t rdat = conn_rd(c, s->rf_spi, RF_SPI_TOP_RDAT);
++	*id = rdat >> 16;
++	CLOG("a-die register 0x%x = 0x%08x: chip id 0x%04x", c->adie_spi, rdat, *id);
++out:
++	conn_mask(c, "a-die SPI disable (ADIE_CTL)", s->top_misc_on, MISC_ON_ADIE_CTL, 1u << 0, 0);
++	return err;
++}
++
++/* ---- Power ---- */
++
++static int
++connsys_power_on(struct rottenapple_wifi *w)
++{
++	struct connsys *c = w->priv;
++	const struct mtk_connsys_soc *s = c->soc;
++	uint32_t v, old;
++	unsigned t;
++	int err;
++
++	c->state = 0;
++	c->nsaved = 0;
++
++	/* Firmware first: a missing or bad file stops here, before any hardware write. */
++	if ((err = patches_load(c)) != 0) {
++		goto out;
++	}
++	bzero((void *)c->emi, (size_t)c->emi_size);
++	__builtin_arm_dsb(0xf);
++	CLOG("EMI 0x%llx+0x%llx cleared", c->emi_pa, c->emi_size);
++
++	rail_log(c, "before");
++	/* VCN18, then VCN33 for the 6631 a-die (3.3 V, as the vendor driver) */
++	if ((err = rail_on(c, c->vcn18, "vcn18", 1800000, "mediatek,vcn18-mode", ST_VCN18)) != 0) {
++		goto out;
++	}
++	if ((err = rail_on(c, c->vcn33, "vcn33", 3300000, "mediatek,vcn33-mode", ST_VCN33)) != 0) {
++		goto out;
++	}
++	/* D-die <-> A-die pins (aux 1) and the TOP_SPI/BT_SPI drive strength */
++	c->state |= ST_PINS;
++	if ((err = rottenapple_pinctrl_select(w->name, "default")) != 0) {
++		CLOG("pinctrl-default failed (%d)", err);
++		goto out;
++	}
++	c->saved_drive = mmio_mask(c->iocfg, s->iocfg_drv, s->iocfg_drv_mask, s->iocfg_drv_val);
++	c->state |= ST_DRIVE;
++	CLOG("pins: aux 1; IOCFG_RT drive 0x%08x -> 0x%08x", c->saved_drive, mmio_rd(c->iocfg, s->iocfg_drv));
++	delay(150);
++	/* Co-clock (26 MHz from the PMIC clock buffer): VCN28 to SW mode, then on for efuse/PA */
++	if ((err = rail_on(c, c->vcn28, "vcn28", 2800000, "mediatek,vcn28-mode", ST_VCN28)) != 0) {
++		goto out;
++	}
++
++	/* Hold the CONNSYS CPU in reset while its memory is filled */
++	old = mmio_mask(c->toprgu, s->rgu_swsysrst, s->rgu_mask, s->rgu_assert);
++	c->state |= ST_RESET;
++	CLOG("CPU reset asserted: TOPRGU SWSYSRST 0x%08x -> 0x%08x", old, mmio_rd(c->toprgu, s->rgu_swsysrst));
++	if ((err = map_mask(c->spm, s->spm_poweron_config, 0xffff0001u, 0x0b160001u, &old)) != 0) {
++		goto out;
++	}
++	CLOG("SPM POWERON_CONFIG_EN 0x%08x -> 0x%08x", old, map_rd(c->spm, s->spm_poweron_config));
++
++	/* EMI as CONNSYS sees it (0xF0000000 -> emi_pa) and the peripheral window */
++	err = map_mask(c->infra, s->infra_emi_remap, 0xfffff, (uint32_t)(c->emi_pa >> 16), &old);
++	CLOG("EMI remap 0x%08x -> 0x%08x", old, map_rd(c->infra, s->infra_emi_remap));
++	if (!err) {
++		err = map_mask(c->infra, s->infra_peri_remap, 0xfffff, s->peri_base >> 16, &old);
++		CLOG("PERI remap 0x%08x -> 0x%08x", old, map_rd(c->infra, s->infra_peri_remap));
++	}
++	if (err) {
++		goto out;
++	}
++
++	if ((err = rottenapple_clk_enable(c->ccif)) != 0) {
++		CLOG("CCIF4 clock enable failed (%d)", err);
++		goto out;
++	}
++	c->state |= ST_CLK;
++	if ((err = rottenapple_pd_on(c->pd)) != 0) {
++		CLOG("conn power domain on failed (%d)", err);
++		goto out;
++	}
++	c->state |= ST_PD;
++	old = map_rd(c->infra, s->infra_con_sta);
++	(void)rottenapple_regmap_write(c->infra, s->infra_con_sta, 0);
++	CLOG("CON_STA 0x%08x -> 0x%08x", old, map_rd(c->infra, s->infra_con_sta));
++	delay(5000 + 10);
++
++	/* Never read the CONNSYS window unless the domain is up and the bus is open. */
++	uint32_t pwr = map_rd(c->spm, s->spm_conn_pwr_con);
++	uint32_t sta1 = map_rd(c->spm, s->spm_pwr_sta), sta2 = map_rd(c->spm, s->spm_pwr_sta2);
++	uint32_t prot = map_rd(c->infra, s->infra_prot_sta), prot1 = map_rd(c->infra, s->infra_prot_sta1);
++	CLOG("CONN_PWR_CON 0x%08x (expect 0x%x), PWR_STATUS 0x%08x/0x%08x, bus prot STA 0x%08x STA1_1 0x%08x",
++	    pwr, s->conn_pwr_con_on, sta1, sta2, prot, prot1);
++	if (!(sta1 & s->spm_conn_bit) || !(sta2 & s->spm_conn_bit) || (pwr & 0x1f) != s->conn_pwr_con_on ||
++	    (prot & s->infra_prot_mask) || (prot1 & s->infra_prot_mask1)) {
++		CLOG("conn domain not up or bus still protected; not touching CONNSYS");
++		err = EIO;
++		goto out;
++	}
++
++	/* Identity */
++	for (t = 0; t < CHIPID_TRIES; t++) {
++		if ((v = conn_rd(c, s->top_misc_off, MISC_OFF_VERSION)) == s->conn_version) {
++			break;
++		}
++		delay(CHIPID_INTERVAL_US);
++	}
++	CLOG("CONNSYS version 0x%08x (expect 0x%08x) after %u retries", v, s->conn_version, t);
++	if (v != s->conn_version) {
++		err = ENODEV;
++		goto out;
++	}
++	uint32_t cfg = conn_rd(c, s->top_misc_off, MISC_OFF_CONFIG);
++	uint32_t hw = conn_rd(c, s->mcu_cfg, MCU_HW_VER), fw = conn_rd(c, s->mcu_cfg, MCU_FW_VER);
++	CLOG("config ID 0x%08x (expect [3:0] = %u), HW ver 0x%08x (expect 0x%x), FW ver 0x%08x", cfg,
++	    s->config_id, hw, s->hw_ver, fw);
++	if ((hw & 0xffff) != s->hw_ver) {
++		err = ENODEV;
++		goto out;
++	}
++
++	/* CONNSYS -> EMI in HW mode, then the oscillator (co-clock, RC mode off) */
++	conn_mask(c, "EMI HW mode", s->top_misc_on, MISC_ON_EMI_SLPPROT, 1u << 0, 1u << 0);
++	conn_mask(c, "RC OSC off", s->top_misc_on, MISC_ON_RC_OSC_CTL_0, 1u << 7, 0);
++	conn_mask(c, "XO bg stable time", s->top_misc_on, MISC_ON_OSC_CTL_2, 0xff00, 0x0600);
++	conn_mask(c, "XO initial stable time", s->top_misc_on, MISC_ON_OSC_CTL, 0xffff, 0x0708);
++	conn_mask(c, "srcclkena ack mask off", s->top_misc_on, MISC_ON_OSC_CTL_2, 1u << 0, 0);
++
++	/* The RF chip */
++	uint32_t adie = 0;
++	if ((err = adie_read_id(c, &adie)) != 0) {
++		goto out;
++	}
++	if (adie != c->adie) {
++		CLOG("a-die 0x%04x, expected 0x%04x; stopping", adie, c->adie);
++		err = ENODEV;
++		goto out;
++	}
++	CLOG("a-die MT%04x confirmed", adie);
++
++	/* Firmware: ROM patches into EMI, entry points, chip settings */
++	if ((err = patches_copy(c)) != 0) {
++		goto out;
++	}
++	conn_wr(c, s->mcu_cfg, MCU_BT_EMI_ENTRY, s->bt_entry);
++	conn_wr(c, s->mcu_cfg, MCU_WF_EMI_ENTRY, s->wf_entry);
++	CLOG("EMI entries: BT 0x%08x, WF 0x%08x", conn_rd(c, s->mcu_cfg, MCU_BT_EMI_ENTRY),
++	    conn_rd(c, s->mcu_cfg, MCU_WF_EMI_ENTRY));
++	conn_mask(c, "a-die is 6631", s->top_misc_on, MISC_ON_RSV, MISC_ON_RSV_ADIE_6631, MISC_ON_RSV_ADIE_6631);
++	conn_wr(c, s->mcu_cfg, MCU_BUSHANGCR, s->bushang);
++	CLOG("bus timeout 0x%08x", conn_rd(c, s->mcu_cfg, MCU_BUSHANGCR));
++	conn_mask(c, "MCU mem PDN delay", s->rgu_on, RGU_ON_DLY_CHAIN, 0xf0000, 0x40000);
++
++	/* Start the CPU and wait for its ROM idle loop */
++	old = mmio_mask(c->toprgu, s->rgu_swsysrst, s->rgu_mask, s->rgu_deassert);
++	c->state &= ~ST_RESET;
++	conn_mask(c, "CPU go (CFG_RSV)", s->hif_on, HIF_ON_CFG_RSV, HIF_ON_CFG_RSV_CPU_GO, HIF_ON_CFG_RSV_CPU_GO);
++	c->state |= ST_CPU;
++	CLOG("CPU reset released: TOPRGU SWSYSRST 0x%08x -> 0x%08x", old, mmio_rd(c->toprgu, s->rgu_swsysrst));
++	for (t = 0; t < IDLE_TIMEOUT_US; t += IDLE_POLL_US) {
++		if ((v = conn_rd(c, s->mcu_cfg, MCU_COM_REG0)) == s->idle) {
++			break;
++		}
++		delay(IDLE_POLL_US);
++	}
++	CLOG("COM_REG0 0x%08x (expect 0x%x) after %u us; SW_DBG 0x%08x CPUPCR 0x%08x", v, s->idle, t,
++	    conn_rd(c, s->mcu_cfg, MCU_SW_DBG), conn_rd(c, s->hif_on, HIF_ON_CPUPCR));
++	if (v != s->idle) {
++		err = ETIMEDOUT;
++		goto out;
++	}
++	delay(20000);
++	CLOG("20 ms later: COM_REG0 0x%08x CPUPCR 0x%08x 0x%08x FW ver 0x%08x", conn_rd(c, s->mcu_cfg, MCU_COM_REG0),
++	    conn_rd(c, s->hif_on, HIF_ON_CPUPCR), conn_rd(c, s->hif_on, HIF_ON_CPUPCR),
++	    conn_rd(c, s->mcu_cfg, MCU_FW_VER));
++	err = 0;
++out:
++	patches_free(c);
++	return err;
++}
++
++static void
++connsys_power_off(struct rottenapple_wifi *w)
++{
++	struct connsys *c = w->priv;
++	const struct mtk_connsys_soc *s = c->soc;
++	uint32_t old;
++
++	if (c->state & ST_PD) {
++		(void)rottenapple_regmap_write(c->infra, s->infra_con_sta, 0);
++		rottenapple_pd_off(c->pd);
++		c->state &= ~(ST_PD | ST_CPU);
++		CLOG("conn domain %s: CONN_PWR_CON 0x%08x PWR_STATUS 0x%08x/0x%08x bus prot STA 0x%08x STA1_1 0x%08x",
++		    rottenapple_pd_is_on(c->pd) == 0 ? "off" : "NOT off", map_rd(c->spm, s->spm_conn_pwr_con),
++		    map_rd(c->spm, s->spm_pwr_sta), map_rd(c->spm, s->spm_pwr_sta2), map_rd(c->infra, s->infra_prot_sta),
++		    map_rd(c->infra, s->infra_prot_sta1));
++		delay(100);
++		mmio_wr(c->pccif4, s->pccif_ack, 0xff);
++	}
++	if (c->state & ST_CLK) {
++		rottenapple_clk_disable(c->ccif);
++		c->state &= ~ST_CLK;
++	}
++	if (c->state & ST_RESET) {
++		/* power-up stopped before the CPU was started: leave the reset as the bootloader did */
++		old = mmio_mask(c->toprgu, s->rgu_swsysrst, s->rgu_mask, s->rgu_deassert);
++		CLOG("CPU reset released (unused): TOPRGU SWSYSRST 0x%08x -> 0x%08x", old,
++		    mmio_rd(c->toprgu, s->rgu_swsysrst));
++		c->state &= ~ST_RESET;
++	}
++	if (c->state & ST_VCN28) {
++		rail_off(c, c->vcn28, "vcn28");
++		c->state &= ~ST_VCN28;
++	}
++	if (c->state & ST_PINS) {
++		int err = rottenapple_pinctrl_select(w->name, "sleep");
++		CLOG("pins: aux 0%s", err ? " FAILED" : "");
++		c->state &= ~ST_PINS;
++	}
++	if (c->state & ST_DRIVE) {
++		old = mmio_rd(c->iocfg, s->iocfg_drv);
++		mmio_mask(c->iocfg, s->iocfg_drv, s->iocfg_drv_mask, c->saved_drive);
++		CLOG("IOCFG_RT drive restored 0x%08x -> 0x%08x", old, mmio_rd(c->iocfg, s->iocfg_drv));
++		c->state &= ~ST_DRIVE;
++	}
++	if (c->state & ST_VCN33) {
++		rail_off(c, c->vcn33, "vcn33");
++		c->state &= ~ST_VCN33;
++	}
++	delay(300);
++	if (c->state & ST_VCN18) {
++		rail_off(c, c->vcn18, "vcn18");
++		c->state &= ~ST_VCN18;
++	}
++	rail_log(c, "after");
++}
++
++static const struct rottenapple_wifi_ops rottenapple_mtk_connsys_ops = {
++	.compatible = "mediatek,mt6789-connsys",
++	.probe = connsys_probe,
++	.report = connsys_report,
++	.power_on = connsys_power_on,
++	.power_off = connsys_power_off,
++};
++ROTTENAPPLE_BACKEND(wifi, rottenapple_mtk_connsys_ops);
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/rottenapple_regulator.c
++++ b/bsd/dev/rottenapple_regulator.c
+@@ -10,6 +10,7 @@
+  *           regulator-min-microvolt = <uV>;  regulator-max-microvolt = <uV>;
+  *           regulator-ramp-delay = <uV/us>;  regulator-settling-time-us = <us>;
+  *           regulator-enable-ramp-delay = <us>;
++ *           regulator-always-on;      (the last disable leaves the rail on)
+  *           <backend props>
+  *       };
+  *   }
+@@ -287,7 +288,7 @@ rottenapple_regulator_disable(struct rottenapple_regulator *r)
+ 	}
+ 	if (r->enables == 0) {
+ 		printf("ROTTEN APPLE: regulator %s disabled more often than enabled\n", r->path);
+-	} else if (--r->enables == 0) {
++	} else if (--r->enables == 0 && !rottenapple_prop_present(r->node, "regulator-always-on")) {
+ 		lck_mtx_unlock(&rottenapple_regulator_lock);
+ 		int err = ops->enable(&r->rc->p, r->index, r->node, false);     /* unlocked */
+ 		if (err) {
+--- /dev/null
++++ b/bsd/dev/rottenapple_wifi.c
+@@ -0,0 +1,248 @@
++/*
++ * Rotten Apple: Wi-Fi core (binding and milestones: rottenapple_wifi.h).
++ * Vendor-free: the chip glue is a ROTTENAPPLE_BACKEND(wifi, ...) backend.
++ *
++ * Firmware comes from the mounted root (rootfiles, patch 0103, installs it
++ * there from the ADT), so the milestones run on a kernel thread started
++ * right after the root fix-ups in bsd_init.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/fcntl.h>
++#include <sys/uio.h>
++#include <sys/proc.h>
++#include <sys/kauth.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include <dev/rottenapple_wifi.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
++extern boolean_t pmap_valid_address(uint64_t addr);     /* osfmk/arm/pmap/pmap.h */
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++
++ROTTENAPPLE_BACKEND_SET(wifi, struct rottenapple_wifi_ops);
++
++#define WIFI_NODE               "rotten-apple-wifi"
++#define WIFI_FW_DIR             "/usr/share/firmware/rottenapple/wifi"
++#define WIFI_FW_MAX             (4u << 20)
++#define WIFI_W1_CYCLES          2
++#define WIFI_PAGE               0x4000ull
++
++#define WLOG(fmt, ...)  printf("ROTTEN APPLE: wifi: " fmt "\n", ##__VA_ARGS__)
++
++static struct rottenapple_wifi rottenapple_wifi_dev;
++
++int
++rottenapple_wifi_reg_index(struct rottenapple_wifi *w, const char *name)
++{
++	int i = rottenapple_prop_string_index(w->node, "reg-names", name);
++	return i >= 0 && (unsigned)i < w->nregs && w->regs[i] != 0 ? i : -1;
++}
++
++/* ---- Firmware from the root file system ---- */
++
++int
++rottenapple_wifi_firmware_load(struct rottenapple_wifi *w, const char *name, uint8_t **data,
++    size_t *size)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	const char *dir = rottenapple_prop_string(w->node, "firmware-dir", 0);
++	char path[MAXPATHLEN];
++	vnode_t vp = NULLVP;
++	off_t fsize = 0;
++	uint8_t *buf;
++	int err, resid = 0;
++
++	*data = NULL;
++	*size = 0;
++	if (name == NULL || name[0] == '\0' || strchr(name, '/') != NULL) {
++		return EINVAL;
++	}
++	if (snprintf(path, sizeof(path), "%s/%s", dir ? dir : WIFI_FW_DIR, name) >= (int)sizeof(path)) {
++		return ENAMETOOLONG;
++	}
++	if ((err = vnode_open(path, O_RDONLY, 0, 0, &vp, ctx)) != 0) {
++		WLOG("firmware %s: cannot open (%d)", path, err);
++		return err;
++	}
++	if ((err = vnode_size(vp, &fsize, ctx)) != 0 || fsize <= 0 || (uint64_t)fsize > WIFI_FW_MAX) {
++		WLOG("firmware %s: bad size %lld (%d)", path, (long long)fsize, err);
++		vnode_close(vp, 0, ctx);
++		return err ? err : EFBIG;
++	}
++	buf = (uint8_t *)kalloc_data((vm_size_t)fsize, Z_WAITOK);
++	if (buf == NULL) {
++		vnode_close(vp, 0, ctx);
++		return ENOMEM;
++	}
++	err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)fsize, 0, UIO_SYSSPACE, IO_NOAUTH,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	vnode_close(vp, 0, ctx);
++	if (err == 0 && resid != 0) {
++		err = EIO;
++	}
++	if (err) {
++		WLOG("firmware %s: read failed (%d)", path, err);
++		kfree_data(buf, (vm_size_t)fsize);
++		return err;
++	}
++	*data = buf;
++	*size = (size_t)fsize;
++	WLOG("firmware %s: %lld bytes", path, (long long)fsize);
++	return 0;
++}
++
++void
++rottenapple_wifi_firmware_free(uint8_t *data, size_t size)
++{
++	if (data != NULL) {
++		kfree_data(data, (vm_size_t)size);
++	}
++}
++
++/* ---- Carve-outs ---- */
++
++int
++rottenapple_wifi_carveout(struct rottenapple_wifi *w, const char *prop, uint64_t *pa,
++    uint64_t *size, uintptr_t *va)
++{
++	uint64_t const *c;
++	unsigned int len;
++
++	if (SecureDTGetProperty(w->node, prop, (void const **)&c, &len) != kSuccess || len < 16 ||
++	    c[1] == 0 || (c[0] & (WIFI_PAGE - 1)) || (c[1] & (WIFI_PAGE - 1))) {
++		WLOG("%s: missing or not 16 KB aligned", prop);
++		return EINVAL;
++	}
++	*pa = c[0];
++	*size = c[1];
++	/* Firmware memory must never be RAM the kernel hands out. */
++	for (uint64_t p = c[0]; p < c[0] + c[1]; p += WIFI_PAGE) {
++		if (pmap_valid_address(p)) {
++			WLOG("%s: 0x%llx+0x%llx overlaps kernel-managed RAM at 0x%llx; refused",
++			    prop, c[0], c[1], p);
++			return EBUSY;
++		}
++	}
++	if (va != NULL) {
++		*va = ml_io_map_wcomb((vm_offset_t)c[0], (vm_size_t)c[1]);
++		if (*va == 0) {
++			WLOG("%s: cannot map 0x%llx+0x%llx", prop, c[0], c[1]);
++			return ENOMEM;
++		}
++	}
++	WLOG("%s: 0x%llx+0x%llx outside kernel RAM%s", prop, c[0], c[1], va ? ", mapped write-combined" : "");
++	return 0;
++}
++
++/* ---- Bring-up ---- */
++
++static int
++wifi_attach(struct rottenapple_wifi *w, const char *node_name)
++{
++	uint64_t const *reg = NULL;
++	unsigned int size = 0;
++	const char *compat;
++
++	bzero(w, sizeof(*w));
++	strlcpy(w->name, node_name, sizeof(w->name));
++	if (!rottenapple_node(node_name, &w->node)) {
++		WLOG("no ADT node %s; nothing to do", node_name);
++		return ENOENT;
++	}
++	w->ops = rottenapple_backend_find(w->node, ROTTENAPPLE_BACKEND_BEGIN(wifi),
++	    ROTTENAPPLE_BACKEND_END(wifi));
++	if (w->ops == NULL) {
++		compat = rottenapple_prop_string(w->node, "compatible", 0);
++		WLOG("no backend for \"%s\"", compat ? compat : "");
++		return ENXIO;
++	}
++	if (SecureDTGetProperty(w->node, "reg", (void const **)&reg, &size) == kSuccess) {
++		w->nregs = MIN(size / 16, ROTTENAPPLE_MAX_REGS);
++	}
++	for (unsigned i = 0; i < w->nregs; i++) {
++		w->reg_pa[i] = reg[2 * i];
++		w->reg_size[i] = reg[2 * i + 1];
++		w->regs[i] = ml_io_map((vm_offset_t)reg[2 * i], (vm_size_t)reg[2 * i + 1]);
++		if (w->regs[i] == 0) {
++			WLOG("cannot map reg %u (0x%llx+0x%llx)", i, w->reg_pa[i], w->reg_size[i]);
++			return ENOMEM;
++		}
++	}
++	WLOG("%s: backend \"%s\", %u reg ranges, %u power domains, %u clocks", node_name,
++	    w->ops->compatible, w->nregs, rottenapple_pd_count(node_name), rottenapple_clk_count(node_name));
++	int err = w->ops->probe ? w->ops->probe(w) : 0;
++	if (err) {
++		WLOG("backend probe failed (%d); hardware not touched", err);
++	}
++	return err;
++}
++
++/* W1: power-up, identify, firmware, CPU to idle, power-down; WIFI_W1_CYCLES times. */
++static void
++wifi_w1(struct rottenapple_wifi *w)
++{
++	unsigned passed = 0;
++
++	if (w->ops->power_on == NULL || w->ops->power_off == NULL) {
++		WLOG("W1: backend has no power hooks");
++		return;
++	}
++	if (w->ops->report) {
++		w->ops->report(w);
++	}
++	for (unsigned cycle = 1; cycle <= WIFI_W1_CYCLES; cycle++) {
++		WLOG("W1 cycle %u/%u: powering up", cycle, WIFI_W1_CYCLES);
++		int err = w->ops->power_on(w);
++		WLOG("W1 cycle %u/%u: %s (%d); powering down", cycle, WIFI_W1_CYCLES,
++		    err ? "power-up FAILED" : "chip CPU reached its idle loop", err);
++		w->ops->power_off(w);
++		if (w->ops->report) {
++			w->ops->report(w);
++		}
++		if (err) {
++			break;          /* a failed cycle is not repeated */
++		}
++		passed++;
++	}
++	WLOG("W1 result: %s (%u/%u cycles)", passed == WIFI_W1_CYCLES ? "PASSED" : "FAILED",
++	    passed, WIFI_W1_CYCLES);
++}
++
++static void
++rottenapple_wifi_thread(void *arg, __unused wait_result_t wr)
++{
++	unsigned level = (unsigned)(uintptr_t)arg;
++	struct rottenapple_wifi *w = &rottenapple_wifi_dev;
++
++	WLOG("milestone W%u (rottenapple_wifi=%u)", level, level);
++	if (wifi_attach(w, WIFI_NODE) != 0) {
++		return;
++	}
++	wifi_w1(w);
++}
++
++void
++rottenapple_wifi_start(void)
++{
++	uint32_t level = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("rottenapple_wifi", &level, sizeof(level)) || level == 0) {
++		return;                 /* default: Wi-Fi hardware is not touched */
++	}
++	if (level != 1) {
++		WLOG("rottenapple_wifi=%u unknown (1 = W1); hardware not touched", level);
++		return;
++	}
++	if (kernel_thread_start(rottenapple_wifi_thread, (void *)(uintptr_t)level, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/bsd/dev/rottenapple_wifi.h
+@@ -0,0 +1,90 @@
++/*
++ * Rotten Apple: Wi-Fi core. The core knows no chip: it finds the Wi-Fi
++ * node, maps its registers, hands out firmware files and carve-outs, and
++ * runs the bring-up milestones. Everything chip- or SoC-specific (power
++ * sequence, identity, firmware placement, CPU start) is a backend chosen by
++ * the node's compatible list and registered with
++ * ROTTENAPPLE_BACKEND(wifi, ops):
++ *
++ *   rotten-apple-wifi {
++ *       compatible = "<soc>-<block>", ...;
++ *       reg = <...>;  reg-names = "...", ...;      (mapped uncached by the core)
++ *       rotten-apple-interrupts = <...>;  interrupt-names = "...", ...;
++ *       power-domains, clocks, <supply>-supply, pinctrl-<state>   (used by the backend)
++ *       firmware-dir = "/usr/share/firmware/rottenapple/wifi";   (optional, the default)
++ *       <backend properties>
++ *   }
++ *
++ * The node is a consumer, not a provider: nothing powers it on first use.
++ *
++ * Milestones (boot-arg rottenapple_wifi; 0 or absent: nothing is touched):
++ *   1  W1: power up, identify, place the firmware, start the chip's CPU and
++ *      see it reach its idle loop, power down; twice. Runs on a kernel
++ *      thread after the root file system is mounted (firmware comes from
++ *      the root), never panics: any failure is logged and powers down.
++ */
++#ifndef _BSD_DEV_ROTTENAPPLE_WIFI_H_
++#define _BSD_DEV_ROTTENAPPLE_WIFI_H_
++
++#include <dev/rottenapple_provider.h>
++
++__BEGIN_DECLS
++
++struct rottenapple_wifi_ops;
++
++/* One Wi-Fi node. */
++struct rottenapple_wifi {
++	char name[32];                  /* ADT node name */
++	DTEntry node;
++	const struct rottenapple_wifi_ops *ops;
++	uintptr_t regs[ROTTENAPPLE_MAX_REGS];   /* "reg" ranges, mapped uncached (device) */
++	uint64_t reg_pa[ROTTENAPPLE_MAX_REGS];
++	uint64_t reg_size[ROTTENAPPLE_MAX_REGS];
++	unsigned nregs;
++	void *priv;                     /* backend state */
++};
++
++/*
++ * A Wi-Fi backend. All hooks run in thread context, unlocked, and may sleep.
++ * power_off is always called after power_on, also when power_on failed
++ * part way: the backend undoes exactly what it did, in reverse.
++ */
++struct rottenapple_wifi_ops {
++	const char *compatible;
++	/* Resolve the backend's own properties and providers; no hardware writes. */
++	int (*probe)(struct rottenapple_wifi *w);
++	/* Log state that is readable while the block is unpowered (reads only). */
++	void (*report)(struct rottenapple_wifi *w);
++	/* W1: power, identify, firmware into place, CPU to its idle loop. */
++	int (*power_on)(struct rottenapple_wifi *w);
++	void (*power_off)(struct rottenapple_wifi *w);
++};
++
++/* Index of the "reg-names" entry name, -1 if absent or unmapped. */
++int rottenapple_wifi_reg_index(struct rottenapple_wifi *w, const char *name);
++
++/*
++ * Read firmware file name (no '/') from the node's "firmware-dir" (default
++ * /usr/share/firmware/rottenapple/wifi) on the mounted root. *data is a
++ * kalloc_data buffer of *size bytes; free it with rottenapple_wifi_firmware_free.
++ * ENOENT, EFBIG (> 4 MB or empty), ENOMEM or a VFS error.
++ */
++int rottenapple_wifi_firmware_load(struct rottenapple_wifi *w, const char *name,
++    uint8_t **data, size_t *size);
++void rottenapple_wifi_firmware_free(uint8_t *data, size_t size);
++
++/*
++ * A firmware carve-out named by the u64 <pa size> property prop. Refused
++ * (EBUSY) when any page of it is kernel-managed RAM; mapped write-combined
++ * (normal non-cacheable: unaligned copies are fine, nothing to clean) when
++ * va is non-NULL. Mappings live for the kernel's lifetime.
++ */
++int rottenapple_wifi_carveout(struct rottenapple_wifi *w, const char *prop, uint64_t *pa,
++    uint64_t *size, uintptr_t *va);
++
++/* Start the milestone selected by boot-arg rottenapple_wifi (after the root is mounted). */
++void rottenapple_wifi_start(void);
++
++__END_DECLS
++
++#endif
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -954,7 +954,9 @@ bsd_init(void)
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	{
+ 		extern void rottenapple_root_fixups(void);      /* bsd/dev/rottenapple_rootfix.c */
++		extern void rottenapple_wifi_start(void);       /* bsd/dev/rottenapple_wifi.c */
+ 		rottenapple_root_fixups();
++		rottenapple_wifi_start();                       /* boot-arg rottenapple_wifi=1 only */
+ 	}
+ #endif
+ 

@@ -1,0 +1,672 @@
+--- a/shim/nord2-xnu/wifi_ios_client.cpp
++++ b/shim/nord2-xnu/wifi_ios_client.cpp
+@@ -37,6 +37,18 @@
+  uint64_t now=0,ns=0;clock_get_uptime(&now);absolutetime_to_nanoseconds(now,&ns);return ns/1000000u;
+ #endif
+ }
++/* Same uptime microsecond domain as ncd_native_now/nsb observations. */
++static uint64_t niw_us(void){
++#ifdef NIWL_HOST_TEST
++#ifdef NIWL_SCAN_TEST_NOW
++ return NIWL_SCAN_TEST_NOW();
++#else
++ return 0; /* A host scan fixture must provide its actual synthetic clock. */
++#endif
++#else
++ uint64_t now=0,ns=0;clock_get_uptime(&now);absolutetime_to_nanoseconds(now,&ns);return ns/1000u;
++#endif
++}
+ static int niw_root_busy(void){
+ #ifdef NIWL_HOST_TEST
+  return -1; /* No real registry exists in the host harness. */
+@@ -97,7 +109,7 @@
+  struct {uint32_t request,operation,count;} controlTrace[40];
+  char interfaceName[16];struct nils_state cacheLife;struct nils_ticket cacheTicket;
+  struct njs_snapshot *station;uint64_t joinTicket,joinEpoch;unsigned joinLogs;
+- struct niwa_snapshot *snapshot;uint32_t producer;IOReturn lastScanError;
++ struct niwa_history *history;struct niwa_snapshot *snapshot;uint32_t producer;IOReturn lastScanError;
+  static void completed(void*,uint64_t,uint64_t,enum nss_status);
+  static void joinCompleted(void*,uint64_t,uint64_t,enum njs_notice);
+  IOReturn joinLocked(const uint8_t*,size_t);
+@@ -106,6 +118,7 @@
+  IOReturn getLocked(const niw_request*,const void*,size_t,IOExternalMethodArguments*);
+  bool eventLocked(uint32_t);
+ 
++ void clearScanLocked(void);
+  void discardLocked(void);
+  void closeOwned(void);
+  IOReturn dispatchLocked(uint32_t,IOExternalMethodArguments *,bool *);
+@@ -123,7 +136,7 @@
+ };
+ OSDefineMetaClassAndStructors(NiwlLifecycleClient,IOUserClient)
+ bool NiwlLifecycleClient::initWithTask(task_t task,void *security,UInt32 type,OSDictionary *props){
+- station=nullptr;joinTicket=joinEpoch=0;joinLogs=0;pipeLogs=scanLogs=queueLogs=completionLogs=eventLogs=resultLogs=outputLogs=unsupportedLogs=0;bzero(controlTrace,sizeof controlTrace);snapshot=nullptr;pendingTicket=0;pendingEpoch=0;pendingBss=0;scanGeneration=0;producer=0;lastScanError=kIOReturnNotReady;bzero(&cacheLife,sizeof cacheLife);bzero(interfaceName,sizeof interfaceName);
++ station=nullptr;joinTicket=joinEpoch=0;joinLogs=0;pipeLogs=scanLogs=queueLogs=completionLogs=eventLogs=resultLogs=outputLogs=unsupportedLogs=0;bzero(controlTrace,sizeof controlTrace);history=nullptr;snapshot=nullptr;pendingTicket=0;pendingEpoch=0;pendingBss=0;scanGeneration=0;producer=0;lastScanError=kIOReturnNotReady;bzero(&cacheLife,sizeof cacheLife);bzero(interfaceName,sizeof interfaceName);
+  timingClient=0;timingCalls=timingRequest=timingNormal=timingSlow=0;
+  owner=TASK_NULL;gate=nullptr;phase=Closed;data=state=nullptr;ownsReference=false;generation=0;bzero(reference,sizeof reference);
+  if(!task||current_task()!=task||type)return false;
+@@ -133,14 +146,20 @@
+  if(!authorized||!IOUserClient::initWithTask(task,security,type,props))return false;
+  gate=IOLockAlloc();if(!gate)return false;
+  snapshot=(niwa_snapshot*)IOMalloc(sizeof(*snapshot));if(!snapshot)return false;bzero(snapshot,sizeof(*snapshot));
++ history=(niwa_history*)IOMalloc(sizeof(*history));if(!history)return false;niwa_history_clear(history);
+  station=(njs_snapshot*)IOMalloc(sizeof(*station));if(!station)return false;bzero(station,sizeof(*station));
+  task_reference(task);owner=task;generation=1;phase=Open;timingClient=niwt_client_id();return true;
++}
++void NiwlLifecycleClient::clearScanLocked(void){
++ nils_close(&cacheLife);if(scanGeneration!=UINT64_MAX)scanGeneration++;
++ if(snapshot)bzero(snapshot,sizeof(*snapshot));if(history)niwa_history_clear(history);
++ lastScanError=kIOReturnNotReady;
+ }
+ void NiwlLifecycleClient::discardLocked(void){
+  /* All cache/event publication and reference sending is under gate. Close
+   * invalidates scan generation first; pending callback retains this client and
+   * stable snapshot until retirement. Mappings own descriptor refs independently. */
+- nils_close(&cacheLife);
++ clearScanLocked();
+  if(ownsReference){IOUserClient::releaseAsyncReference64(reference);ownsReference=false;bzero(reference,sizeof reference);}
+  if(data){data->release();data=nullptr;}if(state){state->release();state=nullptr;}
+ }
+@@ -308,7 +327,7 @@
+ IOReturn NiwlLifecycleClient::clientClose(void){closeOwned();terminate();return kIOReturnSuccess;}
+ IOReturn NiwlLifecycleClient::clientDied(void){closeOwned();terminate();return kIOReturnSuccess;}
+ void NiwlLifecycleClient::stop(IOService*p){closeOwned();IOUserClient::stop(p);}
+-void NiwlLifecycleClient::free(void){closeOwned();if(owner){task_deallocate(owner);owner=TASK_NULL;}if(gate){IOLockFree(gate);gate=nullptr;}if(snapshot){IOFree(snapshot,sizeof(*snapshot));snapshot=nullptr;}if(station){niwj_free(station,sizeof(*station));station=nullptr;}IOUserClient::free();}
++void NiwlLifecycleClient::free(void){closeOwned();if(owner){task_deallocate(owner);owner=TASK_NULL;}if(gate){IOLockFree(gate);gate=nullptr;}if(snapshot){IOFree(snapshot,sizeof(*snapshot));snapshot=nullptr;}if(history){niwa_history_clear(history);IOFree(history,sizeof(*history));history=nullptr;}if(station){niwj_free(station,sizeof(*station));station=nullptr;}IOUserClient::free();}
+ #ifdef NIWL_HOST_TEST
+ class NiwlLifecycleService : public IOService {
+  OSDeclareDefaultStructors(NiwlLifecycleService)
+@@ -359,6 +378,7 @@
+   printf("NORD2 WIFI IOS ADMISSION: status=%d owner_channels=%u requested_channels=%u channel_flags_or=%#x channel_min=%u channel_max=%u t_ms=%llu\n",admission,(unsigned)info.count,admission?0:(unsigned)request.count,flags,low,high,niw_ms());
+  }
+  if(admission)return kIOReturnUnsupported;
++ if(scanGeneration==UINT64_MAX)return kIOReturnNoResources;
+  nils_close(&cacheLife);bzero(snapshot,sizeof(*snapshot));scanGeneration++;
+  if(nils_open(&cacheLife,scanGeneration)||nils_begin(&cacheLife,&cacheTicket,snapshot))return kIOReturnNotReady;
+  retain();uint64_t ticket=0;int result=nord2_wifi_scan_enqueue(&request,this,scanGeneration,completed,&ticket);
+@@ -371,15 +391,15 @@
+  IOLockLock(c->gate);nss_view view={};bool current=c->phase==Armed&&c->scanGeneration==gen&&c->pendingTicket==ticket&&c->pendingEpoch==c->generation;
+  if(current){
+   int result=-1;
+-  if(status==NSS_COMPLETE&&!nord2_wifi_scan_view(ticket,&view)&&view.client_generation==gen){
++  if((status==NSS_COMPLETE||status==NSS_PARTIAL)&&!nord2_wifi_scan_view(ticket,&view)&&view.client_generation==gen){
+    size_t count=0;const niwp_rate_map*map=niwi_rate_map(&count);
+-   result=nils_prepare(&c->cacheTicket,view.scan,view.captured_us,view.captured_us,map,count,c->snapshot);
+-   if(!result)result=niwa_snapshot_bss_filter(c->snapshot,c->pendingBss);
++   result=nils_prepare_history(&c->cacheTicket,c->history,view.scan,view.captured_us,niw_us(),map,count,c->pendingBss,c->snapshot);
+   }
+   if(result==0&&nils_finish(&c->cacheLife,&c->cacheTicket,c->snapshot)==0)c->lastScanError=kIOReturnSuccess;
+   else{nils_finish(&c->cacheLife,&c->cacheTicket,nullptr);c->lastScanError=kIOReturnNotReady;}
+   if(!c->eventLocked(c->lastScanError==kIOReturnSuccess?0:5)){nils_close(&c->cacheLife);c->lastScanError=kIOReturnNoResources;}
+  }else if(c->cacheLife.inflight)nils_finish(&c->cacheLife,&c->cacheTicket,nullptr);
++ if(current&&c->snapshot->retained_view&&c->completionLogs<64)printf("NORD2 WIFI IOS SCANHISTORY: generation=%llu source_rows=%u display_rows=%u retained_rows=%u overflow=%u dropped=%u ttl_ms=30000\n",(unsigned long long)gen,c->snapshot->backend_count,c->snapshot->count,c->history->count,c->snapshot->source_overflow,c->snapshot->dropped);
+  if(c->completionLogs++<64)printf("NORD2 WIFI IOS COMPLETE: generation=%llu ticket=%llu backend=%u current=%u cache_status=%#x rows=%u omitted=%u omit_mask=%#x t_ms=%llu\n",(unsigned long long)gen,(unsigned long long)ticket,(unsigned)status,(unsigned)current,(unsigned)c->lastScanError,current?c->snapshot->count:0,current?c->snapshot->omitted:0,current?c->snapshot->omit_mask:0,niw_ms());
+  if(c->pendingTicket==ticket)c->pendingTicket=0;
+  IOLockUnlock(c->gate);
+@@ -425,7 +445,7 @@
+   if(traceControl(12,0))printf("NORD2 WIFI IOS CARD: bytes=%u features=%u byte0=%#x byte1=%#x\n",(unsigned)used,installed.count,(unsigned)((uint8_t*)a->structureOutput)[0],(unsigned)((uint8_t*)a->structureOutput)[1]);
+   return kIOReturnSuccess;
+  }
+- if(q->request==11){if(q->payload_bytes!=1164||a->structureOutputSize<1164)return kIOReturnBadArgument;int result=nils_take(&cacheLife,scanGeneration,(uint8_t*)a->structureOutput,a->structureOutputSize);if(resultLogs++<256)printf("NORD2 WIFI IOS RESULT: status=%d next=%u count=%u generation=%llu\n",result,snapshot->cursor.next,snapshot->cursor.count,(unsigned long long)scanGeneration);if(result==0)return (IOReturn)0xe0820446;if(result<0)return lastScanError==kIOReturnSuccess?kIOReturnNotReady:lastScanError;a->structureOutputSize=1164;return kIOReturnSuccess;}
++ if(q->request==11){if(q->payload_bytes!=1164||a->structureOutputSize<1164)return kIOReturnBadArgument;int result=nils_take_timed(&cacheLife,history,scanGeneration,niw_us(),(uint8_t*)a->structureOutput,a->structureOutputSize);if(resultLogs++<256)printf("NORD2 WIFI IOS RESULT: status=%d next=%u count=%u generation=%llu\n",result,snapshot->cursor.next,snapshot->cursor.count,(unsigned long long)scanGeneration);if(result==0)return (IOReturn)0xe0820446;if(result<0)return lastScanError==kIOReturnSuccess?kIOReturnNotReady:lastScanError;a->structureOutputSize=1164;return kIOReturnSuccess;}
+  if(q->request==19){nss_info info={};if(q->payload_bytes!=24||a->structureOutputSize<24||nord2_wifi_scan_info(&info))return kIOReturnNotReady;uint8_t power[24]={1,0,0,0,1,0,0,0,1};memcpy(a->structureOutput,power,sizeof power);a->structureOutputSize=sizeof power;return kIOReturnSuccess;}
+  if(unsupportedLogs++<64)printf("NORD2 WIFI IOS REQUEST: request=%u bytes=%u unsupported=1\n",q->request,q->payload_bytes);
+  return kIOReturnUnsupported;
+--- a/shim/nord2-xnu/wifi_ios_lifecycle.c
++++ b/shim/nord2-xnu/wifi_ios_lifecycle.c
+@@ -27,3 +27,13 @@
+  return niwc_take(&s->cache->cursor,generation,out,bytes);
+ }
+ void nils_close(struct nils_state*s){if(s){s->open=0;s->cache=0;}}
++
++int nils_prepare_history(const struct nils_ticket*t,struct niwa_history*h,const struct nsb_scan*scan,
++ uint64_t captured,uint64_t reference,const struct niwp_rate_map*m,size_t n,unsigned bss,struct niwa_snapshot*out){
++ if(!t||!t->generation||!t->serial||!scan||!out||out!=t->output||out->entered)return -1;
++ return niwa_history_prepare(h,scan,t->generation,captured,reference,m,n,bss,out);
++}
++int nils_take_timed(struct nils_state*s,struct niwa_history*h,uint64_t generation,uint64_t reference,uint8_t*out,size_t bytes){
++ if(!s||!s->open||s->inflight||!s->cache||s->generation!=generation)return -1;
++ return niwa_snapshot_take_timed(s->cache,h,generation,reference,out,bytes);
++}
+--- a/shim/nord2-xnu/wifi_ios_lifecycle.h
++++ b/shim/nord2-xnu/wifi_ios_lifecycle.h
+@@ -1,8 +1,10 @@
+ #ifndef PRIVATE_LIFECYCLE_SCAN_H
+ #define PRIVATE_LIFECYCLE_SCAN_H
+ #include "wifi_ios_age.h"
+-/* All state operations require the owning lifecycle gate. Preparation alone
+- * runs outside that gate on an immutable retained scan and unique output. */
++/* All state operations require the owning lifecycle gate. Legacy snapshot
++ * preparation may run outside that gate on an immutable scan/unique output.
++ * History preparation and timed reads also mutate shared retention state and
++ * require the same owning gate. */
+ struct nils_state {uint64_t generation,serial;unsigned open,inflight;struct niwa_snapshot *cache,*pending;};
+ struct nils_ticket {uint64_t generation,serial;struct niwa_snapshot *output;};
+ int nils_open(struct nils_state *,uint64_t);
+@@ -17,5 +19,8 @@
+  * its buffers until matching finish returns2; close must not destroy state. */
+ /* Gate-held GET:1 row,0 proven complete EOF,-1 unavailable/stale. */
+ int nils_take(struct nils_state *,uint64_t,uint8_t *,size_t);
++int nils_prepare_history(const struct nils_ticket *,struct niwa_history *,const struct nsb_scan *,
++ uint64_t,uint64_t,const struct niwp_rate_map *,size_t,unsigned,struct niwa_snapshot *);
++int nils_take_timed(struct nils_state *,struct niwa_history *,uint64_t,uint64_t,uint8_t *,size_t);
+ void nils_close(struct nils_state *);
+ #endif
+--- a/shim/nord2-xnu/wifi_ios_snapshot.c
++++ b/shim/nord2-xnu/wifi_ios_snapshot.c
+@@ -35,6 +35,7 @@
+   }
+  }
+  out->count=out->omitted=out->omit_mask=0;
++ out->retained_view=out->source_overflow=0;
+  out->entered=1;out->status=state;out->generation=generation;out->backend_count=s->count;out->dropped=s->dropped;
+  out->completion_state=s->completion.state;out->completed_channels=s->completion.completed_channels;
+  if(state!=NIWA_COMPLETE)return 1; /* never mark partial/timeout/pending cache READY */
+@@ -55,9 +56,99 @@
+  for(unsigned i=0;i<s->count;i++){
+   unsigned cap=s->rows[i][26]|(unsigned)s->rows[i][27]<<8;
+   if((cap&3u)!=1u){s->omitted++;s->omit_mask|=NIWA_OMIT_BSS;continue;}
+-  if(kept!=i)for(unsigned j=0;j<NIWS_SCAN_RESULT_BYTES;j++)s->rows[kept][j]=s->rows[i][j];
++  if(kept!=i){for(unsigned j=0;j<NIWS_SCAN_RESULT_BYTES;j++)s->rows[kept][j]=s->rows[i][j];s->observed_us[kept]=s->observed_us[i];}
+   kept++;
+  }
+- for(unsigned i=kept;i<s->count;i++)for(unsigned j=0;j<NIWS_SCAN_RESULT_BYTES;j++)s->rows[i][j]=0;
++ for(unsigned i=kept;i<s->count;i++){s->observed_us[i]=0;for(unsigned j=0;j<NIWS_SCAN_RESULT_BYTES;j++)s->rows[i][j]=0;}
+  s->count=kept;s->cursor.count=kept;return 0;
+ }
++
++_Static_assert(NSB_RESULTS==NIWC_MAX_RECORDS,"raw/display bounds must agree");
++static void hist_copy(void*d,const void*s,size_t n){uint8_t*a=d;const uint8_t*b=s;while(n--)*a++=*b++;}
++static void hist_zero(void*v,size_t n){uint8_t*p=v;while(n--)*p++=0;}
++static void hist_put32(uint8_t*p,uint32_t n){for(unsigned j=0;j<4;j++)p[j]=(uint8_t)(n>>(8*j));}
++static int hist_key(const uint8_t*a,const uint8_t*b){
++ if(a[96]!=b[96])return 0;
++ for(unsigned j=28;j<34;j++)if(a[j]!=b[j])return 0;
++ for(unsigned j=0;j<a[96];j++)if(a[97+j]!=b[97+j])return 0;
++ return 1;
++}
++void niwa_history_clear(struct niwa_history*h){if(h)hist_zero(h,sizeof(*h));}
++static int hist_scan(const struct nsb_scan*s){
++ /* Same exact overflow-only proof as niwj_scan_usable, without introducing
++  * station-service dependencies or mutating any native completion metadata. */
++ return s&&s->entered&&s->done&&!s->active&&!s->timed_out&&s->completion.state==7&&
++  s->completion.sequence==s->sequence&&s->count<=NSB_RESULTS&&s->count<=s->frames&&
++  s->dropped<=s->frames-s->count&&s->last>=s->started&&s->last<s->deadline&&s->deadline>s->started&&
++  (s->partial?(s->dropped&&s->count==NSB_RESULTS):!s->dropped);
++}
++static void hist_remove(struct niwa_history*h,unsigned index){
++ for(unsigned j=index+1;j<h->count;j++){
++  h->observed_us[j-1]=h->observed_us[j];hist_copy(h->rows[j-1],h->rows[j],NIWS_SCAN_RESULT_BYTES);
++ }
++ --h->count;h->observed_us[h->count]=0;hist_zero(h->rows[h->count],NIWS_SCAN_RESULT_BYTES);
++}
++int niwa_history_prepare(struct niwa_history*h,const struct nsb_scan*s,uint64_t generation,
++ uint64_t captured,uint64_t reference,const struct niwp_rate_map*m,size_t n,unsigned bss,struct niwa_snapshot*out){
++ struct niws_result decoded;
++ if(!h||!out||out->entered||out->cursor.phase!=NIWC_NEW||!generation||generation<=h->generation||
++  h->count>NIWC_MAX_RECORDS||!hist_scan(s)||captured<s->last||reference<captured||
++  reference<h->reference_us||(bss!=2&&bss!=3)||!m||!n||n>128)return -1;
++ for(size_t j=0;j<n;j++){
++  if(!m[j].ie_rate||m[j].ie_rate>127)return -1;
++  for(size_t k=0;k<j;k++)if(m[j].ie_rate==m[k].ie_rate)return -1;
++ }
++ for(unsigned j=0;j<h->count;j++){
++  if(h->observed_us[j]>h->reference_us||niws_decode_result(h->rows[j],NIWS_SCAN_RESULT_BYTES,&decoded))return -1;
++  for(unsigned k=0;k<j;k++)if(hist_key(h->rows[j],h->rows[k]))return -1;
++ }
++ for(unsigned j=0;j<s->count;j++)if(s->records[j].observed_us<s->started||s->records[j].observed_us>s->last)return -1;
++ /* Every fallible input check precedes mutation; no full scan/history local. */
++ for(unsigned j=0;j<h->count;)if(reference-h->observed_us[j]>=NIWA_HISTORY_TTL_US)hist_remove(h,j);else j++;
++ out->count=out->omitted=out->omit_mask=0;
++ for(unsigned j=0;j<s->count;j++){
++  uint8_t encoded[NIWS_SCAN_RESULT_BYTES];uint64_t observed=s->records[j].observed_us;
++  if(reference-observed>=NIWA_HISTORY_TTL_US)continue;
++  unsigned why=row(&s->records[j],(uint32_t)((reference-observed)/1000),m,n,encoded);
++  if(why){out->omitted++;out->omit_mask|=why;continue;}
++  unsigned at=h->count;
++  for(unsigned k=0;k<h->count;k++)if(hist_key(h->rows[k],encoded)){at=k;break;}
++  if(at<h->count){if(observed<h->observed_us[at])continue;}
++  else if(h->count<NIWC_MAX_RECORDS)h->count++;
++  else{
++   at=0;for(unsigned k=1;k<h->count;k++)if(h->observed_us[k]<h->observed_us[at])at=k;
++   if(observed<h->observed_us[at])continue;
++  }
++  hist_copy(h->rows[at],encoded,sizeof(encoded));h->observed_us[at]=observed;
++ }
++ h->generation=generation;h->reference_us=reference;
++ for(unsigned j=0;j<h->count;j++){
++  unsigned capabilities=h->rows[j][26]|(unsigned)h->rows[j][27]<<8;
++  if(bss==2&&(capabilities&3u)!=1u){out->omitted++;out->omit_mask|=NIWA_OMIT_BSS;continue;}
++  unsigned at=out->count++;hist_copy(out->rows[at],h->rows[j],NIWS_SCAN_RESULT_BYTES);out->observed_us[at]=h->observed_us[j];
++  hist_put32(out->rows[at]+132,(uint32_t)((reference-h->observed_us[j])/1000));
++ }
++ out->entered=out->retained_view=1;out->status=NIWA_COMPLETE;out->generation=generation;out->reference_us=reference;
++ out->backend_count=s->count;out->dropped=s->dropped;out->source_overflow=s->partial;
++ out->completion_state=s->completion.state;out->completed_channels=s->completion.completed_channels;
++ /* All rows were validated before retention or just encoded above; these calls
++  * can only fail on an internal programming error, never grant native state. */
++ if(niwc_begin(&out->cursor,generation)||niwc_complete(&out->cursor,generation,&out->rows[0][0],
++    (size_t)out->count*NIWS_SCAN_RESULT_BYTES,out->count))return -1;
++ return 0;
++}
++int niwa_snapshot_take_timed(struct niwa_snapshot*s,struct niwa_history*h,uint64_t generation,uint64_t reference,uint8_t*out,size_t bytes){
++ if(!h||h->generation!=generation||reference<h->reference_us||!s||s->retained_view!=1||s->status!=NIWA_COMPLETE||!s->entered||s->generation!=generation||
++  s->cursor.phase!=NIWC_READY||s->cursor.generation!=generation||s->cursor.records!=&s->rows[0][0]||
++  s->cursor.count!=s->count||s->count>NIWC_MAX_RECORDS||s->cursor.next>s->count||reference<s->reference_us||
++  !out||bytes!=NIWS_SCAN_RESULT_BYTES)return -1;
++ for(unsigned j=s->cursor.next;j<s->count;j++)if(s->observed_us[j]>s->reference_us)return -1;
++ while(s->cursor.next<s->count&&reference-s->observed_us[s->cursor.next]>=NIWA_HISTORY_TTL_US)s->cursor.next++;
++ unsigned at=s->cursor.next;int result=niwc_take(&s->cursor,generation,out,bytes);
++ if(result==1)hist_put32(out+132,(uint32_t)((reference-s->observed_us[at])/1000));
++ if(result>=0){
++  s->reference_us=reference;h->reference_us=reference;
++  for(unsigned j=0;j<h->count;)if(reference-h->observed_us[j]>=NIWA_HISTORY_TTL_US)hist_remove(h,j);else j++;
++ }
++ return result;
++}
+--- a/shim/nord2-xnu/wifi_ios_snapshot.h
++++ b/shim/nord2-xnu/wifi_ios_snapshot.h
+@@ -8,7 +8,8 @@
+ enum {NIWA_OMIT_RSSI=1u,NIWA_OMIT_CHANNEL=2u,NIWA_OMIT_IES=4u,NIWA_OMIT_RATES=8u,NIWA_OMIT_OTHER=16u,NIWA_OMIT_BSS=32u};
+ struct niwa_snapshot {enum niwa_status status;unsigned entered,count,backend_count,dropped,omitted,omit_mask;
+  uint8_t completion_state,completed_channels;uint64_t generation;
+- struct niwc_cursor cursor;uint8_t rows[NSB_RESULTS][NIWS_SCAN_RESULT_BYTES];};
++ struct niwc_cursor cursor;uint64_t observed_us[NSB_RESULTS],reference_us;
++ unsigned retained_view,source_overflow;uint8_t rows[NSB_RESULTS][NIWS_SCAN_RESULT_BYTES];};
+ /* Copied immutable scan input + caller-owned zeroed output retained through
+  * cursor lifetime. Caller serializes actual backend owner/generation and must
+  * not relocate/copy this object once prepared. No runtime authority granted.
+@@ -24,4 +25,23 @@
+  const uint32_t *,size_t,const struct niwp_rate_map *,size_t,struct niwa_snapshot *);
+ /* Before publication only: filter a freshly prepared complete cursor, never a consumed cache. */
+ int niwa_snapshot_bss_filter(struct niwa_snapshot *,unsigned);
++/* Port display-cache policy, not a proprietary Apple timing claim. Native
++ * scan provenance/connection authority stays separate. Caller owns both heap
++ * objects under its gate; they must be disjoint and not relocated while read. */
++#define NIWA_HISTORY_TTL_US UINT64_C(30000000)
++struct niwa_history {
++ unsigned count;uint64_t generation,reference_us;
++ uint64_t observed_us[NIWC_MAX_RECORDS];
++ uint8_t rows[NIWC_MAX_RECORDS][NIWS_SCAN_RESULT_BYTES];
++};
++void niwa_history_clear(struct niwa_history *);
++/* Only actual state7 complete or exact full-cache-overflow completion; no
++ * failed/timed-out/canceled completion. Captured/reference share native uptime
++ * microseconds. Keeps BSSID+SSID keys and original observation times. Atomic
++ * refusal; per-row metadata omissions never refresh earlier observations. */
++int niwa_history_prepare(struct niwa_history *,const struct nsb_scan *,uint64_t,
++ uint64_t,uint64_t,const struct niwp_rate_map *,size_t,unsigned,struct niwa_snapshot *);
++/* Gate-held1 copied row/0 exhausted/-1 refusal. Expired rows are skipped,
++ * original timestamp ages recomputed per read; TTL is never refreshed by GET. */
++int niwa_snapshot_take_timed(struct niwa_snapshot *,struct niwa_history *,uint64_t,uint64_t,uint8_t *,size_t);
+ #endif
+--- a/shim/nord2-xnu/wifi_scan_bss.h
++++ b/shim/nord2-xnu/wifi_scan_bss.h
+@@ -3,7 +3,7 @@
+ #include <stdint.h>
+ #include <stddef.h>
+ #define NSB_IE_BYTES 1024u /* Exact maximum IE room of the Apple1164-byte scan result. */
+-#define NSB_RESULTS 16u
++#define NSB_RESULTS 64u /* matches existing bounded Apple cursor capacity; owner storage is static */
+ #define NSB_SCAN_DONE_BYTES 476u
+ struct nsb_record {
+  uint8_t bssid[6],transmitter[6],ssid[32],ssid_len,ssid_present,hidden;
+--- a/shim/nord2-xnu/wifi_scan_service_bind.inc
++++ b/shim/nord2-xnu/wifi_scan_service_bind.inc
+@@ -37,7 +37,7 @@
+   if(!found){IOLockUnlock(nss_native.lock);return -1;}}
+  struct nss_slot*s=0;for(unsigned k=0;k<NSS_SLOTS;k++)if(!nss_native.slot[k].state){s=&nss_native.slot[k];break;}
+  if(!s){IOLockUnlock(nss_native.lock);return 2;}
+- *s=(struct nss_slot){0};s->request=*q;s->cookie=cookie;s->generation=generation;s->completion=completion;s->ticket=++nss_native.serial;s->state=NSS_QUEUED;*ticket=s->ticket;
++ memset(s,0,sizeof(*s));s->request=*q;s->cookie=cookie;s->generation=generation;s->completion=completion;s->ticket=++nss_native.serial;s->state=NSS_QUEUED;*ticket=s->ticket;
+  IOLockUnlock(nss_native.lock);thread_wakeup((event_t)&nss_native);return 0;
+ }
+ int nord2_wifi_scan_cancel(uint64_t ticket){if(!ticket||!nss_available())return 1;IOLockLock(nss_native.lock);struct nss_slot*s=nss_find(ticket);int r=s?0:1;if(s)s->canceled=1;IOLockUnlock(nss_native.lock);if(!r)thread_wakeup((event_t)&nss_native);return r;}
+--- a/tools/fixtures/nord2-wifi-five-ghz/channels.c
++++ b/tools/fixtures/nord2-wifi-five-ghz/channels.c
+@@ -0,0 +1,53 @@
++#include "wifi_normal_config.h"
++#include "wifi_ios_policy.h"
++#include "wifi_ios_scalar.h"
++#include "wifi_ios_snapshot.h"
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++static unsigned tests;
++#define C(x) do {assert(x);tests++;} while(0)
++static void put(uint8_t*p,uint32_t x){for(unsigned j=0;j<4;j++)p[j]=(uint8_t)(x>>(8*j));}
++static unsigned get(const uint8_t*p){return p[0]|(unsigned)p[1]<<8|(unsigned)p[2]<<16|(unsigned)p[3]<<24;}
++static unsigned beacon(uint8_t*p,unsigned ch,unsigned suffix){
++ memset(p,0,128);p[2]=1;p[3]=0x38;put(p+4,4u<<11);put(p+8,12u<<8);put(p+12,ch<<8);p[28]=100;p[29]=255;
++ unsigned m=32;p[m]=0x80;p[m+10]=p[m+16]=2;p[m+15]=p[m+21]=(uint8_t)suffix;p[m+32]=100;p[m+34]=1;
++ unsigned i=m+36;p[i++]=0;p[i++]=4;memcpy(p+i,"test",4);i+=4;p[i++]=1;p[i++]=1;p[i++]=12;
++ p[i++]=61;p[i++]=22;p[i]=(uint8_t)ch;i+=22;p[0]=(uint8_t)i;p[1]=(uint8_t)(i>>8);return i;
++}
++int main(int argc,char**argv){
++ C(argc==2);uint8_t board[6146];FILE*f=fopen(argv[1],"rb");C(f&&fread(board,1,sizeof board,f)==sizeof board);fclose(f);
++ struct ncfg_input in={.board=board,.board_bytes=sizeof board,.project=20827,.caps={.phy_present=1,.band5=1,.max_bw=2,.nss=2,.path=15}};
++ struct ncfg_plan p;struct ncfg_channel all[39];size_t count=0;C(!ncfg_prepare(&in,&p));C(!ncfg_channels(&in,&p,all,39,&count)&&count==39&&p.band5);
++ struct nss_info info={.band5=1};unsigned dfs=0,non=0;
++ for(unsigned j=0;j<count;j++)if(all[j].allowed){unsigned k=info.count++;info.channels[k]=(struct ncs_channel){all[j].band,all[j].channel};if(all[j].dfs){info.dfs_mask|=UINT64_C(1)<<k;dfs++;}else non++;}
++ fprintf(stderr,"channel_counts total=%u dfs=%u nonDFS=%u\n",info.count,dfs,non);C(info.count==37&&dfs==15&&non==22);
++ const char name[16]="en0";struct niw_request q={.operation=NIW_GET,.request=27,.payload_bytes=NIWS_CHANNEL_BYTES};memcpy(q.interface_name,name,16);
++ uint8_t response[NIWS_CHANNEL_BYTES+1],before[sizeof response];size_t used=77;
++ for(unsigned id=0;id<2;id++){q.request=id?254:27;memset(response,0xa5,sizeof response);C(!niws_channels(&q,name,&info,response,sizeof response,&used));C(used==NIWS_CHANNEL_BYTES&&get(response+4)==37&&response[NIWS_CHANNEL_BYTES]==0xa5);
++ for(unsigned k=0;k<info.count;k++){C(get(response+12+12*k)==info.channels[k].channel);C(get(response+16+12*k)==(2u|(info.channels[k].band==1?8u:16u)|((info.dfs_mask>>k&1)?0x100u:0)));}}
++ for(unsigned bad=0;bad<3;bad++){struct nss_info b=info;if(!bad)b.dfs_mask|=UINT64_C(1)<<39;if(bad==1)b.dfs_mask|=1;if(bad==2)b.count=40;memset(response,0xa5,sizeof response);memcpy(before,response,sizeof response);used=77;C(niws_channels(&q,name,&b,response,sizeof response,&used));C(used==77&&!memcmp(before,response,sizeof response));}
++ uint8_t request[5456]={0};put(request,1);put(request+4,2);put(request+56,1);put(request+4880,0x80000000u);
++ struct nss_request admitted,old;
++ for(unsigned mode=1;mode<=3;mode++)for(unsigned explicit_flag=0;explicit_flag<2;explicit_flag++)for(unsigned active=0;active<2;active++){
++ put(request+52,mode);put(request+68,info.count);
++ for(unsigned k=0;k<info.count;k++){uint8_t*c=request+72+12*k;put(c,1);put(c+4,info.channels[k].channel);put(c+8,2u|(info.channels[k].band==1?8u:16u)|((explicit_flag&&(info.dfs_mask>>k&1))?0x100u:0u)|(active?128u:0u));}
++ C(!niwi_scan_admit(request,sizeof request,&info,&admitted));C(admitted.count==37&&!admitted.dwell_tu&&!memcmp(admitted.channels,info.channels,sizeof(info.channels[0])*37));
++ }
++ /* Every numeric flag bit is classified; permission to probe never creates TX. */
++ put(request+68,1);put(request+76,100);put(request+52,2);
++ for(unsigned bit=0;bit<32;bit++){put(request+80,0x112u|(1u<<bit));memset(&admitted,0xa5,sizeof admitted);old=admitted;int r=niwi_scan_admit(request,sizeof request,&info,&admitted);unsigned ok=bit==1||bit==4||bit==7||bit==8;C((r==0)==ok);if(r)C(!memcmp(&old,&admitted,sizeof old));}
++ for(unsigned ch=1;ch<=196;ch++){put(request+76,ch);put(request+80,0x112);unsigned allowed=0;for(unsigned k=0;k<info.count;k++)if(info.channels[k].channel==ch&&(info.dfs_mask>>k&1))allowed=1;C((niwi_scan_admit(request,sizeof request,&info,&admitted)==0)==allowed);}
++ struct nsb_scan scan={0};uint8_t packet[128];C(!nsb_begin(&scan,9,1,10000));
++ unsigned bytes=beacon(packet,1,1);C(!nsb_add(&scan,packet,bytes,2));bytes=beacon(packet,100,2);C(!nsb_add(&scan,packet,bytes,3));
++ C(scan.count==2&&scan.records[1].hw_channel==100&&!scan.records[1].channel_mismatch);
++ /* Same SSID, different BSSID/band remains two actual records. */
++ scan.active=0;scan.done=1;scan.completion.state=7;scan.completion.sequence=9;
++ struct niwa_snapshot snap={0};uint32_t ages[NSB_RESULTS]={0};size_t maps=0;const struct niwp_rate_map*map=niwi_rate_map(&maps);
++ C(!niwa_snapshot_prepare(&scan,1,ages,2,map,maps,&snap));C(snap.count==2&&!snap.omitted);C(get(snap.rows[0]+8)==1&&get(snap.rows[1]+8)==100&&get(snap.rows[1]+12)==0x110);
++ /* Existing overflow and subset-replacement behavior is explicit, unchanged. */
++ struct nsb_scan over={0};C(!nsb_begin(&over,1,1,10000));for(unsigned i=0;i<NSB_RESULTS+1;i++){bytes=beacon(packet,i%2?100:1,i+1);int rc=nsb_add(&over,packet,bytes,i+2);C(rc==(i==NSB_RESULTS?1:0));}
++ C(over.count==NSB_RESULTS&&over.dropped==1&&over.partial);over.active=0;over.done=1;over.completion.state=7;over.completion.sequence=1;
++ memset(&snap,0,sizeof snap);C(niwa_snapshot_prepare(&over,2,ages,NSB_RESULTS,map,maps,&snap)==1&&snap.status==NIWA_PARTIAL&&!snap.count);
++ printf("PASS fiveGHz: %u checks; authenticated37 channels/15DFS; channel ABI, passive subset flags, bounds, actual beacon decoder+snapshot, dedup and overflow semantics; no private values\n",tests);
++}
+--- a/tools/fixtures/nord2-wifi-five-ghz/retention.c
++++ b/tools/fixtures/nord2-wifi-five-ghz/retention.c
+@@ -0,0 +1,78 @@
++#include "wifi_ios_snapshot.h"
++#include "wifi_ios_policy.h"
++#include "wifi_ios_join.h"
++#include "wifi_ios_lifecycle.h"
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++static struct niwa_history h,saved;
++static struct niwa_snapshot out,before;
++static struct nsb_scan scan,seed;
++static size_t maps;static const struct niwp_rate_map*map;static unsigned checks;
++#define C(x) do{assert(x);checks++;}while(0)
++static unsigned get(const uint8_t*p){return p[0]|(unsigned)p[1]<<8|(unsigned)p[2]<<16|(unsigned)p[3]<<24;}
++static void record(struct nsb_record*r,unsigned id,unsigned channel,uint64_t observed){
++ memset(r,0,sizeof(*r));r->bssid[0]=2;r->bssid[4]=(uint8_t)(id>>8);r->bssid[5]=(uint8_t)id;r->channel=r->hw_channel=(uint8_t)channel;
++ r->ssid_present=1;r->ssid_len=4;memcpy(r->ssid,"test",4);r->subtype=8;r->interval=100;r->capability=1;r->observed_us=observed;
++ r->rxv_valid=1;r->group_valid=4;r->rxv[4]=100;r->rxv[5]=255;r->ies[0]=1;r->ies[1]=1;r->ies[2]=12;r->ie_bytes=r->ie_total=3;
++}
++static void source(unsigned count,unsigned id,unsigned channel,uint64_t start){
++ memset(&scan,0,sizeof scan);scan.entered=scan.done=1;scan.started=start;scan.last=start+100;scan.deadline=start+1000;scan.sequence=scan.completion.sequence=1;scan.completion.state=7;scan.count=scan.frames=count;
++ for(unsigned j=0;j<count;j++)record(scan.records+j,id+j,channel,start+10+j);
++}
++static int merge(unsigned generation,uint64_t reference,unsigned bss){memset(&out,0,sizeof out);return niwa_history_prepare(&h,&scan,generation,scan.last+10,reference,map,maps,bss,&out);}
++static void reject(unsigned generation,uint64_t captured,uint64_t reference,unsigned bss){
++ saved=h;memset(&out,0,sizeof out);before=out;
++ C(niwa_history_prepare(&h,&scan,generation,captured,reference,map,maps,bss,&out)<0);C(!memcmp(&h,&saved,sizeof h));C(!memcmp(&out,&before,sizeof out));
++}
++int main(void){
++ C(NSB_RESULTS==64&&NIWC_MAX_RECORDS==64);map=niwi_rate_map(&maps);C(map&&maps);
++ source(1,1,1,100);C(!merge(1,500,2)&&h.count==1&&out.count==1);
++ source(1,2,100,1000);C(!merge(2,1500,2)&&h.count==2&&out.count==2);C(out.source_overflow==0&&out.completed_channels==0);
++ C(get(out.rows[0]+8)==1&&get(out.rows[1]+8)==100);C(get(out.rows[1]+12)==0x110);C(h.observed_us[0]==110&&h.observed_us[1]==1010);
++ uint8_t row[NIWS_SCAN_RESULT_BYTES],untouched[sizeof row];memset(row,0xa5,sizeof row);memcpy(untouched,row,sizeof row);
++ unsigned next=out.cursor.next;C(niwa_snapshot_take_timed(&out,&h,2,1500,row,sizeof row-1)<0&&out.cursor.next==next&&!memcmp(row,untouched,sizeof row));
++ C(niwa_snapshot_take_timed(&out,&h,1,1500,row,sizeof row)<0&&out.cursor.next==next);
++ C(niwa_snapshot_take_timed(&out,&h,2,1499,row,sizeof row)<0&&out.cursor.next==next);
++ C(niwa_snapshot_take_timed(&out,&h,2,5001500,row,sizeof row)==1&&get(row+132)==5001);C(h.observed_us[0]==110);
++ C(niwa_snapshot_take_timed(&out,&h,2,5001500,row,sizeof row)==1&&get(row+132)==5000);
++ C(niwa_snapshot_take_timed(&out,&h,2,5001500,row,sizeof row)==0);
++ /* Full TTL is checked at read, including a cursor left unconsumed for30s. */
++ source(0,0,1,6000000);C(!merge(3,6000500,3)&&out.count==2);
++ C(niwa_snapshot_take_timed(&out,&h,3,NIWA_HISTORY_TTL_US+110,row,sizeof row)==1&&get(row+8)==100);C(get(row+132)==29999);C(niwa_snapshot_take_timed(&out,&h,3,NIWA_HISTORY_TTL_US+1010,row,sizeof row)==0);
++ source(0,0,1,31000000);C(!merge(4,31000500,3)&&!out.count&&!h.count);
++ source(1,3,36,32000000);C(!merge(5,32000500,2)&&out.count==1);source(1,3,36,33000000);C(!merge(6,33000500,2)&&out.count==1&&h.count==1&&h.observed_us[0]==33000010);
++ /* Every terminal failure refuses atomically; old valid history unchanged. */
++ seed=scan;
++ for(unsigned bad=0;bad<17;bad++){
++  scan=seed;if(bad==0)scan.entered=0;if(bad==1)scan.done=0;if(bad==2)scan.active=1;if(bad==3)scan.timed_out=1;
++  if(bad==4)scan.completion.state=6;if(bad==5)scan.completion.sequence=2;if(bad==6)scan.count=65;if(bad==7)scan.frames=0;
++  if(bad==8)scan.partial=1;if(bad==9)scan.dropped=1;if(bad==10)scan.last=scan.deadline;if(bad==11)scan.last=scan.started-1;
++  if(bad==12)scan.records[0].observed_us=scan.last+1;if(bad==13)scan.records[0].observed_us=scan.started-1;
++  reject(bad==14?6:7,scan.last+10,bad==15?1:33001000,bad==16?1:2);
++ }
++ scan=seed;reject(7,scan.last-1,33001000,2);
++ /* Complete empty subsets keep still-fresh other-band rows, no timestamp reset. */
++ source(0,0,1,34000000);C(!merge(7,34000500,2)&&out.count==1&&h.observed_us[0]==33000010);
++ /* Bad per-row IEs are omissions, not an update of a previously good key. */
++ source(1,3,36,35000000);scan.records[0].ie_total=1025;scan.records[0].ies_truncated=1;C(!merge(8,35000500,2)&&out.omitted==1&&h.observed_us[0]==33000010);
++ /* Overflow-only genuine completion can supply bounded retained records. */
++ niwa_history_clear(&h);source(64,10,100,100);scan.partial=scan.dropped=1;scan.frames=65;C(niwj_scan_usable(&scan));C(!merge(1,500,2)&&out.count==64&&out.source_overflow==1&&out.dropped==1);
++ for(unsigned bad=0;bad<4;bad++){seed=scan;if(bad==0)scan.dropped=2;if(bad==1)scan.count=63;if(bad==2)scan.timed_out=1;if(bad==3)scan.done=0;C(!niwj_scan_usable(&scan));reject(2,scan.last+10,600,2);scan=seed;}
++ /* Oldest entry drops on capacity, updates keep BSSID+SSID exactly distinct. */
++ source(1,200,36,1000);C(!merge(2,1500,2)&&out.count==64&&h.count==64);unsigned found=0;for(unsigned j=0;j<h.count;j++)if(h.rows[j][33]==200)found++;C(found==1);
++ source(1,200,36,2000);scan.records[0].ssid[0]='X';C(!merge(3,2500,3)&&h.count==64);found=0;for(unsigned j=0;j<h.count;j++)if(h.rows[j][33]==200)found++;C(found==2);
++ source(1,201,36,3000);scan.records[0].capability=2;C(!merge(4,3500,2)&&out.omitted==1&&out.count==63);source(0,0,1,4000);C(!merge(5,4500,3)&&out.count==64);
++ /* Existing before-publication BSS filtering keeps the timestamp paired with
++  * its moved row, including a non-ESS entry in the middle. */
++ C(!niwa_snapshot_bss_filter(&out,2)&&out.count==63);
++ for(unsigned j=0;j<out.count;j++){
++  unsigned found=0;for(unsigned k=0;k<h.count;k++)if(!memcmp(out.rows[j]+28,h.rows[k]+28,6)&&out.rows[j][96]==h.rows[k][96]&&!memcmp(out.rows[j]+97,h.rows[k]+97,out.rows[j][96])){C(out.observed_us[j]==h.observed_us[k]);found++;}
++  C(found==1);
++ }
++ /* Close/OFF clear wipes every historical encoded byte and timestamp. */
++ niwa_history_clear(&h);static const struct niwa_history empty={0};C(!memcmp(&h,&empty,sizeof h));
++ /* Public APIs remain bounded and reject corrupted history before mutation. */
++ source(1,9,1,1);h.count=65;reject(1,scan.last+10,500,2);niwa_history_clear(&h);
++ printf("PASS retention: %u ASan/UBSan checks;64-row union, exact completed-overflow proof, per-read original age/30s expiry, failed-scan atomicity, BSSID+SSID and bounded oldest eviction; no native authority\n",checks);
++}
+--- a/tools/fixtures/nord2-wifi-ios-client/test-extra.inc
++++ b/tools/fixtures/nord2-wifi-ios-client/test-extra.inc
+@@ -1,3 +1,30 @@
++static void retained_client(){
++ for(unsigned failure=1;failure<=3;failure++){
++  niwl_malloc_fail=niwl_malloc_calls+failure;auto*provider=new NiwlLifecycleService;IOUserClient*rejected=nullptr;
++  assert(provider->newUserClient(&ownerTask,nullptr,0,nullptr,&rejected)!=0&&!rejected);provider->release();
++  assert(!malloc_count&&!locks&&!rights&&ownerTask.refs==1);niwl_malloc_fail=0;
++ }
++ niwl_scan_extended=true;IOUserClient*c=make();IOExternalMethodArguments a={};assert(!call(c,3,a));OSAsyncReference64 ref={1};rights++;a={};a.asyncReference=ref;a.asyncReferenceCount=8;a.asyncWakePort=1;assert(!call(c,2,a));
++ auto subset=[&](unsigned channel,unsigned id,uint64_t start,bool timeout=false){
++  completeScan();scan.started=start;scan.last=start+200;scan.deadline=start+1000;scan.count=scan.frames=1;
++  auto&r=scan.records[0];r.observed_us=start+100;r.bssid[0]=2;r.bssid[5]=(uint8_t)id;r.subtype=8;r.channel=r.hw_channel=(uint8_t)channel;r.capability=1;r.ssid_present=1;r.ssid_len=4;memcpy(r.ssid,"test",4);r.interval=100;r.rxv_valid=1;r.group_valid=4;r.rxv[4]=100;r.rxv[5]=255;r.ie_total=r.ie_bytes=3;r.ies[0]=1;r.ies[1]=1;r.ies[2]=12;
++  envelope(carrier,0x802869c8,10,5456);put(carrier+8,1);put(carrier+12,2);put(carrier+60,2);put(carrier+64,1);put(carrier+8+68,1);put(carrier+8+72,1);put(carrier+8+76,channel);put(carrier+8+80,channel==100?0x112:0xa);
++  a={};a.structureInput=carrier;a.structureInputSize=sizeof carrier;assert(!call(c,0,a));niwl_scan_test_us=start+400;
++  if(timeout){scan.partial=scan.timed_out=1;scan.done=0;finish(NSS_PARTIAL);}else finish();
++ };
++ uint8_t row[1164];auto take=[&](unsigned*channel){envelope(carrier,NIW_GET,11,1164);a={};a.structureInput=carrier;a.structureInputSize=sizeof carrier;a.structureOutput=row;a.structureOutputSize=sizeof row;IOReturn result=call(c,0,a);if(!result){niws_result decoded;assert(!niws_decode_result(row,sizeof row,&decoded));*channel=decoded.channel;}return result;};
++ unsigned channel=0;subset(6,1,1000000);assert(!take(&channel)&&channel==6);assert(take(&channel)==(IOReturn)0xe0820446);
++ subset(100,2,2000000);assert(!take(&channel)&&channel==6);assert(!take(&channel)&&channel==100);assert(take(&channel)==(IOReturn)0xe0820446);
++ subset(100,2,3000000);niwl_scan_test_us=31000100;assert(!take(&channel)&&channel==100);assert(take(&channel)==(IOReturn)0xe0820446); /* old2.4 entry expired, current5GHz remains */
++ subset(6,3,32000000,true);assert(take(&channel)==kIOReturnNotReady); /* failed scan never refreshes history */
++ subset(100,2,34000000);assert(!take(&channel)&&channel==100);assert(take(&channel)==(IOReturn)0xe0820446);
++ assert(!c->clientClose());c->release();assert(!rights&&!locks&&!malloc_count&&!buffer_count);
++ c=make();a={};assert(!call(c,3,a));rights++;a={};a.asyncReference=ref;a.asyncReferenceCount=8;a.asyncWakePort=1;assert(!call(c,2,a));
++ completeScan();scan.started=35000000;scan.last=35000200;scan.deadline=35001000;scan.count=scan.frames=0;niwl_scan_test_us=35000400;
++ envelope(carrier,0x802869c8,10,5456);put(carrier+8,1);put(carrier+12,2);put(carrier+60,2);put(carrier+64,1);a={};a.structureInput=carrier;a.structureInputSize=sizeof carrier;assert(!call(c,0,a));finish();assert(take(&channel)==(IOReturn)0xe0820446); /* newclient doesnot inheritoldhistory */
++ assert(!c->clientClose());c->release();niwl_scan_extended=false;niwl_scan_test_us=400;assert(!rights&&!locks&&!malloc_count&&!buffer_count);
++ puts("PASS actual IOUC retention:2.4/DFS5GHz subset union, original age/30s expiry, failed scan refusal, close/reopen isolation; no fake native join");
++}
+ int main(){assert(!oldmain());IOUserClient*c=make();IOExternalMethodArguments a={};uint8_t reply[1164];
+  /* Normal fixed256 identity shape differs from initial zero-body bind. */
+  for(unsigned req:{43u,44u}){envelope(carrier,NIW_GET,req,256);a={};a.structureInput=carrier;a.structureInputSize=sizeof carrier;a.structureOutput=reply;a.structureOutputSize=256;memset(reply,0xaa,sizeof reply);assert(!call(c,0,a)&&a.structureOutputSize==256&&reply[0]=='N');unsigned end=0;while(reply[end])end++;for(unsigned i=end;i<256;i++)assert(!reply[i]);assert(reply[256]==0xaa);}
+@@ -15,7 +42,8 @@
+  /* A failed delivery must not consume an actual populated scan cache row. */
+  a={};assert(!call(c,3,a));OSAsyncReference64 ref={1};rights++;a={};a.asyncReference=ref;a.asyncReferenceCount=8;a.asyncWakePort=1;assert(!call(c,2,a));
+  completeScan();scan.count=scan.frames=1;auto&r=scan.records[0];r.observed_us=150;r.bssid[0]=2;r.subtype=8;r.channel=r.hw_channel=6;r.ssid_present=1;r.interval=100;r.rxv_valid=1;r.group_valid=4;r.rxv[4]=100;r.rxv[5]=90;r.ie_total=r.ie_bytes=3;r.ies[0]=1;r.ies[1]=1;r.ies[2]=2;
+- scan.records[0].capability=1;scan.records[1]=scan.records[0];scan.records[1].capability=2;scan.records[2]=scan.records[0];scan.records[2].capability=3;scan.count=scan.frames=3;envelope(carrier,0x802869c8,10,5456);put(carrier+8,1);put(carrier+12,2);put(carrier+60,3);put(carrier+64,1);carrier[8+60]=110;put(carrier+8+4880,0x80000000u);a={};a.structureInput=carrier;a.structureInputSize=sizeof carrier;assert(!call(c,0,a));assert(capturedRequest.dwell_tu==108&&!capturedRequest.count);finish();
++ scan.records[0].capability=1;scan.records[1]=scan.records[0];scan.records[1].bssid[5]=1;scan.records[1].capability=2;scan.records[2]=scan.records[0];scan.records[2].bssid[5]=2;scan.records[2].capability=3;scan.count=scan.frames=3;envelope(carrier,0x802869c8,10,5456);put(carrier+8,1);put(carrier+12,2);put(carrier+60,3);put(carrier+64,1);carrier[8+60]=110;put(carrier+8+4880,0x80000000u);a={};a.structureInput=carrier;a.structureInputSize=sizeof carrier;assert(!call(c,0,a));assert(capturedRequest.dwell_tu==108&&!capturedRequest.count);finish();
+  auto*rowmd=new IOBufferMemoryDescriptor(1164);envelope(carrier,NIW_GET,11,1164);a.structureOutput=(void*)1;a.structureOutputSize=0;a.structureOutputDescriptor=rowmd;a.structureOutputDescriptorSize=1164;
+  rowmd->failWrite=true;assert(call(c,0,a)==kIOReturnBadArgument);rowmd->failWrite=false;rowmd->failComplete=true;assert(call(c,0,a)==kIOReturnNotReady);rowmd->failComplete=false;assert(!call(c,0,a));niws_result decoded;assert(!niws_decode_result((uint8_t*)rowmd->getBytesNoCopy(),1164,&decoded)&&decoded.rates[0]==1);a.structureOutputDescriptorSize=1164;assert(call(c,0,a)==(IOReturn)0xe0820446);rowmd->release();assert(!c->clientClose());c->release();assert(!rights&&!locks&&!malloc_count&&!buffer_count);
++ retained_client();
+  puts("PASS compatibility: real IOUC scalar4/ENXIO-no-association/idempotentON/no-fakeOFF/bounded OOL prepare-write-complete and failures/task/shape; old scan/cache/event/cancel/close tests retained");return 0;}
+--- a/tools/fixtures/nord2-wifi-ios-client/test-integrated.cpp
++++ b/tools/fixtures/nord2-wifi-ios-client/test-integrated.cpp
+@@ -3,10 +3,10 @@
+ #include <thread>
+ static task ownerTask,otherTask;
+ static nss_completion callback;static nss_request capturedRequest;static void*cookie;static uint64_t ticket=1,gen;static bool canceled,active;static unsigned releases;static nsb_scan scan;
+-extern "C" int nord2_wifi_scan_info(nss_info*out){*out={};out->mac[0]=2;out->count=1;out->channels[0]={1,6};return 0;}
+-extern "C" int nord2_wifi_scan_enqueue(const nss_request*r,void*c,uint64_t g,nss_completion f,uint64_t*t){assert(!r->count&&!active);capturedRequest=*r;active=true;canceled=false;cookie=c;gen=g;callback=f;*t=++ticket;return 0;}
++extern "C" int nord2_wifi_scan_info(nss_info*out){*out={};out->mac[0]=2;out->count=1;out->channels[0]={1,6};if(niwl_scan_extended){out->band5=1;out->count=2;out->channels[1]={2,100};out->dfs_mask=2;}return 0;}
++extern "C" int nord2_wifi_scan_enqueue(const nss_request*r,void*c,uint64_t g,nss_completion f,uint64_t*t){assert((!r->count||niwl_scan_extended)&&!active);capturedRequest=*r;active=true;canceled=false;cookie=c;gen=g;callback=f;*t=++ticket;return 0;}
+ extern "C" int nord2_wifi_scan_cancel(uint64_t t){assert(t==ticket);canceled=true;return 0;}
+-extern "C" int nord2_wifi_scan_view(uint64_t t,nss_view*out){assert(t==ticket);if(canceled)return 1;*out={&scan,400,gen,NSS_COMPLETE};return 0;}
++extern "C" int nord2_wifi_scan_view(uint64_t t,nss_view*out){assert(t==ticket);if(canceled)return 1;*out={&scan,niwl_scan_extended?scan.last+10:400,gen,scan.partial?NSS_PARTIAL:NSS_COMPLETE};return 0;}
+ extern "C" int nord2_wifi_scan_release(uint64_t t){assert(t==ticket);releases++;return 0;}
+ static void finish(nss_status status=NSS_COMPLETE){assert(active);callback(cookie,gen,ticket,status);active=false;}
+ static void put(uint8_t*p,uint32_t n){for(unsigned i=0;i<4;i++)p[i]=(uint8_t)(n>>(8*i));}
+--- a/tools/fixtures/nord2-wifi-ios-client/test-lifecycle.cpp
++++ b/tools/fixtures/nord2-wifi-ios-client/test-lifecycle.cpp
+@@ -19,18 +19,18 @@
+  opt=0x55;IOMemoryDescriptor*sentinel=data;assert(c->clientMemoryForType(3,&opt,&sentinel)==kIOReturnBadArgument&&sentinel==data&&opt==0x55);test_current=&other_task;assert(c->clientMemoryForType(1,&opt,&sentinel)==kIOReturnNotPrivileged);test_current=&owner_task;
+  OSAsyncReference64 ref={7,0xdeadbeef,0x12345678,4,5,6,7,8};a=args();a.asyncWakePort=7;a.asyncReference=ref;a.asyncReferenceCount=7;rights++;assert(call(c,2,a)==kIOReturnBadArgument&&rights==0);a.asyncReferenceCount=8;rights++;assert(!call(c,2,a)&&rights==1);rights++;assert(call(c,2,a)==kIOReturnNotReady&&rights==1);test_current=&other_task;rights++;assert(call(c,2,a)==kIOReturnNotPrivileged&&rights==1);test_current=&owner_task;
+  a=args();assert(!call(c,4,a)&&rights==0&&buffer_count==2);assert(!call(c,4,a));assert(!call(c,3,a)&&buffer_count==4);IOMemoryDescriptor*fresh=nullptr;assert(!c->clientMemoryForType(1,&opt,&fresh)&&fresh!=data);fresh->release();data->release();state->release();assert(buffer_count==2);
+- uint8_t carrier[NIW_SMALL_BYTES]={0},output[256];w32(carrier,NIW_GET);std::memcpy(carrier+15368,"en0",4);w32(carrier+15384,43);auto*md=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,0,sizeof carrier,1);std::memcpy(md->getBytesNoCopy(),carrier,sizeof carrier);a=args();a.structureInputDescriptor=md;a.structureOutput=output;a.structureOutputSize=256;std::memset(output,0xaa,sizeof output);assert(!call(c,0,a)&&a.structureOutputSize<256&&!std::strcmp((char*)output,"Nord2 MT6893 passive scan controller")&&output[a.structureOutputSize]==0xaa&&malloc_count==2);
++ uint8_t carrier[NIW_SMALL_BYTES]={0},output[256];w32(carrier,NIW_GET);std::memcpy(carrier+15368,"en0",4);w32(carrier+15384,43);auto*md=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,0,sizeof carrier,1);std::memcpy(md->getBytesNoCopy(),carrier,sizeof carrier);a=args();a.structureInputDescriptor=md;a.structureOutput=output;a.structureOutputSize=256;std::memset(output,0xaa,sizeof output);assert(!call(c,0,a)&&a.structureOutputSize<256&&!std::strcmp((char*)output,"Nord2 MT6893 passive scan controller")&&output[a.structureOutputSize]==0xaa&&malloc_count==3);
+  assert(md->prepares==1&&md->completes==1&&md->reads==1&&!md->depth);
+  for(unsigned failure=0;failure<3;failure++){
+   unsigned pre=md->prepares,complete=md->completes,read=md->reads;
+   md->failPrepare=failure==0;md->failRead=failure==1;md->failComplete=failure==2;
+   a.structureOutputSize=256;std::memset(output,0xaa,sizeof output);
+-  assert(call(c,0,a)!=kIOReturnSuccess&&a.structureOutputSize==256&&!md->depth&&malloc_count==2);
++  assert(call(c,0,a)!=kIOReturnSuccess&&a.structureOutputSize==256&&!md->depth&&malloc_count==3);
+   for(auto byte:output)assert(byte==0xaa);
+   assert(md->prepares==pre+1&&md->reads==read+(failure!=0)&&md->completes==complete+(failure!=0));
+  }
+  md->failPrepare=md->failRead=md->failComplete=false;
+- w32(carrier+15384,12);w32(carrier+4,13);std::memcpy(md->getBytesNoCopy(),carrier,sizeof carrier);a.structureOutputSize=13;std::memset(output,0xaa,sizeof output);assert(!call(c,0,a)&&output[0]==8&&output[1]==0x40&&a.structureOutputSize==13&&malloc_count==2);md->release();
++ w32(carrier+15384,12);w32(carrier+4,13);std::memcpy(md->getBytesNoCopy(),carrier,sizeof carrier);a.structureOutputSize=13;std::memset(output,0xaa,sizeof output);assert(!call(c,0,a)&&output[0]==8&&output[1]==0x40&&a.structureOutputSize==13&&malloc_count==3);md->release();
+  a=args();a.asyncWakePort=7;a.asyncReference=ref;a.asyncReferenceCount=8;rights++;assert(!call(c,2,a)&&rights==1);test_current=&other_task;assert(!c->clientDied()&&rights==0&&buffer_count==0);test_current=&owner_task;assert(!c->clientClose());a=args();assert(call(c,3,a)==kIOReturnNotOpen);c->release();assert(owner_task.refs==1&&locks==0);
+  c=client();a=args();assert(!call(c,3,a));std::atomic<unsigned>done{0};std::thread thread([&]{test_current=&owner_task;for(unsigned i=0;i<1000;i++){uint8_t v=0xaa;auto b=args();b.selector=1;b.structureOutput=&v;b.structureOutputSize=1;auto rc=c->externalMethod(1,&b,nullptr,nullptr,nullptr);assert(rc==0||rc==kIOReturnNotOpen);if(!rc)assert(v==1);}done=1;});assert(!c->clientClose());thread.join();assert(done==1&&buffer_count==0);c->release();assert(owner_task.refs==1&&locks==0&&rights==0&&malloc_count==0);checks++;
+  /* Close must wait behind the actual gate while an OOL read is prepared. */
+@@ -41,7 +41,7 @@
+  while(!blocked->enteredRead)std::this_thread::yield();
+  std::thread closer([&]{test_current=&owner_task;closeStarted=true;assert(!c->clientClose());closeDone=true;});
+  while(!closeStarted)std::this_thread::yield();assert(!closeDone);blocked->releaseRead=true;reader.join();closer.join();
+- assert(readResult==kIOReturnSuccess&&closeDone&&blocked->prepares==1&&blocked->completes==1&&!blocked->depth&&malloc_count==2);
++ assert(readResult==kIOReturnSuccess&&closeDone&&blocked->prepares==1&&blocked->completes==1&&!blocked->depth&&malloc_count==3);
+  blocked->release();c->release();assert(owner_task.refs==1&&locks==0&&buffer_count==0);checks++;
+  for(unsigned i=0;i<32;i++){c=client();a=args();assert(!call(c,3,a));assert(!c->clientClose());c->release();assert(owner_task.refs==1&&locks==0&&buffer_count==0);}checks+=32;
+  std::printf("PASS %u actual shell lifecycle/owner/async-right/prepared-OOL/mapping/replay/allocation/close/death checks plus1000 concurrent close-admission probes; host IOKit primitives mocked, no service or backend\n",checks);
+--- a/tools/fixtures/nord2-wifi-ios-client/test-xnu.h
++++ b/tools/fixtures/nord2-wifi-ios-client/test-xnu.h
+@@ -1,5 +1,8 @@
+ #ifndef NIWL_TEST_XNU_H
+ #define NIWL_TEST_XNU_H
++static unsigned long long niwl_scan_test_us=400;
++static bool niwl_scan_extended=false;
++#define NIWL_SCAN_TEST_NOW() niwl_scan_test_us
+ #include <cstdint>
+ #include <cstddef>
+ #include <cstdlib>
+@@ -21,7 +24,8 @@
+ constexpr uint32_t kIODirectionOut=2;
+ constexpr uint32_t kIOMemoryKernelUserShared=1,kIOMapReadOnly=0x1000,kIOExternalMethodArgumentsCurrentVersion=2;
+ struct IOLock {std::mutex m;};static IOLock*IOLockAlloc(){if(fail_lock)return nullptr;locks++;return new IOLock;}static void IOLockFree(IOLock*p){locks--;delete p;}static void IOLockLock(IOLock*p){p->m.lock();}static void IOLockUnlock(IOLock*p){p->m.unlock();}
+-static void*IOMalloc(size_t n){malloc_count++;return std::malloc(n);}static void IOFree(void*p,size_t){malloc_count--;std::free(p);}
++static unsigned niwl_malloc_calls,niwl_malloc_fail;
++static void*IOMalloc(size_t n){if(++niwl_malloc_calls==niwl_malloc_fail)return nullptr;void*p=std::malloc(n);if(p)malloc_count++;return p;}static void IOFree(void*p,size_t){malloc_count--;std::free(p);}
+ class OSObject {std::atomic<int> refs{1};public:virtual ~OSObject()=default;virtual void free(){};void retain(){refs++;}void release(){assert(refs>0);if(!--refs){free();delete this;}}};
+ class OSBoolean:public OSObject {bool value;public:explicit OSBoolean(bool v):value(v){}bool isTrue(){return value;}};
+ #define OSDynamicCast(t,p) dynamic_cast<t*>(p)
+--- a/tools/fixtures/nord2-wifi-ios-contract/test-join.c
++++ b/tools/fixtures/nord2-wifi-ios-contract/test-join.c
+@@ -48,6 +48,6 @@
+  info.count=1;info.channels[0].band=info.channels[0].channel=1;s=(struct nsb_scan){0};s.entered=s.done=1;s.completion.state=7;s.started=1;s.last=101;s.deadline=1000;s.count=NSB_RESULTS;s.frames=NSB_RESULTS+1;s.partial=s.dropped=1;record(&s.records[0],1,80);
+  C(niwj_scan_usable(&s));C(!niwj_select(&q,&s,&info,200,&out));
+  s.records[0].ies[27]=32;C(!niwj_select(&q,&s,&info,200,&out));C(out.ap_rsn[21]==32&&out.ap_rsn_bytes==22); /* AP optionalExtendedKeyID; station remainscaps0. */
+- s.dropped=0;absent(&q,&s,&info);s.dropped=1;s.count=15;absent(&q,&s,&info);s.count=16;s.timed_out=1;absent(&q,&s,&info);s.timed_out=0;s.active=1;absent(&q,&s,&info);s.active=0;s.done=0;absent(&q,&s,&info);s.done=1;s.last=s.deadline;absent(&q,&s,&info);s.last=101;s.dropped=2;absent(&q,&s,&info);s.dropped=1;s.completion.sequence=1;absent(&q,&s,&info);
++ s.dropped=0;absent(&q,&s,&info);s.dropped=1;s.count=NSB_RESULTS-1;absent(&q,&s,&info);s.count=NSB_RESULTS;s.timed_out=1;absent(&q,&s,&info);s.timed_out=0;s.active=1;absent(&q,&s,&info);s.active=0;s.done=0;absent(&q,&s,&info);s.done=1;s.last=s.deadline;absent(&q,&s,&info);s.last=101;s.dropped=2;absent(&q,&s,&info);s.dropped=1;s.completion.sequence=1;absent(&q,&s,&info);
+  trailer_tests();
+  niwj_clear(&q,sizeof q);struct niwj_request zero={0};C(!memcmp(&q,&zero,sizeof q));printf("join-policy: %u checks PASS (synthetic; no native readiness)\n",checks);return 0;}
+--- a/tools/fixtures/nord2-wifi-station/native-regression-test.c
++++ b/tools/fixtures/nord2-wifi-station/native-regression-test.c
+@@ -20,8 +20,8 @@
+  put16(m,0x80);m[10]=m[16]=2;put16(m+32,100);m[36]=0;m[37]=3;memcpy(m+38,"lab",3);
+  for(unsigned k=0;k<NSB_RESULTS;k++){m[15]=m[21]=(uint8_t)(k+1);C(!nsb_add(&s,p,sizeof p,101+k));}
+  struct nsb_record retained[NSB_RESULTS];memcpy(retained,s.records,sizeof retained);
+- m[15]=m[21]=99;C(nsb_add(&s,p,sizeof p,120)==1);C(s.partial&&s.dropped==1&&s.count==NSB_RESULTS);C(!memcmp(retained,s.records,sizeof retained));
+- C(!nst_scan_admissible(&s));done[0]=42;done[5]=7;C(!nsb_complete(&s,done,sizeof done,130));C(nst_scan_admissible(&s));
++ m[15]=m[21]=99;C(nsb_add(&s,p,sizeof p,102+NSB_RESULTS)==1);C(s.partial&&s.dropped==1&&s.count==NSB_RESULTS);C(!memcmp(retained,s.records,sizeof retained));
++ C(!nst_scan_admissible(&s));done[0]=42;done[5]=7;C(!nsb_complete(&s,done,sizeof done,103+NSB_RESULTS));C(nst_scan_admissible(&s));
+  s.completion.state=6;C(!nst_scan_admissible(&s));s.completion.state=7;s.timed_out=1;C(!nst_scan_admissible(&s));
+ }
+ static unsigned raw_eapol(struct test*t,uint8_t*p,unsigned payload){
+--- a/tools/fixtures/nord2-wifi-station/service-test.c
++++ b/tools/fixtures/nord2-wifi-station/service-test.c
+@@ -142,7 +142,7 @@
+ assert(!nord2_wifi_join_enqueue(&q,(void*)1,7,complete,&ticket));memset(&q,0,sizeof q);assert(njs_native.request.pmk[0]==0x42&&njs_scan_blocked_locked()&&njs_pending_locked());assert(!nord2_wifi_join_cancel(ticket));assert(njs_owner_work()==1&&!njs_native.queued&&!njs_native.used);assert(notices[NJS_JOIN_FAILED]==1&&notices[NJS_RETIRED]==1&&release_reentry==1&&!prepared_calls);struct niwj_request zero={0};assert(!memcmp(&njs_native.request,&zero,sizeof zero));
+ q=request();assert(!nord2_wifi_join_enqueue(&q,(void*)1,7,complete,&ticket));assert(!nord2_wifi_join_disconnect()&&ifnet_down==1);assert(njs_native.snapshot.phase==NJS_LEAVING&&!njs_native.snapshot.data_ready);assert(njs_owner_work()==1&&notices[NJS_RETIRED]==2);
+ /* Only completed overflow source scans are cacheable; records remain identical. */
+-struct nsb_scan scan={0};scan.entered=scan.done=1;scan.completion.state=7;scan.started=1;scan.last=101;scan.deadline=1000;scan.count=16;scan.frames=17;scan.partial=scan.dropped=1;scan.records[0].bssid[0]=2;unsigned cache_before=njs_native.cache_next;njs_cache_scan_locked(&scan);assert(njs_native.cache_next==cache_before+1&&!memcmp(&scan,&njs_native.cache[cache_before%4],sizeof scan));
++struct nsb_scan scan={0};scan.entered=scan.done=1;scan.completion.state=7;scan.started=1;scan.last=101;scan.deadline=1000;scan.count=NSB_RESULTS;scan.frames=NSB_RESULTS+1;scan.partial=scan.dropped=1;scan.records[0].bssid[0]=2;unsigned cache_before=njs_native.cache_next;njs_cache_scan_locked(&scan);assert(njs_native.cache_next==cache_before+1&&!memcmp(&scan,&njs_native.cache[cache_before%4],sizeof scan));
+ scan.timed_out=1;njs_cache_scan_locked(&scan);assert(njs_native.cache_next==cache_before+1);scan.timed_out=0;scan.done=0;njs_cache_scan_locked(&scan);assert(njs_native.cache_next==cache_before+1);
+ /* Synthetic authoritative-ready seam tests synchronous revoke, not RF readiness. */
+ njs_native.active=njs_native.used=njs_native.linked=1;njs_native.native_generation=3;njs_native.ticket=3;njs_native.epoch=7;njs_native.cookie=(void*)1;njs_native.completion=complete;njs_native.snapshot.phase=NJS_AUTHORIZED;njs_native.snapshot.data_ready=njs_native.snapshot.associated=njs_native.snapshot.ptk_ready=njs_native.snapshot.gtk_ready=1;njs_native.leave=njs_native.canceled=0;nst_native.state.controlled_port=1;njs_native.driver.owner.transaction.phase=STC_CONNECTED;njs_native.driver.owner.transaction.outcome=STC_AUTHORIZED;
+--- a/tools/test-nord2-wifi-five-ghz.py
++++ b/tools/test-nord2-wifi-five-ghz.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++"""Offline passive5GHz and bounded UI scan-history regression; no hardware IO."""
++from pathlib import Path
++import argparse,hashlib,json,os,subprocess,tempfile
++R=next(p for p in Path(__file__).resolve().parents if(p/'AGENTS.md').exists());T=R/'tools';S=R/'shim/nord2-xnu'
++a=argparse.ArgumentParser(description=__doc__);a.add_argument('--calibration',type=Path,required=True,help='read-only authenticated6146-byte WIFI file; never embedded/printed');a.add_argument('--candidate',type=Path);a.add_argument('--fixture-overlay',type=Path);a.add_argument('--only',choices=('all','pure','client','owner','contracts','station'),default='all');a.add_argument('--log-dir',type=Path,required=True);x=a.parse_args()
++O=x.log_dir.resolve();O.mkdir(parents=True,exist_ok=True);board=x.calibration.resolve();assert board.stat().st_size==6146 and hashlib.sha256(board.read_bytes()).hexdigest()=='0000000000000000000000000000000000000000000000000000000000000000','calibration identity/extent'
++F=Path(__file__).resolve().parent/'fixtures/nord2-wifi-five-ghz';sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
++inputs=[p for p in S.iterdir() if p.is_file()]+[p for p in F.iterdir() if p.is_file()]
++if x.candidate:inputs += [p for p in x.candidate.iterdir() if p.is_file()]
++if x.fixture_overlay:inputs += [p for p in x.fixture_overlay.rglob('*') if p.is_file()]
++before={str(p):sha(p) for p in inputs};summaries=[];env=dict(os.environ,ASAN_OPTIONS='halt_on_error=1',UBSAN_OPTIONS='halt_on_error=1')
++def run(name,argv):
++ p=subprocess.run(list(map(str,argv)),env=env,text=True,capture_output=True)
++ (O/(name+'.log')).write_text(p.stdout+p.stderr)
++ if p.returncode:print(p.stdout[-1500:]+p.stderr[-1500:]);p.check_returncode()
++ lines=p.stdout.splitlines();summary=lines[-1] if lines else 'PASS '+name;summaries.append(summary);print(summary)
++with tempfile.TemporaryDirectory(prefix='wifi-fiveGHz-regression-') as td:
++ d=Path(td);C=d/'source';C.mkdir();fixtures=d/'fixtures';fixtures.mkdir()
++ for p in S.iterdir():
++  if p.is_file():(C/p.name).write_bytes(p.read_bytes())
++ if x.candidate:
++  for p in x.candidate.iterdir():
++   if p.is_file():(C/p.name).write_bytes(p.read_bytes())
++ for dirname in ('nord2-wifi-ios-contract','nord2-wifi-ios-client','nord2-wifi-station'):
++  target=fixtures/dirname;target.mkdir()
++  for p in (T/'fixtures'/dirname).iterdir():
++   if p.is_file():(target/p.name).write_bytes(p.read_bytes())
++ if x.fixture_overlay:
++  for p in x.fixture_overlay.rglob('*'):
++   if p.is_file():target=fixtures/p.relative_to(x.fixture_overlay);target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(p.read_bytes())
++ flags=['-std=c11','-O1','-g','-Wall','-Wextra','-Werror','-Wno-misleading-indentation','-fsanitize=address,undefined','-fno-sanitize-recover=all','-I'+str(C)]
++ if x.only in ('all','pure'):
++  base='wifi_ios_snapshot wifi_ios_bss wifi_ios_rates wifi_ios_mapping wifi_ios_scan_contract wifi_ios_cursor wifi_scan_bss wifi_ios_policy wifi_ios_lifecycle wifi_ios_age'.split()
++  for name in ('channels','retention'):
++   units=base+('wifi_normal_config wifi_normal_init wifi_regulatory_policy wifi_ios_scalar'.split() if name=='channels' else [])
++   run('compile-'+name,['clang',*flags,'-DNCFG_HOST_TEST',F/(name+'.c'),*[C/(u+'.c') for u in units],'-lcrypto','-o',d/name])
++   run(name,[d/name,board] if name=='channels' else [d/name])
++ if x.only in ('all','contracts'):
++  suites={'join':['join'],'station-view':'station_view join policy mapping rates scan_contract'.split(),'snapshot':'snapshot age bss rates mapping scan_contract cursor'.split(),'policy':'policy rates mapping'.split(),'scalar':['scalar'],'caller':'policy rates mapping'.split()}
++  for name,units in suites.items():
++   extra=[C/'wifi_scan_bss.c'] if name=='snapshot' else []
++   run('compile-contract-'+name,['clang',*flags,fixtures/'nord2-wifi-ios-contract'/('test-'+name+'.c'),*[C/('wifi_ios_'+u+'.c') for u in units],*extra,'-o',d/('contract-'+name)])
++   run('contract-'+name,[d/('contract-'+name)])
++ if x.only in ('all','owner'):
++  s=(T/'test-nord2-wifi-join-owner.py').read_text()
++  old="P=Path(__file__).resolve().parent;R=next(p for p in P.parents if (p/'AGENTS.md').exists());"
++  assert s.count(old)==1;s=s.replace(old,'P=Path('+repr(str(T))+');R=Path('+repr(str(R))+');')
++  old='setup(0);run_worker();assert(nss_native.ready';assert s.count(old)==1;s=s.replace(old,'setup(0);run_worker();assert(nss_native.info.count==37&&NSB_RESULTS==64);assert(nss_native.ready')
++  runner=d/'owner.py';runner.write_text(s);run('owner',['python3',runner,'--candidate',C,'--board',board,'--log-dir',O/'owner'])
++ if x.only in ('all','client'):
++  s=(T/'test-nord2-wifi-ios-client.py').read_text();start=s.index('R=next(');end=s.index('\nap=',start)
++  s=s[:start]+'R=Path('+repr(str(R))+');P=Path('+repr(str(fixtures/'nord2-wifi-ios-client'))+');B=P;S=R/\'shim/nord2-xnu\'\n'+s[end:]
++  runner=d/'client.py';runner.write_text(s);run('client',['python3',runner,'--candidate',C,'--log',O/'client-stdout.log'])
++ if x.only in ('all','station'):
++  s=(T/'test-nord2-wifi-station.py').read_text();old="P=Path(__file__).resolve().parent/'fixtures/nord2-wifi-station'";assert s.count(old)==1;s=s.replace(old,'P=Path('+repr(str(fixtures/'nord2-wifi-station'))+')')
++  old="R=next(p for p in Path(__file__).resolve().parents if (p/'AGENTS.md').exists())";assert s.count(old)==1;s=s.replace(old,'R=Path('+repr(str(R))+')')
++  runner=d/'station.py';runner.write_text(s)
++  for name in ('native','service'):run('station-'+name,['python3',runner,'--candidate',C,'--only',name,'--log-dir',O/('station-'+name)])
++assert before=={str(p):sha(p) for p in inputs},'input changed during tests'
++(O/'report.json').write_text(json.dumps({'status':'PASS_SYNTHETIC_ONLY','suite':x.only,'summaries':summaries,'source_inputs_immutable':True,'inputs':before,'calibration_sha256':hashlib.sha256(board.read_bytes()).hexdigest(),'private_values_printed':False,'hardware_tested':False},indent=2)+'\n')

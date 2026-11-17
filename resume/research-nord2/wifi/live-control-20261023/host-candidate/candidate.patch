@@ -1,0 +1,404 @@
+--- /dev/null
++++ b/tools/fixtures/nord2-wifi-live/mailbox.c
+@@ -0,0 +1,23 @@
++/* Host-only USB model uses the actual kernel mailbox C implementation. */
++#include "wifi_live_control.h"
++static unsigned executed;
++static uint32_t generation=42,capture,windows=32,drop;
++int mock_initialize(void){return nwl_initialize(UINT64_C(0x12345678));}
++int mock_write(unsigned value,unsigned index){
++ uint8_t setup[8]={0x40,0x61,(uint8_t)value,(uint8_t)(value>>8),(uint8_t)index,(uint8_t)(index>>8),0,0},out[256];uint32_t n;
++ return nwl_usb(setup,out,sizeof out,&n)==2?0:-9;
++}
++int mock_read(unsigned code,uint8_t*out,unsigned size){
++ if(code==0x62){struct nwl_request q;if(nwl_take(&q)){
++  struct nwl_snapshot s={{0}};unsigned result=NWL_OK;
++  if(q.op!=NWL_STATUS&&q.generation!=generation)result=NWL_STALE;
++  else if(q.op>=NWL_CAPTURE_DHCP&&q.op<=NWL_CAPTURE_STOP){capture=q.op==NWL_CAPTURE_STOP?0:q.op-1;if(capture&&windows)windows--;}
++  else if(q.op==NWL_OFLD_ALLOW)drop=0;
++  else if(q.op==NWL_OFLD_DROP)drop=1;
++  s.word[NWL_F_GENERATION_LO]=generation;s.word[NWL_F_CAPTURE]=capture;s.word[NWL_F_WINDOWS_LEFT]=windows;s.word[NWL_F_OFLD_DROP]=drop;
++  if(nwl_complete(&q,result,&s))return -1;executed++;
++ }}
++ uint8_t setup[8]={0xc0,(uint8_t)code,0,0,0,0,(uint8_t)size,(uint8_t)(size>>8)};uint32_t n=0;
++ return nwl_usb(setup,out,size,&n)==1?(int)n:-9;
++}
++unsigned mock_executed(void){return executed;}
+--- /dev/null
++++ b/tools/fixtures/nord2-wifi-live/test.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python3
++"""Mocked EP0 tests. No libusb initialization or device enumeration."""
++import importlib.util,json,struct,sys,tempfile,subprocess,ctypes,os,re
++from pathlib import Path
++p=Path(sys.argv[1]);sp=importlib.util.spec_from_file_location('live',p);m=importlib.util.module_from_spec(sp);sp.loader.exec_module(m)
++checks=0
++def check(v):
++ global checks
++ checks+=1;assert v
++def throws(kind,f):
++ global checks
++ try:f()
++ except kind:checks+=1;return
++ raise AssertionError('expected '+str(kind))
++class Clock:
++ def __init__(self):self.now=0
++ def clock(self):return self.now
++ def sleep(self,n):self.now+=n
++class Mock:
++ def __init__(self):
++  self.boot=7;self.token=0;self.op=0;self.expected=0;self.pending=0;self.generation=1;self.result=0;self.delay=0;self.reads=0;self.calls=[];self.reply=None;self.fault=None;self.executed=[];self.before_cap=None
++ def cap(self):return [m.MAGIC,1,64,256,254,4095,65535,self.boot,0,1,self.pending,self.token,self.op,self.expected,0,0]
++ def pump(self):
++  if self.pending:
++   self.reads+=1
++   if self.reads>self.delay:
++    self.pending=0;w=[0]*64;w[:11]=[m.MAGIC,1,256,self.boot,0,self.token,self.op,self.expected,self.result,self.generation,0];w[40]=32;self.reply=w;self.executed.append((self.token,self.op,self.expected))
++ def read(self,code,size):
++  if code==0x60:
++   if self.before_cap:self.before_cap(self)
++   return struct.pack('<16I',*self.cap())
++  assert code==0x62;self.pump()
++  return b'' if self.reply is None else struct.pack('<64I',*self.reply)
++ def write(self,code,value,index):
++  assert code==0x61;token=value&4095;op=value>>12;self.calls.append((token,op,index));f=self.fault
++  if f=='lost-before':self.fault=None;raise m.USBError(-7)
++  if f=='reboot':self.boot+=1;self.token=0;self.op=0;self.expected=0;self.pending=0;raise m.USBError(-7)
++  if f=='conflict':self.token=token;self.op=7 if op!=7 else 2;self.expected=index;raise m.USBError(-9)
++  if token==self.token:
++   if (op,index)!=(self.op,self.expected):raise m.USBError(-9)
++  elif token!=self.token+1 or self.pending:raise m.USBError(-9)
++  else:self.token=token;self.op=op;self.expected=index;self.pending=1;self.reads=0
++  if f=='lost-after':self.fault=None;raise m.USBError(-7)
++def box(t,timeout=5):
++ c=Clock();return m.Mailbox(t,timeout,c.clock,c.sleep),c
++for name,op in m.OPS.items():
++ t=Mock();b,c=box(t);r=b.command(name);check(r['result']==0 and r['op']==op);check(t.executed==([(1,1,0)] if op==1 else [(1,1,0),(2,op,1)]));check(not m.public(r)['counters_prove_dhcp_lease'])
++# Generation0 is valid for pre-Join capture; never truncate a high generation.
++t=Mock();t.generation=0;b,c=box(t);check(b.command('capture-dhcp')['expected']==0)
++for g in(65535,65536,2**32+1,2**64-1):
++ t=Mock();t.generation=g&0xffffffff
++ old=t.pump
++ def pump(t=t,g=g,old=old):
++  old()
++  if t.reply:t.reply[9]=g&0xffffffff;t.reply[10]=g>>32
++ t.pump=pump;b,c=box(t)
++ if g==65535:check(b.command('ofld-drop')['expected']==65535)
++ else:throws(m.ProtocolError,lambda:b.command('ofld-drop'));check(len(t.calls)==1)
++# Old read-only kernels refuse CAP without issuing OUT.
++t=Mock();t.read=lambda *a:(_ for _ in()).throw(m.USBError(-9));b,c=box(t);throws(m.ProtocolError,lambda:b.command('disconnect'));check(not t.calls)
++# Busy previous command cannot be superseded, even STATUS.
++t=Mock();t.token=1;t.op=7;t.pending=2;b,c=box(t);throws(m.Busy,lambda:b.command('status'));check(not t.calls)
++# A lost OUT ACK is never recovered with a different token, for disconnect too.
++for fault in('lost-before','lost-after'):
++ t=Mock();b,c=box(t);b.command('status');t.fault=fault;r=b.exchange(7,1);check(r['op']==7);check(all(x==(2,7,1) for x in t.calls[1:]));check(t.executed.count((2,7,1))==1)
++# Retry never crosses reboot or conflict.
++for fault,exc in [('reboot',m.Rebooted),('conflict',m.ProtocolError)]:
++ t=Mock();b,c=box(t);b.command('status');t.fault=fault;throws(exc,lambda:b.exchange(7,1));check(len(t.calls)==2)
++# Pending worker with no reply is bounded, remains ambiguous, no new token.
++t=Mock();t.delay=10000;b,c=box(t,.25);throws(m.Ambiguous,lambda:b.exchange(7,1));check(c.now<=.25);check(t.calls==[(1,7,1)]);check(b.command_may_execute)
++# Owner result is authoritative; STALE/REFUSED/LIMIT never reported as OK.
++for result in range(1,5):
++ t=Mock();t.result=result;b,c=box(t);r=b.command('status');check(r['result']==result and m.public(r)['result_name']==m.RESULTS[result]);throws(m.ProtocolError,lambda:b.command('disconnect'));check(all(x[1]==1 for x in t.calls))
++# Delayed completion may return the previous complete reply until its token wins.
++t=Mock();b,c=box(t);b.command('status');t.delay=3;r=b.exchange(2,1);check(r['token']==2 and c.now>.1)
++# Disconnect follow-up sends STATUS only and waits on owner flags, never a new7.
++t=Mock();b,c=box(t);b.command('disconnect');d=b.wait_disconnected();check(d['op']==1);check(sum(x[1]==7 for x in t.calls)==1)
++t=Mock();b,c=box(t,.5);old=t.pump
++def busy_disconnect():
++ old()
++ if t.reply:t.reply[15]=0xbf
++t.pump=busy_disconnect;b.command('disconnect');throws(m.Ambiguous,b.wait_disconnected);check(sum(x[1]==7 for x in t.calls)==1)
++# Source/header contract pins are checked by the runner; parser mutations stay strict.
++t=Mock();b,c=box(t);r=b.command('status');raw=t.read(0x62,256);check(len(m.FIELDS)==57)
++for k,v in [(0,0),(1,2),(2,255),(5,0),(5,4096),(6,0),(6,8),(7,65536),(8,5),(11,9),(15,512),(39,3),(40,33),(41,2),(42,1024),(57,1),(63,1)]:
++ w=list(struct.unpack('<64I',raw));w[k]=v;throws(m.ProtocolError,lambda w=w:m.reply(struct.pack('<64I',*w)))
++for n in(0,1,255,257,512):throws(m.ProtocolError,lambda n=n:m.reply(bytes(n)))
++for k,v in [(0,0),(1,2),(2,63),(3,255),(4,0),(5,4096),(6,65536),(7,0),(9,0),(9,2),(10,3),(11,4096),(12,8),(13,65536),(14,1),(15,1)]:
++ w=t.cap();w[k]=v;throws(m.ProtocolError,lambda w=w:m.caps(struct.pack('<16I',*w)))
++# Token exhaustion refuses before OUT, and new process starts at last+1.
++t=Mock();t.token=4095;t.op=1;b,c=box(t);throws(m.ProtocolError,lambda:b.command('status'));check(not t.calls)
++t=Mock();t.token=18;t.op=6;t.expected=1;b,c=box(t);check(b.command('status')['token']==19)
++# Timing limits, lock exclusion and no hidden libusb actions on module import.
++for seconds in(0,-1,46,float('nan'),float('inf')):throws(ValueError,lambda seconds=seconds:m.Mailbox(Mock(),seconds))
++fd=m.lock_file()
++try:throws(m.Busy,m.lock_file)
++finally:os.close(fd)
++for secret in('ssid','bssid','password','pmk','nonce','mac_address','ip_address'):
++ check(secret not in m.public(r))
++check(m.public(r)['carrier_proves_ip'] is False and m.public(r)['internet_proven'] is False)
++# Real canonical mailbox implementation, USB mocked in memory only.
++R=next(x for x in p.resolve().parents if(x/'AGENTS.md').is_file())
++with tempfile.TemporaryDirectory(prefix='nord2-live-host-') as td:
++ libpath=Path(td)/'mailbox.so';model=Path(__file__).with_name('mailbox.c')
++ build=subprocess.run(['cc','-std=c11','-O2','-Wall','-Wextra','-Werror','-Wno-misleading-indentation','-fPIC','-shared','-I'+str(R/'shim/nord2-xnu'),str(R/'shim/nord2-xnu/wifi_live_control.c'),str(model),'-o',str(libpath)],capture_output=True,text=True)
++ assert not build.returncode,build.stderr
++ lib=ctypes.CDLL(str(libpath));lib.mock_initialize.restype=ctypes.c_int;lib.mock_write.argtypes=[ctypes.c_uint,ctypes.c_uint];lib.mock_read.argtypes=[ctypes.c_uint,ctypes.c_void_p,ctypes.c_uint];check(lib.mock_initialize()==0)
++ class Actual:
++  def __init__(self):self.lose=False;self.writes=[]
++  def read(self,code,size):
++   out=ctypes.create_string_buffer(size);n=lib.mock_read(code,out,size)
++   if n<0:raise m.USBError(n)
++   return out.raw[:n]
++  def write(self,code,value,index):
++   check(code==0x61);self.writes.append((value,index));n=lib.mock_write(value,index)
++   if n<0:raise m.USBError(n)
++   if self.lose:self.lose=False;raise m.USBError(-7)
++ t=Actual();b,c=box(t)
++ check(b.command('status')['generation']==42)
++ check(b.command('capture-dhcp')['capture']==1)
++ check(b.command('capture-headers')['capture']==2)
++ check(b.command('capture-off')['capture']==0)
++ check(b.command('ofld-drop')['ofld_drop']==1)
++ check(b.command('ofld-allow')['ofld_drop']==0)
++ before=lib.mock_executed();t.lose=True
++ check(b.exchange(7,42)['result']==0);check(lib.mock_executed()==before+1)
++ check(b.exchange(5,41)['result']==2)
++ check(len(t.writes)==lib.mock_executed())
++print(json.dumps({'passed':True,'checks':checks,'USB_device_calls':False,'mocked_transport_only':True,'actual_c_mailbox_bridge':True,'dhcp_or_internet_claim':False}))
+--- /dev/null
++++ b/tools/nord2-wifi-live.py
+@@ -0,0 +1,230 @@
++#!/usr/bin/env python3
++"""Bounded development Wi-Fi mailbox. Passwords remain on the phone.
++
++Only compiled STATUS/capture/OFLD/disconnect operations exist. No shell, memory,
++key, reset, join/retry, arbitrary register or packet operation is available.
++A reply reports native counters; carrier, DHCP counts and ACK are NOT an IP lease.
++"""
++import argparse
++import ctypes as C
++import ctypes.util
++import fcntl
++import json
++import os
++from pathlib import Path
++import struct
++import time
++
++MAGIC=0x4c57444e
++OPS={'status':1,'capture-dhcp':2,'capture-headers':3,'capture-off':4,
++     'ofld-allow':5,'ofld-drop':6,'disconnect':7}
++RESULTS=('OK','UNAVAILABLE','STALE','REFUSED','LIMIT')
++FIELDS=('magic version bytes boot_lo boot_hi token op expected result generation_lo '
++        'generation_hi service native_phase error halt flags tx_pending rx_pending '
++        'submitted completed rx_unicast rx_group tx_data tx_security tx_dhcp rx_dhcp '
++        'offer ack nak rx_error rx_peer rx_key rx_replay rx_plain txs_ok txs_fail '
++        'txs_ambiguous time_lo time_hi capture windows_left ofld_drop data_cursor '
++        'command_cursor rx0 rx1 rx2 rx3 rx4 data_published data_report data_ddone '
++        'air_pending wire_busy tx_accepted tx_local rx_delivered').split()
++class ProtocolError(Exception):pass
++class Busy(ProtocolError):pass
++class Rebooted(ProtocolError):pass
++class Ambiguous(ProtocolError):pass
++class USBError(Exception):
++    def __init__(self,code):self.code=code;super().__init__('libusb '+str(code))
++
++def words(raw,count):
++    if len(raw)!=count*4:raise ProtocolError('truncated mailbox structure')
++    return struct.unpack('<'+str(count)+'I',raw)
++def caps(raw):
++    w=words(raw,16)
++    if w[:7]!=(MAGIC,1,64,256,0xfe,4095,65535) or any(w[14:]):raise ProtocolError('unsupported capability ABI')
++    if w[9] not in(0,1) or w[10]>2 or w[11]>4095 or w[13]>65535:raise ProtocolError('capability bounds')
++    if not w[9]:raise ProtocolError('live mailbox disabled or unavailable')
++    nonce=w[7]|w[8]<<32
++    if not nonce:raise ProtocolError('missing boot nonce')
++    if not w[11]:
++        if w[10] or w[12] or w[13]:raise ProtocolError('uninitialized token state')
++    elif not 1<=w[12]<=7 or (w[12]==1 and w[13]):raise ProtocolError('invalid last-command identity')
++    return {'boot':nonce,'pending':w[10],'token':w[11],'op':w[12],'expected':w[13]}
++def reply(raw):
++    w=words(raw,64)
++    if w[:3]!=(MAGIC,1,256) or any(w[len(FIELDS):]):raise ProtocolError('reply ABI/reserved fields')
++    d=dict(zip(FIELDS,w));d['boot']=d['boot_lo']|d['boot_hi']<<32
++    d['generation']=d['generation_lo']|d['generation_hi']<<32
++    d['time_us']=d['time_lo']|d['time_hi']<<32
++    if not d['boot'] or not 1<=d['token']<=4095 or not 1<=d['op']<=7 or d['expected']>65535 or d['result']>4:raise ProtocolError('reply identity/result bounds')
++    if d['op']==1 and d['expected']:raise ProtocolError('STATUS expected generation must be zero')
++    if d['service']>8:raise ProtocolError('service state bounds')
++    if d['flags']&~511 or d['capture']>2 or d['windows_left']>32:raise ProtocolError('snapshot bounds')
++    for k in ('halt','ofld_drop','data_published','data_report','data_ddone','air_pending','wire_busy'):
++        if d[k]>1:raise ProtocolError('snapshot boolean')
++    for k in ('data_cursor','command_cursor','rx0','rx1','rx2','rx3','rx4'):
++        if d[k]>=1024:raise ProtocolError('ring cursor bounds')
++    return d
++
++def public(d):
++    # Boot nonce is checked internally, never used as a device identifier.
++    out={k:v for k,v in d.items() if k not in('magic','version','bytes','boot','boot_lo','boot_hi','generation_lo','generation_hi','time_lo','time_hi')}
++    out['result_name']=RESULTS[d['result']]
++    out.update(same_boot_verified=True,command_ack_is_execution_result=False,
++               counters_prove_dhcp_lease=False,carrier_proves_ip=False,
++               local_retirement_proves_air_success=False,internet_proven=False)
++    return out
++
++class Mailbox:
++    def __init__(self,transport,timeout=45,clock=time.monotonic,sleep=time.sleep):
++        if not 0<timeout<=45:raise ValueError('timeout must be >0 and <=45 seconds')
++        self.t=transport;self.clock=clock;self.sleep=sleep;self.deadline=clock()+timeout;self.boot=None;self.command_may_execute=False
++    def remaining(self):
++        n=self.deadline-self.clock()
++        if n<=0:raise Ambiguous('deadline: execution may be unknown; do not issue a new disconnect token')
++        return n
++    def read_caps(self):
++        while True:
++            self.remaining()
++            if hasattr(self.t,'set_timeout'):self.t.set_timeout(self.remaining())
++            try:d=caps(self.t.read(0x60,64))
++            except USBError as e:
++                if e.code==-9:raise ProtocolError('kernel has no live mailbox support') from e
++                if e.code==-7:
++                    self.sleep(min(.05,self.remaining()));continue
++                raise
++            if self.boot is None:self.boot=d['boot']
++            elif d['boot']!=self.boot:raise Rebooted('boot changed: stop; never replay a command into the new boot')
++            return d
++    def exchange(self,op,expected=0):
++        c=self.read_caps()
++        if c['pending']:raise Busy('owner already has a pending command; no new command was sent')
++        if c['token']==4095:raise ProtocolError('boot command-token budget exhausted')
++        token=c['token']+1;value=op<<12|token
++        # Retrying a timed-out OUT repeats this exact immutable command only.
++        # Never advance the token after uncertain delivery, including disconnect.
++        attempts=0
++        while True:
++            self.remaining();c=self.read_caps()
++            if c['token']==token:
++                if (c['op'],c['expected'])!=(op,expected):raise ProtocolError('token conflict; no retry')
++                break
++            if c['token']!=token-1 or c['pending']:raise Busy('command sequence changed; no retry')
++            if attempts>=3:raise Ambiguous('OUT delivery unknown; same-token attempts exhausted')
++            attempts+=1;self.command_may_execute=True
++            try:
++                if hasattr(self.t,'set_timeout'):self.t.set_timeout(self.remaining())
++                self.t.write(0x61,value,expected)
++            except USBError as e:
++                if e.code not in(-7,-9):raise Ambiguous('USB command delivery unknown; stop') from e
++                # A STALL can be a busy/conflict refusal. Inspect caps before
++                # any retry; never assume a negative transfer means no mutation.
++                self.sleep(min(.05,self.remaining()));continue
++            # ACK means accepted, not executed; read immutable identity again.
++        while True:
++            self.remaining();c=self.read_caps()
++            if (c['token'],c['op'],c['expected'])!=(token,op,expected):raise ProtocolError('command identity changed while waiting')
++            try:
++                if hasattr(self.t,'set_timeout'):self.t.set_timeout(self.remaining())
++                raw=self.t.read(0x62,256)
++            except USBError as e:
++                if e.code in(-7,-9):raw=b''
++                else:raise Ambiguous('reply transfer failed; execution may be unknown') from e
++            if raw:
++                d=reply(raw)
++                if d['boot']!=self.boot:raise Rebooted('reply boot changed; stop')
++                if d['token']==token:
++                    if (d['op'],d['expected'])!=(op,expected):raise ProtocolError('reply command mismatch')
++                    self.command_may_execute=False;return d
++                if d['token']>token:raise ProtocolError('unexpected newer reply')
++            self.sleep(min(.1,self.remaining()))
++    def command(self,name):
++        if name not in OPS:raise ValueError('unsupported command')
++        if name=='status':return self.exchange(1)
++        status=self.exchange(1)
++        if status['result']!=0:raise ProtocolError('fresh STATUS unavailable; mutation refused')
++        g=status['generation']
++        if not 0<=g<=65535:raise ProtocolError('generation outside exact mutation domain; mutation refused')
++        return self.exchange(OPS[name],g)
++
++    def wait_disconnected(self):
++        # Only fresh STATUS is repeated. Never replay disconnect with a new
++        # token. These are owner-reported closure fields, not RF/firmware proof.
++        while True:
++            d=self.exchange(1)
++            if d['result']!=0:return d
++            if not (d['flags']&0xbf) and not any(d[k] for k in ('tx_pending','rx_pending','air_pending','wire_busy')):return d
++            self.sleep(min(.25,self.remaining()))
++
++class USB:
++    """System libusb; exact console product+VID/PID. Never reads serial strings."""
++    def __init__(self):
++        self.timeout_ms=500
++        self.lib=C.CDLL(ctypes.util.find_library('usb-1.0') or 'libusb-1.0.so.0');self.ctx=C.c_void_p();self.handle=C.c_void_p()
++        p=C.c_void_p
++        for name,result,args in [('init',C.c_int,[C.POINTER(p)]),('exit',None,[p]),('get_device_list',C.c_ssize_t,[p,C.POINTER(C.POINTER(p))]),('free_device_list',None,[C.POINTER(p),C.c_int]),('get_bus_number',C.c_uint8,[p]),('get_device_address',C.c_uint8,[p]),('open',C.c_int,[p,C.POINTER(p)]),('close',None,[p]),('control_transfer',C.c_int,[p,C.c_uint8,C.c_uint8,C.c_uint16,C.c_uint16,p,C.c_uint16,C.c_uint])]:
++            f=getattr(self.lib,'libusb_'+name);f.restype=result;f.argtypes=args
++        if self.lib.libusb_init(C.byref(self.ctx)):raise ProtocolError('libusb initialization failed')
++        try:
++            found=[]
++            for node in Path('/sys/bus/usb/devices').iterdir():
++                try:
++                    if (node/'product').read_text().strip()=='Nord2 XNU console' and (node/'idVendor').read_text().strip()=='18d1' and (node/'idProduct').read_text().strip()=='d001':found.append((int((node/'busnum').read_text()),int((node/'devnum').read_text())))
++                except (OSError,ValueError):pass
++            if len(found)!=1:raise ProtocolError('expected exactly one native Nord2 console')
++            devices=C.POINTER(p)();n=self.lib.libusb_get_device_list(self.ctx,C.byref(devices))
++            if n<0:raise ProtocolError('USB enumeration failed')
++            try:
++                for i in range(n):
++                    d=devices[i]
++                    if (self.lib.libusb_get_bus_number(d),self.lib.libusb_get_device_address(d))==found[0]:
++                        e=self.lib.libusb_open(d,C.byref(self.handle))
++                        if e:raise USBError(e)
++                        break
++            finally:self.lib.libusb_free_device_list(devices,1)
++            if not self.handle:raise ProtocolError('native console disappeared')
++        except BaseException:self.close();raise
++    def set_timeout(self,remaining):self.timeout_ms=max(1,min(500,int(remaining*1000)))
++    def read(self,code,size):
++        b=C.create_string_buffer(size);n=self.lib.libusb_control_transfer(self.handle,0xc0,code,0,0,b,size,self.timeout_ms)
++        if n<0:raise USBError(n)
++        return b.raw[:n]
++    def write(self,code,value,index):
++        n=self.lib.libusb_control_transfer(self.handle,0x40,code,value,index,None,0,self.timeout_ms)
++        if n<0:raise USBError(n)
++        if n!=0:raise ProtocolError('unexpected OUT data length')
++    def close(self):
++        if self.handle:self.lib.libusb_close(self.handle);self.handle=C.c_void_p()
++        if self.ctx:self.lib.libusb_exit(self.ctx);self.ctx=C.c_void_p()
++
++def lock_file():
++    path='/tmp/nord2-wifi-live-'+str(os.getuid())+'.lock'
++    fd=os.open(path,os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
++    try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
++    except OSError:os.close(fd);raise Busy('another live CLI process holds the lock')
++    return fd
++
++def main(argv=None):
++    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--timeout',type=float,default=45);sp=ap.add_subparsers(dest='cmd',required=True)
++    s=sp.add_parser('status');s.add_argument('--watch',type=float,default=0)
++    s=sp.add_parser('capture');s.add_argument('mode',choices=('dhcp','headers','off'))
++    s=sp.add_parser('rx-ofld');s.add_argument('mode',choices=('allow','drop'));sp.add_parser('disconnect')
++    a=ap.parse_args(argv)
++    if not 0<a.timeout<=45:ap.error('--timeout must be >0 and <=45 seconds')
++    watch=getattr(a,'watch',0)
++    if not 0<=watch<=45:ap.error('--watch must be <=45 seconds')
++    lock=None;t=None;m=None
++    try:
++        lock=lock_file();t=USB();m=Mailbox(t,a.timeout);end=m.clock()+watch
++        name=a.cmd if a.cmd in('status','disconnect') else ('capture-' if a.cmd=='capture' else 'ofld-')+a.mode
++        while True:
++            d=m.command(name);out=public(d)
++            if name=='disconnect':out['async_leave_requested']=d['result']==0;out['firmware_retirement_proven']=False
++            print(json.dumps(out),flush=True)
++            if name=='disconnect' and d['result']==0:
++                d=m.wait_disconnected();out=public(d);out['disconnect_status_observed']=d['result']==0;out['firmware_retirement_proven']=False;print(json.dumps(out),flush=True)
++            if d['result'] or not watch or m.clock()>=end:return 0 if d['result']==0 else 1
++            m.sleep(min(1,m.remaining()))
++    except (ProtocolError,USBError,OSError,ValueError) as e:
++        print(json.dumps({'ok':False,'error':str(e),'ambiguous_execution':isinstance(e,Ambiguous) or bool(m and m.command_may_execute),'no_new_token_retry_performed':True,'DHCP_lease_proven':False}));return 2
++    finally:
++        if t:t.close()
++        if lock is not None:os.close(lock)
++if __name__=='__main__':raise SystemExit(main())
+--- /dev/null
++++ b/tools/test-nord2-wifi-live.py
+@@ -0,0 +1,10 @@
++#!/usr/bin/env python3
++"""Run mocked-only live mailbox CLI checks, never enumerate or open USB."""
++import argparse,hashlib,json,subprocess,re
++from pathlib import Path
++T=Path(__file__).resolve().parent;R=next(p for p in T.parents if(p/'AGENTS.md').is_file());a=argparse.ArgumentParser(description=__doc__);a.add_argument('--log-dir',type=Path,required=True);v=a.parse_args();v.log_dir.mkdir(parents=True,exist_ok=True)
++h=R/'shim/nord2-xnu/wifi_live_control.h';c=R/'shim/nord2-xnu/wifi_live_control.c'
++fields=re.search(r'enum nwl_field\s*\{(.*?)\};',h.read_text(),re.S).group(1);fields=re.findall(r'NWL_F_(\w+)',fields);assert fields[-1]=='END' and len(fields)==58
++cli=T/'nord2-wifi-live.py';module=cli.read_text();decl=re.search(r"FIELDS=\((.*?)\)\.split\(\)",module,re.S).group(1);strings=re.findall(r"'([^']*)'",decl);assert ''.join(strings).split()==[x.lower() for x in fields[:-1]]
++p=subprocess.run(['python3',str(T/'fixtures/nord2-wifi-live/test.py'),str(cli)],capture_output=True,text=True);(v.log_dir/'tests.log').write_text(p.stdout+p.stderr);assert p.returncode==0,p.stdout+p.stderr
++r=json.loads(p.stdout);r['source_pins']={str(x.relative_to(R)):hashlib.sha256(x.read_bytes()).hexdigest() for x in(h,c)};r['cli_sha256']=hashlib.sha256(cli.read_bytes()).hexdigest();(v.log_dir/'report.json').write_text(json.dumps(r,indent=2)+'\n');print(json.dumps(r,indent=2))

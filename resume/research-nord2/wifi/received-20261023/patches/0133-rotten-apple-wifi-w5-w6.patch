@@ -1,0 +1,2856 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -144,6 +144,8 @@ bsd/dev/rottenapple_battery.c		standard
+ bsd/dev/rottenapple_sm5602.c		standard
+ bsd/dev/rottenapple_sc89601a.c		standard
+ bsd/dev/rottenapple_wifi.c		standard
++bsd/dev/rottenapple_wifi_sta.c		standard
++bsd/dev/rottenapple_wifi_crypto.c	standard
+ bsd/dev/rottenapple_mtk_connsys.c	standard
+ bsd/dev/rottenapple_mtk_wfdma.c		standard
+ bsd/dev/rottenapple_mtk_wmt.c		standard
+--- a/bsd/dev/rottenapple_mtk_connsys.c
++++ b/bsd/dev/rottenapple_mtk_connsys.c
+@@ -1045,6 +1045,47 @@ connsys_scan(struct rottenapple_wifi *w, unsigned mode)
+ 	return mtk_wlan_scan(&c->wl, mode);
+ }
+ 
++/* W5/W6: association, keys, port and the data path (rottenapple_mtk_wlan.c) */
++static int
++connsys_join(struct rottenapple_wifi *w, struct rottenapple_wifi_join *jp)
++{
++	struct connsys *c = w->priv;
++
++	return mtk_wlan_join(&c->wl, jp);
++}
++
++static void
++connsys_disconnect(struct rottenapple_wifi *w)
++{
++	struct connsys *c = w->priv;
++
++	mtk_wlan_disconnect(&c->wl);
++}
++
++static int
++connsys_set_key(struct rottenapple_wifi *w, const struct rottenapple_wifi_key *k)
++{
++	struct connsys *c = w->priv;
++
++	return mtk_wlan_set_key(&c->wl, k);
++}
++
++static int
++connsys_set_port(struct rottenapple_wifi *w, bool authorized)
++{
++	struct connsys *c = w->priv;
++
++	return mtk_wlan_set_port(&c->wl, authorized);
++}
++
++static int
++connsys_tx_data(struct rottenapple_wifi *w, const uint8_t *eth, uint32_t len, uint32_t flags)
++{
++	struct connsys *c = w->priv;
++
++	return mtk_wlan_tx_data(&c->wl, eth, len, flags);
++}
++
+ static const struct rottenapple_wifi_ops rottenapple_mtk_connsys_ops = {
+ 	.compatible = "mediatek,mt6789-connsys",
+ 	.probe = connsys_probe,
+@@ -1055,6 +1096,11 @@ static const struct rottenapple_wifi_ops rottenapple_mtk_connsys_ops = {
+ 	.wifi_off = connsys_wifi_off,
+ 	.cmd_send = connsys_cmd_send,
+ 	.scan = connsys_scan,
++	.join = connsys_join,
++	.disconnect = connsys_disconnect,
++	.set_key = connsys_set_key,
++	.set_port = connsys_set_port,
++	.tx_data = connsys_tx_data,
+ };
+ ROTTENAPPLE_BACKEND(wifi, rottenapple_mtk_connsys_ops);
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/rottenapple_mtk_wfdma.c
++++ b/bsd/dev/rottenapple_mtk_wfdma.c
+@@ -36,10 +36,21 @@
+ #include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
++#include <kern/locks.h>
+ #include <dev/rottenapple_mtk_wfdma.h>
+ 
+ #define DLOG(fmt, ...)  printf("ROTTEN APPLE: wifi wfdma: " fmt "\n", ##__VA_ARGS__)
+ 
++/*
++ * The command ring (TX ring 15) carries both WIFI_CMDs (mtk_wfdma_cmd_send,
++ * serialized by the core's command lock) and 802.11 management / data frames
++ * (mtk_wfdma_tx_frame, from the receive thread, the join thread and the en
++ * output path). This lock serializes the ring so the two paths never corrupt
++ * its index. Lock order: the core command lock, then this one.
++ */
++static LCK_GRP_DECLARE(wfdma_tx_grp, "rottenapple_wifi_wfdma_tx");
++static LCK_MTX_DECLARE(wfdma_tx_lock, &wfdma_tx_grp);
++
+ /* ---- Registers, offsets in the CONNSYS window (bus 0x18000000) ---- */
+ 
+ /* CONN_HIF_PDMA (chip 0x50000000) */
+@@ -1246,13 +1257,42 @@ mtk_wfdma_cmd_send(struct mtk_wfdma *d, uint8_t id, bool set, const void *payloa
+ 	if (seq) {
+ 		*seq = d->seq;
+ 	}
++	lck_mtx_lock(&wfdma_tx_lock);
+ 	err = tx_send(d, &d->tx_cmd, cmd, sizeof(cmd), payload, len);
++	lck_mtx_unlock(&wfdma_tx_lock);
+ 	if (err) {
+ 		DLOG("command 0x%02x seq %u (%u bytes): not sent (%d)", id, d->seq, WIFI_CMD_LEN + len, err);
+ 	}
+ 	return err;
+ }
+ 
++/*
++ * W5: one 802.11 management or 802.3 data frame on the command ring (the MCU
++ * port), as gen4m's COMMAND_TYPE_MANAGEMENT_FRAME / SECURITY_FRAME /
++ * DATA_FRAME path (halWpdmaWriteCmd / axiCopyCmd): the 32-byte HW_MAC_TX_DESC
++ * the caller built, immediately followed by the frame, as one single-segment
++ * packet (no WIFI_CMD header). The firmware transmits it over the air and,
++ * if the TXD asked for a TXS, reports completion with EVENT_ID_TX_DONE.
++ * Serialized with the command path. ENXIO, ETIMEDOUT (ring stuck), EMSGSIZE.
++ */
++int
++mtk_wfdma_tx_frame(struct mtk_wfdma *d, const void *txd, uint32_t txd_len, const void *frame,
++    uint32_t frame_len)
++{
++	int err;
++
++	if (!(d->state & ST_DMA)) {
++		return ENXIO;
++	}
++	if (txd_len == 0 || frame == NULL || frame_len == 0) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&wfdma_tx_lock);
++	err = tx_send(d, &d->tx_cmd, txd, txd_len, frame, frame_len);
++	lck_mtx_unlock(&wfdma_tx_lock);
++	return err;
++}
++
+ static int
+ nic_capability(struct mtk_wfdma *d)
+ {
+--- a/bsd/dev/rottenapple_mtk_wfdma.h
++++ b/bsd/dev/rottenapple_mtk_wfdma.h
+@@ -82,6 +82,14 @@ void mtk_wfdma_wifi_off(struct mtk_wfdma *d);
+ int mtk_wfdma_cmd_send(struct mtk_wfdma *d, uint8_t id, bool set, const void *payload, uint32_t len,
+     uint8_t *seq);
+ 
++/*
++ * W5: send one 802.11 management or 802.3 data frame on the command ring
++ * (MCU port), as a 32-byte TXD immediately followed by the frame. Serialized
++ * with mtk_wfdma_cmd_send. ENXIO, ETIMEDOUT, EINVAL.
++ */
++int mtk_wfdma_tx_frame(struct mtk_wfdma *d, const void *txd, uint32_t txd_len, const void *frame,
++    uint32_t frame_len);
++
+ /*
+  * Next packet of RX ring 1 (events) / RX ring 0 (data), without waiting:
+  * 0 and the whole packet (RXD first, at most size bytes, *len = its length),
+--- a/bsd/dev/rottenapple_mtk_wlan.c
++++ b/bsd/dev/rottenapple_mtk_wlan.c
+@@ -60,9 +60,17 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ #define CMD_ID_BASIC_CONFIG             0x02
+ #define CMD_ID_SCAN_REQ_V2              0x03
+ #define CMD_ID_NIC_POWER_CTRL           0x04
++#define CMD_ID_ADD_REMOVE_KEY           0x07
++#define CMD_ID_INFRASTRUCTURE           0x09
+ #define CMD_ID_SET_DOMAIN_INFO          0x0f
+ #define CMD_ID_BSS_ACTIVATE_CTRL        0x11
++#define CMD_ID_SET_BSS_INFO             0x12
++#define CMD_ID_UPDATE_STA_RECORD        0x13
++#define CMD_ID_REMOVE_STA_RECORD        0x14
++#define CMD_ID_INDICATE_PM_BSS_CONNECTED 0x16
++#define CMD_ID_INDICATE_PM_BSS_ABORT    0x17
+ #define CMD_ID_SCAN_CANCEL              0x1b
++#define CMD_ID_CH_PRIVILEGE             0x1c
+ #define CMD_ID_SET_NVRAM_SETTINGS       0x48
+ #define CMD_ID_SET_COUNTRY_POWER_LIMIT  0x49
+ #define CMD_ID_GET_SET_CUSTOMER_CFG     0x70
+@@ -73,6 +81,10 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ #define EVENT_ID_ACCESS_REG             0x05
+ #define EVENT_ID_SLEEPY_INFO            0x07    /* unsolicited: the firmware may sleep (nicEventSleepyNotify) */
+ #define EVENT_ID_SCAN_DONE              0x0d
++#define EVENT_ID_TX_DONE                0x0f
++#define EVENT_ID_CH_PRIVILEGE           0x10
++#define EVENT_ID_BSS_BEACON_TIMEOUT     0x13
++#define EVENT_ID_SEND_DEAUTH            0x1b
+ #define EVENT_ID_DEBUG_MSG              0x27
+ #define EVENT_ID_ASSERT_DUMP            0xf0
+ #define EVENT_ID_CMD_RESULT             0xfd    /* INIT_EVENT_CMD_RESULT: a command the firmware did not handle */
+@@ -919,6 +931,14 @@ ev_scan_done(__unused struct rottenapple_wifi *w, const struct rottenapple_wifi_
+ 
+ /* ---- Received 802.11 frames (beacons and probe responses for the scan) ---- */
+ 
++/* W5/W6 helpers and event handlers, defined in the "W5/W6" section below */
++static void wl_rx_mgmt_join(struct mtk_wlan *l, const uint8_t *f, uint32_t len);
++static void wl_rx_data_frame(struct mtk_wlan *l, const uint8_t *f, uint32_t len);
++static void ev_tx_done(struct rottenapple_wifi *w, const struct rottenapple_wifi_event *ev, void *arg);
++static void ev_ch_privilege(struct rottenapple_wifi *w, const struct rottenapple_wifi_event *ev, void *arg);
++static void ev_beacon_timeout(struct rottenapple_wifi *w, const struct rottenapple_wifi_event *ev, void *arg);
++static void ev_send_deauth(struct rottenapple_wifi *w, const struct rottenapple_wifi_event *ev, void *arg);
++
+ static void
+ wl_rx_frame(struct mtk_wlan *l, const uint8_t *p, uint32_t len, unsigned ring)
+ {
+@@ -976,11 +996,25 @@ wl_rx_frame(struct mtk_wlan *l, const uint8_t *p, uint32_t len, unsigned ring)
+ 		return;
+ 	}
+ 	const uint8_t *f = p + off;
+-	if ((p[RXD_HDR] & RXD_HDR_TRAN) || ((f[0] >> 2) & 3) != 0) {
+-		/* data (header-translated or not) and control frames: the W5 data path */
+-		l->rx_ctrl_data++;
++	uint32_t flen = bytes - off;
++	if (p[RXD_HDR] & RXD_HDR_TRAN) {
++		/* the firmware translated the 802.11 header: f is an 802.3 frame */
++		l->rx_data_frames++;
++		rottenapple_wifi_rx_data(l->w, f, flen);
++		return;
++	}
++	uint8_t fc_type = (f[0] >> 2) & 3;
++	if (fc_type == 2) {
++		/* 802.11 data (not translated): convert to Ethernet (W5 data path) */
++		wl_rx_data_frame(l, f, flen);
++		return;
++	}
++	if (fc_type != 0) {
++		l->rx_ctrl_data++;      /* control frame */
+ 		return;
+ 	}
++	/* management frame */
++	uint8_t subtype = f[0] >> 4;
+ 	/* RSSI: the stronger valid RCPI of the two paths (asicRxGetRcpiValueFromRxv RCPI_MODE_MAX), RCPI_TO_dBm */
+ 	int rssi = ROTTENAPPLE_WIFI_RSSI_NONE;
+ 	uint32_t rcpi0 = 0, rcpi1 = 0;
+@@ -994,18 +1028,23 @@ wl_rx_frame(struct mtk_wlan *l, const uint8_t *p, uint32_t len, unsigned ring)
+ 			rssi = (int)(r >> 1) - NDBM_LOW_BOUND_FOR_RCPI;
+ 		}
+ 	}
+-	l->rx_mgmt++;
+-	if (l->scan_seq) {
+-		l->scan_frames++;
+-		if (l->scan_frame_logs++ < 4) {
+-			LLOG("RX ring %u: management frame FC 0x%02x (%s, match flags 0x%02x), %u bytes after a %u-byte RX "
+-			    "descriptor (groups 0x%x, header length %u%s), channel %u, RCPI %u/%u -> %d dBm, BSSID "
+-			    "%02x:%02x:%02x:%02x:%02x:%02x", ring, f[0], sw_frame ? "SW frame" : "RX data", p[4], bytes - off,
+-			    off, groups, p[RXD_HDR] & 0x3f, (p[RXD_HDR] & RXD_HDR_OFFSET) ? " +2" : "", p[RXD_CHANNEL], rcpi0, rcpi1,
+-			    rssi, f[16], f[17], f[18], f[19], f[20], f[21]);
++	if (subtype == 8 || subtype == 5) {             /* beacon / probe response: the scan */
++		l->rx_mgmt++;
++		if (l->scan_seq) {
++			l->scan_frames++;
++			if (l->scan_frame_logs++ < 4) {
++				LLOG("RX ring %u: management frame FC 0x%02x (%s, match flags 0x%02x), %u bytes after a %u-byte RX "
++				    "descriptor (groups 0x%x, header length %u%s), channel %u, RCPI %u/%u -> %d dBm, BSSID "
++				    "%02x:%02x:%02x:%02x:%02x:%02x", ring, f[0], sw_frame ? "SW frame" : "RX data", p[4], flen,
++				    off, groups, p[RXD_HDR] & 0x3f, (p[RXD_HDR] & RXD_HDR_OFFSET) ? " +2" : "", p[RXD_CHANNEL],
++				    rcpi0, rcpi1, rssi, f[16], f[17], f[18], f[19], f[20], f[21]);
++			}
+ 		}
++		rottenapple_wifi_rx_mgmt(l->w, f, flen, rssi, p[RXD_CHANNEL]);
++		return;
+ 	}
+-	rottenapple_wifi_rx_mgmt(l->w, f, bytes - off, rssi, p[RXD_CHANNEL]);
++	/* auth / assoc response / deauth / disassoc: the join or the link watcher */
++	wl_rx_mgmt_join(l, f, flen);
+ }
+ 
+ /* ---- Receive thread ---- */
+@@ -1229,6 +1268,10 @@ mtk_wlan_start(struct mtk_wlan *l)
+ 	(void)rottenapple_wifi_event_register(l->w, EVENT_ID_CMD_RESULT, ev_cmd_result, l);
+ 	(void)rottenapple_wifi_event_register(l->w, EVENT_ID_SLEEPY_INFO, ev_sleepy, l);
+ 	(void)rottenapple_wifi_event_register(l->w, EVENT_ID_SCAN_DONE, ev_scan_done, l);
++	(void)rottenapple_wifi_event_register(l->w, EVENT_ID_TX_DONE, ev_tx_done, l);
++	(void)rottenapple_wifi_event_register(l->w, EVENT_ID_CH_PRIVILEGE, ev_ch_privilege, l);
++	(void)rottenapple_wifi_event_register(l->w, EVENT_ID_BSS_BEACON_TIMEOUT, ev_beacon_timeout, l);
++	(void)rottenapple_wifi_event_register(l->w, EVENT_ID_SEND_DEAUTH, ev_send_deauth, l);
+ 	/* W3 open question: the one coredump page written at firmware start (see mtk_connsys_coredump_info) */
+ 	mtk_connsys_coredump_info(l->d->emi, l->d->emi_size);
+ 
+@@ -1330,12 +1373,721 @@ mtk_wlan_stop(struct mtk_wlan *l)
+ 	rottenapple_wifi_event_unregister(l->w, EVENT_ID_CMD_RESULT, ev_cmd_result, l);
+ 	rottenapple_wifi_event_unregister(l->w, EVENT_ID_SLEEPY_INFO, ev_sleepy, l);
+ 	rottenapple_wifi_event_unregister(l->w, EVENT_ID_SCAN_DONE, ev_scan_done, l);
++	rottenapple_wifi_event_unregister(l->w, EVENT_ID_TX_DONE, ev_tx_done, l);
++	rottenapple_wifi_event_unregister(l->w, EVENT_ID_CH_PRIVILEGE, ev_ch_privilege, l);
++	rottenapple_wifi_event_unregister(l->w, EVENT_ID_BSS_BEACON_TIMEOUT, ev_beacon_timeout, l);
++	rottenapple_wifi_event_unregister(l->w, EVENT_ID_SEND_DEAUTH, ev_send_deauth, l);
+ 	mtk_wfdma_health(l->d, &h);
+ 	wl_health_log(l, "stopped", &h);
+ 	l->started = false;
+ 	l->bss_active = false;
+ }
+ 
++/* ================= W5/W6: association, 4-way handshake, data path ================= */
++/*
++ * Clean-room from gen4m's AIS/SAA/CNM paths (mgmt/ais_fsm.c, mgmt/saa_fsm.c,
++ * nic/nic.c nicUpdateBss, mgmt/cnm_mem.c cnmStaSendUpdateCmd, mgmt/cnm.c
++ * cnmChMngrRequestPrivilege, common/wlan_oid.c wlanoidSetAddKey) and the GX4
++ * join trace (0x14 REMOVE_STA, 0x09 INFRASTRUCTURE, 0x12 SET_BSS_INFO, 0x13
++ * UPDATE_STA_RECORD, 0x11 BSS_ACTIVATE, 0x1c CH_PRIVILEGE -> EVENT 0x10).
++ * The TXD and the command struct offsets are from docs/WIFI-PLAN.md "W5".
++ *
++ * Only WPA2-PSK CCMP (and open) are handled; the 4-way handshake itself runs
++ * in the core (rottenapple_wifi_sta.c). Management and EAPOL frames go out on
++ * the command ring (MCU port) with a 32-byte HW_MAC_TX_DESC, exactly as
++ * gen4m's COMMAND_TYPE_MANAGEMENT_FRAME / SECURITY_FRAME do.
++ */
++
++/* WTBL assignment: 0-3 reserved for BIP, pairwise STA at 4, group key at 5. */
++#define STA_WLAN_IDX            4
++#define GRP_WLAN_IDX            5
++#define STA_REC_IDX             0
++#define JOIN_CH_INTERVAL_MS     4000
++#define CH_GRANT_WAIT_MS        2000
++#define AUTH_WAIT_MS            1500
++#define ASSOC_WAIT_MS           1500
++#define JOIN_RETRIES            3
++
++/* TXD fields (HW_MAC_TX_DESC, 32-byte long format; docs/WIFI-PLAN.md "W5") */
++#define TXD_PORT_MCU            0x80    /* ucPortIdx_QueueIdx bit7 = MCU port */
++#define TXD_QUEUE_MCU_Q1        (1u << 2)       /* queue index MCU_Q1 in [2:6] */
++#define TXD_LONG_FORMAT         0x80    /* ucHeaderFormat bit7 */
++#define TXD_HF_802_11_NORMAL    (2u << 5)       /* ucHeaderFormat [5:6] = 2 */
++#define TXD_ETHERNET_II         (1u << 4)       /* ucHeaderFormat bit4 (non-802.11) */
++#define TXD_PKT_FORMAT_COMMAND  2       /* ucOwnMAC [0:1] */
++#define TXD_TXS_TO_MCU          0x02    /* ucTxStatus bit1 */
++#define TXD_PROTECTED           0x02    /* u2TxCountLimit bit1 */
++#define TXD_FIXED_RATE_EN       0x80    /* ucPowerOffset bit7 */
++#define NIC_TX_PSE_HDR          4
++
++/* 802.11 */
++#define FC_SUBTYPE_ASSOC_REQ    0
++#define FC_SUBTYPE_ASSOC_RESP   1
++#define FC_SUBTYPE_REASSOC_RESP 3
++#define FC_SUBTYPE_PROBE_RESP   5
++#define FC_SUBTYPE_AUTH         11
++#define FC_SUBTYPE_DEAUTH       12
++#define FC_SUBTYPE_DISASSOC     10
++
++/* Rate codes (wlan_def.h): lowest fixed rate for management frames. */
++static uint16_t
++lowest_rate_code(uint8_t band)
++{
++	return band == 2 ? 0x004b /* OFDM 6M */ : 0x0000 /* CCK 1M long */;
++}
++
++/* Build the 32-byte TXD for a management (is_mgmt) or 802.3 data frame. */
++static void
++build_txd(struct mtk_wlan *l, uint8_t txd[32], bool is_mgmt, uint8_t subtype, uint8_t wlan_idx,
++    uint32_t frame_len, uint8_t mac_hdr_len, bool protected, bool want_txs)
++{
++	bzero(txd, 32);
++	/* DW0 */
++	put16(txd + 0, (uint16_t)(32 + frame_len));             /* u2TxByteCount */
++	if (is_mgmt) {
++		txd[2] = (uint8_t)((NIC_TX_PSE_HDR + mac_hdr_len) >> 1); /* ether offset (words) */
++	} else {
++		txd[2] = (uint8_t)((14 - 2 + NIC_TX_PSE_HDR) >> 1);     /* 802.3: 8 words */
++	}
++	txd[3] = TXD_PORT_MCU | TXD_QUEUE_MCU_Q1;
++	/* DW1 */
++	txd[4] = wlan_idx;
++	if (is_mgmt) {
++		txd[5] = TXD_LONG_FORMAT | TXD_HF_802_11_NORMAL | (uint8_t)((mac_hdr_len >> 1) & 0x1f);
++	} else {
++		txd[5] = TXD_LONG_FORMAT | TXD_ETHERNET_II;             /* non-802.11, Ethernet II */
++	}
++	txd[6] = 0;                                             /* TID 0 */
++	txd[7] = TXD_PKT_FORMAT_COMMAND;                        /* own MAC index 0 */
++	/* DW2: type/subtype for 802.11 */
++	if (is_mgmt) {
++		txd[8] = (uint8_t)(subtype & 0x0f);             /* type 0 (mgmt) in [4:5] = 0 */
++	}
++	/* DW3: protection + remaining tx count (retry) */
++	uint16_t tcl = (uint16_t)(15u << 11);                   /* remaining tx count 15 */
++	if (protected) {
++		tcl |= TXD_PROTECTED;
++	}
++	put16(txd + 12, tcl);
++	/* DW5: PID + TXS to MCU (TX done via EVENT 0x0F) */
++	if (want_txs) {
++		if (++l->tx_pid == 0 || l->tx_pid > 127) {
++			l->tx_pid = 1;
++		}
++		txd[20] = l->tx_pid;
++		txd[21] = TXD_TXS_TO_MCU;
++	}
++	/* DW6: fixed lowest rate for management reliability (data frames auto-rate) */
++	if (is_mgmt) {
++		txd[11] |= TXD_FIXED_RATE_EN;                   /* ucPowerOffset */
++		put16(txd + 24, lowest_rate_code(l->peer_band));
++	}
++}
++
++/* ---- Event handlers (receive thread) ---- */
++
++static void
++ev_tx_done(__unused struct rottenapple_wifi *w, const struct rottenapple_wifi_event *ev, void *arg)
++{
++	struct mtk_wlan *l = arg;
++
++	if (ev->len >= 2 && ev->body[1] != 0) {
++		l->tx_fails++;          /* EVENT_TX_DONE: ucPacketSeq(PID), ucStatus */
++	}
++}
++
++static void
++ev_ch_privilege(__unused struct rottenapple_wifi *w, const struct rottenapple_wifi_event *ev, void *arg)
++{
++	struct mtk_wlan *l = arg;
++
++	/* EVENT_CH_PRIVILEGE: ucBssIndex, ucTokenID, ucStatus (0 = grant) */
++	if (ev->len >= 3 && l->join_active && ev->body[1] == l->ch_token && ev->body[2] == 0) {
++		l->ch_granted = true;
++		thread_wakeup((event_t)(uintptr_t)&l->ch_granted);
++	}
++}
++
++static void
++ev_beacon_timeout(struct rottenapple_wifi *w, __unused const struct rottenapple_wifi_event *ev, void *arg)
++{
++	struct mtk_wlan *l = arg;
++
++	if (l->connected) {
++		rottenapple_wifi_link_lost(w, "beacon timeout (EVENT 0x13)");
++	}
++}
++
++static void
++ev_send_deauth(struct rottenapple_wifi *w, __unused const struct rottenapple_wifi_event *ev, void *arg)
++{
++	struct mtk_wlan *l = arg;
++
++	if (l->connected) {
++		rottenapple_wifi_link_lost(w, "deauth/disassoc (EVENT 0x1b)");
++	}
++}
++
++/* ---- Received auth/assoc/deauth management frames (join + link watch) ---- */
++
++static void
++wl_rx_mgmt_join(struct mtk_wlan *l, const uint8_t *f, uint32_t len)
++{
++	uint8_t subtype;
++
++	if (len < 24) {
++		return;
++	}
++	subtype = f[0] >> 4;
++	/* only frames from our BSSID (addr3) matter */
++	if (memcmp(f + 16, l->peer, 6) != 0 && !l->join_active) {
++		return;
++	}
++	if (subtype == FC_SUBTYPE_AUTH && l->join_active && len >= 30) {
++		/* auth body: algorithm(2), seq(2), status(2) */
++		uint16_t alg = le16(f + 24), seq = le16(f + 26), status = le16(f + 28);
++		if (alg == 0 && seq == 2) {             /* open system, response */
++			l->auth_status = status;
++			l->auth_done = true;
++			thread_wakeup((event_t)(uintptr_t)&l->auth_done);
++		}
++		return;
++	}
++	if ((subtype == FC_SUBTYPE_ASSOC_RESP || subtype == FC_SUBTYPE_REASSOC_RESP) && l->join_active &&
++	    len >= 30) {
++		/* assoc resp body: capability(2), status(2), AID(2) */
++		l->assoc_status = le16(f + 26);
++		l->assoc_aid = (uint16_t)(le16(f + 28) & 0x3fff);
++		l->assoc_done = true;
++		thread_wakeup((event_t)(uintptr_t)&l->assoc_done);
++		return;
++	}
++	if ((subtype == FC_SUBTYPE_DEAUTH || subtype == FC_SUBTYPE_DISASSOC) && l->connected) {
++		rottenapple_wifi_link_lost(l->w, subtype == FC_SUBTYPE_DEAUTH ? "received deauth" :
++		    "received disassoc");
++	}
++}
++
++/* 802.11 data (not header-translated) -> Ethernet, to the core data path. */
++static void
++wl_rx_data_frame(struct mtk_wlan *l, const uint8_t *f, uint32_t len)
++{
++	static const uint8_t snap[6] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00 };
++	uint8_t eth[1600];
++	uint32_t hdr = 24;
++
++	if (!l->connected || len < 24) {
++		return;
++	}
++	if (f[0] & 0x80) {              /* QoS data: 2-byte QoS control */
++		hdr += 2;
++	}
++	if (len < hdr + 8 + 2 || memcmp(f + hdr, snap, 6) != 0) {
++		l->rx_ctrl_data++;      /* not a SNAP-encapsulated frame we handle */
++		return;
++	}
++	uint32_t payload = len - (hdr + 6);     /* ethertype(2) + data */
++	if (payload + 12 > sizeof(eth)) {
++		return;
++	}
++	/* fromDS: addr1 = DA (f+4), addr2 = BSSID (f+10), addr3 = SA (f+16) */
++	memcpy(eth, f + 4, 6);          /* DA */
++	memcpy(eth + 6, f + 16, 6);     /* SA */
++	memcpy(eth + 12, f + hdr + 6, payload);         /* ethertype + payload */
++	l->rx_data_frames++;
++	rottenapple_wifi_rx_data(l->w, eth, 12 + payload);
++}
++
++/* ---- Commands for the join ---- */
++
++/* CMD_CH_PRIVILEGE (req) + wait for EVENT_CH_PRIVILEGE grant. */
++static int
++wl_ch_privilege(struct mtk_wlan *l, bool req)
++{
++	uint8_t cmd[24] = { 0 };
++
++	cmd[0] = AIS_BSS_INDEX;
++	cmd[1] = ++l->ch_token ? l->ch_token : (l->ch_token = 1);
++	cmd[2] = req ? 0 : 1;                   /* CMD_CH_ACTION_REQ / ABORT */
++	cmd[3] = l->peer_channel;
++	cmd[4] = 0;                             /* RfSco: no secondary */
++	cmd[5] = l->peer_band;                  /* 1 = 2.4, 2 = 5 */
++	cmd[6] = 0;                             /* 20 MHz */
++	cmd[9] = 0;                             /* CH_REQ_TYPE_JOIN */
++	cmd[10] = 4;                            /* ENUM_BAND_AUTO */
++	put32(cmd + 12, req ? JOIN_CH_INTERVAL_MS : 0);
++	l->ch_granted = false;
++	int err = wl_set(l, CMD_ID_CH_PRIVILEGE, cmd, sizeof(cmd), req ? "CH_PRIVILEGE (request)" :
++	    "CH_PRIVILEGE (abort)");
++	if (err || !req) {
++		return err;
++	}
++	uint64_t t0 = now_us();
++	while (!l->ch_granted && l->running && !l->fw_dead && now_us() - t0 < CH_GRANT_WAIT_MS * 1000ull) {
++		(void)assert_wait_timeout((event_t)(uintptr_t)&l->ch_granted, THREAD_UNINT, 20, NSEC_PER_MSEC);
++		if (l->ch_granted) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++		} else {
++			(void)thread_block(THREAD_CONTINUE_NULL);
++		}
++	}
++	if (!l->ch_granted) {
++		LLOG("join: no channel-privilege grant within %u ms (continuing anyway)", CH_GRANT_WAIT_MS);
++	}
++	return 0;       /* not fatal: the firmware parks on the scan/AIS channel */
++}
++
++/* CMD_REMOVE_STA_RECORD {ucActionType, ucStaIndex, ucBssIndex, rsvd} */
++static int
++wl_remove_sta(struct mtk_wlan *l)
++{
++	uint8_t cmd[4] = { 0 /* STA_REC_CMD_ACTION_STA */, STA_REC_IDX, AIS_BSS_INDEX, 0 };
++	return wl_set(l, CMD_ID_REMOVE_STA_RECORD, cmd, sizeof(cmd), "REMOVE_STA_RECORD");
++}
++
++/* CMD_INFRASTRUCTURE: struct PARAM_OP_MODE {u32 eOpMode = NET_TYPE_INFRA, u8 bss} */
++static int
++wl_infrastructure(struct mtk_wlan *l)
++{
++	uint8_t cmd[8] = { 0 };
++
++	put32(cmd + 0, 1);              /* NET_TYPE_INFRA */
++	cmd[4] = AIS_BSS_INDEX;
++	return wl_set(l, CMD_ID_INFRASTRUCTURE, cmd, sizeof(cmd), "INFRASTRUCTURE (infra)");
++}
++
++/* Rate sets for the band (ENUM_SW_RATE_INDEX bitmaps). */
++static void
++band_rates(uint8_t band, uint16_t *op, uint16_t *basic)
++{
++	if (band == 2) {
++		*op = 0x3fc0;           /* 6..54 Mbps */
++		*basic = 0x0540;        /* 6, 12, 24 basic */
++	} else {
++		*op = 0x3fcf;           /* 1..54 Mbps */
++		*basic = 0x000f;        /* 1, 2, 5.5, 11 basic */
++	}
++}
++
++/*
++ * CMD_UPDATE_STA_RECORD (200 bytes, CFG_SUPPORT_802_11AX build; offsets in
++ * docs/WIFI-PLAN.md "W5"). state 1 creates the WTBL entry, state 3 marks it
++ * associated with the AID.
++ */
++#define USR_LEN         200
++#define USR_STA_INDEX   0
++#define USR_STA_TYPE    1
++#define USR_MAC         2
++#define USR_AID         8
++#define USR_LISTEN      10
++#define USR_BSS         12
++#define USR_PHY         13
++#define USR_NONHT_RATE  14
++#define USR_BASIC_RATE  16
++#define USR_IS_QOS      18
++#define USR_STA_STATE   20
++#define USR_WLAN_IDX    54
++#define USR_BMC_IDX     55
++#define USR_RCPI        50
++#define USR_NEED_RESP   51
++#define USR_HWRATE      74
++#define STA_STATE_1     1
++#define STA_STATE_3     3
++#define STA_TYPE_LEGACY_AP      0x41    /* STA_TYPE_LEGACY_MASK | STA_TYPE_AP_MASK */
++
++static int
++wl_update_sta(struct mtk_wlan *l, uint8_t state)
++{
++	uint8_t *cmd = kalloc_data(USR_LEN, Z_WAITOK | Z_ZERO);
++	uint16_t op, basic;
++	int err;
++
++	if (cmd == NULL) {
++		return ENOMEM;
++	}
++	band_rates(l->peer_band, &op, &basic);
++	cmd[USR_STA_INDEX] = STA_REC_IDX;
++	cmd[USR_STA_TYPE] = STA_TYPE_LEGACY_AP;
++	memcpy(cmd + USR_MAC, l->peer, 6);
++	put16(cmd + USR_AID, state == STA_STATE_3 ? l->assoc_aid : 0);
++	put16(cmd + USR_LISTEN, 1);
++	cmd[USR_BSS] = AIS_BSS_INDEX;
++	cmd[USR_PHY] = l->peer_band == 2 ? 0x08 /* OFDM */ : 0x03 /* HR_DSSS | ERP */;
++	put16(cmd + USR_NONHT_RATE, op);
++	put16(cmd + USR_BASIC_RATE, basic);
++	cmd[USR_IS_QOS] = 0;
++	cmd[USR_STA_STATE] = state;
++	cmd[USR_WLAN_IDX] = l->sta_wlan_idx;
++	cmd[USR_BMC_IDX] = l->grp_wlan_idx;
++	cmd[USR_NEED_RESP] = 0;
++	put16(cmd + USR_HWRATE, lowest_rate_code(l->peer_band));
++	err = wl_set(l, CMD_ID_UPDATE_STA_RECORD, cmd, USR_LEN, state == STA_STATE_1 ?
++	    "UPDATE_STA_RECORD (state 1)" : "UPDATE_STA_RECORD (state 3, associated)");
++	kfree_data(cmd, USR_LEN);
++	return err;
++}
++
++/* CMD_SET_BSS_INFO (116 bytes; offsets in docs/WIFI-PLAN.md "W5"). */
++#define SBI_LEN         116
++#define SBI_BSS         0
++#define SBI_CONN_STATE  1
++#define SBI_OPMODE      2
++#define SBI_SSID_LEN    3
++#define SBI_SSID        4
++#define SBI_BSSID       36
++#define SBI_OP_RATE     44
++#define SBI_BASIC_RATE  46
++#define SBI_STAREC_AP   48
++#define SBI_HWRATE      50
++#define SBI_NONHT_PHY   52
++#define SBI_AUTH        53
++#define SBI_ENC         54
++#define SBI_PHYSET      55
++#define SBI_BMC_IDX     58
++#define SBI_RLM         68      /* CMD_SET_BSS_RLM_PARAM */
++#define SBI_DBDC        90
++#define SBI_WMM         91
++#define SBI_NSS         93
++#define AUTH_MODE_OPEN_FW       0
++#define AUTH_MODE_WPA2_PSK_FW   7
++#define ENC_DISABLED_FW         1       /* ENUM_ENCRYPTION_DISABLED */
++#define ENC_CCMP_FW             6       /* ENUM_ENCRYPTION3_ENABLED */
++
++static int
++wl_set_bss_info(struct mtk_wlan *l, const struct rottenapple_wifi_join *jp, bool connected)
++{
++	uint8_t *cmd = kalloc_data(SBI_LEN, Z_WAITOK | Z_ZERO);
++	uint16_t op, basic;
++	int err;
++
++	if (cmd == NULL) {
++		return ENOMEM;
++	}
++	band_rates(jp->band, &op, &basic);
++	cmd[SBI_BSS] = AIS_BSS_INDEX;
++	cmd[SBI_CONN_STATE] = connected ? 0 /* MEDIA_STATE_CONNECTED */ : 1;
++	cmd[SBI_OPMODE] = 0;            /* OP_MODE_INFRASTRUCTURE */
++	cmd[SBI_SSID_LEN] = jp->ssid_len;
++	memcpy(cmd + SBI_SSID, jp->ssid, jp->ssid_len);
++	memcpy(cmd + SBI_BSSID, jp->bssid, 6);
++	put16(cmd + SBI_OP_RATE, op);
++	put16(cmd + SBI_BASIC_RATE, basic);
++	cmd[SBI_STAREC_AP] = STA_REC_IDX;
++	put16(cmd + SBI_HWRATE, lowest_rate_code(jp->band));
++	cmd[SBI_NONHT_PHY] = jp->band == 2 ? 3 /* OFDM index */ : 1 /* ERP index */;
++	cmd[SBI_AUTH] = jp->security == ROTTENAPPLE_WIFI_SEC_WPA2_PSK ? AUTH_MODE_WPA2_PSK_FW : AUTH_MODE_OPEN_FW;
++	cmd[SBI_ENC] = jp->security == ROTTENAPPLE_WIFI_SEC_WPA2_PSK ? ENC_CCMP_FW : ENC_DISABLED_FW;
++	cmd[SBI_PHYSET] = jp->band == 2 ? 0x08 : 0x03;
++	cmd[SBI_BMC_IDX] = l->grp_wlan_idx;
++	/* RLM: channel + band so the firmware knows the operating channel */
++	cmd[SBI_RLM + 0] = AIS_BSS_INDEX;
++	cmd[SBI_RLM + 1] = jp->band;
++	cmd[SBI_RLM + 2] = jp->channel;
++	cmd[SBI_DBDC] = 4;              /* ENUM_BAND_AUTO */
++	cmd[SBI_NSS] = 1;
++	err = wl_set(l, CMD_ID_SET_BSS_INFO, cmd, SBI_LEN, connected ? "SET_BSS_INFO (connected)" :
++	    "SET_BSS_INFO (connecting)");
++	kfree_data(cmd, SBI_LEN);
++	return err;
++}
++
++/* ---- Auth and association request frames ---- */
++
++static void
++hdr80211(struct mtk_wlan *l, uint8_t *f, uint8_t subtype)
++{
++	f[0] = (uint8_t)(subtype << 4);         /* type 0 (mgmt) */
++	f[1] = 0;
++	put16(f + 2, 0);                        /* duration */
++	memcpy(f + 4, l->peer, 6);              /* addr1 = BSSID (DA) */
++	memcpy(f + 10, l->w->mac, 6);           /* addr2 = own (SA) */
++	memcpy(f + 16, l->peer, 6);             /* addr3 = BSSID */
++	put16(f + 22, (uint16_t)(l->mgmt_seq++ << 4));  /* sequence control */
++}
++
++static int
++wl_send_auth(struct mtk_wlan *l)
++{
++	uint8_t txd[32], frame[30];
++
++	hdr80211(l, frame, FC_SUBTYPE_AUTH);
++	put16(frame + 24, 0);          /* algorithm: open system */
++	put16(frame + 26, 1);          /* transaction sequence 1 */
++	put16(frame + 28, 0);          /* status */
++	build_txd(l, txd, true, FC_SUBTYPE_AUTH, l->sta_wlan_idx, sizeof(frame), 24, false, true);
++	l->tx_frames++;
++	return mtk_wfdma_tx_frame(l->d, txd, 32, frame, sizeof(frame));
++}
++
++static int
++wl_send_assoc(struct mtk_wlan *l, const struct rottenapple_wifi_join *jp)
++{
++	/* fixed WPA2-PSK/CCMP RSN IE; must match EAPOL message 2 in the core */
++	static const uint8_t rsn_ie[] = {
++		0x30, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
++		0x01, 0x00, 0x00, 0x0f, 0xac, 0x02, 0x00, 0x00,
++	};
++	static const uint8_t rates_2g[] = { 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24 };
++	static const uint8_t ext_2g[] = { 0x30, 0x48, 0x60, 0x6c };
++	static const uint8_t rates_5g[] = { 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c };
++	uint8_t txd[32], frame[128];
++	uint8_t *p = frame;
++	uint16_t cap;
++
++	hdr80211(l, frame, FC_SUBTYPE_ASSOC_REQ);
++	p = frame + 24;
++	cap = 0x0021;                  /* ESS | short preamble | short slot */
++	if (jp->security == ROTTENAPPLE_WIFI_SEC_WPA2_PSK) {
++		cap |= 0x0010;         /* privacy */
++	}
++	put16(p, cap);
++	p += 2;
++	put16(p, 1);                   /* listen interval */
++	p += 2;
++	/* SSID */
++	*p++ = 0;
++	*p++ = jp->ssid_len;
++	memcpy(p, jp->ssid, jp->ssid_len);
++	p += jp->ssid_len;
++	/* supported rates */
++	*p++ = 1;
++	if (jp->band == 2) {
++		*p++ = sizeof(rates_5g);
++		memcpy(p, rates_5g, sizeof(rates_5g));
++		p += sizeof(rates_5g);
++	} else {
++		*p++ = sizeof(rates_2g);
++		memcpy(p, rates_2g, sizeof(rates_2g));
++		p += sizeof(rates_2g);
++		/* extended rates (2.4 GHz) */
++		*p++ = 50;
++		*p++ = sizeof(ext_2g);
++		memcpy(p, ext_2g, sizeof(ext_2g));
++		p += sizeof(ext_2g);
++	}
++	/* RSN IE for WPA2-PSK */
++	if (jp->security == ROTTENAPPLE_WIFI_SEC_WPA2_PSK) {
++		memcpy(p, rsn_ie, sizeof(rsn_ie));
++		p += sizeof(rsn_ie);
++	}
++	uint32_t flen = (uint32_t)(p - frame);
++	build_txd(l, txd, true, FC_SUBTYPE_ASSOC_REQ, l->sta_wlan_idx, flen, 24, false, true);
++	l->tx_frames++;
++	return mtk_wfdma_tx_frame(l->d, txd, 32, frame, flen);
++}
++
++/* ---- The join ---- */
++
++static bool
++wl_wait_join(struct mtk_wlan *l, volatile bool *flag, unsigned ms)
++{
++	uint64_t t0 = now_us();
++
++	while (!*flag && l->running && !l->fw_dead && now_us() - t0 < (uint64_t)ms * 1000) {
++		(void)assert_wait_timeout((event_t)(uintptr_t)flag, THREAD_UNINT, 20, NSEC_PER_MSEC);
++		if (*flag) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++		} else {
++			(void)thread_block(THREAD_CONTINUE_NULL);
++		}
++	}
++	return *flag;
++}
++
++int
++mtk_wlan_join(struct mtk_wlan *l, struct rottenapple_wifi_join *jp)
++{
++	int err;
++	unsigned attempt;
++
++	if (!l->started || !l->running || l->fw_dead) {
++		return ENXIO;
++	}
++	l->sta_wlan_idx = STA_WLAN_IDX;
++	l->grp_wlan_idx = GRP_WLAN_IDX;
++	l->sta_rec_idx = STA_REC_IDX;
++	memcpy(l->peer, jp->bssid, 6);
++	l->peer_channel = jp->channel;
++	l->peer_band = jp->band;
++	l->connected = false;
++
++	/* AIS network on with the own MAC (as the scan path does) */
++	if (!l->bss_active && (err = wl_bss_activate(l, true)) != 0) {
++		return err;
++	}
++	if ((err = wl_infrastructure(l)) != 0) {
++		return err;
++	}
++	(void)wl_ch_privilege(l, true);         /* park on the channel (grant not fatal) */
++	(void)wl_remove_sta(l);                 /* clean any stale STA record */
++	if ((err = wl_set_bss_info(l, jp, false)) != 0) {
++		return err;
++	}
++	if ((err = wl_update_sta(l, STA_STATE_1)) != 0) {       /* create the WTBL entry */
++		return err;
++	}
++
++	l->join_active = true;
++	for (attempt = 1; attempt <= JOIN_RETRIES; attempt++) {
++		l->auth_done = false;
++		l->auth_status = 0xffff;
++		if ((err = wl_send_auth(l)) != 0) {
++			LLOG("join: auth frame not sent (%d)", err);
++			continue;
++		}
++		if (!wl_wait_join(l, &l->auth_done, AUTH_WAIT_MS)) {
++			LLOG("join: no auth response (attempt %u/%u)", attempt, JOIN_RETRIES);
++			continue;
++		}
++		if (l->auth_status != 0) {
++			LLOG("join: auth rejected, status %u", l->auth_status);
++			l->join_active = false;
++			return ECONNREFUSED;
++		}
++		LLOG("join: open-system authentication succeeded");
++		break;
++	}
++	if (!l->auth_done || l->auth_status != 0) {
++		l->join_active = false;
++		return l->auth_done ? ECONNREFUSED : ETIMEDOUT;
++	}
++	for (attempt = 1; attempt <= JOIN_RETRIES; attempt++) {
++		l->assoc_done = false;
++		l->assoc_status = 0xffff;
++		if ((err = wl_send_assoc(l, jp)) != 0) {
++			LLOG("join: assoc frame not sent (%d)", err);
++			continue;
++		}
++		if (!wl_wait_join(l, &l->assoc_done, ASSOC_WAIT_MS)) {
++			LLOG("join: no assoc response (attempt %u/%u)", attempt, JOIN_RETRIES);
++			continue;
++		}
++		break;
++	}
++	l->join_active = false;
++	if (!l->assoc_done) {
++		return ETIMEDOUT;
++	}
++	if (l->assoc_status != 0) {
++		LLOG("join: association rejected, status %u", l->assoc_status);
++		return ECONNREFUSED;
++	}
++	jp->aid = l->assoc_aid;
++	LLOG("join: associated, AID %u", l->assoc_aid);
++
++	/* connected context: STA state 3, SET_BSS_INFO connected, PM notify */
++	if ((err = wl_update_sta(l, STA_STATE_3)) != 0 || (err = wl_set_bss_info(l, jp, true)) != 0) {
++		return err;
++	}
++	l->connected = true;
++	return 0;
++}
++
++void
++mtk_wlan_disconnect(struct mtk_wlan *l)
++{
++	uint8_t cmd[4] = { 0 };
++
++	if (!l->started) {
++		return;
++	}
++	l->connected = false;
++	l->join_active = false;
++	/* INDICATE_PM_BSS_ABORT {ucBssIndex, rsvd[3]} */
++	cmd[0] = AIS_BSS_INDEX;
++	(void)wl_set(l, CMD_ID_INDICATE_PM_BSS_ABORT, cmd, sizeof(cmd), "INDICATE_PM_BSS_ABORT");
++	(void)wl_remove_sta(l);
++	(void)wl_ch_privilege(l, false);
++	LLOG("disconnected: STA record removed, channel released");
++}
++
++/* ---- Keys (CMD_ADD_REMOVE_KEY) and the controlled port ---- */
++
++/* CMD_802_11_KEY (64 bytes; offsets from docs/WIFI-PLAN.md "W6"). */
++#define KEY_ADDREMOVE   0
++#define KEY_TXKEY       1
++#define KEY_TYPE        2
++#define KEY_AUTHENT     3
++#define KEY_PEER        4
++#define KEY_BSSIDX      10
++#define KEY_ALG         11
++#define KEY_ID          12
++#define KEY_LEN         13
++#define KEY_WLANIDX     14
++#define KEY_MGMTPROT    15
++#define KEY_MATERIAL    16
++#define KEY_RSC         48
++#define CIPHER_CCMP_FW  4
++
++int
++mtk_wlan_set_key(struct mtk_wlan *l, const struct rottenapple_wifi_key *k)
++{
++	uint8_t cmd[64] = { 0 };
++	bool pairwise = k->type == ROTTENAPPLE_WIFI_KEY_PAIRWISE;
++
++	cmd[KEY_ADDREMOVE] = 1;                         /* add */
++	cmd[KEY_TXKEY] = pairwise ? 1 : 0;
++	cmd[KEY_TYPE] = pairwise ? 1 : 0;              /* 1 = pairwise, 0 = group */
++	cmd[KEY_AUTHENT] = 0;                           /* supplicant, not authenticator */
++	if (pairwise) {
++		memcpy(cmd + KEY_PEER, k->peer, 6);
++	}
++	cmd[KEY_BSSIDX] = AIS_BSS_INDEX;
++	cmd[KEY_ALG] = CIPHER_CCMP_FW;
++	cmd[KEY_ID] = k->key_id;
++	cmd[KEY_LEN] = k->key_len;
++	cmd[KEY_WLANIDX] = pairwise ? l->sta_wlan_idx : l->grp_wlan_idx;
++	cmd[KEY_MGMTPROT] = 0;
++	memcpy(cmd + KEY_MATERIAL, k->key, MIN(k->key_len, (uint8_t)32));
++	/* key material is a secret: log the type and index only, never the bytes */
++	int err = wl_set(l, CMD_ID_ADD_REMOVE_KEY, cmd, sizeof(cmd), pairwise ?
++	    "ADD_KEY (pairwise CCMP)" : "ADD_KEY (group CCMP)");
++	bzero(cmd, sizeof(cmd));
++	return err;
++}
++
++int
++mtk_wlan_set_port(struct mtk_wlan *l, bool authorized)
++{
++	/*
++	 * The firmware opens the controlled port once the pairwise key is
++	 * installed and the STA is at state 3; INDICATE_PM_BSS_CONNECTED tells
++	 * power management the link is up. There is no separate "authorize"
++	 * command for this chip, so this is a notification only.
++	 */
++	if (!authorized) {
++		return 0;
++	}
++	uint8_t cmd[12] = { 0 };        /* CMD_INDICATE_PM_BSS_CONNECTED */
++	cmd[0] = AIS_BSS_INDEX;
++	cmd[1] = 1;                     /* DTIM period (placeholder) */
++	put16(cmd + 2, l->assoc_aid);
++	put16(cmd + 4, 100);            /* beacon interval (placeholder) */
++	return wl_set(l, CMD_ID_INDICATE_PM_BSS_CONNECTED, cmd, sizeof(cmd), "INDICATE_PM_BSS_CONNECTED");
++}
++
++/* ---- Data path ---- */
++
++int
++mtk_wlan_tx_data(struct mtk_wlan *l, const uint8_t *eth, uint32_t len, uint32_t flags)
++{
++	uint8_t txd[32];
++	bool protected = (flags & ROTTENAPPLE_WIFI_TX_PROTECTED) != 0;
++
++	if (!l->started || l->fw_dead || len < 14) {
++		return ENXIO;
++	}
++	build_txd(l, txd, false, 0, l->sta_wlan_idx, len, 0, protected, false);
++	int err = mtk_wfdma_tx_frame(l->d, txd, 32, eth, len);
++	if (err == 0) {
++		l->tx_frames++;
++		if (eth[12] == 0x88 && eth[13] == 0x8e) {
++			l->eapol_tx++;
++		}
++	}
++	return err;
++}
++
+ /* ---- W4: scan ---- */
+ 
+ /* Sleep until *flag is set, the firmware died, the receive thread stopped, or ms passed. */
+--- a/bsd/dev/rottenapple_mtk_wlan.h
++++ b/bsd/dev/rottenapple_mtk_wlan.h
+@@ -61,6 +61,22 @@ struct mtk_wlan {
+ 	bool fw_dead, coredump_logged;
+ 	uint32_t debug_msgs, asserts, rejected;
+ 
++	/* W5/W6: association, 4-way handshake, data path */
++	volatile bool join_active;      /* a join is in progress (route auth/assoc frames to it) */
++	volatile bool ch_granted;       /* EVENT_CH_PRIVILEGE grant for our token arrived */
++	uint8_t ch_token;               /* the channel-privilege token we asked for */
++	volatile bool auth_done, assoc_done;
++	volatile uint16_t auth_status, assoc_status, assoc_aid;
++	uint8_t sta_rec_idx;            /* firmware STA record slot for the AP */
++	uint8_t sta_wlan_idx;           /* the AP's pairwise WTBL entry */
++	uint8_t grp_wlan_idx;           /* the group-key WTBL entry */
++	uint8_t tx_pid;                 /* PID counter for TXS-tracked frames */
++	uint8_t mgmt_seq;               /* 802.11 sequence number for frames we build */
++	bool connected;                 /* associated (STA state 3) */
++	uint8_t peer[6];                /* the AP BSSID while connected */
++	uint8_t peer_channel, peer_band;
++	uint32_t tx_frames, tx_fails, rx_data_frames, eapol_rx, eapol_tx;
++
+ 	/* W4: scan and received frames */
+ 	uint8_t scan_seq_next;          /* CMD_SCAN_REQ_V2 ucSeqNum counter (1..255) */
+ 	volatile uint8_t scan_seq;      /* the running scan's ucSeqNum, 0 = no scan */
+@@ -106,6 +122,18 @@ void mtk_wlan_release(struct mtk_wlan *l);
+  */
+ int mtk_wlan_scan(struct mtk_wlan *l, unsigned mode);
+ 
++/*
++ * W5/W6 (after mtk_wlan_start): associate, install keys, open the port, send
++ * data, disconnect. These back the core's join/set_key/set_port/tx_data/
++ * disconnect ops (rottenapple_wifi.h). Received auth/assoc frames and data/
++ * EAPOL frames reach the core from the receive thread.
++ */
++int mtk_wlan_join(struct mtk_wlan *l, struct rottenapple_wifi_join *jp);
++void mtk_wlan_disconnect(struct mtk_wlan *l);
++int mtk_wlan_set_key(struct mtk_wlan *l, const struct rottenapple_wifi_key *k);
++int mtk_wlan_set_port(struct mtk_wlan *l, bool authorized);
++int mtk_wlan_tx_data(struct mtk_wlan *l, const uint8_t *eth, uint32_t len, uint32_t flags);
++
+ __END_DECLS
+ 
+ #endif
+--- a/bsd/dev/rottenapple_wifi.c
++++ b/bsd/dev/rottenapple_wifi.c
+@@ -326,6 +326,7 @@ rottenapple_wifi_thread(void *arg, __unused wait_result_t wr)
+ 			return;
+ 		}
+ 		wifi_attached = true;
++		rottenapple_wifi_sta_init(w);   /* join/link sysctls + STA state */
+ 	}
+ 	if (level == 1) {
+ 		wifi_w1(w);
+@@ -416,6 +417,7 @@ rottenapple_wifi_stop(void)
+ 	lck_mtx_unlock(&wifi_state_lock);
+ 
+ 	WLOG("stop: stopping Wi-Fi, powering down");
++	rottenapple_wifi_sta_stop(w);   /* drop the association and the en interface */
+ 	w->ops->wifi_off(w);
+ 	w->ops->power_off(w);
+ 	if (w->ops->report) {
+@@ -1062,6 +1064,52 @@ wifi_scan_log(struct rottenapple_wifi *w)
+ 	lck_mtx_unlock(&wifi_scan_lock);
+ }
+ 
++/*
++ * The strongest BSS of the last scan whose SSID matches: fills jp with its
++ * BSSID, channel, band and security (only open and WPA2-PSK CCMP are
++ * reported; anything else maps to ROTTENAPPLE_WIFI_SEC_OPEN so the join
++ * refuses it). Used by the join path.
++ */
++bool
++rottenapple_wifi_scan_lookup(const uint8_t *ssid, uint8_t ssid_len, struct rottenapple_wifi_join *jp)
++{
++	uint8_t idx[WIFI_BSS_MAX];
++	bool found = false;
++
++	if (ssid == NULL || ssid_len == 0 || ssid_len > 32 || jp == NULL) {
++		return false;
++	}
++	lck_mtx_lock(&wifi_scan_lock);
++	bss_sorted(idx);                /* strongest first */
++	for (unsigned i = 0; i < wifi_scan.n; i++) {
++		const struct wifi_bss *b = &wifi_scan.bss[idx[i]];
++		if (b->ssid_len != ssid_len || memcmp(b->ssid, ssid, ssid_len) != 0) {
++			continue;
++		}
++		bzero(jp, sizeof(*jp));
++		memcpy(jp->bssid, b->bssid, 6);
++		memcpy(jp->ssid, b->ssid, ssid_len);
++		jp->ssid_len = ssid_len;
++		jp->channel = b->channel;
++		jp->band = b->channel <= 14 ? 1 : 2;
++		jp->capability = b->capability;
++		jp->pmf = (b->sec & (SEC_PMF_CAPABLE | SEC_PMF_REQUIRED)) != 0;
++		/* only WPA2-PSK with CCMP pairwise is supported for now */
++		if ((b->sec & SEC_RSN) && (b->akm_rsn & (AKM_PSK | AKM_PSK_SHA256)) &&
++		    (b->ciph_rsn & CIPH_CCMP) && !(b->ciph_rsn & (CIPH_TKIP | CIPH_WEP))) {
++			jp->security = ROTTENAPPLE_WIFI_SEC_WPA2_PSK;
++		} else if (!(b->sec & (SEC_RSN | SEC_WPA | SEC_PRIVACY))) {
++			jp->security = ROTTENAPPLE_WIFI_SEC_OPEN;
++		} else {
++			jp->security = 0xff;    /* unsupported: the join refuses it */
++		}
++		found = true;
++		break;
++	}
++	lck_mtx_unlock(&wifi_scan_lock);
++	return found;
++}
++
+ int
+ rottenapple_wifi_scan(unsigned mode)
+ {
+--- a/bsd/dev/rottenapple_wifi.h
++++ b/bsd/dev/rottenapple_wifi.h
+@@ -95,6 +95,42 @@ struct rottenapple_wifi {
+ #define ROTTENAPPLE_WIFI_SCAN_ACTIVE_FW 3       /* active, the firmware's own channel list */
+ #define ROTTENAPPLE_WIFI_SCAN_MODES     3
+ 
++/* ---- Join and the data path (W5/W6) ---- */
++
++/* Security the join needs (W4 scan decoded it; only WPA2-PSK CCMP is handled). */
++#define ROTTENAPPLE_WIFI_SEC_OPEN       0
++#define ROTTENAPPLE_WIFI_SEC_WPA2_PSK   1       /* RSN, AKM PSK, pairwise + group CCMP */
++
++/* Target BSS for a join (filled by the core from the last scan). */
++struct rottenapple_wifi_join {
++	uint8_t bssid[6];
++	uint8_t ssid[32];
++	uint8_t ssid_len;
++	uint8_t channel;                /* primary channel */
++	uint8_t band;                   /* 1 = 2.4 GHz, 2 = 5 GHz */
++	uint8_t security;               /* ROTTENAPPLE_WIFI_SEC_* */
++	bool pmf;                       /* the AP is PMF capable (not required here) */
++	uint16_t capability;            /* beacon/probe capability field */
++	uint16_t aid;                   /* filled by the backend on success */
++};
++
++/* A key to install in the firmware (W6). */
++#define ROTTENAPPLE_WIFI_KEY_PAIRWISE   0
++#define ROTTENAPPLE_WIFI_KEY_GROUP      1
++#define ROTTENAPPLE_WIFI_CIPHER_CCMP    4       /* CIPHER_SUITE_CCMP (the only one handled) */
++struct rottenapple_wifi_key {
++	uint8_t type;                   /* ROTTENAPPLE_WIFI_KEY_* */
++	uint8_t cipher;                 /* ROTTENAPPLE_WIFI_CIPHER_* */
++	uint8_t key_id;                 /* 0 for the pairwise key, 1/2 for the GTK */
++	uint8_t key_len;                /* 16 for CCMP */
++	uint8_t key[32];
++	uint8_t rsc[6];                 /* receive sequence counter (GTK) */
++	uint8_t peer[6];                /* pairwise: the AP BSSID; group: ignored */
++};
++
++/* tx_data flags */
++#define ROTTENAPPLE_WIFI_TX_PROTECTED   (1u << 0)       /* request HW encryption (keys installed) */
++
+ /*
+  * A Wi-Fi backend. All hooks run in thread context, unlocked, and may sleep.
+  * power_off is always called after power_on, also when power_on failed
+@@ -134,6 +170,28 @@ struct rottenapple_wifi_ops {
+ 	 * ETIMEDOUT (no scan-done; results so far are kept), ENXIO, EIO.
+ 	 */
+ 	int (*scan)(struct rottenapple_wifi *w, unsigned mode);
++	/*
++	 * W5: associate to jp (open-system auth + association on the firmware's
++	 * command sequence). Synchronous: returns once the STA is at state 3
++	 * (associated, jp->aid set) or it failed. Received data and EAPOL frames
++	 * reach the core via rottenapple_wifi_rx_data() meanwhile. 0, ETIMEDOUT,
++	 * ECONNREFUSED (auth/assoc rejected), ENXIO. Never called concurrently.
++	 */
++	int (*join)(struct rottenapple_wifi *w, struct rottenapple_wifi_join *jp);
++	/* W5: tear the current association down (deauth, remove STA record). */
++	void (*disconnect)(struct rottenapple_wifi *w);
++	/* W6: install (or replace) a key in the firmware. 0 or an error. */
++	int (*set_key)(struct rottenapple_wifi *w, const struct rottenapple_wifi_key *k);
++	/* W6: open (authorized) or block the controlled port for the STA. */
++	int (*set_port)(struct rottenapple_wifi *w, bool authorized);
++	/*
++	 * W5 data path: send one Ethernet (802.3) frame (dest/src/ethertype +
++	 * payload); the firmware does the 802.11 header translation. flags:
++	 * ROTTENAPPLE_WIFI_TX_PROTECTED requests HW encryption (after the keys
++	 * are installed; EAPOL during the handshake is sent without it).
++	 * 0, ENOBUFS (ring full), ENXIO.
++	 */
++	int (*tx_data)(struct rottenapple_wifi *w, const uint8_t *eth, uint32_t len, uint32_t flags);
+ };
+ 
+ /* Index of the "reg-names" entry name, -1 if absent or unmapped. */
+@@ -221,6 +279,40 @@ int rottenapple_wifi_scan(unsigned mode);
+ void rottenapple_wifi_rx_mgmt(struct rottenapple_wifi *w, const uint8_t *frame, uint32_t len, int rssi,
+     uint8_t rx_channel);
+ 
++/*
++ * Look up the strongest BSS matching ssid in the last scan and fill jp
++ * (bssid, channel, band, security). true when found, false otherwise.
++ * Used by the join path (rottenapple_wifi_sta.c).
++ */
++bool rottenapple_wifi_scan_lookup(const uint8_t *ssid, uint8_t ssid_len, struct rottenapple_wifi_join *jp);
++
++/* ---- Station: join, data path, supplicant (W5/W6, rottenapple_wifi_sta.c) ---- */
++
++/*
++ * Registers the join/link sysctls and the STA state. Called once by the
++ * core after the Wi-Fi device attaches. Idempotent.
++ */
++void rottenapple_wifi_sta_init(struct rottenapple_wifi *w);
++
++/*
++ * Backend -> core, receive thread: one received 802.3 Ethernet frame on the
++ * connected link (the firmware already translated the 802.11 header and
++ * decrypted it). EAPOL (ethertype 0x888E) goes to the 4-way-handshake
++ * supplicant; everything else is handed to the en interface. Ignored when no
++ * association is up.
++ */
++void rottenapple_wifi_rx_data(struct rottenapple_wifi *w, const uint8_t *eth, uint32_t len);
++
++/*
++ * Backend -> core: the link dropped (beacon loss, deauth/disassoc from the
++ * AP). The core tears the association down and, unless disabled, tries to
++ * reconnect to the same SSID. reason is for the log.
++ */
++void rottenapple_wifi_link_lost(struct rottenapple_wifi *w, const char *reason);
++
++/* Called from the stop path so the STA layer releases the link and ifnet. */
++void rottenapple_wifi_sta_stop(struct rottenapple_wifi *w);
++
+ __END_DECLS
+ 
+ #endif
+--- /dev/null
++++ b/bsd/dev/rottenapple_wifi_crypto.c
+@@ -0,0 +1,438 @@
++/*
++ * Rotten Apple: self-contained crypto for WPA2-PSK (milestone W6).
++ * Clean-room: SHA-1 (FIPS 180), HMAC-SHA1 (RFC 2104), PBKDF2 (RFC 2898),
++ * the IEEE 802.11 PRF and AES-128 with RFC 3394 key unwrap. Interface in
++ * rottenapple_wifi_crypto.h. These are the standard public algorithms,
++ * written here so the supplicant does not depend on the kernel's optional
++ * corecrypto build. wpa_supplicant (BSD-licensed) was a behavioural
++ * reference for the PRF labels and key layout only; no code was copied.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <dev/rottenapple_wifi_crypto.h>
++
++/* ---- SHA-1 ---- */
++
++struct ra_sha1 {
++	uint32_t h[5];
++	uint64_t len;           /* message length in bytes */
++	uint8_t buf[64];
++	unsigned n;             /* bytes in buf */
++};
++
++static inline uint32_t
++rol32(uint32_t v, unsigned s)
++{
++	return (v << s) | (v >> (32 - s));
++}
++
++static void
++sha1_block(struct ra_sha1 *c, const uint8_t *p)
++{
++	uint32_t w[80], a, b, d, e, f, k, t;
++	unsigned i;
++
++	for (i = 0; i < 16; i++) {
++		w[i] = ((uint32_t)p[4 * i] << 24) | ((uint32_t)p[4 * i + 1] << 16) |
++		    ((uint32_t)p[4 * i + 2] << 8) | (uint32_t)p[4 * i + 3];
++	}
++	for (i = 16; i < 80; i++) {
++		w[i] = rol32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
++	}
++	a = c->h[0];
++	b = c->h[1];
++	uint32_t cc = c->h[2];
++	d = c->h[3];
++	e = c->h[4];
++	for (i = 0; i < 80; i++) {
++		if (i < 20) {
++			f = (b & cc) | (~b & d);
++			k = 0x5a827999;
++		} else if (i < 40) {
++			f = b ^ cc ^ d;
++			k = 0x6ed9eba1;
++		} else if (i < 60) {
++			f = (b & cc) | (b & d) | (cc & d);
++			k = 0x8f1bbcdc;
++		} else {
++			f = b ^ cc ^ d;
++			k = 0xca62c1d6;
++		}
++		t = rol32(a, 5) + f + e + k + w[i];
++		e = d;
++		d = cc;
++		cc = rol32(b, 30);
++		b = a;
++		a = t;
++	}
++	c->h[0] += a;
++	c->h[1] += b;
++	c->h[2] += cc;
++	c->h[3] += d;
++	c->h[4] += e;
++}
++
++static void
++sha1_init(struct ra_sha1 *c)
++{
++	c->h[0] = 0x67452301;
++	c->h[1] = 0xefcdab89;
++	c->h[2] = 0x98badcfe;
++	c->h[3] = 0x10325476;
++	c->h[4] = 0xc3d2e1f0;
++	c->len = 0;
++	c->n = 0;
++}
++
++static void
++sha1_update(struct ra_sha1 *c, const uint8_t *p, size_t len)
++{
++	c->len += len;
++	while (len > 0) {
++		unsigned take = MIN((unsigned)len, 64 - c->n);
++		memcpy(c->buf + c->n, p, take);
++		c->n += take;
++		p += take;
++		len -= take;
++		if (c->n == 64) {
++			sha1_block(c, c->buf);
++			c->n = 0;
++		}
++	}
++}
++
++static void
++sha1_final(struct ra_sha1 *c, uint8_t out[RA_SHA1_LEN])
++{
++	uint64_t bits = c->len * 8;
++	uint8_t pad = 0x80;
++	uint8_t lenbe[8];
++	unsigned i;
++
++	sha1_update(c, &pad, 1);
++	pad = 0;
++	while (c->n != 56) {
++		sha1_update(c, &pad, 1);
++	}
++	for (i = 0; i < 8; i++) {
++		lenbe[i] = (uint8_t)(bits >> (56 - 8 * i));
++	}
++	sha1_update(c, lenbe, 8);
++	for (i = 0; i < 5; i++) {
++		out[4 * i] = (uint8_t)(c->h[i] >> 24);
++		out[4 * i + 1] = (uint8_t)(c->h[i] >> 16);
++		out[4 * i + 2] = (uint8_t)(c->h[i] >> 8);
++		out[4 * i + 3] = (uint8_t)c->h[i];
++	}
++}
++
++/* ---- HMAC-SHA1 ---- */
++
++void
++ra_hmac_sha1(const uint8_t *key, size_t key_len, const uint8_t *msg, size_t msg_len,
++    uint8_t out[RA_SHA1_LEN])
++{
++	struct ra_sha1 c;
++	uint8_t k[64], ipad[64], opad[64], inner[RA_SHA1_LEN];
++	unsigned i;
++
++	bzero(k, sizeof(k));
++	if (key_len > 64) {
++		sha1_init(&c);
++		sha1_update(&c, key, key_len);
++		sha1_final(&c, k);
++	} else {
++		memcpy(k, key, key_len);
++	}
++	for (i = 0; i < 64; i++) {
++		ipad[i] = k[i] ^ 0x36;
++		opad[i] = k[i] ^ 0x5c;
++	}
++	sha1_init(&c);
++	sha1_update(&c, ipad, 64);
++	sha1_update(&c, msg, msg_len);
++	sha1_final(&c, inner);
++	sha1_init(&c);
++	sha1_update(&c, opad, 64);
++	sha1_update(&c, inner, RA_SHA1_LEN);
++	sha1_final(&c, out);
++	bzero(k, sizeof(k));
++	bzero(ipad, sizeof(ipad));
++	bzero(opad, sizeof(opad));
++	bzero(inner, sizeof(inner));
++}
++
++/* ---- PBKDF2-SHA1 ---- */
++
++void
++ra_pbkdf2_sha1(const uint8_t *pass, size_t pass_len, const uint8_t *salt, size_t salt_len,
++    unsigned iterations, uint8_t *dk, size_t dk_len)
++{
++	uint8_t block[64 + 4];          /* salt is the SSID (<= 32) + a 4-byte counter */
++	uint8_t u[RA_SHA1_LEN], t[RA_SHA1_LEN];
++	uint32_t count = 1;
++	size_t done = 0;
++
++	if (salt_len > 64) {
++		salt_len = 64;
++	}
++	while (done < dk_len) {
++		unsigned i, j;
++		memcpy(block, salt, salt_len);
++		block[salt_len] = (uint8_t)(count >> 24);
++		block[salt_len + 1] = (uint8_t)(count >> 16);
++		block[salt_len + 2] = (uint8_t)(count >> 8);
++		block[salt_len + 3] = (uint8_t)count;
++		ra_hmac_sha1(pass, pass_len, block, salt_len + 4, u);
++		memcpy(t, u, RA_SHA1_LEN);
++		for (i = 1; i < iterations; i++) {
++			ra_hmac_sha1(pass, pass_len, u, RA_SHA1_LEN, u);
++			for (j = 0; j < RA_SHA1_LEN; j++) {
++				t[j] ^= u[j];
++			}
++		}
++		size_t take = MIN(dk_len - done, (size_t)RA_SHA1_LEN);
++		memcpy(dk + done, t, take);
++		done += take;
++		count++;
++	}
++	bzero(u, sizeof(u));
++	bzero(t, sizeof(t));
++	bzero(block, sizeof(block));
++}
++
++/* ---- IEEE 802.11 PRF ---- */
++
++void
++ra_prf(const uint8_t *key, size_t key_len, const char *label, const uint8_t *data,
++    size_t data_len, uint8_t *out, size_t out_len)
++{
++	uint8_t buf[128], hash[RA_SHA1_LEN];
++	size_t label_len = strlen(label);
++	size_t done = 0;
++	uint8_t i = 0;
++
++	/* A(i) = HMAC(key, label || 0x00 || data || i), concatenated */
++	while (done < out_len) {
++		size_t n = 0;
++		memcpy(buf + n, label, label_len);
++		n += label_len;
++		buf[n++] = 0;
++		memcpy(buf + n, data, data_len);
++		n += data_len;
++		buf[n++] = i;
++		ra_hmac_sha1(key, key_len, buf, n, hash);
++		size_t take = MIN(out_len - done, (size_t)RA_SHA1_LEN);
++		memcpy(out + done, hash, take);
++		done += take;
++		i++;
++	}
++	bzero(buf, sizeof(buf));
++	bzero(hash, sizeof(hash));
++}
++
++/* ---- AES-128 (encrypt + decrypt), for RFC 3394 key unwrap ---- */
++
++static const uint8_t aes_sbox[256] = {
++	0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
++	0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
++	0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
++	0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
++	0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
++	0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
++	0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
++	0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
++	0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
++	0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
++	0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
++	0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
++	0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
++	0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
++	0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
++	0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
++};
++
++static uint8_t aes_inv_sbox[256];
++static bool aes_inv_ready;
++
++static uint8_t
++xtime(uint8_t x)
++{
++	return (uint8_t)((x << 1) ^ ((x >> 7) * 0x1b));
++}
++
++static uint8_t
++gmul(uint8_t a, uint8_t b)
++{
++	uint8_t p = 0;
++	for (unsigned i = 0; i < 8; i++) {
++		if (b & 1) {
++			p ^= a;
++		}
++		uint8_t hi = a & 0x80;
++		a <<= 1;
++		if (hi) {
++			a ^= 0x1b;
++		}
++		b >>= 1;
++	}
++	return p;
++}
++
++struct aes128 {
++	uint8_t rk[11][16];     /* round keys */
++};
++
++static void
++aes128_key(struct aes128 *a, const uint8_t key[16])
++{
++	static const uint8_t rcon[10] = { 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36 };
++	uint8_t t[4];
++	unsigned r, i;
++
++	if (!aes_inv_ready) {
++		for (i = 0; i < 256; i++) {
++			aes_inv_sbox[aes_sbox[i]] = (uint8_t)i;
++		}
++		aes_inv_ready = true;
++	}
++	memcpy(a->rk[0], key, 16);
++	for (r = 1; r <= 10; r++) {
++		memcpy(t, &a->rk[r - 1][12], 4);
++		uint8_t tmp = t[0];
++		t[0] = aes_sbox[t[1]] ^ rcon[r - 1];
++		t[1] = aes_sbox[t[2]];
++		t[2] = aes_sbox[t[3]];
++		t[3] = aes_sbox[tmp];
++		for (i = 0; i < 4; i++) {
++			a->rk[r][i] = a->rk[r - 1][i] ^ t[i];
++		}
++		for (i = 4; i < 16; i++) {
++			a->rk[r][i] = a->rk[r][i - 4] ^ a->rk[r - 1][i];
++		}
++	}
++}
++
++static void
++aes128_encrypt(const struct aes128 *a, const uint8_t in[16], uint8_t out[16])
++{
++	uint8_t s[16];
++	unsigned r, i;
++
++	for (i = 0; i < 16; i++) {
++		s[i] = in[i] ^ a->rk[0][i];
++	}
++	for (r = 1; r <= 10; r++) {
++		uint8_t t[16];
++		for (i = 0; i < 16; i++) {
++			t[i] = aes_sbox[s[i]];
++		}
++		/* ShiftRows (column-major state: byte c*4+row) */
++		uint8_t sr[16];
++		for (unsigned col = 0; col < 4; col++) {
++			for (unsigned row = 0; row < 4; row++) {
++				sr[col * 4 + row] = t[((col + row) % 4) * 4 + row];
++			}
++		}
++		if (r < 10) {
++			for (unsigned col = 0; col < 4; col++) {
++				uint8_t *c = sr + col * 4;
++				uint8_t a0 = c[0], a1 = c[1], a2 = c[2], a3 = c[3];
++				s[col * 4 + 0] = (uint8_t)(xtime(a0) ^ (xtime(a1) ^ a1) ^ a2 ^ a3);
++				s[col * 4 + 1] = (uint8_t)(a0 ^ xtime(a1) ^ (xtime(a2) ^ a2) ^ a3);
++				s[col * 4 + 2] = (uint8_t)(a0 ^ a1 ^ xtime(a2) ^ (xtime(a3) ^ a3));
++				s[col * 4 + 3] = (uint8_t)((xtime(a0) ^ a0) ^ a1 ^ a2 ^ xtime(a3));
++			}
++		} else {
++			memcpy(s, sr, 16);
++		}
++		for (i = 0; i < 16; i++) {
++			s[i] ^= a->rk[r][i];
++		}
++	}
++	memcpy(out, s, 16);
++}
++
++static void
++aes128_decrypt(const struct aes128 *a, const uint8_t in[16], uint8_t out[16])
++{
++	uint8_t s[16];
++	unsigned r, i;
++
++	for (i = 0; i < 16; i++) {
++		s[i] = in[i] ^ a->rk[10][i];
++	}
++	for (r = 10; r >= 1; r--) {
++		/* InvShiftRows */
++		uint8_t sr[16];
++		for (unsigned col = 0; col < 4; col++) {
++			for (unsigned row = 0; row < 4; row++) {
++				sr[col * 4 + row] = s[((col + 4 - row) % 4) * 4 + row];
++			}
++		}
++		uint8_t t[16];
++		for (i = 0; i < 16; i++) {
++			t[i] = aes_inv_sbox[sr[i]];
++		}
++		for (i = 0; i < 16; i++) {
++			t[i] ^= a->rk[r - 1][i];
++		}
++		if (r > 1) {
++			for (unsigned col = 0; col < 4; col++) {
++				uint8_t *c = t + col * 4;
++				uint8_t a0 = c[0], a1 = c[1], a2 = c[2], a3 = c[3];
++				s[col * 4 + 0] = (uint8_t)(gmul(a0, 14) ^ gmul(a1, 11) ^ gmul(a2, 13) ^ gmul(a3, 9));
++				s[col * 4 + 1] = (uint8_t)(gmul(a0, 9) ^ gmul(a1, 14) ^ gmul(a2, 11) ^ gmul(a3, 13));
++				s[col * 4 + 2] = (uint8_t)(gmul(a0, 13) ^ gmul(a1, 9) ^ gmul(a2, 14) ^ gmul(a3, 11));
++				s[col * 4 + 3] = (uint8_t)(gmul(a0, 11) ^ gmul(a1, 13) ^ gmul(a2, 9) ^ gmul(a3, 14));
++			}
++		} else {
++			memcpy(s, t, 16);
++		}
++	}
++	memcpy(out, s, 16);
++}
++
++int
++ra_aes_unwrap(const uint8_t kek[16], const uint8_t *in, size_t in_len, uint8_t *out)
++{
++	static const uint8_t iv[8] = { 0xa6, 0xa6, 0xa6, 0xa6, 0xa6, 0xa6, 0xa6, 0xa6 };
++	struct aes128 a;
++	uint8_t ablk[8], blk[16];
++	size_t n, i;
++	int j, err = 0;
++
++	if (in_len < 24 || (in_len % 8) != 0) {
++		return EINVAL;
++	}
++	n = in_len / 8 - 1;             /* number of 64-bit data blocks */
++	aes128_key(&a, kek);
++	memcpy(ablk, in, 8);            /* A = C[0] */
++	memcpy(out, in + 8, n * 8);     /* R = C[1..n] */
++	for (j = 5; j >= 0; j--) {
++		for (i = n; i >= 1; i--) {
++			uint64_t t = (uint64_t)(n * (unsigned)j + i);
++			memcpy(blk, ablk, 8);
++			for (unsigned b = 0; b < 8; b++) {
++				blk[b] ^= (uint8_t)(t >> (56 - 8 * b));
++			}
++			memcpy(blk + 8, out + (i - 1) * 8, 8);
++			aes128_decrypt(&a, blk, blk);
++			memcpy(ablk, blk, 8);
++			memcpy(out + (i - 1) * 8, blk + 8, 8);
++		}
++	}
++	for (i = 0; i < 8; i++) {
++		if (ablk[i] != iv[i]) {
++			err = EBADMSG;
++			break;
++		}
++	}
++	bzero(&a, sizeof(a));
++	bzero(blk, sizeof(blk));
++	bzero(ablk, sizeof(ablk));
++	return err;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/bsd/dev/rottenapple_wifi_crypto.h
+@@ -0,0 +1,52 @@
++/*
++ * Rotten Apple: self-contained crypto for the WPA2-PSK 4-way handshake
++ * (milestone W6, docs/WIFI-PLAN.md). Clean-room implementations of the
++ * standard algorithms: SHA-1, HMAC-SHA1, PBKDF2-SHA1, the IEEE 802.11 PRF
++ * and AES-128 (for the RFC 3394 key unwrap of the GTK). No GPL and no
++ * dependency on the kernel's optional corecrypto/ipsec crypto: this file is
++ * always compiled so the supplicant works regardless of the kernel config.
++ *
++ * The passphrase and the keys derived from it are secrets. Nothing here
++ * logs or returns them in cleartext to a reader; callers must wipe their
++ * buffers.
++ */
++#ifndef _BSD_DEV_ROTTENAPPLE_WIFI_CRYPTO_H_
++#define _BSD_DEV_ROTTENAPPLE_WIFI_CRYPTO_H_
++
++#include <sys/types.h>
++
++__BEGIN_DECLS
++
++#define RA_SHA1_LEN     20
++
++/* HMAC-SHA1 of msg under key -> out[RA_SHA1_LEN]. */
++void ra_hmac_sha1(const uint8_t *key, size_t key_len, const uint8_t *msg, size_t msg_len,
++    uint8_t out[RA_SHA1_LEN]);
++
++/*
++ * PBKDF2-SHA1(passphrase, ssid, 4096, dk_len) -> dk. The WPA PMK is
++ * dk_len = 32, iterations 4096 (IEEE 802.11i). passphrase is not NUL
++ * counted; pass its byte length.
++ */
++void ra_pbkdf2_sha1(const uint8_t *pass, size_t pass_len, const uint8_t *salt, size_t salt_len,
++    unsigned iterations, uint8_t *dk, size_t dk_len);
++
++/*
++ * IEEE 802.11 PRF-n (n a multiple of 8 bits): the SHA-1 PRF used to expand
++ * the PMK into the PTK. out_len is the number of bytes wanted (48 for
++ * CCMP: KCK 16 + KEK 16 + TK 16).
++ */
++void ra_prf(const uint8_t *key, size_t key_len, const char *label, const uint8_t *data,
++    size_t data_len, uint8_t *out, size_t out_len);
++
++/*
++ * RFC 3394 AES key unwrap with a 128-bit KEK (the EAPOL-Key KEK). in_len is
++ * the wrapped length (GTK length + 8), a multiple of 8, >= 24. out gets
++ * in_len - 8 bytes. Returns 0 on success (integrity check value matched),
++ * EBADMSG on a mismatch, EINVAL on a bad length.
++ */
++int ra_aes_unwrap(const uint8_t kek[16], const uint8_t *in, size_t in_len, uint8_t *out);
++
++__END_DECLS
++
++#endif /* _BSD_DEV_ROTTENAPPLE_WIFI_CRYPTO_H_ */
+--- /dev/null
++++ b/bsd/dev/rottenapple_wifi_sta.c
+@@ -0,0 +1,1128 @@
++/*
++ * Rotten Apple: Wi-Fi station layer (milestones W5 + W6, docs/WIFI-PLAN.md).
++ * Chip-free: association is driven through the backend ops (join, set_key,
++ * set_port, tx_data, disconnect); this file holds the policy, the WPA2-PSK
++ * 4-way-handshake supplicant, the Ethernet ifnet (en1) and the sysctl
++ * interface.
++ *
++ * Flow (sysctl kern.rottenapple_wifi_join = "<ssid>"):
++ *   1. find the strongest BSS of the last scan with that SSID (W4 list);
++ *   2. WPA2-PSK: read the passphrase (/var/root/.wifi-psk, or the write-only
++ *      sysctl kern.rottenapple_wifi_psk), derive PMK = PBKDF2-SHA1(psk, ssid,
++ *      4096, 32), then wipe the passphrase;
++ *   3. ops->join(): the firmware command sequence, open-system auth and the
++ *      association request (the backend builds the IEs and the frames);
++ *   4. WPA2-PSK: the 4-way handshake here, over the data path (EAPOL frames
++ *      the AP sends arrive through rottenapple_wifi_rx_data); install the PTK
++ *      and GTK (ops->set_key) and open the controlled port (ops->set_port);
++ *   5. bring the en interface up with the NVRAM MAC. The user sets the IP
++ *      with ifconfig/route over SSH, or a minimal static IP via
++ *      kern.rottenapple_wifi_ip; DHCP runs from userland (ipconfig) once the
++ *      interface carries traffic.
++ *
++ * The passphrase and every key derived from it are secrets: nothing here
++ * logs or prints them, and every buffer that held one is wiped.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/kpi_socket.h>
++#include <sys/random.h>
++#include <sys/sockio.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/fcntl.h>
++#include <sys/uio.h>
++#include <sys/proc.h>
++#include <sys/kauth.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <net/dlil.h>
++#include <sys/kern_event.h>
++#include <netinet/in.h>
++#include <net/if_media.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
++#include <dev/rottenapple_wifi.h>
++#include <dev/rottenapple_wifi_crypto.h>
++
++extern int vn_rdwr(enum uio_rw, struct vnode *, caddr_t, int, off_t, enum uio_seg, int, kauth_cred_t,
++    int *, proc_t);
++
++#define TLOG(fmt, ...)  printf("ROTTEN APPLE: wifi sta: " fmt "\n", ##__VA_ARGS__)
++
++/* ---- State ---- */
++
++enum {
++	LINK_IDLE,              /* not associated */
++	LINK_JOINING,          /* auth + assoc in progress */
++	LINK_4WAY,             /* associated, 4-way handshake running */
++	LINK_CONNECTED,        /* data path open */
++};
++static const char *const link_name[] = { "idle", "joining", "4-way handshake", "connected" };
++
++#define PSK_MAX         63      /* WPA passphrase: 8..63 characters */
++#define PMK_LEN         32
++#define KCK_LEN         16
++#define KEK_LEN         16
++#define TK_LEN          16
++#define PTK_LEN         (KCK_LEN + KEK_LEN + TK_LEN)
++#define NONCE_LEN       32
++#define GTK_MAX         32
++
++struct wifi_sta {
++	struct rottenapple_wifi *w;
++	ifnet_t ifp;
++	lck_mtx_t *lock;
++	lck_grp_t *grp;
++
++	volatile unsigned state;
++	struct rottenapple_wifi_join tgt;       /* current/last target */
++	uint8_t own_mac[6];
++
++	/* WPA2-PSK material (secrets; wiped on teardown) */
++	bool have_pmk;
++	uint8_t pmk[PMK_LEN];
++	uint8_t ptk[PTK_LEN];
++	uint8_t snonce[NONCE_LEN];
++	uint8_t anonce[NONCE_LEN];
++	uint64_t replay;                        /* last replay counter seen (big-endian value) */
++	bool replay_valid;
++	uint8_t gtk[GTK_MAX];
++	uint8_t gtk_len, gtk_id;
++	volatile bool hs_done, hs_failed;
++	unsigned hs_m1, hs_m3;                  /* counts, for the log */
++
++	/* reconnect */
++	bool want_reconnect;
++	uint8_t reconnect_ssid[32];
++	uint8_t reconnect_ssid_len;
++
++	/* link info for the log */
++	char ip_text[40];
++	bool ip_set;
++};
++
++static struct wifi_sta sta;
++static bool sta_ready;
++
++/* The fixed WPA2-PSK / CCMP RSN IE (no PMF): the assoc request and EAPOL
++ * message 2 must carry the identical bytes. */
++static const uint8_t rsn_ie_wpa2_psk_ccmp[] = {
++	0x30, 0x14,                             /* RSN IE, length 20 */
++	0x01, 0x00,                             /* version 1 */
++	0x00, 0x0f, 0xac, 0x04,                 /* group cipher CCMP */
++	0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,     /* 1 pairwise cipher CCMP */
++	0x01, 0x00, 0x00, 0x0f, 0xac, 0x02,     /* 1 AKM: PSK */
++	0x00, 0x00,                             /* RSN capabilities (no PMF) */
++};
++
++/* ---- helpers ---- */
++
++static inline uint16_t
++be16(const uint8_t *p)
++{
++	return (uint16_t)((p[0] << 8) | p[1]);
++}
++
++static inline void
++put_be16(uint8_t *p, uint16_t v)
++{
++	p[0] = (uint8_t)(v >> 8);
++	p[1] = (uint8_t)v;
++}
++
++static inline uint64_t
++be64(const uint8_t *p)
++{
++	uint64_t v = 0;
++	for (unsigned i = 0; i < 8; i++) {
++		v = (v << 8) | p[i];
++	}
++	return v;
++}
++
++/* ---- Passphrase ---- */
++
++/*
++ * The passphrase, from /var/root/.wifi-psk (mode 600, root only) or, if that
++ * is absent, the write-only sysctl buffer below. Copied into out (wiped by
++ * the caller); *out_len set. ENOENT if neither is present, EINVAL on a bad
++ * length. Never logged.
++ */
++static uint8_t sysctl_psk[PSK_MAX + 1];
++static uint8_t sysctl_psk_len;
++
++static int
++psk_load(uint8_t *out, size_t *out_len)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	off_t fsize = 0;
++	char buf[PSK_MAX + 8];
++	int err, resid = 0;
++
++	/* 1. the root-only file (read quietly: never log its path, size or content) */
++	if (vnode_open("/var/root/.wifi-psk", O_RDONLY, 0, 0, &vp, ctx) == 0) {
++		if (vnode_size(vp, &fsize, ctx) == 0 && fsize > 0 && fsize <= (off_t)sizeof(buf)) {
++			err = vn_rdwr(UIO_READ, vp, buf, (int)fsize, 0, UIO_SYSSPACE, IO_NOAUTH,
++			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++			vnode_close(vp, 0, ctx);
++			if (err == 0 && resid == 0) {
++				size_t n = (size_t)fsize;
++				while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) {
++					n--;    /* strip the trailing newline the user's editor may add */
++				}
++				if (n < 8 || n > PSK_MAX) {
++					bzero(buf, sizeof(buf));
++					TLOG("passphrase file: length out of range (need 8..63 characters)");
++					return EINVAL;
++				}
++				memcpy(out, buf, n);
++				*out_len = n;
++				bzero(buf, sizeof(buf));
++				return 0;
++			}
++			bzero(buf, sizeof(buf));
++		} else {
++			vnode_close(vp, 0, ctx);
++		}
++	}
++	/* 2. the write-only sysctl */
++	if (sysctl_psk_len >= 8 && sysctl_psk_len <= PSK_MAX) {
++		memcpy(out, sysctl_psk, sysctl_psk_len);
++		*out_len = sysctl_psk_len;
++		return 0;
++	}
++	TLOG("no passphrase: create /var/root/.wifi-psk (mode 600) or write kern.rottenapple_wifi_psk");
++	return ENOENT;
++}
++
++/* ---- The Ethernet interface (en1) ---- */
++
++static errno_t
++sta_if_output(ifnet_t ifp, mbuf_t m)
++{
++	struct wifi_sta *s = &sta;
++	uint8_t frame[ETHERMTU + ETHER_HDR_LEN + 32];
++	size_t len;
++
++	if (s->state != LINK_CONNECTED || s->w->ops->tx_data == NULL) {
++		mbuf_freem(m);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return 0;
++	}
++	len = mbuf_pkthdr_len(m);
++	if (len == 0 || len > sizeof(frame)) {
++		mbuf_freem(m);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return 0;
++	}
++	if (mbuf_copydata(m, 0, len, frame) != 0) {
++		mbuf_freem(m);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return 0;
++	}
++	mbuf_freem(m);
++	int err = s->w->ops->tx_data(s->w, frame, (uint32_t)len, ROTTENAPPLE_WIFI_TX_PROTECTED);
++	if (err) {
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++	} else {
++		ifnet_stat_increment_out(ifp, 1, len, 0);
++	}
++	return 0;
++}
++
++static errno_t
++sta_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
++{
++	switch (cmd) {
++	case SIOCGIFMEDIA32:
++	case SIOCGIFMEDIA64: {
++		struct ifmediareq *ifmr = (struct ifmediareq *)data;
++		user_addr_t list = (cmd == SIOCGIFMEDIA64) ? ((struct ifmediareq64 *)ifmr)->ifmu_ulist :
++		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
++		bool up = sta.state == LINK_CONNECTED;
++		int media = IFM_ETHER | IFM_AUTO;
++		ifmr->ifm_current = media;
++		ifmr->ifm_active = up ? (IFM_ETHER | IFM_1000_T | IFM_FDX) : media;
++		ifmr->ifm_mask = 0;
++		ifmr->ifm_status = IFM_AVALID | (up ? IFM_ACTIVE : 0);
++		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
++			ifmr->ifm_count = 1;
++			return copyout(&media, list, sizeof(media));
++		}
++		ifmr->ifm_count = 1;
++		return 0;
++	}
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void
++sta_if_detach(ifnet_t ifp __unused)
++{
++}
++
++/* Create en1 once (Ethernet family, the NVRAM MAC); later connects reuse it. */
++static int
++sta_if_create(struct wifi_sta *s)
++{
++	struct ifnet_init_eparams init;
++
++	if (s->ifp != NULL) {
++		return 0;
++	}
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY;
++	init.uniqueid = "rotten-apple-wifi";
++	init.uniqueid_len = sizeof("rotten-apple-wifi") - 1;
++	init.name = "en";
++	init.unit = 1;
++	init.family = IFNET_FAMILY_ETHERNET;
++	init.type = IFT_ETHER;
++	init.output = sta_if_output;
++	init.demux = ether_demux;
++	init.add_proto = ether_add_proto;
++	init.del_proto = ether_del_proto;
++	init.check_multi = ether_check_multi;
++	init.framer_extended = ether_frameout_extended;
++	init.ioctl = sta_if_ioctl;
++	init.detach = sta_if_detach;
++	init.broadcast_addr = etherbroadcastaddr;
++	init.broadcast_len = ETHER_ADDR_LEN;
++	if (ifnet_allocate_extended(&init, &s->ifp) != 0) {
++		TLOG("en1: ifnet_allocate failed");
++		s->ifp = NULL;
++		return ENOMEM;
++	}
++	ifnet_set_addrlen(s->ifp, ETHER_ADDR_LEN);
++	ifnet_set_hdrlen(s->ifp, sizeof(struct ether_header));
++	ifnet_set_mtu(s->ifp, ETHERMTU);
++	ifnet_set_flags(s->ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++	if (ifnet_attach(s->ifp, NULL) != 0) {
++		TLOG("en1: ifnet_attach failed");
++		s->ifp = NULL;
++		return ENXIO;
++	}
++	ifnet_set_lladdr(s->ifp, s->own_mac, ETHER_ADDR_LEN);
++	(void)proto_plumb(PF_INET, s->ifp);
++	TLOG("en1 created, MAC from the NVRAM; set an address with ifconfig/ipconfig over SSH, or "
++	    "kern.rottenapple_wifi_ip");
++	return 0;
++}
++
++static void
++sta_if_link(struct wifi_sta *s, bool up)
++{
++	if (s->ifp == NULL) {
++		return;
++	}
++	if (up) {
++		ifnet_set_flags(s->ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++	} else {
++		ifnet_set_flags(s->ifp, 0, IFF_RUNNING);
++	}
++	dlil_post_msg(s->ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
++}
++
++/* Deliver one received Ethernet frame to en1 (sweet_usb.c pattern). */
++static void
++sta_if_input(struct wifi_sta *s, const uint8_t *eth, uint32_t len)
++{
++	mbuf_t m = NULL;
++
++	if (s->ifp == NULL || len < ETHER_HDR_LEN) {
++		return;
++	}
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
++	    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 || !(mbuf_flags(m) & MBUF_EXT) ||
++	    mbuf_maxlen(m) < len) {
++		if (m) {
++			mbuf_freem(m);
++		}
++		return;
++	}
++	struct ifnet_stat_increment_param stats = {};
++	memcpy(mbuf_data(m), eth, len);
++	mbuf_setlen(m, len);
++	mbuf_pkthdr_setlen(m, len);
++	void *fh = mbuf_data(m);
++	mbuf_pkthdr_setrcvif(m, s->ifp);
++	mbuf_pkthdr_setheader(m, fh);
++	mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++	(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++	stats.packets_in = 1;
++	stats.bytes_in = len;
++	ifnet_input(s->ifp, m, &stats);
++}
++
++/* ---- 4-way handshake supplicant ---- */
++
++#define EAPOL_TYPE_KEY          3
++#define KEY_DESC_RSN            2
++
++/* key_info bits */
++#define KI_VER_MASK             0x0007
++#define KI_PAIRWISE             0x0008
++#define KI_INSTALL              0x0040
++#define KI_ACK                  0x0080
++#define KI_MIC                  0x0100
++#define KI_SECURE               0x0200
++#define KI_ERROR                0x0400
++#define KI_REQUEST              0x0800
++#define KI_ENCRYPTED            0x1000
++
++/* Offsets inside the EAPOL-Key body (after the 4-byte EAPOL header) */
++#define K_DESC_TYPE             0
++#define K_INFO                  1       /* 2 bytes */
++#define K_LEN                   3       /* 2 bytes */
++#define K_REPLAY                5       /* 8 bytes */
++#define K_NONCE                 13      /* 32 bytes */
++#define K_IV                    45      /* 16 bytes */
++#define K_RSC                   61      /* 8 bytes */
++#define K_RESERVED              69      /* 8 bytes */
++#define K_MIC                   77      /* 16 bytes (SHA1) */
++#define K_DATA_LEN              93      /* 2 bytes */
++#define K_DATA                  95
++#define EAPOL_HDR               4
++#define EAPOL_KEY_FIXED         (EAPOL_HDR + K_DATA)    /* up to key_data */
++
++/* Build the PTK from the PMK and the two nonces/MACs (IEEE 802.11i). */
++static void
++ptk_derive(struct wifi_sta *s)
++{
++	const uint8_t *aa = s->tgt.bssid, *spa = s->own_mac;
++	uint8_t data[2 * 6 + 2 * NONCE_LEN];
++	const uint8_t *n1 = s->anonce, *n2 = s->snonce;
++	size_t o = 0;
++
++	/* min(AA,SPA) || max(AA,SPA) */
++	if (memcmp(aa, spa, 6) < 0) {
++		memcpy(data + o, aa, 6);
++		o += 6;
++		memcpy(data + o, spa, 6);
++		o += 6;
++	} else {
++		memcpy(data + o, spa, 6);
++		o += 6;
++		memcpy(data + o, aa, 6);
++		o += 6;
++	}
++	/* min(ANonce,SNonce) || max(ANonce,SNonce) */
++	if (memcmp(n1, n2, NONCE_LEN) < 0) {
++		memcpy(data + o, n1, NONCE_LEN);
++		o += NONCE_LEN;
++		memcpy(data + o, n2, NONCE_LEN);
++		o += NONCE_LEN;
++	} else {
++		memcpy(data + o, n2, NONCE_LEN);
++		o += NONCE_LEN;
++		memcpy(data + o, n1, NONCE_LEN);
++		o += NONCE_LEN;
++	}
++	ra_prf(s->pmk, PMK_LEN, "Pairwise key expansion", data, o, s->ptk, PTK_LEN);
++	bzero(data, sizeof(data));
++}
++
++/* MIC (key descriptor version 2 = HMAC-SHA1-128) over frame with MIC zeroed. */
++static void
++eapol_mic(struct wifi_sta *s, uint8_t *frame, size_t len)
++{
++	uint8_t full[RA_SHA1_LEN];
++
++	bzero(frame + EAPOL_HDR + K_MIC, 16);
++	ra_hmac_sha1(s->ptk /* KCK */, KCK_LEN, frame, len, full);
++	memcpy(frame + EAPOL_HDR + K_MIC, full, 16);
++	bzero(full, sizeof(full));
++}
++
++static int
++eapol_tx(struct wifi_sta *s, uint8_t *key_body, size_t body_len)
++{
++	uint8_t frame[14 + EAPOL_HDR + K_DATA + 128];
++	size_t total = 14 + EAPOL_HDR + body_len;
++
++	if (s->w->ops->tx_data == NULL || total > sizeof(frame)) {
++		return EINVAL;
++	}
++	/* 802.3 header: dest = BSSID, src = own, ethertype 0x888E (EAPOL) */
++	memcpy(frame, s->tgt.bssid, 6);
++	memcpy(frame + 6, s->own_mac, 6);
++	frame[12] = 0x88;
++	frame[13] = 0x8e;
++	/* EAPOL header: version 2, type Key, length (body) */
++	frame[14] = 2;
++	frame[15] = EAPOL_TYPE_KEY;
++	put_be16(frame + 16, (uint16_t)body_len);
++	memcpy(frame + 18, key_body, body_len);
++	/* EAPOL-Key frames are sent on the unauthorized port: no HW encryption */
++	int err = s->w->ops->tx_data(s->w, frame, (uint32_t)total, 0);
++	bzero(frame, sizeof(frame));
++	return err;
++}
++
++/* Build and send message 2 (SNonce + our RSN IE, MIC under KCK). */
++static int
++eapol_send_m2(struct wifi_sta *s, const uint8_t *m1)
++{
++	uint8_t body[K_DATA + sizeof(rsn_ie_wpa2_psk_ccmp)];
++	uint8_t frame[14 + EAPOL_HDR + sizeof(body)];
++	size_t body_len = K_DATA + sizeof(rsn_ie_wpa2_psk_ccmp);
++	uint16_t ki = (be16(m1 + K_INFO) & KI_VER_MASK) | KI_PAIRWISE | KI_MIC;
++
++	bzero(body, sizeof(body));
++	body[K_DESC_TYPE] = KEY_DESC_RSN;
++	put_be16(body + K_INFO, ki);
++	put_be16(body + K_LEN, 0);
++	memcpy(body + K_REPLAY, m1 + K_REPLAY, 8);
++	memcpy(body + K_NONCE, s->snonce, NONCE_LEN);
++	put_be16(body + K_DATA_LEN, sizeof(rsn_ie_wpa2_psk_ccmp));
++	memcpy(body + K_DATA, rsn_ie_wpa2_psk_ccmp, sizeof(rsn_ie_wpa2_psk_ccmp));
++
++	/* assemble the full frame so the MIC covers the EAPOL header + body */
++	memcpy(frame, s->tgt.bssid, 6);
++	memcpy(frame + 6, s->own_mac, 6);
++	frame[12] = 0x88;
++	frame[13] = 0x8e;
++	frame[14] = 2;
++	frame[15] = EAPOL_TYPE_KEY;
++	put_be16(frame + 16, (uint16_t)body_len);
++	memcpy(frame + 18, body, body_len);
++	eapol_mic(s, frame + 14, EAPOL_HDR + body_len);
++	int err = s->w->ops->tx_data(s->w, frame, (uint32_t)(14 + EAPOL_HDR + body_len), 0);
++	bzero(frame, sizeof(frame));
++	bzero(body, sizeof(body));
++	return err;
++}
++
++/* Build and send message 4 (acknowledge, MIC under KCK, secure bit set). */
++static int
++eapol_send_m4(struct wifi_sta *s, const uint8_t *m3)
++{
++	uint8_t frame[14 + EAPOL_HDR + K_DATA];
++	size_t body_len = K_DATA;       /* no key data */
++	uint16_t ki = (be16(m3 + K_INFO) & KI_VER_MASK) | KI_PAIRWISE | KI_MIC | KI_SECURE;
++
++	memcpy(frame, s->tgt.bssid, 6);
++	memcpy(frame + 6, s->own_mac, 6);
++	frame[12] = 0x88;
++	frame[13] = 0x8e;
++	frame[14] = 2;
++	frame[15] = EAPOL_TYPE_KEY;
++	put_be16(frame + 16, (uint16_t)body_len);
++	uint8_t *body = frame + 18;
++	bzero(body, body_len);
++	body[K_DESC_TYPE] = KEY_DESC_RSN;
++	put_be16(body + K_INFO, ki);
++	memcpy(body + K_REPLAY, m3 + K_REPLAY, 8);
++	put_be16(body + K_DATA_LEN, 0);
++	eapol_mic(s, frame + 14, EAPOL_HDR + body_len);
++	int err = s->w->ops->tx_data(s->w, frame, (uint32_t)(14 + EAPOL_HDR + body_len), 0);
++	bzero(frame, sizeof(frame));
++	return err;
++}
++
++/* Extract the GTK from the (already unwrapped) key-data KDEs of message 3. */
++static bool
++gtk_from_kde(struct wifi_sta *s, const uint8_t *kd, size_t kd_len)
++{
++	size_t o = 0;
++
++	while (o + 2 <= kd_len) {
++		uint8_t id = kd[o], len = kd[o + 1];
++		if (id == 0xdd && len >= 4 && o + 2 + len <= kd_len) {
++			const uint8_t *p = kd + o + 2;
++			if (p[0] == 0x00 && p[1] == 0x0f && p[2] == 0xac && p[3] == 0x01) {
++				/* GTK KDE: OUI 00-0F-AC type 1, then {keyid[0:1], tx}, rsvd, GTK */
++				if (len >= 6) {
++					s->gtk_id = p[4] & 0x03;
++					uint8_t glen = (uint8_t)(len - 6);
++					if (glen > GTK_MAX) {
++						glen = GTK_MAX;
++					}
++					memcpy(s->gtk, p + 6, glen);
++					s->gtk_len = glen;
++					return true;
++				}
++			}
++		} else if (id == 0x00 && len == 0) {
++			break;          /* padding */
++		}
++		if (len == 0) {
++			break;
++		}
++		o += 2 + len;
++	}
++	return false;
++}
++
++/* Install the PTK and GTK, open the port; called with sta.lock held. */
++static int
++install_keys(struct wifi_sta *s)
++{
++	struct rottenapple_wifi_key k;
++	int err;
++
++	/* Pairwise: the TK is the last 16 bytes of the PTK */
++	bzero(&k, sizeof(k));
++	k.type = ROTTENAPPLE_WIFI_KEY_PAIRWISE;
++	k.cipher = ROTTENAPPLE_WIFI_CIPHER_CCMP;
++	k.key_id = 0;
++	k.key_len = TK_LEN;
++	memcpy(k.key, s->ptk + KCK_LEN + KEK_LEN, TK_LEN);
++	memcpy(k.peer, s->tgt.bssid, 6);
++	err = s->w->ops->set_key(s->w, &k);
++	bzero(&k, sizeof(k));
++	if (err) {
++		TLOG("install the pairwise key: FAILED (%d)", err);
++		return err;
++	}
++	/* Group */
++	bzero(&k, sizeof(k));
++	k.type = ROTTENAPPLE_WIFI_KEY_GROUP;
++	k.cipher = ROTTENAPPLE_WIFI_CIPHER_CCMP;
++	k.key_id = s->gtk_id;
++	k.key_len = s->gtk_len == 16 ? 16 : 16;         /* CCMP group key is 16 bytes */
++	memcpy(k.key, s->gtk, MIN(s->gtk_len, (uint8_t)32));
++	err = s->w->ops->set_key(s->w, &k);
++	bzero(&k, sizeof(k));
++	if (err) {
++		TLOG("install the group key: FAILED (%d)", err);
++		return err;
++	}
++	if (s->w->ops->set_port) {
++		err = s->w->ops->set_port(s->w, true);
++		if (err) {
++			TLOG("open the controlled port: FAILED (%d)", err);
++			return err;
++		}
++	}
++	return 0;
++}
++
++/* One EAPOL-Key frame received on the data path (called on the receive thread). */
++static void
++eapol_input(struct wifi_sta *s, const uint8_t *eapol, uint32_t len)
++{
++	const uint8_t *body;
++	uint16_t ki;
++	uint64_t replay;
++
++	if (len < EAPOL_HDR + K_DATA || eapol[15] != EAPOL_TYPE_KEY) {
++		return;
++	}
++	body = eapol + EAPOL_HDR;
++	if (body[K_DESC_TYPE] != KEY_DESC_RSN) {
++		return;
++	}
++	ki = be16(body + K_INFO);
++	if (!(ki & KI_PAIRWISE)) {
++		return;         /* only the pairwise 4-way handshake here (no group rekey yet) */
++	}
++	replay = be64(body + K_REPLAY);
++
++	lck_mtx_lock(s->lock);
++	/* accept EAPOL once we have the PMK: M1 can arrive between the assoc
++	 * response and the join thread setting LINK_4WAY */
++	if ((s->state != LINK_4WAY && s->state != LINK_JOINING) || !s->have_pmk) {
++		lck_mtx_unlock(s->lock);
++		return;
++	}
++	if ((ki & (KI_ACK | KI_MIC)) == KI_ACK) {
++		/* ---- Message 1: ANonce, no MIC ---- */
++		if (s->replay_valid && replay <= s->replay) {
++			lck_mtx_unlock(s->lock);
++			return;         /* replay/old */
++		}
++		s->replay = replay;
++		s->replay_valid = true;
++		memcpy(s->anonce, body + K_NONCE, NONCE_LEN);
++		read_random(s->snonce, NONCE_LEN);
++		ptk_derive(s);
++		s->hs_m1++;
++		int err = eapol_send_m2(s, body);
++		lck_mtx_unlock(s->lock);
++		if (err) {
++			TLOG("4-way: message 2 not sent (%d)", err);
++		}
++		return;
++	}
++	if ((ki & (KI_ACK | KI_MIC | KI_ENCRYPTED)) == (KI_ACK | KI_MIC | KI_ENCRYPTED)) {
++		/* ---- Message 3: MIC + encrypted GTK ---- */
++		uint8_t check[RA_SHA1_LEN], saved[16];
++		uint8_t *frame;
++		uint16_t kd_len = be16(body + K_DATA_LEN);
++		uint32_t need = EAPOL_HDR + K_DATA + kd_len;
++
++		if (replay < s->replay || need > len || kd_len < 24 || (kd_len % 8) != 0) {
++			lck_mtx_unlock(s->lock);
++			TLOG("4-way: message 3 malformed or stale");
++			return;
++		}
++		/* verify the MIC: copy, zero the MIC field, HMAC under KCK */
++		frame = kalloc_data(need, Z_WAITOK);
++		if (frame == NULL) {
++			lck_mtx_unlock(s->lock);
++			return;
++		}
++		memcpy(frame, eapol, need);
++		memcpy(saved, frame + EAPOL_HDR + K_MIC, 16);
++		bzero(frame + EAPOL_HDR + K_MIC, 16);
++		ra_hmac_sha1(s->ptk, KCK_LEN, frame, need, check);
++		if (memcmp(check, saved, 16) != 0) {
++			kfree_data(frame, need);
++			lck_mtx_unlock(s->lock);
++			TLOG("4-way: message 3 MIC mismatch (wrong passphrase?)");
++			s->hs_failed = true;
++			thread_wakeup((event_t)&s->hs_done);
++			return;
++		}
++		if (memcmp(body + K_NONCE, s->anonce, NONCE_LEN) != 0) {
++			kfree_data(frame, need);
++			lck_mtx_unlock(s->lock);
++			TLOG("4-way: message 3 ANonce changed");
++			return;
++		}
++		s->replay = replay;
++		/* decrypt the key data (AES unwrap with the KEK) */
++		uint8_t kd[256];
++		if (kd_len - 8 > sizeof(kd) ||
++		    ra_aes_unwrap(s->ptk + KCK_LEN /* KEK */, eapol + EAPOL_HDR + K_DATA, kd_len, kd) != 0) {
++			kfree_data(frame, need);
++			lck_mtx_unlock(s->lock);
++			TLOG("4-way: message 3 key-data unwrap failed");
++			s->hs_failed = true;
++			thread_wakeup((event_t)&s->hs_done);
++			return;
++		}
++		bool got_gtk = gtk_from_kde(s, kd, kd_len - 8);
++		bzero(kd, sizeof(kd));
++		kfree_data(frame, need);
++		s->hs_m3++;
++		int err = eapol_send_m4(s, body);
++		if (err == 0 && got_gtk) {
++			err = install_keys(s);
++		} else if (!got_gtk) {
++			err = EINVAL;
++			TLOG("4-way: message 3 had no GTK");
++		}
++		s->hs_failed = err != 0;
++		s->hs_done = true;
++		lck_mtx_unlock(s->lock);
++		thread_wakeup((event_t)&s->hs_done);
++		return;
++	}
++	lck_mtx_unlock(s->lock);
++}
++
++/* ---- RX dispatch (backend -> core) ---- */
++
++void
++rottenapple_wifi_rx_data(struct rottenapple_wifi *w, const uint8_t *eth, uint32_t len)
++{
++	struct wifi_sta *s = &sta;
++
++	if (!sta_ready || s->w != w || len < ETHER_HDR_LEN) {
++		return;
++	}
++	if (eth[12] == 0x88 && eth[13] == 0x8e) {
++		eapol_input(s, eth + ETHER_HDR_LEN, len - ETHER_HDR_LEN);
++		return;
++	}
++	if (s->state == LINK_CONNECTED) {
++		sta_if_input(s, eth, len);
++	}
++}
++
++/* ---- Join / disconnect ---- */
++
++static void
++sta_teardown_locked(struct wifi_sta *s, bool tell_firmware)
++{
++	if (tell_firmware && s->w->ops->disconnect && s->state != LINK_IDLE) {
++		s->w->ops->disconnect(s->w);
++	}
++	sta_if_link(s, false);
++	s->state = LINK_IDLE;
++	s->have_pmk = false;
++	s->hs_done = false;
++	s->hs_failed = false;
++	s->replay_valid = false;
++	bzero(s->pmk, sizeof(s->pmk));
++	bzero(s->ptk, sizeof(s->ptk));
++	bzero(s->gtk, sizeof(s->gtk));
++	bzero(s->snonce, sizeof(s->snonce));
++}
++
++#define JOIN_HS_TIMEOUT_MS      5000
++
++static int
++sta_join(struct wifi_sta *s, const uint8_t *ssid, uint8_t ssid_len)
++{
++	struct rottenapple_wifi_join jp;
++	int err;
++
++	if (rottenapple_wifi_running() != s->w) {
++		TLOG("join refused: Wi-Fi is not running (bring it up with rottenapple_wifi=5/6)");
++		return ENXIO;
++	}
++	if (!rottenapple_wifi_scan_lookup(ssid, ssid_len, &jp)) {
++		TLOG("join: \"%.*s\" not in the last scan; scan first (kern.rottenapple_wifi_scan=1)", ssid_len, ssid);
++		return ENOENT;
++	}
++	if (jp.security != ROTTENAPPLE_WIFI_SEC_OPEN && jp.security != ROTTENAPPLE_WIFI_SEC_WPA2_PSK) {
++		TLOG("join: \"%.*s\" uses an unsupported security (only open and WPA2-PSK CCMP are handled)",
++		    ssid_len, ssid);
++		return ENOTSUP;
++	}
++	if (s->w->ops->join == NULL || s->w->ops->tx_data == NULL) {
++		return ENOTSUP;
++	}
++
++	lck_mtx_lock(s->lock);
++	if (s->state != LINK_IDLE) {
++		sta_teardown_locked(s, true);
++	}
++	memcpy(s->own_mac, s->w->mac, 6);
++	s->tgt = jp;
++	s->replay_valid = false;
++	s->hs_done = false;
++	s->hs_failed = false;
++	s->have_pmk = false;
++	if (jp.security == ROTTENAPPLE_WIFI_SEC_WPA2_PSK) {
++		uint8_t psk[PSK_MAX];
++		size_t psk_len = 0;
++		err = psk_load(psk, &psk_len);
++		if (err) {
++			lck_mtx_unlock(s->lock);
++			return err;
++		}
++		/* PMK = PBKDF2-SHA1(passphrase, SSID, 4096, 32) */
++		ra_pbkdf2_sha1(psk, psk_len, ssid, ssid_len, 4096, s->pmk, PMK_LEN);
++		bzero(psk, sizeof(psk));
++		s->have_pmk = true;
++	}
++	s->state = LINK_JOINING;
++	lck_mtx_unlock(s->lock);
++
++	TLOG("join: \"%.*s\" ch %u (%s GHz), %s", ssid_len, ssid, jp.channel, jp.channel <= 14 ? "2.4" : "5",
++	    jp.security == ROTTENAPPLE_WIFI_SEC_WPA2_PSK ? "WPA2-PSK CCMP" : "open");
++
++	err = s->w->ops->join(s->w, &jp);      /* auth + association (blocks) */
++	if (err) {
++		TLOG("join: association FAILED (%d)", err);
++		lck_mtx_lock(s->lock);
++		sta_teardown_locked(s, true);
++		lck_mtx_unlock(s->lock);
++		return err;
++	}
++	s->tgt.aid = jp.aid;
++	TLOG("associated: AID %u; %s", jp.aid, jp.security == ROTTENAPPLE_WIFI_SEC_WPA2_PSK ?
++	    "starting the 4-way handshake" : "open network, no handshake");
++
++	if (jp.security == ROTTENAPPLE_WIFI_SEC_WPA2_PSK) {
++		uint64_t deadline;
++		lck_mtx_lock(s->lock);
++		s->state = LINK_4WAY;
++		clock_interval_to_deadline(JOIN_HS_TIMEOUT_MS, NSEC_PER_MSEC, &deadline);
++		while (!s->hs_done && mach_absolute_time() < deadline) {
++			(void)lck_mtx_sleep_deadline(s->lock, LCK_SLEEP_DEFAULT, (event_t)&s->hs_done,
++			    THREAD_UNINT, deadline);
++		}
++		bool ok = s->hs_done && !s->hs_failed;
++		if (!ok) {
++			sta_teardown_locked(s, true);
++			lck_mtx_unlock(s->lock);
++			TLOG("4-way handshake %s", s->hs_done ? "failed" : "timed out (no EAPOL from the AP)");
++			return s->hs_done ? EACCES : ETIMEDOUT;
++		}
++		lck_mtx_unlock(s->lock);
++		TLOG("4-way handshake done: PTK and GTK (id %u) installed, controlled port open", s->gtk_id);
++	} else if (s->w->ops->set_port) {
++		(void)s->w->ops->set_port(s->w, true);
++	}
++
++	lck_mtx_lock(s->lock);
++	if (sta_if_create(s) == 0) {
++		sta_if_link(s, true);
++		s->state = LINK_CONNECTED;
++	}
++	/* remember for a reconnect */
++	memcpy(s->reconnect_ssid, ssid, ssid_len);
++	s->reconnect_ssid_len = ssid_len;
++	s->want_reconnect = true;
++	lck_mtx_unlock(s->lock);
++	TLOG("connected: en1 up with the NVRAM MAC; configure IP over SSH (ifconfig/ipconfig) or "
++	    "kern.rottenapple_wifi_ip");
++	return 0;
++}
++
++void
++rottenapple_wifi_link_lost(struct rottenapple_wifi *w, const char *reason)
++{
++	struct wifi_sta *s = &sta;
++
++	if (!sta_ready || s->w != w) {
++		return;
++	}
++	lck_mtx_lock(s->lock);
++	if (s->state == LINK_IDLE) {
++		lck_mtx_unlock(s->lock);
++		return;
++	}
++	TLOG("link lost (%s); disconnecting", reason ? reason : "");
++	bool reconnect = s->want_reconnect;
++	uint8_t ssid[32], ssid_len = s->reconnect_ssid_len;
++	memcpy(ssid, s->reconnect_ssid, ssid_len);
++	sta_teardown_locked(s, true);
++	lck_mtx_unlock(s->lock);
++	/* a single best-effort reconnect attempt using the last scan list */
++	if (reconnect && ssid_len) {
++		TLOG("reconnecting to \"%.*s\"", ssid_len, ssid);
++		(void)sta_join(s, ssid, ssid_len);
++	}
++}
++
++void
++rottenapple_wifi_sta_stop(struct rottenapple_wifi *w)
++{
++	struct wifi_sta *s = &sta;
++
++	if (!sta_ready || s->w != w) {
++		return;
++	}
++	lck_mtx_lock(s->lock);
++	s->want_reconnect = false;
++	sta_teardown_locked(s, false);  /* firmware is being torn down anyway */
++	lck_mtx_unlock(s->lock);
++}
++
++/* ---- sysctls ---- */
++
++static int
++sysctl_wifi_join SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	char ssid[33];
++	int err, changed = 0;
++	size_t slen;
++
++	bzero(ssid, sizeof(ssid));
++	if (sta.state >= LINK_JOINING && sta.tgt.ssid_len) {
++		memcpy(ssid, sta.tgt.ssid, sta.tgt.ssid_len);
++	}
++	err = sysctl_io_string(req, ssid, sizeof(ssid), 0, &changed);
++	if (err || !changed) {
++		return err;
++	}
++	slen = strnlen(ssid, 32);
++	if (slen == 0) {
++		/* empty write = disconnect */
++		lck_mtx_lock(sta.lock);
++		sta.want_reconnect = false;
++		sta_teardown_locked(&sta, true);
++		lck_mtx_unlock(sta.lock);
++		TLOG("disconnected (empty join)");
++		return 0;
++	}
++	return sta_join(&sta, (const uint8_t *)ssid, (uint8_t)slen);
++}
++SYSCTL_PROC(_kern, OID_AUTO, rottenapple_wifi_join, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_wifi_join, "A", "rotten-apple Wi-Fi: write an SSID to join (empty to disconnect)");
++
++/* write-only passphrase; never readable back, wiped once a PMK is derived */
++static int
++sysctl_wifi_psk SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	char buf[PSK_MAX + 1];
++	int err, changed = 0;
++
++	if (req->newptr == USER_ADDR_NULL) {
++		/* reads give nothing */
++		return SYSCTL_OUT(req, "", 1);
++	}
++	bzero(buf, sizeof(buf));
++	err = sysctl_io_string(req, buf, sizeof(buf), 0, &changed);
++	if (err) {
++		bzero(buf, sizeof(buf));
++		return err;
++	}
++	size_t n = strnlen(buf, PSK_MAX);
++	if (n < 8 || n > PSK_MAX) {
++		bzero(buf, sizeof(buf));
++		return EINVAL;
++	}
++	memcpy(sysctl_psk, buf, n);
++	sysctl_psk_len = (uint8_t)n;
++	bzero(buf, sizeof(buf));
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, rottenapple_wifi_psk, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_wifi_psk, "A", "rotten-apple Wi-Fi: write-only WPA2 passphrase (not readable)");
++
++static int
++sysctl_wifi_link SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	char buf[256];
++	struct wifi_sta *s = &sta;
++	const uint8_t *b = s->tgt.bssid;
++	size_t n;
++
++	if (req->newptr != USER_ADDR_NULL) {
++		return EPERM;
++	}
++	if (s->state == LINK_IDLE) {
++		n = (size_t)snprintf(buf, sizeof(buf), "state: idle (not associated)\n");
++	} else {
++		n = (size_t)snprintf(buf, sizeof(buf),
++		    "state: %s\nssid: \"%.*s\"\nbssid: %02x:%02x:%02x:%02x:%02x:%02x\nchannel: %u (%s GHz)\n"
++		    "security: %s\naid: %u\nmessages: M1 %u M3 %u\nip: %s\n",
++		    link_name[s->state], s->tgt.ssid_len, s->tgt.ssid, b[0], b[1], b[2], b[3], b[4], b[5],
++		    s->tgt.channel, s->tgt.channel <= 14 ? "2.4" : "5",
++		    s->tgt.security == ROTTENAPPLE_WIFI_SEC_WPA2_PSK ? "WPA2-PSK CCMP" : "open",
++		    s->tgt.aid, s->hs_m1, s->hs_m3, s->ip_set ? s->ip_text : "(set with ifconfig/ipconfig)");
++	}
++	n = MIN(n, sizeof(buf) - 1);
++	buf[n] = '\0';
++	return SYSCTL_OUT(req, buf, n + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, rottenapple_wifi_link, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_wifi_link, "A", "rotten-apple Wi-Fi: link state, BSSID, channel, security, AID, IP");
++
++/*
++ * Optional static IP: write "A.B.C.D/prefix" (optionally " gw E.F.G.H") to
++ * give en1 an address and, with a gateway, a host route to it over en1
++ * without touching the default route. DHCP from userland is preferred.
++ */
++static int
++sta_set_ipv4(struct wifi_sta *s, uint32_t addr, uint32_t mask, uint32_t gw)
++{
++	socket_t so = NULL;
++	struct ifaliasreq ifra;
++	struct sockaddr_in *a;
++	int err;
++
++	if (s->ifp == NULL) {
++		return ENXIO;
++	}
++	err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
++	if (err) {
++		return err;
++	}
++	bzero(&ifra, sizeof(ifra));
++	snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "en1");
++	a = (struct sockaddr_in *)&ifra.ifra_addr;
++	a->sin_len = sizeof(*a);
++	a->sin_family = AF_INET;
++	a->sin_addr.s_addr = htonl(addr);
++	a = (struct sockaddr_in *)&ifra.ifra_mask;
++	a->sin_len = sizeof(*a);
++	a->sin_family = AF_INET;
++	a->sin_addr.s_addr = htonl(mask);
++	a = (struct sockaddr_in *)&ifra.ifra_broadaddr;
++	a->sin_len = sizeof(*a);
++	a->sin_family = AF_INET;
++	a->sin_addr.s_addr = htonl((addr & mask) | ~mask);
++	err = sock_ioctl(so, SIOCAIFADDR, &ifra);
++	sock_close(so);
++	if (err == 0) {
++		snprintf(s->ip_text, sizeof(s->ip_text), "%u.%u.%u.%u", (addr >> 24) & 0xff, (addr >> 16) & 0xff,
++		    (addr >> 8) & 0xff, addr & 0xff);
++		s->ip_set = true;
++	}
++	(void)gw;       /* a host route to the gateway can be added with `route` over SSH */
++	return err;
++}
++
++static int
++sysctl_wifi_ip SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	char buf[48];
++	int err, changed = 0;
++	unsigned v[4] = { 0, 0, 0, 0 }, pfx = 24, part = 0, digits = 0;
++	bool in_prefix = false;
++
++	bzero(buf, sizeof(buf));
++	if (sta.ip_set) {
++		strlcpy(buf, sta.ip_text, sizeof(buf));
++	}
++	err = sysctl_io_string(req, buf, sizeof(buf), 0, &changed);
++	if (err || !changed) {
++		return err;
++	}
++	/* parse "A.B.C.D" or "A.B.C.D/prefix" by hand (no sscanf in the kernel) */
++	for (const char *p = buf; *p && *p != ' '; p++) {
++		if (*p >= '0' && *p <= '9') {
++			unsigned *t = in_prefix ? &pfx : &v[part];
++			if (digits == 0 && !in_prefix) {
++				*t = 0;
++			}
++			if (in_prefix && digits == 0) {
++				pfx = 0;
++			}
++			*t = *t * 10 + (unsigned)(*p - '0');
++			digits++;
++		} else if (*p == '.' && !in_prefix) {
++			if (++part > 3) {
++				return EINVAL;
++			}
++			digits = 0;
++		} else if (*p == '/' && !in_prefix) {
++			in_prefix = true;
++			digits = 0;
++		} else {
++			return EINVAL;
++		}
++	}
++	if (part != 3 || v[0] > 255 || v[1] > 255 || v[2] > 255 || v[3] > 255 || pfx > 32) {
++		return EINVAL;
++	}
++	uint32_t addr = (v[0] << 24) | (v[1] << 16) | (v[2] << 8) | v[3];        /* host order */
++	uint32_t mask = pfx == 0 ? 0 : (0xffffffffu << (32 - pfx));
++	return sta_set_ipv4(&sta, addr, mask, 0);
++}
++SYSCTL_PROC(_kern, OID_AUTO, rottenapple_wifi_ip, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_wifi_ip, "A", "rotten-apple Wi-Fi: optional static IPv4 for en1 as A.B.C.D/prefix");
++
++/* ---- init ---- */
++
++void
++rottenapple_wifi_sta_init(struct rottenapple_wifi *w)
++{
++	if (sta_ready) {
++		return;
++	}
++	bzero(&sta, sizeof(sta));
++	sta.w = w;
++	sta.state = LINK_IDLE;
++	sta.grp = lck_grp_alloc_init("rottenapple_wifi_sta", LCK_GRP_ATTR_NULL);
++	sta.lock = lck_mtx_alloc_init(sta.grp, LCK_ATTR_NULL);
++	sta_ready = true;
++	TLOG("station layer ready: join with kern.rottenapple_wifi_join, passphrase in /var/root/.wifi-psk");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

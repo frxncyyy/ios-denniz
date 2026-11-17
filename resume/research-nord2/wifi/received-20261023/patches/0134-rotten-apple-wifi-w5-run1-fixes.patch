@@ -1,0 +1,276 @@
+--- a/bsd/dev/rottenapple_mtk_wlan.c
++++ b/bsd/dev/rottenapple_mtk_wlan.c
+@@ -883,15 +883,28 @@ ev_assert(__unused struct rottenapple_wifi *w, const struct rottenapple_wifi_eve
+ 	LLOG("FIRMWARE ASSERT DUMP event (%u bytes): \"%s\"", ev->len, text);
+ }
+ 
+-/* INIT_EVENT_CMD_RESULT {u8 status, u8 CID, 2 x 0}: gen4m "FW not support cmd" */
++/*
++ * EVENT_ID_INIT_EVENT_CMD_RESULT (0xFD) {u8 status, u8 CID, 2 x 0}
++ * (wsys_cmd_handler_fw.h struct INIT_EVENT_CMD_RESULT: status 0 = success,
++ * 0xFE = command not supported, others = failure). W5 run 1: CMD 0x1C
++ * CH_PRIVILEGE got one with status 0 and CID 0x00, i.e. a generic result,
++ * not a rejection; only a non-zero status counts as rejected.
++ */
+ static void
+ ev_cmd_result(__unused struct rottenapple_wifi *w, const struct rottenapple_wifi_event *ev, void *arg)
+ {
+ 	struct mtk_wlan *l = arg;
++	uint8_t st = ev->len >= 1 ? ev->body[0] : 0xff, cid = ev->len >= 2 ? ev->body[1] : 0;
+ 
++	if (st == 0) {
++		LLOG("generic command result (event 0xfd) seq %u: status 0 (success), CID field 0x%02x, body %02x %02x %02x "
++		    "%02x", ev->seq, cid, st, cid, ev->len >= 3 ? ev->body[2] : 0,
++		    ev->len >= 4 ? ev->body[3] : 0);
++		return;
++	}
+ 	l->rejected++;
+-	LLOG("firmware did not handle command 0x%02x (seq %u): status %u", ev->len >= 2 ? ev->body[1] : 0, ev->seq,
+-	    ev->len >= 1 ? ev->body[0] : 0);
++	LLOG("firmware %s command 0x%02x (seq %u): status 0x%02x", st == 0xfe ? "does not support" : "rejected", cid,
++	    ev->seq, st);
+ }
+ 
+ /*
+@@ -997,6 +1010,26 @@ wl_rx_frame(struct mtk_wlan *l, const uint8_t *p, uint32_t len, unsigned ring)
+ 	}
+ 	const uint8_t *f = p + off;
+ 	uint32_t flen = bytes - off;
++	/*
++	 * W5 run 1 decode (gen4m HW_MAC_RX_DESC, nic_rxd_v1_fill_rfb): the EAPOL
++	 * M1 came as DW0 0x5fb100c7 = 199 bytes, packet type 2 (RX_DATA), groups
++	 * 0xf (4+1+2+3 = 64 bytes after the 20-byte RXD); DW1 0x00ce0602 =
++	 * channel 6, header byte 0xce = translated (bit 7) + 2-byte offset
++	 * (bit 6) + header length 14 (an 802.3 header); DW2 0xc0000004 = WLAN
++	 * index 4 (our STA record). So the 802.3 frame starts at 20 + 64 + 2 =
++	 * 86 and is 113 bytes: 14 + a 99-byte EAPOL-Key. The 0x4e00.. packets
++	 * (groups 1+2+3, header 0x18 = 24, not translated, WLAN 0xff, status bit
++	 * 9 LLC mismatch) are group-addressed 802.11 data still encrypted with
++	 * the GTK we do not have yet.
++	 */
++	if (type == RX_PKT_TYPE_RX_DATA && l->rx_data_logs < 12 && (l->connected || l->join_active)) {
++		l->rx_data_logs++;
++		LLOG("RX data: %u bytes, groups 0x%x, header %s length %u%s at +%u, WLAN %u, status 0x%04x, %s", bytes, groups,
++		    (p[RXD_HDR] & RXD_HDR_TRAN) ? "802.3 (translated)" : "802.11", p[RXD_HDR] & 0x3f,
++		    (p[RXD_HDR] & RXD_HDR_OFFSET) ? " +2" : "", off, p[8], le16(p + RXD_STATUS),
++		    (p[RXD_HDR] & RXD_HDR_TRAN) && flen >= 14 ? (f[12] == 0x88 && f[13] == 0x8e ? "EtherType 0x888E (EAPOL)" :
++		    "EtherType other") : ((f[1] & 0x40) ? "protected (not decrypted)" : "plain"));
++	}
+ 	if (p[RXD_HDR] & RXD_HDR_TRAN) {
+ 		/* the firmware translated the 802.11 header: f is an 802.3 frame */
+ 		l->rx_data_frames++;
+@@ -1491,8 +1524,19 @@ ev_tx_done(__unused struct rottenapple_wifi *w, const struct rottenapple_wifi_ev
+ {
+ 	struct mtk_wlan *l = arg;
+ 
+-	if (ev->len >= 2 && ev->body[1] != 0) {
+-		l->tx_fails++;          /* EVENT_TX_DONE: ucPacketSeq(PID), ucStatus */
++	/* EVENT_TX_DONE: ucPacketSeq (PID), ucStatus (0 = acked), u2SN, ucWlanIndex, ucTxCount */
++	if (ev->len < 6) {
++		return;
++	}
++	if (ev->body[1] != 0) {
++		l->tx_fails++;
++	}
++	if (l->txdone_logs < 16) {
++		l->txdone_logs++;
++		LLOG("TX done: PID %u%s, status %u (%s), WLAN %u, %u attempt(s)", ev->body[0],
++		    ev->body[0] == l->eapol_pid && l->eapol_pid ? " (EAPOL)" : "", ev->body[1],
++		    ev->body[1] == 0 ? "acked" : ev->body[1] == 1 ? "lifetime timeout" : ev->body[1] == 3 ? "no ACK (MPDU error)" :
++		    "failed", ev->body[4], ev->body[5]);
+ 	}
+ }
+ 
+@@ -1501,8 +1545,18 @@ ev_ch_privilege(__unused struct rottenapple_wifi *w, const struct rottenapple_wi
+ {
+ 	struct mtk_wlan *l = arg;
+ 
+-	/* EVENT_CH_PRIVILEGE: ucBssIndex, ucTokenID, ucStatus (0 = grant) */
+-	if (ev->len >= 3 && l->join_active && ev->body[1] == l->ch_token && ev->body[2] == 0) {
++	/*
++	 * EVENT_CH_PRIVILEGE: ucBssIndex, ucTokenID, ucStatus (0 = grant), ...,
++	 * u4GrantInterval at +12. Run 1 dropped any grant here because
++	 * join_active was only set after this step; now only the token counts.
++	 */
++	if (ev->len < 3) {
++		return;
++	}
++	LLOG("channel privilege event: BSS %u token %u (ours %u) status %u%s, channel %u, interval %u ms", ev->body[0],
++	    ev->body[1], l->ch_token, ev->body[2], ev->body[2] == 0 ? " (grant)" : "", ev->len > 3 ? ev->body[3] : 0,
++	    ev->len >= 16 ? le32(ev->body + 12) : 0);
++	if (ev->body[1] == l->ch_token && ev->body[2] == 0) {
+ 		l->ch_granted = true;
+ 		thread_wakeup((event_t)(uintptr_t)&l->ch_granted);
+ 	}
+@@ -1579,6 +1633,11 @@ wl_rx_data_frame(struct mtk_wlan *l, const uint8_t *f, uint32_t len)
+ 	if (!l->connected || len < 24) {
+ 		return;
+ 	}
++	if (f[1] & 0x40) {
++		/* protected bit still set: the hardware had no key (e.g. group data before the GTK) */
++		l->rx_ctrl_data++;
++		return;
++	}
+ 	if (f[0] & 0x80) {              /* QoS data: 2-byte QoS control */
+ 		hdr += 2;
+ 	}
+@@ -1607,7 +1666,13 @@ wl_ch_privilege(struct mtk_wlan *l, bool req)
+ 	uint8_t cmd[24] = { 0 };
+ 
+ 	cmd[0] = AIS_BSS_INDEX;
+-	cmd[1] = ++l->ch_token ? l->ch_token : (l->ch_token = 1);
++	if (req) {
++		/* a new token per request; the abort names the request's token (cnmChMngrAbortPrivilege) */
++		if (++l->ch_token == 0) {
++			l->ch_token = 1;
++		}
++	}
++	cmd[1] = l->ch_token;
+ 	cmd[2] = req ? 0 : 1;                   /* CMD_CH_ACTION_REQ / ABORT */
+ 	cmd[3] = l->peer_channel;
+ 	cmd[4] = 0;                             /* RfSco: no secondary */
+@@ -1910,6 +1975,9 @@ mtk_wlan_join(struct mtk_wlan *l, struct rottenapple_wifi_join *jp)
+ 	l->peer_channel = jp->channel;
+ 	l->peer_band = jp->band;
+ 	l->connected = false;
++	l->rx_data_logs = 0;
++	l->txdone_logs = 0;
++	l->eapol_pid = 0;
+ 
+ 	/* AIS network on with the own MAC (as the scan path does) */
+ 	if (!l->bss_active && (err = wl_bss_activate(l, true)) != 0) {
+@@ -2077,7 +2145,18 @@ mtk_wlan_tx_data(struct mtk_wlan *l, const uint8_t *eth, uint32_t len, uint32_t
+ 	if (!l->started || l->fw_dead || len < 14) {
+ 		return ENXIO;
+ 	}
+-	build_txd(l, txd, false, 0, l->sta_wlan_idx, len, 0, protected, false);
++	bool eapol = eth[12] == 0x88 && eth[13] == 0x8e;
++	build_txd(l, txd, false, 0, l->sta_wlan_idx, len, 0, protected, eapol);
++	if (eapol) {
++		/*
++		 * As gen4m's nic_txd_v1_compose_security_frame: the BSS's lowest
++		 * basic rate, fixed in the TXD, and a TXS so EVENT 0x0F reports
++		 * whether the AP acknowledged the frame.
++		 */
++		txd[11] |= TXD_FIXED_RATE_EN;
++		put16(txd + 24, lowest_rate_code(l->peer_band));
++		l->eapol_pid = txd[20];
++	}
+ 	int err = mtk_wfdma_tx_frame(l->d, txd, 32, eth, len);
+ 	if (err == 0) {
+ 		l->tx_frames++;
+--- a/bsd/dev/rottenapple_mtk_wlan.h
++++ b/bsd/dev/rottenapple_mtk_wlan.h
+@@ -76,6 +76,9 @@ struct mtk_wlan {
+ 	uint8_t peer[6];                /* the AP BSSID while connected */
+ 	uint8_t peer_channel, peer_band;
+ 	uint32_t tx_frames, tx_fails, rx_data_frames, eapol_rx, eapol_tx;
++	uint32_t rx_data_logs;           /* decoded RX-data lines logged (first 12 per join) */
++	uint32_t txdone_logs;            /* EVENT_TX_DONE lines logged (first 16 per join) */
++	uint8_t eapol_pid;               /* PID of the last EAPOL frame sent */
+ 
+ 	/* W4: scan and received frames */
+ 	uint8_t scan_seq_next;          /* CMD_SCAN_REQ_V2 ucSeqNum counter (1..255) */
+--- a/bsd/dev/rottenapple_wifi_sta.c
++++ b/bsd/dev/rottenapple_wifi_sta.c
+@@ -102,6 +102,7 @@ struct wifi_sta {
+ 	uint8_t gtk_len, gtk_id;
+ 	volatile bool hs_done, hs_failed;
+ 	unsigned hs_m1, hs_m3;                  /* counts, for the log */
++	unsigned eapol_seen, eapol_drop;
+ 
+ 	/* reconnect */
+ 	bool want_reconnect;
+@@ -630,32 +631,59 @@ eapol_input(struct wifi_sta *s, const uint8_t *eapol, uint32_t len)
+ 	uint16_t ki;
+ 	uint64_t replay;
+ 
+-	if (len < EAPOL_HDR + K_DATA || eapol[15] != EAPOL_TYPE_KEY) {
++	/* eapol points at the EAPOL header {version, type, length}: the type is byte 1 */
++	if (len < EAPOL_HDR + K_DATA || eapol[1] != EAPOL_TYPE_KEY) {
++		s->eapol_drop++;
++		if (s->eapol_drop <= 4) {
++			TLOG("EAPOL frame ignored: %u bytes, version %u, type %u (not an EAPOL-Key)", len,
++			    len > 0 ? eapol[0] : 0, len > 1 ? eapol[1] : 0);
++		}
+ 		return;
+ 	}
++	/* EAPOL length field: ignore padding after the PDU */
++	uint32_t pdu = EAPOL_HDR + be16(eapol + 2);
++	if (pdu < len) {
++		len = pdu;
++	}
+ 	body = eapol + EAPOL_HDR;
++	ki = be16(body + K_INFO);
++	replay = be64(body + K_REPLAY);
++	/* key info and replay counter are not secret: log every EAPOL-Key frame (the first few) */
++	if (s->eapol_seen++ < 16) {
++		TLOG("EAPOL-Key in: %u bytes, descriptor %u, key info 0x%04x (version %u%s%s%s%s%s), replay %llu, key "
++		    "data %u bytes", len, body[K_DESC_TYPE], ki, ki & KI_VER_MASK, (ki & KI_PAIRWISE) ? " pairwise" : " group",
++		    (ki & KI_ACK) ? " ack" : "", (ki & KI_MIC) ? " mic" : "", (ki & KI_INSTALL) ? " install" : "",
++		    (ki & KI_ENCRYPTED) ? " encrypted" : "", replay, be16(body + K_DATA_LEN));
++	}
+ 	if (body[K_DESC_TYPE] != KEY_DESC_RSN) {
+ 		return;
+ 	}
+-	ki = be16(body + K_INFO);
++	if ((ki & KI_VER_MASK) != 2) {
++		/* version 1 = HMAC-MD5/RC4 (WPA1), 3 = AES-CMAC: not implemented */
++		TLOG("4-way: key descriptor version %u not supported (only 2, HMAC-SHA1/AES)", ki & KI_VER_MASK);
++		return;
++	}
+ 	if (!(ki & KI_PAIRWISE)) {
+ 		return;         /* only the pairwise 4-way handshake here (no group rekey yet) */
+ 	}
+-	replay = be64(body + K_REPLAY);
+ 
+ 	lck_mtx_lock(s->lock);
+ 	/* accept EAPOL once we have the PMK: M1 can arrive between the assoc
+ 	 * response and the join thread setting LINK_4WAY */
+ 	if ((s->state != LINK_4WAY && s->state != LINK_JOINING) || !s->have_pmk) {
++		unsigned st = s->state;
+ 		lck_mtx_unlock(s->lock);
++		TLOG("4-way: EAPOL-Key ignored (link %s, PMK %s)", link_name[st], s->have_pmk ? "ready" : "missing");
+ 		return;
+ 	}
+ 	if ((ki & (KI_ACK | KI_MIC)) == KI_ACK) {
+ 		/* ---- Message 1: ANonce, no MIC ---- */
+ 		if (s->replay_valid && replay <= s->replay) {
+ 			lck_mtx_unlock(s->lock);
++			TLOG("4-way: message 1 with an old replay counter %llu: ignored", replay);
+ 			return;         /* replay/old */
+ 		}
++		TLOG("4-way: message 1 (ANonce), sending message 2");
+ 		s->replay = replay;
+ 		s->replay_valid = true;
+ 		memcpy(s->anonce, body + K_NONCE, NONCE_LEN);
+@@ -666,6 +694,8 @@ eapol_input(struct wifi_sta *s, const uint8_t *eapol, uint32_t len)
+ 		lck_mtx_unlock(s->lock);
+ 		if (err) {
+ 			TLOG("4-way: message 2 not sent (%d)", err);
++		} else {
++			TLOG("4-way: message 2 sent (SNonce, RSN IE, MIC)");
+ 		}
+ 		return;
+ 	}
+@@ -721,7 +751,11 @@ eapol_input(struct wifi_sta *s, const uint8_t *eapol, uint32_t len)
+ 		bzero(kd, sizeof(kd));
+ 		kfree_data(frame, need);
+ 		s->hs_m3++;
++		TLOG("4-way: message 3 verified (MIC, ANonce, GTK %s), sending message 4", got_gtk ? "unwrapped" : "MISSING");
+ 		int err = eapol_send_m4(s, body);
++		if (err) {
++			TLOG("4-way: message 4 not sent (%d)", err);
++		}
+ 		if (err == 0 && got_gtk) {
+ 			err = install_keys(s);
+ 		} else if (!got_gtk) {
+@@ -808,6 +842,8 @@ sta_join(struct wifi_sta *s, const uint8_t *ssid, uint8_t ssid_len)
+ 	memcpy(s->own_mac, s->w->mac, 6);
+ 	s->tgt = jp;
+ 	s->replay_valid = false;
++	s->eapol_seen = 0;
++	s->hs_m1 = s->hs_m3 = 0;
+ 	s->hs_done = false;
+ 	s->hs_failed = false;
+ 	s->have_pmk = false;

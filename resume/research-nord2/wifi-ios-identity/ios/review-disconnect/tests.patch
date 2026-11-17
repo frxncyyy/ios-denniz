@@ -1,0 +1,73 @@
+--- a/tools/test-nord2-wifi-ios-client.py
++++ b/tools/test-nord2-wifi-ios-client.py
+@@ -3,7 +3,7 @@
+ from pathlib import Path
+ import subprocess,tempfile,argparse
+ R=next(x for x in Path(__file__).resolve().parents if(x/'AGENTS.md').exists());P=Path(__file__).resolve().parent/'fixtures/nord2-wifi-ios-client';B=P;S=R/'shim/nord2-xnu'
+-ap=argparse.ArgumentParser();ap.add_argument('--log',type=Path);ap.add_argument('--candidate',type=Path,help='Optional reviewed private source overlay; default tests canonical runtime');ap.add_argument('--only',choices=('all','card'),default='all');args=ap.parse_args()
++ap=argparse.ArgumentParser();ap.add_argument('--log',type=Path);ap.add_argument('--candidate',type=Path,help='Optional reviewed private source overlay; default tests canonical runtime');ap.add_argument('--only',choices=('all','card','disconnect'),default='all');args=ap.parse_args()
+ names=('join','station_view','binding','control','event','lifecycle','card','policy','rates','mapping','age','snapshot','bss','scan_contract','cursor','scalar')
+ with tempfile.TemporaryDirectory(prefix='niwl-compat-') as t:
+  d=Path(t);dev=d/'xnu/bsd/dev';arm=d/'xnu/iokit/Kernel/arm';dev.mkdir(parents=True);arm.mkdir(parents=True)
+@@ -27,6 +27,13 @@
+  for name in names:
+   f=dev/('wifi_ios_'+name+'.c');o=d/(name+'.o');subprocess.run(['clang','-std=c11',*flags,'-c',str(f),'-o',str(o)],check=True);objs.append(str(o))
+  logs=[]
++ if args.only=='disconnect':
++  disconnect_source=source[:source.index(legacy_extra)]+(P/'test-disconnect.inc').read_text()
++  (d/'disconnect.cpp').write_text(disconnect_source)
++  subprocess.run(['clang++','-std=c++17',*flags,'-Wno-unused-function','-pthread',str(d/'disconnect.cpp'),*objs,'-o',str(d/'disconnect')],check=True)
++  disconnected=subprocess.run([str(d/'disconnect')],text=True,capture_output=True);print(disconnected.stdout);print(disconnected.stderr)
++  if args.log:args.log.write_text(disconnected.stdout+disconnected.stderr)
++  disconnected.check_returncode();raise SystemExit(0)
+  if args.only=='all':
+   subprocess.run(['clang++','-std=c++17',*flags,'-Wno-unused-function','-pthread',str(d/'test.cpp'),*objs,'-o',str(d/'test')],check=True)
+   result=subprocess.run([str(d/'test')],text=True,capture_output=True);print(result.stdout);print(result.stderr);result.check_returncode()
+--- /dev/null
++++ b/tools/fixtures/nord2-wifi-ios-client/test-disconnect.inc
+@@ -0,0 +1,23 @@
++int main(){IOUserClient*c=make();IOExternalMethodArguments a={};a.structureInput=carrier;a.structureInputSize=sizeof carrier;unsigned checks=0;
++ envelope(carrier,0x802869c8,22,8);put(carrier+8,0xaaaaaaaa);put(carrier+12,0x80000000u);assert(!call(c,0,a)&&jdisconnects==1&&!jenqueues);checks++;
++ /* All other small extents refuse before native; no partial output. */
++ for(unsigned size=1;size<=64;size++){if(size==8)continue;envelope(carrier,0x802869c8,22,size);unsigned n=jdisconnects;assert(call(c,0,a)==kIOReturnUnsupported&&jdisconnects==n);checks++;}
++ /* Compiler-fill prefix is inactive; signed32 reason is opaque metadata. */
++ for(uint32_t prefix:{0u,1u,0xaaaaaaaau,0xffffffffu,0x12345678u})for(uint32_t reason:{0u,1u,2u,0x7fffffffu,0x80000000u,0xffffffffu}){
++  envelope(carrier,0x802869c8,22,8);put(carrier+8,prefix);put(carrier+12,reason);unsigned n=jdisconnects;assert(!call(c,0,a)&&jdisconnects==n+1&&!jenqueues&&!jactive);checks++;
++ }
++ envelope(carrier,0x802869c8,22,0);unsigned n=jdisconnects;assert(!call(c,0,a)&&jdisconnects==n+1);checks++;
++ envelope(carrier,0x802869c8,22,8);n=jdisconnects;put(carrier+15388,1);assert(call(c,0,a)==kIOReturnBadArgument&&jdisconnects==n);checks++;put(carrier+15388,0);
++ uint8_t output=0xa5;a.structureOutput=&output;a.structureOutputSize=1;assert(call(c,0,a)==kIOReturnBadArgument&&jdisconnects==n&&output==0xa5);checks++;a.structureOutput=nullptr;a.structureOutputSize=0;
++ memcpy(carrier+15368,"bad",4);assert(call(c,0,a)!=0&&jdisconnects==n);checks++;envelope(carrier,0x802869c8,22,8);
++ test_current=&otherTask;assert(call(c,0,a)==kIOReturnNotPrivileged&&jdisconnects==n);checks++;test_current=&ownerTask;
++ a.structureInputSize=sizeof carrier-1;assert(call(c,0,a)==kIOReturnBadArgument&&jdisconnects==n);checks++;a.structureInputSize=sizeof carrier;
++ /* Genuine OOL copied carrier has balanced prepare/complete; failures never
++  * reach native. Payload is never kept by native leave API. */
++ auto*md=new IOBufferMemoryDescriptor(sizeof carrier);memcpy(md->getBytesNoCopy(),carrier,sizeof carrier);a.structureInput=nullptr;a.structureInputSize=0;a.structureInputDescriptor=md;
++ assert(!call(c,0,a)&&jdisconnects==n+1&&md->prepares==1&&md->completes==1&&!md->depth);n=jdisconnects;checks++;
++ md->failPrepare=true;assert(call(c,0,a)==kIOReturnNotReady&&jdisconnects==n&&md->completes==1);md->failPrepare=false;checks++;
++ md->failRead=true;assert(call(c,0,a)==kIOReturnBadArgument&&jdisconnects==n&&md->prepares==3&&md->completes==2&&!md->depth);md->failRead=false;checks++;
++ md->failComplete=true;assert(call(c,0,a)==kIOReturnNotReady&&jdisconnects==n&&!md->depth);checks++;md->failComplete=false;md->release();
++ assert(!c->clientClose());c->release();assert(!malloc_count&&!buffer_count&&!rights&&!locks&&ownerTask.refs==1);
++ printf("PASS %u actual IOUC DISASSOC checks: exact0/8/opaque-prefix/signedreason/task/name/value/output/short/OOL faults; no join enqueue\n",checks);return 0;}
+--- a/tools/fixtures/nord2-wifi-station/service-test.c
++++ b/tools/fixtures/nord2-wifi-station/service-test.c
+@@ -71,6 +71,19 @@
+ static void*owner_thread(void*x){(void)x;assert(njs_owner_work()==1);return NULL;}
+ static void*disconnect_thread(void*x){(void)x;pthread_mutex_lock(&barrier);disconnect_started=1;pthread_cond_broadcast(&barrier_cond);pthread_mutex_unlock(&barrier);assert(!nord2_wifi_join_disconnect());pthread_mutex_lock(&barrier);disconnect_done=1;pthread_cond_broadcast(&barrier_cond);pthread_mutex_unlock(&barrier);return NULL;}
+ int main(void){nss_native.lock=IOLockAlloc();njs_initialize_locked();assert(njs_native.notice_lock);struct niwj_request q=request();uint64_t ticket=0;
++/* Exact actual binder: successful repeated idle leave is pure, including
++ * untouched first-attempt ledger and no ifnet callback or native prepare. */
++static unsigned char idle_service[sizeof njs_native],idle_native[sizeof nst_native];
++memcpy(idle_service,&njs_native,sizeof njs_native);memcpy(idle_native,&nst_native,sizeof nst_native);
++for(unsigned k=0;k<256;k++){assert(!nord2_wifi_join_disconnect());assert(!memcmp(idle_service,&njs_native,sizeof njs_native)&&!memcmp(idle_native,&nst_native,sizeof nst_native));assert(!ifnet_down&&!prepared_calls);}
++source_ready=0;assert(nord2_wifi_join_disconnect()==1);source_ready=1;
++nss_native.failed=1;assert(nord2_wifi_join_disconnect()==1);nss_native.failed=0;
++njs_native.used=1;assert(nord2_wifi_join_disconnect()==1);njs_native.used=0;
++nst_native.attempted=1;assert(nord2_wifi_join_disconnect()==1);nst_native.attempted=0;
++nst_native.active=1;assert(nord2_wifi_join_disconnect()==1);nst_native.active=0;
++njs_native.snapshot.phase=NJS_FAILED;assert(nord2_wifi_join_disconnect()==1);njs_native.snapshot.phase=NJS_IDLE;
++assert(!memcmp(idle_service,&njs_native,sizeof njs_native)&&!memcmp(idle_native,&nst_native,sizeof nst_native));
++printf("PASS256 idle disconnects: byteidentical service/native ledger; unavailable/failed/used/nonidle refused; no ifnet/MMIO/prepare\n");
+ /* Same production binder and admissionlock: old scans never make SET20 EBUSY.
+  * Native prepare remains a refusal-only seam; actual DMA proof is separate. */
+  for(unsigned state=NSS_QUEUED;state<=NSS_RUNNING;state++){

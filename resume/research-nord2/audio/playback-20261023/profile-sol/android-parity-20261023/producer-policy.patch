@@ -1,0 +1,145 @@
+--- a/shim/nord2-xnu/audio_stream.h
++++ b/shim/nord2-xnu/audio_stream.h
+@@ -4,12 +4,14 @@
+ #define NSA_RATE 48000u
+ #define NSA_CHANNELS 2u
+ #define NSA_FRAME_BYTES 4u
+-#define NSA_QUEUE_FRAMES 8192u
++/* Pinned HAL advertises up to16384 frames per period. Retain two
++ * periods across bounded cold startup; writes remain nonblocking. */
++#define NSA_QUEUE_FRAMES 32768u
+ /* The native wrapper serializes these operations with one short mutex. No
+  * allocation, hardware access or blocking operation belongs in this queue. */
+ struct nsa_stream {
+  int16_t pcm[NSA_QUEUE_FRAMES * NSA_CHANNELS];
+- uint32_t read, write, count, enabled, below, muted, gain_q15;
++ uint32_t read, write, count, enabled, below, muted, gain_q15, sound_frames;
+  uint64_t written, accepted, dropped, delivered, nonzero, last_sound_us;
+  uint32_t peak, opens, writes, volume_generation, flushes;
+ };
+@@ -21,5 +23,9 @@
+ void nsa_flush(struct nsa_stream *);
+ /* Caller holds the producer lock and samples now while holding it. */
+ void nsa_flush_idle(struct nsa_stream *, uint64_t now_us);
++/* Producer lock held. pending_output describes downstream PCM; drain_us
++ * additionally covers the SRAM ring after the last queued sound leaves it. */
++int nsa_idle_ready(const struct nsa_stream *, uint64_t now_us,
++ unsigned pending_output, uint64_t *last_pending_us, uint64_t drain_us);
+ unsigned nsa_gain(unsigned eighth_db_below);
+ #endif
+--- a/shim/nord2-xnu/audio_stream.c
++++ b/shim/nord2-xnu/audio_stream.c
+@@ -17,12 +17,22 @@
+ }
+ void nsa_flush(struct nsa_stream *s) {
+  if (!s) return;
+- s->read = s->write = s->count = 0; s->flushes++;
++ s->read = s->write = s->count = s->sound_frames = 0; s->flushes++;
+ }
+ void nsa_flush_idle(struct nsa_stream *s, uint64_t now) {
+- if (!s) return;
++ if (!s || s->sound_frames) return;
+  uint64_t sound=s->last_sound_us;
+  if (!sound || (now>=sound && now-sound>=750000)) nsa_flush(s);
++}
++int nsa_idle_ready(const struct nsa_stream *s, uint64_t now, unsigned pending_output,
++ uint64_t *last_pending, uint64_t drain_us) {
++ if (!s || !last_pending) return 0;
++ if (s->sound_frames || pending_output) { *last_pending=now; return 0; }
++ if (s->last_sound_us && (now<s->last_sound_us || now-s->last_sound_us<750000)) return 0;
++ return !*last_pending || (now>=*last_pending && now-*last_pending>=drain_us);
++}
++static unsigned sound_frame(int16_t left,int16_t right) {
++ return left>8 || left<-8 || right>8 || right<-8;
+ }
+ void nsa_enable(struct nsa_stream *s, unsigned enabled) {
+  if (!s) return;
+@@ -43,6 +53,7 @@
+  else if (take > NSA_QUEUE_FRAMES - s->count) take = NSA_QUEUE_FRAMES - s->count;
+  s->writes++; s->written += n; s->accepted += take; s->dropped += n - take;
+  for (unsigned i = 0; i < take; i++) {
++  s->sound_frames += sound_frame(p[i*2],p[i*2+1]);
+   for (unsigned c = 0; c < 2; c++) {
+    int32_t x = p[i * 2 + c]; unsigned level = x < 0 ? (unsigned)-x : (unsigned)x;
+    if (level > peak) peak = level;
+@@ -59,6 +70,7 @@
+  if (!s || !out) return 0;
+  unsigned n = cap < s->count ? cap : s->count;
+  for (unsigned i = 0; i < n; i++) {
++  s->sound_frames -= sound_frame(s->pcm[s->read*2],s->pcm[s->read*2+1]);
+   for (unsigned c = 0; c < 2; c++) {
+    int32_t x = s->pcm[s->read * 2 + c];
+    /* Division rounds negative samples towards zero, just as positive ones. */
+--- a/shim/nord2-xnu/audio_device.c
++++ b/shim/nord2-xnu/audio_device.c
+@@ -32,7 +32,7 @@
+ static struct nsa_stream stream;
+ static struct nau_hw hardware;
+ static struct { unsigned ready, opens, stop, starts, tone_frames, tone_phase;
+- unsigned tone_active, hal_status; uint64_t report_us; } device;
++ unsigned tone_active, hal_status; uint64_t report_us, last_pending_us; } device;
+ static uint64_t now_us(void) {
+  uint64_t ns=0; absolutetime_to_nanoseconds(mach_absolute_time(),&ns); return ns/1000;
+ }
+@@ -139,7 +139,7 @@
+  struct nal_request q;if(!nal_take(&q))return;
+  unsigned result=NAL_OK;
+  if(q.op==NAL_ENABLE) {
+-  if(!hardware.status.initialized || hardware.status.uncertain || hardware.status.stop_error)result=NAL_UNAVAILABLE;
++  if(!hardware.status.initialized || hardware.status.error || hardware.status.uncertain || hardware.status.stop_error)result=NAL_UNAVAILABLE;
+   else {lck_mtx_lock(&nsa_lock);nsa_enable(&stream,1);lck_mtx_unlock(&nsa_lock);}
+  } else if(q.op==NAL_STOP) {
+   lck_mtx_lock(&nsa_lock);nsa_enable(&stream,0);lck_mtx_unlock(&nsa_lock);
+@@ -194,6 +194,16 @@
+   if (now<begin || now-begin>=limit) return NAH_NATIVE_E_TIMEOUT;
+   native_wait_pause();
+  }
++}
++/* Worker-owned queue: inspect memory only, never MMIO or producer state.
++ * Test the final ceiling-scaled sample, so zero downstream PCM is not sound. */
++static unsigned hardware_sound_pending(void) {
++ for(unsigned i=0;i<hardware.qcount && i<NAH_QUEUE_FRAMES;i++) {
++  unsigned frame=(hardware.qr+i)%NAH_QUEUE_FRAMES;
++  for(unsigned c=0;c<2;c++)
++   if((int32_t)hardware.queue[frame*2+c]*(int32_t)hardware.gain_q15/32768) return 1;
++ }
++ return 0;
+ }
+ static void audio_worker(__unused void *arg,__unused wait_result_t wr) {
+  struct nah_io io;void *cookie=NULL;
+@@ -210,10 +220,14 @@
+  if(e)diagnose("init",e,1);
+  for(;;) {
+   commands();
+-  unsigned stop=0,enabled=0,queued=0;uint64_t last_sound=0,t;
++  unsigned stop=0,enabled=0,queued=0,sound_queued=0,idle=0;
++  unsigned downstream=hardware_sound_pending();uint64_t t;
++  const uint64_t drain_us=((uint64_t)NAH_RING_FRAMES*1000000+NSA_RATE-1)/NSA_RATE+2000;
+   lck_mtx_lock(&nsa_lock);stop=device.stop;device.stop=0;enabled=stream.enabled;
+-  queued=stream.count;last_sound=stream.last_sound_us;lck_mtx_unlock(&nsa_lock);t=now_us();
+-  if(hardware.status.running && (stop || (!device.tone_active && (!enabled || !last_sound || t-last_sound>=750000)))) {
++  queued=stream.count;sound_queued=stream.sound_frames;t=now_us();
++  idle=nsa_idle_ready(&stream,t,downstream,&device.last_pending_us,drain_us);
++  lck_mtx_unlock(&nsa_lock);
++  if(hardware.status.running && (stop || (!device.tone_active && (!enabled || idle)))) {
+    device.tone_active=0;(void)nau_hw_stop(&hardware);
+    /* Mute/disable already flush their producer queue. Preserve PCM that
+     * arrived during the bounded hardware stop; fresh idle checks below
+@@ -224,7 +238,7 @@
+    * and do not spin restarting hardware. Live ENABLE after a clean stop can
+    * accept subsequent playback; uncertain bus state is never retried. */
+   if(!hardware.status.running && !hardware.status.error && enabled && queued &&
+-     last_sound && t-last_sound<750000 && !device.tone_active)(void)start(0,0);
++     sound_queued && !device.tone_active)(void)start(0,0);
+   if(hardware.status.running) {
+    if(device.tone_active)feed_tone();
+    else {
+@@ -234,6 +248,8 @@
+     if(n)(void)nau_hw_feed(&hardware,pcm,n);
+    }
+    e=nau_hw_tick(&hardware,now_us());
++   /* Anchor ring drain after PCM writes/monitor work, not at loop entry. */
++   if(hardware.status.running && (sound_queued || downstream))device.last_pending_us=now_us();
+    if(!hardware.status.running){device.tone_active=0;
+     if(e==NAH_E_IDLE && !hardware.status.uncertain && !hardware.status.stop_error)hardware.status.error=0;
+     printf("NORD2 AUDIO: stopped=%d error=%d uncertain=%u pcm=%u silence=%u\n",e,hardware.status.error,

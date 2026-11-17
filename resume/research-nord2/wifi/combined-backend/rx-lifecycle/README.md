@@ -1,0 +1,9 @@
+Private cohesive normal-interface lifecycle correction. Pending final independent review; no activation or hardware success claim.
+
+Recipe preserves existing20 source configuration commands, then adds three CID0x70 default feature batches (indices20..22, wire348, SET/noresponse, seq26..28), CID0x0a RX filter (index23, wire132, seq29), existing AIS CID0x11 activation (index24, wire76, seq30), and existing passive CID3 scan (index25, wire1252, seq31). Total26; native transport completed31. Payload scan sequence remains1. Deadlines/pump budgets and source PSE1/PLE0 credits unchanged; no fake ACK.
+
+Filter mask0x0c derives from ether_setup broadcast plus wlanSetMulticastList forcing ALLMULTI. No promiscuous/P2P flags. CMD_RX_PACKET_FILTER has4-byte mask plus64 reserved bytes. New runtime zeroes reserved bytes explicitly; original OID stack reserved bytes are uninitialized, so there is no historical reserved-byte identity claim. Extracted pinned selected source oracle proves struct extent, named field and SET/noresponse flags. Linux scheduling is asynchronous; deterministic new single-worker ordering does not claim every Linux scan waited for firmware completion.
+
+Default feature helper is byte-exact copied from default-feature-wire/v2, manifest e58fe1e559c47eede1eb47c33ef19a5e1b851c6f571416e3b24d90dbb287f377. It contains only selected source defaults, no optional override loading or invented country/power flags. Its original-source extraction oracle is in that frozen evidence package. New runtime TU must be included in compilation.
+
+Only backend.c/h and new default_feature.c/h require runtime promotion. tools/test-nord2-wifi-normal.py adds the new TU; fixture changes retain the actual owner, instrument only hardware, check three default bodies, RX-filter bytes, sequences/order/credits, atomic short-capacity refusal, async hints, readonly snapshots, common halt/drain and no further callbacks. No canonical/device/CI edits by this package.

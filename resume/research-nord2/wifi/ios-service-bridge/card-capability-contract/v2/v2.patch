@@ -1,0 +1,109 @@
+--- v1/card.c
++++ v2/card.c
+@@ -4,7 +4,7 @@
+  void*out,size_t capacity,size_t*used){
+  static const uint8_t bits[NIWC_FEATURES]={0,1,3,13,14,76};
+  struct niw_request q;uint8_t raw[NIWC_CARD_BYTES]={0};unsigned seen=0;
+- if(!m||!out||!used||capacity<sizeof(raw)||!m->count||m->count>NIWC_FEATURES||
++ if(!m||!out||!used||capacity<sizeof(raw)||m->count>NIWC_FEATURES||
+     niw_decode(0,input,bytes,&q)||q.request!=12||q.value||q.payload_bytes!=sizeof(raw))return -1;
+  for(unsigned n=0;n<m->count;n++){
+   unsigned f=m->entry[n].feature;
+--- v1/card.h
++++ v2/card.h
+@@ -17,9 +17,9 @@
+  * or establish correct implementations. No current backend supplies entries. */
+ struct niwc_manifest {unsigned count;struct niwc_entry entry[NIWC_FEATURES];};
+ /* Exact bind request12 GET, small carrier, payload13, value0. Writes raw13,
+- * no version prefix. Requires nonempty source-proven complete inventory;
+- * rejecting empty manifests is our closed-subset policy, not an Apple ABI
+- * nonzero requirement. Unknown/duplicate/partial features refuse atomically.
++ * no version prefix. A nonnull native-owned empty inventory emits exactly13 zero bytes.
++ * Source-proven nonempty entries require complete implementations;
++ * unknown/duplicate/partial features refuse atomically.
+  * Caller owns task/generation/serialization and exact interface binding. */
+ int niwc_card_reply(const void *,size_t,const struct niwc_manifest *,
+  void *,size_t,size_t *);
+--- v1/test.c
++++ v2/test.c
+@@ -9,7 +9,7 @@
+ static void refused(const uint8_t*q,size_t n,const struct niwc_manifest*m,size_t capacity){uint8_t out[20],before[20];size_t used=99;memset(out,0xaa,sizeof out);memcpy(before,out,sizeof out);assert(niwc_card_reply(q,n,m,out,capacity,&used)<0&&used==99&&!memcmp(out,before,sizeof out));checks++;}
+ int main(void){uint8_t q[NIW_SMALL_BYTES]={0};w32(q,NIW_GET);w32(q+4,13);memcpy(q+15368,"en-test",8);w32(q+15384,12);struct niwc_manifest m={0};
+  const unsigned bits[]={0,1,3,13,14,76};
+- for(unsigned mask=1;mask<64;mask++){
++ for(unsigned mask=0;mask<64;mask++){
+   memset(&m,0,sizeof m);for(unsigned f=0;f<6;f++)if(mask&(1u<<f))m.entry[m.count++]=(struct niwc_entry){f,NIWC_END_TO_END};
+   uint8_t out[20];memset(out,0xaa,sizeof out);size_t used=99;assert(!niwc_card_reply(q,sizeof q,&m,out,sizeof out,&used)&&used==13&&out[13]==0xaa);
+   struct niwq_caps caps;assert(!niwq_caps_decode(out,13,&caps)&&caps.count==m.count&&!caps.unconsumed_bit103);
+@@ -17,11 +17,23 @@
+   checks++;
+   for(unsigned n=0;n<m.count;n++)for(unsigned op=1;op<=32;op<<=1){m.entry[n].installed_operations^=op;refused(q,sizeof q,&m,13);m.entry[n].installed_operations^=op;}
+  }
++ /* An explicit empty native-owned inventory is data, not missing authority.
++  * Ignored unused entries do not become advertised features. */
++ memset(&m,0xff,sizeof m);m.count=0;
++ uint8_t empty[20];memset(empty,0xaa,sizeof empty);size_t empty_used=99;
++ assert(!niwc_card_reply(q,sizeof q,&m,empty,13,&empty_used)&&empty_used==13);
++ for(unsigned n=0;n<13;n++)assert(empty[n]==0);
++ for(unsigned n=13;n<sizeof empty;n++)assert(empty[n]==0xaa);
++ for(unsigned cap=0;cap<13;cap++)refused(q,sizeof q,&m,cap);
++ refused(q,sizeof q,0,13);
++ for(unsigned bad=0;bad<7;bad++){uint8_t b[NIW_SMALL_BYTES];memcpy(b,q,sizeof b);size_t n=sizeof b;
++  if(bad==0)w32(b,0);if(bad==1)w32(b+4,17);if(bad==2)w32(b+15384,43);if(bad==3)w32(b+15388,1);if(bad==4)n--;if(bad==5)memset(b+15368,'X',16);if(bad==6)n++;refused(b,n,&m,13);
++ }
+  m=(struct niwc_manifest){.count=1,.entry={{NIWC_RSN_IE,NIWC_END_TO_END}}};
+  for(unsigned cap=0;cap<13;cap++)refused(q,sizeof q,&m,cap);
+  for(unsigned bad=0;bad<9;bad++){uint8_t x[NIW_SMALL_BYTES];memcpy(x,q,sizeof x);size_t n=sizeof x;struct niwc_manifest b=m;
+-  if(bad==0)w32(x,0);if(bad==1)w32(x+4,17);if(bad==2)w32(x+15384,43);if(bad==3)w32(x+15388,1);if(bad==4)n--;if(bad==5)memset(x+15368,'X',16);if(bad==6)b.count=0;if(bad==7)b.entry[0].feature=6;if(bad==8)b.entry[0].installed_operations=127;refused(x,n,&b,13);
++  if(bad==0)w32(x,0);if(bad==1)w32(x+4,17);if(bad==2)w32(x+15384,43);if(bad==3)w32(x+15388,1);if(bad==4)n--;if(bad==5)memset(x+15368,'X',16);if(bad==6)n++;if(bad==7)b.entry[0].feature=6;if(bad==8)b.entry[0].installed_operations=127;refused(x,n,&b,13);
+  }
+  m.count=2;m.entry[1]=m.entry[0];refused(q,sizeof q,&m,13);m.count=7;refused(q,sizeof q,&m,13);
+- puts("PASS exact raw13/no-version CARD encoder,63 feature subsets, all missing-operation refusals, unsupported/empty/duplicate/shape/capacity atomic guards; no native readiness.");printf("checks=%u\n",checks);return 0;
++ puts("PASS exact raw13/no-version CARD encoder,64 feature subsets including authoritative empty raw13zero, all missing-operation refusals, unsupported/NULL-inventory/duplicate/shape/capacity atomic guards; no native readiness.");printf("checks=%u\n",checks);return 0;
+ }
+--- v1/README.md
++++ v2/README.md
+@@ -1,6 +1,6 @@
+-Private CARD12 raw-bitmap contract, source-proven security subset
++Private CARD12 v2 raw-bitmap contract, honest empty inventory
+ 
+-This closes a bounded part of the mandatory bind query: exact request12 reply encoding plus six same-IPSW feature gates. It supplies a small checked encoder for a future actual installed implementation inventory. It does not publish a controller/interface/userclient, return a current successful CARD reply, or make scan/association/networking available. Existing frozen packages are unchanged.
++This closes a bounded part of the mandatory bind query: exact request12 reply encoding plus six same-IPSW feature gates. It supplies a small checked encoder for a future actual installed implementation inventory. It does not publish a controller/interface/userclient, return a current successful CARD reply, or make scan/association/networking available. Frozen v1 manifest50760f9a and every original pinned file remain unchanged. V2 corrects review CARD-EMPTY-1: the source has no minimum nonzero requirement, so a nonnull authoritative native-owned empty inventory now encodes exactly13 zero bytes. Null inventory still refuses; no current service is activated.
+ 
+ Same-IPSW evidence, not transplanted macOS ABI
+ 
+@@ -27,18 +27,18 @@
+ 
+ Bounded adapter and actual native authority boundary
+ 
+-card.c/h expose niwc_card_reply(input15408,bytes,driver-owned niwc_manifest,output,capacity,used). It freshly invokes the pinned niw_decode for selector0 and requires GET0xc02869c9/request12/value0/payload13, then maps only the six reviewed feature identifiers to the exact raw bit positions. Output is exactly13 bytes; no version word, hardware-ready flag, inferred firmware feature or bit103 is emitted. Malformed carrier/interface, insufficient output, unknown/duplicate feature, extra/missing operation bits or empty inventory refuses atomically.
++card.c/h expose niwc_card_reply(input15408,bytes,driver-owned niwc_manifest,output,capacity,used). It freshly invokes the pinned niw_decode for selector0 and requires GET0xc02869c9/request12/value0/payload13, then maps only the six reviewed feature identifiers to the exact raw bit positions. Output is exactly13 bytes; no version word, hardware-ready flag, inferred firmware feature or bit103 is emitted. Malformed carrier/interface, insufficient output, unknown/duplicate feature or extra/missing operation bits refuses atomically. A nonnull count0 inventory succeeds with exactly13 zero bytes and used13, leaving trailing output untouched; unused entries are ignored. This honestly advertises no features from this catalogue. A NULL inventory remains unavailable/refused.
+ 
+-Each manifest entry requires installed association, authentication, key installation, encryptedTX, encryptedRX and disconnect handling for that ENTIRE feature/family. This is a conservative closed-subset policy, not a claim that Apple enforces that exact operation inventory or requires a nonempty bitmap. The manifest is constructed by a real native owner from reviewed installed handlers and retained implementation state; it is never accepted from a user request. Pure masks cannot authenticate their origin or prove correct crypto/lifetime. The real IOUserClient must separately enforce owning task, generation, gate, exact service/interface binding, output storage lifetime and disjoint used/output storage. Handler behavior and inter-feature combinations still require native review. The helper does not provide those handlers or serve as an admission token.
++Each manifest entry requires installed association, authentication, key installation, encryptedTX, encryptedRX and disconnect handling for that ENTIRE feature/family. The per-entry operation inventory is a conservative closed-subset policy, not a claim that Apple enforces it. Empty native-owned inventories require no invented operation bits or nonempty condition. The manifest is constructed by a real native owner from reviewed installed handlers and retained implementation state; it is never accepted from a user request. Pure masks cannot authenticate their origin or prove correct crypto/lifetime. The real IOUserClient must separately enforce owning task, generation, gate, exact service/interface binding, output storage lifetime and disjoint used/output storage. Handler behavior and inter-feature combinations still require native review. The helper does not provide those handlers or serve as an admission token.
+ 
+-The current MTK backend has normal initialization and bounded scan commands, but no installed association/authentication/key/encrypted data/disconnect implementation. It therefore supplies NO niwc_manifest and NO successful CARD reply. Its physical PHY/resource/TLV facts do not fill this inventory. The future native-lifecycle-shell must keep request12 Unsupported until it owns an actual reviewed inventory. An allzero reply is not supplied to unblock binding. Other97 consumed bit meanings plus bit103 remain outside this source-proven subset; adding any requires its own actual evidence and implementation, not copying a broad stock mask.
++The current MTK backend has normal initialization and bounded scan commands, but no installed association/authentication/key/encrypted data/disconnect implementation. Its physical PHY/resource/TLV facts do not grant these security feature bits. An eventual actual native binding may truthfully construct an explicit reviewed empty inventory and return raw13 zero; it need not return Unsupported merely because no named feature is installed. The pure encoder cannot authenticate that inventory, install a service, or prove that zero satisfies all wifid startup/scan/association requirements. A missing inventory pointer still refuses. No native callsite, interface, or readiness claim is supplied here. Other97 consumed bit meanings plus bit103 remain outside this source-proven subset; adding any requires its own actual evidence and implementation, not copying a broad stock mask.
+ 
+ Topaz comparison and finite remaining work
+ 
+ Pinned local Topaz89451b8 patches0126/0129/0130 expose actual ready/scan/heard, join/join_pmk/leave, EthernetTX and RX/link hook boundaries. Patch0129 installs CCMP pairwise keys, optional TKIP/CCMP group keys, has an actual WPA2 handshake/stateS_UP and gates transmit/receive on that state. This demonstrates why a ready/scan receipt cannot stand in for security/data implementation. It does NOT establish equivalent MTK support, authorize Qualcomm command/crypto/MMIO reuse, or provide an IO80211 service bridge; its exported hook symbols have no bridge assignment in the inspected local source. No Topaz capability bitmap is imported.
+ 
+-The useful next integration is an actual owning IOUserClient selecting the already-proved IOUC transport/event lifecycle and serving honest request43, while request12 remains unsupported until feature implementations are real. This package removes the raw13/version uncertainty and proves six concrete security bit gates for that future work. Controller/interface/BSD publication, the remaining feature catalogue, power/query semantics and actual backend association/data remain separate outstanding requirements. Completed-scan age conversion stays orthogonal: host-millisecond age does not grant any CARD bit or feature readiness.
++The useful next integration is an actual owning IOUserClient selecting the already-proved IOUC transport/event lifecycle and serving honest request43 and request12 from its actual reviewed installed inventory, including an honest empty feature set where appropriate. This package removes the raw13/version uncertainty and proves six concrete security bit gates for that future work. Controller/interface/BSD publication, the remaining feature catalogue, power/query semantics and actual backend association/data remain separate outstanding requirements. Completed-scan age conversion stays orthogonal: host-millisecond age does not grant any CARD bit or feature readiness.
+ 
+ Verification
+ 
+-1239 Clang ASan/UBSan failfast checks exercise all63 nonempty feature subsets, every missing required operation per selected entry, exact104 output bits plus roundtrip through the original numeric-cap decoder, all short13B output capacities, unsupported/empty/duplicate inventories, wrong GET/payload17/request/value/interface/carrier extent and atomic unchanged-output refusal. The raw13 byte0 is actual bitmap data, not a version. Normal ARM64 kernel helper compile passes with recorded source/output substitutions and explicit private parent-header include; no native linkage claimed. Source/cache reads only; no canonical/device/CI/ADT/interface/gate/configuration changes, no identifiers or board data logged.
++1261 Clang ASan/UBSan failfast checks exercise all64 feature subsets including empty, every missing required operation per selected entry, exact104 output bits plus roundtrip through the original numeric-cap decoder, all short13B output capacities, unsupported/NULL/duplicate inventories, wrong GET/payload17/request/value/interface/carrier extent and atomic unchanged-output refusal. The raw13 byte0 is actual bitmap data, not a version. Normal ARM64 kernel helper compile passes with recorded source/output substitutions and explicit private parent-header include; no native linkage claimed. Empty inventories also exercise all short capacities, malformed GET/payload/request/value/interface/extent, exact13 zero output, used13 and unchanged trailing bytes. Source/cache reads only; no canonical/device/CI/ADT/interface/gate/configuration changes, no identifiers or board data logged.
+--- v1/verify.py
++++ v2/verify.py
+@@ -2,7 +2,7 @@
+ """Read-only same-IPSW byte evidence and private synthetic CARD codec tests."""
+ from pathlib import Path
+ import sys,struct,json,hashlib,re,subprocess,tempfile
+-P=Path(__file__).resolve().parent;B=P.parent;R=B.parents[3];sys.path.insert(0,str(B));from cache_view import Cache
++P=Path(__file__).resolve().parent;B=P.parents[1];R=B.parents[3];sys.path.insert(0,str(B));from cache_view import Cache
+ C=Cache(R/'research/nord2/ipsw/root-images/mounts/SystemOS/root/System/Library/Caches/com.apple.dyld');sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+ identity=json.loads((B/'evidence.json').read_text());assert hashlib.sha256(C.read(0x1d3eb9000,344064)).hexdigest()==identity['framework_original_text_sha256']
+ core=json.loads((B/'channel-mode-audit/identity.json').read_text());assert hashlib.sha256(C.read(0x1abd5e000,839680)).hexdigest()==core['original_text_sha256']

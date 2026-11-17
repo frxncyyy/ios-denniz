@@ -1,0 +1,3 @@
+Apple raw scan-result age is milliseconds: the exact same-IPSW raw AGE dictionary value passes through NSDictionary(ScanRecord).age and CWFScanResult without scaling, then its named description formats age=%lums. Bounded disassembly and decoded selector/string pointers are retained; collect.py verifies the original TEXT hashes before collecting evidence. This is ordinary shell static evidence, not REA/decompilation/runtime.
+
+The exact IE-rate→Apple writer mapping remains unresolved. Consumer recognition of CCK code5 alone does not establish a5.5Mbps rounding rule. Keep populated adapter rates blocked. Future monotonic age conversion must bind an explicit owned reference instant; no timing value or live service is supplied here.

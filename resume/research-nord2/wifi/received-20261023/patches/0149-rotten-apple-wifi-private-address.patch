@@ -1,0 +1,346 @@
+diff --git a/bsd/dev/rottenapple_mtk_connsys.c b/bsd/dev/rottenapple_mtk_connsys.c
+index 1974bf6..38f1b6f 100644
+--- a/bsd/dev/rottenapple_mtk_connsys.c
++++ b/bsd/dev/rottenapple_mtk_connsys.c
+@@ -1086,6 +1086,14 @@ connsys_tx_data(struct rottenapple_wifi *w, const uint8_t *eth, uint32_t len, ui
+ 	return mtk_wlan_tx_data(&c->wl, eth, len, flags);
+ }
+ 
++static int
++connsys_set_mac(struct rottenapple_wifi *w, const uint8_t *mac)
++{
++	struct connsys *c = w->priv;
++
++	return mtk_wlan_set_mac(&c->wl, mac);
++}
++
+ static const struct rottenapple_wifi_ops rottenapple_mtk_connsys_ops = {
+ 	.compatible = "mediatek,mt6789-connsys",
+ 	.probe = connsys_probe,
+@@ -1101,6 +1109,7 @@ static const struct rottenapple_wifi_ops rottenapple_mtk_connsys_ops = {
+ 	.set_key = connsys_set_key,
+ 	.set_port = connsys_set_port,
+ 	.tx_data = connsys_tx_data,
++	.set_mac = connsys_set_mac,
+ };
+ ROTTENAPPLE_BACKEND(wifi, rottenapple_mtk_connsys_ops);
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/rottenapple_mtk_wlan.c b/bsd/dev/rottenapple_mtk_wlan.c
+index 37d74b9..ed22529 100644
+--- a/bsd/dev/rottenapple_mtk_wlan.c
++++ b/bsd/dev/rottenapple_mtk_wlan.c
+@@ -2510,6 +2510,37 @@ mtk_wlan_scan(struct mtk_wlan *l, unsigned mode)
+ 	return err;
+ }
+ 
++/*
++ * Own address for the next association (private Wi-Fi addresses). The
++ * firmware takes the own address from BSS_ACTIVATE_CTRL (gen4m
++ * nicActivateNetwork: aucOwnMacAddr into the RMAC own-address slot), host
++ * frames take it from w->mac; re-activate the AIS network so the new
++ * address is in the firmware before the join. The address is never logged.
++ */
++int
++mtk_wlan_set_mac(struct mtk_wlan *l, const uint8_t *mac)
++{
++	if (!l->started || !l->running || l->fw_dead) {
++		return ENXIO;
++	}
++	if (l->connected || l->join_active) {
++		return EBUSY;
++	}
++	if (memcmp(l->mac, mac, 6) == 0) {
++		return 0;
++	}
++	memcpy(l->mac, mac, 6);
++	memcpy(l->w->mac, mac, 6);
++	int err = 0;
++	if (l->bss_active) {
++		(void)wl_bss_activate(l, false);
++		err = wl_bss_activate(l, true);
++	}
++	LLOG("own address changed for the next association (%s address)%s", (mac[0] & 0x02) ? "private" : "hardware",
++	    err ? ", BSS re-activation FAILED" : "");
++	return err;
++}
++
+ void
+ mtk_wlan_release(struct mtk_wlan *l)
+ {
+diff --git a/bsd/dev/rottenapple_mtk_wlan.h b/bsd/dev/rottenapple_mtk_wlan.h
+index 137cb8b..f926549 100644
+--- a/bsd/dev/rottenapple_mtk_wlan.h
++++ b/bsd/dev/rottenapple_mtk_wlan.h
+@@ -142,6 +142,7 @@ void mtk_wlan_disconnect(struct mtk_wlan *l);
+ int mtk_wlan_set_key(struct mtk_wlan *l, const struct rottenapple_wifi_key *k);
+ int mtk_wlan_set_port(struct mtk_wlan *l, bool authorized);
+ int mtk_wlan_tx_data(struct mtk_wlan *l, const uint8_t *eth, uint32_t len, uint32_t flags);
++int mtk_wlan_set_mac(struct mtk_wlan *l, const uint8_t *mac);
+ 
+ __END_DECLS
+ 
+diff --git a/bsd/dev/rottenapple_wifi.h b/bsd/dev/rottenapple_wifi.h
+index 725509a..3104128 100644
+--- a/bsd/dev/rottenapple_wifi.h
++++ b/bsd/dev/rottenapple_wifi.h
+@@ -192,6 +192,13 @@ struct rottenapple_wifi_ops {
+ 	 * 0, ENOBUFS (ring full), ENXIO.
+ 	 */
+ 	int (*tx_data)(struct rottenapple_wifi *w, const uint8_t *eth, uint32_t len, uint32_t flags);
++	/*
++	 * Private addresses: use mac as the own address from now on (firmware
++	 * own address, the address in host-built frames, w->mac). Only while
++	 * not associated. 0, EBUSY (associated or joining), or the backend's
++	 * error. Optional.
++	 */
++	int (*set_mac)(struct rottenapple_wifi *w, const uint8_t *mac);
+ };
+ 
+ /* Index of the "reg-names" entry name, -1 if absent or unmapped. */
+@@ -338,9 +345,11 @@ void rottenapple_wifi_sta_link_info(struct rottenapple_wifi_link_info *li);
+  * Join ssid (in the last scan list) on behalf of userland (stage I3): pmk is
+  * the 32-byte WPA2 PMK the caller derived, or NULL to use the passphrase
+  * file / sysctl (open networks need none). Blocks until connected or failed.
+- * The PMK is kept (in memory only) for the automatic reconnect.
++ * The PMK is kept (in memory only) for the automatic reconnect. own_mac is
++ * the per-network private address to join with (locally administered), or
++ * NULL for the hardware address.
+  */
+-int rottenapple_wifi_sta_join(const uint8_t *ssid, uint8_t ssid_len, const uint8_t *pmk);
++int rottenapple_wifi_sta_join(const uint8_t *ssid, uint8_t ssid_len, const uint8_t *pmk, const uint8_t *own_mac);
+ /* Join the last successfully joined network again (its saved credentials). */
+ int rottenapple_wifi_sta_rejoin_last(void);
+ /* Disconnect, no reconnect; forgets a userland PMK. */
+diff --git a/bsd/dev/rottenapple_wifi_a80211.c b/bsd/dev/rottenapple_wifi_a80211.c
+index 3a9c08a..4365ead 100644
+--- a/bsd/dev/rottenapple_wifi_a80211.c
++++ b/bsd/dev/rottenapple_wifi_a80211.c
+@@ -180,6 +180,8 @@ static struct {
+ 	uint8_t ssid_len;
+ 	bool have_pmk;
+ 	uint8_t pmk[32];                        /* secret: wiped after the join */
++	bool have_mac;
++	uint8_t mac[6];                         /* private address for this network (never logged) */
+ } a80211_assoc;
+ 
+ #define SCAN_REUSE_MS           60000   /* while associated, a scan list younger than this is served as is */
+@@ -193,6 +195,9 @@ static struct {
+ #define AS_PMK_LEN              0x1d4   /* 32 when the PMK was derived in userland */
+ #define AS_PMK                  0x1d8
+ #define AS_KEY_TYPE_PMK         6
++#define AS_FLAGS                0x1d0   /* bit 3: use the private address @AS_PRIVATE_MAC */
++#define AS_FLAG_PRIVATE_MAC     0x08
++#define AS_PRIVATE_MAC          0x1fc
+ #define ASSOC_RESULT_OK         1
+ #define ASSOC_RESULT_FAILED     2
+ 
+@@ -553,7 +558,7 @@ a80211_assoc_thread(__unused void *arg, __unused wait_result_t wr)
+ 		(void)rottenapple_wifi_scan(ROTTENAPPLE_WIFI_SCAN_ACTIVE);
+ 	}
+ 	err = rottenapple_wifi_sta_join(a80211_assoc.ssid, a80211_assoc.ssid_len,
+-	    a80211_assoc.have_pmk ? a80211_assoc.pmk : NULL);
++	    a80211_assoc.have_pmk ? a80211_assoc.pmk : NULL, a80211_assoc.have_mac ? a80211_assoc.mac : NULL);
+ 	bzero(&a80211_assoc, sizeof(a80211_assoc));
+ 	ALOG("userland join: %s (%d)", err ? "FAILED" : "connected", err);
+ 	if (err) {
+@@ -576,7 +581,7 @@ a80211_associate(struct ra_a80211_req *r)
+ 	thread_t th;
+ 	int err = 0;
+ 
+-	if (r->data == 0 || r->len < AS_PMK + 32) {
++	if (r->data == 0 || r->len < AS_PRIVATE_MAC + 6) {
+ 		return EINVAL;
+ 	}
+ 	if (a80211_assoc_running) {
+@@ -606,8 +611,12 @@ a80211_associate(struct ra_a80211_req *r)
+ 		err = EOPNOTSUPP;
+ 		goto out;
+ 	}
++	/* private (per-network) address: flag + a locally administered unicast address (IO80211 checks the same) */
++	bool want_mac = (as[AS_FLAGS] & AS_FLAG_PRIVATE_MAC) && (as[AS_PRIVATE_MAC] & 0x03) == 0x02;
+ 	rottenapple_wifi_sta_link_info(&li);
+-	if (li.associated && li.ssid_len == ssid_len && memcmp(li.ssid, as + AS_SSID, ssid_len) == 0) {
++	struct rottenapple_wifi *w = rottenapple_wifi_running();
++	bool mac_ok = w == NULL || (want_mac ? memcmp(w->mac, as + AS_PRIVATE_MAC, 6) == 0 : (w->mac[0] & 0x02) == 0);
++	if (li.associated && mac_ok && li.ssid_len == ssid_len && memcmp(li.ssid, as + AS_SSID, ssid_len) == 0) {
+ 		/* already on this network (joined at boot or before): keep the link */
+ 		ALOG("associate: already associated to the requested network, keeping the link");
+ 		a80211_assoc_result = ASSOC_RESULT_OK;
+@@ -617,6 +626,10 @@ a80211_associate(struct ra_a80211_req *r)
+ 	bzero(&a80211_assoc, sizeof(a80211_assoc));
+ 	memcpy(a80211_assoc.ssid, as + AS_SSID, ssid_len);
+ 	a80211_assoc.ssid_len = (uint8_t)ssid_len;
++	if (want_mac) {
++		memcpy(a80211_assoc.mac, as + AS_PRIVATE_MAC, 6);
++		a80211_assoc.have_mac = true;
++	}
+ 	if (upper == AUTH_UPPER_WPA2_PSK) {
+ 		if (pmk_len == 32) {
+ 			memcpy(a80211_assoc.pmk, as + AS_PMK, 32);
+@@ -627,8 +640,9 @@ a80211_associate(struct ra_a80211_req *r)
+ 		}
+ 		/* no PMK: the station layer falls back to the passphrase file */
+ 	}
+-	ALOG("associate: WPA2-PSK %s, PMK %s", upper == AUTH_UPPER_WPA2_PSK ? "yes" : "no (open)",
+-	    a80211_assoc.have_pmk ? "from userland" : "not given (passphrase file fallback)");
++	ALOG("associate: WPA2-PSK %s, PMK %s, %s address", upper == AUTH_UPPER_WPA2_PSK ? "yes" : "no (open)",
++	    a80211_assoc.have_pmk ? "from userland" : "not given (passphrase file fallback)",
++	    a80211_assoc.have_mac ? "private" : "hardware");
+ 	a80211_assoc_result = 0;
+ 	a80211_assoc_running = true;
+ 	if (kernel_thread_start(a80211_assoc_thread, NULL, &th) != KERN_SUCCESS) {
+diff --git a/bsd/dev/rottenapple_wifi_sta.c b/bsd/dev/rottenapple_wifi_sta.c
+index 351aee3..0acda9f 100644
+--- a/bsd/dev/rottenapple_wifi_sta.c
++++ b/bsd/dev/rottenapple_wifi_sta.c
+@@ -113,6 +113,9 @@ struct wifi_sta {
+ 	uint8_t reconnect_ssid_len;
+ 	uint8_t reconnect_pmk[PMK_LEN];         /* PMK handed in by userland (secret; wiped on disconnect) */
+ 	bool reconnect_have_pmk;
++	uint8_t reconnect_mac[6];               /* own address of the last join (private or hardware) */
++	bool reconnect_have_mac;
++	uint8_t hw_mac[6];                      /* the hardware (NVRAM) address, from the first bring-up */
+ 
+ 	/* link info for the log */
+ 	char ip_text[40];
+@@ -854,7 +857,7 @@ sta_teardown_locked(struct wifi_sta *s, bool tell_firmware)
+ #define JOIN_HS_TIMEOUT_MS      5000
+ 
+ static int
+-sta_join_ex(struct wifi_sta *s, const uint8_t *ssid, uint8_t ssid_len, const uint8_t *pmk_in)
++sta_join_ex(struct wifi_sta *s, const uint8_t *ssid, uint8_t ssid_len, const uint8_t *pmk_in, const uint8_t *mac_in)
+ {
+ 	struct rottenapple_wifi_join jp;
+ 	int err;
+@@ -880,6 +883,28 @@ sta_join_ex(struct wifi_sta *s, const uint8_t *ssid, uint8_t ssid_len, const uin
+ 	if (s->state != LINK_IDLE) {
+ 		sta_teardown_locked(s, true);
+ 	}
++	/* own address for this network: a private one from userland, else the hardware address */
++	{
++		static const uint8_t zero6[6];
++		const uint8_t *want = mac_in != NULL ? mac_in :
++		    (memcmp(s->hw_mac, zero6, 6) != 0 ? s->hw_mac : s->w->mac);
++		if (memcmp(s->w->mac, want, 6) != 0) {
++			int merr = s->w->ops->set_mac ? s->w->ops->set_mac(s->w, want) : ENOTSUP;
++			if (merr != 0) {
++				TLOG("join: could not switch the own address (%d)%s", merr,
++				    mac_in ? "; joining with the current one" : "");
++			}
++		}
++		if (s->ifp != NULL) {
++			uint8_t cur[6];
++			if (ifnet_lladdr_copy_bytes(s->ifp, cur, 6) == 0 && memcmp(cur, s->w->mac, 6) != 0) {
++				/* en1's link address follows (ARP, DHCP client id, BPF all read it from the ifnet) */
++				(void)ifnet_set_lladdr(s->ifp, s->w->mac, ETHER_ADDR_LEN);
++				TLOG("en1 link address switched to the %s address",
++				    (s->w->mac[0] & 0x02) ? "private" : "hardware");
++			}
++		}
++	}
+ 	memcpy(s->own_mac, s->w->mac, 6);
+ 	s->tgt = jp;
+ 	s->replay_valid = false;
+@@ -952,6 +977,12 @@ sta_join_ex(struct wifi_sta *s, const uint8_t *ssid, uint8_t ssid_len, const uin
+ 	/* remember for a reconnect */
+ 	memcpy(s->reconnect_ssid, ssid, ssid_len);
+ 	s->reconnect_ssid_len = ssid_len;
++	if (mac_in != NULL) {
++		memcpy(s->reconnect_mac, mac_in, 6);
++		s->reconnect_have_mac = true;
++	} else {
++		s->reconnect_have_mac = false;
++	}
+ 	if (pmk_in != NULL) {
+ 		memcpy(s->reconnect_pmk, pmk_in, PMK_LEN);
+ 		s->reconnect_have_pmk = true;
+@@ -981,16 +1012,17 @@ rottenapple_wifi_link_lost(struct rottenapple_wifi *w, const char *reason)
+ 	}
+ 	TLOG("link lost (%s); disconnecting", reason ? reason : "");
+ 	bool reconnect = s->want_reconnect;
+-	uint8_t ssid[32], ssid_len = s->reconnect_ssid_len, pmk[PMK_LEN];
+-	bool have_pmk = s->reconnect_have_pmk;
++	uint8_t ssid[32], ssid_len = s->reconnect_ssid_len, pmk[PMK_LEN], mac[6];
++	bool have_pmk = s->reconnect_have_pmk, have_mac = s->reconnect_have_mac;
+ 	memcpy(ssid, s->reconnect_ssid, ssid_len);
+ 	memcpy(pmk, s->reconnect_pmk, PMK_LEN);
++	memcpy(mac, s->reconnect_mac, 6);
+ 	sta_teardown_locked(s, true);
+ 	lck_mtx_unlock(s->lock);
+ 	/* a single best-effort reconnect attempt using the last scan list */
+ 	if (reconnect && ssid_len) {
+ 		TLOG("reconnecting to \"%.*s\"", ssid_len, ssid);
+-		(void)sta_join_ex(s, ssid, ssid_len, have_pmk ? pmk : NULL);
++		(void)sta_join_ex(s, ssid, ssid_len, have_pmk ? pmk : NULL, have_mac ? mac : NULL);
+ 	}
+ 	bzero(pmk, sizeof(pmk));
+ }
+@@ -1010,7 +1042,7 @@ rottenapple_wifi_sta_stop(struct rottenapple_wifi *w)
+ }
+ 
+ int
+-rottenapple_wifi_sta_join(const uint8_t *ssid, uint8_t ssid_len, const uint8_t *pmk)
++rottenapple_wifi_sta_join(const uint8_t *ssid, uint8_t ssid_len, const uint8_t *pmk, const uint8_t *own_mac)
+ {
+ 	bool differs = false;
+ 	int err;
+@@ -1034,11 +1066,11 @@ rottenapple_wifi_sta_join(const uint8_t *ssid, uint8_t ssid_len, const uint8_t *
+ 		bzero(psk, sizeof(psk));
+ 		bzero(fpmk, sizeof(fpmk));
+ 	}
+-	err = sta_join_ex(&sta, ssid, ssid_len, pmk);
++	err = sta_join_ex(&sta, ssid, ssid_len, pmk, own_mac);
+ 	if (err != 0 && differs) {
+ 		/* a wrong password typed in Settings must not keep the phone offline */
+ 		TLOG("join with the userland PMK failed (%d); retrying with the passphrase file", err);
+-		err = sta_join_ex(&sta, ssid, ssid_len, NULL);
++		err = sta_join_ex(&sta, ssid, ssid_len, NULL, own_mac);
+ 	}
+ 	return err;
+ }
+@@ -1046,8 +1078,8 @@ rottenapple_wifi_sta_join(const uint8_t *ssid, uint8_t ssid_len, const uint8_t *
+ int
+ rottenapple_wifi_sta_rejoin_last(void)
+ {
+-	uint8_t ssid[32], ssid_len, pmk[PMK_LEN];
+-	bool have_pmk;
++	uint8_t ssid[32], ssid_len, pmk[PMK_LEN], mac[6];
++	bool have_pmk, have_mac;
+ 	int err;
+ 
+ 	if (!sta_ready) {
+@@ -1058,12 +1090,14 @@ rottenapple_wifi_sta_rejoin_last(void)
+ 	memcpy(ssid, sta.reconnect_ssid, sizeof(ssid));
+ 	memcpy(pmk, sta.reconnect_pmk, PMK_LEN);
+ 	have_pmk = sta.reconnect_have_pmk;
++	memcpy(mac, sta.reconnect_mac, 6);
++	have_mac = sta.reconnect_have_mac;
+ 	lck_mtx_unlock(sta.lock);
+ 	if (ssid_len == 0) {
+ 		return ENOENT;
+ 	}
+ 	TLOG("rejoining the last network");
+-	err = sta_join_ex(&sta, ssid, ssid_len, have_pmk ? pmk : NULL);
++	err = sta_join_ex(&sta, ssid, ssid_len, have_pmk ? pmk : NULL, have_mac ? mac : NULL);
+ 	bzero(pmk, sizeof(pmk));
+ 	return err;
+ }
+@@ -1128,6 +1162,9 @@ rottenapple_wifi_sta_attach(struct rottenapple_wifi *w)
+ 		return;
+ 	}
+ 	lck_mtx_lock(s->lock);
++	if (memcmp(s->hw_mac, zero, sizeof(zero)) == 0) {
++		memcpy(s->hw_mac, w->mac, 6);           /* the NVRAM address of the first bring-up */
++	}
+ 	if (s->ifp == NULL) {
+ 		memcpy(s->own_mac, w->mac, 6);
+ 		(void)sta_if_create(s);
+@@ -1160,7 +1197,7 @@ sysctl_wifi_join SYSCTL_HANDLER_ARGS
+ 		TLOG("disconnected (empty join)");
+ 		return 0;
+ 	}
+-	return sta_join_ex(&sta, (const uint8_t *)ssid, (uint8_t)slen, NULL);
++	return sta_join_ex(&sta, (const uint8_t *)ssid, (uint8_t)slen, NULL, NULL);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, rottenapple_wifi_join, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
+     sysctl_wifi_join, "A", "rotten-apple Wi-Fi: write an SSID to join (empty to disconnect)");

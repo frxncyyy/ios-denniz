@@ -1,0 +1,437 @@
+--- a/shim/nord2-xnu/wifi_normal_backend_forward.inc
++++ b/shim/nord2-xnu/wifi_normal_backend_forward.inc
+@@ -1,4 +1,7 @@
+ #include "wifi_station_transport_forward.inc"
++struct nct_session;
++static int nss_scan_return_origin_valid(const struct nct_session *);
++#define NCT_SCAN_RETURN_VALID(s) nss_scan_return_origin_valid(s)
+ static int ncb_after_basic(void);
+ static int ncb_rx_active(const struct nwfn_native *);
+ static int ncb_rx_memory(const struct nwfn_native *,uint64_t,uint32_t,unsigned);
+--- a/shim/nord2-xnu/wifi_normal_rx.c
++++ b/shim/nord2-xnu/wifi_normal_rx.c
+@@ -32,6 +32,13 @@
+  if(!p||p==s||!source(p)||!p->entered||p->active||p->halt||p->error||p->scan.active||!t||t->continuation!=1||t->previous!=p->session||p->init!=i)return -1;
+  if(prepare(s,i,t,0,sequence,timeout,t->base_completed))return -1;
+  for(unsigned k=0;k<NCR_QUEUES;k++){s->queue[k].next=p->queue[k].next;s->queue[k].didx=p->queue[k].didx;s->queue[k].segmented=p->queue[k].segmented;}
++ return source(s)?0:-1;
++}
++int ncr_scan_return_prepare(struct ncr_state*s,struct nwi_state*i,struct nct_session*t,const struct ncr_queue*q,uint8_t sequence,uint64_t timeout){
++ if(!q||!i||!t||t->continuation!=2||!t->scan_return||!t->scan_return->sealed||t->init!=i)return -1;
++ for(unsigned k=0;k<NCR_QUEUES;k++)if(!same_ring(&q[k].ring,&i->rings[k+4])||q[k].next>=q[k].ring.count||q[k].segmented>1)return -1;
++ if(q[1].next!=i->transport.rx_index||prepare(s,i,t,0,sequence,timeout,t->base_completed))return -1;
++ for(unsigned k=0;k<NCR_QUEUES;k++){s->queue[k]=q[k];/* Refresh DIDX/raw only through next checked pump. */s->queue[k].didx=0;for(unsigned j=0;j<4;j++)s->queue[k].raw[j]=0;}
+  return source(s)?0:-1;
+ }
+ int ncr_memory_range(const struct ncr_state*s,uint64_t p,uint32_t n,unsigned write){
+--- a/shim/nord2-xnu/wifi_normal_rx.h
++++ b/shim/nord2-xnu/wifi_normal_rx.h
+@@ -29,6 +29,7 @@
+  * this object and its owning command session alive through the bounded batch. */
+ int ncr_prepare(struct ncr_state *,struct nwi_state *,struct nct_session *,unsigned,uint8_t,uint64_t);
+ int ncr_continue_prepare(struct ncr_state *,struct nwi_state *,struct nct_session *,const struct ncr_state *,uint8_t,uint64_t);
++int ncr_scan_return_prepare(struct ncr_state *,struct nwi_state *,struct nct_session *,const struct ncr_queue *,uint8_t,uint64_t);
+ int ncr_pump(void *,const struct ncd_io *,void *,unsigned,unsigned *);
+ /* Native admission adds these exact per-operation slots to the existing
+  * command-only allowlist; it also checks the current native worker/session. */
+--- a/shim/nord2-xnu/wifi_normal_transport.c
++++ b/shim/nord2-xnu/wifi_normal_transport.c
+@@ -66,9 +66,14 @@
+ }
+ int nct_done_receipt(const struct nct_session*p){return terminal(p);}
+ static int anchor(const struct nct_session*s){
+- if(!s->continuation)return !s->previous&&s->base_completed==5;
++ if(!s->continuation)return !s->previous&&!s->scan_return&&s->base_completed==5;
++ if(s->continuation==2){const struct nct_scan_return*p=s->scan_return;
++  return !s->previous&&p&&p->sealed==1&&p->generation&&p->basic==s->basic&&p->cap==s->cap&&p->init==s->init&&p->firmware==s->firmware&&
++   s->count==1&&s->entry[0].cid==3&&s->entry[0].bytes==1252&&s->entry[0].set_query==1&&
++   s->base_completed==p->completed&&s->first_tx==p->tx_index&&s->first_sequence==p->next_sequence&&s->pse_total==p->pse_total&&s->capacity==p->capacity;
++ }
+  const struct nct_session*p=s->previous;
+- return s->continuation==1&&p!=s&&terminal(p)&&s->count==1&&s->entry[0].cid==3&&s->entry[0].bytes==1252&&s->entry[0].set_query==1&&
++ return s->continuation==1&&p!=s&&terminal(p)&&s->scan_return==p->scan_return&&s->count==1&&s->entry[0].cid==3&&s->entry[0].bytes==1252&&s->entry[0].set_query==1&&
+  p->basic==s->basic&&p->cap==s->cap&&p->init==s->init&&p->firmware==s->firmware&&
+  s->base_completed==p->base_completed+p->count&&s->first_tx==(p->first_tx+p->count)%1024&&s->first_sequence==(uint8_t)(p->first_sequence+p->count)&&s->pse_total==p->pse_total;
+ }
+@@ -79,7 +84,15 @@
+  struct nwt_state*t=&s->init->transport;
+  if(p->base_completed+p->count==UINT32_MAX||t->completed!=p->base_completed+p->count||t->tx_index!=(p->first_tx+p->count)%1024||t->next_sequence!=(uint8_t)(p->first_sequence+p->count)||t->submit_attempted||t->tx_done||t->rx_done||t->rx_index>=16)return refuse(s,111);
+  if(!r||!r->entry||!r->build||r->count!=1||r->entry[0].cid!=3||r->entry[0].bytes!=1252||r->entry[0].set_query!=1||!r->batch_us||r->batch_us>NCT_BATCH_MAX_US||!r->service_us||r->service_us>NCT_SERVICE_MAX_US||r->service_us>=r->batch_us||p->pse_total!=b->plan.pse_cmd||p->capacity!=p->pse_total-1)return refuse(s,112);
+- s->continuation=1;s->previous=p;return seal(s,r,p->pse_total);
++ s->continuation=1;s->previous=p;s->scan_return=p->scan_return;return seal(s,r,p->pse_total);
++}
++int nct_scan_return_prepare(const struct nbc_state*b,const struct nct_scan_return*p,const struct nct_recipe*r,struct nct_session*s){
++ if(!s||s->attempted)return -1;s->attempted=1;s->basic=b;
++ if(basic_receipt(b)||!p||p->sealed!=1||!p->generation||p->basic!=b||p->cap!=b->cap||p->init!=b->init||p->firmware!=b->firmware||p->completed<5||p->completed==UINT32_MAX||p->tx_index>=1024||p->pse_total!=b->plan.pse_cmd||p->capacity!=p->pse_total-1)return refuse(s,113);
++ s->cap=b->cap;s->init=b->init;s->firmware=b->firmware;const struct nwt_state*t=&s->init->transport;
++ if(t->completed!=p->completed||t->tx_index!=p->tx_index||t->next_sequence!=p->next_sequence||t->submit_attempted||t->tx_done||t->rx_done||t->rx_index>=16)return refuse(s,114);
++ if(!r||!r->entry||!r->build||r->count!=1||r->entry[0].cid!=3||r->entry[0].bytes!=1252||r->entry[0].set_query!=1||!r->batch_us||r->batch_us>NCT_BATCH_MAX_US||!r->service_us||r->service_us>NCT_SERVICE_MAX_US||r->service_us>=r->batch_us)return refuse(s,115);
++ s->continuation=2;s->scan_return=p;return seal(s,r,p->pse_total);
+ }
+ int nct_lease_window(const struct nct_session*s,const struct nbc_state*b,const struct ncd_state*c,const struct nwi_state*i,const struct nfp_native*f){
+  if(!s||!s->attempted||!s->prepared||!s->entered||s->halt||s->error||s->refusal||
+@@ -94,7 +107,7 @@
+  unsigned in_flight=s->phase==NCT_SUBMITTED;
+  if(in_flight&&s->cursor>=s->count)return 0;
+  if(s->acquired!=s->cursor+in_flight||s->released!=s->cursor+(in_flight&&s->record[s->cursor].published))return 0;
+- if(s->phase==NCT_DRAIN)return s->continuation==1&&!s->cursor&&!s->reserved&&!i->transport.submit_attempted;
++ if(s->phase==NCT_DRAIN)return (s->continuation==1||s->continuation==2)&&!s->cursor&&!s->reserved&&!i->transport.submit_attempted;
+  if(s->phase==NCT_SERVICE)return s->cursor==s->count&&!s->reserved&&!i->transport.submit_attempted;
+  if((s->phase!=NCT_COMMAND&&s->phase!=NCT_WRITING&&s->phase!=NCT_SUBMITTED)||s->cursor>=s->count)return 0;
+  const struct nct_record*q=&s->record[s->cursor];const struct nct_entry*e=&s->entry[s->cursor];
+--- a/shim/nord2-xnu/wifi_normal_transport.h
++++ b/shim/nord2-xnu/wifi_normal_transport.h
+@@ -17,6 +17,13 @@
+  uint64_t batch_us,service_us;
+ };
+ enum nct_phase {NCT_NEW,NCT_PREPARED,NCT_COMMAND,NCT_WRITING,NCT_SUBMITTED,NCT_BETWEEN,NCT_SERVICE,NCT_DONE,NCT_HALTED,NCT_DRAIN};
++/* Native-sealed one-way return origin after real closed station ownership.
++ * A public copy has no authority: native binder authenticates exact address. */
++struct nct_scan_return {
++ const struct nbc_state *basic;struct ncd_state *cap;struct nwi_state *init;const struct nfp_native *firmware;
++ unsigned sealed,completed,tx_index,pse_total,capacity;uint8_t next_sequence;
++ uint64_t generation;
++};
+ struct nct_session;
+ struct nct_access {struct nct_session *session;const struct ncd_io *hardware;void *context;};
+ struct nct_record {uint8_t cid,sequence;uint16_t bytes;unsigned from,to,didx,polls,observed;
+@@ -32,7 +39,7 @@
+  struct nct_record record[NCT_COMMAND_LIMIT];
+  int (*build)(void *,unsigned,uint8_t *,size_t,size_t *);void *build_context;
+  unsigned drain_quiescent,drain_refused;
+- unsigned continuation;const struct nct_session *previous;
++ unsigned continuation;const struct nct_session *previous;const struct nct_scan_return *scan_return;
+  struct nct_access access;uint8_t wire[NCT_WIRE_LIMIT],descriptor[16];
+ };
+ /* Pure one-use admission/seal. Return1 clean prerequisite refusal, -1 malformed
+@@ -40,6 +47,7 @@
+ int nct_prepare(const struct nbc_state *,const struct nct_recipe *,struct nct_session *);
+ int nct_done_receipt(const struct nct_session *);
+ int nct_continue_prepare(const struct nbc_state *,const struct nct_session *,const struct nct_recipe *,struct nct_session *);
++int nct_scan_return_prepare(const struct nbc_state *,const struct nct_scan_return *,const struct nct_recipe *,struct nct_session *);
+ int nct_lease_window(const struct nct_session *,const struct nbc_state *,const struct ncd_state *,const struct nwi_state *,const struct nfp_native *);
+ /* Checked IO is usable only via exact session.access while actual lease active.
+  * Root's RX parser can consume it with the unchanged ncd_io interface. */
+--- a/shim/nord2-xnu/wifi_normal_transport_bind.inc
++++ b/shim/nord2-xnu/wifi_normal_transport_bind.inc
+@@ -2,12 +2,16 @@
+  * Root coordinator supplies the immutable reviewed config+scan recipe/hooks;
+  * no flag, caller receipt clone or pure plan grants this native authority. */
+ #include "wifi_normal_transport.h"
++#ifndef NCT_SCAN_RETURN_VALID
++#define NCT_SCAN_RETURN_VALID(s) (!(s)->scan_return)
++#endif
+ static struct {struct nct_session session;unsigned attempted,active;}nct_native;
+ static int nct_native_owner_window(const struct nwfn_native*n)
+ {
+  return n==&nwfn_native&&nct_native.attempted==1&&nct_native.active==1&&
+   ncd_native.active==1&&!ncd_native.parked&&!ncd_native.halt&&
+   ncd_native.worker==current_thread()&&
++  NCT_SCAN_RETURN_VALID(&nct_native.session)&&
+   nct_native.session.access.session==&nct_native.session&&
+   nct_native.session.access.context==&ncd_native&&nct_native.session.access.hardware==&ncd_io&&
+   nct_lease_window(&nct_native.session,&nbc_native.state,&ncd_native.diag,&nwfn_native.init,&nfp_native);
+--- /dev/null
++++ b/shim/nord2-xnu/wifi_scan_return_bind.inc
+@@ -0,0 +1,61 @@
++/* One-way same-worker return after actual closed first-station cleanup. No
++ * allocation/reset/rejoin: original DMA pool and first-attempt ledger persist. */
++static int nss_scan_return_origin_valid(const struct nct_session*s){
++ if(!nss_return.ready)return !nst_native.attempted&&!nst_native.active&&s->continuation!=2&&!s->scan_return;
++ return s==&nct_native.session&&s->scan_return==&nss_return.origin&&
++  nss_return.attempted==1&&nss_return.ready==1&&nss_return.origin.sealed==1&&
++  !nst_native.active&&!njs_native.queued&&!njs_native.active&&!njs_native.linked&&!njs_native.tx_admit&&
++  njs_native.cookie_retired&&!njs_native.retiring&&!njs_native.cookie&&!njs_native.completion&&
++  njs_native.driver.owner.transaction.phase==STC_DONE&&njs_native.scan_returned==1&&njs_native.used==1&&
++  njs_native.arbiter.connection_used==1&&nst_native.attempted==1&&
++  nss_return.origin.generation==njs_native.native_generation;
++}
++/* Pure prerequisite failure leaves scans blocked. A physical owner/read fault
++ * keeps the existing common halt/drain path, never a guessed return origin. */
++static int nss_return_scans(void){
++ if(ncd_native.worker!=current_thread())return 1;
++ IOLockLock(nss_native.lock);
++ if(njs_native.scan_returned){IOLockUnlock(nss_native.lock);return 0;}
++ struct nst*n=&nst_native.state;struct nwo*o=&njs_native.driver.owner;struct stc*t=&o->transaction;
++ struct nwt_state*w=&nwfn_native.init.transport;
++ if(nss_return.attempted||nss_return.ready||nss_native.failed||nct_native.active||
++  !ncd_native.active||ncd_native.parked||ncd_native.halt||nwfn_native.halt||nwfn_native.stage!=NWFN_RETAINED||!nwfn_native.ap_owned||!nwfn_native.wf_owned||nwfn_native.asleep||
++  !nfp_native.ready||nfp_native.halt||nfp_native.state.halt||nfp_native.state.error||!nfp_native.finish_done||
++  !njs_native.used||njs_native.joined||njs_native.queued||njs_native.active||!njs_native.terminal||njs_native.retiring||!njs_native.cookie_retired||njs_native.cookie||njs_native.completion||njs_native.linked||njs_native.tx_admit||njs_native.tx_count||njs_native.rx_count||
++  njs_native.snapshot.phase!=NJS_FAILED||njs_native.snapshot.data_ready||njs_native.snapshot.associated||njs_native.snapshot.ptk_ready||njs_native.snapshot.gtk_ready||
++  !njs_native.native_generation||njs_native.driver.transport!=n||t->generation!=njs_native.native_generation||t->phase!=STC_DONE||t->action.kind||o->halted||o->issuing||o->in_ticket||o->in_kind||!o->closed||
++  t->arbiter!=&njs_native.arbiter||njs_native.arbiter.mode||njs_native.arbiter.generation||!njs_native.arbiter.connection_used||
++  nst_native.attempted!=1||nst_native.active!=1||!n->prepared||n->halt||n->error||n->active||n->phase!=NST_IDLE||n->callback_active||n->generation!=njs_native.native_generation||n->init!=&nwfn_native.init||n->previous!=&nct_native.session||n->previous_rx!=&ncb_native.rx||
++  !nct_done_receipt(n->previous)||n->previous->basic!=&nbc_native.state||n->previous->cap!=&ncd_native.diag||n->previous->init!=&nwfn_native.init||n->previous->firmware!=&nfp_native||
++  n->base_completed!=n->previous->base_completed+n->previous->count||
++  !n->cleanup_started||n->wire_cid!=0x17||n->wire_type||n->wire_sequence!=(uint8_t)(w->next_sequence-1u)||n->peer_step!=3||!n->dma_done||n->wire_busy||n->air_pending||n->peer_kind||n->activation_pending||n->channel_held||n->sta_active||n->ptk_ready||n->controlled_port||n->ptk.installed||n->gtk.installed||
++  !n->submitted||n->submitted!=n->dma_completed||n->base_completed>UINT32_MAX-n->dma_completed||w->completed!=n->base_completed+n->dma_completed||w->completed==UINT32_MAX||w->tx_index!=n->tx_next||w->tx_index>=1024||w->submit_attempted||w->tx_done||w->rx_done||w->halt||nwfn_native.init.halt||
++  n->credit_reserved||n->credit_available!=n->credit_capacity||n->credit_acquired!=n->credit_released||n->credit_capacity!=n->previous->capacity||n->credit_capacity!=nbc_native.state.plan.pse_cmd-1||
++  w->rx_index!=n->queue[1].next){IOLockUnlock(nss_native.lock);return 1;}
++ for(unsigned k=0;k<5;k++){
++  const struct ncr_queue*q=&n->queue[k];const struct nwi_ring*r=&nwfn_native.init.rings[k+4];
++  if(q->ring.descriptors!=r->descriptors||q->ring.buffers!=r->buffers||q->ring.base!=r->base||q->ring.count!=r->count||q->ring.ext!=r->ext||q->ring.rx!=r->rx||q->next>=r->count||q->segmented>1){IOLockUnlock(nss_native.lock);return 1;}
++ }
++ nss_return.attempted=1;unsigned phase=n->phase,active=n->active;int result=-1;uint32_t v;uint64_t now;uint8_t descriptor[16];
++ n->active=1;n->phase=NST_TX_READ;
++ /* Same checked native callbacks/lease, no writes and no returned addresses. */
++ if(ncd_io.bus->owner(&ncd_native)||ncd_io.now_us(&ncd_native,&now)||now<n->last||now>=n->deadline)goto restore;
++ n->last=now;
++ if(ncd_io.bus->reg_read(&ncd_native,0x180600f0,&v)||(v&3)!=3)goto restore;
++ for(unsigned k=0;k<2;k++)if(ncd_io.bus->reg_read(&ncd_native,0x18024200+4096u*k,&v)||(v&0x00300000))goto restore;
++ if(ncd_io.bus->reg_read(&ncd_native,0x18025418,&v)||v!=n->tx_next||ncd_io.bus->reg_read(&ncd_native,0x1802541c,&v)||v!=n->tx_next)goto restore;
++ uint64_t cell=w->tx_ring+16u*n->tx_next;
++ if(ncd_io.bus->sync(&ncd_native,cell,16,2)||ncd_io.bus->mem_read(&ncd_native,cell,descriptor,16)||!(descriptor[7]&128))goto restore;
++ result=0;
++restore:
++ n->phase=phase;n->active=active;
++ if(result){IOLockUnlock(nss_native.lock);return -1;}
++ /* Seal exact current counters independently: frames do not advance command
++  * sequence. Old nct.session may now be replaced only through this origin. */
++ nss_return.origin=(struct nct_scan_return){.basic=&nbc_native.state,.cap=&ncd_native.diag,.init=&nwfn_native.init,.firmware=&nfp_native,
++  .sealed=1,.completed=w->completed,.tx_index=w->tx_index,.pse_total=nbc_native.state.plan.pse_cmd,.capacity=n->credit_capacity,.next_sequence=w->next_sequence,.generation=n->generation};
++ for(unsigned k=0;k<5;k++)nss_return.queue[k]=n->queue[k];
++ n->pm_pending=0;nst_native.active=0;nss_return.ready=1;njs_native.scan_returned=1;
++ printf("NORD2 WIFI IOS SCANRETURN: generation=%llu completed=%u tx=%u sequence=%u rx_event=%u used=1\n",(unsigned long long)n->generation,w->completed,w->tx_index,w->next_sequence,w->rx_index);
++ IOLockUnlock(nss_native.lock);return 0;
++}
+--- a/shim/nord2-xnu/wifi_scan_service_bind.inc
++++ b/shim/nord2-xnu/wifi_scan_service_bind.inc
+@@ -18,6 +18,7 @@
+ static void njs_initialize_locked(void){}
+ static int njs_owner_work(void){return 0;}
+ #else
++static int nss_return_scans(void);
+ static int njs_scan_blocked_locked(void);
+ static int njs_pending_locked(void);
+ static void njs_cache_scan_locked(const struct nsb_scan*);
+@@ -67,6 +68,7 @@
+  printf("NORD2 WIFI IOS OWNER: active=1 retained=1 boot_complete=1 ready=1\n");
+  nord2_wifi_ios_backend_ready();return 0;
+ }
++static struct {struct nct_scan_return origin;struct ncr_queue queue[5];unsigned attempted,ready,consumed;}nss_return;
+ static int nss_execute(struct nss_slot*slot){
+  struct nct_session*s=&nct_native.session;struct ncr_state*r=&ncb_native.rx;
+  if(ncd_native.worker!=current_thread()||!ncd_native.active||ncd_native.halt||nct_native.active||s->phase!=NCT_DONE||s->halt||r->active||r->halt)return 1;
+@@ -77,13 +79,18 @@
+  nss_native.previous=*s;nss_native.previous_rx=*r;nss_native.previous_rx.session=&nss_native.previous;
+  memset(s,0,sizeof(*s));memset(r,0,sizeof(*r));
+  const struct nct_entry entry={NCS_SCAN_BYTES,3,1};const struct nct_recipe recipe={&entry,1,nss_build,&nss_native.frames,UINT64_C(30000000),UINT64_C(15000000)};
+- if(nct_continue_prepare(&nbc_native.state,&nss_native.previous,&recipe,s)||ncr_continue_prepare(r,&nwfn_native.init,s,&nss_native.previous_rx,sequence,UINT64_C(14000000))){*s=nss_native.previous;*r=nss_native.previous_rx;r->session=s;return 1;}
++ unsigned returning=nss_return.ready&&!nss_return.consumed;
++ int preparation=returning?nct_scan_return_prepare(&nbc_native.state,&nss_return.origin,&recipe,s):nct_continue_prepare(&nbc_native.state,&nss_native.previous,&recipe,s);
++ if(!preparation)preparation=returning?ncr_scan_return_prepare(r,&nwfn_native.init,s,nss_return.queue,sequence,UINT64_C(14000000)):ncr_continue_prepare(r,&nwfn_native.init,s,&nss_native.previous_rx,sequence,UINT64_C(14000000));
++ if(preparation){*s=nss_native.previous;*r=nss_native.previous_rx;r->session=s;return 1;}
+  nct_native.active=1;NVC_PHASE(5);
+  const struct nct_hooks hooks={ncr_pump,r,ncb_sleep,&ncb_native};
+  int result=nct_run(&ncd_io,&ncd_native,&hooks,s);nct_native.active=0;
+  if(result==1&&s->drain_refused){/* RX may already have rearmed stale frames: preserve its current cursors. */
++  if(returning)for(unsigned k=0;k<5;k++)nss_return.queue[k]=r->queue[k];
+   *s=nss_native.previous;r->session=s;r->phase=NCR_IDLE;r->active=0;return 1;
+  }
++ if(returning)nss_return.consumed=1;
+  nss_native.scan_sequence=sequence;
+  if(result<0){slot->scan=r->scan;slot->captured=r->scan.last;ncd_native.halt=nwfn_native.halt=nwfn_native.init.halt=nwfn_native.init.transport.halt=nfp_native.halt=1;return -1;}
+  if(!r->scan.done&&r->scan_requested){r->scan.active=0;r->scan.partial=1;if(s->service_timed_out)r->scan.timed_out=1;}
+@@ -100,8 +107,12 @@
+ }
+ #ifndef NSS_STATION_TEST_DISABLED
+ #include "wifi_station_transport_bind.inc"
++#define NJS_RETURN_SCANS() nss_return_scans()
+ #include "wifi_station_service_bind.inc"
++#include "wifi_scan_return_bind.inc"
+ #else
++static int nss_scan_return_origin_valid(const struct nct_session*s){return !s->scan_return;}
++static int nss_return_scans(void){return 1;}
+ static int nst_native_owner_window(const struct nwfn_native*n){(void)n;return 0;}
+ static int nst_native_rx_active(const struct nwfn_native*n){(void)n;return 0;}
+ static int nst_native_rx_memory(const struct nwfn_native*n,uint64_t a,uint32_t b,unsigned w){(void)n;(void)a;(void)b;(void)w;return 0;}
+--- a/shim/nord2-xnu/wifi_station_service_bind.inc
++++ b/shim/nord2-xnu/wifi_station_service_bind.inc
+@@ -17,13 +17,16 @@
+  uint64_t absolute,ns;clock_get_uptime(&absolute);absolutetime_to_nanoseconds(absolute,&ns);return ns/1000;
+ #endif
+ }
++#ifndef NJS_RETURN_SCANS
++#define NJS_RETURN_SCANS() 0
++#endif
+ #define NJS_JOIN_BUDGET_US UINT64_C(8000000)
+ #define NJS_TX_SLOTS 8u
+ #define NJS_CACHE_SLOTS 4u
+ #define NJS_RX_SLOTS 16u
+ static struct {
+  IOLock*notice_lock;
+- unsigned queued,active,canceled,leave,detach,used,joined,terminal,retiring,cache_next;
++ unsigned queued,active,canceled,leave,detach,used,joined,terminal,retiring,cache_next,scan_returned;
+  unsigned linked,tx_admit,tx_head,tx_count,rx_count;
+  unsigned logs,last_phase,last_kind,last_outcome,last_error,last_halt,last_ready,last_event,last_status,event_count,tx_accepted,tx_results,tx_ok,tx_fail,queued_drop,rx_delivered,data_logs,cookie_retired,last_service,last_linked,last_result;
+  uint64_t admitted_us,deadline_us;
+@@ -57,7 +60,7 @@
+ }
+ static void njs_link_error(unsigned up,int error){IOLockLock(nss_native.lock);unsigned log=njs_native.logs<112;if(log)njs_native.logs++;IOLockUnlock(nss_native.lock);if(log)printf("NORD2 WIFI IOS LINK: generation=%llu up=%u error=%d\n",(unsigned long long)njs_native.native_generation,up,error);}
+ static int njs_pending_locked(void){return njs_native.queued||njs_native.active;}
+-static int njs_scan_blocked_locked(void){return njs_native.queued||njs_native.active||njs_native.used;}
++static int njs_scan_blocked_locked(void){return njs_native.queued||njs_native.active||(njs_native.used&&!njs_native.scan_returned);}
+ static void njs_cache_scan_locked(const struct nsb_scan*s){
+  if(!niwj_scan_usable(s))return;
+  njs_native.cache[njs_native.cache_next++%NJS_CACHE_SLOTS]=*s;
+@@ -246,6 +249,7 @@
+  if(notify_join&&!detach){IOLockLock(nss_native.lock);unsigned live=njs_native.linked&&!njs_native.canceled&&!njs_native.leave;IOLockUnlock(nss_native.lock);if(live)njs_notice(NJS_JOINED);}
+  if(notify_terminal)njs_notice(njs_native.joined?NJS_LEFT:NJS_JOIN_FAILED);
+  if(retire)njs_notice(NJS_RETIRED);
++ if(terminal&&njs_native.driver.owner.transaction.phase==STC_DONE&&NJS_RETURN_SCANS()<0)return njs_fatal_owner();
+  if(!terminal){uint64_t deadline;clock_interval_to_deadline(1000,NSEC_PER_USEC,&deadline);IOLockLock(nss_native.lock);assert_wait_deadline((event_t)&nss_native,THREAD_UNINT,deadline);IOLockUnlock(nss_native.lock);thread_block(THREAD_CONTINUE_NULL);}
+  return 1;
+ }
+--- /dev/null
++++ b/tools/fixtures/nord2-wifi-scan-return/owner-extra.c
+@@ -0,0 +1,112 @@
++static unsigned callbacks,last_status,station_pubs,station_frames,station_commands,station_receipts[20];
++static int fixture_rng(void*c,uint8_t*p,size_t n){(void)c;memset(p,0x41,n);return 0;}
++static void completed(void*c,uint64_t gen,uint64_t ticket,enum nss_status status){assert(c==&callbacks&&gen==99);callbacks++;last_status=status;assert(!nord2_wifi_scan_release(ticket));}
++int nord2_wifi_ifnet_link(uint64_t g,int a){assert(g&&!a);return 0;}
++int nord2_wifi_ifnet_receive(uint64_t g,const uint8_t*p,size_t n){assert(g&&p&&n>=14);return 0;}
++static void drain(void){worker_thread=2;if(!setjmp(parked_exit))nss_owner_loop();}
++static void station_packet(unsigned k,unsigned type,unsigned bytes,unsigned last,unsigned pid,unsigned wlan){
++ struct ncr_queue*q=&nst_native.state.queue[k];unsigned at=q->next;
++ uint8_t*d=pool_memory+(q->ring.descriptors-NDP_POOL_BASE)+16*at,*p=pool_memory+(q->ring.buffers-NDP_POOL_BASE)+4096*at;memset(p,0,bytes);w16(p,bytes);w16(p+2,type==7?0x3800:type<<11);
++ if(type==7){p[28]=0x0f;p[36]=pid;p[40]=wlan;}
++ put32(d,(uint32_t)(q->ring.buffers+4096*at));put32(d+4,0x80000000u|(last?0x40000000u:0)|(bytes<<16));put32(d+8,0);put32(d+12,0);hardware_register(q->ring.base+12,(at+1)%q->ring.count);
++}
++static void station_completion(unsigned next){
++ struct nwt_state*t=&nwfn_native.init.transport;struct nst*s=&nst_native.state;
++ uint8_t*d=pool_memory+(t->tx_ring-NDP_POOL_BASE)+16*t->tx_index,*p=pool_memory+(t->command-NDP_POOL_BASE);
++ assert(station_hardware&&s->wire_busy);station_pubs++;
++ if(s->wire_type){station_frames++;/* Synthetic genuine air result only for management; security uses local DDONE. */if(s->wire_type==1)station_packet(1,7,124,1,s->wire_pid,s->wire_wlan);}
++ else{station_commands++;assert(p[37]==0xa0&&p[39]==t->next_sequence);}
++ put32(d,0xffffffffu);put32(d+4,0xffffffffu);put32(d+8,0xdeadbeefu);put32(d+12,0x12345678u);hardware_register(0x1802541c,next);
++}
++static int station_event(void*c,const struct nst_event*e){assert(c==&station_pubs&&e->generation==1&&e->kind<20);station_receipts[e->kind]++;return 0;}
++static void pump_station(void){for(unsigned tries=0;tries<1000;tries++){
++ assert(!nst_step(&nst_native.state,&ncd_io,&ncd_native,16,station_event,&station_pubs));
++ if(!nst_native.state.wire_busy&&!nst_native.state.air_pending&&!nst_native.state.peer_kind)return;
++ }assert(!"station model did not retire");}
++static unsigned returned_notices[5];
++static void join_completed(void*c,uint64_t epoch,uint64_t ticket,enum njs_notice notice){
++ assert(c==returned_notices&&epoch==7&&ticket==1&&notice<5);returned_notices[notice]++;
++ /* Actual njs_notice invokes clients outside NSS lock; both callbacks run
++  * before cookie retirement and before scan-return publication. */
++ assert(!pthread_mutex_trylock(&nss_native.lock->m));pthread_mutex_unlock(&nss_native.lock->m);
++ assert(!nss_return.ready&&!njs_native.scan_returned&&njs_native.retiring&&!njs_native.cookie_retired);
++ struct nss_request request={0};uint64_t untouched=123;assert(nord2_wifi_scan_enqueue(&request,&callbacks,99,completed,&untouched)==2&&untouched==123);
++}
++static struct niwj_target selected;
++static void seal_failed_service(void){
++ njs_native.used=njs_native.terminal=njs_native.cookie_retired=1;njs_native.native_generation=njs_native.ticket=1;njs_native.snapshot.phase=NJS_FAILED;njs_native.snapshot.result=2;
++ njs_native.arbiter.mode=0;njs_native.arbiter.generation=0;njs_native.arbiter.connection_used=1;assert(njs_native.driver.transport==&nst_native.state);njs_native.driver.owner.closed=1;
++ struct stc*t=&njs_native.driver.owner.transaction;t->attempted=1;t->generation=1;t->phase=STC_DONE;memset(&t->action,0,sizeof t->action);t->outcome=STC_FAILED;t->arbiter=&njs_native.arbiter;
++ /* Service/transaction terminal metadata is a documented seam. All preceding
++  * native publications and retirement, worker and memory guards are real. */
++}
++int main(int argc,char**argv){assert(argc==2);FILE*f=fopen(argv[1],"rb");assert(f&&fread(authenticated_board,1,sizeof authenticated_board,f)==sizeof authenticated_board);fclose(f);
++ setup(0);run_worker();assert(nss_native.ready&&!ncd_native.parked&&service_ready_hooks==1&&nct_native.session.completed==26);
++ struct nss_request scan={0};uint64_t ticket=0;delivered=0;assert(!nord2_wifi_scan_enqueue(&scan,&callbacks,99,completed,&ticket));drain();assert(callbacks==1&&last_status==NSS_COMPLETE);
++ memset(&selected,0,sizeof selected);selected.record=ncb_native.rx.scan.records[0];selected.band=1;selected.channel=selected.record.channel;selected.rate_count=1;selected.rates[0]=0x82;selected.record.interval=100;selected.record.rxv_valid=1;selected.record.group_valid=4;selected.record.rxv[4]=100;selected.record.rxv[5]=255;
++ uint64_t now;assert(!ncd_native_now(&ncd_native,&now));assert(!nst_native_prepare(&selected,1,now,now+UINT64_C(60000000),&njs_native.profile));station_hardware=1;assert(!nss_scan_return_origin_valid(&nct_native.session));
++ /* Real constructor installs the real native close/submit callbacks. The
++  * eventual terminal phase metadata remains the documented fixture seam. */
++ static const uint8_t station_rsn[22]={48,20,1,0,0,15,172,4,1,0,0,15,172,4,1,0,0,15,172,2,0,0};uint8_t pmk[32];memset(pmk,0x42,sizeof pmk);
++ struct stc_config cfg={.generation=1,.deadline_ms=now/1000+8000,.cleanup_timeout_ms=30000,.assoc=njs_native.profile.assoc,.channel={.bss=0,.token=1,.band=selected.band,.channel=selected.channel,.dbdc_band=4,.interval_ms=4000},.sta_wlan=5,.group_wlan=4,.pmk=pmk,.station_rsn=station_rsn,.ap_rsn=station_rsn,.ap_rsn_bytes=22,.rng=fixture_rng};
++ assert(nwn_begin(&njs_native.driver,&nst_native.state,&njs_native.arbiter,&cfg,njs_peer,&njs_native,now/1000)==1);niwj_clear(pmk,sizeof pmk);
++ unsigned base_completed=nwfn_native.init.transport.completed,base_tx=nwfn_native.init.transport.tx_index;uint8_t base_sequence=nwfn_native.init.transport.next_sequence;
++ assert(!nst_peer_begin(&nst_native.state,10,NST_PREPARE_PEER,&njs_native.profile,0,0));pump_station();assert(station_receipts[NST_PEER_PREPARED]==1&&station_commands==4);
++ uint8_t auth[30];size_t used=0;assert(!sw_auth(auth,sizeof auth,&used,&njs_native.profile.assoc.peer));assert(!nst_management(&nst_native.state,11,auth,used));pump_station();
++ uint8_t security[18]={0};memcpy(security,nst_native.state.peer.ap,6);memcpy(security+6,nst_native.state.peer.self,6);security[12]=0x88;security[13]=0x8e;security[14]=2;
++ assert(!nst_eapol(&nst_native.state,12,security,sizeof security,0));pump_station();
++ /* All five real RX queues move. A segmented chain persists across handoff. */
++ for(unsigned k=0;k<5;k++){station_packet(k,0,24,k!=0,0,0);pump_station();}
++ assert(nst_native.state.queue[0].segmented==1);
++ assert(!nst_cleanup_begin(&nst_native.state,nst_native.state.last,nst_native.state.last+UINT64_C(30000000)));
++ assert(!nst_peer_begin(&nst_native.state,13,NST_RETIRE_PEER,0,0,0));pump_station();assert(station_receipts[NST_PEER_RETIRED]==1);
++ assert(station_pubs==9&&station_frames==2&&station_commands==7&&nst_native.state.submitted==nst_native.state.dma_completed);
++ assert(nwfn_native.init.transport.completed==base_completed+9&&nwfn_native.init.transport.tx_index==(base_tx+9)%1024&&nwfn_native.init.transport.next_sequence==(uint8_t)(base_sequence+7));
++ seal_failed_service();unsigned reads=mmio_reads,writes=mmio_writes;
++ worker_thread=3;assert(nss_return_scans()==1&&reads==mmio_reads&&writes==mmio_writes);worker_thread=2;
++ /* Finite closure failures refuse before backend IO and keep first attempt. */
++ unsigned*bad[]={&njs_native.queued,&njs_native.active,&njs_native.retiring,&njs_native.linked,&njs_native.tx_admit,&njs_native.tx_count,&njs_native.rx_count,&njs_native.driver.owner.halted,&njs_native.driver.owner.issuing,&njs_native.driver.owner.in_kind,&nst_native.state.wire_busy,&nst_native.state.air_pending,&nst_native.state.peer_kind,&nst_native.state.activation_pending,&nst_native.state.controlled_port,&nst_native.state.sta_active,&nst_native.state.ptk_ready,&nst_native.state.credit_reserved,&nst_native.state.callback_active};
++ for(unsigned k=0;k<sizeof bad/sizeof bad[0];k++){unsigned prior=*bad[k];*bad[k]=1;assert(nss_return_scans()==1&&reads==mmio_reads&&writes==mmio_writes&&!nss_return.ready);*bad[k]=prior;}
++ njs_native.driver.owner.in_ticket=99;assert(nss_return_scans()==1&&reads==mmio_reads&&writes==mmio_writes);njs_native.driver.owner.in_ticket=0;
++ nst_native.state.channel_held=1;assert(nss_return_scans()==1&&reads==mmio_reads&&writes==mmio_writes);nst_native.state.channel_held=0;
++ nst_native.state.dma_completed--;assert(nss_return_scans()==1&&reads==mmio_reads&&writes==mmio_writes);nst_native.state.dma_completed++;
++ nst_native.state.credit_available--;assert(nss_return_scans()==1&&reads==mmio_reads&&writes==mmio_writes);nst_native.state.credit_available++;
++ /* Physical preflight failures restore exact phase/active; no writes or
++  * return publication. Production caller takes fatal retained-owner path. */
++ hardware_register(0x1802541c,(nst_native.state.tx_next+1)%1024);assert(nss_return_scans()==-1&&!nss_return.ready&&nst_native.state.phase==NST_IDLE&&!nst_native.state.active&&mmio_writes==writes);nss_return.attempted=0;hardware_register(0x1802541c,nst_native.state.tx_next);
++ uint8_t*next=pool_memory+(nwfn_native.init.transport.tx_ring-NDP_POOL_BASE)+16*nst_native.state.tx_next;uint32_t ctl=get32(next+4);put32(next+4,ctl&0x7fffffff);assert(nss_return_scans()==-1&&!nss_return.ready&&nst_native.state.phase==NST_IDLE&&!nst_native.state.active&&mmio_writes==writes);nss_return.attempted=0;put32(next+4,ctl);
++ unsigned cursor[5],seg[5];for(unsigned k=0;k<5;k++){cursor[k]=nst_native.state.queue[k].next;seg[k]=nst_native.state.queue[k].segmented;}
++ unsigned used_before=njs_native.used,attempted_before=nst_native.attempted;
++ njs_native.active=1;njs_native.terminal=njs_native.cookie_retired=0;njs_native.cookie=returned_notices;njs_native.completion=join_completed;njs_native.epoch=7;njs_native.driver.cleanup_started=1;
++ assert(njs_owner_work()==1&&returned_notices[NJS_JOIN_FAILED]==1&&returned_notices[NJS_RETIRED]==1&&njs_native.cookie_retired&&!njs_native.cookie&&!njs_native.completion&&!njs_native.retiring);
++ assert(nss_return.ready&&!nss_return.consumed&&njs_native.scan_returned&&!nst_native.active&&njs_native.used==used_before&&nst_native.attempted==attempted_before&&njs_native.arbiter.connection_used==1&&mmio_writes==writes);
++ assert(nss_return.origin.completed==base_completed+9&&nss_return.origin.tx_index==(base_tx+9)%1024&&nss_return.origin.next_sequence==(uint8_t)(base_sequence+7));for(unsigned k=0;k<5;k++)assert(nss_return.queue[k].next==cursor[k]&&nss_return.queue[k].segmented==seg[k]);
++ reads=mmio_reads;assert(!nss_return_scans()&&reads==mmio_reads&&writes==mmio_writes);assert(!njs_scan_blocked_locked());
++ struct nct_session clone=nct_native.session;clone.continuation=2;clone.scan_return=&nss_return.origin;assert(!nss_scan_return_origin_valid(&clone));
++ struct nct_scan_return copied_origin=nss_return.origin;clone.scan_return=&copied_origin;assert(!nss_scan_return_origin_valid(&clone));
++ nst_native.state.active=1;nst_native.state.phase=NST_TX_READ;assert(!nst_native_owner_window(&nwfn_native));nst_native.state.active=0;nst_native.state.phase=NST_IDLE;
++ struct niwj_request join={.ssid_length=4,.security=1};memcpy(join.ssid,"test",4);static const uint8_t rsn[22]={48,20,1,0,0,15,172,4,1,0,0,15,172,4,1,0,0,15,172,2,0,0};memcpy(join.station_rsn,rsn,22);uint64_t denied=123;assert(nord2_wifi_join_enqueue(&join,&callbacks,1,join_completed,&denied)==1&&denied==123);
++ station_hardware=0;normal_pubs+=station_commands;/* Source fixture's command-only sequence oracle follows7 commands, not9 frames. */
++ /* First return drain may rearm stale cells then cleanly refuse a pending
++  * DDONE. Persist actual RX cursor/segmentation without publishing CID3. */
++ unsigned before0=nss_return.queue[0].next;station_packet(0,0,24,1,0,0);
++ struct ncr_queue*pending=&nss_return.queue[2];uint8_t*pd=pool_memory+(pending->ring.descriptors-NDP_POOL_BASE)+16*pending->next;put32(pd+4,0);hardware_register(pending->ring.base+12,(pending->next+1)%pending->ring.count);
++ unsigned before_refusal=nwfn_native.init.transport.completed;uint8_t scan_sequence_before=nss_native.scan_sequence;
++ assert(!nord2_wifi_scan_enqueue(&scan,&callbacks,99,completed,&ticket));drain();assert(last_status==NSS_REFUSED&&!nss_return.consumed&&nwfn_native.init.transport.completed==before_refusal&&nss_native.scan_sequence==scan_sequence_before&&!manual_halts);
++ assert(nss_return.queue[0].next==(before0+1)%1024&&!nss_return.queue[0].segmented&&ncb_native.rx.queue[2].wait_ddone>=256);hardware_register(pending->ring.base+12,pending->next);
++ /* First new scan drains a late old frame; the segmented q0 head cannot turn
++  * into a fresh BSS. Both scans use actual NSS/native owner/callback guards. */
++ for(unsigned repeat=0;repeat<2;repeat++){delivered=0;unsigned count_before=nwfn_native.init.transport.completed;assert(!nord2_wifi_scan_enqueue(&scan,&callbacks,99,completed,&ticket));drain();assert(last_status==NSS_COMPLETE&&nwfn_native.init.transport.completed==count_before+1&&!manual_halts&&njs_native.used&&nst_native.attempted&&njs_native.arbiter.connection_used&&!nst_native.active);assert(ncb_native.rx.scan.count>=1);
++  assert(nct_native.session.scan_return==&nss_return.origin&&nss_scan_return_origin_valid(&nct_native.session));
++  reads=mmio_reads;writes=mmio_writes;
++  unsigned sealed=nss_return.origin.sealed;nss_return.origin.sealed=0;assert(!nss_scan_return_origin_valid(&nct_native.session));nss_return.origin.sealed=sealed;
++  nss_return.origin.generation++;assert(!nss_scan_return_origin_valid(&nct_native.session));nss_return.origin.generation--;
++  njs_native.scan_returned=0;assert(!nss_scan_return_origin_valid(&nct_native.session));njs_native.scan_returned=1;
++  nst_native.active=1;assert(!nss_scan_return_origin_valid(&nct_native.session));nst_native.active=0;
++  assert(reads==mmio_reads&&writes==mmio_writes);
++ }
++ assert(nss_return.consumed&&nct_native.session.continuation==1&&nct_native.session.phase==NCT_DONE&&callbacks==4&&!njs_native.linked&&!njs_native.snapshot.data_ready&&njs_native.snapshot.phase==NJS_FAILED);
++ assert(nord2_wifi_join_enqueue(&join,&callbacks,1,join_completed,&denied)==1&&denied==123);assert(!nord2_wifi_scan_info(&nss_native.info));
++ assert(delivered&&nrd_calls&&nrd_calls==nrd_restored&&nrd_checked==nrd_calls);
++ IOLock*notice=njs_native.notice_lock;assert(!pthread_mutex_destroy(&notice->m));free(notice);assert(!pthread_mutex_destroy(&nss_native.lock->m));free(nss_native.lock);
++ puts("PASS actual native scan return: boot26/scan then9 mixed station publications7commands/5queue rearm+segmentation/real peer cleanup/closure guards/read-only physical preflight/typed sealed origin/two real scans/permanent rejoin refusal; terminalmetadata seam with actualNJSretire/callback ordering, no RF claim");return 0;}
+--- a/tools/nord2-mkpatch.sh
++++ b/tools/nord2-mkpatch.sh
+@@ -57,7 +57,7 @@
+ cp shim/nord2-xnu/wifi_wfsys_bind.inc "$BT/bsd/dev/wifi_wfsys_bind.inc"
+ cp shim/nord2-xnu/wifi_rom_bind.inc "$BT/bsd/dev/wifi_rom_bind.inc"
+ cp shim/nord2-xnu/pool_bind.inc "$BT/bsd/dev/pool_bind.inc"
+-for name in wifi_station_service.h wifi_station_source_layout.h wifi_station_transport_forward.inc wifi_station_transport_bind.inc wifi_station_service_bind.inc wifi_ifnet_link.h wifi_ifnet_link.inc wifi_scan_service.h wifi_scan_service_bind.inc wifi_vcn33_bind.inc wifi_normal_transport_bind.inc wifi_normal_backend_bind.inc wifi_normal_backend_forward.inc wifi_normal_config_tables.inc wifi_basic_config_bind.inc wifi_capability_bind.inc wifi_async_event.h wifi_main_wfdma_native.h wifi_main_halt.h wifi_main_wfdma_bind.inc wifi_main_bind.inc failure_drain.inc; do
++for name in wifi_station_service.h wifi_station_source_layout.h wifi_station_transport_forward.inc wifi_station_transport_bind.inc wifi_station_service_bind.inc wifi_ifnet_link.h wifi_ifnet_link.inc wifi_scan_service.h wifi_scan_service_bind.inc wifi_scan_return_bind.inc wifi_vcn33_bind.inc wifi_normal_transport_bind.inc wifi_normal_backend_bind.inc wifi_normal_backend_forward.inc wifi_normal_config_tables.inc wifi_basic_config_bind.inc wifi_capability_bind.inc wifi_async_event.h wifi_main_wfdma_native.h wifi_main_halt.h wifi_main_wfdma_bind.inc wifi_main_bind.inc failure_drain.inc; do
+     cp "shim/nord2-xnu/$name" "$BT/bsd/dev/$name"
+     NEW_FILES="$NEW_FILES bsd/dev/$name"
+ done
+--- /dev/null
++++ b/tools/test-nord2-wifi-scan-return.py
+@@ -0,0 +1,23 @@
++#!/usr/bin/env python3
++"""Offline actual retained-owner scan return regression; synthetic hardware only.
++Uses canonical source, existing authenticated-board fixture and checked owner IO.
++No optional candidate overlay, RF claim, or device access.
++"""
++from pathlib import Path
++import argparse, subprocess, tempfile
++P=Path(__file__).resolve().parent
++R=next(p for p in P.parents if (p/'AGENTS.md').exists())
++a=argparse.ArgumentParser();a.add_argument('--log-dir',type=Path);a.add_argument('--board',type=Path);args=a.parse_args()
++with tempfile.TemporaryDirectory(prefix='wifi-scan-return-') as tmp:
++ W=args.log_dir.resolve() if args.log_dir else Path(tmp);W.mkdir(parents=True,exist_ok=True)
++ s=(P/'test-nord2-wifi-join-owner.py').read_text()
++ start=s.index(" test+=\'\'\'");end=s.index(" (d/\'test.c\').write_text(test)",start)
++ s=s[:start]+" test+="+repr((P/'fixtures/nord2-wifi-scan-return/owner-extra.c').read_text())+'\n'+s[end:]
++ old="P=Path(__file__).resolve().parent;R=next(p for p in P.parents if (p/'AGENTS.md').exists());"
++ assert old in s;s=s.replace(old,'R=Path('+repr(str(R))+');P=R/"tools";')
++ insertion=" owner=(d/'owner-fixture.inc').read_text().replace('static unsigned normal_enabled,','static unsigned station_hardware;static void station_completion(unsigned);\\nstatic unsigned normal_enabled,').replace('if(normal_enabled&&t->completed>=5){','if(normal_enabled&&t->completed>=5){if(station_hardware){station_completion(next);return;}')\n (d/'owner-fixture.inc').write_text(owner)\n # Existing full native fixture's probes"
++ assert " # Existing full native fixture's probes" in s;s=s.replace(" # Existing full native fixture's probes",insertion)
++ f=W/'runner.py';f.write_text(s)
++ cmd=['python3',str(f),'--log-dir',str(W)]
++ if args.board:cmd+=['--board',str(args.board.resolve())]
++ subprocess.run(cmd,check=True)

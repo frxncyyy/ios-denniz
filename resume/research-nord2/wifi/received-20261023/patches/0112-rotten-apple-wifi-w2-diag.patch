@@ -1,0 +1,268 @@
+--- a/bsd/dev/rottenapple_mtk_connsys.c
++++ b/bsd/dev/rottenapple_mtk_connsys.c
+@@ -776,6 +776,9 @@ connsys_power_on(struct rottenapple_wifi *w)
+ 	if ((err = patches_copy(c)) != 0) {
+ 		goto out;
+ 	}
++	/* Firmware log rings (Android sets them up at probe, before any power-on) */
++	mtk_connsys_fwlog_init(c->emi, c->emi_size);
++	CLOG("firmware log rings at EMI +0x58000 (header \"EMIFWLOG\")");
+ 	conn_wr(c, s->mcu_cfg, MCU_BT_EMI_ENTRY, s->bt_entry);
+ 	conn_wr(c, s->mcu_cfg, MCU_WF_EMI_ENTRY, s->wf_entry);
+ 	CLOG("EMI entries: BT 0x%08x, WF 0x%08x", conn_rd(c, s->mcu_cfg, MCU_BT_EMI_ENTRY),
+--- a/bsd/dev/rottenapple_mtk_wfdma.c
++++ b/bsd/dev/rottenapple_mtk_wfdma.c
+@@ -108,11 +108,19 @@
+ #define HIF_ON_IRQ_ENA          0x7008
+ #define HIF_ON_DBGCR01          0x7104          /* MCU program counter */
+ #define HIF_ON_MAILBOX_DBG      0x711c
++#define HIF_ON_MAILBOX(n)       (0x701c + 4 * (n))      /* HOST_CSR_MCU_SW_MAILBOX_0..3 */
+ 
+ /* CONN_MCU_CONFIG (chip 0x80000000) */
+ #define MCU_FW_VER              0x2004
++#define MCU_SW_DBG              0x216c
++#define MCU_PC_LOG              0x2450          /* HOST_CSR_MCU_PROG_COUNT: PC log 0x2450..0x24d0 */
++#define MCU_PC_LOG_END          0x24d0
+ #define MCU_COM_REG0            0x2600
+ 
++/* CONN_CFG_ON IRQ status / enable (host_csr.h HOST_CSR_IRQ_STA/ENA) */
++#define CFG_ON_IRQ_STA          0xc1170
++#define CFG_ON_IRQ_ENA          0xc1174
++
+ /* CONN_CFG_ON CONN_ON_MISC (chip 0x81021140): DRV_FM_STAT_SYNC[3:1] */
+ #define CFG_ON_MISC             0xc1140
+ #define READY_SHIFT             1
+@@ -303,6 +311,159 @@ wfdma_dump(struct mtk_wfdma *d, const char *why)
+ 	    rd(d, HIF_ON_MAILBOX_DBG), d->irq_count, d->irq_sta);
+ }
+ 
++/* ---- CONNSYS MCU state and firmware logs (diagnostics) ---- */
++
++/*
++ * EMI log rings (common/debug_utility/connsys_debug_utility{.c,_emi.h},
++ * platform/mt6789.c connsys_fw_log_parameter): header 0x40 bytes {MCU base,
++ * size, Wi-Fi base, size, BT base, size, GPS base, size; +0x20 state (1 =
++ * resume); +0x30 IRQ counter; +0x38 "EMIFWLOG"}; each ring: +0 read, +4
++ * write, +0x20 data; rings separated by 0x20 + 0x20 bytes.
++ */
++#define FWLOG_EMI_OFF           0x58000
++#define FWLOG_EMI_SIZE          (192 * 1024)
++#define FWLOG_HDR_SIZE          0x40
++#define FWLOG_RING_RSV          0x20
++#define FWLOG_STATE             0x20
++#define FWLOG_READY             0x38
++#define COREDUMP_EMI_OFF        0x88000
++#define COREDUMP_EMI_SIZE       0xc8000
++#define FWLOG_MAX_LINES         60
++
++static const struct {
++	const char *name;
++	uint32_t size;
++} fwlog_rings[] = {
++	{ "MCU", 16 * 1024 }, { "Wi-Fi", 64 * 1024 }, { "BT", 64 * 1024 }, { "GPS", 32 * 1024 },
++};
++
++static uint32_t
++fwlog_base(unsigned i)
++{
++	uint32_t base = FWLOG_HDR_SIZE;
++	for (unsigned k = 0; k < i; k++) {
++		base += fwlog_rings[k].size + 2 * FWLOG_RING_RSV;
++	}
++	return base;
++}
++
++void
++mtk_connsys_fwlog_init(uintptr_t emi, uint64_t emi_size)
++{
++	if (emi_size < FWLOG_EMI_OFF + FWLOG_EMI_SIZE) {
++		return;
++	}
++	uintptr_t log = emi + FWLOG_EMI_OFF;
++	bzero((void *)log, FWLOG_EMI_SIZE);
++	for (unsigned i = 0; i < ROTTENAPPLE_COUNT(fwlog_rings); i++) {
++		mem_wr32(log + 8 * i, fwlog_base(i));
++		mem_wr32(log + 8 * i + 4, fwlog_rings[i].size);
++	}
++	mem_wr32(log + FWLOG_STATE, 1);
++	memcpy((void *)(log + FWLOG_READY), "EMIFWLOG", 8);
++	__builtin_arm_dsb(0xf);
++}
++
++/* Printable runs of at least 6 characters, one per line, at most *lines lines. */
++static void
++fwlog_strings(const char *tag, uintptr_t p, uint32_t len, unsigned *lines)
++{
++	char line[128];
++	unsigned n = 0;
++
++	for (uint32_t i = 0; i <= len && *lines > 0; i++) {
++		uint8_t ch = i < len ? *(volatile uint8_t *)(p + i) : 0;
++		bool printable = ch >= 0x20 && ch < 0x7f;
++		if (printable) {
++			line[n++] = (char)ch;
++			if (n < sizeof(line) - 1) {
++				continue;
++			}
++		}
++		if (n >= 6) {
++			line[n] = '\0';
++			printf("ROTTEN APPLE: wifi fwlog: %s +0x%05x: %s\n", tag, i + (printable ? 1 : 0) - n, line);
++			(*lines)--;
++		}
++		n = 0;
++	}
++}
++
++void
++mtk_connsys_fwlog_dump(uintptr_t emi, uint64_t emi_size, const char *why, bool text)
++{
++	if (emi_size < COREDUMP_EMI_OFF + COREDUMP_EMI_SIZE) {
++		return;
++	}
++	uintptr_t log = emi + FWLOG_EMI_OFF;
++	char ready[9];
++	memcpy(ready, (const void *)(log + FWLOG_READY), 8);
++	ready[8] = '\0';
++	for (unsigned k = 0; k < 8; k++) {
++		if (ready[k] < 0x20 || ready[k] > 0x7e) {
++			ready[k] = '.';
++		}
++	}
++	printf("ROTTEN APPLE: wifi fwlog (%s): header \"%s\" state %u IRQ counter %u\n", why, ready,
++	    mem_rd32(log + FWLOG_STATE), mem_rd32(log + 0x30));
++	for (unsigned i = 0; i < ROTTENAPPLE_COUNT(fwlog_rings); i++) {
++		uint32_t base = fwlog_base(i), size = fwlog_rings[i].size;
++		uint32_t r = mem_rd32(log + base), w = mem_rd32(log + base + 4);
++		printf("ROTTEN APPLE: wifi fwlog (%s): %s ring at EMI +0x%x: read 0x%x write 0x%x (size 0x%x)\n", why,
++		    fwlog_rings[i].name, FWLOG_EMI_OFF + base, r, w, size);
++		if (text && w != 0) {
++			unsigned lines = FWLOG_MAX_LINES;
++			fwlog_strings(fwlog_rings[i].name, log + base + FWLOG_RING_RSV, size, &lines);
++			const uint8_t *b = (const uint8_t *)(log + base + FWLOG_RING_RSV);
++			printf("ROTTEN APPLE: wifi fwlog: %s first bytes %02x %02x %02x %02x %02x %02x %02x %02x "
++			    "%02x %02x %02x %02x %02x %02x %02x %02x\n", fwlog_rings[i].name, b[0], b[1], b[2], b[3], b[4],
++			    b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
++		}
++	}
++	/* The coredump area is zeroed at power-on; anything there was written by the firmware. */
++	uintptr_t cd = emi + COREDUMP_EMI_OFF;
++	uint32_t used = 0;
++	for (uint32_t off = 0; off < COREDUMP_EMI_SIZE; off += 0x1000) {
++		for (uint32_t k = 0; k < 0x1000; k += 64) {
++			if (mem_rd32(cd + off + k) != 0) {
++				used++;
++				break;
++			}
++		}
++	}
++	printf("ROTTEN APPLE: wifi fwlog (%s): coredump area EMI +0x%x: %u of %u 4 KB pages written\n", why,
++	    COREDUMP_EMI_OFF, used, COREDUMP_EMI_SIZE / 0x1000);
++	if (text && used) {
++		unsigned lines = FWLOG_MAX_LINES;
++		fwlog_strings("coredump", cd, 0x20000, &lines);
++	}
++}
++
++/* CONNSYS MCU: program counter samples, its PC log, debug and mailbox registers. */
++static void
++mcu_dump(struct mtk_wfdma *d, const char *why)
++{
++	uint32_t pc[8];
++
++	for (unsigned i = 0; i < ROTTENAPPLE_COUNT(pc); i++) {
++		pc[i] = rd(d, HIF_ON_DBGCR01);
++		delay(500);
++	}
++	DLOG("MCU (%s): PC samples 0x%05x 0x%05x 0x%05x 0x%05x 0x%05x 0x%05x 0x%05x 0x%05x (ROM idle on Android: "
++	    "0x21f66)", why, pc[0], pc[1], pc[2], pc[3], pc[4], pc[5], pc[6], pc[7]);
++	for (uint32_t off = MCU_PC_LOG; off < MCU_PC_LOG_END; off += 0x20) {
++		DLOG("MCU PC log 0x%08x: %08x %08x %08x %08x %08x %08x %08x %08x", 0x18000000u + off, rd(d, off),
++		    rd(d, off + 4), rd(d, off + 8), rd(d, off + 12), rd(d, off + 16), rd(d, off + 20), rd(d, off + 24),
++		    rd(d, off + 28));
++	}
++	uint32_t misc = rd(d, CFG_ON_MISC);
++	DLOG("MCU (%s): COM_REG0 0x%08x SW_DBG 0x%08x FW ver 0x%08x; host mailbox 0x%08x 0x%08x 0x%08x 0x%08x; "
++	    "CONN_CFG_ON IRQ 0x%08x/0x%08x; CONN_ON_MISC 0x%08x (FW_OWN %u, INIT_DONE %u, N9_DONE %u)", why,
++	    rd(d, MCU_COM_REG0), rd(d, MCU_SW_DBG), rd(d, MCU_FW_VER), rd(d, HIF_ON_MAILBOX(0)), rd(d, HIF_ON_MAILBOX(1)),
++	    rd(d, HIF_ON_MAILBOX(2)), rd(d, HIF_ON_MAILBOX(3)), rd(d, CFG_ON_IRQ_STA), rd(d, CFG_ON_IRQ_ENA), misc,
++	    misc & 1, (misc >> 1) & 1, (misc >> 2) & 1);
++}
++
+ /* ---- Firmware image ---- */
+ 
+ static int
+@@ -1044,6 +1205,27 @@ out:
+ 
+ /* ---- W2 ---- */
+ 
++/*
++ * After WIFI_START (or the ready bits) failed: MCU state, firmware logs and
++ * coredump strings, then watch the ready bits for another 2 s in case only
++ * the acknowledgement was lost.
++ */
++static void
++start_failed(struct mtk_wfdma *d, const char *what)
++{
++	uint32_t v = 0;
++
++	mcu_dump(d, what);
++	mtk_connsys_fwlog_dump(d->emi, d->emi_size, what, true);
++	uint64_t t0 = now_us();
++	while (!ready(d, &v) && now_us() - t0 < 2000000) {
++		delay(5000);
++	}
++	DLOG("after %s failed: CONN_ON_MISC 0x%08x %s (watched %llu ms more); COM_REG0 0x%08x PC 0x%05x", what, v,
++	    ready(d, &v) ? "READY: the firmware came up anyway" : "still not ready", (now_us() - t0) / 1000,
++	    rd(d, MCU_COM_REG0), rd(d, HIF_ON_DBGCR01));
++}
++
+ int
+ mtk_wfdma_wifi_on(struct mtk_wfdma *d, unsigned level)
+ {
+@@ -1103,7 +1285,9 @@ mtk_wfdma_wifi_on(struct mtk_wfdma *d, unsigned level)
+ 		}
+ 	}
+ 	DLOG("RAM code in place after %llu us (%u commands so far)", now_us() - t0, d->seq);
++	mcu_dump(d, "before WIFI_START");
+ 	if ((err = wifi_start(d, entry)) != 0) {
++		start_failed(d, "WIFI_START");
+ 		return err;
+ 	}
+ 	fwdl_mode(d, false);
+@@ -1115,6 +1299,7 @@ mtk_wfdma_wifi_on(struct mtk_wfdma *d, unsigned level)
+ 			DLOG("ready bits not set: CONN_ON_MISC 0x%08x (bits [3:1] = 0x%x, expect 0x%x) after %u ms", v,
+ 			    (v >> READY_SHIFT) & 7, READY_BITS, READY_TIMEOUT_US / 1000);
+ 			wfdma_dump(d, "ready");
++			start_failed(d, "ready bits");
+ 			return ETIMEDOUT;
+ 		}
+ 		delay(5000);
+@@ -1123,6 +1308,7 @@ mtk_wfdma_wifi_on(struct mtk_wfdma *d, unsigned level)
+ 	    v, now_us() - t0, rd(d, MCU_COM_REG0), rd(d, MCU_FW_VER), rd(d, HIF_ON_DBGCR01),
+ 	    rd(d, HIF_ON_MAILBOX_DBG));
+ 	DLOG("SPI 409: %u interrupt(s), INT_STA 0x%08x", d->irq_count, d->irq_sta);
++	mtk_connsys_fwlog_dump(d->emi, d->emi_size, "ready", false);
+ 
+ 	if (level >= 3 && (err = nic_capability(d)) != 0) {
+ 		DLOG("W3 preview: NIC_CAPABILITY_V2 failed (%d)", err);
+--- a/bsd/dev/rottenapple_mtk_wfdma.h
++++ b/bsd/dev/rottenapple_mtk_wfdma.h
+@@ -53,6 +53,17 @@ struct mtk_wfdma {
+ int mtk_wfdma_wifi_on(struct mtk_wfdma *d, unsigned level);
+ void mtk_wfdma_wifi_off(struct mtk_wfdma *d);
+ 
++/*
++ * CONNSYS firmware log rings in EMI (+0x58000, 192 KB: header, then MCU,
++ * Wi-Fi, BT and GPS rings), the layout Android's connsys debug utility sets
++ * up at probe. init writes the header and the "EMIFWLOG" ready pattern
++ * (call it after EMI is cleared, before the CPU is released); dump prints
++ * each ring's pointers and, with text = true, the printable strings in it
++ * and in the coredump area (+0x88000).
++ */
++void mtk_connsys_fwlog_init(uintptr_t emi, uint64_t emi_size);
++void mtk_connsys_fwlog_dump(uintptr_t emi, uint64_t emi_size, const char *why, bool text);
++
+ __END_DECLS
+ 
+ #endif

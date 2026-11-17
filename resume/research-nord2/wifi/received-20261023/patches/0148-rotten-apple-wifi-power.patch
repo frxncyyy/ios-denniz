@@ -1,0 +1,174 @@
+diff --git a/bsd/dev/rottenapple_wifi.c b/bsd/dev/rottenapple_wifi.c
+index 111b77b..2260f32 100644
+--- a/bsd/dev/rottenapple_wifi.c
++++ b/bsd/dev/rottenapple_wifi.c
+@@ -431,6 +431,30 @@ rottenapple_wifi_stop(void)
+ 	return 0;
+ }
+ 
++/*
++ * Radio on for userland (stage I3 power): start the level-5 bring-up again
++ * and wait until it runs. 0 when running (also if it already was), EBUSY /
++ * ETIMEDOUT / EIO otherwise.
++ */
++int
++rottenapple_wifi_power_on(void)
++{
++	uint64_t deadline;
++	int err = wifi_launch(WIFI_LEVEL_RUN);
++
++	if (err == EBUSY && wifi_state == WIFI_RUNNING) {
++		return 0;
++	}
++	if (err && err != EBUSY) {
++		return err;
++	}
++	clock_interval_to_deadline(30000, NSEC_PER_MSEC, &deadline);
++	while (wifi_state == WIFI_STARTING && mach_absolute_time() < deadline) {
++		delay(50 * 1000);
++	}
++	return wifi_state == WIFI_RUNNING ? 0 : (wifi_state == WIFI_STARTING ? ETIMEDOUT : EIO);
++}
++
+ struct rottenapple_wifi *
+ rottenapple_wifi_running(void)
+ {
+diff --git a/bsd/dev/rottenapple_wifi.h b/bsd/dev/rottenapple_wifi.h
+index 0ab4ebe..725509a 100644
+--- a/bsd/dev/rottenapple_wifi.h
++++ b/bsd/dev/rottenapple_wifi.h
+@@ -246,6 +246,9 @@ void rottenapple_wifi_event_unregister(struct rottenapple_wifi *w, uint8_t id, r
+ void rottenapple_wifi_event_input(struct rottenapple_wifi *w, uint8_t id, uint8_t seq, const uint8_t *body,
+     uint32_t len);
+ 
++/* Start Wi-Fi (level 5) again and wait until it runs (userland power on). */
++int rottenapple_wifi_power_on(void);
++
+ /* The Wi-Fi device while it is running (level 5 up), else NULL. */
+ struct rottenapple_wifi *rottenapple_wifi_running(void);
+ 
+diff --git a/bsd/dev/rottenapple_wifi_a80211.c b/bsd/dev/rottenapple_wifi_a80211.c
+index 1926787..3a9c08a 100644
+--- a/bsd/dev/rottenapple_wifi_a80211.c
++++ b/bsd/dev/rottenapple_wifi_a80211.c
+@@ -644,6 +644,99 @@ out:
+ 	return err;
+ }
+ 
++/*
++ * Wi-Fi power from Settings / Control Center (POWER set, radio 0 state):
++ * off = disconnect and the full stop (firmware off, chip powered down);
++ * on = the level-5 bring-up again (about 3 s on the device), then the last
++ * network is rejoined unless userland joined one meanwhile. en1 and its
++ * IOKit objects stay. A worker thread applies the latest request, so
++ * rapid toggles collapse; POWER_CHANGED is posted after every change.
++ * (wifid also turns power off until the first unlock after boot and on again
++ * afterwards.)
++ */
++static volatile bool a80211_power_want = true;
++static volatile bool a80211_power_busy;
++
++static void
++a80211_power_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		bool want = a80211_power_want;
++		bool running = rottenapple_wifi_running() != NULL;
++		if (want == running) {
++			lck_mtx_lock(&a80211_lock);
++			if (a80211_power_want == want) {
++				a80211_power_busy = false;
++				lck_mtx_unlock(&a80211_lock);
++				return;
++			}
++			lck_mtx_unlock(&a80211_lock);
++			continue;
++		}
++		if (!want) {
++			int err = rottenapple_wifi_stop();
++			ALOG("power off from userland: %s (%d)", err == 0 ? "radio off" : "stop failed", err);
++			a80211_post(M_POWER_CHANGED, NULL, 0);
++			if (err && err != EALREADY) {
++				delay(500 * 1000);      /* EBUSY while starting/stopping: try again shortly */
++			}
++			continue;
++		}
++		int err = rottenapple_wifi_power_on();
++		ALOG("power on from userland: %s (%d)", err == 0 ? "radio on" : "start failed", err);
++		a80211_post(M_POWER_CHANGED, NULL, 0);
++		if (err) {
++			delay(1000 * 1000);
++			if (rottenapple_wifi_running() == NULL && a80211_power_want) {
++				ALOG("power on failed; leaving the radio off (toggle again to retry)");
++				lck_mtx_lock(&a80211_lock);
++				a80211_power_want = false;
++				lck_mtx_unlock(&a80211_lock);
++			}
++			continue;
++		}
++		/* give userland's auto-join a moment, then rejoin the last network ourselves */
++		delay(3000 * 1000);
++		struct rottenapple_wifi_link_info li;
++		rottenapple_wifi_sta_link_info(&li);
++		if (a80211_power_want && !li.associated && !a80211_assoc_running) {
++			(void)rottenapple_wifi_scan(ROTTENAPPLE_WIFI_SCAN_ACTIVE);
++			rottenapple_wifi_sta_link_info(&li);
++			if (a80211_power_want && !li.associated && !a80211_assoc_running) {
++				int e2 = rottenapple_wifi_sta_rejoin_last();
++				ALOG("power on: last network %s (%d)", e2 == 0 ? "rejoined" : "not rejoined", e2);
++			}
++		}
++	}
++}
++
++static int
++a80211_power(bool on)
++{
++	thread_t th;
++
++	lck_mtx_lock(&a80211_lock);
++	bool changed = a80211_power_want != on;
++	a80211_power_want = on;
++	if (a80211_power_busy) {
++		lck_mtx_unlock(&a80211_lock);
++		return 0;                       /* the worker picks the new state up */
++	}
++	if ((rottenapple_wifi_running() != NULL) == on) {
++		lck_mtx_unlock(&a80211_lock);
++		return 0;
++	}
++	a80211_power_busy = true;
++	lck_mtx_unlock(&a80211_lock);
++	ALOG("power %s requested by userland%s", on ? "on" : "off", changed ? "" : " (again)");
++	if (kernel_thread_start(a80211_power_thread, NULL, &th) != KERN_SUCCESS) {
++		a80211_power_busy = false;
++		return ENOMEM;
++	}
++	thread_deallocate(th);
++	return 0;
++}
++
+ static int
+ a80211_get(struct ra_a80211_req *r)
+ {
+@@ -751,7 +844,7 @@ a80211_get(struct ra_a80211_req *r)
+ 	case A_POWER:
+ 		put32(buf + 0, 1);              /* version */
+ 		put32(buf + 4, 1);              /* radios */
+-		put32(buf + 8, 1);              /* radio 0 on: the driver only exists while Wi-Fi runs */
++		put32(buf + 8, rottenapple_wifi_running() != NULL ? 1 : 0);    /* radio 0 */
+ 		return a80211_reply(r, buf, POWER_LEN);
+ 	case A_SUPPORTED_CHANNELS:
+ 	case A_HW_SUPPORTED_CHANNELS: {
+@@ -799,7 +892,10 @@ a80211_set(struct ra_a80211_req *r)
+ 		}
+ 		uint32_t on;
+ 		memcpy(&on, buf + 8, 4);
+-		return on ? 0 : EPERM;  /* already on; power-off from userland is not wired to the stop path */
++		if (a80211_on < 2) {
++			return on ? 0 : EPERM;  /* read-only: power-off is not wired */
++		}
++		return a80211_power(on != 0);
+ 	}
+ 	if (a80211_on < 2) {
+ 		return EOPNOTSUPP;      /* rottenapple_a80211=1: read-only */

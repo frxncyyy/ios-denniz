@@ -1,0 +1,1 @@
+Completed exact artifact review: see review.json and REPORT.md. extract.py requires explicit parent ARTIFACTS_READY pins and verifies run/source/kernel before extraction. Initial preparation requirements are retained in requirements.json.

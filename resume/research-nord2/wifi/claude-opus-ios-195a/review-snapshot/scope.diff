@@ -1,0 +1,153 @@
+diff --git a/shim/nord2-xnu/wifi_ios_bss.c b/shim/nord2-xnu/wifi_ios_bss.c
+index 486221c..163a213 100644
+--- a/shim/nord2-xnu/wifi_ios_bss.c
++++ b/shim/nord2-xnu/wifi_ios_bss.c
+@@ -12,7 +12,12 @@ int niwb_bss_metadata(const struct nsb_record*s,struct niwb_bss*out){
+  }
+  for(size_t i=0;i<s->ie_bytes;){if(s->ie_bytes-i<2)return -1;unsigned id=s->ies[i++],z=s->ies[i++];if(z>s->ie_bytes-i)return -1;
+   if(id==1||id==50){unsigned flag=id==1?1:2;if(rate_ies&flag)return -1;rate_ies|=flag;
+-   for(unsigned j=0;j<z;j++){uint8_t x=s->ies[i+j]&127;if(!x)return -1;unsigned k;for(k=0;k<r.rate_count;k++)if(r.ie_rates[k]==x)break;if(k==r.rate_count){if(k==16)return -1;r.ie_rates[r.rate_count++]=x;}}
++   for(unsigned j=0;j<z;j++){uint8_t v=s->ies[i+j],x=v&127;
++    /* Selected gen4m mac.h: HT127, VHT126, H2E-only123 are BSS
++     * membership selectors when basic-marked, not 500kb/s rates.
++     * Keep original IE bytes unchanged; do not classify other values by range. */
++    if((v&128)&&(x==127||x==126||x==123))continue;
++    if(!x)return -1;unsigned k;for(k=0;k<r.rate_count;k++)if(r.ie_rates[k]==x)break;if(k==r.rate_count){if(k==16)return -1;r.ie_rates[r.rate_count++]=x;}}
+   }i+=z;
+  }
+  r.ie_bytes=s->ie_bytes;for(unsigned i=0;i<s->ie_bytes;i++)r.ies[i]=s->ies[i];*out=r;return 0;
+diff --git a/shim/nord2-xnu/wifi_ios_snapshot.c b/shim/nord2-xnu/wifi_ios_snapshot.c
+index 246ad14..781c424 100644
+--- a/shim/nord2-xnu/wifi_ios_snapshot.c
++++ b/shim/nord2-xnu/wifi_ios_snapshot.c
+@@ -1,16 +1,23 @@
+ #include "wifi_ios_snapshot.h"
+ #include "wifi_ios_bss.h"
+-static int row(const struct nsb_record*s,uint32_t age,const struct niwp_rate_map*m,size_t n,struct niws_result*out){
++_Static_assert(NSB_IE_BYTES<=NIWS_MAX_IE,"retained IEs fit the 1164-byte result element room");
++/* One record that cannot be encoded from observed data is omitted and counted;
++ * it never fails the other rows of a completed scan. Off-channel receptions
++ * are omitted: INC_OFFCHANNEL_BSS (0x8) is refused at admission. */
++static unsigned row(const struct nsb_record*s,uint32_t age,const struct niwp_rate_map*m,size_t n,uint8_t*encoded){
+  struct niwb_bss b;struct niws_result r={0};size_t rates=0;
+- if(niwb_bss_metadata(s,&b)||!b.rssi_valid||b.rate_count>NIWS_MAX_RATES)return -1;
+- if(b.rate_count&&niwp_rates(m,n,b.ie_rates,b.rate_count,r.rates,NIWS_MAX_RATES,&rates))return -1;
++ if(s->channel_mismatch)return NIWA_OMIT_CHANNEL;
++ if(s->ies_truncated||s->ie_bytes!=s->ie_total)return NIWA_OMIT_IES;
++ if(niwb_bss_metadata(s,&b))return NIWA_OMIT_OTHER;
++ if(!b.rssi_valid)return NIWA_OMIT_RSSI;
++ if(b.rate_count>NIWS_MAX_RATES||(b.rate_count&&niwp_rates(m,n,b.ie_rates,b.rate_count,r.rates,NIWS_MAX_RATES,&rates)))return NIWA_OMIT_RATES;
+  r.channel=b.channel;r.channel_flags=b.band==1?8u:16u;r.age=age;r.rssi=b.rssi_dbm;
+  r.beacon_interval=b.interval;r.capabilities=b.capabilities;r.rate_count=(uint8_t)rates;
+  r.ssid_bytes=b.ssid_bytes;r.ie_bytes=b.ie_bytes;
+  for(unsigned i=0;i<6;i++)r.bssid[i]=b.bssid[i];
+  for(unsigned i=0;i<b.ssid_bytes;i++)r.ssid[i]=b.ssid[i];
+  for(unsigned i=0;i<b.ie_bytes;i++)r.ie[i]=b.ies[i];
+- *out=r;return 0;
++ return niws_encode_result(&r,encoded,NIWS_SCAN_RESULT_BYTES)?NIWA_OMIT_OTHER:0;
+ }
+ int niwa_snapshot_prepare(const struct nsb_scan*s,uint64_t generation,const uint32_t*age,size_t ages,
+  const struct niwp_rate_map*m,size_t n,struct niwa_snapshot*out){
+@@ -21,20 +28,18 @@ int niwa_snapshot_prepare(const struct nsb_scan*s,uint64_t generation,const uint
+  else if(s->partial||s->dropped)state=NIWA_PARTIAL;
+  else if(s->done){if(s->completion.sequence!=s->sequence||s->completion.state!=7)return -1;state=NIWA_COMPLETE;}
+  if(state==NIWA_COMPLETE){
+-  if(ages!=s->count||(ages&&!age))return -1;
+-  for(unsigned i=0;i<s->count;i++){
+-   struct niws_result r;uint8_t encoded[NIWS_SCAN_RESULT_BYTES];
+-   if(row(&s->records[i],age[i],m,n,&r)||niws_encode_result(&r,encoded,sizeof encoded))return -1;
++  if(ages!=s->count||(ages&&!age)||out->cursor.phase!=NIWC_NEW)return -1;
++  if(s->count&&(!m||!n||n>128))return -1;
++  for(size_t i=0;s->count&&i<n;i++){if(!m[i].ie_rate||m[i].ie_rate>127)return -1;
++   for(size_t j=0;j<i;j++)if(m[j].ie_rate==m[i].ie_rate)return -1;
+   }
+  }
++ out->count=out->omitted=out->omit_mask=0;
+  out->entered=1;out->status=state;out->generation=generation;out->backend_count=s->count;out->dropped=s->dropped;
+  out->completion_state=s->completion.state;out->completed_channels=s->completion.completed_channels;
+  if(state!=NIWA_COMPLETE)return 1; /* never mark partial/timeout/pending cache READY */
+- out->count=s->count;
+- for(unsigned i=0;i<s->count;i++){
+-  struct niws_result r;/* Immutable input validated above; no backend callbacks. */
+-  if(row(&s->records[i],age[i],m,n,&r)||niws_encode_result(&r,out->rows[i],NIWS_SCAN_RESULT_BYTES))return -1;
+- }
++ for(unsigned i=0;i<s->count;i++){unsigned why=row(&s->records[i],age[i],m,n,out->rows[out->count]);
++  if(why){out->omitted++;out->omit_mask|=why;}else out->count++;} /* encoder writes nothing on refusal */
+  if(niwc_begin(&out->cursor,generation)||niwc_complete(&out->cursor,generation,&out->rows[0][0],
+     (size_t)out->count*NIWS_SCAN_RESULT_BYTES,out->count))return -1;
+  return 0;
+diff --git a/shim/nord2-xnu/wifi_ios_snapshot.h b/shim/nord2-xnu/wifi_ios_snapshot.h
+index 95cc788..c99ae55 100644
+--- a/shim/nord2-xnu/wifi_ios_snapshot.h
++++ b/shim/nord2-xnu/wifi_ios_snapshot.h
+@@ -5,7 +5,8 @@
+ #include "wifi_ios_cursor.h"
+ #include "wifi_ios_mapping.h"
+ enum niwa_status {NIWA_PENDING=1,NIWA_PARTIAL,NIWA_TIMEOUT,NIWA_COMPLETE};
+-struct niwa_snapshot {enum niwa_status status;unsigned entered,count,backend_count,dropped;
++enum {NIWA_OMIT_RSSI=1u,NIWA_OMIT_CHANNEL=2u,NIWA_OMIT_IES=4u,NIWA_OMIT_RATES=8u,NIWA_OMIT_OTHER=16u};
++struct niwa_snapshot {enum niwa_status status;unsigned entered,count,backend_count,dropped,omitted,omit_mask;
+  uint8_t completion_state,completed_channels;uint64_t generation;
+  struct niwc_cursor cursor;uint8_t rows[NSB_RESULTS][NIWS_SCAN_RESULT_BYTES];};
+ /* Copied immutable scan input + caller-owned zeroed output retained through
+@@ -13,7 +14,10 @@ struct niwa_snapshot {enum niwa_status status;unsigned entered,count,backend_cou
+  * not relocate/copy this object once prepared. No runtime authority granted.
+  * age_raw has one separately verified Apple age-unit value per actual record;
+  * no unit conversion guessed. rate map must be separately proven, not supplied
+- * as a permission boolean. Unknown RSSI/rates/truncated IEs refuse encoding.
++ * as a permission boolean. Unknown RSSI/rates, channel mismatch or truncated IEs omit and count
++ * that individual row; a completed all-omitted scan is a real empty cache.
++ * Malformed scan/map/cursor state still refuses globally. Original IEs remain
++ * byte-exact; known membership selectors are not fabricated numeric rates.
+  * Channel flags contain only proven band; width/DFS stay unspecified. */
+ int niwa_snapshot_prepare(const struct nsb_scan *,uint64_t,
+  const uint32_t *,size_t,const struct niwp_rate_map *,size_t,struct niwa_snapshot *);
+diff --git a/shim/nord2-xnu/wifi_scan_bss.c b/shim/nord2-xnu/wifi_scan_bss.c
+index 9b3791b..5759b9c 100644
+--- a/shim/nord2-xnu/wifi_scan_bss.c
++++ b/shim/nord2-xnu/wifi_scan_bss.c
+@@ -81,7 +81,10 @@ int nsb_add(struct nsb_scan *s,const uint8_t *p,size_t n,uint64_t now)
+  s->frames++;
+  for(unsigned i=0;i<s->count;i++)if(eq(s->records[i].bssid,r.bssid,6)&&
+    s->records[i].ssid_present==r.ssid_present&&s->records[i].ssid_len==r.ssid_len&&eq(s->records[i].ssid,r.ssid,r.ssid_len)){
+-  s->records[i]=r;return 0;
++  /* Do not replace a coherent on-channel observation with adjacent-channel
++   * leakage. Preserve that observation's RSSI/IEs/timestamp as one real row. */
++  if(!r.channel_mismatch||s->records[i].channel_mismatch)s->records[i]=r;
++  return 0;
+  }
+  if(s->count==NSB_RESULTS){s->dropped++;s->partial=1;return 1;}
+  s->records[s->count++]=r;return 0;
+diff --git a/shim/nord2-xnu/wifi_scan_bss.h b/shim/nord2-xnu/wifi_scan_bss.h
+index 6eba40b..34aa13f 100644
+--- a/shim/nord2-xnu/wifi_scan_bss.h
++++ b/shim/nord2-xnu/wifi_scan_bss.h
+@@ -2,7 +2,7 @@
+ #define PRIVATE_NORD2_SCAN_BSS_H
+ #include <stdint.h>
+ #include <stddef.h>
+-#define NSB_IE_BYTES 512u
++#define NSB_IE_BYTES 1024u /* Exact maximum IE room of the Apple1164-byte scan result. */
+ #define NSB_RESULTS 16u
+ #define NSB_SCAN_DONE_BYTES 476u
+ struct nsb_record {
+diff --git a/tools/test-nord2-wifi-ios-contract.py b/tools/test-nord2-wifi-ios-contract.py
+index 84a3b3a..da4cc61 100644
+--- a/tools/test-nord2-wifi-ios-contract.py
++++ b/tools/test-nord2-wifi-ios-contract.py
+@@ -14,13 +14,14 @@ import tempfile
+ def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument('--cc', default='clang', help='ASan/UBSan-capable C compiler')
+-    parser.add_argument('--only', choices=('all', 'policy', 'caller', 'scalar'), default='all')
++    parser.add_argument('--only', choices=('all', 'policy', 'caller', 'scalar', 'snapshot'), default='all')
+     parser.add_argument('--report', type=Path, help='Optional JSON hashes and summaries')
+     args = parser.parse_args()
+     root = Path(__file__).resolve().parents[1]
+     source = root / 'shim/nord2-xnu'
+     fixtures = root / 'tools/fixtures/nord2-wifi-ios-contract'
+     suites = {
++        'snapshot': ('wifi_ios_snapshot.c', 'wifi_ios_age.c', 'wifi_ios_bss.c', 'wifi_ios_rates.c', 'wifi_ios_mapping.c', 'wifi_ios_scan_contract.c', 'wifi_ios_cursor.c', 'wifi_scan_bss.c'),
+         'policy': ('wifi_ios_policy.c', 'wifi_ios_rates.c', 'wifi_ios_mapping.c'),
+         'scalar': ('wifi_ios_scalar.c',),
+         'caller': ('wifi_ios_policy.c', 'wifi_ios_rates.c', 'wifi_ios_mapping.c'),

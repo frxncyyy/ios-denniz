@@ -1,0 +1,27 @@
+# Private native AP-wake binding after retained phase10
+
+Final include names: wifi_wake.c/h, wifi_wake_adapter.c/h and wifi_wake_bind.inc. Source core/adapter algorithms and symbols are unchanged from the independently reviewed ap-wake candidate; `name-mapping.json` records include/header-guard-only changes. Two separate BSD translation units avoid static-name collisions. No active files, CI, device or frozen core/adapter were modified.
+
+Exact private whole-source copy starts from the current retained persistent production sweet_touch.c (identity in source-identity.json). It adds header/bind includes after wifi_persistent_bind.inc and calls nawa_after_persistent **only after** npa_persistent_window returned retained1. No original outer power, cleanup, source phase10 or input branch was changed. All final includes are canonical names, not absolute research paths.
+
+New opt-in **nord2wifiwake=1** requires the existing successful **nord2wifi=2/nord2wifipersist=1** path. Default-off is zero added mappings, MMIO, result logs or new wake-state changes. No WFSYS/BGFSYS release, DRAM/MPU/ROM/SPI/semaphore/DMA operation. Hardware phase10 success was reported preliminary; this file is a private future candidate, not authorization or final capture evidence.
+
+Native owner callback reads **software only**: old persistent global/outer/state retained latches, entered, phase10, terminal2, no old fatal/halt/command/semaphores, original input saved/fresh/domain owner plus required mapped handles. It never calls ncc_ap_check, old npa/npc callbacks, PMIF or a hardware getter. A new `nawa_native` object owns its separate one-shot AP wake reference; it never changes old terminal2 or clears the persistent power lifetime. Same sole input thread serializes this call. Current kernel has no other newly introduced AP HOST1a0 voter; core additionally snapshots the source ON HOST1a0 and refuses an inherited/nonzero vote without writing.
+
+Concrete raw map selection reuses existing powered handles: SPM for10006304/616c/6170; infra for10001228/1724; GALS1020e504; existing HOST for180601a0/184/clock000/IRQ2d4/power2cc; CFG for18001000; RGU for18000010/00/14/08. No new mapping is allocated and no broad arbitrary address switch is exposed. Reviewed adapter enforces always-on AP guards before HOST wake, ACK/clock+IRQ before CFG, correct ID before five cold reads, exact clock measurement RMW and terminal no-callback state after sleep. Final source writes may stall like any MMIO; software polls cannot interrupt a stalled access.
+
+On success, last hardware operation is source HOST1a0write0, then software-only result logs and normal original input initialization. The old phase10 terminal state remains2; later off-domain work needs another reviewed wake API, not old npa callbacks. `balanced1/ref0` applies only to the diagnostic's wake vote; source common remains retained and outer restored0. Unknown write/timeout/readability/IRQ/cold failure after wake retains the new reference and old common lifetime, logs software state and panics for manual reset. No compensating sleep or nw_restore is called. A foreign initial vote is a clean diagnostic refusal with no write; it does not tear down persistent common state. Reentry panics before any new MMIO.
+
+Logs, all below255bytes:
+
+- `NORD2 WIFI WAKE: status=0 phase=7 balanced=1 ref=0 halt=0`
+- `NORD2 WIFI WAKE ID: id=0x20010101 clock=... irq=... ack_polls=... clock_polls=... id_polls=...`
+- `NORD2 WIFI WAKE COLD: valid=0x1f cpu=... top=... power=... bgfcpu=... bgftop=...`
+
+For success require clockreadybits6, IRQbit0, every cold mask0, old PERSIST phase10/id66358a11/handoff2 and original outer retained1/restored0 plus GUI/input health. Raw cold words may contain unrelated bits; validate masks rather than rawzero. WAKE logs occur after old PERSIST success marker and before original outer stage3/retained summary. There is no new connectivity/firmware-ready claim.
+
+Timing clarification: reviewed diagnostic stops at first ACK timeout instead of source second retry/debug dump, but deterministic no-jitter clock polling does **not** necessarily refuse earlier than vendor jitter; it retains a finite1600/<16000us bound. Old README's broad earlier-refusal wording is not a timing equivalence guarantee. Algorithms themselves were left frozen.
+
+Validation: all3 ARM64 translation units compile against39398655023 generated headers/exact active sweet_early.h; new public symbols naw_run/nawa_start do not collide with whole-source exports. Renamed real core/adapter ASan/UBSan test preserves every240 callback fault position, no callback after balanced sleep and ACK11/clock1600/ID10 bounds. A separate harness executes the **actual native bind include** against mocked ni_rd/ni_wr and production npa declarations: default-off and missing phase10 ownership perform no MMIO; successful binding preserves the entire old persistent object byte-for-byte; inherited HOST vote refuses cleanly; IRQ failure retains reference and manual-panics; reentry performs zero further IO. Raw backend asserts no access after source sleep. These are code/ownership tests, not hardware wake acceptance.
+
+Remaining promotion steps: independent binding review; parent chooses exact image/args and adds two BSD file entries; focused tracked tests/mkpatch/default-off checks; CI/image verification and exact hardware approval. Global old persistent cleanup/suspend/refusal policy remains as reviewed production. No NOTES edit or active integration is part of this artifact.

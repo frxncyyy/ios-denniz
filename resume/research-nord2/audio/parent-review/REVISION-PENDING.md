@@ -1,0 +1,1 @@
+Opus revision stopped at its session limit (reported reset 16:20 Europe/Rome). Files are saved but incomplete and unverified. No audio source has been integrated and no audio hardware action is authorized. The last assistant work was adding a DATA_PORT stage guard. Resume/review later; do not treat tool subtype success as completion: result.is_error is true.

@@ -1,0 +1,89 @@
+--- a/shim/nord2-xnu/audio_i2c8.c
++++ b/shim/nord2-xnu/audio_i2c8.c
+@@ -100,6 +100,8 @@
+ 	s->ifr1 = s->ifr2 = s->dma_en = s->sh_start = s->ccu_start = s->ccu_ctrl = 0;
+ 	s->prior_irq = s->prior_ack = s->completion_irq = 0;
+ 	s->dma_checked = 0;
++ s->ap_valid=0;
++ for(unsigned i=0;i<NA8_AP_FIELDS;i++)s->ap_preflight[i]=0;
+ }
+ 
+ int
+@@ -252,17 +254,29 @@
+  R(NA8_SH+0x10,2,&v);if(v&4){REFUSE(7);}
+  R(NA8_SH+0xf4,2,&v);if(v){REFUSE(9);}
+  R(NA8_CCU+0xf4,2,&v);if(v){REFUSE(9);}
+-	R(NA8_CH + 0x24, 2, &v);
+-	if (v & 1) { REFUSE(6); }
+-	R(NA8_CH + 0x10, 2, &v);
+-	if (v & 4) { REFUSE(7); } /* I2C_CONTROL_DMA_EN */
+-	R(NA8_CH + 0x0c, 2, &v);
+-	s->prior_irq = v;
+-	if (v != 0 && v != 1) { REFUSE(8); }
+-	R(NA8_CH + 0xf4, 2, &v);
+-	if (v) { REFUSE(9); }
+-	R(NA8_CH + 0xec, 2, &s->i3c);
+-	if (s->i3c & NA8_I3C_EN) { REFUSE(21); }
++ /* These are the same five read-only accesses as before. Collect them
++  * before applying predicates, so one safe refusal does not conceal the
++  * other inherited AP conditions. A callback failure exits immediately via
++  * R: never read another register after a failed access. */
++ static const uint32_t ap_offsets[NA8_AP_FIELDS]={0x24,0x10,0x0c,0xf4,0xec};
++ for(unsigned i=0;i<NA8_AP_FIELDS;i++) {
++  R(NA8_CH+ap_offsets[i],2,&v);
++  s->ap_preflight[i]=v;
++  s->ap_valid|=1u<<i;
++ }
++ s->prior_irq=s->ap_preflight[NA8_AP_IRQ];
++ s->i3c=s->ap_preflight[NA8_AP_I3C];
++ /* last_* must identify the refused predicate, not merely the last of the
++  * collected reads. No callback or MMIO occurs while selecting evidence. */
++#define AP_REFUSE(code,field) do { s->last_addr=NA8_CH+ap_offsets[field]; \
++ s->last_width=2;s->last_write=0;s->last_valid=1; \
++ s->last_value=s->ap_preflight[field];REFUSE(code); } while(0)
++ if(s->ap_preflight[NA8_AP_START]&1) {AP_REFUSE(6,NA8_AP_START);}
++ if(s->ap_preflight[NA8_AP_CONTROL]&4) {AP_REFUSE(7,NA8_AP_CONTROL);}
++ if(s->prior_irq!=0 && s->prior_irq!=1) {AP_REFUSE(8,NA8_AP_IRQ);}
++ if(s->ap_preflight[NA8_AP_FIFO]) {AP_REFUSE(9,NA8_AP_FIFO);}
++ if(s->i3c&NA8_I3C_EN) {AP_REFUSE(21,NA8_AP_I3C);}
++#undef AP_REFUSE
+ 	if (s->prior_irq == 1) {
+ 		/* Same exact-completion adoption as the reviewed battery handoff;
+ 		 * every idle condition is re-read before the single W1C. */
+--- a/shim/nord2-xnu/audio_i2c8.h
++++ b/shim/nord2-xnu/audio_i2c8.h
+@@ -27,6 +27,11 @@
+  * 16 CAM power (CCU may run), 17 CCU channel busy, 18 shadow START,
+  * 19 argument not allowed, 20 existing GPIO input-enable/pads not high,
+  * 21 AP-channel I3C mode enabled. */
++/* Read-only AP-channel preflight snapshot. Bit(index) means that read
++ * completed successfully during the latest transfer; missing fields are0. */
++enum na8_ap_field { NA8_AP_START, NA8_AP_CONTROL, NA8_AP_IRQ, NA8_AP_FIFO,
++ NA8_AP_I3C, NA8_AP_FIELDS };
++#define NA8_AP_VALID_ALL ((1u << NA8_AP_FIELDS) - 1u)
+ struct na8_state {
+ 	unsigned entered, inflight, offline, mutated, uncertain, polls, calls;
+  unsigned poll_limit; /* 0=2000, streaming monitor uses200 (2ms); maximum2000 */
+@@ -39,6 +44,8 @@
+ 	uint32_t ifr1, ifr2, dma_en, sh_start, ccu_start, ccu_ctrl, prior_irq, prior_ack;
+ 	uint32_t completion_irq;
+ 	unsigned dma_checked;
++ uint32_t ap_preflight[NA8_AP_FIELDS];
++ unsigned ap_valid;
+ };
+ 
+ /* One read of a 16-bit big-endian TFA register (tfa98xx.c:4705-4709).
+--- a/shim/nord2-xnu/audio_device.c
++++ b/shim/nord2-xnu/audio_device.c
+@@ -105,6 +105,11 @@
+   where,reason,h->gate,h->afe_phase,h->afe_op,h->i2c_stage,h->i2c_failure,
+   h->last_pa,h->stop_error,h->reset_error,h->amp_reset_held,h->uncertain,
+   h->i2c_last_pa,h->i2c_last_value,h->ownership,h->amp_status[0],h->amp_status[1]);
++ /* Worker-owned saved values only; diagnostics never perform MMIO. */
++ printf("NORD2 AUDIO AP: valid=%x start=%x ctrl=%x irq=%x fifo=%x i3c=%x\n",
++  hardware.bus.ap_valid,hardware.bus.ap_preflight[NA8_AP_START],
++  hardware.bus.ap_preflight[NA8_AP_CONTROL],hardware.bus.ap_preflight[NA8_AP_IRQ],
++  hardware.bus.ap_preflight[NA8_AP_FIFO],hardware.bus.ap_preflight[NA8_AP_I3C]);
+  if(initial)for(unsigned i=0;i<hardware.snapshot.snap_read && i<NAU_SNAP_COUNT;i++)
+   printf("NORD2 AUDIO SNAP: index=%u pa=%x value=%x\n",i,nau_snapshot_pa[i],hardware.snapshot.snap[i]);
+ }

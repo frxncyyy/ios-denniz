@@ -1,0 +1,73 @@
+diff --git a/bsd/dev/rottenapple_mtk_wlan.c b/bsd/dev/rottenapple_mtk_wlan.c
+index 5ebe5de..37d74b9 100644
+--- a/bsd/dev/rottenapple_mtk_wlan.c
++++ b/bsd/dev/rottenapple_mtk_wlan.c
+@@ -1785,6 +1785,9 @@ wl_ch_privilege(struct mtk_wlan *l, bool req)
+ 	l->ch_granted = false;
+ 	int err = wl_set(l, CMD_ID_CH_PRIVILEGE, cmd, sizeof(cmd), req ? "CH_PRIVILEGE (request)" :
+ 	    "CH_PRIVILEGE (abort)");
++	if (err == 0) {
++		l->ch_held = req;
++	}
+ 	if (err || !req) {
+ 		return err;
+ 	}
+@@ -2260,7 +2263,20 @@ mtk_wlan_set_port(struct mtk_wlan *l, bool authorized)
+ 	cmd[1] = 1;                     /* DTIM period (placeholder) */
+ 	put16(cmd + 2, l->assoc_aid);
+ 	put16(cmd + 4, 100);            /* beacon interval (placeholder) */
+-	return wl_set(l, CMD_ID_INDICATE_PM_BSS_CONNECTED, cmd, sizeof(cmd), "INDICATE_PM_BSS_CONNECTED");
++	int err = wl_set(l, CMD_ID_INDICATE_PM_BSS_CONNECTED, cmd, sizeof(cmd), "INDICATE_PM_BSS_CONNECTED");
++	/*
++	 * gen4m releases the join's channel privilege once connected (its join
++	 * timer ends in AIS_STATE_NORMAL_TR -> aisFsmReleaseCh): the
++	 * connected BSS keeps its channel without it. Holding it keeps the
++	 * firmware's channel manager parked there, so a scan while connected
++	 * never left the channel and never finished (device: no SCAN_DONE in
++	 * 12 s, only beacons of the home channel).
++	 */
++	if (l->ch_held) {
++		LLOG("connected: releasing the join's channel privilege (gen4m: released in NORMAL_TR)");
++		(void)wl_ch_privilege(l, false);
++	}
++	return err;
+ }
+ 
+ /* ---- Data path ---- */
+@@ -2449,6 +2465,11 @@ mtk_wlan_scan(struct mtk_wlan *l, unsigned mode)
+ 	 * the STA still "connected" (seen with a scan while connected).
+ 	 */
+ 	bool keep_bss = l->connected || l->join_active;
++	if (l->connected && l->ch_held) {
++		/* see mtk_wlan_set_port: the scan needs the channel manager free to go off-channel */
++		LLOG("scan while connected: releasing the join's channel privilege first");
++		(void)wl_ch_privilege(l, false);
++	}
+ 	err = (keep_bss && l->bss_active) ? 0 : wl_bss_activate(l, true);
+ 	if (err == 0) {
+ 		err = wl_set(l, CMD_ID_SCAN_REQ_V2, cmd, SCAN_REQ_LEN, "SCAN_REQ_V2");
+diff --git a/bsd/dev/rottenapple_mtk_wlan.h b/bsd/dev/rottenapple_mtk_wlan.h
+index 273a22c..137cb8b 100644
+--- a/bsd/dev/rottenapple_mtk_wlan.h
++++ b/bsd/dev/rottenapple_mtk_wlan.h
+@@ -65,6 +65,7 @@ struct mtk_wlan {
+ 	volatile bool join_active;      /* a join is in progress (route auth/assoc frames to it) */
+ 	volatile bool ch_granted;       /* EVENT_CH_PRIVILEGE grant for our token arrived */
+ 	uint8_t ch_token;               /* the channel-privilege token we asked for */
++	bool ch_held;                   /* a join's channel privilege is requested and not yet aborted */
+ 	volatile bool auth_done, assoc_done;
+ 	volatile uint16_t auth_status, assoc_status, assoc_aid;
+ 	uint8_t sta_rec_idx;            /* firmware STA record slot for the AP */
+diff --git a/bsd/dev/rottenapple_wifi_a80211.c b/bsd/dev/rottenapple_wifi_a80211.c
+index e1ef704..1926787 100644
+--- a/bsd/dev/rottenapple_wifi_a80211.c
++++ b/bsd/dev/rottenapple_wifi_a80211.c
+@@ -182,7 +182,7 @@ static struct {
+ 	uint8_t pmk[32];                        /* secret: wiped after the join */
+ } a80211_assoc;
+ 
+-#define SCAN_REUSE_MS           10000   /* while associated, a scan list younger than this is served as is */
++#define SCAN_REUSE_MS           60000   /* while associated, a scan list younger than this is served as is */
+ #define ASSOC_LEN               0x250   /* struct of the ASSOCIATE request (IO80211 _performAssociation) */
+ #define AS_AUTH_UPPER           0x08
+ #define AS_SSID_LEN             0x0c

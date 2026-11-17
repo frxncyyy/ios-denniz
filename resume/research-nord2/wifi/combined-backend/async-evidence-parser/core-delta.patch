@@ -1,0 +1,88 @@
+--- frozen-v3/base-v3.py
++++ new/core-async.py
+@@ -30,10 +30,12 @@
+ 'CAP TLV':'elements known unknown mac_present mac_valid resources version product fw/2',
+ 'CAP OWNER':'native_error native_halt init_halt driver dmairq/2 valid parked',
+ 'CAP EVENT':'n kind type eid seq bytes declared/2 debug_type debug_bytes',
++'CAP SLEEPY':'n state',
+ 'CAP EVENTHEADER':'n valid bytes inner raw/9',
+ 'CAP WORKER':'parking retained callbacks_complete',
+ 'BASIC ARM':'cid seq bytes deadline_us rx_budget',
+ 'BASIC':'status phase complete skipped reason halt error submit txdone polls debug rearmed callbacks publications',
++'BASIC ASYNC':'events sleepy state_valid state',
+ 'BASIC TX':'cid seq bytes from to completed didx control consumed ack_expected firmware_ack',
+ 'BASIC TXDESC':'observed address expected software_used raw/4',
+ 'BASIC RESOURCE':'valid version pse/2 ple/2 pages/2 extra debit/2 reserved remaining',
+@@ -53,7 +55,7 @@
+ 'RXQUEUE':'n next didx packets rearmed waits segmented dropped raw/4',
+ 'RXEVENT':'n bytes outer inner eid seq kind status',
+ }
+-REPEATED={'CAP EVENT','CAP EVENTHEADER','NORMAL COMMAND','RXQUEUE','RXEVENT'}
++REPEATED={'CAP SLEEPY','CAP EVENT','CAP EVENTHEADER','NORMAL COMMAND','RXQUEUE','RXEVENT'}
+ MAIN_KEYS=[x for x in SCHEMA if x.startswith('MAIN')]
+ MAIN_AUX={
+ 'ARM':'stage action events finish ap wf driver',
+@@ -144,32 +146,39 @@
+  exact('CAP ARM',(0x8a,0xec,4,3000000,16));eq('CAP',status=0,phase=5,complete=1,halt=0,error=0,submit=1,txdone=1,match=1)
+  cap=r('CAP');ce=rows.get('CAP EVENT',[]);ch=rows.get('CAP EVENTHEADER',[])
+  ck(1<=cap['events']<=16 and len(ce)==len(ch)==cap['events']==cap['rearmed'] and cap['events']+1<=cap['polls']<=3000,'CAP bounded events')
+- eq('CAP RX',valid=3,debug=cap['events']-1);ck(r('CAP RX')['elapsed_us']<3000000 and not any(x&0x00300000 for x in r('CAP RX')['irq']),'CAP IRQ/deadline');ck(not (r('CAP RX')['irq'][1]&0x20000000),'CAP pending STA29')
++ eq('CAP RX',valid=3,debug=sum(e['kind']==2 for e in ce));ck(r('CAP RX')['elapsed_us']<3000000 and not any(x&0x00300000 for x in r('CAP RX')['irq']),'CAP IRQ/deadline');ck(not (r('CAP RX')['irq'][1]&0x20000000),'CAP pending STA29')
+  eq('CAP OWNER',native_error=0,native_halt=0,init_halt=0,driver=1,valid=3,parked=0);ck(not any(x&0x00300000 for x in r('CAP OWNER')['dmairq']),'CAP coherent owner');ck(not (r('CAP OWNER')['dmairq'][1]&0x20000000),'CAP owner pending STA29')
+  eq('CAP DESCRIPTOR',raw=(0x90006000+((2+cap['events'])%16)*4096,3840<<16,0,0))
+  tlv=r('CAP TLV');ck(tlv['elements']==tlv['known']+tlv['unknown'] and 2<=tlv['known']<=6 and tlv['mac_present'] in (0,1) and tlv['mac_valid']<=tlv['mac_present'] and tlv['resources']==1 and tlv['version']==0x80000001,'CAP TLV metadata');ck(tlv['elements']<=(r('CAP RX')['bytes']-40)//8 and 40+8*tlv['elements']+4*tlv['known']+4*tlv['mac_present']+24<=r('CAP RX')['bytes'],'CAP TLV bounded body');ck(tlv['product']<=65535 and all(x<=65535 for x in tlv['fw']),'CAP product/firmware widths')
+  for j,(e,h) in enumerate(zip(ce,ch)):
+   ck(e['n']==h['n']==j and h['valid']==1 and h['bytes']==36 and h['inner']<=65535 and e['type']<=65535 and e['type']&0x380f==0x3800 and e['seq']<=255 and 36<=e['bytes']<=3840,'CAP event/header classification')
+   w=h['raw'];ck((w[0]&65535,w[0]>>16,w[6]&65535,w[6]>>16,w[7]&255,(w[7]>>8)&255)==(e['declared'][0],e['type'],e['declared'][1],h['inner'],e['eid'],e['seq']),'CAP raw header correlation')
+-  ck(positions['CAP EVENTHEADER'][j]==positions['CAP EVENT'][j]+1,'CAP paired row order')
++  ck(positions['CAP EVENTHEADER'][j]==positions['CAP EVENT'][j]+(2 if e['kind']==3 else 1),'CAP paired row order')
+   if j==len(ce)-1:ck(e['kind']==1 and e['eid']==0xec and e['bytes']>=40 and e['debug_type']==e['debug_bytes']==0 and r('CAP RX')['bytes']==e['bytes'],'CAP final reply')
++  elif e['kind']==3:ck(e['eid']==7 and e['bytes']>=40 and e['debug_type']<=255 and e['debug_bytes']==0,'CAP bounded sleepy')
+   else:ck(e['kind']==2 and e['eid']==0x27 and e['bytes']>=48 and e['debug_type']==3 and e['debug_bytes']<=min(1200,e['bytes']-48),'CAP bounded debug')
++ sleepy=rows.get('CAP SLEEPY',[]);expect=[e for e in ce if e['kind']==3]
++ ck(len(sleepy)==len(expect),'CAP sleepy count')
++ for q,e in zip(sleepy,expect):ck(q['n']==e['n'] and q['state']==e['debug_type'] and q['state']<=255,'CAP sleepy state/index')
+  if ce:
+   actual_sequence=ce[-1]['seq'];eq('CAP RX',echo=int(actual_sequence==r('CAP ARM')['seq']),mismatch=int(actual_sequence!=r('CAP ARM')['seq']))
+  before('CAP OWNER','CAP EVENT');before('CAP EVENTHEADER','BASIC ARM')
+  # Exact successful BASIC transport+actual selected metadata, independently.
+  exact('BASIC ARM',(2,5,76,3000000,16));b=r('BASIC');eq('BASIC',status=0,phase=5,complete=1,skipped=0,reason=0,halt=0,error=0,submit=1,txdone=1,publications=1)
+- ck(1<=b['polls']<=3000 and b['debug']==b['rearmed']<=16 and b['callbacks']>0,'BASIC bounded receipt')
++ a=r('BASIC ASYNC');ck(a['events']==b['debug']+a['sleepy']==b['rearmed']<=16 and a['state_valid']==int(a['sleepy']>0) and a['state']<=255 and (a['state_valid'] or a['state']==0),'BASIC async accounting/state')
++ ck(1<=b['polls']<=3000 and b['callbacks']>0,'BASIC bounded receipt')
+  bt=r('BASIC TX');eq('BASIC TX',cid=2,seq=5,bytes=76,**{'from':4,'to':5},completed=5,didx=5,ack_expected=0,firmware_ack=0)
+  ck(bt['control']&0x80000000 and bt['consumed']==int(bt['control']==0x80000000),'BASIC DDONE')
+  bd=r('BASIC TXDESC');eq('BASIC TXDESC',address=0x90000040,expected=0x90005000,software_used=76);ck(1<=bd['observed']<=b['polls'] and bd['raw'][1]==bt['control'],'BASIC owned descriptor')
+  br=r('BASIC RESOURCE');eq('BASIC RESOURCE',valid=1,version=0x80000001,debit=(1,0),reserved=1,remaining=2);ck(br['pse'][1]==3 and all(0<=x<=65535 for x in br['pages']) and br['extra']<=255,'BASIC resource provenance')
+  eq('BASIC CAPS',valid=1,sku=0,efuse=0,country=0,phy=1,band5=1,bw=2,nss=2,path=15,known=tlv['known'],unknown=tlv['unknown'])
+  d=r('BASIC DEBUG');h=r('BASIC DEBUGHEADER')
+- if not b['debug']:ck(not any(v for value in d.values() for v in (value if isinstance(value,tuple) else (value,))) and h['valid']==0 and not any(h['raw']),'BASIC absent debug')
++ if not a['events']:ck(not any(v for value in d.values() for v in (value if isinstance(value,tuple) else (value,))) and h['valid']==0 and not any(h['raw']),'BASIC absent debug')
+  else:
+-  ck(d['valid']==h['valid']==1 and d['kind']==2 and d['type']<=65535 and d['type']&0x380f==0x3800 and d['eid']==0x27 and d['inner']<=65535 and d['format']==3 and d['seq']<=255 and d['id']<=65535 and 48<=d['bytes']<=3840 and d['length']<=min(1200,d['bytes']-48),'BASIC bounded debug')
+-  ck(d['index']==(2+cap['events']+b['debug'])%16,'BASIC debug index');w=h['raw'];ck((w[0]&65535,w[0]>>16,w[6]&65535,w[6]>>16,w[7]&255,(w[7]>>8)&255)==(d['declared'][0],d['type'],d['declared'][1],d['inner'],d['eid'],d['seq']),'BASIC debug header correlation')
++  ck(d['valid']==h['valid']==1 and d['type']<=65535 and d['type']&0x380f==0x3800 and d['inner']<=65535 and d['seq']<=255 and 40<=d['bytes']<=3840,'BASIC async header')
++  if d['kind']==3:ck(d['eid']==7 and a['sleepy']>0 and d['format']==a['state'] and d['id']==d['length']==0,'BASIC bounded sleepy')
++  else:ck(d['kind']==2 and b['debug']>0 and d['eid']==0x27 and d['format']==3 and d['id']<=65535 and d['bytes']>=48 and d['length']<=min(1200,d['bytes']-48),'BASIC bounded debug')
++  ck(d['index']==(2+cap['events']+a['events'])%16,'BASIC debug index');w=h['raw'];ck((w[0]&65535,w[0]>>16,w[6]&65535,w[6]>>16,w[7]&255,(w[7]>>8)&255)==(d['declared'][0],d['type'],d['declared'][1],d['inner'],d['eid'],d['seq']),'BASIC debug header correlation')
+  exact('BASIC OWNER',(1,0,0,0,0,0,5,0));exact('BASIC WORKER',(1,1,1));exact('CAP WORKER',(1,1,1));before('BASIC OWNER','BACKEND ARM');before('RXQUEUE','BASIC WORKER');before('BASIC WORKER','CAP WORKER')
+  # Exact22 recipe and publication-credit-DDONE accounting.
+  normal=r('NORMAL');eq('NORMAL',status=0,phase=7,prepared=1,halt=0,error=0,refusal=0,cursor=22,count=22,complete=22,current_cid=0)
+@@ -192,7 +201,7 @@
+  rx=r('RX');scan=r('SCAN');eq('RX',entered=1,halt=0,error=0,phase=0);ck(rx['queue']<5 and rx['packets']==rx['rearmed']==normal['events']<=8192 and rx['malformed']<=rx['packets'] and rx['dropped']<=rx['packets'] and rx['debug']+rx['sleepy']+rx['unknown']<=rx['events']<=rx['packets'],'RX accounting')
+  queues=rows.get('RXQUEUE',[]);ck(len(queues)==5,'RXQUEUE count')
+  for j,q in enumerate(queues):
+-  size=16 if j in (1,3,4) else 1024;initial=3+cap['events']+b['debug'] if j==1 else 0
++  size=16 if j in (1,3,4) else 1024;initial=3+cap['events']+a['events'] if j==1 else 0
+   ck(q['n']==j and q['next']==(initial+q['rearmed'])%size and q['didx']<size and q['packets']==q['rearmed'] and q['dropped']<=q['packets'] and q['segmented'] in (0,1),'RXQUEUE slot/accounting')
+   if scan['done']:ck(q['didx']==q['next'],'SCAN completed with undrained RX queue')
+  ck(sum(q['packets'] for q in queues)==rx['packets'] and sum(q['rearmed'] for q in queues)==rx['rearmed'] and sum(q['dropped'] for q in queues)<=rx['dropped'],'RXQUEUE aggregate')
+@@ -211,7 +220,7 @@
+   ck(scan['partial']==1 and scan['drain']==0 and scan['state']==scan['completed_channels']==0 and (normal['service_timed_out'] or normal['event_limit']) and (scan['timed_out'] or normal['event_limit']) and (not normal['service_timed_out'] or scan['timed_out']),'SCAN truthful partial lifetime')
+  before('BACKEND','RX');before('RX','SCAN');before('SCAN','RXQUEUE')
+  if events:before('RXQUEUE','RXEVENT');before('RXEVENT','BASIC WORKER')
+- expected_order=MAIN_KEYS+['CAP ARM','CAP','CAP RX','CAP DESCRIPTOR','CAP TLV','CAP OWNER']+['CAP EVENT','CAP EVENTHEADER']*len(ce)+['BASIC ARM','BASIC','BASIC TX','BASIC TXDESC','BASIC RESOURCE','BASIC CAPS','BASIC DEBUG','BASIC DEBUGHEADER','BASIC OWNER','BACKEND ARM','NORMAL','NORMAL CREDIT','NORMAL BOUNDS']+['NORMAL COMMAND']*22+['BACKEND','RX','SCAN']+['RXQUEUE']*5+['RXEVENT']*len(events)+['BASIC WORKER','CAP WORKER']
++ expected_order=MAIN_KEYS+['CAP ARM','CAP','CAP RX','CAP DESCRIPTOR','CAP TLV','CAP OWNER']+sum((['CAP EVENT']+(['CAP SLEEPY'] if e['kind']==3 else [])+['CAP EVENTHEADER'] for e in ce),[])+['BASIC ARM','BASIC','BASIC ASYNC','BASIC TX','BASIC TXDESC','BASIC RESOURCE','BASIC CAPS','BASIC DEBUG','BASIC DEBUGHEADER','BASIC OWNER','BACKEND ARM','NORMAL','NORMAL CREDIT','NORMAL BOUNDS']+['NORMAL COMMAND']*22+['BACKEND','RX','SCAN']+['RXQUEUE']*5+['RXEVENT']*len(events)+['BASIC WORKER','CAP WORKER']
+  ck(ordered==expected_order,'combined source record order');ck(not aux or max(aux)<positions['MAIN'][0],'MAIN auxiliary lifetime')
+  if issues:return result
+  clean=bool(scan['done'] and scan['state']==7 and not scan['partial'])

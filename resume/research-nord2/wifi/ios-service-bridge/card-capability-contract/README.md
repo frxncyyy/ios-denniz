@@ -1,0 +1,44 @@
+Private CARD12 raw-bitmap contract, source-proven security subset
+
+This closes a bounded part of the mandatory bind query: exact request12 reply encoding plus six same-IPSW feature gates. It supplies a small checked encoder for a future actual installed implementation inventory. It does not publish a controller/interface/userclient, return a current successful CARD reply, or make scan/association/networking available. Existing frozen packages are unchanged.
+
+Same-IPSW evidence, not transplanted macOS ABI
+
+verify.py rereads the original mounted20H392/d22ap cache. IO80211 TEXT344064B SHA c1e1afa676d75de03fd7bee970ccf8cbf63d6199e862a48ebed41aeea0df3aea and CoreWiFi TEXT839680B SHA5a71851bbffeaf836285ae280cc4db27ab57ed426abb904a0d71d17cd066eb3d match prior identities. It compares1076 instruction bytes in10 focused ranges against the retained disassembly carriers, checks four actual CFString keys and ten4B cipher-suite constants, and resolves the actual CoreWiFi branch island to exported Apple80211Get. source-evidence.json retains addresses/hashes and limits. These are ordinary shell static observations; REA tools/provider/CLI remain unavailable, with no engine install/config change, decompilation or runtime observation.
+
+The bind path0x1d3ed5050–5070 requests CARD_CAPABILITIES12/raw13 into context+80 after DRIVER_VERSION and selector1. Common conversion0x1d3ec5138–51dc requests13 into local+4, iterates bit indices0..102 and appends numeric set-bit IDs to a CFArray. Its preceding local4B zero is NOT part of the driver reply; there is no version prefix in the raw13. Bit103 is outside that array loop. No raw bit is guessed from MTK's unrelated capability TLVs.
+
+Fresh CoreWiFi ObjC metadata identifies CWFApple80211 capabilities: at0x1abd7c7a0. It creates an array, invokes Apple80211Get(request12) through branch island0x1afb67eb8 (resolved actual target0x1d3ec172c), then copies the numeric collection. That exported Get forwards to common dispatch0x1d3ec3f64. This method and the bounded bind path do not impose a minimum nonzero feature mask. This is NOT a complete audit of every wifid startup consumer, and it is not permission to reply with arbitrary zeroes merely to advance initialization.
+
+Six bit meanings established by actual behavior
+
+The exported association path saves its original context tosp+120 (0x1d3ebf1d8/3f0), reloads it asx22 at0x1d3ec0d98/db8, then tests raw context+80+byte. Actual dictionary keys and suite bytes remove dependence on old header names:
+
+|Raw bit|Observed same-IPSW gate|Concrete evidence|
+|---:|---|---|
+|0|WEP40 AND WEP104 cipher family|ctx+80 bit0 gates suites000fac01/05 and0050f201/05 at0x1d3ec0eb4/f50/fe8/119c|
+|1|TKIP|ctx+80 bit1 gates000fac02/0050f202 at0x1d3ec0fc0/1174|
+|3|CCMP128|ctx+80 bit3 gates000fac04/0050f204 at0x1d3ec0fd4/1188|
+|13|legacy WPA_IE association path|actual WPA_IE CFString0x1dabadf78 plusctx+81 bit5 at0x1d3ec0e10|
+|14|RSN_IE association path|actual RSN_IE CFString0x1dabadf98 plusctx+81 bit6 at0x1d3ec0df4|
+|76|GCMP128 AND GCMP256 cipher family|ctx+89 bit4 gates000fac08/09 at0x1d3ec0ffc/1010|
+
+Selected Android include/mgmt/rsn.h79–98 independently names the same cipher-suite bytes. Local pinned Airport headers corroborate early numeric names but are NOT the authority for this encoding: their macOS structures contain a version word and11/14 capability bytes, incompatible with the exact iOS raw13 consumer. No code from those producers was copied. WPA_IE/RSN_IE are deliberately behavior names, not a recovered complete Apple canonical enum or a claim that all WPA2/WPA3 modes share one implementation. WEP and GCMP family bits admit both listed suite variants; implementing only one cannot justify advertising that family.
+
+Bounded adapter and actual native authority boundary
+
+card.c/h expose niwc_card_reply(input15408,bytes,driver-owned niwc_manifest,output,capacity,used). It freshly invokes the pinned niw_decode for selector0 and requires GET0xc02869c9/request12/value0/payload13, then maps only the six reviewed feature identifiers to the exact raw bit positions. Output is exactly13 bytes; no version word, hardware-ready flag, inferred firmware feature or bit103 is emitted. Malformed carrier/interface, insufficient output, unknown/duplicate feature, extra/missing operation bits or empty inventory refuses atomically.
+
+Each manifest entry requires installed association, authentication, key installation, encryptedTX, encryptedRX and disconnect handling for that ENTIRE feature/family. This is a conservative closed-subset policy, not a claim that Apple enforces that exact operation inventory or requires a nonempty bitmap. The manifest is constructed by a real native owner from reviewed installed handlers and retained implementation state; it is never accepted from a user request. Pure masks cannot authenticate their origin or prove correct crypto/lifetime. The real IOUserClient must separately enforce owning task, generation, gate, exact service/interface binding, output storage lifetime and disjoint used/output storage. Handler behavior and inter-feature combinations still require native review. The helper does not provide those handlers or serve as an admission token.
+
+The current MTK backend has normal initialization and bounded scan commands, but no installed association/authentication/key/encrypted data/disconnect implementation. It therefore supplies NO niwc_manifest and NO successful CARD reply. Its physical PHY/resource/TLV facts do not fill this inventory. The future native-lifecycle-shell must keep request12 Unsupported until it owns an actual reviewed inventory. An allzero reply is not supplied to unblock binding. Other97 consumed bit meanings plus bit103 remain outside this source-proven subset; adding any requires its own actual evidence and implementation, not copying a broad stock mask.
+
+Topaz comparison and finite remaining work
+
+Pinned local Topaz89451b8 patches0126/0129/0130 expose actual ready/scan/heard, join/join_pmk/leave, EthernetTX and RX/link hook boundaries. Patch0129 installs CCMP pairwise keys, optional TKIP/CCMP group keys, has an actual WPA2 handshake/stateS_UP and gates transmit/receive on that state. This demonstrates why a ready/scan receipt cannot stand in for security/data implementation. It does NOT establish equivalent MTK support, authorize Qualcomm command/crypto/MMIO reuse, or provide an IO80211 service bridge; its exported hook symbols have no bridge assignment in the inspected local source. No Topaz capability bitmap is imported.
+
+The useful next integration is an actual owning IOUserClient selecting the already-proved IOUC transport/event lifecycle and serving honest request43, while request12 remains unsupported until feature implementations are real. This package removes the raw13/version uncertainty and proves six concrete security bit gates for that future work. Controller/interface/BSD publication, the remaining feature catalogue, power/query semantics and actual backend association/data remain separate outstanding requirements. Completed-scan age conversion stays orthogonal: host-millisecond age does not grant any CARD bit or feature readiness.
+
+Verification
+
+1239 Clang ASan/UBSan failfast checks exercise all63 nonempty feature subsets, every missing required operation per selected entry, exact104 output bits plus roundtrip through the original numeric-cap decoder, all short13B output capacities, unsupported/empty/duplicate inventories, wrong GET/payload17/request/value/interface/carrier extent and atomic unchanged-output refusal. The raw13 byte0 is actual bitmap data, not a version. Normal ARM64 kernel helper compile passes with recorded source/output substitutions and explicit private parent-header include; no native linkage claimed. Source/cache reads only; no canonical/device/CI/ADT/interface/gate/configuration changes, no identifiers or board data logged.

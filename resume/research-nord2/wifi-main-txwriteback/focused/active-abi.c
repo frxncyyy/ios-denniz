@@ -1,0 +1,29 @@
+#include <stddef.h>
+#include "wifi_main_wfdma_native.h"
+#include "wifi_main_fw_xnu.h"
+void active_layout(size_t *o){
+o[0]=sizeof(struct nwt_state);
+o[1]=offsetof(struct nwt_state,tx_descriptor_address);
+o[2]=offsetof(struct nwt_state,tx_submitted);
+o[3]=offsetof(struct nwt_state,tx_observed);
+o[4]=offsetof(struct nwt_state,tx_didx);
+o[5]=offsetof(struct nwt_state,tx_used);
+o[6]=offsetof(struct nwt_state,tx_mismatch);
+o[7]=offsetof(struct nwt_state,tx_descriptor_valid);
+o[8]=offsetof(struct nwt_state,tx_ddone_waits);
+o[9]=offsetof(struct nwt_state,tx_consumed_zero);
+o[10]=sizeof(struct nwi_state);
+o[11]=offsetof(struct nwi_state,transport);
+o[12]=sizeof(struct nwfn_native);
+o[13]=offsetof(struct nwfn_native,init);
+o[14]=offsetof(struct nwfn_native,rom);
+o[15]=offsetof(struct nwfn_native,pool);
+o[16]=offsetof(struct nwfn_native,halt);
+o[17]=offsetof(struct nwfn_native,stage);
+o[18]=offsetof(struct nwfn_native,ap_owned);
+o[19]=offsetof(struct nwfn_native,wf_owned);
+o[20]=offsetof(struct nwfn_native,finish_tx);
+o[21]=sizeof(struct nfp_native);
+o[22]=offsetof(struct nfp_native,state);
+o[23]=offsetof(struct nfp_native,pre_span_reason);
+}

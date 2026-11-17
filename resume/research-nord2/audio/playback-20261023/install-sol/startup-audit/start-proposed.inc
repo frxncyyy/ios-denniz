@@ -1,0 +1,22 @@
+static int start(unsigned silent,unsigned duration) {
+ uint64_t begin=now_us();
+ int e=nau_hw_start(&hardware,48000,2,16,silent,NAH_MAX_GAIN_Q15,duration,begin);
+ if(!e && duration) {
+  /* Hardware startup is bounded but may include reset, board and clock
+   * waits. Count the diagnostic interval only after successful startup;
+   * a one-second test must not expire while still starting. The lower
+   * layer already validated duration<=NAH_MAX_TEST_US before mutations. */
+  uint64_t active=now_us();
+  if(active<begin || active>UINT64_MAX-duration) {
+   hardware.status.error=e=NAH_E_DEADLINE;
+   (void)nau_hw_stop(&hardware); /* Preserve stop_error/uncertainty evidence. */
+  } else hardware.deadline_us=active+duration;
+ }
+ if(!e)device.starts++;
+ /* Never stall the running two-ms DMA feeder on synchronous console IO. */
+ if(!hardware.status.running)
+  printf("NORD2 AUDIO: start=%d silent=%u duration=%u gate=%u amp=%04x/%04x\n",
+   e,silent,duration,hardware.status.gate,hardware.status.amp_revision[0],hardware.status.amp_revision[1]);
+ if(e)diagnose("start",e,1);
+ return e;
+}

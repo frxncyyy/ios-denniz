@@ -1,0 +1,184 @@
+diff --git a/bsd/dev/rottenapple_mtk_wlan.c b/bsd/dev/rottenapple_mtk_wlan.c
+index ed22529..c1f7487 100644
+--- a/bsd/dev/rottenapple_mtk_wlan.c
++++ b/bsd/dev/rottenapple_mtk_wlan.c
+@@ -1036,6 +1036,15 @@ wl_rx_frame(struct mtk_wlan *l, const uint8_t *p, uint32_t len, unsigned ring)
+ 	if (p[RXD_HDR] & RXD_HDR_TRAN) {
+ 		/* the firmware translated the 802.11 header: f is an 802.3 frame */
+ 		l->rx_data_frames++;
++		if (g3 && l->connected) {
++			/* live link RSSI from the RX vector of unicast data from the AP (status bar, LQM) */
++			uint32_t v = le32(p + g3 + 12), r0 = v & 0xff, r1 = (v >> 8) & 0xff;
++			uint32_t r = r0 <= RCPI_HIGH_BOUND && r1 <= RCPI_HIGH_BOUND ? MAX(r0, r1) :
++			    r0 <= RCPI_HIGH_BOUND ? r0 : r1;
++			if (r <= RCPI_HIGH_BOUND && r > 0) {
++				rottenapple_wifi_rx_rssi(l->w, (int)(r >> 1) - NDBM_LOW_BOUND_FOR_RCPI);
++			}
++		}
+ 		rottenapple_wifi_rx_data(l->w, f, flen);
+ 		return;
+ 	}
+diff --git a/bsd/dev/rottenapple_wifi.h b/bsd/dev/rottenapple_wifi.h
+index 3104128..14bcd93 100644
+--- a/bsd/dev/rottenapple_wifi.h
++++ b/bsd/dev/rottenapple_wifi.h
+@@ -355,6 +355,14 @@ int rottenapple_wifi_sta_rejoin_last(void);
+ /* Disconnect, no reconnect; forgets a userland PMK. */
+ void rottenapple_wifi_sta_disconnect(void);
+ 
++/*
++ * Backend -> core, receive thread: the RSSI (dBm) of one frame received from
++ * the AP while connected. The core keeps a smoothed live link RSSI.
++ */
++void rottenapple_wifi_rx_rssi(struct rottenapple_wifi *w, int rssi);
++/* The live link RSSI (dBm), ROTTENAPPLE_WIFI_RSSI_NONE when none arrived in the last 10 s. */
++int rottenapple_wifi_live_rssi(void);
++
+ /* RSSI of bssid in the last scan list, ROTTENAPPLE_WIFI_RSSI_NONE if absent. */
+ int rottenapple_wifi_scan_rssi(const uint8_t *bssid);
+ 
+diff --git a/bsd/dev/rottenapple_wifi_a80211.c b/bsd/dev/rottenapple_wifi_a80211.c
+index 4365ead..65ceb0a 100644
+--- a/bsd/dev/rottenapple_wifi_a80211.c
++++ b/bsd/dev/rottenapple_wifi_a80211.c
+@@ -99,6 +99,7 @@ _Static_assert(sizeof(struct ra_a80211_req) == 40, "apple80211 request is 40 byt
+ #define M_LINK_CHANGED          4
+ #define M_ASSOC_DONE            9
+ #define M_SCAN_DONE             10
++#define M_RSSI_CHANGED          39
+ #define KEV_APPLE80211_SUBCLASS 1
+ 
+ /* buffer sizes IO80211 uses for these types */
+@@ -201,6 +202,40 @@ static struct {
+ #define ASSOC_RESULT_OK         1
+ #define ASSOC_RESULT_FAILED     2
+ 
++/* ---- live RSSI and link-quality events ---- */
++
++static volatile int a80211_rssi_avg = ROTTENAPPLE_WIFI_RSSI_NONE;      /* smoothed dBm */
++static volatile uint64_t a80211_rssi_at;                                /* mach_absolute_time of the last sample */
++static volatile unsigned a80211_link_gen;                               /* bumped on every link change */
++
++void
++rottenapple_wifi_rx_rssi(__unused struct rottenapple_wifi *w, int rssi)
++{
++	int avg = a80211_rssi_avg;
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time() - a80211_rssi_at, &ns);
++	if (avg == ROTTENAPPLE_WIFI_RSSI_NONE || ns > 10ull * NSEC_PER_SEC) {
++		avg = rssi;
++	} else {
++		avg = (3 * avg + rssi) / 4;
++	}
++	a80211_rssi_avg = avg;
++	a80211_rssi_at = mach_absolute_time();
++}
++
++int
++rottenapple_wifi_live_rssi(void)
++{
++	uint64_t ns;
++
++	if (a80211_rssi_avg == ROTTENAPPLE_WIFI_RSSI_NONE || a80211_rssi_at == 0) {
++		return ROTTENAPPLE_WIFI_RSSI_NONE;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - a80211_rssi_at, &ns);
++	return ns > 10ull * NSEC_PER_SEC ? ROTTENAPPLE_WIFI_RSSI_NONE : a80211_rssi_avg;
++}
++
+ /* ---- events ---- */
+ 
+ static void
+@@ -228,6 +263,59 @@ a80211_post(uint32_t code, const void *payload, uint32_t plen)
+ 	(void)kev_post_msg(&ev);
+ }
+ 
++/*
++ * RSSI_CHANGED payload as IO80211's _dispatchlqmChangedEvent reads it (it
++ * drops events shorter than 0xb4 bytes): RSSI valid u8 @0 + s32 @4,
++ * per-core valid u8 @8 + s8 @9/@10, SNR valid u8 @0xb + s16 @0xc, noise
++ * valid u8 @0xe + s16 @0x10, CCA valid u8 @0x12 + u8 @0x13, then TX
++ * counters (left 0). wifid seeds its link quality at link-up and keeps it
++ * current from these; without them the status bar showed 0 bars.
++ */
++static void
++a80211_post_rssi(void)
++{
++	struct rottenapple_wifi_link_info li;
++	uint8_t ev[0xb4];
++	int16_t v16;
++
++	rottenapple_wifi_sta_link_info(&li);
++	if (!li.associated || li.rssi == ROTTENAPPLE_WIFI_RSSI_NONE) {
++		return;
++	}
++	bzero(ev, sizeof(ev));
++	ev[0] = 1;
++	put32(ev + 4, (uint32_t)li.rssi);
++	ev[8] = 1;
++	ev[9] = (uint8_t)(int8_t)li.rssi;
++	ev[10] = (uint8_t)(int8_t)li.rssi;
++	ev[0xb] = 1;
++	v16 = (int16_t)(li.rssi - NOISE_FLOOR_DBM);
++	memcpy(ev + 0xc, &v16, 2);
++	ev[0xe] = 1;
++	v16 = (int16_t)NOISE_FLOOR_DBM;
++	memcpy(ev + 0x10, &v16, 2);
++	a80211_post(M_RSSI_CHANGED, ev, sizeof(ev));
++}
++
++#define LQM_PERIOD_MS           3000
++
++static void
++a80211_lqm_thread(void *arg, __unused wait_result_t wr)
++{
++	unsigned gen = (unsigned)(uintptr_t)arg;
++
++	delay(500 * 1000);
++	while (a80211_link_gen == gen) {
++		struct rottenapple_wifi_link_info li;
++		rottenapple_wifi_sta_link_info(&li);
++		if (!li.associated) {
++			break;
++		}
++		a80211_post_rssi();
++		delay(LQM_PERIOD_MS * 1000);
++	}
++}
++
+ void
+ rottenapple_wifi_a80211_attach(ifnet_t ifp)
+ {
+@@ -257,6 +345,15 @@ rottenapple_wifi_a80211_link(bool up, int rssi)
+ 		a80211_post(M_ASSOC_DONE, NULL, 0);
+ 	}
+ 	a80211_post(M_LINK_CHANGED, lc, sizeof(lc));
++	unsigned gen = ++a80211_link_gen;
++	if (!up) {
++		a80211_rssi_avg = ROTTENAPPLE_WIFI_RSSI_NONE;
++	} else if (a80211_ifp != NULL && rottenapple_wifi_a80211_enabled()) {
++		thread_t th;
++		if (kernel_thread_start(a80211_lqm_thread, (void *)(uintptr_t)gen, &th) == KERN_SUCCESS) {
++			thread_deallocate(th);
++		}
++	}
+ }
+ 
+ /* SCAN_DONE carries a 4-byte status (IO80211 reads it when the payload is 4 bytes) */
+diff --git a/bsd/dev/rottenapple_wifi_sta.c b/bsd/dev/rottenapple_wifi_sta.c
+index 0acda9f..2f3e8cc 100644
+--- a/bsd/dev/rottenapple_wifi_sta.c
++++ b/bsd/dev/rottenapple_wifi_sta.c
+@@ -1137,7 +1137,10 @@ rottenapple_wifi_sta_link_info(struct rottenapple_wifi_link_info *li)
+ 	}
+ 	lck_mtx_unlock(s->lock);
+ 	if (li->associated) {
+-		li->rssi = rottenapple_wifi_scan_rssi(li->bssid);
++		li->rssi = rottenapple_wifi_live_rssi();
++		if (li->rssi == ROTTENAPPLE_WIFI_RSSI_NONE) {
++			li->rssi = rottenapple_wifi_scan_rssi(li->bssid);
++		}
+ 	}
+ }
+ 

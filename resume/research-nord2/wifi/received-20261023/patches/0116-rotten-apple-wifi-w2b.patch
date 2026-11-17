@@ -1,0 +1,1337 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -146,6 +146,7 @@ bsd/dev/rottenapple_sc89601a.c		standard
+ bsd/dev/rottenapple_wifi.c		standard
+ bsd/dev/rottenapple_mtk_connsys.c	standard
+ bsd/dev/rottenapple_mtk_wfdma.c		standard
++bsd/dev/rottenapple_mtk_wmt.c		standard
+ bsd/dev/rottenapple_firmware.c		standard
+ bsd/dev/rottenapple_audio.c		standard
+ bsd/dev/rottenapple_mtk_afe.c		standard
+--- a/bsd/dev/rottenapple_mtk_connsys.c
++++ b/bsd/dev/rottenapple_mtk_connsys.c
+@@ -12,9 +12,11 @@
+  *
+  * Node (board profile tools/boards/vidofnir.py):
+  *   compatible = "mediatek,mt6789-connsys", ...;
+- *   reg = <CONNSYS window> <TOPRGU> <AP2MD PCCIF4> <IOCFG_RT>;
+- *   reg-names = "conn", "toprgu", "pccif4", "iocfg";
+- *   power-domains = "<scpsys>:conn";  clocks = "<infracfg_ao>:<ccif4 gate>";
++ *   reg = <CONNSYS window> <TOPRGU> <AP2MD PCCIF4> <IOCFG_RT> [<BTIF> <CONNSYS BTIF>];
++ *   reg-names = "conn", "toprgu", "pccif4", "iocfg" [, "btif", "conn-btif"];
++ *   power-domains = "<scpsys>:conn";
++ *   clocks = "<infracfg_ao>:<ccif4 gate>" [, "<infracfg_ao>:<btif gate>"];
++ *   clock-names = "ccif" [, "btif"];      (btif: W2b only)
+  *   vcn18-supply, vcn33-supply, vcn28-supply = "<pmic regulators>:<rail>";
+  *   mediatek,pmic = "<PMIC regmap>";
+  *   mediatek,vcn18-mode / vcn33-mode / vcn28-mode = <reg value restore>, ...;
+@@ -40,9 +42,13 @@
+  *   patches (48-byte header stripped) into EMI and verify them; EMI entry
+  *   addresses; a-die select; bus timeout; MCU memory power-down delay;
+  *   release the CPU; poll COM_REG0 for the ROM idle code 0x1D1E.
++ * W2b (level 4, rottenapple_mtk_wmt.c): with the CPU at ROM idle, the WMT
++ * init over BTIF/STP that Android's WMT stack runs before the Wi-Fi driver
++ * (chip ID, a-die, coexistence/antenna settings, RF calibration); then W2.
+  * W2 (wifi_on/wifi_off, rottenapple_mtk_wfdma.c): with the CPU at ROM idle,
+  * WFDMA rings in mediatek,dma-pool, RAM-code download, WIFI_START, ready
+- * bits; then DMA off and ownership back before the W1 power-off.
++ * bits; then DMA off and ownership back, BTIF off (W2b), before the W1
++ * power-off.
+  * Power-off is the reverse of whatever was done (Linux order: CON_STA,
+  * domain off, PCCIF4 acknowledge, CCIF4 clock, VCN28, pins, VCN33, 300 us,
+  * VCN18). Registers inside the CONNSYS window are only touched while the
+@@ -56,6 +62,7 @@
+ #include <kern/clock.h>
+ #include <dev/rottenapple_wifi.h>
+ #include <dev/rottenapple_mtk_wfdma.h>
++#include <dev/rottenapple_mtk_wmt.h>
+ 
+ #define CLOG(fmt, ...)  printf("ROTTEN APPLE: wifi connsys: " fmt "\n", ##__VA_ARGS__)
+ 
+@@ -87,6 +94,7 @@ struct mtk_connsys_soc {
+ 	uint32_t peri_base;             /* PERI remap target */
+ 	uint32_t rgu_swsysrst, rgu_mask, rgu_assert, rgu_deassert;
+ 	uint32_t pccif_ack;
++	uint32_t chip_id;               /* SoC id the WMT ROM is told (SET_CHIP_ID) */
+ 	uint32_t iocfg_drv, iocfg_drv_mask, iocfg_drv_val;
+ };
+ 
+@@ -107,6 +115,7 @@ static const struct mtk_connsys_soc mtk_connsys_socs[] = {
+ 		.rgu_swsysrst = 0x18, .rgu_mask = 0xff001000, .rgu_assert = 0x88001000,
+ 		.rgu_deassert = 0x88000000,
+ 		.pccif_ack = 0x14,
++		.chip_id = 0x6789,
+ 		.iocfg_drv = 0x10, .iocfg_drv_mask = 0x3ffffff8, .iocfg_drv_val = 0x9048,
+ 	},
+ };
+@@ -212,6 +221,10 @@ struct connsys {
+ 	uint64_t pool_pa, pool_size;
+ 	uintptr_t pool;
+ 	struct mtk_wfdma wlan;
++	/* W2b */
++	uintptr_t btif, conn_btif;
++	struct rottenapple_clk *btif_clk;
++	struct mtk_wmt wmt;
+ };
+ 
+ static struct connsys mtk_connsys;
+@@ -511,6 +524,16 @@ connsys_probe(struct rottenapple_wifi *w)
+ 		return EINVAL;
+ 	}
+ 	c->ram_code = rottenapple_prop_string(w->node, "mediatek,wifi-ram-code", 0);
++	/* W2b (optional): BTIF on both sides and its clock */
++	if ((i = rottenapple_wifi_reg_index(w, "btif")) >= 0) {
++		c->btif = w->regs[i];
++	}
++	if ((i = rottenapple_wifi_reg_index(w, "conn-btif")) >= 0) {
++		c->conn_btif = w->regs[i];
++	}
++	if (rottenapple_prop_string_index(w->node, "clock-names", "btif") >= 0) {
++		c->btif_clk = rottenapple_clk_of(w->name, "btif");
++	}
+ 	CLOG("%s, a-die 0x%x expected; EMI 0x%llx+0x%llx (CONNSYS 0x%08x); %u patches",
+ 	    c->soc->compatible, c->adie, c->emi_pa, c->emi_size, c->soc->emi_fw_base, c->npatches);
+ 	return 0;
+@@ -879,8 +902,11 @@ connsys_wifi_on(struct rottenapple_wifi *w, unsigned level)
+ {
+ 	struct connsys *c = w->priv;
+ 	struct mtk_wfdma *d = &c->wlan;
++	struct mtk_wmt *m = &c->wmt;
+ 	int err;
+ 
++	bzero(d, sizeof(*d));
++	bzero(m, sizeof(*m));
+ 	if (c->ram_code == NULL) {
+ 		CLOG("no mediatek,wifi-ram-code: W2 not possible");
+ 		return EINVAL;
+@@ -893,7 +919,29 @@ connsys_wifi_on(struct rottenapple_wifi *w, unsigned level)
+ 	    (err = rottenapple_wifi_carveout(w, "mediatek,dma-pool", &c->pool_pa, &c->pool_size, &c->pool)) != 0) {
+ 		return err;
+ 	}
+-	bzero(d, sizeof(*d));
++	if (level >= 4) {
++		/* W2b: WMT init over BTIF/STP between ROM idle and the Wi-Fi firmware */
++		if (c->btif == 0 || c->conn_btif == 0 || c->btif_clk == NULL) {
++			CLOG("W2b needs reg \"btif\" and \"conn-btif\" and clock \"btif\" (btif %d conn-btif %d clock %d)",
++			    c->btif != 0, c->conn_btif != 0, c->btif_clk != NULL);
++			return EINVAL;
++		}
++		m->conn = c->conn;
++		m->btif = c->btif;
++		m->conn_btif = c->conn_btif;
++		m->clk = c->btif_clk;
++		m->chip_id = c->soc->chip_id;
++		m->adie = c->adie;
++		m->emi = c->emi;
++		m->emi_size = c->emi_size;
++		CLOG("W2b: rail vcn28 %s (kept on through the RF calibration)",
++		    rottenapple_regulator_is_enabled(c->vcn28) == 1 ? "on" : "OFF");
++		if ((err = mtk_wmt_on(m)) != 0) {
++			CLOG("W2b (WMT init) failed (%d): W2 not started", err);
++			return err;
++		}
++		level = 3;      /* then W2 with the NIC_CAPABILITY_V2 query */
++	}
+ 	d->w = w;
+ 	d->conn = c->conn;
+ 	d->emi = c->emi;
+@@ -911,6 +959,7 @@ connsys_wifi_off(struct rottenapple_wifi *w)
+ 	struct connsys *c = w->priv;
+ 
+ 	mtk_wfdma_wifi_off(&c->wlan);
++	mtk_wmt_off(&c->wmt);
+ }
+ 
+ static const struct rottenapple_wifi_ops rottenapple_mtk_connsys_ops = {
+--- a/bsd/dev/rottenapple_wifi.c
++++ b/bsd/dev/rottenapple_wifi.c
+@@ -30,7 +30,7 @@ ROTTENAPPLE_BACKEND_SET(wifi, struct rottenapple_wifi_ops);
+ #define WIFI_FW_DIR             "/usr/share/firmware/rottenapple/wifi"
+ #define WIFI_FW_MAX             (4u << 20)
+ #define WIFI_W1_CYCLES          2
+-#define WIFI_MAX_LEVEL          3
++#define WIFI_MAX_LEVEL          4
+ #define WIFI_PAGE               0x4000ull
+ 
+ #define WLOG(fmt, ...)  printf("ROTTEN APPLE: wifi: " fmt "\n", ##__VA_ARGS__)
+@@ -175,7 +175,8 @@ wifi_w1(struct rottenapple_wifi *w)
+ }
+ 
+ /*
+- * W2 (level 2) / W2 + first query (level 3): W1's power-up, then the Wi-Fi
++ * W2 (level 2) / W2 + first query (level 3) / W2b + W2 + first query (level
++ * 4, the backend runs the WMT init first): W1's power-up, then the Wi-Fi
+  * firmware up to "ready", then stop it and power down; WIFI_W1_CYCLES times.
+  */
+ static void
+@@ -223,7 +224,9 @@ rottenapple_wifi_thread(void *arg, __unused wait_result_t wr)
+ 	unsigned level = (unsigned)(uintptr_t)arg;
+ 	struct rottenapple_wifi *w = &rottenapple_wifi_dev;
+ 
+-	WLOG("milestone W%u (rottenapple_wifi=%u)", level == 3 ? 2 : level, level);
++	static const char *const milestone[] = { "", "W1", "W2", "W2 + NIC capability",
++		                                 "W2b (WMT over BTIF) + W2 + NIC capability" };
++	WLOG("milestone %s (rottenapple_wifi=%u)", milestone[level], level);
+ 	if (wifi_attach(w, WIFI_NODE) != 0) {
+ 		return;
+ 	}
+@@ -244,8 +247,8 @@ rottenapple_wifi_start(void)
+ 		return;                 /* default: Wi-Fi hardware is not touched */
+ 	}
+ 	if (level > WIFI_MAX_LEVEL) {
+-		WLOG("rottenapple_wifi=%u unknown (1 = W1, 2 = W2, 3 = W2 + NIC capability); hardware not touched",
+-		    level);
++		WLOG("rottenapple_wifi=%u unknown (1 = W1, 2 = W2, 3 = W2 + NIC capability, 4 = W2b + W2 + NIC "
++		    "capability); hardware not touched", level);
+ 		return;
+ 	}
+ 	if (kernel_thread_start(rottenapple_wifi_thread, (void *)(uintptr_t)level, &thread) == KERN_SUCCESS) {
+--- a/bsd/dev/rottenapple_wifi.h
++++ b/bsd/dev/rottenapple_wifi.h
+@@ -27,6 +27,8 @@
+  *      power down; twice.
+  *   3  W2 plus the first post-start query (W3 preview: firmware version,
+  *      MAC address).
++ *   4  W2b: W1's power-up, the chip's own init protocol (MediaTek: WMT over
++ *      BTIF/STP, with the RF calibration), then level 3.
+  */
+ #ifndef _BSD_DEV_ROTTENAPPLE_WIFI_H_
+ #define _BSD_DEV_ROTTENAPPLE_WIFI_H_
+@@ -65,7 +67,8 @@ struct rottenapple_wifi_ops {
+ 	void (*power_off)(struct rottenapple_wifi *w);
+ 	/*
+ 	 * W2, after a successful power_on: host interface up, Wi-Fi firmware
+-	 * downloaded and started, ready; level is the milestone (2 or 3).
++	 * downloaded and started, ready; level is the milestone (2, 3 or 4;
++	 * 4 = the chip's init protocol first, then 3).
+ 	 * wifi_off is always called after wifi_on, also when it failed, and
+ 	 * before power_off: it stops the host interface and returns ownership.
+ 	 */
+--- /dev/null
++++ b/bsd/dev/rottenapple_mtk_wmt.c
+@@ -0,0 +1,1038 @@
++/*
++ * Rotten Apple: MediaTek CONNSYS WMT init over BTIF/STP (milestone W2b) for
++ * the CONNSYS backend (rottenapple_mtk_connsys.c); interface in
++ * rottenapple_mtk_wmt.h, notes in docs/WIFI-PLAN.md "W2b".
++ *
++ * Clean-room: behaviour, register offsets, frame layouts and the command
++ * bytes were read from the vendor kernel (drivers/misc/mediatek/btif/common:
++ * btif_plat.c, plat_inc/btif_priv.h, mtk_btif.c; drivers/misc/mediatek/
++ * connectivity/common/common_main: core/stp_core.c, core/wmt_core.c,
++ * core/wmt_ic_soc.c, platform/mt6789.c) and the Gigaset GX4 boot log; the
++ * code is our own. The WMT command and event bytes are protocol constants.
++ *
++ * BTIF (AP side, 0x1100c000): a 16550-like FIFO port without a baud rate
++ * (on-chip link): RBR/THR +0x0, IER +0x4, IIR/FIFOCTRL +0x8, FAKELCR +0xc,
++ * LSR +0x14 (DR 0, THRE 5, TEMT 6), DMA_EN +0x4c, TRI_LVL +0x60, WAK
++ * +0x64, HANDSHAKE +0x6c; TX FIFO 16, RX FIFO 8 bytes. Linux's open: clock
++ * "btifc" on, FAKELCR normal, "new handshake" on, both FIFOs cleared,
++ * trigger levels TX 8 / RX 1, loopback off, DMA off for both directions,
++ * DMA auto-reset on, TX interrupt off, RX interrupt on. We poll (SPI 190 is
++ * never enabled) and drain the RX FIFO while sending. Before every frame the
++ * CONNSYS-side DMA_EN (0x180a204c) is read: its RX DMA runs with auto-reset
++ * off, where a read re-arms the RX timeout (btif_priv.h). CONNSYS side: 0x180a2064 = 1 (Linux
++ * consys_wakeup_btif_irq_pull_low, mt6789.c). WAK (ap_wakeup_consys) is
++ * pulsed and then held low for the whole of W2b and W2 (see "CONNSYS
++ * wake" below).
++ *
++ * STP (stp_core.c): frame = 4-byte header + payload + 2 bytes.
++ *   mandatory mode: 80, type << 4 | len[11:8], len[7:0], 00; payload; 00 00
++ *   full mode:      80 | seq << 3 | ack, type << 4 | len[11:8], len[7:0],
++ *                   (sum of bytes 0-2) & 0xff; payload; CRC-16 (reflected
++ *                   0xA001, init 0) of the payload, little-endian
++ *   full-mode ACK:  80 | ack, 00, 00, checksum (header only)
++ * seq/ack are 3 bits; after enabling a mode the host starts with seq 0, ack 7
++ * and expects seq 0. Every received full-mode data frame with the expected
++ * seq is acknowledged; a frame with another seq is dropped and the previous
++ * ACK repeated. Type 4 = WMT, 5 = STP (firmware assert text), 6 = info.
++ *
++ * WMT (wmt_core.c, wmt_ic_soc.c): command {01, opcode, u16 length, body},
++ * event {02, opcode, u16 length, body}. Order on MT6789 + MT6631 (Android:
++ * wmt_core_stp_init + mtk_wcn_soc_sw_init with options 0x7080ca8, patches
++ * already in EMI, PDA patch flag set, WMT_SOC.cfg of the device):
++ *   mandatory mode: register reads GEN_HCR/HVR/FVR (0x80000008/0/4),
++ *     QUERY_STP (default options), SET_STP; host switches to full mode;
++ *   full mode: QUERY_STP, SET_CHIP_ID 0x6789, QUERY_A_DIE, "LTE project"
++ *     (coex filter mode 0, table 3), BT TSSI from Wi-Fi (bt_tssi_from_wifi=3,
++ *     target 3776), Wi-Fi antenna swap (mode 1, polarity 0, ant-sel GPIO 2),
++ *     START_RF_CALIBRATION (about 1.1 s; VCN28 stays on), GET_RF_CALIBRATION
++ *     (backup: the Wi-Fi result is in EMI), coex config adjust x3 (all 0),
++ *     FM strap (comm mode), UTC time sync.
++ * Not sent (as on the device): ROM patch download (OPT_DISABLE_ROM_PATCH_DWN),
++ * wifi_config/ePA/eLNA/invert (absent from WMT_SOC.cfg), coex before
++ * calibration, OSC type, core-dump level. Sleep (PSM) stays off: the host
++ * never sends WMT_SLEEP. Power-off sends no WMT command (sw_deinit and
++ * stp_deinit only disable STP and close BTIF).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <dev/rottenapple_mtk_wmt.h>
++
++#define MLOG(fmt, ...)  printf("ROTTEN APPLE: wifi wmt: " fmt "\n", ##__VA_ARGS__)
++
++/* ---- BTIF registers ---- */
++#define BTIF_RBR                0x00    /* read */
++#define BTIF_THR                0x00    /* write */
++#define BTIF_IER                0x04
++#define BTIF_IER_RXFEN          (1u << 0)
++#define BTIF_IER_TXEEN          (1u << 1)
++#define BTIF_IIR                0x08    /* read */
++#define BTIF_FIFOCTRL           0x08    /* write */
++#define BTIF_FIFOCTRL_CLR_RX    (1u << 1)
++#define BTIF_FIFOCTRL_CLR_TX    (1u << 2)
++#define BTIF_FAKELCR            0x0c
++#define BTIF_LSR                0x14
++#define BTIF_LSR_DR             (1u << 0)
++#define BTIF_LSR_OE             (1u << 1)       /* overrun, as in a 16550 */
++#define BTIF_LSR_THRE           (1u << 5)
++#define BTIF_LSR_TEMT           (1u << 6)
++#define BTIF_SLEEP_EN           0x48
++#define BTIF_DMA_EN             0x4c
++#define BTIF_DMA_EN_RX          (1u << 0)
++#define BTIF_DMA_EN_TX          (1u << 1)
++#define BTIF_DMA_EN_AUTORST     (1u << 2)
++#define BTIF_RTOCNT             0x54
++#define BTIF_TRI_LVL            0x60
++#define BTIF_TRI_LVL_TX(x)      ((x) & 0xf)
++#define BTIF_TRI_LVL_RX(x)      (((x) & 0x7) << 4)
++#define BTIF_TRI_LOOP_EN        (1u << 7)
++#define BTIF_WAK                0x64
++#define BTIF_WAT_TIME           0x68
++#define BTIF_HANDSHAKE          0x6c
++#define BTIF_HANDSHAKE_EN       (1u << 0)
++#define BTIF_TX_FIFO            16
++#define BTIF_TX_THRE            8       /* TX trigger level: half the FIFO */
++#define BTIF_RX_THRE            1
++
++/* CONNSYS side (0x180a2000) */
++#define CONN_BTIF_WAK           0x64
++
++/* CONNSYS window, for the dumps */
++#define CONN_MCU_SW_DBG         0x216c
++#define CONN_MCU_COM_REG0       0x2600
++#define CONN_HIF_ON_PC          0x7104
++#define CONN_CFG_ON_MISC        0xc1140
++
++/* ---- STP ---- */
++#define STP_TYPE_WMT            4
++#define STP_TYPE_STP            5       /* firmware assert / exception text */
++#define STP_TYPE_INFO           6
++#define STP_TYPE_MAX            8
++#define STP_MODE_OFF            0
++#define STP_MODE_MAND           1
++#define STP_MODE_FULL           2
++#define STP_ACK_TIMEOUT_US      300000  /* full mode: retransmit an unacked frame */
++#define STP_RETRIES             3
++#define STP_SWITCH_DELAY_US     10000   /* Linux: >= 2 ms for the chip to change mode */
++
++enum { P_SYNC, P_HDR1, P_HDR2, P_HDR3, P_DATA, P_CRC1, P_CRC2 };
++
++/* ---- WMT ---- */
++#define WMT_CMD                 0x01
++#define WMT_EVT                 0x02
++#define WMT_TIMEOUT_MS          2000    /* Linux WMT_LIB_RX_TIMEOUT */
++#define WMT_CAL_TIMEOUT_MS      5000    /* the calibration takes about 1.1 s */
++#define WMT_F_OPTIONAL          (1u << 0)       /* Android goes on when it fails */
++#define WMT_F_STATUS            (1u << 1)       /* compare only the header and status byte */
++
++/* chip registers read over WMT (GEN_CONFG_BASE) */
++#define GEN_HVR                 0x80000000u
++#define GEN_FVR                 0x80000004u
++#define GEN_HCR                 0x80000008u
++
++/* state, undone by mtk_wmt_off */
++#define ST_CLK                  (1u << 0)
++#define ST_BTIF                 (1u << 1)
++
++static const char *const stp_mode_name[] = { "off", "mandatory", "full" };
++
++/* ---- Helpers ---- */
++
++static uint64_t
++now_us(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++
++static inline uint32_t
++b_rd(struct mtk_wmt *m, uint32_t off)
++{
++	return *(volatile uint32_t *)(m->btif + off);
++}
++
++static inline void
++b_wr(struct mtk_wmt *m, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(m->btif + off) = v;
++	__builtin_arm_dsb(0xf);
++}
++
++static inline uint32_t
++c_rd(struct mtk_wmt *m, uint32_t off)
++{
++	return *(volatile uint32_t *)(m->conn + off);
++}
++
++/* CONNSYS-side BTIF (0x180a2000). Reading DMA_EN (+0x4c) also resets a pending RX timeout there. */
++static inline uint32_t
++cb_rd(struct mtk_wmt *m, uint32_t off)
++{
++	return *(volatile uint32_t *)(m->conn_btif + off);
++}
++
++static void
++conn_btif_log(struct mtk_wmt *m, const char *why)
++{
++	MLOG("CONNSYS BTIF (%s): IER 0x%02x FAKELCR 0x%02x LSR 0x%02x SLEEP_EN 0x%x RTOCNT 0x%x TRI_LVL 0x%02x "
++	    "WAT_TIME 0x%x HANDSHAKE 0x%x DMA_EN 0x%x", why, cb_rd(m, BTIF_IER), cb_rd(m, BTIF_FAKELCR),
++	    cb_rd(m, BTIF_LSR), cb_rd(m, BTIF_SLEEP_EN), cb_rd(m, BTIF_RTOCNT), cb_rd(m, BTIF_TRI_LVL),
++	    cb_rd(m, BTIF_WAT_TIME), cb_rd(m, BTIF_HANDSHAKE), cb_rd(m, BTIF_DMA_EN));
++}
++
++static void
++trace_add(uint8_t *ring, uint32_t *n, uint8_t b)
++{
++	ring[*n % MTK_WMT_TRACE] = b;
++	(*n)++;
++}
++
++/* Hex dump of buf, 32 bytes per line. */
++static void
++hex_log(const char *what, const uint8_t *buf, size_t len)
++{
++	char line[32 * 3 + 1];
++
++	if (len == 0) {
++		MLOG("%s: (empty)", what);
++		return;
++	}
++	for (size_t off = 0; off < len; off += 32) {
++		size_t n = MIN(len - off, (size_t)32), k = 0;
++		for (size_t i = 0; i < n; i++) {
++			static const char hx[] = "0123456789abcdef";
++			line[k++] = hx[buf[off + i] >> 4];
++			line[k++] = hx[buf[off + i] & 0xf];
++			line[k++] = ' ';
++		}
++		line[k ? k - 1 : 0] = '\0';
++		if (len <= 32) {
++			MLOG("%s: %s", what, line);
++		} else {
++			MLOG("%s [+%zu/%zu]: %s", what, off, len, line);
++		}
++	}
++}
++
++static void
++trace_log(const char *what, const uint8_t *ring, uint32_t n)
++{
++	uint8_t tmp[MTK_WMT_TRACE];
++	uint32_t cnt = MIN(n, (uint32_t)MTK_WMT_TRACE);
++
++	for (uint32_t i = 0; i < cnt; i++) {
++		tmp[i] = ring[(n - cnt + i) % MTK_WMT_TRACE];
++	}
++	hex_log(what, tmp, cnt);
++}
++
++/* CRC-16 as STP uses it: reflected polynomial 0xA001, initial value 0. */
++static uint16_t
++stp_crc16(const uint8_t *p, size_t len)
++{
++	uint16_t crc = 0;
++
++	while (len--) {
++		crc ^= *p++;
++		for (int i = 0; i < 8; i++) {
++			crc = (crc & 1) ? (uint16_t)((crc >> 1) ^ 0xa001) : (uint16_t)(crc >> 1);
++		}
++	}
++	return crc;
++}
++
++/* ---- Dump ---- */
++
++static void
++wmt_dump(struct mtk_wmt *m, const char *why)
++{
++	if (m->state & ST_CLK) {
++		MLOG("BTIF (%s): IER 0x%02x IIR 0x%02x LSR 0x%02x FAKELCR 0x%02x SLEEP_EN 0x%x DMA_EN 0x%x RTOCNT 0x%x "
++		    "TRI_LVL 0x%02x WAT_TIME 0x%x HANDSHAKE 0x%x; clock %s", why, b_rd(m, BTIF_IER), b_rd(m, BTIF_IIR),
++		    b_rd(m, BTIF_LSR), b_rd(m, BTIF_FAKELCR), b_rd(m, BTIF_SLEEP_EN), b_rd(m, BTIF_DMA_EN),
++		    b_rd(m, BTIF_RTOCNT), b_rd(m, BTIF_TRI_LVL), b_rd(m, BTIF_WAT_TIME), b_rd(m, BTIF_HANDSHAKE),
++		    rottenapple_clk_is_enabled(m->clk) == 1 ? "running" : "GATED");
++	} else {
++		MLOG("BTIF (%s): clock not enabled by us; registers not read", why);
++	}
++	MLOG("STP (%s): mode %s, txseq %u txack %u, last rx ack %u, expected rx seq %u, %s; parser state %u "
++	    "(type %u len %u got %u)", why, stp_mode_name[m->mode], m->txseq, m->txack, m->rxack, m->rxseq,
++	    m->out_pending ? "last frame NOT acked" : "nothing unacked", m->pstate, m->ptype, m->plen, m->pcount);
++	MLOG("BTIF WAK (%s): %s, %u pulse(s), preferred level %s", why, m->wak_held ? "held low (asserted)" :
++	    "high", m->wak_pulses, m->wak_end_high ? "high" : "low");
++	MLOG("STP (%s): rx %u bytes / %u frames / %u acks, tx %u bytes / %u frames / %u acks; header errors %u, "
++	    "CRC errors %u, seq errors %u, junk bytes %u, LSR overruns %u, firmware messages %u", why, m->rx_bytes,
++	    m->rx_frames, m->acks_rx, m->tx_bytes, m->tx_frames, m->acks_tx, m->hdr_errs, m->crc_errs, m->seq_errs,
++	    m->junk, m->overruns, m->fw_msgs);
++	trace_log("last bytes received", m->rx_trace, m->rx_trace_n);
++	trace_log("last bytes sent", m->tx_trace, m->tx_trace_n);
++	MLOG("CONNSYS (%s): COM_REG0 0x%08x SW_DBG 0x%08x PC 0x%05x 0x%05x 0x%05x 0x%05x CONN_ON_MISC 0x%08x", why,
++	    c_rd(m, CONN_MCU_COM_REG0), c_rd(m, CONN_MCU_SW_DBG), c_rd(m, CONN_HIF_ON_PC), c_rd(m, CONN_HIF_ON_PC),
++	    c_rd(m, CONN_HIF_ON_PC), c_rd(m, CONN_HIF_ON_PC), c_rd(m, CONN_CFG_ON_MISC));
++	conn_btif_log(m, why);
++	MLOG("retry statistics (%s): %u CONNSYS RX-timeout resets (DMA_EN reads), %u double sends, %u WAK pulses", why,
++	    m->rto_resets, m->double_sends, m->wak_pulses);
++}
++
++/* ---- STP receive ---- */
++
++static void stp_send_ack(struct mtk_wmt *m);
++
++/* A received WMT packet (one STP frame can carry several). */
++static void
++wmt_packet(struct mtk_wmt *m, const uint8_t *p, size_t len)
++{
++	if (!m->got && len >= 4 && p[0] == WMT_EVT && p[1] == m->want_op) {
++		memcpy(m->evt, p, len);
++		m->evt_len = (uint16_t)len;
++		m->got = true;
++		return;
++	}
++	hex_log("unsolicited WMT packet", p, len);
++}
++
++static void
++stp_deliver(struct mtk_wmt *m)
++{
++	const uint8_t *p = m->rx;
++	size_t len = m->plen;
++
++	m->rx_frames++;
++	if (m->ptype == STP_TYPE_WMT) {
++		size_t off = 0;
++		while (off + 4 <= len) {
++			size_t n = 4 + ((size_t)p[off + 2] | ((size_t)p[off + 3] << 8));
++			if (off + n > len) {
++				MLOG("WMT packet at +%zu claims %zu bytes, frame has %zu", off, n, len - off);
++				n = len - off;
++			}
++			wmt_packet(m, p + off, n);
++			off += n;
++		}
++		if (off < len) {
++			hex_log("trailing bytes in a WMT frame", p + off, len - off);
++		}
++	} else if (m->ptype == STP_TYPE_STP || m->ptype == STP_TYPE_INFO) {
++		char text[129];
++		size_t n = MIN(len, sizeof(text) - 1);
++		for (size_t i = 0; i < n; i++) {
++			text[i] = (p[i] >= 0x20 && p[i] < 0x7f) ? (char)p[i] : '.';
++		}
++		text[n] = '\0';
++		m->fw_msgs++;
++		MLOG("firmware message (STP type %u, %zu bytes): \"%s\"%s", m->ptype, len, text,
++		    m->ptype == STP_TYPE_STP ? " (STP type 5: firmware assert/exception)" : "");
++	} else {
++		char what[48];
++		snprintf(what, sizeof(what), "STP frame type %u (not WMT)", m->ptype);
++		hex_log(what, p, MIN(len, (size_t)64));
++	}
++}
++
++/* Full mode: the peer acknowledges our frames in the ack field of any header. */
++static void
++stp_rx_ack(struct mtk_wmt *m, uint8_t ack)
++{
++	m->rxack = ack;
++	if (m->out_pending && ack == m->out_seq) {
++		m->out_pending = false;
++	}
++}
++
++static void
++stp_frame_done(struct mtk_wmt *m)
++{
++	if (m->mode == STP_MODE_MAND) {
++		if (m->pcrc != 0) {
++			MLOG("mandatory-mode frame with CRC bytes 0x%04x (expected 0)", m->pcrc);
++		}
++		stp_deliver(m);
++		return;
++	}
++	/* full mode; assert/info text frames carry no checked CRC (Linux skips it) */
++	if (m->ptype != STP_TYPE_STP && m->ptype != STP_TYPE_INFO && stp_crc16(m->rx, m->plen) != m->pcrc) {
++		m->crc_errs++;
++		MLOG("CRC error: frame seq %u type %u len %u CRC 0x%04x, computed 0x%04x; dropped (no ACK)", m->pseq,
++		    m->ptype, m->plen, m->pcrc, stp_crc16(m->rx, m->plen));
++		return;
++	}
++	stp_rx_ack(m, m->pack);
++	if (m->pseq != m->rxseq) {
++		m->seq_errs++;
++		MLOG("frame seq %u, expected %u: dropped, previous ACK %u repeated", m->pseq, m->rxseq, m->txack);
++		stp_send_ack(m);
++		return;
++	}
++	m->txack = m->pseq;
++	m->rxseq = (m->rxseq + 1) & 7;
++	stp_send_ack(m);
++	stp_deliver(m);
++}
++
++static void
++stp_rx_byte(struct mtk_wmt *m, uint8_t b)
++{
++	switch (m->pstate) {
++	case P_SYNC:
++		if (m->mode == STP_MODE_FULL ? (b & 0xc0) == 0x80 : b == 0x80) {
++			m->hdr[0] = b;
++			m->pseq = (b >> 3) & 7;
++			m->pack = b & 7;
++			m->pstate = P_HDR1;
++		} else if (!(m->mode == STP_MODE_FULL && (b == 0x7f || b == 0x55))) {
++			m->junk++;      /* 0x7f = resync pattern, 0x55 = delimiter: skipped quietly */
++		}
++		break;
++	case P_HDR1:
++		m->hdr[1] = b;
++		m->ptype = (b >> 4) & 7;
++		m->plen = (uint16_t)((b & 0xf) << 8);
++		m->pstate = P_HDR2;
++		break;
++	case P_HDR2:
++		m->hdr[2] = b;
++		m->plen |= b;
++		m->pstate = P_HDR3;
++		break;
++	case P_HDR3:
++		m->hdr[3] = b;
++		if (m->mode == STP_MODE_FULL && (uint8_t)(m->hdr[0] + m->hdr[1] + m->hdr[2]) != b) {
++			m->hdr_errs++;
++			MLOG("header checksum error: %02x %02x %02x %02x", m->hdr[0], m->hdr[1], m->hdr[2], b);
++			m->pstate = P_SYNC;
++			break;
++		}
++		if (m->plen > MTK_WMT_RX_MAX || m->ptype >= STP_TYPE_MAX) {
++			m->hdr_errs++;
++			MLOG("bad header %02x %02x %02x %02x (type %u, length %u)", m->hdr[0], m->hdr[1], m->hdr[2], b,
++			    m->ptype, m->plen);
++			m->pstate = P_SYNC;
++			break;
++		}
++		if (m->plen == 0) {
++			if (m->mode == STP_MODE_FULL) {
++				m->acks_rx++;
++				stp_rx_ack(m, m->pack);
++			}
++			m->pstate = P_SYNC;
++			break;
++		}
++		m->pcount = 0;
++		m->pstate = P_DATA;
++		break;
++	case P_DATA:
++		m->rx[m->pcount++] = b;
++		if (m->pcount == m->plen) {
++			m->pstate = P_CRC1;
++		}
++		break;
++	case P_CRC1:
++		m->pcrc = b;
++		m->pstate = P_CRC2;
++		break;
++	case P_CRC2:
++		m->pcrc |= (uint16_t)(b << 8);
++		m->pstate = P_SYNC;
++		stp_frame_done(m);
++		break;
++	}
++}
++
++/* Drain the RX FIFO into the parser. */
++static void
++btif_poll(struct mtk_wmt *m)
++{
++	uint32_t lsr;
++
++	for (unsigned n = 0; n < 512 && ((lsr = b_rd(m, BTIF_LSR)) & BTIF_LSR_DR); n++) {
++		if (lsr & BTIF_LSR_OE) {
++			m->overruns++;
++		}
++		uint8_t b = *(volatile uint8_t *)(m->btif + BTIF_RBR);
++		m->rx_bytes++;
++		trace_add(m->rx_trace, &m->rx_trace_n, b);
++		stp_rx_byte(m, b);
++	}
++}
++
++/* ---- CONNSYS wake (ap_wakeup_consys) ----
++ *
++ * BTIF_WAK (+0x64) drives ap_wakeup_consys. Linux hal_btif_raise_wak_sig
++ * pulses it (0, > one 32 kHz period, 1) and leaves it high; Linux never
++ * touches it during the WMT init (PSM is off until STP is ready). W2b run 1
++ * showed the ROM answering only the one command sent right after such a
++ * pulse: with the line high it stops listening once it is idle, i.e. low =
++ * "AP wants CONNSYS awake" (guess for Android: the line sits low from reset
++ * until the first PSM wake-up, which keeps the ROM awake through the init;
++ * on our boot it is high). So W2b gives the Linux pulse (both edges), then
++ * holds the line low until mtk_wmt_off releases it to the Linux resting
++ * level (high). W2b run 2 showed this alone is not enough (still one answer
++ * per power cycle). A mandatory-mode command with no byte back is resent
++ * (wmt_cmd: CONNSYS wake IRQ clear + the frame twice, then WAK pulses); a
++ * full-mode frame with no ACK gets a pulse and a retransmission. If an answer
++ * only comes with the line left high, that level is kept from then on.
++ */
++static void
++btif_wake(struct mtk_wmt *m, const char *why, bool end_high)
++{
++	b_wr(m, BTIF_WAK, 0);
++	delay(150);
++	b_wr(m, BTIF_WAK, 1);           /* the Linux pulse: falling and rising edge */
++	m->wak_pulses++;
++	if (end_high) {
++		m->wak_held = false;
++		MLOG("BTIF WAK (%s): pulse low 150 us, then left high (Linux style)", why);
++		return;
++	}
++	delay(150);
++	b_wr(m, BTIF_WAK, 0);           /* then held asserted (low) */
++	m->wak_held = true;
++	MLOG("BTIF WAK (%s): pulse low/high 150 us each, then held low (ap_wakeup_consys asserted)", why);
++}
++
++static void
++btif_wake_release(struct mtk_wmt *m)
++{
++	if (m->wak_held) {
++		b_wr(m, BTIF_WAK, 1);
++		m->wak_held = false;
++	}
++	MLOG("BTIF WAK high (the Linux resting level) after %u pulse(s)", m->wak_pulses);
++}
++
++/* ---- STP send ---- */
++
++/* Bytes into the TX FIFO as room allows (TEMT: 16, THRE: 16 - trigger level), RX drained meanwhile. */
++static int
++btif_tx(struct mtk_wmt *m, const uint8_t *p, size_t len)
++{
++	uint64_t t0 = now_us();
++	size_t i = 0;
++
++	m->in_tx = true;
++	while (i < len) {
++		uint32_t lsr = b_rd(m, BTIF_LSR);
++		unsigned room = (lsr & BTIF_LSR_TEMT) ? BTIF_TX_FIFO : (lsr & BTIF_LSR_THRE) ? BTIF_TX_FIFO - BTIF_TX_THRE : 0;
++		while (room-- && i < len) {
++			*(volatile uint8_t *)(m->btif + BTIF_THR) = p[i];
++			trace_add(m->tx_trace, &m->tx_trace_n, p[i]);
++			i++;
++		}
++		__builtin_arm_dsb(0xf);
++		btif_poll(m);
++		if (i < len && now_us() - t0 > 100000) {
++			m->in_tx = false;
++			MLOG("TX stalled: %zu of %zu bytes in the FIFO after 100 ms (LSR 0x%02x)", i, len, b_rd(m, BTIF_LSR));
++			return ETIMEDOUT;
++		}
++	}
++	m->tx_bytes += (uint32_t)len;
++	m->in_tx = false;
++	return 0;
++}
++
++static void
++stp_send_ack(struct mtk_wmt *m)
++{
++	if (m->in_tx) {
++		m->ack_due = true;      /* sent once the current frame is out */
++		return;
++	}
++	uint8_t h[4] = { (uint8_t)(0x80 | m->txack), 0, 0, 0 };
++	h[3] = (uint8_t)(h[0] + h[1] + h[2]);
++	m->ack_due = false;
++	m->acks_tx++;
++	(void)btif_tx(m, h, sizeof(h));
++}
++
++/* (Re)send the frame in m->out: full mode with seq m->out_seq and the current ack. */
++static int
++stp_xmit(struct mtk_wmt *m)
++{
++	uint8_t f[4 + MTK_WMT_CMD_MAX + 2];
++	uint16_t len = m->out_len, crc = 0;
++
++	f[0] = 0x80;
++	if (m->mode == STP_MODE_FULL) {
++		f[0] |= (uint8_t)(m->out_seq << 3 | m->txack);
++		crc = stp_crc16(m->out, len);
++	}
++	f[1] = (uint8_t)(m->out_type << 4 | ((len >> 8) & 0xf));
++	f[2] = (uint8_t)len;
++	f[3] = m->mode == STP_MODE_FULL ? (uint8_t)(f[0] + f[1] + f[2]) : 0;
++	memcpy(f + 4, m->out, len);
++	f[4 + len] = (uint8_t)crc;
++	f[5 + len] = (uint8_t)(crc >> 8);
++	m->ack_due = false;     /* the header carries our current ack */
++	/*
++	 * The CONNSYS-side BTIF runs its RX DMA with auto-reset off (DMA_EN 0x1):
++	 * per btif_priv.h, after an RX timeout software must read DMA_EN to re-arm
++	 * it. W2b runs 1 and 2: the ROM serves exactly one command per power cycle
++	 * and then idles with our next frames unprocessed; re-arm it before each
++	 * frame (a read, no write).
++	 */
++	(void)cb_rd(m, BTIF_DMA_EN);
++	m->rto_resets++;
++	int err = btif_tx(m, f, 6u + len);
++	if (m->ack_due) {
++		stp_send_ack(m);
++	}
++	m->tx_frames++;
++	return err;
++}
++
++static int
++stp_send(struct mtk_wmt *m, uint8_t type, const uint8_t *p, size_t len)
++{
++	if (len > MTK_WMT_CMD_MAX) {
++		return EINVAL;
++	}
++	memcpy(m->out, p, len);
++	m->out_len = (uint16_t)len;
++	m->out_type = type;
++	if (m->mode == STP_MODE_FULL) {
++		m->out_seq = m->txseq;
++		m->txseq = (m->txseq + 1) & 7;
++		m->out_pending = true;
++	}
++	return stp_xmit(m);
++}
++
++static void
++stp_set_mode(struct mtk_wmt *m, unsigned mode)
++{
++	/* Linux mtk_wcn_stp_enable -> stp_rest_ctx_state: seq 0, acks 7, expected rx seq 0 */
++	m->mode = mode;
++	m->txseq = 0;
++	m->txack = 7;
++	m->rxack = 7;
++	m->rxseq = 0;
++	m->out_pending = false;
++	m->ack_due = false;
++	m->pstate = P_SYNC;
++	MLOG("STP %s mode (host seq 0, ack 7)", stp_mode_name[mode]);
++}
++
++/* Poll for us microseconds (keeps the link serviced: ACKs, unsolicited frames). */
++static void
++stp_idle(struct mtk_wmt *m, uint64_t us)
++{
++	uint64_t t0 = now_us();
++	while (now_us() - t0 < us) {
++		btif_poll(m);
++		if (m->ack_due && !m->in_tx) {
++			stp_send_ack(m);
++		}
++	}
++}
++
++/* ---- WMT ---- */
++
++/*
++ * One command: send it, wait for the event with the same opcode, log both
++ * as hex, compare with exp (all exp_len bytes, or with WMT_F_STATUS the
++ * header and the status byte). 0, ETIMEDOUT (no event), EPROTO (other
++ * event), or a TX error.
++ */
++static int
++wmt_cmd(struct mtk_wmt *m, const char *name, const uint8_t *cmd, size_t len, const uint8_t *exp, size_t exp_len,
++    unsigned timeout_ms, unsigned flags)
++{
++	char what[80];
++	unsigned tries = 0;
++	bool end_high = m->wak_end_high;
++	int err;
++
++	snprintf(what, sizeof(what), "cmd  %s", name);
++	hex_log(what, cmd, len);
++	m->want_op = cmd[1];
++	m->got = false;
++	uint32_t rx0 = m->rx_bytes;
++	uint64_t t0 = now_us(), last = t0;
++	if ((err = stp_send(m, STP_TYPE_WMT, cmd, len)) != 0) {
++		MLOG("%s: send failed (%d)", name, err);
++		goto fail;
++	}
++	while (!m->got) {
++		btif_poll(m);
++		if (m->ack_due && !m->in_tx) {
++			stp_send_ack(m);
++		}
++		uint64_t now = now_us();
++		if (m->mode == STP_MODE_FULL && m->out_pending && now - last > STP_ACK_TIMEOUT_US &&
++		    tries < STP_RETRIES) {
++			tries++;
++			last = now;
++			MLOG("%s: frame seq %u not acked after %u ms; wake + retransmission %u", name, m->out_seq,
++			    STP_ACK_TIMEOUT_US / 1000, tries);
++			end_high = (tries & 1) ? m->wak_end_high : !m->wak_end_high;
++			btif_wake(m, "no ACK", end_high);
++			if ((err = stp_xmit(m)) != 0) {
++				goto fail;
++			}
++		}
++		if (m->mode == STP_MODE_MAND && m->rx_bytes == rx0 && now - last > STP_ACK_TIMEOUT_US &&
++		    tries < STP_RETRIES) {
++			/*
++			 * Mandatory mode has no ACKs: nothing at all came back. Runs 1/2: the
++			 * only answers came when the ROM had two copies of the frame. Ladder:
++			 * 1 CONNSYS wake IRQ cleared (0x180a2064 = 1) + the frame twice;
++			 * 2 WAK pulse (preferred level) + once; 3 WAK pulse, other level, twice.
++			 */
++			tries++;
++			last = now;
++			bool twice = tries != 2;
++			if (tries == 1) {
++				*(volatile uint32_t *)(m->conn_btif + CONN_BTIF_WAK) = 1;
++				__builtin_arm_dsb(0xf);
++				MLOG("%s: no byte back after %u ms; resend %u: CONNSYS 0x180a2064 = 1, frame sent twice", name,
++				    STP_ACK_TIMEOUT_US / 1000, tries);
++			} else {
++				end_high = (tries == 2) ? m->wak_end_high : !m->wak_end_high;
++				MLOG("%s: no byte back after %u ms; resend %u: WAK pulse, frame sent %s", name,
++				    STP_ACK_TIMEOUT_US / 1000, tries, twice ? "twice" : "once");
++				btif_wake(m, "no answer", end_high);
++			}
++			if ((err = stp_xmit(m)) != 0 || (twice && (err = stp_xmit(m)) != 0)) {
++				goto fail;
++			}
++			if (twice) {
++				m->double_sends++;
++			}
++		}
++		if (now - t0 > (uint64_t)timeout_ms * 1000) {
++			MLOG("%s: no event 02 %02x within %u ms (frame %s)", name, m->want_op, timeout_ms,
++			    m->mode != STP_MODE_FULL ? "sent in mandatory mode: no ACKs" :
++			    m->out_pending ? "never acked" : "acked");
++			err = ETIMEDOUT;
++			goto fail;
++		}
++	}
++	snprintf(what, sizeof(what), "evt  %s (%llu us%s)", name, now_us() - t0, tries == 0 ? "" :
++	    tries == 1 ? ", after resend 1" : tries == 2 ? ", after resend 2" : ", after resend 3");
++	hex_log(what, m->evt, m->evt_len);
++	if (tries >= 2 && end_high != m->wak_end_high) {
++		m->wak_end_high = end_high;
++		MLOG("answered with WAK left %s: keeping that level from now on", end_high ? "HIGH" : "low");
++	}
++	if (exp != NULL) {
++		bool ok;
++		if (flags & WMT_F_STATUS) {
++			ok = m->evt_len >= 5 && m->evt[4] == 0;
++		} else {
++			ok = m->evt_len >= exp_len && memcmp(m->evt, exp, exp_len) == 0;
++		}
++		if (!ok) {
++			hex_log("     expected", exp, exp_len);
++			MLOG("%s: unexpected event%s", name, (flags & WMT_F_STATUS) ? " status (byte 4 != 0)" : "");
++			err = EPROTO;
++			goto fail;
++		}
++		if (m->evt_len > exp_len && !(flags & WMT_F_STATUS)) {
++			MLOG("%s: event has %u bytes, Android compares the first %zu", name, m->evt_len, exp_len);
++		}
++	}
++	return 0;
++fail:
++	if (flags & WMT_F_OPTIONAL) {
++		MLOG("%s FAILED (%d); optional on Android, going on", name, err);
++		return 0;
++	}
++	return err;
++}
++
++/* WMT register read (opcode 0x08, op 2 = read, type 1 = register, 1 register). */
++static int
++wmt_reg_read(struct mtk_wmt *m, const char *name, uint32_t addr, uint32_t mask, uint32_t *val)
++{
++	uint8_t cmd[20] = { WMT_CMD, 0x08, 0x10, 0x00, 0x02, 0x01, 0x00, 0x01 };
++	int err;
++
++	for (int i = 0; i < 4; i++) {
++		cmd[8 + i] = (uint8_t)(addr >> (8 * i));
++		cmd[16 + i] = (uint8_t)(mask >> (8 * i));
++	}
++	if ((err = wmt_cmd(m, name, cmd, sizeof(cmd), NULL, 0, WMT_TIMEOUT_MS, 0)) != 0) {
++		return err;
++	}
++	if (m->evt_len < 16 || m->evt[4] != 0) {
++		MLOG("%s: short or failed register event (%u bytes, status 0x%02x)", name, m->evt_len,
++		    m->evt_len > 4 ? m->evt[4] : 0xff);
++		return EPROTO;
++	}
++	uint32_t a = 0, v = 0;
++	for (int i = 0; i < 4; i++) {
++		a |= (uint32_t)m->evt[8 + i] << (8 * i);
++		v |= (uint32_t)m->evt[12 + i] << (8 * i);
++	}
++	if (a != addr) {
++		MLOG("%s: event for address 0x%08x, asked 0x%08x", name, a, addr);
++		return EPROTO;
++	}
++	*val = v;
++	return 0;
++}
++
++/* ---- BTIF ---- */
++
++static int
++btif_on(struct mtk_wmt *m)
++{
++	int err;
++
++	if ((err = rottenapple_clk_enable(m->clk)) != 0) {
++		MLOG("BTIF clock enable failed (%d)", err);
++		return err;
++	}
++	m->state |= ST_CLK;
++	MLOG("BTIF clock %s; before: IER 0x%02x LSR 0x%02x DMA_EN 0x%x TRI_LVL 0x%02x HANDSHAKE 0x%x",
++	    rottenapple_clk_is_enabled(m->clk) == 1 ? "running" : "GATED", b_rd(m, BTIF_IER), b_rd(m, BTIF_LSR),
++	    b_rd(m, BTIF_DMA_EN), b_rd(m, BTIF_TRI_LVL), b_rd(m, BTIF_HANDSHAKE));
++	/* Linux hal_btif_hw_init order */
++	/* Linux enables the RX interrupt (RXFEN); the GIC line (SPI 190) is never enabled here, so we still poll */
++	b_wr(m, BTIF_IER, BTIF_IER_RXFEN);
++	b_wr(m, BTIF_FAKELCR, 0);                               /* normal mode */
++	b_wr(m, BTIF_HANDSHAKE, b_rd(m, BTIF_HANDSHAKE) | BTIF_HANDSHAKE_EN);
++	/* FIFOCTRL shares its offset with IIR; Linux sets/clears the bits on top of the IIR value */
++	b_wr(m, BTIF_FIFOCTRL, b_rd(m, BTIF_IIR) | BTIF_FIFOCTRL_CLR_RX);
++	b_wr(m, BTIF_FIFOCTRL, b_rd(m, BTIF_IIR) & ~BTIF_FIFOCTRL_CLR_RX);
++	b_wr(m, BTIF_FIFOCTRL, b_rd(m, BTIF_IIR) | BTIF_FIFOCTRL_CLR_TX);
++	b_wr(m, BTIF_FIFOCTRL, b_rd(m, BTIF_IIR) & ~BTIF_FIFOCTRL_CLR_TX);
++	b_wr(m, BTIF_TRI_LVL, BTIF_TRI_LVL_TX(BTIF_TX_THRE) | BTIF_TRI_LVL_RX(BTIF_RX_THRE));    /* loopback off */
++	b_wr(m, BTIF_DMA_EN, (b_rd(m, BTIF_DMA_EN) & ~(BTIF_DMA_EN_TX | BTIF_DMA_EN_RX)) | BTIF_DMA_EN_AUTORST);
++	m->state |= ST_BTIF;
++	/* anything left in the RX FIFO is stale */
++	unsigned stale = 0;
++	while ((b_rd(m, BTIF_LSR) & BTIF_LSR_DR) && stale < 64) {
++		(void)*(volatile uint8_t *)(m->btif + BTIF_RBR);
++		stale++;
++	}
++	MLOG("BTIF on (PIO, polled): IER 0x%02x LSR 0x%02x DMA_EN 0x%x TRI_LVL 0x%02x HANDSHAKE 0x%x FAKELCR 0x%x%s",
++	    b_rd(m, BTIF_IER), b_rd(m, BTIF_LSR), b_rd(m, BTIF_DMA_EN), b_rd(m, BTIF_TRI_LVL), b_rd(m, BTIF_HANDSHAKE),
++	    b_rd(m, BTIF_FAKELCR), stale ? " (stale RX bytes discarded)" : "");
++	/* CONNSYS side: Linux consys_wakeup_btif_irq_pull_low */
++	*(volatile uint32_t *)(m->conn_btif + CONN_BTIF_WAK) = 1;
++	__builtin_arm_dsb(0xf);
++	MLOG("CONNSYS BTIF wake 0x180a2064 = 1");
++	btif_wake(m, "BTIF open", m->wak_end_high);
++	conn_btif_log(m, "before the first frame");
++	return 0;
++}
++
++/* ---- The init script ---- */
++
++static const uint8_t WMT_QUERY_STP[] = { 0x01, 0x04, 0x01, 0x00, 0x04 };
++static const uint8_t WMT_QUERY_STP_DEFAULT_EVT[] = { 0x02, 0x04, 0x06, 0x00, 0x00, 0x04, 0x11, 0x00, 0x00, 0x00 };
++static const uint8_t WMT_SET_STP[] = { 0x01, 0x04, 0x05, 0x00, 0x03, 0xdb, 0x0e, 0x68, 0x01 };
++static const uint8_t WMT_SET_STP_EVT[] = { 0x02, 0x04, 0x02, 0x00, 0x00, 0x03 };
++static const uint8_t WMT_QUERY_STP_EVT[] = { 0x02, 0x04, 0x06, 0x00, 0x00, 0x04, 0xdb, 0x0e, 0x68, 0x01 };
++static const uint8_t WMT_SET_CHIP_ID_EVT[] = { 0x02, 0x02, 0x01, 0x00, 0x00 };
++static const uint8_t WMT_QUERY_A_DIE[] = { 0x01, 0x02, 0x01, 0x00, 0x12 };
++static const uint8_t WMT_QUERY_A_DIE_EVT[] = { 0x02, 0x02, 0x05, 0x00, 0x00 };
++static const uint8_t WMT_COEX_IS_LTE_PROJ[] = { 0x01, 0x10, 0x02, 0x00, 0x15, 0x01 };
++static const uint8_t WMT_COEX_EVT[] = { 0x02, 0x10, 0x01, 0x00, 0x00 };
++static const uint8_t WMT_BT_TSSI_EVT[] = { 0x02, 0x02, 0x01, 0x00, 0x00 };
++static const uint8_t WMT_ANT_SWAP_EVT[] = { 0x02, 0x14, 0x02, 0x00, 0x00, 0x07 };
++static const uint8_t WMT_RF_CAL[] = { 0x01, 0x14, 0x01, 0x00, 0x01 };
++static const uint8_t WMT_RF_CAL_EVT[] = { 0x02, 0x14, 0x02, 0x00, 0x00, 0x01 };
++static const uint8_t WMT_GET_RF_CAL[] = { 0x01, 0x14, 0x01, 0x00, 0x03 };
++static const uint8_t WMT_FM_STRAP[] = { 0x01, 0x05, 0x02, 0x00, 0x02, 0x02 };
++static const uint8_t WMT_FM_STRAP_EVT[] = { 0x02, 0x05, 0x02, 0x00, 0x00, 0x02 };
++static const uint8_t WMT_UTC_SYNC_EVT[] = { 0x02, 0xf0, 0x02, 0x00, 0x02, 0x00 };
++
++/* Settings from the device's WMT_SOC.cfg (research/wifi/vendor-fw) */
++#define CFG_BT_TSSI_FROM_WIFI   3
++#define CFG_BT_TSSI_TARGET      3776
++#define CFG_ANT_SWAP_POLARITY   0
++#define CFG_ANT_SWAP_SEL_GPIO   2
++
++/* Calibration backup event: 02 14 <len> 00 03 <BT size u16> <BT data> <8 u16> <Wi-Fi offset u32> <Wi-Fi len u32> */
++static void
++wmt_cal_backup_log(struct mtk_wmt *m)
++{
++	const uint8_t *e = m->evt;
++	size_t n = m->evt_len;
++
++	if (n < 8 || e[4] != 0x00 || e[5] != 0x03) {
++		MLOG("calibration backup event not in the expected format");
++		return;
++	}
++	size_t bt = (size_t)e[6] | ((size_t)e[7] << 8);
++	size_t o = 8 + bt;
++	if (o + 10 > n) {
++		MLOG("calibration backup: BT data %zu bytes, no Wi-Fi part (event %zu bytes)", bt, n);
++		return;
++	}
++	uint32_t off = 0, len = 0;
++	for (int i = 0; i < 4; i++) {
++		off |= (uint32_t)e[o + 2 + i] << (8 * i);
++		len |= (uint32_t)e[o + 6 + i] << (8 * i);
++	}
++	bool nonzero = false;
++	if ((uint64_t)off + len <= m->emi_size) {
++		for (uint32_t i = 0; i < len && !nonzero; i++) {
++			nonzero = ((volatile uint8_t *)(m->emi + off))[i] != 0;
++		}
++	}
++	MLOG("calibration backup: BT data %zu bytes; Wi-Fi result at EMI +0x%x, %u bytes (Android: +0x2e3578, 8192)%s",
++	    bt, off, len, (uint64_t)off + len > m->emi_size ? " - outside EMI" : nonzero ? ", non-zero in EMI" :
++	    ", ALL ZERO in EMI");
++}
++
++int
++mtk_wmt_on(struct mtk_wmt *m)
++{
++	uint32_t hcr = 0, hvr = 0, fvr = 0;
++	uint64_t t0 = now_us();
++	int err;
++
++	m->state = 0;
++	m->mode = STP_MODE_OFF;
++	m->cal_us = 0;
++	MLOG("WMT init over BTIF: chip 0x%04x, a-die 0x%04x expected", m->chip_id, m->adie);
++	MLOG("CONNSYS before: COM_REG0 0x%08x PC 0x%05x CONN_ON_MISC 0x%08x", c_rd(m, CONN_MCU_COM_REG0),
++	    c_rd(m, CONN_HIF_ON_PC), c_rd(m, CONN_CFG_ON_MISC));
++	if ((err = btif_on(m)) != 0) {
++		goto fail;
++	}
++
++	/* wmt_core_stp_init: STP in BTIF mandatory mode, then wmt_core_hw_check + soc ver_check */
++	stp_set_mode(m, STP_MODE_MAND);
++	if ((err = wmt_reg_read(m, "read GEN_HCR (chip id)", GEN_HCR, 0xffff, &hcr)) != 0) {
++		goto fail;
++	}
++	MLOG("GEN_HCR 0x%08x (Android logs the SoC id 0x6789 instead of this on SoC chips)", hcr);
++	if ((err = wmt_reg_read(m, "read GEN_HVR (HW ver)", GEN_HVR, 0xffff, &hvr)) != 0 ||
++	    (err = wmt_reg_read(m, "read GEN_FVR (ROM ver)", GEN_FVR, 0xffff, &fvr)) != 0) {
++		goto fail;
++	}
++	MLOG("HW ver 0x%04x ROM ver 0x%04x (expect 0x8a00/0x8a00)", hvr & 0xffff, fvr & 0xffff);
++
++	/* mtk_wcn_soc_sw_init -> _wmt_soc_mode_ctrl(BTIF full mode); PDA patch flag: patches are in EMI */
++	if ((err = wmt_cmd(m, "query STP default", WMT_QUERY_STP, sizeof(WMT_QUERY_STP), WMT_QUERY_STP_DEFAULT_EVT,
++	    sizeof(WMT_QUERY_STP_DEFAULT_EVT), WMT_TIMEOUT_MS, 0)) != 0 ||
++	    (err = wmt_cmd(m, "set STP", WMT_SET_STP, sizeof(WMT_SET_STP), WMT_SET_STP_EVT, sizeof(WMT_SET_STP_EVT),
++	    WMT_TIMEOUT_MS, 0)) != 0) {
++		goto fail;
++	}
++	stp_set_mode(m, STP_MODE_FULL);
++	stp_idle(m, STP_SWITCH_DELAY_US);
++	if ((err = wmt_cmd(m, "query STP", WMT_QUERY_STP, sizeof(WMT_QUERY_STP), WMT_QUERY_STP_EVT,
++	    sizeof(WMT_QUERY_STP_EVT), WMT_TIMEOUT_MS, 0)) != 0) {
++		MLOG("STP full mode handshake failed");
++		goto fail;
++	}
++	MLOG("STP full mode up after %llu ms", (now_us() - t0) / 1000);
++
++	uint8_t chip[] = { 0x01, 0x02, 0x05, 0x00, 0x11, (uint8_t)m->chip_id, (uint8_t)(m->chip_id >> 8), 0x00, 0x00 };
++	(void)wmt_cmd(m, "set chip id", chip, sizeof(chip), WMT_SET_CHIP_ID_EVT, sizeof(WMT_SET_CHIP_ID_EVT),
++	    WMT_TIMEOUT_MS, WMT_F_OPTIONAL);
++
++	/* OPT_QUERY_ADIE: Android retries once and fails the power-on */
++	err = wmt_cmd(m, "query a-die", WMT_QUERY_A_DIE, sizeof(WMT_QUERY_A_DIE), WMT_QUERY_A_DIE_EVT,
++	    sizeof(WMT_QUERY_A_DIE_EVT), WMT_TIMEOUT_MS, 0);
++	if (err) {
++		err = wmt_cmd(m, "query a-die (retry)", WMT_QUERY_A_DIE, sizeof(WMT_QUERY_A_DIE), WMT_QUERY_A_DIE_EVT,
++		    sizeof(WMT_QUERY_A_DIE_EVT), WMT_TIMEOUT_MS, 0);
++	}
++	if (err) {
++		MLOG("a-die query failed: Android stops the power-on here (\"Connsys A-die is not exist\")");
++		goto fail;
++	}
++	bool found = false;
++	for (unsigned i = 5; i + 1 < m->evt_len; i++) {
++		if ((m->evt[i] | (uint32_t)m->evt[i + 1] << 8) == m->adie) {
++			found = true;
++		}
++	}
++	MLOG("a-die event: status 0, %s 0x%04x in its body", found ? "contains" : "does NOT contain", m->adie);
++
++	/* wifi_config: not in WMT_SOC.cfg. CFG_WMT_FILTER_MODE_SETTING, filter mode 0, table 3 */
++	stp_idle(m, 5000);
++	(void)wmt_cmd(m, "coex: LTE project", WMT_COEX_IS_LTE_PROJ, sizeof(WMT_COEX_IS_LTE_PROJ), WMT_COEX_EVT,
++	    sizeof(WMT_COEX_EVT), WMT_TIMEOUT_MS, WMT_F_OPTIONAL);
++	uint8_t tssi[] = { 0x01, 0x02, 0x04, 0x00, 0x10, CFG_BT_TSSI_FROM_WIFI, (uint8_t)CFG_BT_TSSI_TARGET,
++		           (uint8_t)(CFG_BT_TSSI_TARGET >> 8) };
++	(void)wmt_cmd(m, "BT TSSI from Wi-Fi", tssi, sizeof(tssi), WMT_BT_TSSI_EVT, sizeof(WMT_BT_TSSI_EVT),
++	    WMT_TIMEOUT_MS, WMT_F_OPTIONAL);
++	/* ePA (coex_wmt_ant_mode_ex 0), eLNA and invert CRs: not configured, nothing sent */
++	uint8_t swap[] = { 0x01, 0x14, 0x04, 0x00, 0x07, 0x02, CFG_ANT_SWAP_POLARITY, CFG_ANT_SWAP_SEL_GPIO };
++	(void)wmt_cmd(m, "Wi-Fi antenna swap", swap, sizeof(swap), WMT_ANT_SWAP_EVT, sizeof(WMT_ANT_SWAP_EVT),
++	    WMT_TIMEOUT_MS, WMT_F_OPTIONAL | WMT_F_STATUS);
++
++	/* mtk_wcn_soc_calibration: BT/Wi-Fi PALDO are no-ops for a 6631; VCN28 (efuse/PA LDO) is on since W1 */
++	MLOG("RF calibration start (VCN28 on since the power-up)");
++	uint64_t tc = now_us();
++	err = wmt_cmd(m, "start RF calibration", WMT_RF_CAL, sizeof(WMT_RF_CAL), WMT_RF_CAL_EVT, sizeof(WMT_RF_CAL_EVT),
++	    WMT_CAL_TIMEOUT_MS, WMT_F_STATUS);
++	m->cal_us = now_us() - tc;
++	if (err) {
++		MLOG("RF calibration FAILED (%d) after %llu ms", err, m->cal_us / 1000);
++		goto fail;
++	}
++	MLOG("RF calibration done in %llu ms (GX4: 1124 ms)", m->cal_us / 1000);
++	if (wmt_cmd(m, "get RF calibration (backup)", WMT_GET_RF_CAL, sizeof(WMT_GET_RF_CAL), NULL, 0, WMT_TIMEOUT_MS,
++	    WMT_F_OPTIONAL) == 0 && m->got) {
++		wmt_cal_backup_log(m);
++	}
++
++	/* OPT_COEX_CONFIG_ADJUST with the new flags 0x1e/0x1f/0x20, all values 0 */
++	static const uint8_t adjust_op[] = { 0x1e, 0x1f, 0x20 };
++	static const char *const adjust_name[] = { "coex: BT ctrl", "coex: opp time ratio", "coex: BLE scan time ratio" };
++	for (unsigned i = 0; i < 3; i++) {
++		uint8_t adj[] = { 0x01, 0x10, 0x04, 0x00, adjust_op[i], 0x00, 0x00, 0x00 };
++		(void)wmt_cmd(m, adjust_name[i], adj, sizeof(adj), WMT_COEX_EVT, sizeof(WMT_COEX_EVT), WMT_TIMEOUT_MS,
++		    WMT_F_OPTIONAL);
++	}
++	/* init_table_5_1 (Android fails the power-on when this fails; we go on and say so) */
++	(void)wmt_cmd(m, "FM strap (comm)", WMT_FM_STRAP, sizeof(WMT_FM_STRAP), WMT_FM_STRAP_EVT,
++	    sizeof(WMT_FM_STRAP_EVT), WMT_TIMEOUT_MS, WMT_F_OPTIONAL);
++	/* wmt_core_stp_init: UTC time sync (CONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH) */
++	clock_sec_t sec;
++	clock_usec_t usec;
++	clock_get_calendar_microtime(&sec, &usec);
++	uint8_t utc[] = { 0x01, 0xf0, 0x09, 0x00, 0x02, (uint8_t)sec, (uint8_t)(sec >> 8), (uint8_t)(sec >> 16),
++		          (uint8_t)(sec >> 24), (uint8_t)usec, (uint8_t)(usec >> 8), (uint8_t)(usec >> 16),
++		          (uint8_t)(usec >> 24) };
++	(void)wmt_cmd(m, "UTC time sync", utc, sizeof(utc), WMT_UTC_SYNC_EVT, sizeof(WMT_UTC_SYNC_EVT),
++	    WMT_TIMEOUT_MS, WMT_F_OPTIONAL);
++
++	stp_idle(m, 1000);
++	MLOG("WMT init done in %llu ms (RF calibration %llu ms); STP: rx %u frames, tx %u frames, %u CRC / %u "
++	    "header / %u seq errors, %u firmware messages", (now_us() - t0) / 1000, m->cal_us / 1000, m->rx_frames,
++	    m->tx_frames, m->crc_errs, m->hdr_errs, m->seq_errs, m->fw_msgs);
++	MLOG("CONNSYS after: COM_REG0 0x%08x PC 0x%05x 0x%05x CONN_ON_MISC 0x%08x", c_rd(m, CONN_MCU_COM_REG0),
++	    c_rd(m, CONN_HIF_ON_PC), c_rd(m, CONN_HIF_ON_PC), c_rd(m, CONN_CFG_ON_MISC));
++	return 0;
++fail:
++	MLOG("WMT init FAILED (%d) after %llu ms", err, (now_us() - t0) / 1000);
++	wmt_dump(m, "failure");
++	return err ? err : EIO;
++}
++
++void
++mtk_wmt_off(struct mtk_wmt *m)
++{
++	if (m->mode != STP_MODE_OFF) {
++		/* Android's power-off sends no WMT command: stp_deinit only disables STP and closes BTIF */
++		stp_idle(m, 1000);      /* collect anything still in flight */
++		MLOG("STP off (was %s mode): rx %u bytes / %u frames, tx %u bytes / %u frames%s", stp_mode_name[m->mode],
++		    m->rx_bytes, m->rx_frames, m->tx_bytes, m->tx_frames, m->out_pending ? ", last frame unacked" : "");
++		m->mode = STP_MODE_OFF;
++	}
++	if (m->state & ST_BTIF) {
++		btif_wake_release(m);
++		b_wr(m, BTIF_IER, 0);
++		m->state &= ~ST_BTIF;
++	}
++	if (m->state & ST_CLK) {
++		rottenapple_clk_disable(m->clk);
++		m->state &= ~ST_CLK;
++		MLOG("BTIF off: clock %s", rottenapple_clk_is_enabled(m->clk) == 1 ? "still running (shared or boot-on)" :
++		    "gated");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/bsd/dev/rottenapple_mtk_wmt.h
+@@ -0,0 +1,84 @@
++/*
++ * Rotten Apple: MediaTek CONNSYS "WMT" software init over BTIF/STP for the
++ * CONNSYS backend (rottenapple_mtk_connsys.c). Milestone W2b,
++ * docs/WIFI-PLAN.md "W2b".
++ *
++ * The AP talks to the CONNSYS CPU's ROM over BTIF, an on-chip UART-like
++ * link (AP side at 0x1100c000, CONNSYS side at 0x180a2000), in MediaTek's
++ * STP framing. The ROM's WMT task takes commands {0x01, opcode, u16
++ * length, body} and answers with events {0x02, opcode, u16 length, body}.
++ * Android's WMT stack runs a fixed script there between ROM idle and the
++ * Wi-Fi driver; the important part is the RF calibration.
++ */
++#ifndef _BSD_DEV_ROTTENAPPLE_MTK_WMT_H_
++#define _BSD_DEV_ROTTENAPPLE_MTK_WMT_H_
++
++#include <dev/rottenapple_wifi.h>
++
++__BEGIN_DECLS
++
++#define MTK_WMT_RX_MAX          2048    /* largest STP payload (Linux: 2048 in full mode) */
++#define MTK_WMT_TRACE           64      /* last bytes kept per direction for the failure dump */
++#define MTK_WMT_CMD_MAX         256     /* largest WMT command we send */
++
++struct mtk_wmt {
++	/* filled by the caller before mtk_wmt_on */
++	uintptr_t conn;                 /* CONNSYS window (bus 0x18000000), mapped uncached */
++	uintptr_t btif;                 /* AP-side BTIF (0x1100c000) */
++	uintptr_t conn_btif;            /* CONNSYS-side BTIF (0x180a2000) */
++	struct rottenapple_clk *clk;    /* BTIF clock gate ("btifc") */
++	uint32_t chip_id;               /* SoC id for SET_CHIP_ID (0x6789) */
++	uint32_t adie;                  /* expected RF chip (0x6631) */
++	uintptr_t emi;                  /* CONNSYS EMI (for the calibration backup check) */
++	uint64_t emi_size;
++
++	/* state */
++	uint32_t state;
++	unsigned mode;                  /* STP: 0 off, 1 mandatory, 2 full */
++	uint8_t txseq, txack, rxack, rxseq;     /* full mode sequence numbers */
++	/* receive parser */
++	unsigned pstate;
++	uint8_t hdr[4];
++	uint8_t ptype, pseq, pack;
++	uint16_t plen, pcount;
++	uint16_t pcrc;
++	uint8_t rx[MTK_WMT_RX_MAX + 4];
++	/* the event being waited for */
++	uint8_t want_op;
++	bool got;
++	uint8_t evt[MTK_WMT_RX_MAX];
++	uint16_t evt_len;
++	/* the last frame sent (full mode: kept for a retransmission until acked) */
++	uint8_t out[MTK_WMT_CMD_MAX];
++	uint16_t out_len;
++	uint8_t out_type, out_seq;
++	bool out_pending;               /* sent in full mode, no ACK yet */
++	bool in_tx, ack_due;            /* an ACK to send once the current frame is out */
++	bool wak_held;                  /* BTIF WAK held low (ap_wakeup_consys asserted) */
++	bool wak_end_high;              /* level WAK is left at after a pulse (default low) */
++	uint32_t wak_pulses;
++	uint32_t rto_resets, double_sends;      /* CONNSYS RX-timeout re-arms, frames sent twice */
++	/* statistics and trace for the dumps */
++	uint32_t rx_bytes, tx_bytes, rx_frames, tx_frames, acks_rx, acks_tx;
++	uint32_t hdr_errs, crc_errs, seq_errs, junk, overruns, fw_msgs;
++	uint8_t rx_trace[MTK_WMT_TRACE], tx_trace[MTK_WMT_TRACE];
++	uint32_t rx_trace_n, tx_trace_n;
++	uint64_t cal_us;                /* RF calibration time, 0 if not done */
++};
++
++/*
++ * With the CONNSYS CPU at ROM idle (W1 power_on done): BTIF on (clock,
++ * FIFOs, PIO), STP in mandatory mode, chip ID reads, the switch to STP full
++ * mode, then the WMT init script of Android's mtk_wcn_soc_sw_init for
++ * MT6789 + MT6631 (chip ID, a-die, coexistence and antenna settings, RF
++ * calibration, ...). Every command and event is logged as hex. Every wait
++ * has a timeout; a failure dumps the BTIF and STP state and returns an
++ * errno. mtk_wmt_off is always called afterwards (also on failure), before
++ * the CONNSYS power-off.
++ */
++int mtk_wmt_on(struct mtk_wmt *m);
++void mtk_wmt_off(struct mtk_wmt *m);
++
++__END_DECLS
++
++#endif

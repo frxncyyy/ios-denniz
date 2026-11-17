@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+"""Host-only actual IOUC wire/lifetime regression; no device or firmware IO."""
+from pathlib import Path
+import subprocess,tempfile,argparse
+R=next(x for x in Path(__file__).resolve().parents if(x/'AGENTS.md').exists());P=R/'tools/fixtures/nord2-wifi-ios-client';B=P;S=R/'shim/nord2-xnu'
+ap=argparse.ArgumentParser();ap.add_argument('--log',type=Path);ap.add_argument('--candidate',type=Path,help='Optional reviewed private source overlay; default tests canonical runtime');ap.add_argument('--only',choices=('all','card'),default='all');args=ap.parse_args()
+names=('join','station_view','binding','control','event','lifecycle','card','policy','rates','mapping','age','snapshot','bss','scan_contract','cursor','scalar')
+with tempfile.TemporaryDirectory(prefix='niwl-compat-') as t:
+ d=Path(t);dev=d/'xnu/bsd/dev';arm=d/'xnu/iokit/Kernel/arm';dev.mkdir(parents=True);arm.mkdir(parents=True)
+ for f in S.iterdir():
+  if f.suffix in ('.h','.c','.cpp'):((arm if f.suffix=='.cpp' else dev)/f.name).write_bytes(f.read_bytes())
+ if args.candidate:
+  for f in args.candidate.iterdir():((arm if f.suffix=='.cpp' else dev)/f.name).write_bytes(f.read_bytes())
+ source_inventory=(args.candidate/'wifi_station_service_bind.inc' if args.candidate and(args.candidate/'wifi_station_service_bind.inc').exists()else S/'wifi_station_service_bind.inc').read_text()
+ start=source_inventory.index('int nord2_wifi_join_card_inventory(');end=source_inventory.index('\n}',start)+2
+ (d/'test-card-inventory.inc').write_text(source_inventory[start:end]+'\n')
+ h=(B/'test-xnu.h').read_text().replace('kIODirectionOut=2','kIODirectionOut=2,kIODirectionIn=1').replace('virtual size_t readBytes(size_t,void*,size_t)=0;','virtual size_t readBytes(size_t,void*,size_t)=0;virtual size_t writeBytes(size_t,const void*,size_t)=0;')
+ h=h.replace('bool failPrepare=false,failRead=false,failComplete=false;','bool failPrepare=false,failRead=false,failWrite=false,failComplete=false;unsigned writes=0;')
+ h=h.replace('assert(dir==kIODirectionOut);','assert(dir==kIODirectionOut||dir==kIODirectionIn);').replace('assert(dir==kIODirectionOut&&depth);','assert((dir==kIODirectionOut||dir==kIODirectionIn)&&depth);')
+ h=h.replace('std::memcpy(p,(char*)bytes+o,n);return n;}};', 'std::memcpy(p,(char*)bytes+o,n);return n;}size_t writeBytes(size_t o,const void*p,size_t n)override{assert(depth);writes++;if(failWrite)return n?n-1:0;if(o>length||n>length-o)return 0;std::memcpy((char*)bytes+o,p,n);return n;}};')
+ h=h.replace('size_t structureOutputSize=0;', 'size_t structureOutputSize=0,structureOutputDescriptorSize=0;');(d/'test-xnu.h').write_text(h)
+ source=(B/'test-integrated.cpp').read_text().replace('"LifecycleShell.cpp"','"wifi_ios_client.cpp"').replace('int main(){','static int oldmain(){').replace('out->count=1;','out->scanning=active;out->count=1;')
+ ix=source.rfind('}');source=source[:ix]+' return 0;\n'+source[ix:]
+ source+=(P/'test-join-stubs.inc').read_text();legacy_extra='int main(){IOUserClient*c=make();IOExternalMethodArguments a={};a.structureInput=carrier;a.structureInputSize=sizeof carrier;unsigned checks=0;\n envelope(carrier,0x802869c8,22,8);put(carrier+8,0xaaaaaaaa);put(carrier+12,0x80000000u);assert(!call(c,0,a)&&jdisconnects==1&&!jenqueues);checks++;\n /* All other small extents refuse before native; no partial output. */\n for(unsigned size=1;size<=64;size++){if(size==8)continue;envelope(carrier,0x802869c8,22,size);unsigned n=jdisconnects;assert(call(c,0,a)==kIOReturnUnsupported&&jdisconnects==n);checks++;}\n /* Compiler-fill prefix is inactive; signed32 reason is opaque metadata. */\n for(uint32_t prefix:{0u,1u,0xaaaaaaaau,0xffffffffu,0x12345678u})for(uint32_t reason:{0u,1u,2u,0x7fffffffu,0x80000000u,0xffffffffu}){\n  envelope(carrier,0x802869c8,22,8);put(carrier+8,prefix);put(carrier+12,reason);unsigned n=jdisconnects;assert(!call(c,0,a)&&jdisconnects==n+1&&!jenqueues&&!jactive);checks++;\n }\n envelope(carrier,0x802869c8,22,0);unsigned n=jdisconnects;assert(!call(c,0,a)&&jdisconnects==n+1);checks++;\n envelope(carrier,0x802869c8,22,8);n=jdisconnects;put(carrier+15388,1);assert(call(c,0,a)==kIOReturnBadArgument&&jdisconnects==n);checks++;put(carrier+15388,0);\n uint8_t output=0xa5;a.structureOutput=&output;a.structureOutputSize=1;assert(call(c,0,a)==kIOReturnBadArgument&&jdisconnects==n&&output==0xa5);checks++;a.structureOutput=nullptr;a.structureOutputSize=0;\n memcpy(carrier+15368,"bad",4);assert(call(c,0,a)!=0&&jdisconnects==n);checks++;envelope(carrier,0x802869c8,22,8);\n test_current=&otherTask;assert(call(c,0,a)==kIOReturnNotPrivileged&&jdisconnects==n);checks++;test_current=&ownerTask;\n a.structureInputSize=sizeof carrier-1;assert(call(c,0,a)==kIOReturnBadArgument&&jdisconnects==n);checks++;a.structureInputSize=sizeof carrier;\n /* Genuine OOL copied carrier has balanced prepare/complete; failures never\n  * reach native. Payload is never kept by native leave API. */\n auto*md=new IOBufferMemoryDescriptor(sizeof carrier);memcpy(md->getBytesNoCopy(),carrier,sizeof carrier);a.structureInput=nullptr;a.structureInputSize=0;a.structureInputDescriptor=md;\n assert(!call(c,0,a)&&jdisconnects==n+1&&md->prepares==1&&md->completes==1&&!md->depth);n=jdisconnects;checks++;\n md->failPrepare=true;assert(call(c,0,a)==kIOReturnNotReady&&jdisconnects==n&&md->completes==1);md->failPrepare=false;checks++;\n md->failRead=true;assert(call(c,0,a)==kIOReturnBadArgument&&jdisconnects==n&&md->prepares==3&&md->completes==2&&!md->depth);md->failRead=false;checks++;\n md->failComplete=true;assert(call(c,0,a)==kIOReturnNotReady&&jdisconnects==n&&!md->depth);checks++;md->failComplete=false;md->release();\n assert(!c->clientClose());c->release();assert(!malloc_count&&!buffer_count&&!rights&&!locks&&ownerTask.refs==1);\n printf("PASS %u actual IOUC DISASSOC checks: exact0/8/opaque-prefix/signedreason/task/name/value/output/short/OOL faults; no join enqueue\\n",checks);return 0;}\n'.replace('int main(){','int main(){assertNoJoins();');source+=legacy_extra;(d/'test.cpp').write_text(source)
+ flags=['-O1','-g','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-fno-sanitize-recover=all','-I'+str(d),'-I'+str(dev),'-I'+str(arm)]
+ objs=[]
+ for name in names:
+  f=dev/('wifi_ios_'+name+'.c');o=d/(name+'.o');subprocess.run(['clang','-std=c11',*flags,'-c',str(f),'-o',str(o)],check=True);objs.append(str(o))
+
+ subprocess.run(['clang++','-std=c++17',*flags,'-Wno-unused-function','-pthread',str(d/'test.cpp'),*objs,'-o',str(d/'test')],check=True)
+ result=subprocess.run([str(d/'test')],text=True,capture_output=True);print(result.stdout);print(result.stderr)
+ if args.log:args.log.write_text(result.stdout+result.stderr)
+ result.check_returncode()

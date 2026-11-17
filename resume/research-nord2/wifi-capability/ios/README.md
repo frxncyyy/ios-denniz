@@ -1,0 +1,13 @@
+# Private Wi-Fi capability image stage
+
+This is an offline, unprepared template for `nord2-ios-wifi-capability-battery-stop23.img`. It is a new image and authorization scope after the executed SWINT image `fa13be9baa232b26c89994998cd566fa2ec4e0d96748b5420f1c6504ba203be7`. The intended change is one default-off capability query after an actual FW_READY receipt, with the reviewed 30-second failure drain. No scan, network interface, or capability result is claimed by this template.
+
+The new command line is the executed SWINT command line plus `nord2wificap=1` (474 bytes, below the 608-byte field). The same private calibration ADT input, iOS/UFS/CPU parameters, and e0d3 fallback and RAM rescue are retained. The current SWINT boot is human-health confirmed (lockscreen, touch, buttons). The deliberately retained recovery fallback remains e0d3 plus the verified RAM rescue.
+
+`identity-required.json`, `native-schema-required.json`, `prepared-image-required.json`, and `authorization-required.json` remain closed. Source pins identify the promoted production candidate `75fc0de8`, its five canonical capability files, generated copies, hook, registration, and generator. Main receipt parsing uses the independently reviewed evidence-v2 manifest `2e9052ab`; the executed SWINT stage remains immutable.
+
+`parse-capability.py LOG` requires the complete actual emitter contract: ARM, result, RX, rearmed descriptor, TLV metadata, owner, every bounded event row, and terminal worker parking. It removes only strictly recognized capability records before applying the pinned main parser. Errors, unsupported events, unknown records, malformed/duplicate/truncated rows, ordering conflicts, and incomplete receipts refuse completion. Known debug events may precede the capability event. Sequence echo and declared lengths remain metadata; supported unknown TLV counts are preserved. No MAC address or payload is emitted or returned. These captured metadata cannot independently replay or validate the unlogged TLV body.
+
+`test-capability.py` appends synthetic capability rows to the frozen actual main receipt. **No actual capability reply has been captured**, and normal E000 RX remains unproven on hardware. Passing these tests does not establish scan, interface, association, or networking. The parent must review the parser/schema and supply the exact verified CI kernel, image, and new human authorization before the one-use runner can execute. Prior SWINT approval and image are rejected explicitly.
+
+Offline stage check: `python3 research/nord2/wifi-capability/ios/test-stage.py`. This does not build an image or access a device.

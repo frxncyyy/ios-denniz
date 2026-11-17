@@ -1,0 +1,5 @@
+The scan-result mapping is now closed by two independent directions in the same IPSW: raw Apple80211 result+12 is converted to CHANNEL_FLAGS, and wifid passes that number without recoding into CWFChannel.setFlags:. Its inverse reads channel.flags into the same dictionary key. Cached class resolver string is CWFChannel, not an inferred receiver class. The origin selector previously confused with flags is explicitly separate.
+
+Named CoreWiFi consumers establish raw scan-result flag bits: 2GHz 0x8, 5GHz 0x10, 6GHz 0x2000, DFS 0x100; widths20/40/80/160 use0x2/0x4/0x400/0x800. Width getter precedence160 then80 then40 then20 applies only to decoding; do not emit multiple inconsistent widths. These bits represent metadata, not regulatory permission, readiness, or support. Unknown bits are not assigned meanings. Channel request mapping and rates remain separate open boundaries. No service or interface is registered.
+
+Evidence is shell static analysis of the authenticated local wifid and same-IPSW split cache, not REA decompilation or runtime. mapping-evidence.json records exact addresses and bounded extracts.

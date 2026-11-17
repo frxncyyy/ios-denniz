@@ -1,0 +1,2282 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -147,6 +147,7 @@ bsd/dev/rottenapple_wifi.c		standard
+ bsd/dev/rottenapple_mtk_connsys.c	standard
+ bsd/dev/rottenapple_mtk_wfdma.c		standard
+ bsd/dev/rottenapple_mtk_wmt.c		standard
++bsd/dev/rottenapple_mtk_wlan.c		standard
+ bsd/dev/rottenapple_firmware.c		standard
+ bsd/dev/rottenapple_audio.c		standard
+ bsd/dev/rottenapple_mtk_afe.c		standard
+--- a/bsd/dev/rottenapple_mtk_connsys.c
++++ b/bsd/dev/rottenapple_mtk_connsys.c
+@@ -28,6 +28,9 @@
+  *   mediatek,emi = <pa size>;                    (u64; CONNSYS sees it at 0xF0000000)
+  *   mediatek,dma-pool = <pa size>;               (u64; WFDMA rings, from W2 on)
+  *   mediatek,wifi-ram-code = "<file>";            (W2: WIFI_RAM_CODE for the a-die)
++ *   mediatek,nvram = "<full path>";              (W3: the device's Wi-Fi NVRAM, 2048 + 2 bytes)
++ *   mediatek,nvram-custom = "<full path>";       (W3, optional: WIFI_CUSTOM, logged only)
++ *   mediatek,wifi-cfg = "<file>";                (W3, optional: wifi.cfg in firmware-dir)
+  *   mediatek,adie-id = <0x6631>;                 (expected RF chip)
+  *   mediatek,patches = "<file>", ...;  mediatek,patch-offsets = <EMI offset>, ...;
+  *
+@@ -49,6 +52,12 @@
+  * WFDMA rings in mediatek,dma-pool, RAM-code download, WIFI_START, ready
+  * bits; then DMA off and ownership back, BTIF off (W2b), before the W1
+  * power-off.
++ * W3 (level 5, rottenapple_mtk_wlan.c): the NVRAM and wifi.cfg are read
++ * before anything is powered; after W2b + W2 the receive thread takes SPI
++ * 409 (and keeps STP alive), the configuration commands go out, the MAC is
++ * set and read back; the chip stays up. wifi_off first stops it cleanly
++ * (NIC power off command, ready bits drop, thread stopped). cmd_send is
++ * the core's path for firmware commands (TX ring 15).
+  * Power-off is the reverse of whatever was done (Linux order: CON_STA,
+  * domain off, PCCIF4 acknowledge, CCIF4 clock, VCN28, pins, VCN33, 300 us,
+  * VCN18). Registers inside the CONNSYS window are only touched while the
+@@ -63,6 +72,7 @@
+ #include <dev/rottenapple_wifi.h>
+ #include <dev/rottenapple_mtk_wfdma.h>
+ #include <dev/rottenapple_mtk_wmt.h>
++#include <dev/rottenapple_mtk_wlan.h>
+ 
+ #define CLOG(fmt, ...)  printf("ROTTEN APPLE: wifi connsys: " fmt "\n", ##__VA_ARGS__)
+ 
+@@ -227,6 +237,9 @@ struct connsys {
+ 	struct mtk_wmt wmt;
+ 	unsigned w2b_runs;              /* W2b attempts this boot */
+ 	int w2b_last_err;               /* result of the previous attempt */
++	/* W3 */
++	const char *nvram, *nvram_custom, *wifi_cfg;
++	struct mtk_wlan wl;
+ };
+ 
+ static struct connsys mtk_connsys;
+@@ -526,6 +539,10 @@ connsys_probe(struct rottenapple_wifi *w)
+ 		return EINVAL;
+ 	}
+ 	c->ram_code = rottenapple_prop_string(w->node, "mediatek,wifi-ram-code", 0);
++	/* W3 (optional until level 5 runs) */
++	c->nvram = rottenapple_prop_string(w->node, "mediatek,nvram", 0);
++	c->nvram_custom = rottenapple_prop_string(w->node, "mediatek,nvram-custom", 0);
++	c->wifi_cfg = rottenapple_prop_string(w->node, "mediatek,wifi-cfg", 0);
+ 	/* W2b (optional): BTIF on both sides and its clock */
+ 	if ((i = rottenapple_wifi_reg_index(w, "btif")) >= 0) {
+ 		c->btif = w->regs[i];
+@@ -912,10 +929,26 @@ connsys_wifi_on(struct rottenapple_wifi *w, unsigned level)
+ 	struct connsys *c = w->priv;
+ 	struct mtk_wfdma *d = &c->wlan;
+ 	struct mtk_wmt *m = &c->wmt;
++	struct mtk_wlan *l = &c->wl;
++	bool w3 = level >= 5;
+ 	int err;
+ 
+ 	bzero(d, sizeof(*d));
+ 	bzero(m, sizeof(*m));
++	bzero(l, sizeof(*l));
++	if (w3) {
++		/* W3: NVRAM and wifi.cfg first; a missing NVRAM stops before the 1.2 s WMT init */
++		l->w = w;
++		l->d = d;
++		l->wmt = m;
++		l->nvram_path = c->nvram;
++		l->custom_path = c->nvram_custom;
++		l->cfg_name = c->wifi_cfg;
++		if ((err = mtk_wlan_prepare(l)) != 0) {
++			CLOG("W3: NVRAM/configuration files not usable (%d): Wi-Fi not started", err);
++			return err;
++		}
++	}
+ 	if (c->ram_code == NULL) {
+ 		CLOG("no mediatek,wifi-ram-code: W2 not possible");
+ 		return EINVAL;
+@@ -947,7 +980,7 @@ connsys_wifi_on(struct rottenapple_wifi *w, unsigned level)
+ 		 * same again; after a failure PIO, as the reference with the same
+ 		 * diagnostics.
+ 		 */
+-		bool dma = c->w2b_runs == 0 || c->w2b_last_err == 0;
++		bool dma = w3 || c->w2b_runs == 0 || c->w2b_last_err == 0;     /* W3: always AP-DMA (PIO never worked) */
+ 		m->tx_dma = m->rx_dma = dma;
+ 		c->w2b_runs++;
+ 		CLOG("W2b attempt %u: BTIF over %s%s", c->w2b_runs, dma ? "AP-DMA (TX and RX, as Android)" : "PIO",
+@@ -974,7 +1007,10 @@ connsys_wifi_on(struct rottenapple_wifi *w, unsigned level)
+ 	d->pool_pa = c->pool_pa;
+ 	d->pool_size = c->pool_size;
+ 	d->ram_code = c->ram_code;
+-	return mtk_wfdma_wifi_on(d, level);
++	if ((err = mtk_wfdma_wifi_on(d, level)) != 0 || !w3) {
++		return err;
++	}
++	return mtk_wlan_start(l);
+ }
+ 
+ static void
+@@ -982,8 +1018,19 @@ connsys_wifi_off(struct rottenapple_wifi *w)
+ {
+ 	struct connsys *c = w->priv;
+ 
++	mtk_wlan_stop(&c->wl);          /* W3 only: firmware off, receive thread stopped */
+ 	mtk_wfdma_wifi_off(&c->wlan);
+ 	mtk_wmt_off(&c->wmt);
++	mtk_wlan_release(&c->wl);
++}
++
++/* The core's command path (rottenapple_wifi_cmd), W3 on */
++static int
++connsys_cmd_send(struct rottenapple_wifi *w, uint8_t id, bool set, const void *payload, uint32_t len, uint8_t *seq)
++{
++	struct connsys *c = w->priv;
++
++	return mtk_wfdma_cmd_send(&c->wlan, id, set, payload, len, seq);
+ }
+ 
+ static const struct rottenapple_wifi_ops rottenapple_mtk_connsys_ops = {
+@@ -994,6 +1041,7 @@ static const struct rottenapple_wifi_ops rottenapple_mtk_connsys_ops = {
+ 	.power_off = connsys_power_off,
+ 	.wifi_on = connsys_wifi_on,
+ 	.wifi_off = connsys_wifi_off,
++	.cmd_send = connsys_cmd_send,
+ };
+ ROTTENAPPLE_BACKEND(wifi, rottenapple_mtk_connsys_ops);
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/rottenapple_mtk_wfdma.c
++++ b/bsd/dev/rottenapple_mtk_wfdma.c
+@@ -26,7 +26,9 @@
+  *   ready bits (CONN_ON_MISC DRV_FM_STAT_SYNC = 0x3).
+  * All waits poll the ring indexes with a timeout. SPI 409 is installed as a
+  * one-shot probe: its handler masks the WFDMA interrupt and records the
+- * status (proves the wiring for W3, which will use it).
++ * status. W3 (rottenapple_mtk_wlan.c) then attaches its receive thread to
++ * it (mtk_wfdma_irq_attach) and sends normal commands over TX ring 15
++ * (mtk_wfdma_cmd_send).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -208,6 +210,7 @@
+ 
+ /* Normal command (WIFI_CMD) and NIC_CAPABILITY_V2 */
+ #define WIFI_CMD_LEN            64
++#define WIFI_CMD_MAX_PAYLOAD    (BUF_STRIDE - WIFI_CMD_LEN)
+ #define CMD_ID_NIC_CAP_V2       0x8a
+ #define EVT_ID_NIC_CAP_V2       0xec
+ #define S2D_H2N_H2C             3
+@@ -708,7 +711,7 @@ rx_poll(struct mtk_wfdma *d, struct mtk_wfdma_ring *r, uint8_t *out, uint32_t bu
+ 			*len = n;
+ 			return 0;
+ 		}
+-		if (now_us() - t0 > timeout_us) {
++		if (now_us() - t0 >= timeout_us) {
+ 			return ETIMEDOUT;
+ 		}
+ 		delay(50);
+@@ -1054,15 +1057,24 @@ fwdl_mode(struct mtk_wfdma *d, bool on)
+ 	}
+ }
+ 
+-/* One-shot probe of SPI 409: mask WFDMA interrupts at the source, record why. */
++/*
++ * SPI 409. Until W3 attaches its thread: a one-shot probe (mask the WFDMA
++ * interrupt at its source, record why). Attached: mask at the source (the
++ * line is level-triggered) and wake the receive thread, which acks INT_STA,
++ * drains the rings and unmasks (gen4m mtk_axi_interrupt + hif_thread).
++ */
+ static void
+ wfdma_irq(void *arg)
+ {
+ 	struct mtk_wfdma *d = arg;
++	void (*wake)(void *) = d->irq_wake;
+ 
+ 	d->irq_sta |= rd(d, PDMA_INT_STA);
+ 	wr(d, PDMA_INT_MSK, 0);
+-	if (++d->irq_count > 4) {
++	d->irq_count++;
++	if (wake) {
++		wake(d->irq_wake_arg);
++	} else if (d->irq_count > 4) {
+ 		wr(d, HIF_ON_IRQ_ENA, 0);       /* still firing: gate the whole host interrupt */
+ 	}
+ }
+@@ -1120,27 +1132,59 @@ wfdma_init(struct mtk_wfdma *d)
+ 
+ /* ---- NIC_CAPABILITY_V2 over the command ring (rottenapple_wifi=3) ---- */
+ 
+-static int
+-nic_capability(struct mtk_wfdma *d)
++/*
++ * One normal command on TX ring 15 (asicFillCmdTxdInfo): WIFI_CMD = the
++ * 32-byte TXD {byte count, PQ 0x8000, 0, header format 0xA0, 0, packet
++ * format 2}, then {length - 32, PQ 0, CID, packet type 0xA0, set/query,
++ * seq, 0, extended CID 0, S2D index 3 (H2N_H2C), 0, version 0, ...} up to
++ * 64 bytes, then the payload. The sequence counter is the init commands'
++ * one (gen4m nicIncreaseCmdSeqNum); 0 is skipped so it never looks like an
++ * unsolicited event.
++ */
++int
++mtk_wfdma_cmd_send(struct mtk_wfdma *d, uint8_t id, bool set, const void *payload, uint32_t len, uint8_t *seq)
+ {
+-	uint8_t cmd[WIFI_CMD_LEN], *ev;
+-	uint32_t len = 0;
++	uint8_t cmd[WIFI_CMD_LEN];
+ 	int err;
+ 
+-	/* WIFI_CMD: 32-byte TXD, then length, PQ, CID, 0xA0, set/query, seq, ..., S2D index */
++	if (!(d->state & ST_DMA)) {
++		return ENXIO;
++	}
++	if (len > WIFI_CMD_MAX_PAYLOAD || (len && payload == NULL)) {
++		return EINVAL;
++	}
+ 	bzero(cmd, sizeof(cmd));
+-	put16(cmd + 0, WIFI_CMD_LEN);
++	put16(cmd + 0, (uint16_t)(WIFI_CMD_LEN + len));
+ 	put16(cmd + 2, INIT_CMD_PQ_ID);
+ 	cmd[5] = INIT_PKT_TYPE;
+ 	cmd[7] = INIT_PKT_FT_CMD;
+-	put16(cmd + 32, WIFI_CMD_LEN - 32);
+-	cmd[36] = CMD_ID_NIC_CAP_V2;
++	put16(cmd + 32, (uint16_t)(WIFI_CMD_LEN - 32 + len));
++	cmd[36] = id;
+ 	cmd[37] = INIT_PKT_TYPE;
+-	cmd[38] = 0;                    /* query */
+-	cmd[39] = ++d->seq;
++	cmd[38] = set ? 1 : 0;
++	if (++d->seq == 0) {
++		d->seq = 1;
++	}
++	cmd[39] = d->seq;
+ 	cmd[42] = S2D_H2N_H2C;
+-	uint8_t seq = d->seq;
+-	if ((err = tx_send(d, &d->tx_cmd, cmd, sizeof(cmd), NULL, 0)) != 0) {
++	if (seq) {
++		*seq = d->seq;
++	}
++	err = tx_send(d, &d->tx_cmd, cmd, sizeof(cmd), payload, len);
++	if (err) {
++		DLOG("command 0x%02x seq %u (%u bytes): not sent (%d)", id, d->seq, WIFI_CMD_LEN + len, err);
++	}
++	return err;
++}
++
++static int
++nic_capability(struct mtk_wfdma *d)
++{
++	uint8_t *ev, seq = 0;
++	uint32_t len = 0;
++	int err;
++
++	if ((err = mtk_wfdma_cmd_send(d, CMD_ID_NIC_CAP_V2, false, NULL, 0, &seq)) != 0) {
+ 		DLOG("NIC_CAPABILITY_V2: not sent (%d)", err);
+ 		return err;
+ 	}
+@@ -1184,10 +1228,37 @@ nic_capability(struct mtk_wfdma *d)
+ 			DLOG("  HW version: product 0x%04x ECO %u, MAC IP 0x%08x, BB IP 0x%08x, TOP IP 0x%08x, config 0x%08x",
+ 			    le16(b), b[2], le32(b + 4), le32(b + 8), le32(b + 12), le32(b + 16));
+ 		} else if (tag == 0x6 && blen >= 24) {
++			/* CAP_SW_VERSION {u16 version <major.minor>, u16 build, branch[4], date code[16]} */
++			d->fw_ver = le16(b);
++			d->fw_build = le16(b + 2);
++			memcpy(d->fw_branch, b + 4, 4);
++			d->fw_branch[4] = '\0';
++			memcpy(d->fw_date, b + 8, 16);
++			d->fw_date[16] = '\0';
+ 			DLOG("  SW version: %u.%u build %u, branch \"%.4s\", date \"%.16s\"", le16(b) >> 8, le16(b) & 0xff,
+ 			    le16(b + 2), (const char *)b + 4, (const char *)b + 8);
+ 		} else if (tag == 0x7 && blen >= 6) {
++			memcpy(d->efuse_mac, b, 6);
+ 			DLOG("  MAC address (efuse): %02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5]);
++		} else if (tag == 0x0 && blen >= 16) {
++			/* NIC_TX_RESOURCE {cmd total, cmd unit, data total, data unit, ...} */
++			DLOG("  TX resource: MCU %u x %u bytes, LMAC %u x %u bytes", le32(b), le32(b + 4), le32(b + 8),
++			    le32(b + 12));
++		} else if (tag == 0x4 && blen >= 1) {
++			d->csum_offload = b[0] != 0;
++			DLOG("  checksum offload: %ssupported", b[0] ? "" : "not ");
++		} else if (tag == 0x9 && blen >= 3) {
++			/* CAP_MAC_CAP {HW BSSID number, WMM sets, WTBL entries} */
++			d->hw_bssid_num = b[0];
++			d->wmm_sets = b[1];
++			d->wtbl_entries = b[2];
++			DLOG("  MAC: %u HW BSSIDs, %u WMM set(s), %u WTBL entries", b[0], b[1], b[2]);
++		} else if (tag == 0xe && blen >= 4) {
++			/* CAP_BUFFER_MODE_INFO {version, format bitmap, u16 efuse size, 10 x section} */
++			d->efuse_size = le16(b + 2);
++			DLOG("  efuse/buffer mode: version %u, formats 0x%02x, efuse %u bytes", b[0], b[1], le16(b + 2));
++		} else if (tag == 0x16 && blen >= 3) {
++			DLOG("  antenna swap: version %u, %ssupported", b[0], b[2] ? "" : "not ");
+ 		} else if (tag == 0x14 && blen >= 4) {
+ 			DLOG("  a-die: product 0x%04x ECO 0x%04x", le16(b), le16(b + 2));
+ 		} else if (tag == 0x8 && blen >= 6) {
+@@ -1197,12 +1268,141 @@ nic_capability(struct mtk_wfdma *d)
+ 		}
+ 		off += 8 + blen;
+ 	}
++	d->cap_valid = true;
+ 	err = 0;
+ out:
+ 	kfree_data(ev, RX1_BUF_SIZE);
+ 	return err;
+ }
+ 
++/* ---- W3: receive path, interrupt, health ---- */
++
++static int
++rx_next(struct mtk_wfdma *d, struct mtk_wfdma_ring *r, uint8_t *out, uint32_t size, uint32_t *len)
++{
++	if (!(d->state & ST_DMA)) {
++		return ENXIO;
++	}
++	int err = rx_poll(d, r, out, size, len, 0);
++	return err == ETIMEDOUT ? EAGAIN : err;
++}
++
++int
++mtk_wfdma_rx_event(struct mtk_wfdma *d, uint8_t *out, uint32_t size, uint32_t *len)
++{
++	return rx_next(d, &d->rx_evt, out, size, len);
++}
++
++int
++mtk_wfdma_rx_data(struct mtk_wfdma *d, uint8_t *out, uint32_t size, uint32_t *len)
++{
++	return rx_next(d, &d->rx_data, out, size, len);
++}
++
++#define INT_W3_MASK     (INT_RX_DONE(0) | INT_RX_DONE(1) | INT_MCU2HOST_SW)
++
++void
++mtk_wfdma_irq_attach(struct mtk_wfdma *d, void (*wake)(void *), void *arg)
++{
++	wr(d, PDMA_INT_MSK, 0);
++	d->irq_wake_arg = arg;
++	d->irq_wake = wake;
++	wr(d, HIF_ON_IRQ_ENA, 1);
++	wr(d, PDMA_INT_STA, rd(d, PDMA_INT_STA));       /* write 1 to clear (kalDevReadIntStatus) */
++	wr(d, PDMA_INT_MSK, INT_W3_MASK);
++	DLOG("SPI 409 drives the event path: INT_MSK 0x%08x (RX done 0/1, MCU software interrupt), %s", rd(d, PDMA_INT_MSK),
++	    (d->state & ST_IRQ) ? "handler installed" : "NO handler (polling only)");
++}
++
++void
++mtk_wfdma_irq_detach(struct mtk_wfdma *d)
++{
++	if (d->state & ST_DMA) {
++		wr(d, PDMA_INT_MSK, 0);
++	}
++	d->irq_wake = NULL;
++	d->irq_wake_arg = NULL;
++}
++
++uint32_t
++mtk_wfdma_irq_ack(struct mtk_wfdma *d, uint32_t *mcu_sw)
++{
++	uint32_t sta = rd(d, PDMA_INT_STA);
++
++	*mcu_sw = 0;
++	if (sta) {
++		wr(d, PDMA_INT_STA, sta);
++	}
++	if (sta & INT_MCU2HOST_SW) {
++		*mcu_sw = rd(d, PDMA_MCU2HOST_SW_STA);
++		if (*mcu_sw) {
++			wr(d, PDMA_MCU2HOST_SW_STA, *mcu_sw);
++		}
++	}
++	return sta;
++}
++
++void
++mtk_wfdma_irq_unmask(struct mtk_wfdma *d)
++{
++	if ((d->state & ST_DMA) && d->irq_wake) {
++		wr(d, PDMA_INT_MSK, INT_W3_MASK);
++	}
++}
++
++void
++mtk_wfdma_health(struct mtk_wfdma *d, struct mtk_wfdma_health *h)
++{
++	bzero(h, sizeof(*h));
++	h->ready = ready(d, &h->misc);
++	h->pc = rd(d, HIF_ON_DBGCR01);
++	h->com_reg0 = rd(d, MCU_COM_REG0);
++	h->mcu2host = rd(d, PDMA_MCU2HOST_SW_STA);
++	h->int_sta = rd(d, PDMA_INT_STA);
++	if (d->emi_size >= COREDUMP_EMI_OFF + COREDUMP_EMI_SIZE) {
++		uintptr_t log = d->emi + FWLOG_EMI_OFF, cd = d->emi + COREDUMP_EMI_OFF;
++		for (unsigned i = 0; i < ROTTENAPPLE_COUNT(fwlog_rings); i++) {
++			h->log_w[i] = mem_rd32(log + fwlog_base(i) + 4);
++		}
++		for (uint32_t off = 0; off < COREDUMP_EMI_SIZE; off += 0x1000) {
++			for (uint32_t k = 0; k < 0x1000; k += 64) {
++				if (mem_rd32(cd + off + k) != 0) {
++					h->coredump_pages++;
++					break;
++				}
++			}
++		}
++	}
++}
++
++void
++mtk_wfdma_fwlog_new(struct mtk_wfdma *d, const uint32_t last[4], const uint32_t now[4], unsigned max_lines)
++{
++	unsigned lines = max_lines;
++
++	if (d->emi_size < FWLOG_EMI_OFF + FWLOG_EMI_SIZE) {
++		return;
++	}
++	for (unsigned i = 0; i < ROTTENAPPLE_COUNT(fwlog_rings) && lines > 0; i++) {
++		uint32_t size = fwlog_rings[i].size, a = last[i], b = now[i];
++		uintptr_t data = d->emi + FWLOG_EMI_OFF + fwlog_base(i) + FWLOG_RING_RSV;
++		if (a == b || a >= size || b >= size) {
++			if (a != b) {
++				DLOG("fwlog %s: write pointer 0x%x -> 0x%x (outside the 0x%x-byte ring)", fwlog_rings[i].name, a, b,
++				    size);
++			}
++			continue;
++		}
++		DLOG("fwlog %s: write pointer 0x%x -> 0x%x", fwlog_rings[i].name, a, b);
++		if (b > a) {
++			fwlog_strings(fwlog_rings[i].name, data + a, b - a, &lines);
++		} else {
++			fwlog_strings(fwlog_rings[i].name, data + a, size - a, &lines);
++			fwlog_strings(fwlog_rings[i].name, data, b, &lines);
++		}
++	}
++}
++
+ /* ---- W2 ---- */
+ 
+ /*
+@@ -1238,6 +1438,8 @@ mtk_wfdma_wifi_on(struct mtk_wfdma *d, unsigned level)
+ 	d->seq = 0;
+ 	d->irq_count = 0;
+ 	d->irq_sta = 0;
++	d->irq_wake = NULL;
++	d->cap_valid = false;
+ 
+ 	/* Firmware first: a missing or bad file stops here, before any WFDMA write. */
+ 	if ((err = rottenapple_wifi_firmware_load(d->w, d->ram_code, &d->fw, &d->fw_size)) != 0) {
+@@ -1320,6 +1522,7 @@ mtk_wfdma_wifi_on(struct mtk_wfdma *d, unsigned level)
+ void
+ mtk_wfdma_wifi_off(struct mtk_wfdma *d)
+ {
++	d->irq_wake = NULL;
+ 	if (d->state & ST_IRQ) {
+ 		wr(d, PDMA_INT_MSK, 0);
+ 		rottenapple_irq_free(d->w->name, 0);
+--- a/bsd/dev/rottenapple_mtk_wfdma.h
++++ b/bsd/dev/rottenapple_mtk_wfdma.h
+@@ -40,6 +40,26 @@ struct mtk_wfdma {
+ 	uint8_t seq;
+ 	uint32_t state;
+ 	volatile uint32_t irq_count, irq_sta;
++	/* W3: interrupt-driven event path (mtk_wfdma_irq_attach); NULL = one-shot probe */
++	void (*volatile irq_wake)(void *arg);
++	void *irq_wake_arg;
++	/* NIC_CAPABILITY_V2 results (level >= 3) */
++	bool cap_valid;
++	uint8_t efuse_mac[6];
++	uint8_t hw_bssid_num, wmm_sets, wtbl_entries;
++	bool csum_offload;
++	uint16_t efuse_size;
++	char fw_branch[5], fw_date[17];
++	uint16_t fw_ver, fw_build;
++};
++
++/* Firmware health, read from registers and the EMI log/coredump areas (mtk_wfdma_health). */
++struct mtk_wfdma_health {
++	uint32_t misc;                  /* CONN_ON_MISC */
++	bool ready;                     /* DRV_FM_STAT_SYNC ready bits still set */
++	uint32_t pc, com_reg0, mcu2host, int_sta;
++	uint32_t log_w[4];              /* write pointers of the MCU / Wi-Fi / BT / GPS log rings */
++	uint32_t coredump_pages;        /* 4 KB pages of the coredump area that are not zero */
+ };
+ 
+ /*
+@@ -53,6 +73,48 @@ struct mtk_wfdma {
+ int mtk_wfdma_wifi_on(struct mtk_wfdma *d, unsigned level);
+ void mtk_wfdma_wifi_off(struct mtk_wfdma *d);
+ 
++/*
++ * W3, after mtk_wfdma_wifi_on succeeded. Commands go out on TX ring 15 as
++ * WIFI_CMD {32-byte TXD, length, PQ, id, 0xA0, set/query, seq, ..., S2D
++ * index 3}; callers serialize (the core's command lock). *seq is never 0.
++ */
++int mtk_wfdma_cmd_send(struct mtk_wfdma *d, uint8_t id, bool set, const void *payload, uint32_t len,
++    uint8_t *seq);
++
++/*
++ * Next packet of RX ring 1 (events) / RX ring 0 (data), without waiting:
++ * 0 and the whole packet (RXD first, at most size bytes, *len = its length),
++ * EAGAIN when the ring is empty, EIO on a descriptor error. Only the
++ * receive thread calls these once it runs.
++ */
++int mtk_wfdma_rx_event(struct mtk_wfdma *d, uint8_t *out, uint32_t size, uint32_t *len);
++int mtk_wfdma_rx_data(struct mtk_wfdma *d, uint8_t *out, uint32_t size, uint32_t *len);
++
++/* Offsets into a received event packet: RXD (20 bytes), then WIFI_EVENT (12 bytes). */
++#define MTK_WFDMA_RXD_LEN       20
++#define MTK_WFDMA_EVT_EID       (MTK_WFDMA_RXD_LEN + 4)
++#define MTK_WFDMA_EVT_SEQ       (MTK_WFDMA_RXD_LEN + 5)
++#define MTK_WFDMA_EVT_BODY      (MTK_WFDMA_RXD_LEN + 12)
++#define MTK_WFDMA_EVT_BUF       3840    /* RX ring 1 buffer size (RX_BUFFER_AGGRESIZE) */
++
++/*
++ * Interrupt-driven receive path on SPI 409. attach: the handler (primary
++ * interrupt context) masks the WFDMA interrupt at its source and calls
++ * wake(arg); INT_STA is cleared and RX done 0/1 + the MCU software
++ * interrupt are unmasked. The thread then calls ack (reads INT_STA and
++ * clears it; *mcu_sw gets MCU2HOST_SW_STA, cleared too, when that bit was
++ * set), drains the rings and unmasks. detach masks everything.
++ */
++void mtk_wfdma_irq_attach(struct mtk_wfdma *d, void (*wake)(void *), void *arg);
++void mtk_wfdma_irq_detach(struct mtk_wfdma *d);
++uint32_t mtk_wfdma_irq_ack(struct mtk_wfdma *d, uint32_t *mcu_sw);
++void mtk_wfdma_irq_unmask(struct mtk_wfdma *d);
++
++/* Registers and EMI areas that tell whether the firmware is alive (reads only). */
++void mtk_wfdma_health(struct mtk_wfdma *d, struct mtk_wfdma_health *h);
++/* New printable text in the firmware log rings since last[] (write pointers), at most max_lines lines. */
++void mtk_wfdma_fwlog_new(struct mtk_wfdma *d, const uint32_t last[4], const uint32_t now[4], unsigned max_lines);
++
+ /*
+  * CONNSYS firmware log rings in EMI (+0x58000, 192 KB: header, then MCU,
+  * Wi-Fi, BT and GPS rings), the layout Android's connsys debug utility sets
+--- /dev/null
++++ b/bsd/dev/rottenapple_mtk_wlan.c
+@@ -0,0 +1,1102 @@
++/*
++ * Rotten Apple: MediaTek CONNAC1 Wi-Fi configuration, MAC address, basic
++ * queries and the interrupt-driven event path (milestone W3; interface in
++ * rottenapple_mtk_wlan.h).
++ *
++ * Clean-room: what is sent, in which order and with which values was read
++ * from the vendor gen4m driver (drivers/misc/mediatek/connectivity/wlan/
++ * core/gen4m, mostly dual BSD/GPL; chip glue GPL) and checked against the
++ * command trace of a Gigaset GX4 boot log (same MT6789 platform); the code
++ * is our own. docs/WIFI-PLAN.md "W3" lists every structure with its gen4m
++ * file:line.
++ *
++ * gen4m order after the ready bits (wlan_lib.c wlanAdapterStart,
++ * wlanOnPostFirmwareReady -> wlanLoadManufactureData, txPwrCtrlLoadConfig;
++ * gl_init.c wlanOnWhenProbeSuccess -> wlanFeatureToFw), as on the GX4:
++ *   0x70 GET_SET_CUSTOMER_CFG "EnableDbgLog"   (connsysFwLogControl)
++ *   0x8A NIC_CAPABILITY_V2 query                (rottenapple_mtk_wfdma.c)
++ *   0x02 BASIC_CONFIG
++ *        MAC address: host side (wlanUpdateNetworkAddress, nicApplyNetworkAddress)
++ *   0x0F SET_DOMAIN_INFO passive, 0x0F SET_DOMAIN_INFO  (rlmDomainSendCmd)
++ *   0x49 SET_COUNTRY_POWER_LIMIT legacy + antenna      (rlmDomainSendPwrLimitCmd)
++ *   0x48 SET_NVRAM_SETTINGS (the 2048-byte NVRAM)
++ *   0x49 x2 again                                      (txPwrCtrlLoadConfig)
++ *   0x70 GET_SET_CUSTOMER_CFG: built-in defaults + wifi.cfg (wlanFeatureToFw)
++ * Sets get no answer (fgNeedResp = FALSE); a register query afterwards is
++ * the sync point. gen4m hands the MAC to the firmware only when it
++ * activates the AIS network (nicActivateNetwork, CMD 0x11 BSS_ACTIVATE_CTRL,
++ * right before the first scan); W3 does that once, reads the MAC back from
++ * the RMAC own-address registers through CMD 0xC0 ACCESS_REG, and
++ * deactivates again (gen4m's idle state; W4 activates it per scan).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include <dev/rottenapple_mtk_wlan.h>
++
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++
++#define LLOG(fmt, ...)  printf("ROTTEN APPLE: wifi wlan: " fmt "\n", ##__VA_ARGS__)
++
++/* ---- Firmware command and event ids (wsys_cmd_handler_fw.h ENUM_CMD_ID / ENUM_EVENT_ID) ---- */
++
++#define CMD_ID_BASIC_CONFIG             0x02
++#define CMD_ID_NIC_POWER_CTRL           0x04
++#define CMD_ID_SET_DOMAIN_INFO          0x0f
++#define CMD_ID_BSS_ACTIVATE_CTRL        0x11
++#define CMD_ID_SET_NVRAM_SETTINGS       0x48
++#define CMD_ID_SET_COUNTRY_POWER_LIMIT  0x49
++#define CMD_ID_GET_SET_CUSTOMER_CFG     0x70
++#define CMD_ID_GET_STATISTICS           0x82
++#define CMD_ID_ACCESS_REG               0xc0
++
++#define EVENT_ID_STATISTICS             0x03
++#define EVENT_ID_ACCESS_REG             0x05
++#define EVENT_ID_DEBUG_MSG              0x27
++#define EVENT_ID_ASSERT_DUMP            0xf0
++#define EVENT_ID_CMD_RESULT             0xfd    /* INIT_EVENT_CMD_RESULT: a command the firmware did not handle */
++
++#define RX_PKT_TYPE_SW_MASK             0xe00f
++#define RX_PKT_TYPE_SW_EVENT            0xe000
++
++/* ---- NVRAM (CFG_Wifi_File.h WIFI_CFG_PARAM_STRUCT) ---- */
++
++#define NV_OWN_VER              0       /* u16 0x0102 */
++#define NV_PEER_VER             2       /* u16 */
++#define NV_MAC                  4       /* aucMacAddress[6] */
++#define NV_COUNTRY              10      /* aucCountryCode[2] */
++#define NV_SUPPORT_5G           197     /* ucSupport5GBand */
++#define NV_REG_MAP              202     /* ucRegChannelListMap (gen4m forces 0: by country code) */
++#define NV_REG_INDEX            203
++#define NV_ENABLE_5G            240     /* ucEnable5GBand */
++#define NV_TAGS                 256     /* ucTypeID0: tag area */
++
++/* ---- Command payloads ---- */
++
++#define CUSTOMER_CFG_ITEMS      4       /* MAX_CMD_ITEM_MAX */
++#define CUSTOMER_CFG_ITEM_LEN   68      /* CMD_FORMAT_V1: type, name len, value len, 0, name[32], value[32] */
++#define CUSTOMER_CFG_LEN        (12 + CUSTOMER_CFG_ITEMS * CUSTOMER_CFG_ITEM_LEN)      /* CMD_HEADER: 284 */
++#define ITEM_TYPE_STR           3
++#define CMD_TYPE_SET            1
++#define CMD_VER_1               0
++
++#define DOMAIN_INFO_LEN         56      /* CMD_SET_DOMAIN_INFO with MAX_SUBBAND_NUM 6 */
++#define SUBBANDS                6
++#define BAND_2G4                1
++#define BAND_5G                 2
++#define CHNL_SPAN_5             1
++#define CHNL_SPAN_20            4
++#define CONFIG_BW_20_40M        0
++
++#define PWR_LIMIT_LEN           1472    /* CMD_SET_COUNTRY_CHANNEL_POWER_LIMIT: 8 + 61 x 24 (HE BW160 union) */
++#define PWR_LIMIT_HDR           8
++#define PWR_LIMIT_ENTRY         12      /* CMD_CHANNEL_POWER_LIMIT: ch, CCK, 20L..160H, flag, rsv */
++#define PWR_LIMIT_VALUES        9       /* PWR_LIMIT_NUM without the 11AC_V2 setting */
++#define PWR_LIMIT_CHANNELS      61      /* MAX_CMD_SUPPORT_CHANNEL_NUM */
++#define PWR_LIMIT_TYPE_11AC     0
++#define PWR_LIMIT_TYPE_ANT_V2   7
++#define MAX_TX_POWER            63      /* default table, no country: 63 = no limit */
++
++#define BASIC_CONFIG_LEN        12
++#define STATISTICS_QUERY_LEN    184     /* sizeof(PARAM_802_11_STATISTICS_STRUCT), LEN[216] on the GX4 */
++
++/* AIS network for BSS_ACTIVATE_CTRL (nicActivateNetwork) */
++#define AIS_BSS_INDEX           0
++#define NETWORK_TYPE_AIS        0
++#define AIS_OWN_MAC_INDEX       0
++#define BMC_WLAN_INDEX_FIRST    4       /* secPrivacySeekForBcEntry: entries 0-3 are kept for BIP */
++
++/* RMAC own-MAC registers are somewhere in WF_RMAC (chip 0x820f5000, mt6632.c bus table) [I] */
++#define RMAC_BASE               0x820f5000u
++#define RMAC_WORDS              32
++
++/* Chip registers read with CMD ACCESS_REG (mt66xx_reg.h TOP_HVR / TOP_FVR) */
++#define CHIP_TOP_HVR            0x80021000u
++#define CHIP_TOP_FVR            0x80021004u
++
++#define QUERY_TIMEOUT_MS        2000
++#define POLL_MS                 100     /* receive thread: backup poll when no interrupt comes */
++#define HEALTH_US               1000000ull
++#define OFF_TIMEOUT_US          5000000ull
++#define THREAD_EXIT_TIMEOUT_US  2000000ull
++#define RX_BURST                64
++
++/* ---- Helpers ---- */
++
++static inline uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static inline uint16_t
++le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | (p[1] << 8));
++}
++
++static inline uint64_t
++le64(const uint8_t *p)
++{
++	return (uint64_t)le32(p) | ((uint64_t)le32(p + 4) << 32);
++}
++
++static inline void
++put16(uint8_t *p, uint16_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++}
++
++static inline void
++put32(uint8_t *p, uint32_t v)
++{
++	put16(p, (uint16_t)v);
++	put16(p + 2, (uint16_t)(v >> 16));
++}
++
++static uint64_t
++now_us(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++
++static bool
++mac_valid(const uint8_t *m)
++{
++	static const uint8_t zero[6];
++	return memcmp(m, zero, 6) != 0 && !(m[0] & 1) && !(m[0] == 0xff && m[1] == 0xff);
++}
++
++static void
++printable(char *out, size_t outsz, const uint8_t *p, size_t len)
++{
++	size_t n = MIN(len, outsz - 1);
++	for (size_t i = 0; i < n; i++) {
++		out[i] = (p[i] >= 0x20 && p[i] < 0x7f) ? (char)p[i] : (p[i] == 0 ? ' ' : '.');
++	}
++	out[n] = '\0';
++}
++
++/* ---- Files: NVRAM, WIFI_CUSTOM, wifi.cfg ---- */
++
++static int
++load_path(const char *path, uint8_t **data, size_t *size)
++{
++	char dir[MAXPATHLEN];
++	const char *slash = path ? strrchr(path, '/') : NULL;
++
++	if (slash == NULL || slash == path || slash[1] == '\0' || (size_t)(slash - path) >= sizeof(dir)) {
++		return EINVAL;
++	}
++	memcpy(dir, path, (size_t)(slash - path));
++	dir[slash - path] = '\0';
++	return rottenapple_firmware_load(dir, slash + 1, 64 * 1024, data, size);
++}
++
++/*
++ * The tag area after offset 256. The device's file (NVRAM version 0x0102,
++ * peer 0x0003) holds tags {id, length, data} with a one-byte length here:
++ * ids 0..0xc follow each other at 0x100, 0x105, 0x139, 0x181, 0x236, ...
++ * (gen4m's own WIFI_NVRAM_TAG_FORMAT has a 16-bit length; it only walks
++ * the tags on chips with is_support_nvram_fragment, not soc2_1x1, which
++ * gets the 2048 bytes as they are). Logged for information only [I].
++ */
++static void
++nvram_tags_log(const uint8_t *nv)
++{
++	char line[160];
++	size_t n = 0;
++	uint32_t off = NV_TAGS;
++	unsigned count = 0;
++
++	line[0] = '\0';
++	while (off + 2 <= MTK_WLAN_NVRAM_SIZE && count < 32) {
++		uint8_t id = nv[off], len = nv[off + 1];
++		if (id == 0 && len == 0 && count > 0) {
++			break;
++		}
++		if (off + 2 + len > MTK_WLAN_NVRAM_SIZE) {
++			break;
++		}
++		n += (size_t)snprintf(line + n, sizeof(line) - n, "%s%u@0x%x+%u", count ? " " : "", id, off, len);
++		if (n >= sizeof(line) - 16) {
++			LLOG("NVRAM tags (id@offset+length): %s", line);
++			n = 0;
++			line[0] = '\0';
++		}
++		off += 2 + len;
++		count++;
++	}
++	if (n) {
++		LLOG("NVRAM tags (id@offset+length): %s", line);
++	}
++	LLOG("NVRAM tag area: %u tags, ends at 0x%x", count, off);
++}
++
++static void
++cfg_parse(struct mtk_wlan *l, const uint8_t *buf, size_t size)
++{
++	size_t i = 0;
++
++	while (i < size && l->ncfg < MTK_WLAN_CFG_MAX) {
++		size_t end = i;
++		while (end < size && buf[end] != '\n' && buf[end] != '\r') {
++			end++;
++		}
++		/* "key value" / "key=value", '#' comments, surrounding blanks ignored */
++		size_t k = i;
++		while (k < end && (buf[k] == ' ' || buf[k] == '\t')) {
++			k++;
++		}
++		size_t ke = k;
++		while (ke < end && buf[ke] != ' ' && buf[ke] != '\t' && buf[ke] != '=' && buf[ke] != '#') {
++			ke++;
++		}
++		size_t v = ke;
++		while (v < end && (buf[v] == ' ' || buf[v] == '\t' || buf[v] == '=')) {
++			v++;
++		}
++		size_t ve = v;
++		while (ve < end && buf[ve] != '#') {
++			ve++;
++		}
++		while (ve > v && (buf[ve - 1] == ' ' || buf[ve - 1] == '\t')) {
++			ve--;
++		}
++		if (ke > k && buf[k] != '#') {
++			if (ke - k > MTK_WLAN_CFG_STR || ve - v > MTK_WLAN_CFG_STR) {
++				LLOG("wifi.cfg: entry at +%zu longer than %u characters: skipped (gen4m skips it too)", i,
++				    MTK_WLAN_CFG_STR);
++			} else {
++				memcpy(l->cfg_key[l->ncfg], buf + k, ke - k);
++				l->cfg_key[l->ncfg][ke - k] = '\0';
++				memcpy(l->cfg_val[l->ncfg], buf + v, ve - v);
++				l->cfg_val[l->ncfg][ve - v] = '\0';
++				l->ncfg++;
++			}
++		}
++		i = end + 1;
++	}
++}
++
++int
++mtk_wlan_prepare(struct mtk_wlan *l)
++{
++	uint8_t *data = NULL;
++	size_t size = 0;
++	int err;
++
++	l->prepared = false;
++	l->ncfg = 0;
++	if (l->nvram_path == NULL) {
++		LLOG("no mediatek,nvram in the ADT: W3 needs the NVRAM (MAC address, TX power)");
++		return EINVAL;
++	}
++	if ((err = load_path(l->nvram_path, &data, &size)) != 0) {
++		LLOG("NVRAM %s: not loaded (%d); rootfiles installs it from research/wifi/nvram", l->nvram_path, err);
++		return err;
++	}
++	if (size < MTK_WLAN_NVRAM_SIZE) {
++		LLOG("NVRAM: %zu bytes, need %u (WIFI_CFG_PARAM_STRUCT)", size, MTK_WLAN_NVRAM_SIZE);
++		rottenapple_firmware_free(data, size);
++		return EINVAL;
++	}
++	memcpy(l->nvram, data, MTK_WLAN_NVRAM_SIZE);
++	const uint8_t *nv = l->nvram;
++	/* gen4m glLoadNvram: version, MAC, country code (as two characters), 5 GHz */
++	LLOG("NVRAM: %zu bytes (%u sent to the firmware%s), version own 0x%04x peer 0x%04x (gen4m log \"NVRAM Version = "
++	    "[00000102,00000003]\")", size, MTK_WLAN_NVRAM_SIZE, size > MTK_WLAN_NVRAM_SIZE ? ", the rest is the nvdata trailer" : "",
++	    le16(nv + NV_OWN_VER), le16(nv + NV_PEER_VER));
++	LLOG("NVRAM: MAC %02x:%02x:%02x:%02x:%02x:%02x (%s), country code 0x%02x%02x%s, 5 GHz support %u enable %u, "
++	    "channel list map %u index %u", nv[NV_MAC], nv[NV_MAC + 1], nv[NV_MAC + 2], nv[NV_MAC + 3], nv[NV_MAC + 4],
++	    nv[NV_MAC + 5], mac_valid(nv + NV_MAC) ? "valid" : "NOT valid", nv[NV_COUNTRY], nv[NV_COUNTRY + 1],
++	    (nv[NV_COUNTRY] | nv[NV_COUNTRY + 1]) ? "" : " (none: default regulatory domain)", nv[NV_SUPPORT_5G],
++	    nv[NV_ENABLE_5G], nv[NV_REG_MAP], nv[NV_REG_INDEX]);
++	if (size >= MTK_WLAN_NVRAM_SIZE + 2) {
++		LLOG("NVRAM: trailer after byte 2048: %02x %02x (nvdata checksum; not sent)", data[MTK_WLAN_NVRAM_SIZE],
++		    data[MTK_WLAN_NVRAM_SIZE + 1]);
++	}
++	if (le16(nv + NV_OWN_VER) != 0x0102) {
++		LLOG("NVRAM: own version 0x%04x, expected 0x0102 (layout read from the device file); sent anyway, as gen4m does",
++		    le16(nv + NV_OWN_VER));
++	}
++	nvram_tags_log(nv);
++	/* wlanLoadManufactureData: u2CountryCode = cc[0] << 8 | cc[1] */
++	l->country = (uint16_t)((nv[NV_COUNTRY] << 8) | nv[NV_COUNTRY + 1]);
++	rottenapple_firmware_free(data, size);
++
++	/* WIFI_CUSTOM: gen4m only names it (platform.c WIFI_NVRAM_CUSTOM_NAME); logged */
++	if (l->custom_path && load_path(l->custom_path, &data, &size) == 0) {
++		LLOG("WIFI_CUSTOM: %zu bytes: %02x %02x %02x %02x %02x %02x%s (not used by gen4m)", size, size > 0 ? data[0] : 0,
++		    size > 1 ? data[1] : 0, size > 2 ? data[2] : 0, size > 3 ? data[3] : 0, size > 4 ? data[4] : 0,
++		    size > 5 ? data[5] : 0, size > 6 ? " ..." : "");
++		rottenapple_firmware_free(data, size);
++	}
++
++	/* wifi.cfg: built-in default "AdapScan 0x0" first (wlanLoadDefaultCustomerSetting), then the file */
++	strlcpy(l->cfg_key[0], "AdapScan", sizeof(l->cfg_key[0]));
++	strlcpy(l->cfg_val[0], "0x0", sizeof(l->cfg_val[0]));
++	l->ncfg = 1;
++	if (l->cfg_name && rottenapple_wifi_firmware_load(l->w, l->cfg_name, &data, &size) == 0) {
++		cfg_parse(l, data, size);
++		rottenapple_firmware_free(data, size);
++		for (unsigned i = 1; i < l->ncfg; i++) {
++			LLOG("wifi.cfg: %s = %s", l->cfg_key[i], l->cfg_val[i]);
++		}
++	} else if (l->cfg_name) {
++		LLOG("wifi.cfg not loaded: only the built-in default goes to the firmware");
++	}
++	l->prepared = true;
++	return 0;
++}
++
++/* ---- Commands through the generic API ---- */
++
++static int
++wl_set(struct mtk_wlan *l, uint8_t id, const void *payload, uint32_t len, const char *what)
++{
++	int err = rottenapple_wifi_cmd(l->w, id, true, payload, len, ROTTENAPPLE_WIFI_NO_EVENT, NULL, 0, NULL, 0);
++	LLOG("cmd 0x%02x %s: %u bytes%s", id, what, len, err ? " NOT SENT" : " sent");
++	return err;
++}
++
++static int
++wl_query(struct mtk_wlan *l, uint8_t id, const void *payload, uint32_t len, uint8_t eid, void *resp, uint32_t size,
++    uint32_t *rlen)
++{
++	return rottenapple_wifi_cmd(l->w, id, false, payload, len, eid, resp, size, rlen, QUERY_TIMEOUT_MS);
++}
++
++/* CMD_ACCESS_REG {u32 address, u32 data} query -> EVENT_ACCESS_REG {address, data} (wlanoidQueryMcrRead) */
++static int
++wl_reg_read(struct mtk_wlan *l, uint32_t addr, uint32_t *val)
++{
++	uint8_t cmd[8] = { 0 }, ev[8];
++	uint32_t rlen = 0;
++	int err;
++
++	put32(cmd, addr);
++	if ((err = wl_query(l, CMD_ID_ACCESS_REG, cmd, sizeof(cmd), EVENT_ID_ACCESS_REG, ev, sizeof(ev), &rlen)) != 0) {
++		return err;
++	}
++	if (rlen < 8 || le32(ev) != addr) {
++		LLOG("ACCESS_REG 0x%08x: answer for 0x%08x (%u bytes)", addr, rlen >= 4 ? le32(ev) : 0, rlen);
++		return EIO;
++	}
++	*val = le32(ev + 4);
++	return 0;
++}
++
++/*
++ * CMD_ID_GET_SET_CUSTOMER_CFG with CMD_HEADER {u32 version CMD_VER_1, u32
++ * type SET, u8 item count, pad, u16 buffer length, 4 x CMD_FORMAT_V1}, the
++ * format of connsysFwLogControl and wlanFeatureToFw.
++ */
++static int
++wl_customer_cfg(struct mtk_wlan *l, const char *const *keys, const char *const *vals, unsigned n, const char *what)
++{
++	uint8_t cmd[CUSTOMER_CFG_LEN];
++	int err = 0;
++
++	for (unsigned base = 0; base < n && err == 0; base += CUSTOMER_CFG_ITEMS) {
++		unsigned items = MIN(n - base, CUSTOMER_CFG_ITEMS);
++		bzero(cmd, sizeof(cmd));
++		put32(cmd + 0, CMD_VER_1);
++		put32(cmd + 4, CMD_TYPE_SET);
++		cmd[8] = (uint8_t)items;
++		put16(cmd + 10, (uint16_t)(items * CUSTOMER_CFG_ITEM_LEN));
++		for (unsigned i = 0; i < items; i++) {
++			uint8_t *it = cmd + 12 + i * CUSTOMER_CFG_ITEM_LEN;
++			size_t kl = strnlen(keys[base + i], MTK_WLAN_CFG_STR), vl = strnlen(vals[base + i], MTK_WLAN_CFG_STR);
++			it[0] = ITEM_TYPE_STR;
++			it[1] = (uint8_t)kl;
++			it[2] = (uint8_t)vl;
++			memcpy(it + 4, keys[base + i], kl);
++			memcpy(it + 4 + MTK_WLAN_CFG_STR, vals[base + i], vl);
++			LLOG("  %s item %u: \"%s\" = \"%s\"", what, base + i, keys[base + i], vals[base + i]);
++		}
++		err = wl_set(l, CMD_ID_GET_SET_CUSTOMER_CFG, cmd, sizeof(cmd), what);
++	}
++	return err;
++}
++
++/* CMD_BASIC_CONFIG {native 802.11, assert path, debug level, 0, u16 RX csum, u16 TX csum, segment, 3 x 0} */
++static int
++wl_basic_config(struct mtk_wlan *l)
++{
++	uint8_t cmd[BASIC_CONFIG_LEN] = { 0 };
++
++	/*
++	 * gen4m: native 802.11 0, assert path DBG_ASSERT_PATH_WIFI (0), level
++	 * DBG_ASSERT_CTRL_LEVEL_ERROR (0); checksum offload bits only with
++	 * CFG_TCP_IP_CHKSUM_OFFLOAD and fgIsSupportCsumOffload. Off here: the
++	 * W5 data path computes checksums in software until it handles the
++	 * RX descriptor checksum status.
++	 */
++	LLOG("BASIC_CONFIG: native 802.11 0, assert path Wi-Fi, assert level error, checksum offload off "
++	    "(firmware %s it)", l->d->csum_offload ? "supports" : "does not report");
++	return wl_set(l, CMD_ID_BASIC_CONFIG, cmd, sizeof(cmd), "BASIC_CONFIG");
++}
++
++/*
++ * CMD_SET_DOMAIN_INFO {u16 country, u16 is-passive, 6 x CMD_SUBBAND_INFO
++ * {reg class, band, channel span, first channel, channel count, 3 x 0},
++ * u8 2.4 GHz bandwidth, u8 5 GHz bandwidth, 2 x 0}. rlmDomainSendCmd with
++ * no country (the NVRAM has none): rlmDomainSendPassiveScanInfoCmd with
++ * arSupportedRegDomains_Passive[1] (the default: passive on 52-64 and
++ * 100-144), then rlmDomainSendDomainInfoCmd with the last entry of
++ * arSupportedRegDomains (the default group). Bandwidth modes
++ * CONFIG_BW_20_40M for both bands (aisFsmInit with Sta2gBw = 40 MHz).
++ */
++static void
++domain_fill(uint8_t *cmd, uint16_t country, bool passive, const uint8_t sub[SUBBANDS][5])
++{
++	bzero(cmd, DOMAIN_INFO_LEN);
++	put16(cmd + 0, country);
++	put16(cmd + 2, passive ? 1 : 0);
++	for (unsigned i = 0; i < SUBBANDS; i++) {
++		uint8_t *s = cmd + 4 + 8 * i;
++		s[0] = sub[i][0];
++		s[1] = sub[i][1];
++		if (sub[i][1] != 0) {           /* BAND_NULL: only class and band are copied */
++			s[2] = sub[i][2];
++			s[3] = sub[i][3];
++			s[4] = sub[i][4];
++		}
++	}
++	cmd[4 + 8 * SUBBANDS] = CONFIG_BW_20_40M;
++	cmd[5 + 8 * SUBBANDS] = CONFIG_BW_20_40M;
++}
++
++static int
++wl_domain(struct mtk_wlan *l)
++{
++	static const uint8_t passive[SUBBANDS][5] = {
++		{ 81, BAND_2G4, CHNL_SPAN_5, 1, 0 }, { 82, BAND_2G4, CHNL_SPAN_5, 14, 0 },
++		{ 115, BAND_5G, CHNL_SPAN_20, 36, 0 }, { 118, BAND_5G, CHNL_SPAN_20, 52, 4 },
++		{ 121, BAND_5G, CHNL_SPAN_20, 100, 12 }, { 125, BAND_5G, CHNL_SPAN_20, 149, 0 },
++	};
++	static const uint8_t active[SUBBANDS][5] = {
++		{ 81, BAND_2G4, CHNL_SPAN_5, 1, 13 }, { 115, BAND_5G, CHNL_SPAN_20, 36, 4 },
++		{ 118, BAND_5G, CHNL_SPAN_20, 52, 4 }, { 121, BAND_5G, CHNL_SPAN_20, 100, 12 },
++		{ 125, BAND_5G, CHNL_SPAN_20, 149, 5 }, { 0, 0, 0, 0, 0 },
++	};
++	uint8_t cmd[DOMAIN_INFO_LEN];
++	int err;
++
++	if (l->country != 0) {
++		/* gen4m would look the country up in its tables; we only carry the default group */
++		LLOG("NVRAM country code 0x%04x: not in our tables, the default regulatory domain is used", l->country);
++	}
++	LLOG("regulatory domain: default group (gen4m: \"No matched country code, use the default regulatory "
++	    "domain\"): 2.4 GHz 1-13, 5 GHz 36-48, 52-64 (DFS), 100-144 (DFS), 149-165; passive scan on 52-64, 100-144");
++	domain_fill(cmd, l->country, true, passive);
++	if ((err = wl_set(l, CMD_ID_SET_DOMAIN_INFO, cmd, sizeof(cmd), "SET_DOMAIN_INFO (passive channels)")) != 0) {
++		return err;
++	}
++	domain_fill(cmd, l->country, false, active);
++	return wl_set(l, CMD_ID_SET_DOMAIN_INFO, cmd, sizeof(cmd), "SET_DOMAIN_INFO (channels)");
++}
++
++/*
++ * CMD_SET_COUNTRY_CHANNEL_POWER_LIMIT {u16 country, u8 flag, u8 count, u8
++ * keep table, u8 band index, u8 limit type, u8 version 1, entries}, 1472
++ * bytes. Without a country, rlmDomainPwrLimitDefaultTableDecision picks
++ * the {0, 0} entry of g_rRlmPowerLimitDefault: 63 for every sub-band, unit
++ * dBm, so rlmDomainBuildCmdByDefaultTable writes 63 (MAX_TX_POWER, no
++ * limit) into all 9 values of each of the 61 channels (1-14, 36-50, 52-64,
++ * 100-144, 149-165, the even ones in 5 GHz); the configuration table has no
++ * {0, 0} rows. The second command (PWR_LIMIT_TYPE_COMP_ANT_V2, keep table)
++ * carries no entries: txpowerctrl.cfg is absent and no SAR scenario is on.
++ */
++static int
++wl_power_limits(struct mtk_wlan *l, const char *when)
++{
++	static const struct {
++		uint8_t first, last, step;
++	} sub[] = { { 1, 14, 1 }, { 36, 50, 2 }, { 52, 64, 2 }, { 100, 144, 2 }, { 149, 165, 2 } };
++	uint8_t *cmd = kalloc_data(PWR_LIMIT_LEN, Z_WAITOK | Z_ZERO);
++	char what[64];
++	unsigned n = 0;
++	int err;
++
++	if (cmd == NULL) {
++		return ENOMEM;
++	}
++	put16(cmd + 0, 0);                      /* country of the default table entry */
++	cmd[6] = PWR_LIMIT_TYPE_11AC;
++	cmd[7] = 1;
++	for (unsigned s = 0; s < ROTTENAPPLE_COUNT(sub); s++) {
++		for (unsigned ch = sub[s].first; ch <= sub[s].last && n < PWR_LIMIT_CHANNELS; ch += sub[s].step, n++) {
++			uint8_t *e = cmd + PWR_LIMIT_HDR + n * PWR_LIMIT_ENTRY;
++			e[0] = (uint8_t)ch;
++			memset(e + 1, MAX_TX_POWER, PWR_LIMIT_VALUES);
++		}
++	}
++	cmd[3] = (uint8_t)n;
++	snprintf(what, sizeof(what), "SET_COUNTRY_POWER_LIMIT (%s, %u channels at %u)", when, n, MAX_TX_POWER);
++	err = wl_set(l, CMD_ID_SET_COUNTRY_POWER_LIMIT, cmd, PWR_LIMIT_LEN, what);
++	if (err == 0) {
++		bzero(cmd, PWR_LIMIT_LEN);
++		cmd[4] = 1;                     /* fgPwrTblKeep */
++		cmd[6] = PWR_LIMIT_TYPE_ANT_V2;
++		cmd[7] = 1;
++		snprintf(what, sizeof(what), "SET_COUNTRY_POWER_LIMIT (%s, antenna, no entries)", when);
++		err = wl_set(l, CMD_ID_SET_COUNTRY_POWER_LIMIT, cmd, PWR_LIMIT_LEN, what);
++	}
++	kfree_data(cmd, PWR_LIMIT_LEN);
++	return err;
++}
++
++/* CMD_BSS_ACTIVATE_CTRL {BSS index, active, network type, own MAC index, MAC[6], BMC WLAN index, 0} */
++static int
++wl_bss_activate(struct mtk_wlan *l, bool on)
++{
++	uint8_t cmd[12] = { 0 };
++
++	cmd[0] = AIS_BSS_INDEX;
++	cmd[1] = on ? 1 : 0;
++	cmd[2] = NETWORK_TYPE_AIS;
++	cmd[3] = AIS_OWN_MAC_INDEX;
++	if (on) {
++		memcpy(cmd + 4, l->mac, 6);     /* nicDeactivateNetwork leaves the address 0 */
++	}
++	cmd[10] = l->bmc_idx;
++	int err = wl_set(l, CMD_ID_BSS_ACTIVATE_CTRL, cmd, sizeof(cmd), on ? "BSS_ACTIVATE_CTRL (AIS on)" :
++	    "BSS_ACTIVATE_CTRL (AIS off)");
++	if (err == 0) {
++		l->bss_active = on;
++	}
++	return err;
++}
++
++/* Read the RMAC words; false when a read fails (stops early). */
++static bool
++rmac_read(struct mtk_wlan *l, uint32_t *w)
++{
++	for (unsigned i = 0; i < RMAC_WORDS; i++) {
++		int err = wl_reg_read(l, RMAC_BASE + 4 * i, &w[i]);
++		if (err) {
++			LLOG("RMAC 0x%08x: read failed (%d)", RMAC_BASE + 4 * i, err);
++			return false;
++		}
++	}
++	return true;
++}
++
++/*
++ * Words of the RMAC block that hold the MAC: MAC[0..3] little-endian with
++ * MAC[4..5] in the low half of the next word (the CONNAC own-MAC register
++ * pair layout [I]), or any word equal to four consecutive MAC bytes.
++ */
++static unsigned
++rmac_find(struct mtk_wlan *l, const uint32_t *w, char *out, size_t outsz)
++{
++	const uint8_t *m = l->mac;
++	uint32_t lo = le32(m), hi = le16(m + 4), mid = le32(m + 2);
++	unsigned found = 0;
++	size_t n = 0;
++
++	out[0] = '\0';
++	for (unsigned i = 0; i < RMAC_WORDS && n < outsz - 48; i++) {
++		if (w[i] == lo && i + 1 < RMAC_WORDS && (w[i + 1] & 0xffff) == hi) {
++			n += (size_t)snprintf(out + n, outsz - n, " 0x%08x/0x%08x = %08x %08x (address pair)",
++			    RMAC_BASE + 4 * i, RMAC_BASE + 4 * i + 4, w[i], w[i + 1]);
++			found++;
++		} else if (w[i] == mid || w[i] == __builtin_bswap32(lo) || w[i] == __builtin_bswap32(mid)) {
++			n += (size_t)snprintf(out + n, outsz - n, " 0x%08x = %08x (4 address bytes)", RMAC_BASE + 4 * i, w[i]);
++			found++;
++		}
++	}
++	return found;
++}
++
++/*
++ * The MAC address. gen4m (wlanUpdateNetworkAddress): the host-supplied
++ * address (the NVRAM's) when it is valid, else the efuse one, else a
++ * generated 00:08:22:xx:xx:xx; nicApplyNetworkAddress keeps it host side.
++ * It reaches the firmware with the AIS network activation (CMD 0x11). The
++ * readback: the RMAC block before and after the activation, through the
++ * firmware's own register access (CMD 0xC0).
++ */
++static int
++wl_mac(struct mtk_wlan *l)
++{
++	uint32_t before[RMAC_WORDS], after[RMAC_WORDS];
++	char found[256];
++	int err;
++
++	if (mac_valid(l->nvram + NV_MAC)) {
++		memcpy(l->mac, l->nvram + NV_MAC, 6);
++		l->mac_source = "NVRAM";
++	} else if (mac_valid(l->d->efuse_mac)) {
++		memcpy(l->mac, l->d->efuse_mac, 6);
++		l->mac_source = "efuse";
++	} else {
++		uint32_t t = (uint32_t)now_us();
++		l->mac[0] = 0x00;
++		l->mac[1] = 0x08;
++		l->mac[2] = 0x22;
++		l->mac[3] = (uint8_t)t;
++		l->mac[4] = (uint8_t)(t >> 8);
++		l->mac[5] = (uint8_t)(t >> 16);
++		l->mac_source = "generated (no valid NVRAM or efuse address)";
++	}
++	LLOG("MAC address %02x:%02x:%02x:%02x:%02x:%02x from the %s (efuse %02x:%02x:%02x:%02x:%02x:%02x); gen4m: \"Using "
++	    "host-supplied MAC address\"", l->mac[0], l->mac[1], l->mac[2], l->mac[3], l->mac[4], l->mac[5], l->mac_source,
++	    l->d->efuse_mac[0], l->d->efuse_mac[1], l->d->efuse_mac[2], l->d->efuse_mac[3], l->d->efuse_mac[4],
++	    l->d->efuse_mac[5]);
++
++	l->bmc_idx = BMC_WLAN_INDEX_FIRST;
++	if (l->d->wtbl_entries && l->bmc_idx >= l->d->wtbl_entries) {
++		LLOG("only %u WTBL entries: no broadcast entry for the AIS network", l->d->wtbl_entries);
++		return EINVAL;
++	}
++	bool have_before = rmac_read(l, before);
++	if (have_before && rmac_find(l, before, found, sizeof(found))) {
++		LLOG("MAC already in RMAC before the activation:%s", found);
++	}
++	LLOG("AIS network on: BSS %u, own MAC index %u, broadcast WLAN index %u (gen4m nicActivateNetwork)", AIS_BSS_INDEX,
++	    AIS_OWN_MAC_INDEX, l->bmc_idx);
++	if ((err = wl_bss_activate(l, true)) != 0) {
++		return err;
++	}
++	if (!rmac_read(l, after)) {
++		LLOG("MAC readback: RMAC not readable; the address is set (activation sent) but not proven");
++	} else if (rmac_find(l, after, found, sizeof(found))) {
++		LLOG("MAC readback: PASSED, %02x:%02x:%02x:%02x:%02x:%02x is in the RMAC own-address registers:%s", l->mac[0],
++		    l->mac[1], l->mac[2], l->mac[3], l->mac[4], l->mac[5], found);
++	} else {
++		LLOG("MAC readback: address NOT found in RMAC 0x%08x-0x%08x (the own-MAC register offset is our guess [I]); "
++		    "words changed by the activation:", RMAC_BASE, RMAC_BASE + 4 * RMAC_WORDS - 4);
++	}
++	if (have_before) {
++		unsigned changed = 0;
++		for (unsigned i = 0; i < RMAC_WORDS && changed < 8; i++) {
++			if (before[i] != after[i]) {
++				LLOG("  RMAC 0x%08x: 0x%08x -> 0x%08x", RMAC_BASE + 4 * i, before[i], after[i]);
++				changed++;
++			}
++		}
++		if (changed == 0) {
++			LLOG("  RMAC: no word changed with the activation");
++		}
++	}
++	/* back to gen4m's idle state (AIS deactivated); W4 activates it around each scan */
++	return wl_bss_activate(l, false);
++}
++
++/* EVENT_STATISTICS: 14 x u64 counters, then u32 HW MAC awake duration (wsys_cmd_handler_fw.h) */
++static int
++wl_statistics(struct mtk_wlan *l)
++{
++	uint8_t q[STATISTICS_QUERY_LEN] = { 0 }, *ev;
++	uint32_t rlen = 0;
++	int err;
++
++	ev = kalloc_data(MTK_WFDMA_EVT_BUF, Z_WAITOK | Z_ZERO);
++	if (ev == NULL) {
++		return ENOMEM;
++	}
++	err = wl_query(l, CMD_ID_GET_STATISTICS, q, sizeof(q), EVENT_ID_STATISTICS, ev, MTK_WFDMA_EVT_BUF, &rlen);
++	if (err == 0 && rlen >= 116) {
++		LLOG("statistics (%u bytes): TX fragments %llu, multicast TX %llu, failed %llu, retries %llu, multiple "
++		    "retries %llu, RTS ok %llu / failed %llu, ACK failures %llu, duplicates %llu", rlen, le64(ev),
++		    le64(ev + 8), le64(ev + 16), le64(ev + 24), le64(ev + 32), le64(ev + 40), le64(ev + 48), le64(ev + 56),
++		    le64(ev + 64));
++		LLOG("statistics: RX fragments %llu, multicast RX %llu, FCS errors %llu, MDRDY %llu, channel idle %llu, HW "
++		    "MAC awake %u", le64(ev + 72), le64(ev + 80), le64(ev + 88), le64(ev + 96), le64(ev + 104), le32(ev + 112));
++	} else if (err == 0) {
++		LLOG("statistics: short event (%u bytes)", rlen);
++		err = EIO;
++	}
++	kfree_data(ev, MTK_WFDMA_EVT_BUF);
++	return err;
++}
++
++/* ---- Unsolicited firmware events ---- */
++
++static void
++ev_debug_msg(__unused struct rottenapple_wifi *w, const struct rottenapple_wifi_event *ev, void *arg)
++{
++	struct mtk_wlan *l = arg;
++	char text[129];
++
++	/* EVENT_DEBUG_MSG {u16 id, u8 type, u8 flags, u32 value, u16 size, 2 x 0, text} */
++	l->debug_msgs++;
++	if (ev->len < 12) {
++		return;
++	}
++	uint32_t n = MIN((uint32_t)le16(ev->body + 8), ev->len - 12);
++	printable(text, sizeof(text), ev->body + 12, n);
++	if (l->debug_msgs <= 64) {
++		LLOG("firmware debug message id 0x%04x type %u value 0x%08x: \"%s\"", le16(ev->body), ev->body[2],
++		    le32(ev->body + 4), text);
++	}
++}
++
++static void
++ev_assert(__unused struct rottenapple_wifi *w, const struct rottenapple_wifi_event *ev, void *arg)
++{
++	struct mtk_wlan *l = arg;
++	char text[129];
++
++	l->asserts++;
++	printable(text, sizeof(text), ev->body, ev->len);
++	LLOG("FIRMWARE ASSERT DUMP event (%u bytes): \"%s\"", ev->len, text);
++}
++
++/* INIT_EVENT_CMD_RESULT {u8 status, u8 CID, 2 x 0}: gen4m "FW not support cmd" */
++static void
++ev_cmd_result(__unused struct rottenapple_wifi *w, const struct rottenapple_wifi_event *ev, void *arg)
++{
++	struct mtk_wlan *l = arg;
++
++	l->rejected++;
++	LLOG("firmware did not handle command 0x%02x (seq %u): status %u", ev->len >= 2 ? ev->body[1] : 0, ev->seq,
++	    ev->len >= 1 ? ev->body[0] : 0);
++}
++
++/* ---- Receive thread ---- */
++
++static void
++wl_wake(void *arg)
++{
++	struct mtk_wlan *l = arg;
++
++	l->wake_pending = 1;
++	thread_wakeup((event_t)(uintptr_t)&l->wake_pending);
++}
++
++static void
++wl_rx_events(struct mtk_wlan *l)
++{
++	for (unsigned k = 0; k < RX_BURST; k++) {
++		uint32_t len = 0;
++		int err = mtk_wfdma_rx_event(l->d, l->rxbuf, MTK_WFDMA_EVT_BUF, &len);
++		if (err) {
++			if (err != EAGAIN) {
++				LLOG("RX ring 1: error %d", err);
++			}
++			return;
++		}
++		uint16_t type = (uint16_t)(le32(l->rxbuf) >> 16);
++		if (len < MTK_WFDMA_EVT_BODY || (type & RX_PKT_TYPE_SW_MASK) != RX_PKT_TYPE_SW_EVENT) {
++			if (l->rx_other++ < 16) {
++				LLOG("RX ring 1: %u-byte packet of type 0x%04x (not an event): %08x %08x %08x %08x", len, type,
++				    le32(l->rxbuf), le32(l->rxbuf + 4), le32(l->rxbuf + 8), le32(l->rxbuf + 12));
++			}
++			continue;
++		}
++		l->events++;
++		rottenapple_wifi_event_input(l->w, l->rxbuf[MTK_WFDMA_EVT_EID], l->rxbuf[MTK_WFDMA_EVT_SEQ],
++		    l->rxbuf + MTK_WFDMA_EVT_BODY, len - MTK_WFDMA_EVT_BODY);
++	}
++}
++
++static void
++wl_rx_data(struct mtk_wlan *l)
++{
++	for (unsigned k = 0; k < RX_BURST; k++) {
++		uint32_t len = 0;
++		int err = mtk_wfdma_rx_data(l->d, l->databuf, MTK_WFDMA_EVT_BUF, &len);
++		if (err) {
++			if (err != EAGAIN) {
++				LLOG("RX ring 0: error %d", err);
++			}
++			return;
++		}
++		/* nothing consumes data frames before W4/W5: count them, show the first descriptors */
++		if (l->data_pkts++ < 8) {
++			LLOG("RX ring 0: %u-byte packet, RXD %08x %08x %08x %08x (dropped: no data path yet)", len,
++			    le32(l->databuf), le32(l->databuf + 4), le32(l->databuf + 8), le32(l->databuf + 12));
++		}
++	}
++}
++
++static void
++wl_health_log(struct mtk_wlan *l, const char *why, const struct mtk_wfdma_health *h)
++{
++	LLOG("%s: CONN_ON_MISC 0x%08x (%s), PC 0x%08x, COM_REG0 0x%08x, MCU2HOST 0x%08x, INT_STA 0x%08x; log rings "
++	    "0x%x/0x%x/0x%x/0x%x; coredump %u pages; IRQs %u, events %u, data packets %u, debug messages %u, asserts %u",
++	    why, h->misc, h->ready ? "ready" : "NOT READY", h->pc, h->com_reg0, h->mcu2host, h->int_sta, h->log_w[0],
++	    h->log_w[1], h->log_w[2], h->log_w[3], h->coredump_pages, l->irqs, l->events, l->data_pkts, l->debug_msgs,
++	    l->asserts);
++}
++
++/*
++ * Is the firmware alive: ready bits, MCU error interrupt, coredump area,
++ * log rings (new text is printed). Returns false once it is gone.
++ */
++static bool
++wl_health(struct mtk_wlan *l, const char *why)
++{
++	struct mtk_wfdma_health h;
++
++	mtk_wfdma_health(l->d, &h);
++	if (memcmp(h.log_w, l->h_last.log_w, sizeof(h.log_w)) != 0) {
++		mtk_wfdma_fwlog_new(l->d, l->h_last.log_w, h.log_w, 20);
++	}
++	if (h.coredump_pages != l->h_last.coredump_pages && !l->coredump_logged) {
++		LLOG("coredump area: %u -> %u pages written: the firmware dumped state (assert?)", l->h_last.coredump_pages,
++		    h.coredump_pages);
++		mtk_connsys_fwlog_dump(l->d->emi, l->d->emi_size, "coredump", true);
++		l->coredump_logged = true;
++	}
++	if (!h.ready && !l->fw_dead) {
++		l->fw_dead = true;
++		wl_health_log(l, "FIRMWARE NO LONGER READY", &h);
++		mtk_connsys_fwlog_dump(l->d->emi, l->d->emi_size, "firmware down", true);
++	} else if (why) {
++		wl_health_log(l, why, &h);
++	}
++	l->h_last = h;
++	return !l->fw_dead;
++}
++
++static void
++wl_thread(void *arg, __unused wait_result_t wr)
++{
++	struct mtk_wlan *l = arg;
++
++	l->running = true;
++	LLOG("receive thread running (SPI 409 + %u ms backup poll)", POLL_MS);
++	while (!l->stop) {
++		uint32_t mcu_sw = 0;
++		(void)assert_wait_timeout((event_t)(uintptr_t)&l->wake_pending, THREAD_UNINT, POLL_MS, NSEC_PER_MSEC);
++		if (l->wake_pending || l->stop) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++		} else {
++			(void)thread_block(THREAD_CONTINUE_NULL);
++		}
++		if (l->wake_pending) {
++			l->irqs++;
++		} else {
++			l->polls++;
++		}
++		l->wake_pending = 0;
++		if (l->stop) {
++			break;
++		}
++		uint32_t sta = mtk_wfdma_irq_ack(l->d, &mcu_sw);
++		if (mcu_sw) {
++			l->mcu_sw++;
++			LLOG("MCU software interrupt: MCU2HOST_SW_STA 0x%08x (INT_STA 0x%08x)%s", mcu_sw, sta,
++			    (mcu_sw & 0x3c) ? ": error/recovery bits (SER)" : "");
++		}
++		wl_rx_events(l);
++		wl_rx_data(l);
++		mtk_wfdma_irq_unmask(l->d);
++		if (l->wmt) {
++			mtk_wmt_poll(l->wmt);
++		}
++		uint64_t t = now_us();
++		if (t >= l->next_health) {
++			const char *beat = NULL;
++			if (t >= l->next_beat) {
++				/* 10 s, then every minute for 10 minutes, then every 30 minutes */
++				beat = "alive";
++				l->beats++;
++				l->next_beat = t + (l->beats < 11 ? 60 : 1800) * 1000000ull;
++			}
++			(void)wl_health(l, beat);
++			l->next_health = t + HEALTH_US;
++		}
++	}
++	LLOG("receive thread stopped (IRQs %u, polls %u, events %u, data packets %u)", l->irqs, l->polls, l->events,
++	    l->data_pkts);
++	l->running = false;
++	l->exited = true;
++	thread_wakeup((event_t)(uintptr_t)&l->exited);
++}
++
++static int
++wl_thread_start(struct mtk_wlan *l)
++{
++	thread_t thread;
++
++	l->stop = false;
++	l->exited = false;
++	l->wake_pending = 0;
++	l->t_start = now_us();
++	l->next_health = l->t_start + HEALTH_US;
++	l->next_beat = l->t_start + 10 * 1000000ull;
++	if (kernel_thread_start(wl_thread, l, &thread) != KERN_SUCCESS) {
++		LLOG("receive thread: cannot start");
++		return ENOMEM;
++	}
++	thread_deallocate(thread);
++	l->thread_started = true;
++	for (uint64_t t0 = now_us(); !l->running && now_us() - t0 < THREAD_EXIT_TIMEOUT_US;) {
++		delay(1000);
++	}
++	return 0;
++}
++
++static void
++wl_thread_stop(struct mtk_wlan *l)
++{
++	if (!l->thread_started || l->exited) {
++		return;
++	}
++	l->stop = true;
++	thread_wakeup((event_t)(uintptr_t)&l->wake_pending);
++	uint64_t t0 = now_us();
++	while (!l->exited && now_us() - t0 < THREAD_EXIT_TIMEOUT_US) {
++		delay(2000);
++	}
++	if (!l->exited) {
++		LLOG("receive thread did not stop within %llu ms", THREAD_EXIT_TIMEOUT_US / 1000);
++	}
++}
++
++/* ---- W3 ---- */
++
++int
++mtk_wlan_start(struct mtk_wlan *l)
++{
++	static const char *const dbglog_key[] = { "EnableDbgLog" };
++	const char *dbglog_val[1];
++	const char *keys[MTK_WLAN_CFG_MAX], *vals[MTK_WLAN_CFG_MAX];
++	uint32_t fwlog = 0, hw = 0, fw = 0;
++	int err;
++
++	if (!l->prepared) {
++		return EINVAL;
++	}
++	l->started = true;
++	l->rxbuf = kalloc_data(MTK_WFDMA_EVT_BUF, Z_WAITOK | Z_ZERO);
++	l->databuf = kalloc_data(MTK_WFDMA_EVT_BUF, Z_WAITOK | Z_ZERO);
++	if (l->rxbuf == NULL || l->databuf == NULL) {
++		return ENOMEM;
++	}
++	mtk_wfdma_health(l->d, &l->h_last);
++	wl_health_log(l, "W3 start", &l->h_last);
++	(void)rottenapple_wifi_event_register(l->w, EVENT_ID_DEBUG_MSG, ev_debug_msg, l);
++	(void)rottenapple_wifi_event_register(l->w, EVENT_ID_ASSERT_DUMP, ev_assert, l);
++	(void)rottenapple_wifi_event_register(l->w, EVENT_ID_CMD_RESULT, ev_cmd_result, l);
++
++	/* Event path: the receive thread on SPI 409 (polling backs it up) */
++	if ((err = wl_thread_start(l)) != 0) {
++		return err;
++	}
++	mtk_wfdma_irq_attach(l->d, wl_wake, l);
++
++	/* connsysFwLogControl: "EnableDbgLog" 0 on Android unless a log reader runs; boot-arg rottenapple_wifi_fwlog=1 */
++	(void)PE_parse_boot_argn("rottenapple_wifi_fwlog", &fwlog, sizeof(fwlog));
++	dbglog_val[0] = fwlog ? "1" : "0";
++	if ((err = wl_customer_cfg(l, dbglog_key, dbglog_val, 1, "firmware log switch")) != 0) {
++		return err;
++	}
++	if ((err = wl_basic_config(l)) != 0) {
++		return err;
++	}
++	/* wlanLoadManufactureData + txPwrCtrlLoadConfig, in gen4m's order */
++	if ((err = wl_domain(l)) != 0 || (err = wl_power_limits(l, "regulatory")) != 0) {
++		return err;
++	}
++	LLOG("NVRAM to the firmware: %u bytes (SET_NVRAM_SETTINGS, whole WIFI_CFG_PARAM_STRUCT: soc2_1x1 has no NVRAM "
++	    "fragments)", MTK_WLAN_NVRAM_SIZE);
++	if ((err = wl_set(l, CMD_ID_SET_NVRAM_SETTINGS, l->nvram, MTK_WLAN_NVRAM_SIZE, "SET_NVRAM_SETTINGS")) != 0) {
++		return err;
++	}
++	if ((err = wl_power_limits(l, "after NVRAM, txPwrCtrlLoadConfig")) != 0) {
++		return err;
++	}
++	/* wlanFeatureToFw(WLAN_CFG_DEFAULT): the built-in default and the wifi.cfg entries, 4 per command */
++	for (unsigned i = 0; i < l->ncfg; i++) {
++		keys[i] = l->cfg_key[i];
++		vals[i] = l->cfg_val[i];
++	}
++	if ((err = wl_customer_cfg(l, keys, vals, l->ncfg, "wifi.cfg")) != 0) {
++		return err;
++	}
++
++	/* Sync point and chip info: the firmware answers register queries after all the sets above */
++	if ((err = wl_reg_read(l, CHIP_TOP_HVR, &hw)) != 0 || (err = wl_reg_read(l, CHIP_TOP_FVR, &fw)) != 0) {
++		LLOG("ACCESS_REG query failed (%d): the firmware does not answer normal commands", err);
++		(void)wl_health(l, "after the configuration");
++		return err;
++	}
++	LLOG("configuration accepted (the register query after it was answered); chip: TOP_HVR 0x%08x TOP_FVR 0x%08x "
++	    "(expect 0x8a00/0x8a00), firmware %u.%u build %u branch \"%s\" date \"%s\", efuse %u bytes", hw, fw,
++	    l->d->fw_ver >> 8, l->d->fw_ver & 0xff, l->d->fw_build, l->d->fw_branch, l->d->fw_date, l->d->efuse_size);
++
++	if ((err = wl_mac(l)) != 0) {
++		return err;
++	}
++	if ((err = wl_statistics(l)) != 0) {
++		LLOG("statistics query failed (%d); not fatal", err);
++	}
++	/* settle, then the verdict: still ready, no assert, nothing new in the coredump area */
++	delay(500000);
++	if (!wl_health(l, "W3 done")) {
++		return EIO;
++	}
++	if (l->asserts) {
++		LLOG("the firmware sent %u assert dump event(s)", l->asserts);
++		return EIO;
++	}
++	LLOG("W3: Wi-Fi configured and running: MAC from the %s, events by interrupt (%u IRQs so far, %u polls), %u "
++	    "command(s) not handled by the firmware", l->mac_source, l->irqs, l->polls, l->rejected);
++	return 0;
++}
++
++void
++mtk_wlan_stop(struct mtk_wlan *l)
++{
++	struct mtk_wfdma_health h;
++
++	if (!l->started) {
++		return;
++	}
++	LLOG("stopping Wi-Fi (gen4m halHifPowerOffWifi order)");
++	if (l->running && !l->fw_dead) {
++		if (l->bss_active) {
++			(void)wl_bss_activate(l, false);
++		}
++		/* CMD_NIC_POWER_CTRL {power mode 1 = off, 3 x 0} (wlanSendNicPowerCtrlCmd(TRUE)) */
++		uint8_t cmd[4] = { 1, 0, 0, 0 };
++		if (wl_set(l, CMD_ID_NIC_POWER_CTRL, cmd, sizeof(cmd), "NIC_POWER_CTRL (Wi-Fi off)") == 0) {
++			uint64_t t0 = now_us();
++			do {
++				delay(5000);
++				mtk_wfdma_health(l->d, &h);
++			} while (h.ready && now_us() - t0 < OFF_TIMEOUT_US);
++			LLOG("Wi-Fi power off %s: CONN_ON_MISC 0x%08x after %llu ms (gen4m wlanCheckWifiFunc(FALSE))",
++			    h.ready ? "NOT acknowledged" : "done", h.misc, (now_us() - t0) / 1000);
++		}
++	}
++	mtk_wfdma_irq_detach(l->d);
++	wl_thread_stop(l);
++	rottenapple_wifi_event_unregister(l->w, EVENT_ID_DEBUG_MSG, ev_debug_msg, l);
++	rottenapple_wifi_event_unregister(l->w, EVENT_ID_ASSERT_DUMP, ev_assert, l);
++	rottenapple_wifi_event_unregister(l->w, EVENT_ID_CMD_RESULT, ev_cmd_result, l);
++	mtk_wfdma_health(l->d, &h);
++	wl_health_log(l, "stopped", &h);
++	l->started = false;
++	l->bss_active = false;
++}
++
++void
++mtk_wlan_release(struct mtk_wlan *l)
++{
++	if (l->rxbuf) {
++		kfree_data(l->rxbuf, MTK_WFDMA_EVT_BUF);
++		l->rxbuf = NULL;
++	}
++	if (l->databuf) {
++		kfree_data(l->databuf, MTK_WFDMA_EVT_BUF);
++		l->databuf = NULL;
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/bsd/dev/rottenapple_mtk_wlan.h
+@@ -0,0 +1,89 @@
++/*
++ * Rotten Apple: MediaTek CONNAC1 Wi-Fi firmware configuration and event
++ * path for the CONNSYS backend (rottenapple_mtk_connsys.c). Milestone W3,
++ * docs/WIFI-PLAN.md "W3".
++ *
++ * After the firmware is ready (rottenapple_mtk_wfdma.c), this layer starts
++ * the receive thread on SPI 409, sends what gen4m's wlanAdapterStart /
++ * wlanOnPostFirmwareReady / wlanOnWhenProbeSuccess send for this chip
++ * (firmware log switch, basic config, regulatory domain, TX power limits,
++ * the 2048-byte NVRAM, wifi.cfg settings), puts the NVRAM MAC address into
++ * the firmware and reads it back, queries chip registers and statistics,
++ * and then watches the firmware (ready bits, log rings, coredump area).
++ * All commands go through the generic command/event API of
++ * rottenapple_wifi.c, which W4 (scan) reuses.
++ */
++#ifndef _BSD_DEV_ROTTENAPPLE_MTK_WLAN_H_
++#define _BSD_DEV_ROTTENAPPLE_MTK_WLAN_H_
++
++#include <dev/rottenapple_wifi.h>
++#include <dev/rottenapple_mtk_wfdma.h>
++#include <dev/rottenapple_mtk_wmt.h>
++
++__BEGIN_DECLS
++
++#define MTK_WLAN_NVRAM_SIZE     2048    /* WIFI_CFG_PARAM_STRUCT, what the firmware gets */
++#define MTK_WLAN_CFG_MAX        32      /* wifi.cfg entries kept */
++#define MTK_WLAN_CFG_STR        32      /* MAX_CMD_NAME_MAX_LENGTH / MAX_CMD_VALUE_MAX_LENGTH */
++
++struct mtk_wlan {
++	/* filled by the caller before mtk_wlan_prepare */
++	struct rottenapple_wifi *w;
++	struct mtk_wfdma *d;
++	struct mtk_wmt *wmt;            /* STP kept alive by the receive thread (NULL: none) */
++	const char *nvram_path;         /* NVRAM file (full path on the root) */
++	const char *custom_path;        /* WIFI_CUSTOM (optional, logged only) */
++	const char *cfg_name;           /* wifi.cfg in the firmware directory (optional) */
++
++	/* prepared (no hardware) */
++	bool prepared;
++	uint8_t nvram[MTK_WLAN_NVRAM_SIZE];
++	uint8_t ncfg;
++	char cfg_key[MTK_WLAN_CFG_MAX][MTK_WLAN_CFG_STR + 1];
++	char cfg_val[MTK_WLAN_CFG_MAX][MTK_WLAN_CFG_STR + 1];
++	uint16_t country;               /* from the NVRAM, as gen4m (0 = default domain) */
++
++	/* running */
++	bool started;
++	uint8_t mac[6];
++	const char *mac_source;
++	bool bss_active;
++	uint8_t bmc_idx;
++	bool thread_started;
++	volatile bool stop, running, exited;
++	volatile uint32_t wake_pending;
++	uint8_t *rxbuf, *databuf;
++	uint32_t irqs, events, rx_other, data_pkts, mcu_sw, polls;
++	uint64_t t_start, next_health, next_beat;
++	unsigned beats;
++	struct mtk_wfdma_health h_last;
++	bool fw_dead, coredump_logged;
++	uint32_t debug_msgs, asserts, rejected;
++};
++
++/*
++ * Before the power-up (reads files only): the NVRAM (2048 bytes needed;
++ * version, MAC, country, 5 GHz flags and tag list logged), WIFI_CUSTOM and
++ * wifi.cfg. EINVAL/ENOENT/EFBIG: W3 is not started.
++ */
++int mtk_wlan_prepare(struct mtk_wlan *l);
++
++/*
++ * After mtk_wfdma_wifi_on (firmware ready, NIC capability known): receive
++ * thread + interrupt, the configuration commands, MAC address, queries,
++ * health check. On failure the caller still calls mtk_wlan_stop.
++ */
++int mtk_wlan_start(struct mtk_wlan *l);
++
++/*
++ * Clean stop, before mtk_wfdma_wifi_off: AIS network deactivated if still
++ * active, CMD NIC_POWER_CTRL (power off) and the ready bits watched until
++ * they drop, receive thread stopped, interrupt masked. Safe to call when
++ * start failed or never ran. mtk_wlan_release frees the buffers.
++ */
++void mtk_wlan_stop(struct mtk_wlan *l);
++void mtk_wlan_release(struct mtk_wlan *l);
++
++__END_DECLS
++
++#endif
+--- a/bsd/dev/rottenapple_mtk_wmt.c
++++ b/bsd/dev/rottenapple_mtk_wmt.c
+@@ -1402,6 +1402,18 @@ fail:
+ 	return err ? err : EIO;
+ }
+ 
++void
++mtk_wmt_poll(struct mtk_wmt *m)
++{
++	if (m->mode == STP_MODE_OFF) {
++		return;
++	}
++	btif_poll(m);
++	if (m->ack_due && !m->in_tx) {
++		stp_send_ack(m);
++	}
++}
++
+ void
+ mtk_wmt_off(struct mtk_wmt *m)
+ {
+--- a/bsd/dev/rottenapple_mtk_wmt.h
++++ b/bsd/dev/rottenapple_mtk_wmt.h
+@@ -94,6 +94,15 @@ struct mtk_wmt {
+ int mtk_wmt_on(struct mtk_wmt *m);
+ void mtk_wmt_off(struct mtk_wmt *m);
+ 
++/*
++ * W3 (Wi-Fi left running): keep STP alive between mtk_wmt_on and
++ * mtk_wmt_off as Android's STP core does: drain BTIF, acknowledge full-mode
++ * frames, log anything unsolicited (WMT events, firmware assert text).
++ * Never sends a command. Call it from one thread only (the Wi-Fi receive
++ * thread polls it).
++ */
++void mtk_wmt_poll(struct mtk_wmt *m);
++
+ __END_DECLS
+ 
+ #endif
+--- a/bsd/dev/rottenapple_wifi.c
++++ b/bsd/dev/rottenapple_wifi.c
+@@ -10,7 +10,10 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
++#include <sys/sysctl.h>
+ #include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+ #include <dev/rottenapple_wifi.h>
+@@ -30,13 +33,46 @@ ROTTENAPPLE_BACKEND_SET(wifi, struct rottenapple_wifi_ops);
+ #define WIFI_FW_DIR             "/usr/share/firmware/rottenapple/wifi"
+ #define WIFI_FW_MAX             (4u << 20)
+ #define WIFI_W1_CYCLES          2
+-#define WIFI_MAX_LEVEL          4
++#define WIFI_MAX_LEVEL          5
++#define WIFI_LEVEL_RUN          5       /* W3: bring up once and leave running */
++#define WIFI_MAX_HANDLERS       16
+ #define WIFI_PAGE               0x4000ull
+ 
+ #define WLOG(fmt, ...)  printf("ROTTEN APPLE: wifi: " fmt "\n", ##__VA_ARGS__)
+ 
+ static struct rottenapple_wifi rottenapple_wifi_dev;
+ 
++/*
++ * Level 5 state, the command path and the event handlers. One Wi-Fi device,
++ * so plain statics: state_lock orders start/stop, cmd_lock serializes
++ * commands, ev_lock protects the waiter and the handler table (and is held
++ * across cmd_send, so an answer cannot be delivered before its waiter knows
++ * the sequence number).
++ */
++enum { WIFI_OFF, WIFI_STARTING, WIFI_RUNNING, WIFI_STOPPING };
++static const char *const wifi_state_name[] = { "off", "starting", "running", "stopping" };
++static LCK_GRP_DECLARE(rottenapple_wifi_grp, "rottenapple_wifi");
++static LCK_MTX_DECLARE(wifi_state_lock, &rottenapple_wifi_grp);
++static LCK_MTX_DECLARE(wifi_cmd_lock, &rottenapple_wifi_grp);
++static LCK_MTX_DECLARE(wifi_ev_lock, &rottenapple_wifi_grp);
++static unsigned wifi_state;             /* WIFI_*, under wifi_state_lock */
++static bool wifi_attached;
++
++static struct {
++	bool active, done;
++	uint8_t id, seq;
++	uint8_t got_id;                 /* id of the event that answered */
++	uint8_t *buf;
++	uint32_t size, len;
++} wifi_waiter;                          /* the one outstanding command (cmd_lock serializes) */
++
++static struct {
++	uint8_t id;
++	rottenapple_wifi_event_fn fn;
++	void *arg;
++} wifi_handlers[WIFI_MAX_HANDLERS];
++static uint32_t wifi_unhandled;         /* events nobody took (the first 32 are logged) */
++
+ int
+ rottenapple_wifi_reg_index(struct rottenapple_wifi *w, const char *name)
+ {
+@@ -225,6 +261,50 @@ wifi_w2(struct rottenapple_wifi *w, unsigned level)
+ 	    WIFI_W1_CYCLES);
+ }
+ 
++/*
++ * W3 (level 5): W1's power-up and the backend's wifi_on at level 5 (WMT
++ * init, firmware, configuration, event path) once; on success Wi-Fi stays
++ * up until rottenapple_wifi_stop(). Any failure stops and powers down.
++ */
++static int
++wifi_run(struct rottenapple_wifi *w)
++{
++	if (w->ops->power_on == NULL || w->ops->power_off == NULL || w->ops->wifi_on == NULL ||
++	    w->ops->wifi_off == NULL || w->ops->cmd_send == NULL) {
++		WLOG("W3: backend has no power, Wi-Fi or command hooks");
++		return ENOTSUP;
++	}
++	if (w->ops->report) {
++		w->ops->report(w);
++	}
++	WLOG("W3: powering up");
++	int err = w->ops->power_on(w);
++	if (err) {
++		WLOG("W3: power-up FAILED (%d); powering down", err);
++	} else {
++		WLOG("W3: chip CPU at its idle loop; starting and configuring the Wi-Fi firmware");
++		err = w->ops->wifi_on(w, WIFI_LEVEL_RUN);
++		if (err == 0) {
++			return 0;
++		}
++		WLOG("W3: Wi-Fi bring-up FAILED (%d); stopping Wi-Fi, powering down", err);
++		w->ops->wifi_off(w);
++	}
++	w->ops->power_off(w);
++	if (w->ops->report) {
++		w->ops->report(w);
++	}
++	return err;
++}
++
++static void
++wifi_set_state(unsigned st)
++{
++	lck_mtx_lock(&wifi_state_lock);
++	wifi_state = st;
++	lck_mtx_unlock(&wifi_state_lock);
++}
++
+ static void
+ rottenapple_wifi_thread(void *arg, __unused wait_result_t wr)
+ {
+@@ -232,34 +312,272 @@ rottenapple_wifi_thread(void *arg, __unused wait_result_t wr)
+ 	struct rottenapple_wifi *w = &rottenapple_wifi_dev;
+ 
+ 	static const char *const milestone[] = { "", "W1", "W2", "W2 + NIC capability",
+-		                                 "W2b (WMT over BTIF) + W2 + NIC capability" };
++		                                 "W2b (WMT over BTIF) + W2 + NIC capability",
++		                                 "W3 (configuration, MAC address, basic commands; left running)" };
+ 	WLOG("milestone %s (rottenapple_wifi=%u)", milestone[level], level);
+-	if (wifi_attach(w, WIFI_NODE) != 0) {
+-		return;
++	if (!wifi_attached) {
++		if (wifi_attach(w, WIFI_NODE) != 0) {
++			wifi_set_state(WIFI_OFF);
++			return;
++		}
++		wifi_attached = true;
+ 	}
+ 	if (level == 1) {
+ 		wifi_w1(w);
+-	} else {
++	} else if (level < WIFI_LEVEL_RUN) {
+ 		wifi_w2(w, level);
++	} else {
++		int err = wifi_run(w);
++		wifi_set_state(err ? WIFI_OFF : WIFI_RUNNING);
++		WLOG("W3 result: %s (%d)%s", err ? "FAILED, powered down" : "PASSED, Wi-Fi left running", err,
++		    err ? "" : "; stop with sysctl kern.rottenapple_wifi=0");
++		return;
+ 	}
++	wifi_set_state(WIFI_OFF);
++}
++
++static int
++wifi_launch(unsigned level)
++{
++	thread_t thread;
++
++	lck_mtx_lock(&wifi_state_lock);
++	if (wifi_state != WIFI_OFF) {
++		unsigned st = wifi_state;
++		lck_mtx_unlock(&wifi_state_lock);
++		WLOG("start (level %u) refused: Wi-Fi is %s", level, wifi_state_name[st]);
++		return EBUSY;
++	}
++	wifi_state = WIFI_STARTING;
++	lck_mtx_unlock(&wifi_state_lock);
++	if (kernel_thread_start(rottenapple_wifi_thread, (void *)(uintptr_t)level, &thread) != KERN_SUCCESS) {
++		wifi_set_state(WIFI_OFF);
++		return ENOMEM;
++	}
++	thread_deallocate(thread);
++	return 0;
+ }
+ 
+ void
+ rottenapple_wifi_start(void)
+ {
+ 	uint32_t level = 0;
+-	thread_t thread;
+ 
+ 	if (!PE_parse_boot_argn("rottenapple_wifi", &level, sizeof(level)) || level == 0) {
+ 		return;                 /* default: Wi-Fi hardware is not touched */
+ 	}
+ 	if (level > WIFI_MAX_LEVEL) {
+ 		WLOG("rottenapple_wifi=%u unknown (1 = W1, 2 = W2, 3 = W2 + NIC capability, 4 = W2b + W2 + NIC "
+-		    "capability); hardware not touched", level);
++		    "capability, 5 = W3, left running); hardware not touched", level);
+ 		return;
+ 	}
+-	if (kernel_thread_start(rottenapple_wifi_thread, (void *)(uintptr_t)level, &thread) == KERN_SUCCESS) {
+-		thread_deallocate(thread);
++	(void)wifi_launch(level);
++}
++
++int
++rottenapple_wifi_stop(void)
++{
++	struct rottenapple_wifi *w = &rottenapple_wifi_dev;
++
++	lck_mtx_lock(&wifi_state_lock);
++	if (wifi_state != WIFI_RUNNING) {
++		unsigned st = wifi_state;
++		lck_mtx_unlock(&wifi_state_lock);
++		WLOG("stop: nothing to stop (Wi-Fi is %s)", wifi_state_name[st]);
++		return st == WIFI_OFF ? EALREADY : EBUSY;
++	}
++	wifi_state = WIFI_STOPPING;
++	lck_mtx_unlock(&wifi_state_lock);
++
++	WLOG("stop: stopping Wi-Fi, powering down");
++	w->ops->wifi_off(w);
++	w->ops->power_off(w);
++	if (w->ops->report) {
++		w->ops->report(w);
++	}
++	wifi_set_state(WIFI_OFF);
++	WLOG("stop: Wi-Fi stopped and powered down");
++	return 0;
++}
++
++struct rottenapple_wifi *
++rottenapple_wifi_running(void)
++{
++	return wifi_state == WIFI_RUNNING ? &rottenapple_wifi_dev : NULL;
++}
++
++/*
++ * kern.rottenapple_wifi: read = 5 while Wi-Fi runs, 0 otherwise (also while
++ * starting or stopping); write 0 = stop (returns once powered down), 5 =
++ * start the level-5 bring-up again on its own thread (returns at once).
++ */
++static int
++sysctl_rottenapple_wifi SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	int value = wifi_state == WIFI_RUNNING ? WIFI_LEVEL_RUN : 0, changed = 0;
++	int err = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++
++	if (err || !changed) {
++		return err;
++	}
++	if (value == 0) {
++		err = rottenapple_wifi_stop();
++		return err == EALREADY ? 0 : err;
++	}
++	if (value == WIFI_LEVEL_RUN) {
++		return wifi_launch(WIFI_LEVEL_RUN);
++	}
++	return EINVAL;
++}
++SYSCTL_PROC(_kern, OID_AUTO, rottenapple_wifi, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_rottenapple_wifi, "I", "rotten-apple Wi-Fi: 5 = running; write 0 to stop, 5 to start");
++
++/* ---- Command/event API ---- */
++
++int
++rottenapple_wifi_cmd(struct rottenapple_wifi *w, uint8_t id, bool set, const void *payload, uint32_t len,
++    int resp_event, void *resp, uint32_t resp_size, uint32_t *resp_len, unsigned timeout_ms)
++{
++	uint8_t seq = 0;
++	uint64_t deadline;
++	int err;
++
++	if (w == NULL || w->ops == NULL || w->ops->cmd_send == NULL || resp_event > 0xff ||
++	    (resp != NULL && resp_size == 0)) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&wifi_cmd_lock);
++	lck_mtx_lock(&wifi_ev_lock);
++	if (resp_event >= 0) {
++		wifi_waiter.active = true;
++		wifi_waiter.done = false;
++		wifi_waiter.id = (uint8_t)resp_event;
++		wifi_waiter.seq = 0;            /* matches nothing until the sequence number is known */
++		wifi_waiter.buf = resp;
++		wifi_waiter.size = resp ? resp_size : 0;
++		wifi_waiter.len = 0;
++	}
++	/* ev_lock held: the receive thread cannot deliver the answer before seq is set */
++	err = w->ops->cmd_send(w, id, set, payload, len, &seq);
++	wifi_waiter.seq = seq;
++	if (err || resp_event < 0) {
++		wifi_waiter.active = false;
++		lck_mtx_unlock(&wifi_ev_lock);
++		lck_mtx_unlock(&wifi_cmd_lock);
++		if (err) {
++			WLOG("command 0x%02x (%s, %u bytes): not sent (%d)", id, set ? "set" : "query", len, err);
++		}
++		return err;
++	}
++	clock_interval_to_deadline(timeout_ms, NSEC_PER_MSEC, &deadline);
++	while (!wifi_waiter.done && mach_absolute_time() < deadline) {
++		/* drops ev_lock while asleep; rottenapple_wifi_event_input wakes &wifi_waiter */
++		(void)lck_mtx_sleep_deadline(&wifi_ev_lock, LCK_SLEEP_DEFAULT, (event_t)&wifi_waiter, THREAD_UNINT,
++		    deadline);
++	}
++	err = !wifi_waiter.done ? ETIMEDOUT : wifi_waiter.got_id != (uint8_t)resp_event ? EBADMSG : 0;
++	uint8_t got = wifi_waiter.got_id;
++	if (resp_len) {
++		*resp_len = wifi_waiter.len;
++	}
++	wifi_waiter.active = false;
++	lck_mtx_unlock(&wifi_ev_lock);
++	lck_mtx_unlock(&wifi_cmd_lock);
++	if (err == ETIMEDOUT) {
++		WLOG("command 0x%02x (%s, seq %u): no event 0x%02x within %u ms", id, set ? "set" : "query", seq,
++		    resp_event, timeout_ms);
++	} else if (err) {
++		/* MediaTek: 0xFD = INIT_EVENT_CMD_RESULT, the firmware does not handle the command */
++		WLOG("command 0x%02x (%s, seq %u): answered by event 0x%02x, expected 0x%02x", id, set ? "set" : "query",
++		    seq, got, resp_event);
++	}
++	return err;
++}
++
++int
++rottenapple_wifi_event_register(struct rottenapple_wifi *w, uint8_t id, rottenapple_wifi_event_fn fn, void *arg)
++{
++	int err = ENOSPC;
++
++	if (w == NULL || fn == NULL) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&wifi_ev_lock);
++	for (unsigned i = 0; i < WIFI_MAX_HANDLERS; i++) {
++		if (wifi_handlers[i].fn == fn && wifi_handlers[i].id == id && wifi_handlers[i].arg == arg) {
++			err = EEXIST;
++			break;
++		}
++	}
++	for (unsigned i = 0; err == ENOSPC && i < WIFI_MAX_HANDLERS; i++) {
++		if (wifi_handlers[i].fn == NULL) {
++			wifi_handlers[i].id = id;
++			wifi_handlers[i].arg = arg;
++			wifi_handlers[i].fn = fn;
++			err = 0;
++		}
++	}
++	lck_mtx_unlock(&wifi_ev_lock);
++	return err;
++}
++
++void
++rottenapple_wifi_event_unregister(struct rottenapple_wifi *w, uint8_t id, rottenapple_wifi_event_fn fn, void *arg)
++{
++	if (w == NULL) {
++		return;
++	}
++	lck_mtx_lock(&wifi_ev_lock);
++	for (unsigned i = 0; i < WIFI_MAX_HANDLERS; i++) {
++		if (wifi_handlers[i].fn == fn && wifi_handlers[i].id == id && wifi_handlers[i].arg == arg) {
++			wifi_handlers[i].fn = NULL;
++		}
++	}
++	lck_mtx_unlock(&wifi_ev_lock);
++}
++
++void
++rottenapple_wifi_event_input(struct rottenapple_wifi *w, uint8_t id, uint8_t seq, const uint8_t *body,
++    uint32_t len)
++{
++	struct rottenapple_wifi_event ev = { .id = id, .seq = seq, .len = len, .body = body };
++	struct {
++		rottenapple_wifi_event_fn fn;
++		void *arg;
++	} call[WIFI_MAX_HANDLERS];
++	unsigned n = 0;
++	bool answered = false;
++
++	lck_mtx_lock(&wifi_ev_lock);
++	/* matched by sequence number alone, as gen4m's nicGetPendingCmdInfo; the caller checks the id */
++	if (wifi_waiter.active && !wifi_waiter.done && wifi_waiter.seq != 0 && wifi_waiter.seq == seq) {
++		if (wifi_waiter.buf) {
++			memcpy(wifi_waiter.buf, body, MIN(len, wifi_waiter.size));
++		}
++		wifi_waiter.got_id = id;
++		wifi_waiter.len = len;
++		wifi_waiter.done = true;
++		answered = true;
++		thread_wakeup((event_t)&wifi_waiter);
++	}
++	for (unsigned i = 0; i < WIFI_MAX_HANDLERS; i++) {
++		if (wifi_handlers[i].fn != NULL && wifi_handlers[i].id == id) {
++			call[n].fn = wifi_handlers[i].fn;
++			call[n].arg = wifi_handlers[i].arg;
++			n++;
++		}
++	}
++	lck_mtx_unlock(&wifi_ev_lock);
++	for (unsigned i = 0; i < n; i++) {
++		call[i].fn(w, &ev, call[i].arg);
++	}
++	if (!answered && n == 0) {
++		wifi_unhandled++;
++		if (wifi_unhandled <= 32) {
++			WLOG("event 0x%02x seq %u (%u bytes): no waiter, no handler%s", id, seq, len,
++			    wifi_unhandled == 32 ? " (further unhandled events are not logged)" : "");
++		}
+ 	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/rottenapple_wifi.h
++++ b/bsd/dev/rottenapple_wifi.h
+@@ -29,6 +29,21 @@
+  *      MAC address).
+  *   4  W2b: W1's power-up, the chip's own init protocol (MediaTek: WMT over
+  *      BTIF/STP, with the RF calibration), then level 3.
++ *   5  W3: level 4 once, then the firmware configuration (NVRAM, regulatory
++ *      domain, TX power limits, basic config, MAC address) and basic
++ *      queries over the command/event API below, with the interrupt-driven
++ *      event path; Wi-Fi is LEFT RUNNING. rottenapple_wifi_stop() (sysctl
++ *      kern.rottenapple_wifi=0) stops it cleanly and powers down; writing 5
++ *      starts it again.
++ *
++ * Command/event API (W3 on; the scan and join of W4+ are built on it):
++ * the firmware is driven by commands {id, set/query, payload} and answers
++ * with events {id, sequence number, body}. rottenapple_wifi_cmd() sends one
++ * command and optionally waits for the event that answers it (matched by
++ * event id and the command's sequence number); handlers registered with
++ * rottenapple_wifi_event_register() get every event of an id (unsolicited
++ * ones like scan results too). The backend feeds received events in with
++ * rottenapple_wifi_event_input() from its own receive thread.
+  */
+ #ifndef _BSD_DEV_ROTTENAPPLE_WIFI_H_
+ #define _BSD_DEV_ROTTENAPPLE_WIFI_H_
+@@ -38,6 +53,24 @@
+ __BEGIN_DECLS
+ 
+ struct rottenapple_wifi_ops;
++struct rottenapple_wifi;
++
++/* One firmware event as the core hands it to waiters and handlers. */
++struct rottenapple_wifi_event {
++	uint8_t id;                     /* event id */
++	uint8_t seq;                    /* sequence number of the command it answers, 0 = unsolicited */
++	uint32_t len;                   /* body length */
++	const uint8_t *body;            /* event body (after the backend's event header) */
++};
++
++/*
++ * Event handler. Runs on the backend's receive thread with no lock held:
++ * keep it short, copy what it needs, and never wait for a command's answer
++ * from it (rottenapple_wifi_cmd with a response would wait for the very
++ * thread it runs on; commands without a response are fine).
++ */
++typedef void (*rottenapple_wifi_event_fn)(struct rottenapple_wifi *w, const struct rottenapple_wifi_event *ev,
++    void *arg);
+ 
+ /* One Wi-Fi node. */
+ struct rottenapple_wifi {
+@@ -74,6 +107,14 @@ struct rottenapple_wifi_ops {
+ 	 */
+ 	int (*wifi_on)(struct rottenapple_wifi *w, unsigned level);
+ 	void (*wifi_off)(struct rottenapple_wifi *w);
++	/*
++	 * W3: queue one firmware command (no waiting for an answer); *seq gets
++	 * the sequence number the answering event will carry (never 0).
++	 * Called with the core's command lock held, so calls never overlap.
++	 * ENXIO when the host interface is not up.
++	 */
++	int (*cmd_send)(struct rottenapple_wifi *w, uint8_t id, bool set, const void *payload, uint32_t len,
++	    uint8_t *seq);
+ };
+ 
+ /* Index of the "reg-names" entry name, -1 if absent or unmapped. */
+@@ -101,6 +142,44 @@ int rottenapple_wifi_carveout(struct rottenapple_wifi *w, const char *prop, uint
+ /* Start the milestone selected by boot-arg rottenapple_wifi (after the root is mounted). */
+ void rottenapple_wifi_start(void);
+ 
++/* ---- Command/event API (W3) ---- */
++
++#define ROTTENAPPLE_WIFI_NO_EVENT       (-1)    /* rottenapple_wifi_cmd: fire and forget */
++#define ROTTENAPPLE_WIFI_EVT_MAX        4096    /* largest event body the core copies */
++
++/*
++ * Send command id (set or query) with payload. With resp_event >= 0, wait
++ * up to timeout_ms for the event carrying the command's sequence number
++ * and copy at most resp_size bytes of its body to resp (*resp_len = the
++ * full body length); EBADMSG when that event is not resp_event (MediaTek:
++ * 0xFD, command not handled by the firmware). Commands are serialized;
++ * sleeps; never call it from an event handler with resp_event >= 0.
++ * ETIMEDOUT, ENXIO (no command path: Wi-Fi not running), EINVAL.
++ */
++int rottenapple_wifi_cmd(struct rottenapple_wifi *w, uint8_t id, bool set, const void *payload, uint32_t len,
++    int resp_event, void *resp, uint32_t resp_size, uint32_t *resp_len, unsigned timeout_ms);
++
++/* Call fn for every event id (up to 16 registrations); EEXIST, ENOSPC. */
++int rottenapple_wifi_event_register(struct rottenapple_wifi *w, uint8_t id, rottenapple_wifi_event_fn fn,
++    void *arg);
++void rottenapple_wifi_event_unregister(struct rottenapple_wifi *w, uint8_t id, rottenapple_wifi_event_fn fn,
++    void *arg);
++
++/* Backend -> core: one received event (thread context). */
++void rottenapple_wifi_event_input(struct rottenapple_wifi *w, uint8_t id, uint8_t seq, const uint8_t *body,
++    uint32_t len);
++
++/* The Wi-Fi device while it is running (level 5 up), else NULL. */
++struct rottenapple_wifi *rottenapple_wifi_running(void);
++
++/*
++ * Stop a running Wi-Fi (level 5): the backend's clean stop (firmware told
++ * to power off, event path down, host interface back to the firmware), then
++ * the power-down. 0; EALREADY when nothing runs, EBUSY while it is still
++ * starting or already stopping. Sleeps (a few seconds).
++ */
++int rottenapple_wifi_stop(void);
++
+ __END_DECLS
+ 
+ #endif
