@@ -73,9 +73,9 @@ Paths written as `$HOME`, `user` or `user@host` in scripts were the author's hom
    `xnu/patches/SERIES-q10jfinal44ts.tsv` records how each piece entered). Expect `FAILURES none`, `BUILD_EXIT 1`
    (the known 0399 image-check stop), `SCANPATH_OK`, `WIFI_MEMBERS_OK`. Kernel history and hashes: docs/STATUS.md.
 5. **Per-device values**: the kernel must carry **your** phone's pins: either rebuild the recipe after writing your
-   values (the sources hold zero placeholders), or build a template with
-   `components/release-20261115/tools/make_release.sh` and apply your profile (`n2_kernel_pins.py apply`, step 7 of
-   the install guide).
+   values (the sources hold zero placeholders), or use the published q10jfinal19 template in `components/release-20261115/dist/nord2-ios-release-20261115/kernel/`
+   (or a newer one from `components/release-20261115/tools/make_release.sh`) and apply your profile
+   (`n2_kernel_pins.py apply`, step 7 of the install guide).
 6. **Userland payloads**: GPU `components/gfx200-20261114/shipall/` (gfxall17; built binaries are committed),
    codecs `components/vcodec-20261114` + `components/apps-20261104/payload-vcodec-prod9`, GNSS
    `components/gnss-20261114/pl22` (gnssfix22), Bluetooth `components/bt-20261115/pl` (bt1), SIM

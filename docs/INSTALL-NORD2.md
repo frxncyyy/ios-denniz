@@ -3,10 +3,11 @@
 > **Read this first**
 > - Everything here has run only on the author's computer and the author's phone. The flow for a **second Nord 2 has
 >   never been tested**. Expect to be the first tester, and expect to stop at a `REFUSED` or `REBUILD_NEEDED` verdict.
-> - **This repository cannot produce a bootable kernel by itself.** Step 7 needs a **kernel template** (`kernel.tpl` +
->   `pins-map.json`) and an **ADT template** (`template.adt`) that only the release builder
->   (`components/release-20261115/tools/make_release.sh`) makes from a built kernel. Until such a release exists you can do
->   steps 0-6 and must stop before step 7. **This is the current blocker.** Why: [COMPLETENESS.md](COMPLETENESS.md).
+> - **Kernel for your phone: a published template.** Step 7 uses the kernel template `kernel.tpl` + `pins-map.json` and
+>   the ADT template `template.adt` in `components/release-20261115/dist/nord2-ios-release-20261115/kernel/` (published 2026-11-17). The template was made from
+>   the **q10jfinal19** line (2026-11-15): it predates the later Bluetooth iterations (bt5..bt22), the TrollStore/Files, GPU-fault and
+>   sensor pieces (0730-0734, 0750, 0760-0762) of the current line q10jfinal44ts. A newer template needs a kernel build
+>   (CI + `make_release.sh`), see [COMPLETENESS.md](COMPLETENESS.md).
 > - The kernels built so far contain constants of the author's unit (GPT digest + CRC, Wi-Fi calibration digest, sensor
 >   calibration). Such a kernel **halts in the two-lane UFS switch on any other unit** and refuses that unit's Wi-Fi
 >   calibration. In this tree those constants are zero placeholders; step 7 writes **your** phone's values. Nothing is ever
@@ -14,7 +15,7 @@
 > - Steps marked ⚠ write to the phone. Unlocking erases all Android data; installing the iOS root replaces `userdata`.
 
 What the tags mean: **[V]** verified on the author's phone or host, **[D]** designed only (syntax-checked or host-tested on
-synthetic data), **[B]** blocked until a second Nord 2 or a published kernel template exists.
+synthetic data), **[B]** blocked (needs a second Nord 2 or a missing piece).
 
 What works once installed (on the author's phone): see the table in the [README](../README.md#what-works) and
 [STATUS.md](STATUS.md).
@@ -23,8 +24,8 @@ What works once installed (on the author's phone): see the table in the [README]
 
 Phone
 - [ ] OnePlus Nord 2 5G, fastboot product `oplus6893`, 128 GB storage layout (another layout ends in `REBUILD_NEEDED`).
-- [ ] The OxygenOS build the kernel constants were made for (its boot/recovery sha256 are listed in the release manifest
-      `release-manifest.json`, made by `make_release.sh`; not in this tree).
+- [ ] The OxygenOS build the kernel constants were made for: its boot/recovery sha256 are in
+      `components/release-20261115/dist/nord2-ios-release-20261115/release-manifest.json` (`supported_firmware`); `tools/fetch-oxygenos.sh verify boot.img recovery.img` checks them.
 - [ ] Battery charged; a good USB cable.
 
 PC (Linux)
@@ -49,7 +50,7 @@ Downloads (by **you**, from the original vendors, never from this repository)
 | 4 | Read-only dump | no (read-only) | [D] |
 | 5 | Profile and checks | no | [V] on the author's data, [D] elsewhere |
 | 6 | Your modem NVRAM blob | no | [V] tools on host, [D] elsewhere |
-| 7 | Kernel + device tree + boot image for your phone | no | **[B]** |
+| 7 | Kernel + device tree + boot image for your phone (from the published template) | no | [D] (template published; never booted on another unit) |
 | 8 | iOS root filesystem | ⚠ `userdata` | **[B]** overlay not packaged |
 | 9 | Payloads (modem, SIM, Bluetooth, Sileo/TrollStore, GPU userland) | ⚠ iOS root | [D] generic tool |
 | 10 | First-boot checks | no | [V] on the author's phone |
@@ -68,7 +69,7 @@ fastboot flashing unlock        # confirm on the phone; this wipes it
 
 ```sh
 payload-dumper-go -p boot,recovery,vendor OxygenOS-full-OTA.zip
-sha256sum boot.img recovery.img          # compare with the release manifest's supported_firmware
+tools/fetch-oxygenos.sh verify boot.img recovery.img   # OXYGENOS_SUPPORTED, else stop
 adb keygen ~/.android/adbkey             # only if you have no adb key yet
 python3 tools/nord2-mkrescue.py boot.img recovery.img ~/nord2-private/my-rescue.img --adb-key ~/.android/adbkey.pub
 ```
@@ -102,7 +103,7 @@ Keep the folder private.
 
 ```sh
 python3 components/release-20261115/tools/n2dev/n2_device_profile.py ~/nord2-private/dump \
-    --out ~/nord2-private/dump/device-profile.json --expect release-manifest.json
+    --out ~/nord2-private/dump/device-profile.json --expect components/release-20261115/dist/nord2-ios-release-20261115/release-manifest.json
 ```
 **Expected output:** one verdict line.
 - `READY`: continue.
@@ -126,24 +127,37 @@ python3 components/release-20261115/tools/n2dev/mk_nvfile_payload.py --blob ~/no
 `guest-nvfile1.sh` and `owned-nvfile1.json`. The IMEI the modem reports is the one already stored in your phone; no tool
 creates, edits or copies an IMEI.
 
-## 7. Kernel + device tree + boot image for YOUR phone [B: needs kernel.tpl / pins-map.json / template.adt]
+## 7. Kernel + device tree + boot image for YOUR phone [D: template published, never booted on another unit]
 
-With a published release (author side: `make_release.sh`, which runs `n2_kernel_pins.py template` on a built kernel):
+The template files are in the repository (sha256: `kernel.tpl` 6dfce954…, `pins-map.json` 99322d01…,
+`template.adt` 5f76af4b…; full hashes in [LARGE-ARTIFACTS.md](LARGE-ARTIFACTS.md)). The pins are written from **your**
+dump's profile (step 5); nothing comes from another phone.
 ```sh
-python3 components/release-20261115/tools/n2dev/n2_kernel_pins.py apply kernel/kernel.tpl --map kernel/pins-map.json \
+R=components/release-20261115/dist/nord2-ios-release-20261115
+sha256sum $R/kernel/*                       # compare with the hashes above / pins-map.json kernel_template_sha256
+python3 components/release-20261115/tools/n2dev/n2_kernel_pins.py check $R/kernel/kernel.tpl --map $R/kernel/pins-map.json
+python3 components/release-20261115/tools/n2dev/n2_kernel_pins.py apply $R/kernel/kernel.tpl --map $R/kernel/pins-map.json \
     --profile ~/nord2-private/dump/device-profile.json --out ~/nord2-private/kernel.dev
-python3 components/release-20261115/tools/n2dev/n2_kernel_pins.py check ~/nord2-private/kernel.dev --map kernel/pins-map.json
-python3 components/release-20261115/tools/n2dev/mk_device_adt.py kernel/template.adt ~/nord2-private/device.adt \
+python3 components/release-20261115/tools/n2dev/n2_kernel_pins.py check ~/nord2-private/kernel.dev --map $R/kernel/pins-map.json
+python3 components/release-20261115/tools/n2dev/mk_device_adt.py $R/kernel/template.adt ~/nord2-private/device.adt \
     --profile ~/nord2-private/dump/device-profile.json --wifi ~/nord2-private/dump/wifi/WIFI
 ZOPFLI=$(command -v zopfli) bash components/release-20261115/tools/n2dev/n2_pack_device.sh ~/nord2-private/boot-ios.img \
     ~/nord2-private/kernel.dev ~/nord2-private/device.adt ~/nord2-private/my-rescue.img
 ```
-**Check:** `n2_kernel_pins.py check` passes; `n2_pack_device.sh` ends with its checker OK.
+**Expected output:**
+- first `check` on the template: `PINS_LEFT wifi_cal_sha256, gpt5_sha256, vendor_gpt_sha256, vendor_geometry_sha256,
+  vendor_lp_sha256, sensor_cal, gpt_entries_crc` (exit 1: the template is intact; it must never be flashed);
+- `apply`: `device kernel …kernel.dev: 7 per-device values written from this phone's profile, sha256 …` (it refuses
+  unless the profile says `READY`);
+- second `check`: `PINS_LEFT none`;
+- `mk_device_adt.py`: `device ADT …device.adt: … bytes (Wi-Fi calibration + MAC of this phone…)`;
+- `n2_pack_device.sh`: `PACK_OK …boot-ios.img … (private: carries this phone's Wi-Fi data)`.
 
-`n2_pack_device.sh` reproduced the author's q10jfinal19 image byte for byte from the author's inputs [V]; with a synthetic
-phone's values it builds an image that passes the checker and holds no owner identifier [V host]. It has never booted on
-another unit [B]. The long-term fix (a kernel that reads the per-device values from the device tree, `/chosen
-nord2-device-pins` and `/chosen nord2-sensor-cal`) is designed only and needs a kernel build [D].
+Honest limits: `n2_pack_device.sh` reproduced the author's q10jfinal19 image byte for byte from the author's inputs [V];
+with a synthetic phone's values it builds an image that passes the checker and holds no owner identifier [V host]. The
+whole step has **never been run on a second Nord 2**, and the resulting kernel is the q10jfinal19 line (see the note at the
+top). The long-term fix (a kernel that reads the per-device values from the device tree, `/chosen nord2-device-pins` and
+`/chosen nord2-sensor-cal`) is designed only [D].
 
 ## 8. ⚠ iOS root filesystem [B: port overlay not packaged]
 

@@ -22,15 +22,29 @@ Paths: `$NORD2_REPO` = the ios-sweet checkout, `$NORD2_WORK` = `$NORD2_REPO/rese
 | --- | --- | --- | --- | --- |
 | CI kernel object archive `B/startup-diagnostic/kernel.startup.a` (1191 members) | 140 638 264 B | `08a3190a2e31640510b8ed6262a0e1a04ba21204d9135c3b9b0cf9ea7d388edf` | > 100 MB GitHub limit; compiled with the author's per-device constants in some objects | run the CI workflow on the patch series (`xnu-buildtree` / `xnu-kernel` artifacts), then the local integration of `build/recipes/build_q10jfi.sh` (`components/autotest/build_p1_candidate.py` replaces/links members) |
 | Patched XNU source used by the integration step `B/xnu-stage-backup-pre-p15-20261028/xnu-stage` | ~150 MB (text, Apple APSL source + patches) | directory | Apple's open-source XNU, reproducible: it is the CI's patched tree | `xnu-buildtree` artifact of the CI run (`buildtree.tgz` contains `xnu/`) |
-| Release kernel template `kernel/kernel.tpl` (from q10jfinal19, pins templated) | 14 604 336 B | `6dfce9541aeeadc6cee4389f7c5d4362e21d7e7191dfd0a4416bb1827c9e686a` | **owner decision pending**: contains Apple-built kernel code linked with the port; needed by step 7 of the install guide | `components/release-20261115/tools/make_release.sh` on a built kernel |
-| `kernel/pins-map.json` | 726 B | `99322d019b4c4cf775b9e705e020d8a825f973c4fe614c1771a1c8ceecd81c9d` | ships with the template | same |
-| `kernel/template.adt` | 273 324 B | `5f76af4bfe074f576f7622a1e60ebef0230c1109e56e72c8188964931a6244f2` | contains the iPhone X `/product` node copied from Apple's device tree | same (`tools/mkadt.py` + IPSW DeviceTree) |
 | Kernel/boot images `device-mmu-*-candidate/ui-sched/*.img` (every line, e.g. q10jfinal44ts `f55a15ea…`) | ~15 MB each | listed in docs/STATUS.md | embed the author's per-device pins | recipes `components/*/build_q10jfinal*.sh` (needs the archive above), or step 7 for your phone |
 | `vcodecd` (hardware codec daemon, payload-vcodec-prod9) | 446 112 B | `1580fbbebcf944540c7872d4d64a5a30f0a4c06188ef1e1d75093d34b5f20fd9` | embeds build-host paths | `components/vcodec-20261114` build scripts (iOS SDK needed) |
 | Offline-VM initramfs (`research/nord2/rootfs-vm/initramfs`, busybox/python/hfsprogs + host kernel modules) | ~45 MB, 714 files | directory | host-specific (kernel modules must match the VM kernel); GPL userland | `resume/research-nord2/rootfs-vm/prepare.py` on the new host (see RESUME.md) |
 | VM rehearsal images (`*/rehearsal-*/overlay.qcow2`, `delta.bin`, `gfx200-20261114/shipall/vm`) | 20-530 MB | - | per-run scratch, built from the owner's root mirror | rerun the `rehearse*.sh` of each payload |
 | GPU userland build trees (`build-*`, `anchor-*`, every `y2s*` iteration's dylibs) | GBs | - | intermediate builds; only the current gfxall17 binaries are committed | `components/gfx200-20261114` / `gpu/` build scripts (iOS SDK + Mesa) |
 | Shader corpus `ui-corpus-20261025`, pipeline-pack data, `hardware-20261024` (134 GB), `render-diagnostic-review` | 1.6-134 GB | - | derived from captures of Apple shaders/apps on the owner's phone; huge | regenerate with the corpus tools in `components/` |
+
+## Now committed (2026-11-17, owner decision)
+
+The generic release-builder output is in `components/release-20261115/dist/nord2-ios-release-20261115/` (see its `NOTICE-TEMPLATE.md`):
+
+| File | Size | sha256 |
+| --- | ---: | --- |
+| `kernel/kernel.tpl` (q10jfinal19, 7 pins = fixed placeholders) | 14 604 336 B | `6dfce9541aeeadc6cee4389f7c5d4362e21d7e7191dfd0a4416bb1827c9e686a` |
+| `kernel/pins-map.json` | 726 B | `99322d019b4c4cf775b9e705e020d8a825f973c4fe614c1771a1c8ceecd81c9d` |
+| `kernel/template.adt` | 273 324 B | `5f76af4bfe074f576f7622a1e60ebef0230c1109e56e72c8188964931a6244f2` |
+| `host-tools/loader-Image` | 26 456 B | `cd060cae19fad9ac048b1a00c6f8530a732a11b91ca009b95dff7d1ac8ca07ee` |
+| `host-tools/stub-Image` | 9 193 B | `4dac6db2f648e3559182c17a19fc52414364c633c7f9428803ac1dce40cd1678` |
+| `payloads/bt/n2btd` | 53 376 B | `339f32a2603b23b444f98d55b45ed2518f951bb2108b2966345f9b2506818fec` |
+
+Plus `release-manifest.json`, `MANIFEST.sha256`, `README-RECIPIENT.md`, the host tools, `tools/n2dev/`, the sanitizer and
+the jbts/bt payload scripts. From that output **not** committed: the jbts input debs and TrollStore (third-party binaries:
+fetch and verify with `build_jbts.py`) and `vm/initramfs/` (GPL binaries of the build host: rebuild with `prepare.py`).
 
 ## Secrets and device-specific data (never committed)
 

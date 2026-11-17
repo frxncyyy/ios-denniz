@@ -30,6 +30,8 @@ extra scans (private keys, tokens, e-mail addresses, MAC/IMEI/ICCID patterns, ow
   `components/y2s-stage0/tools-mesa/*.patch`) and the port's own sources are included.
 - The engineering log is included as `notes/ENGINEERING-LOG.md` with identity values redacted in place (one SSID occurrence
   replaced by `<redacted-ssid>`; on 2026-11-17 the position of the first GNSS fix was redacted too).
+- 2026-11-17: the generic release-builder output (kernel template, ADT template, manifest, host tools) is published in
+  `components/release-20261115/dist/nord2-ios-release-20261115/` by the owner's decision; see its `NOTICE-TEMPLATE.md`.
 - The wider "resume" scope (2026-11-17) and what is still out by design: [COMPLETENESS.md](COMPLETENESS.md),
   [LARGE-ARTIFACTS.md](LARGE-ARTIFACTS.md).
 - Owner host paths were rewritten (`$NORD2_WORK`, `$NORD2_REPO`, `$HOME`, `user`).

@@ -102,7 +102,7 @@ files too. Some subdirectories were also pruned without a reason. Added on 2026-
 | CI workflow `.github/workflows/xnu.yml` | yes | run it on a fork | - |
 | CI object archive, patched XNU tree | no | CI run (`xnu-kernel`, `xnu-buildtree` artifacts) | > 100 MB; contains pins |
 | Kernel/boot images of every line | no | recipes or step 7 | embed the owner's pins |
-| Release kernel template (`kernel.tpl`, `pins-map.json`, `template.adt`) | no | `make_release.sh` | owner decision pending (Apple-built kernel code, Apple device-tree data); hashes in LARGE-ARTIFACTS |
+| Release kernel template (`kernel.tpl`, `pins-map.json`, `template.adt`) + release manifest and host tools | yes (2026-11-17), `components/release-20261115/dist/nord2-ios-release-20261115/` | newer template: `make_release.sh` on a built kernel | owner decision; pins are fixed placeholders; Apple-derived parts noted in `NOTICE-TEMPLATE.md` |
 | GPU userland binaries gfxall17 (`Nord2Metal`, `libredwoodair.dylib`) | yes | `components/gfx200-20261114` (iOS SDK) | - |
 | n2btd, n2simcache, n2mnld, n2locbridge, Slim VideoToolbox plug-ins, camera/audio boot packages | yes | sources in `components/` | - |
 | vcodecd binary | no | `components/vcodec-20261114` | embeds build-host paths |
@@ -127,7 +127,7 @@ By design (Apple/vendor/third-party): 12 iOS IPSW and the root image; 13 OxygenO
 BT firmware, codec libraries, `vpud`, GNSS `libmnl`, modem/SCP firmware; 15 patched Apple daemons in payloads
 (`locationd`); 16 Apple private headers / `fakeroot`; 17 decrypted game IPAs; 18 upstream Mesa trees.
 Build outputs / too big: 19 CI object archive `kernel.startup.a`; 20 CI-patched XNU tree; 21 kernel and boot images
-of every line; 22 release kernel template + template ADT (owner decision); 23 vcodecd binary; 24 VM initramfs; 25 VM
+of every line; 22 the jbts input debs/TrollStore of the release output (fetch them); 23 vcodecd binary; 24 VM initramfs; 25 VM
 rehearsal images; 26 seeded GPU payloads and shader caches; 27 historical GPU dylib builds (`y2s*` iterations);
 28 shader corpus `ui-corpus` and `hardware-20261024` captures; 29 per-line `device-mmu-*-candidate` stage copies;
 30 the Apple/LLVM cross toolchain used for the integration step.
@@ -138,5 +138,5 @@ rehearsal images; 26 seeded GPU payloads and shader caches; 27 historical GPU dy
   tree: both come from running the CI workflow (a GitHub macOS runner), not from git. A from-scratch build of the
   whole kernel from this tree has not been attempted.
 - **Building userland**: needs the iOS SDK (not redistributable) and Mesa 25.0.7; the current binaries are committed.
-- **Installing on another phone**: steps 0-6 of the install guide work from git; step 7 needs a kernel template; the
-  port's root overlay is not packaged (step 8). The second-phone flow has never been tested.
+- **Installing on another phone**: steps 0-7 of the install guide can now be run from git (step 7 uses the published
+  q10jfinal19 template); the port's root overlay is not packaged (step 8). The second-phone flow has never been tested.

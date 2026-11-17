@@ -20,3 +20,10 @@ notice were excluded).
 
 The GPU userland (Nord2Metal Metal driver, libredwoodair glue around Mesa's Valhall compiler) **is** in this tree as source; the
 built `libredwoodair.dylib`/Nord2Metal binaries are not.
+
+## Release kernel template (`components/release-20261115/dist/nord2-ios-release-20261115/`)
+- `kernel/kernel.tpl`: built from Apple's open-source XNU (xnu-8796; Apple Public Source License 2.0) plus this port's
+  patches (`xnu/patches/`, `xnu/stage-q10jfinal44ts/`; the XNU version is pinned in `.github/workflows/xnu.yml`). The CI
+  build may link Apple-provided kernel support libraries; **check the upstream licences** (not verified here).
+- `kernel/template.adt`: contains the iPhone X `/product` device-tree node data (Apple-originated); **check upstream licence**.
+- Details: `components/release-20261115/dist/nord2-ios-release-20261115/NOTICE-TEMPLATE.md`.

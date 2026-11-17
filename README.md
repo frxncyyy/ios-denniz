@@ -17,9 +17,9 @@ and Subway Surfers run, and IPA files can be installed with TrollStore.
 
 > **This is the port's full working tree, not an installable release.** It holds all sources, recipes, payload scripts,
 > notes and the port's own built userland binaries, so the work can be resumed on another PC
-> ([resume/RESUME.md](resume/RESUME.md)). There are no kernel/boot images, no Apple or vendor files, no device dumps and
-> no personal data (see [What is not in this repo](#what-is-not-in-this-repo-and-why)). A bootable kernel still needs a
-> CI build and your phone's own values.
+> ([resume/RESUME.md](resume/RESUME.md)). It includes the generic kernel template for new phones; there are no kernel/boot images of
+> the author's phone, no Apple or vendor files beyond that template, no device dumps and no personal data (see [What is not in this repo](#what-is-not-in-this-repo-and-why)). A bootable kernel for your phone is made from that
+> template with your phone's own values; rebuilding the kernel itself needs a CI build.
 
 ## What works
 
@@ -115,9 +115,9 @@ port's transaction tools edit the iOS root offline from it. Details: [shim/nord2
 Short version. The full guide, with what to check after each step and a recovery table, is
 **[docs/INSTALL-NORD2.md](docs/INSTALL-NORD2.md)**.
 
-> Honest limit: **steps 0-6 can be done with this repository. Step 7 needs a kernel template** (`kernel.tpl`,
-> `pins-map.json`, `template.adt`) that only comes from a full kernel build, which this repository cannot produce on its own.
-> The whole flow for a second phone has **never been tested**.
+> Honest limit: **steps 0-7 can be done with this repository**; step 7 uses the published kernel template of the
+> q10jfinal19 line (`components/release-20261115/dist/nord2-ios-release-20261115/kernel/`), so a new phone gets that older line, with **its own** pins. The
+> port's root overlay (step 8) is not packaged yet. The whole flow for a second phone has **never been tested**.
 
 0. **Get the inputs yourself**: a OnePlus Nord 2 5G (`oplus6893`), a Linux PC (python3, adb/fastboot, zopfli, hfsprogs,
    qemu with KVM, apfs-fuse, payload-dumper-go), the official OxygenOS full OTA and the iPhone X iOS 16.7.x IPSW.
@@ -143,14 +143,19 @@ Short version. The full guide, with what to check after each step and a recovery
 5. **Profile and check** (must say `READY`):
    ```sh
    python3 components/release-20261115/tools/n2dev/n2_device_profile.py ~/nord2-private/dump \
-       --out ~/nord2-private/dump/device-profile.json --expect release-manifest.json
+       --out ~/nord2-private/dump/device-profile.json --expect components/release-20261115/dist/nord2-ios-release-20261115/release-manifest.json
    ```
 6. **Your own modem NVRAM blob** (from your partitions, never someone else's):
    ```sh
    python3 components/release-20261115/tools/n2dev/mk_nvdisk_dev.py --tree ~/nord2-private/nvtree --out ~/nord2-private/n2nvdisk.bin --check
    ```
-7. **Kernel + device tree + boot image for your phone**: `n2_kernel_pins.py apply`, `mk_device_adt.py`, `n2_pack_device.sh`
-   (blocked until a kernel template exists).
+7. **Kernel + device tree + boot image for your phone** from the published template (writes **your** pins):
+   ```sh
+   R=components/release-20261115/dist/nord2-ios-release-20261115
+   python3 components/release-20261115/tools/n2dev/n2_kernel_pins.py apply $R/kernel/kernel.tpl --map $R/kernel/pins-map.json \
+       --profile ~/nord2-private/dump/device-profile.json --out ~/nord2-private/kernel.dev
+   ```
+   then `mk_device_adt.py` and `n2_pack_device.sh` (see the guide).
 8. **iOS root** from your IPSW (`tools/mkiosroot.sh`) and the port's payloads (`n2_txn.sh`): see the guide; the port's root
    changes are not yet packaged as one overlay.
 
@@ -178,10 +183,12 @@ Paths inside scripts were rewritten: `$NORD2_WORK` = the original work tree, `$N
 ## What is not in this repo and why
 
 - **Personal data of the author's phone**: dumps, modem NVRAM, Wi-Fi/Bluetooth addresses, calibration values, logs, SSH keys.
-  The kernel pieces 0260-0276 are withheld because they embedded the author's modem NVRAM; the final kernel loads the
+  The kernel pieces 0260-0277 are withheld because they embedded the author's modem NVRAM; the final kernel loads the
   blob from the phone instead.
 - **Apple and vendor files**: IPSW content, iOS SDK headers, Android/MediaTek firmware and partitions. Get them yourself.
-- **Build outputs that are too big or carry per-phone values**: kernel and boot images, the CI kernel object archive
+- **Kernel/boot images built for the author's phone** (they carry its pins). The generic kernel **template** is
+  included: `components/release-20261115/dist/nord2-ios-release-20261115/` (Apple-derived parts: see its `NOTICE-TEMPLATE.md`).
+- **Build outputs that are too big**: the CI kernel object archive
   (140 MB), VM images. Their sizes, sha256 and how to rebuild them: [docs/LARGE-ARTIFACTS.md](docs/LARGE-ARTIFACTS.md).
 - **Secrets and third-party apps**: SSH host keys and the jbts bootstrap with its password, decrypted game IPAs,
   seeded shader caches (they reflect the owner's usage).
