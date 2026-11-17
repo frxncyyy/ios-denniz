@@ -1,10 +1,14 @@
 # Port status: kernel lines, pieces, known limits
 
-**verified on one phone** = confirmed by the user on the author's phone in the 2026-11-15/16 sessions. Everything else carries
+**verified on one phone** = confirmed by the user on the author's phone in the 2026-11-14..17 sessions. Everything else carries
 no verification claim here; the engineering log (`notes/ENGINEERING-LOG.md`) has the evidence of earlier milestones. Image
 hashes are sha256 prefixes of the author's per-device images (not reproducible from this tree: they contain the author's pins).
 
 ## Verified on one phone (final line q10jfinal44ts, sha256 f55a15ea)
+
+The README's [What works](../README.md#what-works) table lists every hardware block with its evidence level
+(this session vs engineering log).
+
 | Area | Result | Pieces / payloads |
 |---|---|---|
 | MDP | dual pipe works on Magnifier | 0690 (+ MDP chain 0670-0691) |
@@ -17,7 +21,7 @@ hashes are sha256 prefixes of the author's per-device images (not reproducible f
 | TrollStore | opens; Install IPA File picker opens; ipainbox installed Terraria + Subway | 0730 sandbox container, 0731 SBLOG, 0732 jetsam floor (fixed lsd kill + TrollStore registration), fix2 payload re-registers |
 | Files | "On My iPhone" fixed | 0734 (root statfs type "apfs" for fileproviderd); 0733 never fired, kept harmless |
 | Logs | fplog1 readable-log payload | optional |
-| Torch/flash | not claimed | - |
+| Torch / camera flash | **works** (verified by the user, 2026-11-17) | 0496 torch, 0501/0502, 0560 strobe + camera bundle |
 
 ## Kernel lines (most recent first; only hash prefixes)
 | Line | sha256 prefix | Adds |
