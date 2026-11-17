@@ -70,6 +70,9 @@ files too. Some subdirectories were also pruned without a reason. Added on 2026-
 | Recipe inputs and data: `.txt` lists (e.g. `scanpath_extra*.txt`, `stages.txt`) and `.json` contracts/catalogs/plans | 1 978 |
 | Agent briefs (`.claude/`), work-tree README | 6 |
 | research/nord2 early-phase notes and tools | 4 459 |
+| Text files with extensions outside the first allowlist: Rust AIR tools and the port's metal2vulkan fork, GLSL test shaders, `.scenario`, `.tbd` link stubs, export lists | 1 949 |
+| The port's own built userland binaries of the current install (gfxall17, n2btd, n2simcache, n2mnld, n2locbridge, Slim plug-ins, boot packages) | 11 |
+| Assistant project memory (`resume/claude-memory/`) | 12 |
 
 ## Specific checks
 
